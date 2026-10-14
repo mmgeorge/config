@@ -194,6 +194,7 @@ mod tests {
     fn existing_design_projection_is_rebuilt_without_rewriting_reviewed_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("plan", "Design");
         let mut design = crate::plan::DeclarationDesign::default();
         design.proposed.insert(
@@ -247,6 +248,7 @@ mod tests {
     fn review_capture_rejects_changed_working_and_submitted_sources() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let document = crate::plan::document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &document)

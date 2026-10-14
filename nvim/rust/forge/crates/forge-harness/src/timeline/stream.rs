@@ -302,7 +302,7 @@ impl TimelineStream {
     }
 
     /// Reconcile one canonical projection into ordered top-level operations.
-    pub(crate) fn update_checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<TimelinePatch> {
+    pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
         let base_revision=self.revision;
         let mut operation=Vec::new();
         let entry=TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run:run.clone() };
@@ -402,8 +402,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
                         || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running))))
                 || agent.iter().any(ticking),
         TimelineEntry::Status { status,.. } => status.ticking(),
-        TimelineEntry::Checks { run, .. } => run.state == crate::plan::checks::CheckState::Running
-            && run.commands.iter().any(|check| check.state == crate::plan::checks::CheckState::Running
+        TimelineEntry::Checks { run, .. } => run.state == crate::checks::CheckState::Running
+            && run.commands.iter().any(|check| check.state == crate::checks::CheckState::Running
                 && check.started_at_ms.is_some() && check.completed_at_ms.is_none()),
         _ => false,
     }

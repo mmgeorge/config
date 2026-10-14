@@ -800,6 +800,7 @@ async fn validated_submission_uses_cached_sources_and_rejects_invalid_references
     let dependency = fixture.path().join("engine");
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::create_dir_all(dependency.join("src")).unwrap();
+    crate::checks::configure_fixture(&workspace);
     std::fs::write(dependency.join("Cargo.toml"), "[package]\nname='engine'\nversion='0.1.0'\nedition='2024'\n").unwrap();
     std::fs::write(dependency.join("src/lib.rs"), "pub struct Engine;\n").unwrap();
     let manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nengine={path='../engine'}\nunused='=999.0.0'\n";

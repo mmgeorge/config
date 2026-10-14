@@ -73,7 +73,7 @@ pub enum TimelineEntry {
     Checks {
         id: String,
         created_at_ms: i64,
-        run: crate::plan::checks::CheckRun,
+        run: crate::checks::CheckRun,
     },
     Status {
         id: String,
@@ -225,6 +225,16 @@ pub struct TimelineProjection<'a> {
 }
 
 impl TimelineProjector {
+    /// Merges durable check groups with plan-owned groups while preserving one identity per run.
+    pub(crate) fn with_checks(mut timeline: Vec<TimelineEntry>, runs: Vec<crate::checks::CheckRun>) -> Vec<TimelineEntry> {
+        for run in runs {
+            if !timeline.iter().any(|entry|entry.id() == run.id) {
+                timeline.push(TimelineEntry::Checks {id:run.id.clone(),created_at_ms:run.started_at_ms,run});
+            }
+        }
+        timeline.sort_by_key(TimelineEntry::created_at_ms);
+        timeline
+    }
     /// Build one stable session timeline from interactions and plan lifecycle records.
     pub fn build(projection: TimelineProjection<'_>) -> Result<Vec<TimelineEntry>> {
         let TimelineProjection {
@@ -441,6 +451,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            check_setup: None,
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,

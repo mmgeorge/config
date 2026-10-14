@@ -258,7 +258,7 @@ pub struct PlanExecutionRecord {
     pub progress: SemanticProgress,
     pub verification: Vec<VerificationEvidence>,
     #[serde(default)]
-    pub check_runs: Vec<super::checks::CheckRun>,
+    pub check_runs: Vec<crate::checks::CheckRun>,
     pub revision_history: Vec<ExecutionRevision>,
     pub pending_revision_reason: Option<String>,
     pub review_paused: bool,

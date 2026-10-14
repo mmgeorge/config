@@ -1,9 +1,25 @@
 {
   "version": 14,
   "node": {
-    "kind": ["exchange", "message", "tool_group", "tool", "changes", "file", "hunk", "group"],
-    "lifecycle": ["live", "settled"],
-    "display": ["heading", "preview", "full"]
+    "kind": [
+      "exchange",
+      "message",
+      "tool_group",
+      "tool",
+      "changes",
+      "file",
+      "hunk",
+      "group"
+    ],
+    "lifecycle": [
+      "live",
+      "settled"
+    ],
+    "display": [
+      "heading",
+      "preview",
+      "full"
+    ]
   },
   "session": {
     "task_operation": {
@@ -273,6 +289,13 @@
     "error": {
       "route": "handle",
       "required": {}
+    },
+    "checks_configuration_error": {
+      "route": "handle",
+      "required": {
+        "data.run_id": "string",
+        "data.error": "string"
+      }
     }
   },
   "request": {

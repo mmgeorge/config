@@ -4,6 +4,7 @@ pub mod backend;
 pub mod broker;
 pub mod buffer;
 pub mod checkpoint;
+pub mod checks;
 pub mod control_tools;
 pub mod exchange;
 pub mod goal;

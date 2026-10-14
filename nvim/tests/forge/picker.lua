@@ -535,6 +535,28 @@ local ok, failure = pcall(function()
     "item counter must remain opt-in")
   picker.close(false)
 
+  local page_spec = {
+    host = { window_list = { origin_win, composer_win }, control_win = composer_win },
+    page_list = {
+      { id = "first", option_list = { { label = "First decision" } } },
+      { id = "second", option_list = { { label = "Second decision" } } },
+    },
+  }
+  picker.open(page_spec)
+  invoke("]")
+  picker.update(page_spec)
+  active = picker._state_for_test()
+  assert_equals(picker_state.page(active.state, active.spec).id, "second", "refresh must retain the selected page")
+  page_spec.initial_page = 1
+  picker.update(page_spec)
+  active = picker._state_for_test()
+  assert_equals(picker_state.page(active.state, active.spec).id, "first", "explicit decision navigation must override page retention")
+  page_spec.initial_page = 2
+  picker.update(page_spec)
+  active = picker._state_for_test()
+  assert_equals(picker_state.page(active.state, active.spec).id, "second", "multi-page forms must advance after a decision")
+  picker.close(false)
+
   require("forge.views.harness.model_picker").open({
     host = { window_list = { origin_win, composer_win }, control_win = composer_win },
     model_list = { { id = "example", reasoning = { "medium", "high" },

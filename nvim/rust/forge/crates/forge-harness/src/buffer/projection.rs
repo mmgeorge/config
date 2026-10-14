@@ -223,8 +223,8 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     if let TimelineEntry::Checks { run, .. } = entry {
         let mut blocks = Vec::new();
-        if run.state == crate::plan::checks::CheckState::Running {
-            for check in run.commands.iter().filter(|check| check.state == crate::plan::checks::CheckState::Running) {
+        if run.state == crate::checks::CheckState::Running {
+            for check in run.commands.iter().filter(|check| check.state == crate::checks::CheckState::Running) {
                 let Some(previous) = document.block(&BlockId(format!("{}:tool",check.id))) else { continue; };
                 let mut profile = width.clone();
                 profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
@@ -1571,12 +1571,24 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<()> {
+    fn checks(&mut self, run: &crate::checks::CheckRun) -> Result<()> {
         if self.leading_separator {
             self.literal(&format!("{}:separator", run.id), "", None)?;
         }
-        self.literal(&format!("{}:checks", run.id), &format!("Checks · {:?}", run.state), None)?;
+        let heading = if run.context.is_some() {
+            if run.lifecycle.iter().any(|event|matches!(event.kind,crate::checks::CheckEventKind::ConfigurationSaved)) {
+                run.lifecycle.last().map(|event|event.text.clone()).unwrap_or_else(||"Check configuration saved".into())
+            } else if run.state == crate::checks::CheckState::Running {
+                format!("Checks started · {} · {} selected",run.context.as_ref().unwrap().trigger,run.commands.len())
+            } else {
+                format!("Checks {} · {} · {:.1}s",if run.state == crate::checks::CheckState::Interrupted {"interrupted"} else {"finished"},run.summary(),
+                    run.duration_ms() as f64 / 1000.0)
+            }
+        } else {format!("Checks · {:?}",run.state)};
+        self.literal(&format!("{}:checks", run.id), &heading, None)?;
         let checks = self.begin_section(2);
+        for event in &run.lifecycle { self.literal(&event.id,&event.text,None)?; }
+        if run.context.as_ref().is_none_or(|context|context.trigger == "Plan execution") {
         self.literal(&format!("{}:declarations", run.id),
             &format!("Declarations · {}", if run.progress.conforms() { "match" } else { "differ" }), None)?;
         let declarations = self.begin_section(2);
@@ -1587,13 +1599,14 @@ impl TimelineRenderer<'_> {
             self.diff(&format!("{}:declaration:{index}",run.id),&change.name,&change.diff,"",Some((&change.path,&change.name)),None)?;
         }
         self.finish_section(declarations,&format!("{}:declarations",run.id),true);
+        }
         for check in &run.commands {
             let command_start = self.block.len();
             let call_id = check.id.clone();
             let heading = crate::turn::ToolCall {
                 id:call_id.clone(), kind:"check".into(), title:check.heading(),
                 started_at_ms:check.started_at_ms, completed_at_ms:check.completed_at_ms,
-                task_id:None,output:String::new(),status:String::new(),failed:matches!(check.state,crate::plan::checks::CheckState::Failed),change:Default::default(),
+                task_id:None,output:String::new(),status:String::new(),failed:matches!(check.state,crate::checks::CheckState::Failed | crate::checks::CheckState::Blocked | crate::checks::CheckState::ConfigurationError),change:Default::default(),
             };
             let mut output = ToolOutputView::file(call_id.clone(),check.output.clone(),check.output_bytes)?;
             output.heading(&heading);
@@ -1605,11 +1618,16 @@ impl TimelineRenderer<'_> {
             let renderer=TranscriptRenderer::new(&width)?;
             self.push(renderer.tool_header(BlockId(format!("{call_id}:tool")),TargetId(format!("{call_id}:tool")),
                 "check",check.elapsed_ms(self.now_ms),heading.failed,&heading.title,expanded)?)?;
+            if expanded && let Some(context)=&check.context {
+                self.literal(&format!("{call_id}:command"),&format!("Command: {}",check.command),None)?;
+                self.literal(&format!("{call_id}:selection"),&format!("Requested: {}",serde_json::to_string(&context.selection)?),None)?;
+                if let Some(resolved)=&context.resolved {self.literal(&format!("{call_id}:resolved"),&format!("Resolved: {}",serde_json::to_string(resolved)?),None)?;}
+            }
             if expanded {
                 for chunk in 0..output.inline_prefix_chunks(limit)? { self.push(renderer.tool_body(&call_id,&output,true,chunk)?)?; }
                 self.push(renderer.tool_hidden(&call_id,&output,true)?)?;
             } else {
-                let preview=run.state==crate::plan::checks::CheckState::Running && check.state==crate::plan::checks::CheckState::Running
+                let preview=run.state==crate::checks::CheckState::Running && check.state==crate::checks::CheckState::Running
                     && self.expansion.get(&format!("{call_id}:tool"))!=Some(&false);
                 if preview {
                     let visible=ToolOutputView::new(call_id.clone(),&check.preview)?;
@@ -1620,14 +1638,14 @@ impl TimelineRenderer<'_> {
             if let Some(error)=&check.error { self.literal(&format!("{call_id}:error"),error,None)?; }
             self.fold(command_start,&format!("{call_id}:tool"),true,NodeKind::Tool);
             if let Some(node)=&mut self.block[command_start].metadata.node { node.more=expanded && output.has_unloaded_output();
-                if check.state==crate::plan::checks::CheckState::Running {
+                if check.state==crate::checks::CheckState::Running {
                     node.lifecycle=NodeLifecycle::Live;
                     node.default_display=NodeDisplay::Preview;
                     node.resolve(self.expansion.get(&node.id.0).copied());
                 } }
             self.tool.insert(call_id,output);
         }
-        self.finish_section(checks,&format!("{}:checks",run.id),run.state != crate::plan::checks::CheckState::Running);
+        self.finish_section(checks,&format!("{}:checks",run.id),run.state != crate::checks::CheckState::Running);
         if let Some(title)=&run.completed_plan { self.literal(&format!("{}:complete",run.id), &format!("◇ Plan complete: {title}"),None)?; }
         Ok(())
     }
@@ -4171,7 +4189,7 @@ mod tests {
 
     #[test]
     fn silent_checks_refresh_only_the_live_heading_without_reading_output() -> anyhow::Result<()> {
-        let mut run:crate::plan::checks::CheckRun=serde_json::from_value(json!({
+        let mut run:crate::checks::CheckRun=serde_json::from_value(json!({
             "id":"check-run","revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
             "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
@@ -4191,23 +4209,23 @@ mod tests {
         assert_eq!(refreshed[0].id.0,"check-command:tool");
         assert_ne!(refreshed[0].text,document.block(&refreshed[0].id).unwrap().text);
         assert_eq!(projected.tool["check-command"].snapshot()?.retained_bytes(),0);
-        run.state=crate::plan::checks::CheckState::Passed;
-        run.commands[0].state=crate::plan::checks::CheckState::Passed;
+        run.state=crate::checks::CheckState::Passed;
+        run.commands[0].state=crate::checks::CheckState::Passed;
         run.commands[0].completed_at_ms=Some(2000);
         let mut previous=run.commands[0].clone();
         previous.id="previous-command".into();
         run.commands.insert(0,previous);
-        run.state=crate::plan::checks::CheckState::Running;
-        run.commands[1].state=crate::plan::checks::CheckState::Interrupted;
+        run.state=crate::checks::CheckState::Running;
+        run.commands[1].state=crate::checks::CheckState::Interrupted;
         assert_eq!(run.status().elapsed_ms(90_000),2000);
-        run.state=crate::plan::checks::CheckState::Interrupted;
+        run.state=crate::checks::CheckState::Interrupted;
         assert_eq!(run.status(),SessionPhase::Paused);
-        run.state=crate::plan::checks::CheckState::Running;
-        run.commands[1].state=crate::plan::checks::CheckState::Running;
+        run.state=crate::checks::CheckState::Running;
+        run.commands[1].state=crate::checks::CheckState::Running;
         run.commands[1].started_at_ms=Some(90_000);
         run.commands[1].completed_at_ms=None;
         assert_eq!(run.status().elapsed_ms(93_000),5000);
-        run.state=crate::plan::checks::CheckState::Passed;
+        run.state=crate::checks::CheckState::Passed;
         let finished=TimelineEntry::Checks {id:run.id.clone(),created_at_ms:0,run};
         assert!(super::timing_blocks(&finished,&profile,&document,&Default::default(),&projected.tool)?.is_empty());
         Ok(())

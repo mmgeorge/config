@@ -1429,6 +1429,7 @@ mod tests {
     fn test_inventory_revision_preserves_document_and_declaration_state() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Inspect configuration.");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Expose configuration.".into();
@@ -1496,6 +1497,7 @@ mod tests {
     fn declaration_collapse_preserves_source_and_visibility_choices() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Inspect containers.");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Expose configuration.".into();
@@ -1544,6 +1546,7 @@ mod tests {
     fn questions_preserve_design_and_persist_answers_bound_to_current_text() {
         let temporary = tempfile::tempdir().unwrap();
         let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&file.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Question the API.");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Expose shared state.".into();
@@ -1635,6 +1638,7 @@ mod tests {
     fn historical_revision_retains_comments_after_working_plan_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Original overview");
         store
             .write_working_document("session", "plan", &canonical)
@@ -1747,6 +1751,7 @@ mod tests {
     async fn declaration_jumps_use_token_positions_and_filtered_snapshots() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Declarations");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Define the API.".into();
@@ -1901,6 +1906,7 @@ mod tests {
     fn module_declaration_jump_selects_the_file_diff() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Module navigation");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Expose the assets module.".into();
@@ -2034,6 +2040,7 @@ mod tests {
     fn signature_type_jump_resolves_cursor_entity_and_preserves_flow_navigation() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Initial");
         let mut summary = canonical.entity_changes[0].clone();
         summary.name = "DiagnosticSummary".into();
@@ -2130,6 +2137,7 @@ mod tests {
     async fn proposed_rust_nested_and_imported_types_jump_without_dependency_acquisition() {
         let temporary = tempfile::tempdir().unwrap();
         let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&file.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Movement declarations");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Define movement interfaces.".into();
@@ -2239,6 +2247,7 @@ mod tests {
     fn annotation_capture_saves_exact_text_and_rejects_changed_source_atomically() {
         let temporary = tempfile::tempdir().unwrap();
         let file = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&file.workspace);
         let canonical = crate::plan::document::test_fixture("plan", "Initial");
         file.write_working_document("session", "plan", &canonical)
             .unwrap();
@@ -2357,6 +2366,7 @@ mod tests {
     fn physical_projection_preserves_source_and_rejects_stale_or_forged_targets() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let canonical = crate::plan::document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &canonical)
@@ -2411,6 +2421,7 @@ mod tests {
         )
         .unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical =
             crate::plan::document::test_fixture("plan", "Uncaptured property navigation");
         let mut design = crate::plan::DeclarationDesign::default();
@@ -2496,6 +2507,7 @@ mod tests {
     fn property_navigation_reveals_filtered_uses_and_previews_planned_rename() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Property navigation");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Add a client count property.".into();
@@ -2605,6 +2617,7 @@ mod tests {
     fn references_hide_plain_rust_imports_without_losing_exports_or_rename_uses() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Import visibility");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Define shared record declarations.".into();
@@ -2644,6 +2657,7 @@ mod tests {
     fn references_reveal_filtered_calls_in_the_same_snapshot_without_editing_design() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut canonical = crate::plan::document::test_fixture("plan", "Call navigation");
         let mut design = crate::plan::DeclarationDesign::default();
         design.document.objective = "Define call relationships.".into();

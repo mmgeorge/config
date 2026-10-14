@@ -22,6 +22,9 @@ static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sy
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    /// Captures read-only project checks displayed with a submitted design.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check_configuration: Option<crate::checks::ConfigSnapshot>,
     /// Retains dependency selection independently of subsequent checkout edits.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub cargo_lock: BTreeMap<String, String>,
@@ -50,6 +53,7 @@ fn default_line_width() -> usize {
 impl Default for DeclarationDesign {
     fn default() -> Self {
         Self {
+            check_configuration: None,
             cargo_lock: BTreeMap::new(),
             validation: None,
             document: DesignDocument::default(),
@@ -73,6 +77,7 @@ impl DeclarationDesign {
     /// Validate a new target without replacing the immutable pre-execution baseline.
     pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
+        design.check_configuration = Some(crate::checks::ConfigSnapshot::load(workspace)?);
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
@@ -786,44 +791,35 @@ mod tests {
     }
 
     #[test]
-    fn validation_requirements_survive_submission_and_revision_without_running_commands() {
-        let workspace=tempfile::tempdir().unwrap();
-        let store=crate::plan::PlanFileStore::new(workspace.path().join("data"),workspace.path());
-        let mut design=DeclarationDesign::default();
-        design.document.objective="Verify score resets".into();
-        design.document.background="Existing score fixture".into();
-        design.document.design="Reset score when a round starts".into();
-        design.document.checks=vec!["echo test > should-not-exist.txt".into(),"nvim --headless -l tests/score.lua".into()];
-        design.document.verification=vec!["Start a new round and confirm the score is zero.".into()];
-        let mut document=crate::plan::document::test_fixture("validation","Score validation");
-        document.design=Some(design.clone());
-        store.write_working_document("session","validation",&document).unwrap();
-        let (_,rendered,_)=store.submit_document_revision("session","validation",1,1).unwrap();
-        let original=store.read_submitted_document("session","validation",1).unwrap();
-        assert_eq!(original.design.as_ref().unwrap().document,design.document);
-        assert!(rendered.markdown.contains(" Checks "));
-        assert!(rendered.markdown.contains("echo test > should-not-exist.txt"));
-        assert!(rendered.markdown.contains(" Verification "));
+    fn project_checks_are_snapshotted_without_running_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        let config = serde_json::json!({"checks":{"version":2,"definitions":[{"id":"score","name":"Score tests","area":"Game","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"echo test > should-not-exist.txt"}}]}});
+        std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"),workspace.path());
+        crate::checks::configure_fixture(&store.workspace);
+        let mut design = DeclarationDesign::default();
+        design.document.objective = "Verify score resets".into();
+        design.document.background = "Existing score fixture".into();
+        design.document.design = "Reset score when a round starts".into();
+        design.document.verification = vec!["Start a new round and confirm the score is zero.".into()];
+        let mut document = crate::plan::document::test_fixture("validation", "Score validation");
+        document.design = Some(design);
+        store.write_working_document("session", "validation", &document).unwrap();
+        std::fs::remove_file(workspace.path().join(".forge.json")).unwrap();
+        assert!(store.submit_document_revision("session", "validation", 1, 1).unwrap_err().to_string().contains("checks_not_configured"));
+        std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&config).unwrap()).unwrap();
+        let (submitted, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
+        assert!(submitted.design.unwrap().check_configuration.is_some());
+        assert!(rendered.markdown.contains("Score tests"));
         assert!(!workspace.path().join("should-not-exist.txt").exists());
-        let mut revised=original.clone();revised.version+=1;
-        revised.design.as_mut().unwrap().document.checks.remove(0);
-        store.write_working_document("session","validation",&revised).unwrap();
-        store.submit_document_revision("session","validation",2,revised.version).unwrap();
-        let current=store.read_submitted_document("session","validation",2).unwrap();
-        let delta=crate::plan::revision::DeclarationDelta::between(Some(&original),&current).unwrap();
-        assert!(delta.document.contains("a/Checks b/Checks"));
-        assert!(delta.document.contains("-echo test > should-not-exist.txt"));
-        assert_eq!(store.read_submitted_document("session","validation",1).unwrap(),original);
-        for invalid in ["line\nline","line\0line",""] {
-            let mut invalid_design=design.clone();invalid_design.document.checks=vec![invalid.into()];
-            assert!(invalid_design.document.validate().is_err());
-        }
+        assert!(serde_json::to_value(store.read_submitted_document("session", "validation", 1).unwrap().design.unwrap().document).unwrap().get("checks").is_none());
     }
 
     #[test]
     fn complete_specification_survives_review_and_optional_section_removal() {
         let workspace = tempfile::tempdir().unwrap();
         let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        crate::checks::configure_fixture(&store.workspace);
         let empty = DeclarationDesign::default();
         let metadata = serde_json::json!({
             "objective": "Make cancellation observable.",
@@ -833,7 +829,7 @@ mod tests {
             "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
             "design": "`Request` retains cancellation state until pending work finishes.",
             "flows": [{"title":"Cancel request", "description":"Cancel before publication and retain the current texture.", "root":{"text":"Request.cancel", "children":[{"text":"TextureStreaming.discard", "via":"cancellation"}]}}],
-            "checks": ["cargo test --release cancellation"], "verification": ["Cancel an upload and confirm the current texture remains visible."],
+            "verification": ["Cancel an upload and confirm the current texture remains visible."],
             "tests": [{"file":"src/request.rs", "cases":[{"name":"tests::cancellation", "change":"new", "description":"Cancel before publication and retain the current texture."}]}]
         });
         let replace = |design: &DeclarationDesign, metadata: &serde_json::Value| {
@@ -855,7 +851,7 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
         assert!(rendered.markdown.contains("Request.cancel → cancellation → TextureStreaming.discard"));
-        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "checks", "verification", "tests"] {
+        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "verification", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
         for field in ["objective", "background", "design"] {

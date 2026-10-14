@@ -592,6 +592,20 @@ fn rows(
             text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
     }
+    let start = overview.len();
+    overview.push(section_header(BlockId("plan:section:checks".into()), "Configured checks")?);
+    let lines = if let Some(snapshot) = &design.check_configuration {
+        if snapshot.config.definitions.is_empty() { vec!["No automated checks configured.".into()] }
+        else { snapshot.config.order()?.into_iter().map(|index| {
+            let check = &snapshot.config.definitions[index];
+            format!("{} · {} · {:?} · {:?} · {} · trigger: {} · prerequisites: {}", check.area, check.name, check.category, check.scope,
+                if check.enabled {"Enabled"} else {"Disabled"}, check.trigger.description(), if check.depends_on.is_empty() {"None".into()} else {check.depends_on.join(", ")})
+        }).collect::<Vec<String>>() }
+    } else { vec!["Unconfigured · use /checks setup before submission.".into()] };
+    for (index,line) in lines.into_iter().enumerate() {
+        overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows([line])?,metadata:BlockMetadata::default()});
+    }
+    fold(&mut overview, start, "plan:section:checks")?;
     navigation.anchor.extend(section_anchor);
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
@@ -1081,7 +1095,7 @@ mod tests {
             assert!(!rows.iter().any(|row| row.contains("= existing_case")));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/tests/1/cases/0"));
             let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
-            let verification_start = block.iter().position(|block| block.id.0 == "plan:section:checks").unwrap();
+            let verification_start = block.iter().position(|block| block.id.0 == "plan:section:verification").unwrap();
             assert!(tests_start < verification_start);
             let endpoint = &block[tests_start].metadata.fold[0].end.block;
             assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < verification_start);
@@ -1131,7 +1145,7 @@ mod tests {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("lib.rs".into(), "pub struct State;\n".into());
-        design.document.checks = vec!["cargo test -- --test-threads=1".into(), "printf '# *literal*'".into()];
+
         design.document.verification = vec!["Resize and confirm `State` remains visible.".into()];
         design.document.decisions.push(super::super::design_document::DesignDecision {
             decision: "Keep state explicit.".into(), rationale: "Callers can inspect it.".into(),
@@ -1147,16 +1161,15 @@ mod tests {
         for public_only in [false, true] {
             let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
             assert!(block.iter().flat_map(|block| block.text.wire_rows()).all(|line| !line.contains("Cargo source resolution failed") && !line.contains("dependency source is unavailable")));
-            let command = block.iter().find(|block| block.id.0 == "plan:metadata:checks:1").unwrap();
-            assert_eq!(command.text.row(0), Some("printf '# *literal*'"));
-            assert!(!command.metadata.markdown);
+            let checks = block.iter().find(|block| block.id.0 == "plan:configured-checks:0").unwrap();
+            assert!(!checks.metadata.markdown);
             let decision = block.iter().find(|block| block.id.0 == "plan:metadata:decisions:0").unwrap();
             assert_eq!(decision.text.row(0), Some("- **Keep state explicit.** Callers can inspect it."));
             assert!(decision.metadata.markdown);
             assert!(decision.metadata.decoration.iter().any(|style| style.capture == "ForgeStatusHeader"));
             assert!(block.iter().filter(|block| block.id.0.starts_with("plan:metadata:verification:")).all(|block| block.metadata.markdown));
             assert!(block.iter().filter(|block| block.id.0.starts_with("plan:section:")).all(|block| !block.metadata.markdown));
-            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/checks"));
+            assert!(!target.values().any(|anchor| anchor.json_path == "/design/document/checks"));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/verification"));
             forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("validation".into()), block.clone()).unwrap();
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
@@ -1498,8 +1511,8 @@ mod tests {
         assert_eq!(folded_header[4].text.row(0), Some(" Changes "));
         assert!(folded_header[5].text.row(0).unwrap().starts_with("Modified src/lib.rs"));
         assert!(folded_header[6].text.row(0).unwrap().starts_with("@@"));
-        assert_eq!(folded_header[7].text.row(0), Some(" Checks "));
-        assert_eq!(folded_header[8].text.row(0), Some(" Verification "));
+        assert_eq!(folded_header[7].text.row(0), Some(" Verification "));
+        assert_eq!(folded_header[8].text.row(0), Some(" Configured checks "));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

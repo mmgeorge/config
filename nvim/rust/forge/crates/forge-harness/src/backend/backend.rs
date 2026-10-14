@@ -655,7 +655,7 @@ pub fn build(
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
                 }
-                Some("session-blocking") => Some(Duration::from_secs(3)),
+                Some("session-blocking" | "approval-blocking") => Some(Duration::from_secs(3)),
                 Some("steering") => Some(Duration::from_millis(500)),
                 _ => None,
             },
@@ -673,11 +673,17 @@ pub fn build(
                 .is_some_and(|value| value == "fork-blocking")
                 .then_some(Duration::from_secs(3)),
             steering_by_session: Default::default(),
+            permission: launch.command.first().is_some_and(|value| value == "approval-blocking")
+                .then_some(permission_coordinator),
+            retained_control: launch.command.first().is_some_and(|value| value == "retained-control")
+                .then(Default::default),
         })),
     }
 }
 
 struct MockBackend {
+    retained_control: Option<std::sync::Mutex<std::collections::HashMap<String, crate::control_tools::ControlTurnContext>>>,
+    permission: Option<std::sync::Arc<approval::PermissionCoordinator>>,
     delay: Option<Duration>,
     emit_before_delay: bool,
     write_before_delay: bool,
@@ -741,9 +747,46 @@ impl Backend for MockBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
+        if let Some(retained) = &self.retained_control
+            && let Some(context) = &request.control_context {
+            retained.lock().expect("mock control context poisoned")
+                .insert(request.runtime_key()?, context.clone());
+        }
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
+        if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
+            && scope.setup_reviewed() == Some(false) {
+            let catalog: Value = serde_json::from_str(&scope.invoke("harness_checks_list", serde_json::json!({})).await?)?;
+            let rejected = scope.invoke("harness_checks_configure", serde_json::json!({
+                "expected_revision": catalog["revision"], "config": {"version":2,"definitions":[]}
+            })).await;
+            anyhow::ensure!(rejected.is_err(), "setup published before the user answered");
+            return Ok(BackendOutput { plan_question: Some(crate::plan::PlanQuestionSet::freeform(
+                "Which functional areas and suites should run automatically, and should routine coverage be targeted or full?".into())), ..Default::default() });
+        }
+        if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
+            && scope.setup_reviewed() == Some(true) {
+            let catalog: Value = serde_json::from_str(&scope.invoke("harness_checks_list", serde_json::json!({})).await?)?;
+            let config = if catalog["snapshot"]["config"].is_object() { catalog["snapshot"]["config"].clone() }
+                else { serde_json::json!({"version":2,"definitions":[]}) };
+            scope.invoke("harness_checks_configure", serde_json::json!({
+                "expected_revision": catalog["revision"], "config": config,
+            })).await?;
+        }
+        if let Some(permission) = &self.permission {
+            let resolution = permission.authorize_callback(request.execution_mode, true,
+                crate::permissions::matcher::PermissionRequest {
+                    id: "mock-approval".into(), provider: "Mock".into(), reason: None,
+                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                        command: "mock-probe".into(), shell: None,
+                    }],
+                }, Some(ProviderAddress { owner: Some(request.owner()?),
+                    thread_id: request.harness_session_id.clone(), turn_id: "mock-turn".into() }),
+                event_sink.as_ref()).await?;
+            anyhow::ensure!(resolution == approval::ApprovalResolution::AllowOnce,
+                "mock approval was not allowed");
+        }
         let event = BackendEvent {
             received_at_ms: None,
             address: None,
@@ -1216,6 +1259,8 @@ mod test {
     #[tokio::test]
     async fn applies_steering_to_the_same_planning_turn() {
         let backend = Arc::new(MockBackend {
+            retained_control: None,
+            permission: None,
             delay: Some(Duration::from_millis(50)),
             emit_before_delay: false,
             write_before_delay: false,

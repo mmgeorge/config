@@ -24,8 +24,6 @@ pub struct DesignDocument {
     /// Traces operations between concrete objects independently of Design prose.
     #[serde(default)]
     pub flows: Vec<super::design_flows::DesignFlow>,
-    /// Lists commands Harness executes locally in order before manual verification.
-    pub checks: Vec<String>,
     /// Lists manual actions and expected results after automated checks pass.
     pub verification: Vec<String>,
     /// Inventories changed and reused tests by file, independently of source language.
@@ -101,12 +99,6 @@ impl DesignDocument {
                 text: super::design_tests::text(&self.tests),
             },
             DesignSection {
-                path: "checks",
-                title: "Checks",
-                section: PlanSection::AutomatedVerification,
-                text: self.checks.join("\n"),
-            },
-            DesignSection {
                 path: "verification",
                 title: "Verification",
                 section: PlanSection::ManualVerification,
@@ -119,10 +111,6 @@ impl DesignDocument {
     pub(crate) fn validate(&self) -> Result<()> {
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
-        for command in &self.checks {
-            ensure!(!command.trim().is_empty() && !command.contains(['\n', '\r', '\0']),
-                "each check must contain one nonempty command without line breaks");
-        }
         for action in &self.verification {
             ensure!(!action.trim().is_empty(), "manual verification actions cannot be empty");
         }

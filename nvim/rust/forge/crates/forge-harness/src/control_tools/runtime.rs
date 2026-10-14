@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub struct ControlTurnContext {
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
+    pub(crate) checks: Option<Arc<crate::checks::CheckToolScope>>,
     pub mode: PromptMode,
     pub planning_feedback: bool,
     pub check_shell: crate::session::CheckShell,
@@ -57,6 +58,7 @@ impl ControlTurnContext {
         Self {
             checkpoint: None,
             agent: None,
+            checks: None,
             mode,
             planning_feedback: false,
             check_shell: Default::default(),
@@ -129,6 +131,11 @@ impl ControlToolRuntime {
         if matches!(invocation.name.as_str(), "harness_design_apply_patch" | "harness_plan_submit")
             && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
+            "harness_checks_list" | "harness_checks_configure" | "harness_checks_run" | "harness_checks_status" | "harness_checks_cancel" => {
+                let scope = self.context.checks.as_ref().context("check tools require an authenticated root interaction")?;
+                let message = scope.invoke(&invocation.name, invocation.arguments).await?;
+                Ok(ControlToolResult {invocation:None,message})
+            }
             "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
             | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output" => {
                 let scope = self.context.agent.as_ref().context("agent tools require an authenticated active root turn")?;
@@ -478,9 +485,12 @@ mod test {
 
     fn planning_context() -> ControlTurnContext {
         let cache_dir = tempfile::tempdir().unwrap().keep();
+        let workspace = tempfile::tempdir().unwrap().keep();
+        crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
             checkpoint: None,
             agent: None,
+            checks: None,
             mode: PromptMode::Plan,
             planning_feedback: false,
             check_shell: Default::default(),
@@ -490,7 +500,7 @@ mod test {
             has_active_elicitation: false,
             has_active_execution: false,
             has_active_goal: false,
-            workspace_root: Some(tempfile::tempdir().unwrap().keep()),
+            workspace_root: Some(workspace),
             repository: None,
             execution: None,
             rustdoc: Some(Arc::new(

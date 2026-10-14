@@ -393,10 +393,14 @@ local function confirm(instance, with_feedback)
   end
 end
 
+local install_keymaps
+
 local function move_page(instance, delta)
   close_input(instance)
+  clear_modal_keymaps(instance)
   picker_state.move_page(instance.state, instance.spec, delta)
   render_view(instance)
+  install_keymaps(instance)
 end
 
 local function move_selection(instance, delta)
@@ -471,7 +475,7 @@ end
 
 local open_search
 
-local function install_keymaps(instance)
+install_keymaps = function(instance)
   local set = command_set.new()
   command_set.register(set, "previous", function()
     move_selection(instance, -1)
@@ -642,6 +646,11 @@ function Picker.update(spec)
   active.spec = spec
   update_deadline_timer(active)
   local next_state = picker_state.new(spec)
+  if previous_page and spec.initial_page == nil then
+    for page_index, page in ipairs(spec.page_list) do
+      if page.id == previous_page.id then next_state.page_index = page_index break end
+    end
+  end
   next_state.selected_index_by_page = previous_state.selected_index_by_page
   next_state.selected_set_by_page = previous_state.selected_set_by_page
   for page_id, draft in pairs(previous_state.draft_by_page) do next_state.draft_by_page[page_id] = draft end

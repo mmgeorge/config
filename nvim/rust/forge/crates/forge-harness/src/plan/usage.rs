@@ -503,6 +503,7 @@ mod tests {
     #[tokio::test]
     async fn rejects_missing_uses_before_dependency_acquisition() {
         let workspace = tempfile::tempdir().unwrap();
+        crate::checks::configure_fixture(workspace.path());
         let design = design("lib.rs", "fn internal() {}\n");
         let error = design.validated(workspace.path()).await.unwrap_err();
         assert!(error.downcast_ref::<DeclarationValidationError>().is_some());
@@ -513,6 +514,7 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let store =
             crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("uses", "Connect internal behavior");
         let mut design = design("lib.rs", "pub fn install() { worker(); }\nfn worker() {}\n");
         design.document.objective = "Connect internal behavior".into();

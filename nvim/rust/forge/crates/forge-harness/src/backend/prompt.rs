@@ -50,7 +50,7 @@ impl BackendRequest {
             crate::session::CheckShell::System => "the system login shell",
         };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nAccepted checks run in {interpreter}. Write exact check commands for that interpreter.\n{question}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Use harness_checks tools for automated validation outside plan execution.\n{question}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }

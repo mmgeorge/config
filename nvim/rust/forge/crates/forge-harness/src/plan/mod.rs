@@ -17,6 +17,7 @@ mod design;
 mod design_document;
 mod design_flows;
 mod design_tests;
+pub use design_tests::DesignTestChange;
 pub(crate) use design_tests::DesignTestSelection;
 pub(crate) mod calls;
 mod references;
@@ -48,7 +49,6 @@ mod review_projection;
 pub(crate) mod review_source;
 mod scheduler;
 pub(crate) mod execution;
-pub(crate) mod checks;
 pub use execution::{PlanExecutionState, PlanExecutionRecord, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanPhase};
 pub mod state_machine;
 mod validation;
@@ -780,13 +780,6 @@ pub struct PlanFileStore {
 }
 
 impl PlanFileStore {
-    /// Build a plan file store beneath the Harness data directory.
-    pub(crate) fn check_output_directory(&self, session: &str, run: &str) -> Result<PathBuf> {
-        let path = self.root.join(session).join("checks").join(run);
-        fs::create_dir_all(&path)?;
-        Ok(path)
-    }
-
     pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),
@@ -944,6 +937,7 @@ impl PlanFileStore {
         }
         document.validate_for_submission()?;
         if let Some(design) = &mut document.design {
+            design.check_configuration = Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
             if design
                 .validation
                 .as_ref()
@@ -1263,6 +1257,7 @@ mod test {
     fn warm_review_edits_preserve_a_multifile_plan() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut document = document::test_fixture("fast-review", "Review a multifile plan");
         let mut design = DeclarationDesign::default();
         design.document.objective = "Keep updates local to their declarations.".into();
@@ -1303,6 +1298,7 @@ mod test {
         assert_eq!(fs::read_dir(directory.join("revisions")).unwrap().count(), 3);
         assert_eq!(store.read_submitted_document("session", "fast-review", 1).unwrap(), document);
         let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&reopened.workspace);
         let checksum = digest(&serde_json::to_vec(&deleted).unwrap());
         let reviewed = reopened.capture_review_source("session", "fast-review", None, &checksum).unwrap();
         assert_eq!(reviewed.document, deleted);
@@ -1363,6 +1359,7 @@ mod test {
         );
         document.design = Some(design);
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         store
             .persist_revision("session", "rename", 1, document.clone(), None)
             .unwrap();
@@ -1462,6 +1459,7 @@ mod test {
         document.design.as_mut().unwrap().document.background = "Cargo.toml already enables engine rendering.".into();
         document.design.as_mut().unwrap().document.requirements = vec!["Enable input without disabling rendering.".into()];
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
             .unwrap();
@@ -1587,6 +1585,7 @@ mod test {
         let mut document = document::test_fixture("plan", "Configuration");
         document.design = Some(design);
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
             .unwrap();
@@ -1660,6 +1659,7 @@ mod test {
         );
         document.design = Some(design);
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         store
             .write_working_document("session", "plan", &document)
             .unwrap();
@@ -1719,6 +1719,7 @@ mod test {
     fn preserves_submitted_json_revisions_while_the_working_document_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let document = document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &document)
@@ -1769,6 +1770,7 @@ mod test {
     fn renders_only_complete_submissions_while_preserving_repairable_drafts() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let document = document::test_fixture("plan", "Initial");
         store
             .write_working_document("session", "plan", &document)

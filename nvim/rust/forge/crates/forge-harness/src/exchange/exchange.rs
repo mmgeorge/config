@@ -103,6 +103,8 @@ pub struct Exchange {
     /// Retains terminal approvals and their response source after the picker closes.
     #[serde(default)]
     pub approval_resolution: Vec<crate::backend::approval::ApprovalRequestView>,
+    /// Owns the setup question boundary independently of the active plan.
+    pub check_setup: Option<crate::checks::CheckSetupState>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub node_list: Vec<ExchangeNode>,
@@ -183,6 +185,7 @@ impl Exchange {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            check_setup: None,
             created_at_ms: delegation.created_at_ms,
             completed_at_ms: None,
             node_list: Vec::new(),
@@ -858,6 +861,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            check_setup: None,
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,

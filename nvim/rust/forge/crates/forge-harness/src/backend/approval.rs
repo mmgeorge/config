@@ -98,6 +98,7 @@ struct PendingApproval {
     token: Uuid,
     view: ApprovalRequestView,
     response: oneshot::Sender<ApprovalResolution>,
+    resolution_sink: Option<BackendEventSink>,
 }
 
 struct PendingRegistration<'registry> {
@@ -294,6 +295,7 @@ impl PermissionCoordinator {
                     token,
                     view: view.clone(),
                     response: sender,
+                    resolution_sink: event_sink.cloned(),
                 },
             );
         }
@@ -370,6 +372,8 @@ impl PermissionCoordinator {
         Ok(Some(approval.view.clone()))
     }
 
+    /// Resolve a pending request and publish its terminal event on the requesting execution's stream.
+    /// Use `event_sink` only when the request was registered without a stream.
     pub async fn resolve(
         &self,
         approval_id: &str,
@@ -462,6 +466,7 @@ impl PermissionCoordinator {
                 .expect("validated approval must remain pending while locked");
             (pending, resolution, rule_list)
         };
+        let event_sink = pending.resolution_sink.as_ref().or(event_sink);
         let persisted = if !rule_list.is_empty() {
             self.store
                 .write()
@@ -474,11 +479,12 @@ impl PermissionCoordinator {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             return Err(error);
         }
+        // Queue the terminal event before the provider can resume and finish its turn.
+        Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
         if pending.response.send(resolution).is_err() {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             anyhow::bail!("provider no longer waits for approval {approval_id}");
         }
-        Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
         Ok(pending.view)
     }
 
@@ -1803,13 +1809,17 @@ mod test {
                     item_id: "0".into(),
                     choice_id: "allow_broad".into(),
                 }],
-                Some(&event_sink),
+                None,
             )
             .await
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowOnce);
-        let resolved = event_stream.recv().await.unwrap().unwrap();
+        let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), event_stream.recv())
+            .await.expect("manual resolution must reach the requesting execution").unwrap().unwrap();
         assert_eq!(resolved.kind, "approval_resolved");
+        let resolved_view: ApprovalRequestView = serde_json::from_value(resolved.data).unwrap();
+        assert_eq!(resolved_view.exchange_id, owned.exchange_id);
+        assert_eq!(resolved_view.turn_id, owned.turn_id);
         let source = store.read().unwrap().open().1;
         assert!(source.contains("\"rg *\": \"allow\""));
     }

@@ -3060,9 +3060,11 @@ In `permission.bash`, `"*"` supplies the lowest-priority decision for a recogniz
 More specific command rules override it. Without a matching rule, commands ask for approval.
 Empty or ambiguous command text returns a parse error, even when `"*"` allows other commands.
 
-Approval requests bypass the timeline reducer and stream directly into the controller. Resolution
-and cancellation emit matching lifecycle events keyed by approval ID, so the controller removes the
-request, closes its float, clears the winbar status, and presents the next queued request atomically.
+Approval requests enter the owning exchange's reducer before reaching the controller. The permission
+coordinator retains the request's event stream and queues manual resolution there before releasing
+the provider callback. Root and child exchanges therefore clear their approval blocker and resume
+timing through the same lifecycle path. The controller consumes events keyed by approval ID to remove
+the request, close its float, and present the next queued request. Cancellation emits a matching event.
 Cancelling a turn drains the coordinator before provider teardown, preventing abandoned requests
 from reappearing through a later state snapshot.
 
@@ -6086,12 +6088,108 @@ or restore a cursor. A committed update, closure, or session replacement stops
 the old timer. New status metadata supplies the next animation policy.
 
 
-## Harness-owned checking gate
+## Project checks and the Harness checking gate
 
-Plan metadata separates `checks: string[]` from `verification: string[]`. Checks are exact automated commands. Verification contains manual actions and expected observations. Implement and Resolve produce code without executing validation. Their completion transitions persist Checking before any process starts.
+Project check definitions live in the `checks` section of `.forge.json`. The LLM configures
+them through `/checks setup`, preserving other repository settings. The categories are
+`format`, `lint`, `check`, `test`, and `build`. Unit, integration, and screenshot suites are
+named `test` definitions. No language detector generates commands. An absent checks section
+blocks plan submission. An explicitly empty definition list is valid. Configuration version 2
+requires each check to name its functional area and define its automatic trigger.
 
-Checking does not admit a provider exchange or report tokens. Harness runs commands sequentially in the workspace, using `/config Shell` (System or installed Nushell), outside the provider sandbox. System resolves PowerShell 7 on Windows and the default shell on macOS. An unavailable selected shell blocks the gate without substitution. Each run captures interpreter, revision, environment digest, source digests, and Git checkpoint content identities. No environment values appear in the transcript.
+Each definition owns its identity, name, area, trigger, enabled default, scope, directory, static commands,
+and prerequisite identities. Every definition implements `all`; `files` and `cases` are
+optional contracts. Scoped handlers receive versioned JSON on stdin and write the actual
+resolved selection to a Harness-provided receipt path. Unsupported scopes, empty results
+for nonempty requests, malformed receipts, and missing receipts are configuration errors.
+Harness notifies the user and never silently broadens a selection. Managed Nushell helpers
+live under `.forge/checks/`, and setup validates their syntax without running the checks.
 
-Each command owns state, timestamps, exit code, separate stdout and stderr files, and a combined output file. Timeline command nodes load saved output incrementally on expansion. Closed nodes retain headings only. Running previews retain at most four lines. Output never depends on provider tool IDs. Process ownership terminates descendants on interruption or host exit. Recovery marks unfinished commands interrupted and leaves the saved phase paused. Resume reuses completed results only when captured identities match and reruns the interrupted command.
+Changed-case defaults consume an accepted plan's added/modified case inventory. An explicitly
+empty inventory can select no cases. Standalone runs have no such inventory and report a
+configuration error when an applicable case-scoped check cannot resolve coverage. Explicit
+empty file or case selections also fail configuration. File mappings and explicit nonempty
+case selections remain available outside plan execution.
 
-Recorded declaration or command failures enter Resolve. Missing prerequisites block Checking with a persisted reason. Source changes during the gate invalidate its result. Passing gates enter manual Verify only when manual actions exist, otherwise complete the plan. Manual defects return to Resolve and manual blockers preserve Verify. Preferences, permissions, prompt history, workspace files, and Git history survive the session format reset. Incompatible session records and their cascading timeline records are removed only after runtime ownership locks can be acquired.
+Triggers select checks independently from execution scope. An `any_change` trigger requires at
+least one task-relative changed path. A `paths` trigger selects changes matching an include and
+no exclude pattern. Patterns support `*` and `?` within components and `**` across components.
+A `manual` trigger requires an explicit request or a dependency from a selected check. Areas
+are descriptive groups and may overlap through trigger paths. A full-workspace check therefore
+does not run on changes outside its trigger. Required prerequisites enter the selected set even
+when their own triggers do not match.
+
+The runner compares the current checkpoint with the first checkpoint of the owning task,
+preserving the baseline across continuations and host recovery. Existing dirty files do not
+trigger checks unless that task changes them. Additions, deletions, and both rename paths remain
+part of the change set. Before a task baseline exists, automatic applicability remains unknown
+and runs select no commands. Explicit IDs or the separate run-all action bypass triggers.
+
+Setup first discovers commands and then asks the user about areas, automatic suites, coverage,
+and cost through the shared question flow. The setup exchange retains its decision state across
+question continuations. The configuration tool rejects publication before a user answer.
+Missing-configuration bootstrap during planning uses the same question requirement before
+publishing checks. Explicit setup never runs configured checks or modifies active-plan questions.
+Setup rejected before exchange admission returns `not_admitted` and preserves the existing task's
+status and pending questions. An error after admission follows normal task failure handling.
+
+The check-tool lease owns authorization and lifecycle event senders. When a provider turn ends,
+the lease revokes tool access and releases those senders even if a persistent provider connection
+retains its control context. Request completion can then drain the event stream and publish pending
+questions to the UI. A retained context cannot keep the broker locked after the turn returns.
+
+`/checks` shows ordered definitions, areas, enabled state, scope, prerequisites, result, duration,
+and each check's applicability reason in its subtitle and details. Run applicable checks uses
+current task changes. Run all enabled checks explicitly requests complete suites regardless of triggers.
+Shared inline picker fields change task overrides without editing project defaults. Overrides
+persist by task identity across resume and revisions. Ad hoc conversations use a separate
+conversation identity. Saving defaults writes `.forge.json` explicitly. Details expose commands,
+requested and resolved coverage, error reasons, and saved output. History retains completed
+and interrupted runs. Read, status, cancel, and override requests remain responsive outside
+the active provider or automatic-gate broker lock.
+
+Checks use arrow keys for value editing on the definitions page and bracket keys for page
+navigation. Refresh retains the selected page unless the owner supplies an explicit initial page.
+History replaces definition actions with its own page mappings. Action rows use the available
+width independently of table columns.
+Expanded details wrap long output paths without discarding characters or crossing picker borders.
+Missing configuration stays unconfigured. Invalid configuration and failed catalog requests retain
+a visible repair row and disable execution until the catalog loads successfully.
+
+Plans retain test inventory and manual `verification` actions, while configured checks are a
+read-only projection. Submission captures the saved configuration. Acceptance rejects stale
+configuration, refreshes the projection, and requires reopening the review. Implement and
+Resolve write source without executing validation. Their completion persists Checking before
+process admission. Manual Verify begins only after the declaration scan and enabled checks pass.
+
+One Rust-owned runner serves the automatic gate and `harness_checks_run`. Its provider-neutral
+tools list configuration, save authorized setup captures, start runs, read status, and cancel
+owned runs. Model-triggered commands follow the existing permission coordinator. The narrow
+setup action writes only checks settings and managed helpers while retaining the active plan.
+Disabled checks cannot be selected by the model. Source-writing phases and active children
+exclude on-demand runs. Automatic checking does not admit a model exchange or report tokens.
+
+Checks execute serially in explicit dependency order through `/config Shell`. Independent
+checks continue after failures. Dependents of failed prerequisites are skipped with a reason.
+An enabled check with a disabled prerequisite is a configuration error. Categories do not
+imply dependencies. Formatting and lint errors therefore do not suppress independent tests.
+Run snapshots retain configuration, helper hashes, overrides, selections, matched paths, selection
+reasons, shell, source identity,
+and environment digest. Environment values do not appear in the transcript. Each command owns
+exit status, timestamps, stdout, stderr, combined output, and requested/resolved selections.
+
+Each run owns stable structured events for start, individual check start and completion,
+skips, configuration errors, interruption, resumption, and completion. Setup records a
+configuration-saved event. The timeline keeps one expandable group per run with a visible
+result-count and duration summary. Child rows retain lifecycle events and lazy output nodes.
+Timer and output refreshes update the existing group without appending events. Reopening a
+session reconstructs the same identities, ordering, and completed output. Running previews
+retain at most four lines, and expanded nodes page output from saved files.
+
+Recorded declaration or command failures enter Resolve. Configuration errors block completion
+and notify the user to fix the definitions. Disabled checks and empty task selections remain
+Not run, never Passed. Source changes during the gate invalidate its result. Interruption
+terminates owned processes and preserves outputs. Recovery marks detached work interrupted.
+Resume reuses completed results only when configuration, scope, environment, and workspace
+identities still match. Passing gates enter manual Verify when actions exist, otherwise
+complete the plan. Manual defects return to Resolve and manual blockers preserve Verify.

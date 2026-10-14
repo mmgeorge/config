@@ -185,7 +185,7 @@ impl HarnessBroker {
             return;
         }
         if execution.phase == crate::plan::PlanPhase::Checking && execution.state == crate::plan::PlanExecutionState::Active {
-            if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::plan::checks::CheckState::Running) {
+            if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::checks::CheckState::Running) {
                 *status = run.status();
             }
         }

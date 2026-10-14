@@ -19,7 +19,7 @@ use crate::broker::{
     prepare_provider_fork,
 };
 use crate::protocol::HarnessMethod;
-use crate::session::{ProviderForkState, SessionLeaseConflict};
+use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 
 /// Owns lazy Harness initialization and independently serialized session controllers.
@@ -470,6 +470,12 @@ impl HarnessService {
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.cancellation.request(false);
+                    if let Some(id) = controller.checks.active()? {
+                        controller.checks.cancel(&id)?;
+                        while controller.checks.active()?.is_some() {
+                            controller.checks.status(&id,250).await?;
+                        }
+                    }
                     let approval_owner = crate::backend::ExecutionOwner::root(&controller.catalog_request.read().await.harness_session_id);
                 controller.permission.cancel_owner(&approval_owner, None).await?;
                     child_quiescence.push(quiesce_children(&controller).await?);
@@ -575,6 +581,7 @@ struct SessionController {
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
+    checks: Arc<crate::checks::CheckRunner>,
     agent_backend_factory: crate::agent::AgentBackendFactory,
     parent_input: crate::backend::SteeringLane,
     compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -613,6 +620,7 @@ impl SessionController {
             timeout_task: Mutex::new(None),
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
+            checks: broker.checks(),
             agent_backend_factory: broker.agent_backend_factory.clone(),
             parent_input: broker.parent_input.clone(),
             compaction_task: Mutex::new(None),
@@ -929,6 +937,20 @@ async fn analyze_plan_source(
     Ok(())
 }
 
+/// Forwards check lifecycle patches while retaining source-work exclusion until runner collection.
+fn checks_event_sink(output: MessageSender, session_id: String, admission: Option<OwnedSemaphorePermit>) -> crate::backend::BackendEventSink {
+    let (sink, mut stream) = crate::backend::events::channel();
+    tokio::spawn(async move {
+        let _admission = admission;
+        while let Ok(Some(event)) = stream.recv().await {
+            let (event_name,payload) = if event.kind == "document_changed" {("document_changed".into(),event.data)}
+                else {("backend_event".into(),serde_json::to_value(event).unwrap_or(Value::Null))};
+            if output.send_event(SessionEvent {session_id:session_id.clone(),event:event_name,payload}).await.is_err() {break;}
+        }
+    });
+    sink
+}
+
 async fn route_request(
     registry: Arc<SessionControllerRegistry>,
     session_id: String,
@@ -1110,7 +1132,7 @@ async fn route_request(
             params:json!({"operation_id":operation_id,"action":"configure","config":{"settings_revision":mutation.revision,"setting_fields":mutation.field}}) };
         return route_task_transition(registry,controller,session_id,request,message_sink).await;
     }
-    let _setup_admission = if matches!(method, HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate) {
+    let _setup_admission = if matches!(method, HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate | HarnessMethod::ChecksSetup) {
         let control = Arc::clone(&controller.control_admission).try_acquire_owned()
             .context("Provider setup cannot run while cleanup is pending")?;
         let execution = Arc::clone(&controller.execution_admission).try_acquire_owned()
@@ -1143,6 +1165,39 @@ async fn route_request(
             profiles.save(revision, serde_json::from_value(request.params["document"].clone())?)?
         } else { profiles.snapshot()? };
         message_sink.send_response(Response::success(request.id, snapshot)?).await?;
+        return Ok(());
+    }
+    if matches!(method, HarnessMethod::ChecksList | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksSaveDefaults) {
+        if matches!(method, HarnessMethod::ChecksList | HarnessMethod::ChecksRun | HarnessMethod::ChecksOverride) {
+            controller.checks.refresh_changes().await?;
+        }
+        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let session = store.load_session(&session_id)?.context("checks session is missing")?;
+        let task = store.list_task(&session_id)?.into_iter().find(|task| Some(&task.id) == session.current_task_id.as_ref() && !task.status.terminal());
+        let task_id = task.as_ref().map(|task|task.id.as_str());
+        let result = match method {
+            HarnessMethod::ChecksList => controller.checks.catalog(task_id)?,
+            HarnessMethod::ChecksStatus => serde_json::to_value(controller.checks.status(request.params["run_id"].as_str().context("run_id required")?,request.params["wait_ms"].as_u64().unwrap_or(0)).await?)?,
+            HarnessMethod::ChecksCancel => {
+                let id = request.params["run_id"].as_str().context("run_id required")?;
+                controller.checks.cancel(id)?; json!({"run_id":id,"cancellation_requested":true})
+            },
+            HarnessMethod::ChecksOverride => controller.checks.set_overrides(task_id,serde_json::from_value(request.params.clone())?)?,
+            HarnessMethod::ChecksRun => {
+                ensure!(task.as_ref().is_none_or(|task|task.kind != crate::task::TaskKind::Plan)
+                    && controller.agent_coordinator.active_count() == 0, "checks cannot race planning or writing agents");
+                let admission = Arc::clone(&controller.execution_admission).try_acquire_owned().context("finish active source work before checks")?;
+                let run = controller.checks.prepare_request(serde_json::from_value(request.params.clone())?,task_id.map(str::to_owned),session.shell,"User requested".into())?;
+                let sink = checks_event_sink(message_sink.clone(),session_id.clone(),Some(admission));
+                json!({"run_id":controller.checks.start(run,Some(sink),None).await?})
+            },
+            HarnessMethod::ChecksSaveDefaults => {
+                let sink = checks_event_sink(message_sink.clone(),session_id.clone(),None);
+                controller.checks.save_defaults(task_id,Some(&sink)).await?
+            },
+            _ => unreachable!(),
+        };
+        message_sink.send_response(Response::success(request.id,result)?).await?;
         return Ok(());
     }
     if method == HarnessMethod::AgentModels {
@@ -1910,15 +1965,6 @@ async fn route_control_request(
                 .permission
                 .resolve(approval_id, &answer_list, None)
                 .await?;
-            if let (Some(owner), Some(task_id)) = (&approval.execution_owner, &approval.exchange_id)
-                && !owner.is_root() {
-                controller.agent_coordinator.sender().send(crate::agent::AgentCommand::Event {
-                    owner:owner.clone(),task_id:task_id.clone(),event:crate::backend::BackendEvent {
-                        received_at_ms:None,address:None,turn_boundary:None,kind:"approval_resolved".into(),
-                        text:None,data:serde_json::to_value(&approval)?,activity:None,summary:None,task_update:None,
-                    },
-                }).await?;
-            }
             Some(Response::success(
                 request.id,
                 json!({ "resolved": true, "approval": approval }),
@@ -2012,6 +2058,7 @@ mod tests {
     #[tokio::test]
     async fn manual_plan_edits_retain_projection_and_decision_history() -> Result<()> {
         let fixture = tempfile::tempdir()?;
+        crate::checks::configure_fixture(fixture.path());
         let service = service();
         let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
         let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
@@ -2492,6 +2539,12 @@ mod tests {
         assert!(route_control_request(&controller,&Request {id:2,method:"approval.resolve".into(),
             params:json!({"approval_id":approval_id,"answer_list":answers})},HarnessMethod::ApprovalResolve,&sink,&service.syntax,None).await?);
         assert_eq!(pending.await??,crate::backend::approval::ApprovalResolution::AllowOnce);
+        let resolved = tokio::time::timeout(Duration::from_secs(2), events.recv()).await??.unwrap();
+        assert_eq!(resolved.kind, "approval_resolved");
+        controller.agent_coordinator.sender().send(crate::agent::AgentCommand::Event {
+            owner: crate::backend::ExecutionOwner { session_id: session_id.clone(), agent_id: agent_id.clone() },
+            task_id: task_id.clone(), event: resolved,
+        }).await?;
         tokio::time::timeout(Duration::from_secs(2),async {
             loop {
                 let frame = output.recv().await?.context("event stream ended")?;

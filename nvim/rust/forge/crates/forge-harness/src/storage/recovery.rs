@@ -116,11 +116,11 @@ impl SqliteStore {
             let mut execution:crate::plan::PlanExecutionRecord=serde_json::from_str(&payload)?;
             let mut changed=false;
             for run in &mut execution.check_runs {
-                if run.state == crate::plan::checks::CheckState::Running {
-                    run.state=crate::plan::checks::CheckState::Interrupted;
+                if run.state == crate::checks::CheckState::Running {
+                    run.state=crate::checks::CheckState::Interrupted;
                     for command in &mut run.commands {
-                        if command.state == crate::plan::checks::CheckState::Running {
-                            command.state=crate::plan::checks::CheckState::Interrupted;
+                        if command.state == crate::checks::CheckState::Running {
+                            command.state=crate::checks::CheckState::Interrupted;
                             command.output_bytes=std::fs::metadata(&command.output).map_or(0,|metadata|metadata.len());
                         }
                     }

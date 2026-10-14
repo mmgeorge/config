@@ -488,7 +488,6 @@ A plan's metadata can use this shape:
       }
     }
   ],
-  "checks": ["cargo test --release texture_replacement"],
   "verification": ["Cancel a pending replacement and confirm the current texture remains visible.", "Replace a texture with frames in flight and confirm rendering remains valid."],
   "tests": [
     {
@@ -526,7 +525,7 @@ and declaration edits can share one atomic patch:
 
 ### Checks and verification
 
-Record automated checks in `checks`, an array of exact single-line executable commands in execution order. Use commands compatible with the inspected project and installed toolchain. Each command runs from the project workspace using the configured System or Nushell interpreter. Include a directory change inside a command only when needed. Leave the array empty when no automated checks apply.
+Automated checks belong to the project's saved `.forge.json`, not virtual `plan.json`. Read them through `harness_checks_list`. Missing configuration blocks submission. Before configuring it, use `harness_question_ask` to ask the user about functional areas, automatic versus explicit suites, and targeted versus full coverage. Present the proposed version-2 checks with areas, change triggers, scope, dependencies, and cost. After the answers, configure through `harness_checks_configure` and retry the same plan. Check setup may save only the checks section and managed Nushell helpers under `.forge/checks/`, even while a Plan task is open. Do not run checks or write implementation files during setup. An explicitly empty checks configuration is valid. Test inventory describes intended coverage independently of commands.
 
 Harness executes these commands locally, outside the model provider sandbox, after Implement and Resolve. Harness records exit status, duration, and saved stdout/stderr and checks declaration conformance. The model must not execute automated checks during Implement, Resolve, or manual Verify.
 

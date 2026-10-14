@@ -21,10 +21,21 @@ local function wrap(text, width, prefix, continuation)
     local separator = current == prefix and "" or " "
     if vim.fn.strdisplaywidth(current .. separator .. word) > width and current ~= prefix then
       result[#result + 1] = current
-      current = continuation .. word
-    else
-      current = current .. separator .. word
+      current, separator = continuation, ""
     end
+    local word_prefix = current .. separator
+    while vim.fn.strdisplaywidth(word_prefix .. word) > width do
+      local count = 0
+      while count < vim.fn.strchars(word)
+        and vim.fn.strdisplaywidth(word_prefix .. vim.fn.strcharpart(word, 0, count + 1)) <= width do
+        count = count + 1
+      end
+      count = math.max(1, count)
+      result[#result + 1] = word_prefix .. vim.fn.strcharpart(word, 0, count)
+      word = vim.fn.strcharpart(word, count)
+      word_prefix = continuation
+    end
+    current = word_prefix .. word
   end
   result[#result + 1] = current
   return result

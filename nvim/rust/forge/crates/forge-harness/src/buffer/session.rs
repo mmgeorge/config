@@ -374,7 +374,7 @@ impl SessionPresentation {
         self.timeline.revision()
     }
 
-    pub(crate) fn update_checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<TimelinePatch> {
+    pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
         let patch=self.timeline.update_checks(run)?;
         self.project_patch(&patch);
         Ok(patch)
@@ -1317,7 +1317,7 @@ mod tests {
         let output=directory.path().join("command.output");
         let text="saved command output\n".repeat(15000);
         std::fs::write(&output,&text)?;
-        let run:crate::plan::checks::CheckRun=serde_json::from_value(serde_json::json!({
+        let run:crate::checks::CheckRun=serde_json::from_value(serde_json::json!({
             "id":"gate","revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
             "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
@@ -1775,6 +1775,7 @@ mod tests {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            check_setup: None,
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 0,

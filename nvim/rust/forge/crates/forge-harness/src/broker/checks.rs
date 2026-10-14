@@ -1,14 +1,20 @@
 use super::*;
-use crate::plan::checks::{CheckRun, CheckState, CommandCheck};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use crate::checks::{CheckRun, CheckState};
 
 impl HarnessBroker {
     /// Executes the accepted gate without admitting a model exchange.
     pub(super) async fn run_checks(&mut self) -> Result<Vec<SessionEvent>> {
-        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
-            "child execution must settle before running verification checks. Wait for or interrupt active children first");
+        anyhow::ensure!(
+            self.agent_coordinator.active_count() == 0,
+            "child execution must settle before running verification checks. Wait for or interrupt active children first"
+        );
         let result = self.run_checks_inner().await;
         if let Err(error) = &result {
+            if let Some(sink) = &self.event_sink {
+                let _ = sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
+                    kind:"checks_configuration_error".into(),text:None,data:json!({"run_id":"automatic-gate","error":format!("Checking could not finish: {error:#}. Fix project checks through /checks setup.")}),
+                    activity:None,summary:None,task_update:None}).await;
+            }
             let mut goal = self.active_goal()?;
             if let Some(mut execution) = self
                 .store
@@ -64,7 +70,7 @@ impl HarnessBroker {
             .design
             .as_ref()
             .context("accepted declarations are missing")?;
-        let commands = design.document.checks.clone();
+
         let manual = !design.document.verification.is_empty();
         let progress = self.scan_execution_conformance(&execution, design).await?;
         let workspace_identity = self.check_workspace_identity().await?;
@@ -80,104 +86,113 @@ impl HarnessBroker {
                 })
                 .collect::<std::collections::BTreeMap<_, _>>(),
         )?);
-        let resume = execution
-            .check_runs
-            .last()
-            .filter(|run| {
-                run.state == CheckState::Interrupted
-                    && run.revision == execution.revision
-                    && run.shell == shell
-                    && run.environment_digest == environment_digest
-                    && run.workspace_digest == progress.source_digest
-                    && run.workspace_identity == workspace_identity
-                    && run.executable == executable.as_ref().ok().cloned()
-            })
-            .cloned();
-        let mut run = if let Some(run) = resume {
-            run
-        } else {
-            let id = Uuid::new_v4().to_string();
-            let directory = self
-                .plan_file
-                .check_output_directory(&self.session.id, &id)?;
-            CheckRun {
-                id: id.clone(),
-                revision: execution.revision,
-                completed_plan: None,
-                shell,
-                executable: executable.as_ref().ok().cloned(),
-                workspace: self.session.workspace.clone(),
-                environment_digest,
-                started_at_ms: self.clock.now_ms(),
-                completed_at_ms: None,
-                state: CheckState::Running,
-                workspace_identity: workspace_identity.clone(),
-                workspace_digest: progress.source_digest.clone(),
-                progress,
-                commands: commands
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, command)| CommandCheck {
-                        id: format!("{id}:{index}"),
-                        command,
-                        state: CheckState::Pending,
-                        started_at_ms: None,
-                        completed_at_ms: None,
-                        exit_code: None,
-                        error: None,
-                        stdout: directory.join(format!("{index}.stdout")),
-                        stderr: directory.join(format!("{index}.stderr")),
-                        output: directory.join(format!("{index}.output")),
-                        output_bytes: 0,
-                        preview: String::new(),
-                    })
-                    .collect(),
-            }
-        };
-        run.state = CheckState::Running;
-        run.completed_at_ms = None;
-        let mut events = Vec::new();
-        self.publish_check_run(&mut execution, &run, &mut events)
-            .await?;
-        for index in 0..run.commands.len() {
-            if run.commands[index].state == CheckState::Passed
-                || run.commands[index].state == CheckState::Failed
-            {
-                continue;
-            }
-            if self.turn_cancellation.requested.load(Ordering::Acquire) {
-                run.state = CheckState::Interrupted;
-                break;
-            }
-            run.commands[index].started_at_ms = Some(self.clock.now_ms());
-            run.commands[index].state = CheckState::Running;
-            run.commands[index].output_bytes = 0;
-            run.commands[index].preview.clear();
-            run.commands[index].error = None;
-            run.commands[index].exit_code = None;
-            run.commands[index].completed_at_ms = None;
-            self.publish_check_run(&mut execution, &run, &mut events)
-                .await?;
-            let result = match &executable {
-                Ok(executable) => {
-                    self.execute_check(&mut execution, &mut run, index, executable, &mut events)
-                        .await
-                }
-                Err(error) => Err(anyhow::anyhow!("{error:#}")),
-            };
-            if let Err(error) = result {
-                let check = &mut run.commands[index];
-                check.state = CheckState::Blocked;
-                check.error = Some(format!("{error:#}"));
-            }
-            run.commands[index].completed_at_ms = Some(self.clock.now_ms());
-            self.publish_check_run(&mut execution, &run, &mut events)
-                .await?;
-            if run.commands[index].state == CheckState::Interrupted {
-                run.state = CheckState::Interrupted;
-                break;
+        let task_id = self
+            .current_task()?
+            .filter(|task| !task.status.terminal())
+            .map(|task| task.id);
+        let overrides = self.check_runner.overrides(task_id.as_deref())?;
+        let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
+        for definition in &mut snapshot.config.definitions {
+            if let Some(scope) = overrides.scopes.get(&definition.id) {
+                definition.scope = *scope;
             }
         }
+        let files = self.check_task_files(&execution, design).await?;
+        let cases = design
+            .document
+            .tests
+            .iter()
+            .flat_map(|file| {
+                file.cases
+                    .iter()
+                    .filter(|case| {
+                        matches!(
+                            case.change,
+                            crate::plan::DesignTestChange::New
+                                | crate::plan::DesignTestChange::Modified
+                        )
+                    })
+                    .map(|case| crate::checks::CheckCase {
+                        file: file.file.clone(),
+                        name: case.name.clone(),
+                    })
+            })
+            .collect();
+        let mut run = self.check_runner.prepare(
+            snapshot,
+            crate::checks::CheckAdmission {
+                request: Default::default(),
+                overrides: overrides.enabled,
+                files,
+                cases: Some(cases),
+                has_scope: true,
+                shell,
+                trigger: "Plan execution".into(),
+                task_id,
+                revision: execution.revision,
+            },
+        )?;
+        run.progress = progress;
+        run.workspace_identity = workspace_identity.clone();
+        run.workspace_digest = run.progress.source_digest.clone();
+        let recovered = if execution.check_runs.is_empty() {
+            self.check_runner
+                .history()?
+                .into_iter()
+                .rev()
+                .find(|previous| {
+                    previous
+                        .context
+                        .as_ref()
+                        .zip(run.context.as_ref())
+                        .is_some_and(|(previous, current)| {
+                            previous.trigger == "Plan execution"
+                                && previous.task_id == current.task_id
+                        })
+                })
+        } else {
+            None
+        };
+        let previous = execution
+            .check_runs
+            .last()
+            .or(recovered.as_ref())
+            .filter(|previous| {
+                previous.state == CheckState::Interrupted
+                    && previous.revision == run.revision
+                    && previous.shell == shell
+                    && previous.environment_digest == environment_digest
+                    && previous.workspace_digest == run.workspace_digest
+                    && previous.workspace_identity == run.workspace_identity
+                    && previous.executable == executable.as_ref().ok().cloned()
+                    && previous
+                        .context
+                        .as_ref()
+                        .zip(run.context.as_ref())
+                        .is_some_and(|(previous, current)| {
+                            previous.snapshot == current.snapshot
+                                && previous.overrides == current.overrides
+                        })
+            });
+        if let Some(previous) = previous {
+            run = previous.clone();
+            run.state = CheckState::Running;
+            run.completed_at_ms = None;
+            run.record(
+                crate::checks::CheckEventKind::Resumed,
+                None,
+                "Checks resumed".into(),
+            );
+        }
+        let mut events = Vec::new();
+        let mut run = self
+            .check_runner
+            .run(
+                run,
+                self.event_sink.clone(),
+                Some(Arc::clone(&self.turn_cancellation.requested)),
+            )
+            .await?;
         let final_progress = self.scan_execution_conformance(&execution, design).await?;
         if final_progress.source_digest != run.workspace_digest
             || self.check_workspace_identity().await? != workspace_identity
@@ -193,7 +208,10 @@ impl HarnessBroker {
             execution.progress = run.progress.clone();
             execution.findings = run.progress.findings();
             for check in &run.commands {
-                if matches!(check.state, CheckState::Failed | CheckState::Blocked) {
+                if matches!(
+                    check.state,
+                    CheckState::Failed | CheckState::Blocked | CheckState::ConfigurationError
+                ) {
                     execution.findings.push(format!(
                         "{}: {:?}, exit {:?}. {}\nSaved output: {}",
                         check.command,
@@ -305,6 +323,9 @@ impl HarnessBroker {
     ) -> Result<()> {
         Self::save_run(execution, run);
         self.store.save_plan_execution(execution)?;
+        self.check_runner
+            .publish(run, self.event_sink.as_ref())
+            .await?;
         let (patch, status_patch) = {
             let mut presentation = self
                 .presentation
@@ -316,105 +337,5 @@ impl HarnessBroker {
         };
         self.emit_timeline_patch(patch, events).await?;
         self.emit_timeline_patch(status_patch, events).await
-    }
-
-    async fn execute_check(
-        &mut self,
-        execution: &mut PlanExecutionRecord,
-        run: &mut CheckRun,
-        index: usize,
-        executable: &std::path::Path,
-        events: &mut Vec<SessionEvent>,
-    ) -> Result<()> {
-        let check = &run.commands[index];
-        let mut command = run.shell.command(executable, &check.command)?;
-        command
-            .current_dir(&run.workspace)
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped());
-        let mut child = crate::process::spawn_owned(command).context("start accepted check")?;
-        let mut stdout = child
-            .stdout()
-            .take()
-            .context("check stdout pipe is missing")?;
-        let mut stderr = child
-            .stderr()
-            .take()
-            .context("check stderr pipe is missing")?;
-        let mut output = tokio::fs::File::create(&check.output).await?;
-        let mut stdout_file = tokio::fs::File::create(&check.stdout).await?;
-        let mut stderr_file = tokio::fs::File::create(&check.stderr).await?;
-        let mut stdout_buffer = [0u8; 8192];
-        let mut stderr_buffer = [0u8; 8192];
-        let mut stdout_done = false;
-        let mut stderr_done = false;
-        let mut status = None;
-        let mut cancelled = false;
-        let mut published_bytes = 0;
-        let mut published_second = 0;
-        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(100));
-        while !stdout_done || !stderr_done || status.is_none() {
-            tokio::select! {
-                result = stdout.read(&mut stdout_buffer), if !stdout_done => {
-                    let bytes = result?; stdout_done = bytes == 0;
-                    if bytes > 0 { stdout_file.write_all(&stdout_buffer[..bytes]).await?; output.write_all(&stdout_buffer[..bytes]).await?;
-                        run.commands[index].output_bytes += bytes as u64;
-                        append_preview(&mut run.commands[index].preview,&stdout_buffer[..bytes]); }
-                }
-                result = stderr.read(&mut stderr_buffer), if !stderr_done => {
-                    let bytes = result?; stderr_done = bytes == 0;
-                    if bytes > 0 { stderr_file.write_all(&stderr_buffer[..bytes]).await?; output.write_all(&stderr_buffer[..bytes]).await?;
-                        run.commands[index].output_bytes += bytes as u64;
-                        append_preview(&mut run.commands[index].preview,&stderr_buffer[..bytes]); }
-                }
-                result = child.wait(), if status.is_none() => { status = Some(result?); }
-                _ = ticker.tick() => {
-                    if !cancelled && self.turn_cancellation.requested.load(Ordering::Acquire) {
-                        child.start_kill()?; cancelled = true;
-                    }
-                    let second=self.clock.now_ms()/1000;
-                    if published_bytes!=run.commands[index].output_bytes || published_second!=second || cancelled {
-                        output.flush().await?;
-                        self.publish_check_run(execution, run, events).await?;
-                        published_bytes=run.commands[index].output_bytes;
-                        published_second=second;
-                    }
-                }
-            }
-        }
-        output.flush().await?;
-        output.sync_all().await?;
-        stdout_file.sync_all().await?;
-        stderr_file.sync_all().await?;
-        let check = &mut run.commands[index];
-        let status = status.context("check exit status is missing")?;
-        check.exit_code = status.code();
-        check.state = if cancelled {
-            CheckState::Interrupted
-        } else if status.success() {
-            CheckState::Passed
-        } else {
-            CheckState::Failed
-        };
-        Ok(())
-    }
-}
-
-fn append_preview(preview: &mut String, bytes: &[u8]) {
-    preview.push_str(&String::from_utf8_lossy(bytes));
-    let start = preview
-        .match_indices('\n')
-        .rev()
-        .nth(4)
-        .map_or(0, |(index, _)| index + 1);
-    if start > 0 {
-        preview.drain(..start);
-    }
-    if preview.len() > 8192 {
-        let mut start = preview.len() - 8192;
-        while !preview.is_char_boundary(start) {
-            start += 1;
-        }
-        preview.drain(..start);
     }
 }

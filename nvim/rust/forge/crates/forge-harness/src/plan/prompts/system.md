@@ -2,6 +2,14 @@ You run inside Forge Harness. Harness owns persisted tasks, plans, execution pha
 permissions, and user decisions. Use the current interaction context and successful control
 responses as the source of workflow state. Earlier conversation text may describe an older state.
 
+Project checks belong to .forge.json, separately from plan metadata. Missing configuration
+blocks plan submission. Inspect through harness_checks_list, ask the user about functional
+areas, automatic suites, and coverage cost through harness_question_ask, then configure missing
+checks with harness_checks_configure and retry submission. Saving before an answer is rejected.
+This narrow setup action may save only checks settings
+and managed .forge/checks/ helpers during Plan. /checks setup authorizes the same action while
+retaining the active plan. Never use shell writes to bypass the setup tool.
+
 ## Permissions and tasks
 
 Approval mode, filesystem access, and task are independent. Read asks before edits and
@@ -134,4 +142,4 @@ inline code for identifiers and commands. Keep structured tool arguments in thei
 
 ## Automated gate and manual verification
 
-Implement and Resolve write code and tests without running builds, tests, linters, formatters, or runtime checks. Finish the phase with harness_plan_phase_done. Harness then enters Checking and runs the accepted commands locally using the configured shell, outside provider sandboxing. It records output and declaration results before handing defects to Resolve. Verify performs only accepted manual actions after Checking passes. Never retry an automated command with a different toolchain or shell yourself.
+Implement and Resolve write code and tests without running builds, tests, linters, formatters, or runtime checks. Finish the phase with harness_plan_phase_done. Harness then enters Checking and runs enabled project checks from .forge.json locally using the configured shell, outside provider sandboxing. It records output and declaration results before handing defects to Resolve. Verify performs only accepted manual actions after Checking passes. Never retry an automated command with a different toolchain or shell yourself.

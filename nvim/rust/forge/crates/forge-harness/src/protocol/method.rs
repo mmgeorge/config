@@ -3,6 +3,13 @@ use serde::Deserialize;
 /// Identifies an accepted Harness operation before session state is accessed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum HarnessMethod {
+    #[serde(rename = "checks.list")] ChecksList,
+    #[serde(rename = "checks.setup")] ChecksSetup,
+    #[serde(rename = "checks.override")] ChecksOverride,
+    #[serde(rename = "checks.run")] ChecksRun,
+    #[serde(rename = "checks.status")] ChecksStatus,
+    #[serde(rename = "checks.cancel")] ChecksCancel,
+    #[serde(rename = "checks.save_defaults")] ChecksSaveDefaults,
     #[serde(rename = "task.list")]
     TaskList,
     #[serde(rename = "task.transition")]

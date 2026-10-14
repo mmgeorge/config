@@ -13,6 +13,8 @@ local session = require("forge.session")
 
 
 local command_list = {
+  { label = "/checks", detail = "Manage project checks, scopes, and run history" },
+  { label = "/checks setup", detail = "Configure project checks with the agent" },
   { label = "/config", detail = "Configure Harness settings" },
   { label = "/capabilities", detail = "Inspect supported and unsupported backend capabilities" },
   { label = "/log", detail = "Open the current session debug log" },

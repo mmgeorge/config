@@ -354,6 +354,7 @@ mod test {
     #[tokio::test]
     async fn rejects_before_preparing_dependency_sources() {
         let temporary = tempfile::tempdir().unwrap();
+        crate::checks::configure_fixture(temporary.path());
         let error = design(
             "lib.rs",
             "/// Returns settings.\npub fn standard() -> unavailable::Settings;\n",
@@ -370,6 +371,7 @@ mod test {
         let temporary = tempfile::tempdir().unwrap();
         let store =
             crate::plan::PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("lint", "Introduce settings");
         let proposed = concat!(
             "/// Get settings that define the finite arena, initial player position, and playable round duration for the starter game.\n",

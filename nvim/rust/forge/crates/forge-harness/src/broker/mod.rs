@@ -1,5 +1,6 @@
 mod execution;
 mod checks;
+mod project_checks;
 mod fork;
 mod new_session;
 mod replanning;
@@ -420,6 +421,17 @@ impl std::fmt::Display for TurnCancelled {
 impl std::error::Error for TurnCancelled {}
 
 #[derive(Debug)]
+struct RequestNotAdmitted(&'static str);
+
+impl std::fmt::Display for RequestNotAdmitted {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.0)
+    }
+}
+
+impl std::error::Error for RequestNotAdmitted {}
+
+#[derive(Debug)]
 struct TurnRetracted {
     prompt: String,
 }
@@ -518,6 +530,8 @@ pub struct HarnessBroker {
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
     plan_file: PlanFileStore,
+    check_runner: Arc<crate::checks::CheckRunner>,
+    check_setup: bool,
     /// Shares admitted review documents between view requests and serialized question turns.
     pub(crate) plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     pub(crate) revision_review: Arc<crate::plan::revision_review::RevisionReview>,
@@ -742,6 +756,9 @@ impl HarnessBroker {
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
+        let check_runner = crate::checks::CheckRunner::open(PathBuf::from(&session.workspace),
+            data_root.join(&session.id).join("checks"), Arc::clone(&presentation),
+            store.objects.clone(), Arc::clone(&runtime.repositories))?;
         let broker = Self {
             active_operation_id: None,
             runtime_epoch: Uuid::new_v4().to_string(),
@@ -751,6 +768,8 @@ impl HarnessBroker {
             diff: Arc::clone(&runtime.diff),
             store,
             plan_file: PlanFileStore::new(&data_root, &session.workspace),
+            check_runner,
+            check_setup: false,
             workspace_kind,
             data_root,
             client_id: request.client_id,
@@ -801,6 +820,8 @@ impl HarnessBroker {
         Arc::clone(&self.backend)
     }
 
+    pub(crate) fn checks(&self) -> Arc<crate::checks::CheckRunner> { Arc::clone(&self.check_runner) }
+
     /// Share root-owned admission without requiring the active provider's broker lock.
     pub(crate) fn agent_coordinator(&self) -> Arc<crate::agent::AgentCoordinator> {
         self.agent_coordinator.clone()
@@ -835,6 +856,7 @@ impl HarnessBroker {
         Some(crate::control_tools::ControlTurnContext {
             checkpoint: self.exchange_runtime.as_ref().and_then(|runtime| runtime.tool_gate.clone()),
             agent: None,
+            checks: None,
             check_shell: self.session.shell,
             mode,
             planning_feedback: mode == PromptMode::Plan
@@ -965,7 +987,7 @@ impl HarnessBroker {
         for run in &agent_run_list {
             agent_exchange_list.extend(self.store.list_agent_exchange(&run.id)?);
         }
-        let mut timeline = TimelineProjector::build(TimelineProjection {
+        let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: interaction.clone(),
             plan_list: &plan_list,
             lifecycle_list,
@@ -978,6 +1000,10 @@ impl HarnessBroker {
             session_event_list,
             plan_file: &self.plan_file,
         })?;
+        let mut timeline = TimelineProjector::with_checks(timeline,self.check_runner.history()?);
+        if let Some(run) = self.check_runner.active()?.and_then(|id|self.check_runner.history().ok()?.into_iter().find(|run|run.id == id)) {
+            status = run.status();
+        }
         if status.visible() {
             timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
                 id: format!("{}:status", self.session.id),
@@ -1109,7 +1135,8 @@ impl HarnessBroker {
         let mut outcome = self.dispatch_inner(method, request.params).await;
         if let Some(stage) = mutation_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
         let settle_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.settle_task"));
-        if !matches!(method, HarnessMethod::StateGet | HarnessMethod::TaskList | HarnessMethod::PlanList) {
+        if !matches!(method, HarnessMethod::StateGet | HarnessMethod::TaskList | HarnessMethod::PlanList)
+            && !outcome.as_ref().is_err_and(|error| error.is::<RequestNotAdmitted>()) {
             if let Err(error) = self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}"))) {
                 outcome = Err(error.context("persist task outcome"));
             }
@@ -1195,7 +1222,9 @@ impl HarnessBroker {
                         event,
                     };
                 }
-                let code = if error.downcast_ref::<TurnCancelled>().is_some() {
+                let code = if error.is::<RequestNotAdmitted>() {
+                    "not_admitted"
+                } else if error.downcast_ref::<TurnCancelled>().is_some() {
                     "turn_cancelled"
                 } else {
                     "request_failed"
@@ -1243,6 +1272,8 @@ impl HarnessBroker {
             self.refresh_lease()?;
         }
         match method {
+            HarnessMethod::ChecksSetup => self.setup_checks(params).await,
+            HarnessMethod::ChecksList | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksSaveDefaults => self.project_checks(method, params).await,
             HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
             HarnessMethod::TaskTransition => self.transition_task(params).await,
             HarnessMethod::TaskOperation | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
@@ -2542,6 +2573,7 @@ impl HarnessBroker {
 
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         self.require_restore_recovered()?;
+        anyhow::ensure!(self.check_runner.active()?.is_none(), "wait for or cancel the active check run before starting source work");
         let text = required_text(&params, "text")?;
         if text.trim() == "/plan" {
             return self.list_replanning_choices();
@@ -3322,6 +3354,10 @@ impl HarnessBroker {
             .take()
             .context("active interaction has no elicitation state")?;
         let feedback = elicitation.feedback();
+        if interaction.check_setup.is_some() && elicitation.answer.iter().any(|answer|
+            !matches!(answer.response, PlanQuestionResponse::Skipped)) {
+            interaction.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
+        }
         interaction.awaiting_input = false;
         for node in &mut interaction.node_list {
             if let ExchangeNode::QuestionPresented { question, answer, .. } = node {
@@ -3627,7 +3663,18 @@ Planning continuation: turn {} of {}.",
             .interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)
             .await?;
         interaction.mode = Some(self.session.execution_mode);
+        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
+            && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_err()
+        {
+            let reviewed = self.session.active_plan_id.as_deref()
+                .map(|id| self.store.load_plan(id)).transpose()?.flatten()
+                .is_some_and(|plan| plan.question_ledger.resolution.iter().any(|answer|
+                    answer.kind == crate::plan::PlanQuestionResolutionKind::Answered));
+            interaction.check_setup = Some(if reviewed { crate::checks::CheckSetupState::Reviewed }
+                else { crate::checks::CheckSetupState::Discovery });
+        }
         if new_interaction && let Some(admission) = admission.as_ref() {
+            if self.check_setup { interaction.check_setup = Some(crate::checks::CheckSetupState::Discovery); }
             interaction.lifecycle.clone_from(&admission.lifecycle);
             interaction.kind = admission.kind;
             interaction.plan_id.clone_from(&admission.plan_id);
@@ -4448,6 +4495,8 @@ Planning continuation: turn {} of {}.",
     ) -> Result<()> {
         runtime.checkpoint.take();
         let saved = result.and_then(|checkpoint| {
+            let owner = interaction.execution_id.as_ref().or(interaction.goal_id.as_ref()).unwrap_or(&interaction.id).clone();
+            self.check_runner.begin_changes(owner, &checkpoint)?;
             interaction.checkpoint_before = Some(checkpoint.id.clone());
             self.store.save_checkpoint_exchange(&checkpoint, interaction)?;
             if let Some(execution_id) = interaction.execution_id.as_deref()
@@ -4815,6 +4864,24 @@ Planning continuation: turn {} of {}.",
             .find(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && execution.state == PlanExecutionState::Active);
         if request.mode == PromptMode::ExecutePlan && let (Some(context), Some(execution)) = (&mut request.control_context, execution.as_ref()) {
             context.execution = Some(crate::plan::execution::ExecutionControlSender { phase: execution.phase, execution_id: execution.id.clone(), generation: execution.generation, sender: execution_sender.clone() });
+        }
+        let (check_scope, _check_lease) = crate::checks::CheckToolScope::open(Arc::clone(&self.check_runner), crate::checks::CheckAuthority {
+            task_id:self.current_task()?.filter(|task| !task.status.terminal()).map(|task|task.id),
+            shell:self.session.shell,mode:request.mode,permission:self.session.execution_mode,
+            permissions:Arc::clone(&self.permission_coordinator),
+            address:crate::backend::ProviderAddress {owner:Some(request.owner()?),thread_id:self.session.id.clone(),turn_id:interaction.id.clone()},
+            authorization_sink:backend_event_sink.clone(),
+            setup:interaction.check_setup.is_some(),
+            setup_reviewed:interaction.check_setup == Some(crate::checks::CheckSetupState::Reviewed),
+            can_run:interaction.check_setup.is_none() && self.agent_coordinator.active_count() == 0 && execution.is_none(),
+            agent:Arc::clone(&self.agent_coordinator),
+            cancelled:Arc::clone(&self.turn_cancellation.requested),sink:self.event_sink.clone() });
+        if let Some(context) = &mut request.control_context {
+            context.checks = Some(check_scope);
+            if interaction.check_setup.is_some() && request.mode == PromptMode::Chat {
+                context.resolved_question_digest_set.clear();
+                context.has_active_elicitation = interaction.elicitation.is_some();
+            }
         }
         let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -6004,6 +6071,7 @@ Planning continuation: turn {} of {}.",
                 checkpoint_diff_text: None,
                 attributed_matches_checkpoint: false,
                 approval_resolution: Vec::new(),
+                check_setup: None,
                 disposition: crate::exchange::HistoryDisposition::Current,
                 turn: Vec::new(),
                 created_at_ms: now_ms,
@@ -6047,6 +6115,7 @@ Planning continuation: turn {} of {}.",
                 "plan changed after the accept action began"
             );
         }
+        anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
         let reviewed = self.capture_plan_review(&plan.id, &review_digest)?;
         if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.plan_id == plan.id) {
             anyhow::ensure!(execution.pending_revision_reason.is_some(), "execution already exists. Use /goal resume to continue it");
@@ -6301,6 +6370,7 @@ Planning continuation: turn {} of {}.",
                 "plan changed after the accept action began"
             );
         }
+        anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
         let reviewed = self.capture_plan_review(&plan.id, &digest)?;
         let accepted_document = &reviewed.document;
         let accepted_render = &reviewed.rendered;
@@ -7519,6 +7589,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             session_event_list: self.store.list_session_event(&session_id)?,
             plan_file: &self.plan_file,
         })?;
+        let timeline = TimelineProjector::with_checks(timeline,crate::checks::CheckRunner::saved_history(&self.data_root.join(&session_id).join("checks"))?);
         let preview = SessionPreview {
             lines: preview_lines(&timeline)?,
             session: preview_session,
@@ -8721,7 +8792,12 @@ mod test {
         design.document.objective="Check accepted commands".into();
         design.document.background="A repository fixture".into();
         design.document.design="Harness owns the command gate".into();
-        design.document.checks=commands;
+        let config = crate::checks::CheckConfig {version:2,definitions:commands.into_iter().enumerate().map(|(index,command)| crate::checks::CheckDefinition {
+            id:format!("check-{index}"),name:format!("Check {index}"),category:crate::checks::CheckCategory::Check,enabled:true,
+            area:"Fixture".into(),trigger:crate::checks::CheckTrigger::AnyChange,scope:Default::default(),directory:".".into(),
+            all:crate::checks::CheckOperation {command},files:None,cases:None,depends_on:Vec::new()
+        }).collect()};
+        std::fs::write(repository.join(".forge.json"),serde_json::to_vec(&json!({"checks":config})).unwrap()).unwrap();
         design.document.verification=if manual { vec!["Observe manual result".into()] } else { Vec::new() };
         design.proposed.insert(".gitignore".into(),"/target/\n".into());
         document.design=Some(design);
@@ -8756,7 +8832,7 @@ mod test {
         assert_eq!(execution.phase,crate::plan::PlanPhase::Resolve);
         let run=&execution.check_runs[0];
         assert_eq!(run.commands[1].exit_code,Some(7));
-        assert_eq!(run.commands[2].state,crate::plan::checks::CheckState::Passed);
+        assert_eq!(run.commands[2].state,crate::checks::CheckState::Passed);
         assert!(std::fs::read_to_string(&run.commands[0].stdout).unwrap().contains("accepted stdout"));
         assert!(std::fs::read_to_string(&run.commands[0].stderr).unwrap().contains("accepted stderr"));
         assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
@@ -8790,7 +8866,7 @@ mod test {
         broker.run_checks().await.unwrap();
         let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
         assert_eq!(execution.phase,crate::plan::PlanPhase::Verify);
-        assert_eq!(execution.check_runs[0].state,crate::plan::checks::CheckState::Passed);
+        assert_eq!(execution.check_runs[0].state,crate::checks::CheckState::Passed);
         assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
     }
 
@@ -8803,8 +8879,8 @@ mod test {
         let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
         execution.phase=crate::plan::PlanPhase::Checking;
         let run=&mut execution.check_runs[0];
-        run.state=crate::plan::checks::CheckState::Running;
-        run.commands[0].state=crate::plan::checks::CheckState::Running;
+        run.state=crate::checks::CheckState::Running;
+        run.commands[0].state=crate::checks::CheckState::Running;
         run.commands[0].output_bytes=0;
         let output=run.commands[0].output.clone();
         broker.store.save_plan_execution(&execution).unwrap();
@@ -8812,8 +8888,8 @@ mod test {
         let recovered=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
         assert_eq!(recovered.state,PlanExecutionState::Paused);
         assert_eq!(recovered.phase,crate::plan::PlanPhase::Checking);
-        assert_eq!(recovered.check_runs[0].state,crate::plan::checks::CheckState::Interrupted);
-        assert_eq!(recovered.check_runs[0].commands[0].state,crate::plan::checks::CheckState::Interrupted);
+        assert_eq!(recovered.check_runs[0].state,crate::checks::CheckState::Interrupted);
+        assert_eq!(recovered.check_runs[0].commands[0].state,crate::checks::CheckState::Interrupted);
         assert_eq!(recovered.check_runs[0].commands[0].output_bytes,std::fs::metadata(&output).unwrap().len());
         assert!(std::fs::read_to_string(output).unwrap().contains("retained"));
         assert_eq!(broker.active_goal().unwrap().state,GoalState::Paused);
@@ -8851,7 +8927,7 @@ mod test {
         cancel.await.unwrap();
         let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
         assert_eq!(execution.state,PlanExecutionState::Paused);
-        assert_eq!(execution.check_runs[0].commands[1].state,crate::plan::checks::CheckState::Interrupted);
+        assert_eq!(execution.check_runs[0].commands[1].state,crate::checks::CheckState::Interrupted);
         // Reuse is intentionally rejected when user changes workspace contents.
         std::fs::write(repository.path().join("target/resume.txt"),"resume").unwrap();
         if changed { std::fs::write(repository.path().join("extra.rs"),"fn helper() {}\n").unwrap(); }
@@ -8865,6 +8941,25 @@ mod test {
         assert_eq!(execution.check_runs.len(),if changed {2} else {1});
         assert_eq!(std::fs::read_to_string(repository.path().join("target/completed.txt")).unwrap().lines().count(),if changed {2} else {1});
         }
+    }
+
+    #[tokio::test]
+    async fn saved_checks_refresh_review_without_changing_design_metadata() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let result = broker.dispatch(Request { id:1,method:"prompt.submit".into(),params:json!({"text":"/plan add coverage"}) }).await;
+        assert!(result.response.error().is_none(), "{:?}",result.response.error());
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+        let before = broker.plan_file.read_working_document(&broker.session.id,&plan.id).unwrap();
+        std::fs::write(repository.path().join(".forge.json"),serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
+            "id":"unit","name":"Unit tests","area":"Core","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"exit 0"}
+        }]}})).unwrap()).unwrap();
+        assert!(broker.refresh_check_review(&plan.id).unwrap());
+        let after = broker.plan_file.read_working_document(&broker.session.id,&plan.id).unwrap();
+        assert_eq!(before.design.as_ref().unwrap().document,after.design.as_ref().unwrap().document);
+        assert_eq!(after.design.as_ref().unwrap().check_configuration.as_ref().unwrap().config.definitions[0].id,"unit");
+        assert!(!broker.refresh_check_review(&plan.id).unwrap());
     }
 
     #[tokio::test]
@@ -8981,6 +9076,7 @@ mod test {
     #[tokio::test]
     async fn declaration_design_acceptance_executes_verifies_resolves_and_completes() {
         let repository = repository();
+        crate::checks::configure_fixture(repository.path());
         std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
         let initialize = InitializeRequest {
@@ -9009,7 +9105,7 @@ mod test {
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
         for (path, expected) in [("Objective", &overview.objective), ("Design", &overview.design),
-            ("Checks", &overview.checks.join("\n")), ("Verification", &overview.verification.iter().map(|action|format!("- {action}")).collect::<Vec<_>>().join("\n"))] {
+            ("Verification", &overview.verification.iter().map(|action|format!("- {action}")).collect::<Vec<_>>().join("\n"))] {
             let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
                 "revision":2,"document":true,"path":path})).unwrap();
             assert_eq!(snapshot["text"].as_str().unwrap(), expected);
@@ -9224,6 +9320,7 @@ mod test {
     #[tokio::test]
     async fn semantic_execution_stalls_after_two_read_only_turns_and_resumes_the_same_phase() {
         let repository = repository();
+        crate::checks::configure_fixture(repository.path());
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
             backend_launch_by_provider: Default::default(),
@@ -9324,6 +9421,7 @@ mod test {
     async fn execution_revisions_preserve_the_original_and_respect_review_and_user_pause() {
         for decision in ["automatic", "accept", "recovered_accept", "recovered_interrupted", "recovered_cancelled", "recovered_failed", "paused_accept", "reject", "changes"] {
             let repository = repository();
+            crate::checks::configure_fixture(repository.path());
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
                 backend_launch_by_provider: Default::default(),
@@ -9668,6 +9766,7 @@ mod test {
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
             approval_resolution: Vec::new(),
+            check_setup: None,
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,
@@ -11608,6 +11707,7 @@ mod test {
         data_root: &Path,
         structured: bool,
     ) -> HarnessBroker {
+        crate::checks::configure_fixture(repository);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
                 backend_launch_by_provider: Default::default(),

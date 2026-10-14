@@ -565,7 +565,9 @@ local function on_event(event, payload)
     schedule_render()
   elseif event == "backend_event" then
     if require("forge.event_contract").route("backend", payload.kind) == "ignore" then return end
-    if payload.kind == "turn_started" then
+    if payload.kind == "checks_configuration_error" then
+      notifications.error((payload.data or {}).error or "Fix the project check configuration", "Harness checks")
+    elseif payload.kind == "turn_started" then
       recap.clear(state)
     elseif payload.kind == "execution_state" then
       local execution = payload.data or {}
@@ -1556,6 +1558,26 @@ function M.submit()
   if text == "/backend" then
     set_composer_text(state.composer_buf, "")
     M.select_backend()
+    return
+  end
+  if text == "/checks" then
+    set_composer_text(state.composer_buf, "")
+    require("forge.views.harness.checks").open(state, picker_host(state), function(check_id)
+      require("forge.views.picker").close()
+      set_composer_text(state.composer_buf, "/checks setup" .. (check_id and " " .. check_id or ""))
+      M.submit()
+    end)
+    return
+  end
+  if text == "/checks setup" or text:match("^/checks setup%s+") then
+    if state.busy then notifications.error("Finish or pause active work before check setup", "Harness checks") return end
+    set_composer_text(state.composer_buf, "")
+    state.busy = true
+    client.request_for(state.session.id, "checks.setup", { check_id = text:match("^/checks setup%s+(.+)$") }, function(_, failure)
+      state.busy = false
+      if failure then notifications.error(failure, "Harness checks") end
+      synchronize_state()
+    end)
     return
   end
   if text == "/skills" then
