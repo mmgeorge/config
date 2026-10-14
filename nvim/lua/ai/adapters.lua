@@ -2,10 +2,8 @@ local M = {}
 
 --- Adapter selection for AI features. `chat`, `inline`, and `cmd` are
 --- CodeCompanion adapter configs (the chat UI still runs on CodeCompanion).
---- `commit`, `pr_create`, and `inline_edit` are model tokens for the local
---- `ai` prompt library (see AGENTS.md in this directory): `commit` drives
---- commit-message generation, `pr_create` drives ForgeGithubPRCreate metadata, and
---- `inline_edit` drives require("ai.inline").
+--- `commit` selects an API model token or "harness" for the current Harness
+--- backend. `pr_create` and `inline_edit` are local `ai` model tokens.
 ---@return { chat: table|string, inline: table|string, cmd: string, commit: string, pr_create: string, inline_edit: string }
 function M.get()
   if os.getenv("GEMINI_API_KEY") then
@@ -29,7 +27,7 @@ function M.get()
     chat = "copilot",
     inline = "copilot",
     cmd = "copilot",
-    commit = "copilot,model=gpt-4.1",
+    commit = "harness",
     pr_create = "copilot-cli,model=gpt-5.6-luna,thinking=low",
     inline_edit = "copilot-mini",
   }

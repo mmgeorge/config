@@ -525,7 +525,7 @@ pub trait Backend: Send + Sync {
 
     /// Generate text independently of the main provider conversation.
     async fn generate_text(&self, _request: BackendCatalogRequest, _purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
-        Err(UnsupportedCapability("recap").into())
+        Err(UnsupportedCapability("text_generation").into())
     }
 
     /// List provider models for the Harness model picker.
@@ -732,6 +732,7 @@ impl Backend for MockBackend {
         purpose.validate(match purpose {
             TextGeneration::Recap => "The current request is recorded. Review the next proposed change.",
             TextGeneration::SessionName => "Review proposed changes",
+            TextGeneration::CommitMessage => "feat: describe repository changes",
         })
     }
     fn descriptor(&self) -> BackendDescriptor {

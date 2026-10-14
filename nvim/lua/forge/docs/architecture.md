@@ -1699,6 +1699,16 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   edits, newer regeneration requests, submission, and closure prevent late results
   from overwriting newer editor state. Provider failures preserve the message.
   Each explicit regeneration calls the provider without a message-cache check.
+  When `GEMINI_API_KEY` exists, generation uses the configured Gemini API model.
+  Otherwise, Lua initializes or reuses the most recently selected Harness backend
+  and session, and Rust calls that backend's isolated `generate_text()` with the
+  session's selected model and the commit comparison's diff. Fresh startup restores
+  the remembered backend and its latest same-workspace session through normal
+  Harness initialization. The commit request supplies its own workspace and never
+  submits a conversational turn. Copilot uses its SDK and Codex uses an ephemeral
+  app-server thread. Unsupported backends fail visibly without switching providers.
+  `TextGeneration::CommitMessage` owns the shared Conventional Commit instructions
+  and multiline output validation for both API and Harness generation.
 - **`commit.lua`** — the **fake-editor commit bridge**. Because `git commit` needs an editor,
   this spawns a headless `nvim --clean` as `GIT_EDITOR`, which connects back to the parent
   over RPC (`$NVIM`) and asks it to open the real `COMMIT_EDITMSG` in a borrowed
@@ -2133,10 +2143,15 @@ configuration root. That root binds only selected skill definitions and links it
 directory to the native OAuth and conversation store. It does not copy credentials or inherit native
 global MCP configuration. Windows directory bindings use NTFS junctions and Unix bindings use
 directory symlinks. Cleanup removes bindings before the temporary profile and preserves the source.
-`ResourceProfile` owns these bindings across adapters. Copilot receives shared MCP definitions and
-an isolated skill directory through its Rust SDK session options with native configuration discovery
-disabled. It verifies loaded skills, disables unselected runtime resources, and disconnects before
-resuming the same provider conversation when selection changes. `SessionResources` exposes source
+`ResourceProfile` owns these bindings across adapters. Copilot receives an isolated skill directory
+and an empty MCP set through its Rust SDK session options with native configuration discovery
+disabled. It starts each selected MCP server through the session-scoped `session.mcp.startServer`
+API using the canonical launch payload. This preserves required empty argument arrays that the
+SDK's session-option serializer omits, without modifying native user configuration. It verifies
+loaded skills and registered servers, disables unselected runtime resources, and disconnects before
+resuming the same provider conversation when selection changes. Missing or disabled selected servers
+fail immediately with their names, and startup timeouts identify the active verification or launch
+step rather than polling for a server the provider skipped. `SessionResources` exposes source
 identities and per-server credential failures independently from its ephemeral launch payloads.
 Resource binding rejects names that traverse or alias profile directories before creating links.
 Selected skills own execution-scoped read and script grants through the shared permission coordinator.

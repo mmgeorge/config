@@ -94,7 +94,7 @@ pub(super) async fn generate(
         .context("Missing isolated thread identity")?;
     let result = tokio::time::timeout(Duration::from_secs(60), async {
         let request_id = process.send_request("turn/start", json!({"threadId":thread,
-            "input":[{"type":"text","text":format!("Conversation:\n{history}"),"text_elements":[]}]})).await?;
+            "input":[{"type":"text","text":purpose.input(history),"text_elements":[]}]})).await?;
         let mut text = String::new();
         loop {
             let event = process.read_message(output).await?;
@@ -128,8 +128,14 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
 
     #[tokio::test]
-    async fn session_name_uses_selected_model_and_minimum_effort_in_an_ephemeral_thread()
+    async fn session_name_and_commit_use_selected_model_in_an_isolated_thread()
     -> Result<()> {
+        for purpose in [TextGeneration::SessionName, TextGeneration::CommitMessage] {
+        let (input, expected) = match purpose {
+            TextGeneration::SessionName => ("User: Fix terminal status", "Terminal status fixes"),
+            TextGeneration::CommitMessage => ("Staged diff:\n+change", "fix: preserve commit drafts\n\nKeep existing text."),
+            _ => unreachable!(),
+        };
         let fixture = tempfile::tempdir()?;
         let workspace = fixture.path().to_string_lossy().into_owned();
         let permission = crate::backend::approval::PermissionCoordinator::transient(&workspace)?;
@@ -145,7 +151,7 @@ mod tests {
                 "thread/start",
                 "turn/start",
                 "thread/unsubscribe",
-            ] {
+            ].into_iter().filter(|method| *method != "model/list" || purpose == TextGeneration::SessionName) {
                 let request: Value =
                     serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
@@ -159,10 +165,10 @@ mod tests {
                     }
                     "thread/start" => {
                         assert_eq!(request["params"]["model"], "selected-model");
-                        assert_eq!(
-                            request["params"]["config"]["model_reasoning_effort"],
-                            "minimal"
-                        );
+                        if purpose == TextGeneration::SessionName {
+                            assert_eq!(request["params"]["config"]["model_reasoning_effort"], "minimal");
+                        }
+                        assert_eq!(request["params"]["baseInstructions"], purpose.instructions());
                         assert_eq!(request["params"]["ephemeral"], true);
                         assert_eq!(
                             request["params"]["config"]["mcp_servers"]["test"]["enabled"],
@@ -170,6 +176,11 @@ mod tests {
                         );
                         assert_eq!(request["params"]["config"]["features.shell_tool"], false);
                         json!({"thread":{"id":"temporary"}})
+                    }
+                    "turn/start" => {
+                        assert_eq!(request["params"]["threadId"], "temporary");
+                        assert_eq!(request["params"]["input"][0]["text"], purpose.input(input));
+                        json!({})
                     }
                     _ => {
                         assert_eq!(request["params"]["threadId"], "temporary");
@@ -186,7 +197,7 @@ mod tests {
                     .unwrap();
                 if method == "turn/start" {
                     for notification in [
-                        json!({"method":"item/completed","params":{"threadId":"temporary","item":{"type":"agentMessage","text":"Terminal status fixes"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"temporary","item":{"type":"agentMessage","text":expected}}}),
                         json!({"method":"turn/completed","params":{"threadId":"temporary","turn":{"status":"completed"}}}),
                     ] {
                         socket
@@ -213,13 +224,14 @@ mod tests {
             &mut process,
             &mut BackendOutput::default(),
             &workspace,
-            TextGeneration::SessionName,
+            purpose,
             "selected-model",
-            "User: Fix terminal status",
+            input,
         )
         .await?;
-        assert_eq!(result, "Terminal status fixes");
+        assert_eq!(result, expected);
         tokio::time::timeout(Duration::from_secs(2), server).await??;
+        }
         Ok(())
     }
 }

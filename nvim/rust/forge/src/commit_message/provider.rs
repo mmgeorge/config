@@ -3,12 +3,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail, ensure};
+use forge_harness::backend::TextGeneration;
 use reqwest::{Client, RequestBuilder};
 use serde_json::{Value, json};
 
 use super::{GenerationPermit, ModelSpec};
-
-const SYSTEM: &str = "You are a factual Conventional Commit message generator. Return only the commit message, without code fences or explanations. Use <type>: <description>, imperative mood, lowercase first letter, no final period, maximum 50 characters. Describe concrete changes, not benefits or intentions. Default to no body. Never add a body for chore commits. If essential API, behavior, migration, or test facts require a body, write one or two concise sentences, never more than two sentences, wrapped at 72 characters.";
 
 pub async fn generate(
     client: &Client,
@@ -16,10 +15,11 @@ pub async fn generate(
     prompt: &str,
     ownership: &Arc<GenerationPermit>,
 ) -> Result<String> {
+    let system = TextGeneration::CommitMessage.instructions();
     let response = match model.provider.as_str() {
         "gemini" => {
             let key = std::env::var("GEMINI_API_KEY").context("GEMINI_API_KEY is not set")?;
-            let mut body = json!({ "contents": [{ "role": "user", "parts": [{ "text": prompt }] }], "systemInstruction": { "parts": [{ "text": SYSTEM }] } });
+            let mut body = json!({ "contents": [{ "role": "user", "parts": [{ "text": prompt }] }], "systemInstruction": { "parts": [{ "text": system }] } });
             if let Some(thinking) = &model.thinking {
                 let field = if thinking.is_number() {
                     "thinkingBudget"
@@ -62,11 +62,11 @@ pub async fn generate(
                 url.scheme() == "https" && url.username().is_empty() && url.password().is_none(),
                 "invalid Copilot completion endpoint"
             );
-            read_json(client.post(url).bearer_auth(token).header("editor-version", "Neovim/0.11").header("editor-plugin-version", "ai.nvim/1.0").header("copilot-integration-id", "vscode-chat").header("x-github-api-version", "2025-10-01").json(&json!({ "model": model.model, "messages": [{ "role": "system", "content": SYSTEM }, { "role": "user", "content": prompt }], "stream": false }))).await?
+            read_json(client.post(url).bearer_auth(token).header("editor-version", "Neovim/0.11").header("editor-plugin-version", "ai.nvim/1.0").header("copilot-integration-id", "vscode-chat").header("x-github-api-version", "2025-10-01").json(&json!({ "model": model.model, "messages": [{ "role": "system", "content": system }, { "role": "user", "content": prompt }], "stream": false }))).await?
         }
         "openai" => {
             let key = std::env::var("OPENAI_API_KEY").context("OPENAI_API_KEY is not set")?;
-            let mut body = json!({ "model": model.model, "instructions": SYSTEM, "input": prompt });
+            let mut body = json!({ "model": model.model, "instructions": system, "input": prompt });
             if let Some(thinking) = &model.thinking {
                 body["reasoning"] = json!({ "effort": thinking });
             }
@@ -152,13 +152,7 @@ fn extract(provider: &str, response: &Value) -> Result<String> {
         }
         _ => bail!("unknown provider response"),
     }
-    let mut text = text.trim();
-    if text.starts_with("```") {
-        text = text.split_once('\n').map(|(_, body)| body).unwrap_or(text);
-        text = text.strip_suffix("```").unwrap_or(text).trim();
-    }
-    ensure!(!text.is_empty(), "model returned an empty commit message");
-    Ok(text.to_owned())
+    TextGeneration::CommitMessage.validate(&text)
 }
 
 fn oauth_token() -> Result<String> {

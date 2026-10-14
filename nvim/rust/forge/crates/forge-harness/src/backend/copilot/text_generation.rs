@@ -82,7 +82,7 @@ async fn summarize(
     .context("Isolated session creation timed out")??;
     let result = tokio::time::timeout(
         Duration::from_secs(60),
-        session.send_and_wait(MessageOptions::new(format!("Conversation:\n{history}"))),
+        session.send_and_wait(MessageOptions::new(purpose.input(history))),
     )
     .await
     .context("Isolated text generation timed out")

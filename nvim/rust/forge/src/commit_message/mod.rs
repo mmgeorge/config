@@ -7,6 +7,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_git::store::RepositoryStore;
+use forge_harness::{backend::TextGeneration, service::HarnessService};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -81,7 +82,12 @@ impl CommitMessageService {
         })
     }
 
-    pub async fn dispatch(&self, params: Value) -> Result<GenerationResponse> {
+    pub async fn dispatch(
+        &self,
+        params: Value,
+        harness: &HarnessService,
+        session_id: Option<String>,
+    ) -> Result<GenerationResponse> {
         let request: GenerationRequest = serde_json::from_value(params)?;
         ensure!(
             request.operation == "generate",
@@ -121,28 +127,23 @@ impl CommitMessageService {
         if context.prompt.is_none() {
             return Ok(response);
         }
-        let model = request
-            .model
-            .as_ref()
-            .context("detached generation requires a resolved model")?;
-        ensure!(
-            !model.model.is_empty() && model.model.len() <= 256 && model.provider.len() <= 32,
-            "invalid generation model identity"
-        );
-        ensure!(
-            model.thinking.as_ref().is_none_or(|value| value
-                .as_str()
-                .is_some_and(|value| value.len() <= 32)
-                || value.as_u64().is_some_and(|value| value <= 1_000_000)),
-            "invalid generation thinking configuration"
-        );
-        let message = provider::generate(
-            &self.http,
-            model,
-            context.prompt.as_deref().unwrap_or_default(),
-            &permit,
-        )
-        .await?;
+        let prompt = context.prompt.as_deref().unwrap_or_default();
+        let message = if let Some(model) = request.model.as_ref() {
+            ensure!(
+                !model.model.is_empty() && model.model.len() <= 256 && model.provider.len() <= 32,
+                "invalid generation model identity"
+            );
+            ensure!(
+                model.thinking.as_ref().is_none_or(|value| value
+                    .as_str()
+                    .is_some_and(|value| value.len() <= 32)
+                    || value.as_u64().is_some_and(|value| value <= 1_000_000)),
+                "invalid generation thinking configuration"
+            );
+            provider::generate(&self.http, model, prompt, &permit).await?
+        } else {
+            harness.generate_text(session_id, &request.workspace, TextGeneration::CommitMessage, prompt).await?
+        };
         response.message = Some(message);
         Ok(response)
     }

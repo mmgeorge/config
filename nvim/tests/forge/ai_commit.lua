@@ -4,6 +4,7 @@ local ai_commit = require("forge.integrations.ai_commit")
 local original_ai = package.loaded.ai
 local original_adapters = package.loaded["ai.adapters"]
 local original_backend = ai_commit._backend
+local original_client = package.loaded["forge.client"]
 
 local function assert_equal(actual, expected, message)
   if actual ~= expected then error((message or "values differ") .. ": " .. vim.inspect(actual) .. " ~= " .. vim.inspect(expected), 2) end
@@ -108,6 +109,36 @@ local function run()
   assert_equal(ai_commit.state(cwd, "HEAD"), nil)
   assert_equal(ai_commit.state().message, "other draft", "clearing one workspace removed another draft")
   assert_equal(#requests, 0)
+
+  ai_commit.reset_backend()
+  package.loaded["forge.client"] = {
+    request_host = function(method, params, callback)
+      assert_equal(method, "repository.generate")
+      assert_equal(params.model.provider, "fixture")
+      assert_equal(params.model.model, "fixture-model")
+      callback({ state = "ready", message = "fix: use configured API" })
+    end,
+    request = function() error("API generation initialized Harness") end,
+  }
+  ai_commit.ensure("D:/configured-api", { ref = "HEAD" })
+  assert_equal(ai_commit.state("D:/configured-api", "HEAD").message, "fix: use configured API")
+  package.loaded["ai.adapters"] = { get = function() return { commit = "harness" } end }
+  package.loaded.ai = { resolve = function() error("Harness fallback resolved an API model") end }
+  package.loaded["forge.client"] = {
+    request_host = function() error("Harness fallback bypassed session initialization") end,
+    request = function(method, params, callback)
+      assert_equal(method, "repository.generate")
+      assert_equal(params.model, nil, "fallback hardcoded a provider or model")
+      callback({ state = "ready", message = "fix: use recent Harness\n\nPreserve the body." })
+    end,
+  }
+  ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
+  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
+  package.loaded["forge.client"].request = function(_, _, callback)
+    callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
+  end
+  ai_commit.ensure("D:/unsupported-harness", { ref = "HEAD" })
+  assert(ai_commit.state("D:/unsupported-harness", "HEAD").error:find("text_generation", 1, true))
 end
 
 local ok, failure = xpcall(run, debug.traceback)
@@ -115,6 +146,7 @@ ai_commit.reset_backend()
 ai_commit.set_backend(original_backend)
 package.loaded.ai = original_ai
 package.loaded["ai.adapters"] = original_adapters
+package.loaded["forge.client"] = original_client
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("ai_commit OK")
 vim.cmd("qa!")

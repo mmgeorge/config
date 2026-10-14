@@ -29,9 +29,13 @@ local function text_to_lines(text)
 end
 
 local function native_request(cwd, ref, ignored, callback, is_current)
-  local resolved, failure = require("ai").resolve(require("ai.adapters").get().commit)
-  if not resolved then callback(nil, failure) return end
-  local model = { provider = resolved.provider.name, model = resolved.model, thinking = resolved.thinking }
+  local selected = require("ai.adapters").get().commit
+  local model
+  if selected ~= "harness" then
+    local resolved, failure = require("ai").resolve(selected)
+    if not resolved then callback(nil, failure) return end
+    model = { provider = resolved.provider.name, model = resolved.model, thinking = resolved.thinking }
+  end
   local params = { operation = "generate", workspace = cwd,
     comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
     ignored_paths = ignored or {}, model = model }
@@ -49,6 +53,7 @@ local function native_request(cwd, ref, ignored, callback, is_current)
     callback(result, failure)
   end
   if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
+  elseif selected == "harness" then require("forge.client").request("repository.generate", params, receive)
   else require("forge.client").request_host("repository.generate", params, receive) end
 end
 

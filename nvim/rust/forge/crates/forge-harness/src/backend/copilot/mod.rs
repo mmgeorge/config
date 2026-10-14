@@ -24,7 +24,7 @@ use event_decoder::CopilotEventDecoder;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::{
     CommandsInvokeRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
-    McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, SessionsForkRequest,
+    McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, McpStartServerRequest, SessionsForkRequest,
     SkillsConfigSetDisabledSkillsRequest, SkillsDisableRequest, SkillsEnableRequest,
     SlashCommandInvocationResult,
 };
@@ -258,14 +258,6 @@ impl CopilotBackend {
         let profile = resources.as_ref().map(|resources| {
             crate::settings::ResourceProfile::copilot(self.settings_root.as_ref().expect("configured resource root"), &resources.selected_skill)
         }).transpose()?;
-        let mcp_config = resources.as_ref().map(|resources| {
-            let launch = resources.launch.iter().map(|(name, payload)| {
-                let mut payload = payload.clone();
-                if payload.get("tools").is_none() { payload["tools"] = json!(["*"]); }
-                (name.clone(), payload)
-            }).collect();
-            serde_json::from_value(serde_json::Value::Object(launch))
-        }).transpose()?;
         let skill_directories = profile.as_ref().map(|profile| vec![profile.path().join("skills")]);
         let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
         // Dropping the old SDK session after resume unregisters the replacement's event router.
@@ -290,7 +282,7 @@ impl CopilotBackend {
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(resources.is_none());
             config.enable_skills = Some(true);
-            config.mcp_servers = mcp_config.clone();
+            config.mcp_servers = resources.as_ref().map(|_| Default::default());
             config.skill_directories = skill_directories.clone();
             config.disabled_skills = resources.as_ref().map(|_| Vec::new());
             self.trace.record(&request.harness_session_id, "copilot.session.resume", json!({
@@ -315,7 +307,7 @@ impl CopilotBackend {
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(resources.is_none());
             config.enable_skills = Some(true);
-            config.mcp_servers = mcp_config;
+            config.mcp_servers = resources.as_ref().map(|_| Default::default());
             config.skill_directories = skill_directories;
             config.disabled_skills = resources.as_ref().map(|_| Vec::new());
             self.trace.record(&request.harness_session_id, "copilot.session.create", json!({
@@ -330,33 +322,42 @@ impl CopilotBackend {
         };
         let session = Arc::new(session);
         if let Some(resources) = &resources {
+            let mut stage = "inspect Copilot skill selection".to_owned();
             let verified = tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 let loaded = session.rpc().skills().list().await.context("inspect Copilot skill selection")?;
                 for skill in loaded.skills.iter().filter(|skill| skill.enabled && !resources.selected_skill.iter().any(|selected| selected.name == skill.name)) {
                     session.rpc().skills().disable(SkillsDisableRequest { name: skill.name.clone() }).await
                         .with_context(||format!("exclude unselected Copilot skill {}", skill.name))?;
                 }
+                stage = "verify Copilot skill selection".into();
                 let loaded = session.rpc().skills().list().await.context("verify Copilot skill selection")?;
                 for skill in &resources.skill {
                     let enabled = loaded.skills.iter().any(|candidate| candidate.name == skill.name && candidate.enabled);
                     let selected = resources.selected_skill.iter().any(|candidate| candidate.name == skill.name);
                     anyhow::ensure!(enabled == selected, "Copilot did not apply skill selection for {}", skill.name);
                 }
-                loop {
-                    let loaded = session.rpc().mcp().list().await.context("verify Copilot MCP selection")?;
-                    for server in loaded.servers.iter().filter(|server| !resources.launch.iter().any(|(name, _)| name == &server.name)) {
-                        session.rpc().mcp().disable(McpDisableRequest { server_name: server.name.clone() }).await
-                            .with_context(||format!("exclude unselected Copilot MCP server {}", server.name))?;
-                    }
-                    if resources.launch.iter().all(|(name, _)| loaded.servers.iter().any(|server| {
-                        &server.name == name && !serde_json::to_value(&server.status).ok()
-                            .and_then(|status|status.as_str().map(str::to_owned))
-                            .is_some_and(|status|matches!(status.as_str(), "disabled" | "not_configured"))
-                    })) { break; }
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                for (name, payload) in &resources.launch {
+                    stage = format!("start Copilot MCP server {name}");
+                    session.rpc().mcp().start_server(mcp_launch_request(name, payload)).await
+                        .with_context(|| format!("start Copilot MCP server {name}"))?;
+                }
+                stage = "verify Copilot MCP selection".into();
+                let loaded = session.rpc().mcp().list().await.context("verify Copilot MCP selection")?;
+                for server in loaded.servers.iter().filter(|server| !resources.launch.iter().any(|(name, _)| name == &server.name)) {
+                    session.rpc().mcp().disable(McpDisableRequest { server_name: server.name.clone() }).await
+                        .with_context(||format!("exclude unselected Copilot MCP server {}", server.name))?;
+                }
+                for (name, _) in &resources.launch {
+                    let server = loaded.servers.iter().find(|server| &server.name == name)
+                        .with_context(|| format!("Copilot MCP server {name} is missing after startup"))?;
+                    anyhow::ensure!(!matches!(server.status,
+                        github_copilot_sdk::session_events::McpServerStatus::Disabled
+                        | github_copilot_sdk::session_events::McpServerStatus::NotConfigured),
+                        "Copilot did not apply MCP selection for {name}: {:?}", server.status);
                 }
                 Ok::<_, anyhow::Error>(())
-            }).await.context("Copilot resource verification timed out").and_then(|result| result);
+            }).await.with_context(|| format!("Copilot resource verification timed out while attempting to {stage}"))
+                .and_then(|result| result);
             if let Err(error) = verified {
                 let _ = session.disconnect().await;
                 return Err(error);
@@ -1339,6 +1340,12 @@ fn default_model_descriptor() -> BackendModel {
     }
 }
 
+fn mcp_launch_request(name: &str, payload: &Value) -> McpStartServerRequest {
+    let mut config = payload.clone();
+    if config.get("tools").is_none() { config["tools"] = json!(["*"]); }
+    McpStartServerRequest { server_name: name.to_owned(), config }
+}
+
 fn selected_reasoning_effort(
     model_list: &[BackendModel],
     request: &BackendRequest,
@@ -1772,6 +1779,20 @@ mod test {
     }
 
     use super::*;
+
+    #[test]
+    fn mcp_launch_preserves_empty_arguments_and_explicit_tool_selection() {
+        let payload = json!({"type":"stdio","command":"docs-mcp","args":[]});
+        let request = serde_json::to_value(mcp_launch_request("docs", &payload)).unwrap();
+        assert_eq!(request["serverName"], "docs");
+        assert_eq!(request["config"]["args"], json!([]));
+        assert_eq!(request["config"]["tools"], json!(["*"]));
+        assert!(payload.get("tools").is_none());
+
+        let payload = json!({"type":"http","url":"https://example.invalid/mcp","tools":[]});
+        let request = serde_json::to_value(mcp_launch_request("remote", &payload)).unwrap();
+        assert_eq!(request["config"], payload);
+    }
 
     #[test]
     fn descriptor_exposes_supported_native_capabilities() {

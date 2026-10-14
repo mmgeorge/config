@@ -665,7 +665,11 @@ impl HostRouter {
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::RepositoryGenerate => {
-                let result = self.host.generation.dispatch(request.params).await?;
+                let result = self.host.generation.dispatch(
+                    request.params,
+                    &self.host.harness,
+                    envelope.session_id,
+                ).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::Notifications => {
