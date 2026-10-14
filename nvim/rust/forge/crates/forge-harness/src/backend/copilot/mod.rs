@@ -1,6 +1,7 @@
 mod event_decoder;
 mod compaction;
 mod text_generation;
+mod mcp;
 
 use crate::agent::AgentCapability;
 use crate::backend::approval::{
@@ -58,6 +59,7 @@ struct CopilotSessionBinding {
     session: SharedCopilotSession,
     tool_schema: Vec<Value>,
     compaction: Option<compaction::CompactionMonitor>,
+    mcp_failure: HashMap<String, String>,
     _profile: Option<crate::settings::ResourceProfile>,
 }
 
@@ -336,25 +338,6 @@ impl CopilotBackend {
                     let selected = resources.selected_skill.iter().any(|candidate| candidate.name == skill.name);
                     anyhow::ensure!(enabled == selected, "Copilot did not apply skill selection for {}", skill.name);
                 }
-                for (name, payload) in &resources.launch {
-                    stage = format!("start Copilot MCP server {name}");
-                    session.rpc().mcp().start_server(mcp_launch_request(name, payload)).await
-                        .with_context(|| format!("start Copilot MCP server {name}"))?;
-                }
-                stage = "verify Copilot MCP selection".into();
-                let loaded = session.rpc().mcp().list().await.context("verify Copilot MCP selection")?;
-                for server in loaded.servers.iter().filter(|server| !resources.launch.iter().any(|(name, _)| name == &server.name)) {
-                    session.rpc().mcp().disable(McpDisableRequest { server_name: server.name.clone() }).await
-                        .with_context(||format!("exclude unselected Copilot MCP server {}", server.name))?;
-                }
-                for (name, _) in &resources.launch {
-                    let server = loaded.servers.iter().find(|server| &server.name == name)
-                        .with_context(|| format!("Copilot MCP server {name} is missing after startup"))?;
-                    anyhow::ensure!(!matches!(server.status,
-                        github_copilot_sdk::session_events::McpServerStatus::Disabled
-                        | github_copilot_sdk::session_events::McpServerStatus::NotConfigured),
-                        "Copilot did not apply MCP selection for {name}: {:?}", server.status);
-                }
                 Ok::<_, anyhow::Error>(())
             }).await.with_context(|| format!("Copilot resource verification timed out while attempting to {stage}"))
                 .and_then(|result| result);
@@ -363,9 +346,19 @@ impl CopilotBackend {
                 return Err(error);
             }
         }
+        let mcp_failure = if let Some(resources) = &resources {
+            match mcp::start(&session, &resources.launch, &self.trace, &request.harness_session_id,
+                std::time::Duration::from_secs(30)).await {
+                Ok(failure) => failure,
+                Err(error) => {
+                    let _ = session.disconnect().await;
+                    return Err(error);
+                }
+            }
+        } else { HashMap::new() };
         let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
             .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event));
-        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), tool_schema, compaction, _profile: profile });
+        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), tool_schema, compaction, mcp_failure, _profile: profile });
         Ok(session)
     }
 
@@ -1002,6 +995,8 @@ impl Backend for CopilotBackend {
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let backend_request = Self::catalog_backend_request(&request);
         let session = self.session(&backend_request).await?;
+        let mcp_failure = self.session_slot(&request.runtime_key()?).await.lock().await
+            .as_ref().map(|binding| binding.mcp_failure.clone()).unwrap_or_default();
         let definition = self.mcp_configuration(request).await?;
         let server_list = session
             .rpc()
@@ -1057,7 +1052,7 @@ impl Backend for CopilotBackend {
                     }
                     .into()
                 });
-            let status = match status_text.as_str() {
+            let mut status = match status_text.as_str() {
                 "disabled" | "not_configured" => McpStatus::Disabled,
                 "pending" => McpStatus::Loading,
                 "connected" => McpStatus::Connected,
@@ -1065,6 +1060,10 @@ impl Backend for CopilotBackend {
                 "failed" => McpStatus::Failed,
                 _ => McpStatus::Unavailable,
             };
+            let startup_error = mcp_failure.get(&discovered.name);
+            if startup_error.is_some() && matches!(status, McpStatus::Disabled | McpStatus::Loading | McpStatus::Unavailable) {
+                status = McpStatus::Failed;
+            }
             let (tools, tool_error) = if status == McpStatus::Connected {
                 match session
                     .rpc()
@@ -1097,7 +1096,8 @@ impl Backend for CopilotBackend {
                 token_estimated: false,
                 enabled: discovered.enabled,
                 status,
-                status_detail: status_entry.and_then(|server| server.error.clone()),
+                status_detail: status_entry.and_then(|server| server.error.clone())
+                    .or_else(|| (status == McpStatus::Failed).then(|| startup_error.cloned()).flatten()),
                 name: discovered.name,
                 transport:discovered.transport,
                 tools,

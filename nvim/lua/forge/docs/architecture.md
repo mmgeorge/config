@@ -399,9 +399,9 @@ Body delivery does not advance the inventory revision.
 Native syntax adoption merges adjacent display groups when their scopes are equal or nested
 and the gap between their padded windows is at most six lines on both source sides.
 Each group retains the union of its raw hunk identities, so actions on bridge context stage
-or unstage exactly those edits. Larger gaps and unrelated sibling scopes remain separate.
-The display summary uses the innermost source declaration, including its signature, rather
-than only its name. Unchanged scope openers appear in the first containing group and closers
+or unstage exactly those edits. Semantic bridging leaves larger gaps and unrelated sibling
+scopes separate. The display summary uses the innermost source declaration's first line
+rather than only its name. Unchanged scope openers appear in the first containing group and closers
 in the last, with each source coordinate emitted once across the file's groups. Syntax
 adoption replaces the body generation before publishing the regrouped targets and rows.
 Read-only demand accepts an older inventory revision for a still-live file handle and
@@ -2174,10 +2174,13 @@ and an empty MCP set through its Rust SDK session options with native configurat
 disabled. It starts each selected MCP server through the session-scoped `session.mcp.startServer`
 API using the canonical launch payload. This preserves required empty argument arrays that the
 SDK's session-option serializer omits, without modifying native user configuration. It verifies
-loaded skills and registered servers, disables unselected runtime resources, and disconnects before
-resuming the same provider conversation when selection changes. Missing or disabled selected servers
-fail immediately with their names, and startup timeouts identify the active verification or launch
-step rather than polling for a server the provider skipped. `SessionResources` exposes source
+loaded skills and disables unselected runtime resources, and disconnects before
+resuming the same provider conversation when selection changes. Selected MCP servers start with
+at most four concurrent requests and an independent 30-second deadline per server. Startup errors,
+timeouts, and missing or disabled registrations produce `copilot.mcp.start_failed` trace events
+without rejecting the conversation. `/mcp` retains each failure until the provider reports recovery,
+including failures before native registration, and exposes the existing enable and retry controls.
+Failure to enforce skill or server selection still rejects initialization. `SessionResources` exposes source
 identities and per-server credential failures independently from its ephemeral launch payloads.
 Resource binding rejects names that traverse or alias profile directories before creating links.
 Selected skills own execution-scoped read and script grants through the shared permission coordinator.

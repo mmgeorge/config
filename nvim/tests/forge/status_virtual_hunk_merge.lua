@@ -108,6 +108,9 @@ status.close(state)
 client.stop()
 assert(vim.wait(10000, function() return client._client.process == nil end, 20), "Forge host did not stop")
 vim.notify = original_notify
-assert(success, failure)
+if not success then
+  vim.api.nvim_err_writeln(failure)
+  vim.cmd("cquit 1")
+end
 print("status_virtual_hunk_merge: real TypeScript, arrow, and Rust semantic grouping passed")
 vim.cmd("qa!")

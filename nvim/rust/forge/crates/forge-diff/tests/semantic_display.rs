@@ -159,6 +159,30 @@ async fn semantic_windows_merge_and_shared_boundaries_render_once_in_typescript_
 }
 
 #[tokio::test]
+async fn semantic_bridge_accepts_six_hidden_lines_but_rejects_seven() {
+    let original = function("function foo() {", "const");
+    for (second, groups) in [(21, 1), (22, 2)] {
+        let mut modified = original.clone();
+        for row in [8, second] {
+            modified[row] = format!("    const value_{row} = {};", 900 + row);
+        }
+        let (diff, old, new) = analysis(
+            SyntaxLanguage::Typescript,
+            &original.join("\n"),
+            &modified.join("\n"),
+        )
+        .await;
+        let cursor = DisplayCursor::compact(diff, 3, BodyKind::Modified)
+            .with_syntax_context(Some(&old), Some(&new));
+        assert!(cursor.group(groups - 1).is_some());
+        assert!(
+            cursor.group(groups).is_none(),
+            "gap threshold at source row {second}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn semantic_bridge_does_not_join_unrelated_functions() {
     let mut original = vec!["function first() {".to_owned()];
     original.extend((1..=12).map(|line| format!("  const first_{line} = {line};")));

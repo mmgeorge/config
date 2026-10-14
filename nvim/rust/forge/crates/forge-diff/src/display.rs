@@ -253,6 +253,7 @@ impl DisplayCursor {
             })
             .collect();
         let mut owner = BTreeMap::new();
+        // Shared opening rows belong to the first group and closing rows to the last.
         for (index, context) in plan.iter_mut().enumerate() {
             context.selected.retain(|&(old, new)| {
                 let candidate = visible.partition_point(|(range, _)| range.end <= old);

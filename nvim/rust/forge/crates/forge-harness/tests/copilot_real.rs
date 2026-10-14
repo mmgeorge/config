@@ -40,13 +40,18 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     std::fs::create_dir_all(&resource).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(resource.join("mcp.json"), json!({
-        "mcpServers": {"docs": {"command":"docs-mcp"}}
+        "mcpServers": {
+            "docs": {"command":"docs-mcp"},
+            "broken": {"command":"forge-missing-mcp-startup-test"}
+        }
     }).to_string()).unwrap();
     let data = temporary.path().join("data");
     forge_harness::settings::SettingsStore::open(&data).unwrap().configure_catalog(&config).unwrap();
+    let trace = std::sync::Arc::new(forge_harness::trace::TraceStore::open(&data).unwrap());
+    trace.configure(true).unwrap();
     let backend = CopilotBackend::new_with_permission_coordinator(
         Vec::new(), forge_harness::backend::approval::PermissionCoordinator::transient(&workspace).unwrap(),
-        std::sync::Arc::new(forge_harness::trace::TraceStore::open(&data).unwrap()), Some(data),
+        std::sync::Arc::clone(&trace), Some(data),
     ).unwrap();
     let request = BackendCatalogRequest {
         execution_owner: None, harness_session_id: "copilot-mcp-no-args-test".into(),
@@ -55,12 +60,18 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     };
     let server = tokio::time::timeout(Duration::from_secs(40), backend.mcp_list(request.clone()))
         .await.expect("Copilot MCP startup timed out").unwrap();
-    assert_eq!(server.len(), 1);
-    assert_eq!(server[0].name, "docs");
-    assert_eq!(server[0].status, forge_harness::backend::McpStatus::Connected);
+    assert_eq!(server.len(), 2);
+    assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,
+        forge_harness::backend::McpStatus::Connected);
+    let failed = server.iter().find(|server| server.name == "broken").unwrap();
+    assert_eq!(failed.status, forge_harness::backend::McpStatus::Failed);
+    assert!(failed.status_detail.as_ref().is_some_and(|detail| !detail.is_empty()));
+    let log = std::fs::read_to_string(trace.session_status(&request.harness_session_id).path).unwrap();
+    assert!(log.contains("copilot.mcp.start_failed") && log.contains("broken"));
     let session_id = backend.active_session_id_for(&request.harness_session_id).await.unwrap();
     let server = backend.mcp_list(request.clone()).await.unwrap();
-    assert_eq!(server[0].status, forge_harness::backend::McpStatus::Connected);
+    assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,
+        forge_harness::backend::McpStatus::Connected);
     assert_eq!(backend.active_session_id_for(&request.harness_session_id).await.as_deref(),
         Some(session_id.as_str()));
     let terminals = tokio::time::timeout(Duration::from_secs(10), backend.background_terminals(request))
