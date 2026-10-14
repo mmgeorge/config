@@ -22,8 +22,22 @@
 
 ---@class AIRequestContext
 ---@field request fun(request: AIHttpRequest, cb: AIHttpCallback)
+---@field run_process fun(request: AIProcessRequest, cb: AIProcessCallback)
 ---@field read_file fun(path: string): string?
 ---@field now fun(): integer
+
+---@class AIProcessRequest
+---@field command string[]
+---@field input? string
+---@field cwd? string
+
+---@class AIProcessResult
+---@field code integer
+---@field stdout string
+---@field stderr string
+---@field output string
+
+---@alias AIProcessCallback fun(result: AIProcessResult)
 
 ---@class AIToolSpec normalized tool definition sent to the provider
 ---@field name string
@@ -68,6 +82,7 @@
 
 ---@class AIBackend test seam; any omitted method falls back to the default
 ---@field request? fun(request: AIHttpRequest, cb: AIHttpCallback)
+---@field run_process? fun(request: AIProcessRequest, cb: AIProcessCallback)
 ---@field read_file? fun(path: string): string?
 ---@field now? fun(): integer
 
@@ -80,6 +95,7 @@ local providers = {
   require("ai.providers.gemini"),
   require("ai.providers.openai"),
   require("ai.providers.copilot"),
+  require("ai.providers.copilot_cli"),
 }
 
 ---@type table<string, AIProvider>
@@ -181,6 +197,7 @@ local function request_context()
   local backend = M._backend or {}
   return {
     request = backend.request or require("ai.http").request,
+    run_process = backend.run_process or require("ai.process").run,
     read_file = backend.read_file or read_file,
     now = backend.now or os.time,
   }

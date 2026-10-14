@@ -27,3 +27,8 @@ codex/skills/.system/
 nushell/history*
 nushell/completions/
 /git/config.local
+node_modules/
+/package-lock.json
+/caddy/autosave.json
+/homebrew/trust.json.lock
+/swiftpm/

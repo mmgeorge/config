@@ -7,7 +7,8 @@ description: >-
   sharing, and ArcGIS Play previews. Use when a request names the portal CLI,
   portal config, portal item, portal job, Feature Layer items, Web Map items, or
   ArcGIS Portal item management. Use the parquet skill instead for portal tools
-  parquet, portal item parquet, Azure Parquet delivery, or ParquetLayer work.
+  parquet, portal item parquet, or Azure Parquet delivery. Use the maps-sdk
+  skill for hand-authored application code that consumes Portal content.
 targets:
   - copilotcli
 ---
@@ -48,9 +49,10 @@ per-type selections.
   Esri-hosted Play service. Web Map `--mini` modes upload embedded map JSON.
 - **Do not call `app` a Portal Application item.** It creates and opens an
   ArcGIS Play document.
-- **Route Parquet work to the `parquet` skill.** This includes
-  `portal tools parquet`, `portal item parquet`, `_spatial.json`, Azure Parquet,
-  and ParquetLayer workflows.
+- **Route Parquet data work to the `parquet` skill.** This includes
+  `portal tools parquet`, `portal item parquet`, `_spatial.json`, and Azure
+  Parquet delivery. Route hand-authored `ParquetLayer` app code to the
+  `maps-sdk` skill.
 
 ## Quick start
 

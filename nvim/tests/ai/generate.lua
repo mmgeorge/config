@@ -22,6 +22,17 @@ local routes = {}
 
 local mock_now = 1000
 
+---@type AIProcessRequest[]
+local process_requests = {}
+
+---@type AIProcessResult
+local process_result = {
+  code = 0,
+  stdout = "",
+  stderr = "",
+  output = "",
+}
+
 ---@type AIBackend
 local backend = {
   request = function(request, cb)
@@ -49,6 +60,13 @@ local backend = {
   end,
   now = function()
     return mock_now
+  end,
+  run_process = function(request, cb)
+    process_requests[#process_requests + 1] = vim.deepcopy(request)
+    local result = vim.deepcopy(process_result)
+    vim.defer_fn(function()
+      cb(result)
+    end, 2)
   end,
 }
 
@@ -83,6 +101,11 @@ local function test_resolve_errors()
   local copilot_spec = ai.resolve("copilot,thinking=minimal")
   assert_true(copilot_spec ~= nil, "every thinking level should resolve on copilot")
   assert_eq(copilot_spec.thinking, nil, "copilot has no thinking mapping, level should resolve to nothing")
+
+  local copilot_cli_spec = ai.resolve("copilot-cli,thinking=low")
+  assert_true(copilot_cli_spec ~= nil, "copilot CLI preset should resolve")
+  assert_eq(copilot_cli_spec.model, "gpt-5.6-luna", "copilot CLI default model")
+  assert_eq(copilot_cli_spec.thinking, "low", "copilot CLI low effort mapping")
 
   local max_spec = ai.resolve("gemini3,thinking=max")
   assert_eq(max_spec and max_spec.thinking, "high", "gemini3 max should alias high")
@@ -312,6 +335,102 @@ local function test_copilot_missing_oauth()
   ai.set_backend(backend)
 end
 
+local function test_copilot_cli_generate()
+  process_requests = {}
+  process_result = {
+    code = 0,
+    stdout = "feat: route prompts through copilot cli\n",
+    stderr = "",
+    output = "feat: route prompts through copilot cli\n",
+  }
+
+  local result = generate_sync({
+    model = "copilot-cli,model=gpt-5.6-luna,thinking=low",
+    system = "You write commit messages.",
+    prompt = "diff content",
+  })
+  assert_true(result.ok, "copilot CLI generate failed: " .. tostring(result.error))
+  assert_eq(result.content, "feat: route prompts through copilot cli", "copilot CLI content should be trimmed")
+  assert_eq(#process_requests, 1, "copilot CLI should run one process")
+
+  local request = process_requests[1]
+  assert_eq(request.cwd, vim.fn.stdpath("cache"), "copilot CLI should run outside the repository")
+  assert_true(vim.deep_equal(request.command, {
+    "copilot",
+    "--silent",
+    "--no-color",
+    "--stream", "off",
+    "--model", "gpt-5.6-luna",
+    "--allow-all-tools",
+    "--excluded-tools",
+    "builtin:*",
+    "mcp:*",
+    "custom:*",
+    "--disable-builtin-mcps",
+    "--no-custom-instructions",
+    "--no-ask-user",
+    "--no-auto-update",
+    "--no-bash-env",
+    "--disable-remote-sessions",
+    "--effort", "low",
+  }), "copilot CLI command mismatch: " .. vim.inspect(request.command))
+  assert_eq(
+    request.input,
+    table.concat({
+      "diff content",
+      "Response requirements:\nYou write commit messages.",
+      "Return only the requested final text. Do not use tools.",
+    }, "\n\n"),
+    "copilot CLI prompt"
+  )
+end
+
+local function test_copilot_cli_errors()
+  process_result = {
+    code = 1,
+    stdout = "",
+    stderr = "authentication required",
+    output = "authentication required",
+  }
+  local result = generate_sync({ model = "copilot-cli,thinking=low", prompt = "diff" })
+  assert_true(not result.ok, "copilot CLI process failure should fail")
+  assert_true(result.error:find("authentication required", 1, true) ~= nil, "copilot CLI stderr should be preserved")
+
+  process_result = {
+    code = 0,
+    stdout = " \n",
+    stderr = "",
+    output = " \n",
+  }
+  result = generate_sync({ model = "copilot-cli,thinking=low", prompt = "diff" })
+  assert_true(not result.ok, "copilot CLI empty output should fail")
+  assert_true(result.error:find("empty response", 1, true) ~= nil, "copilot CLI empty response error")
+end
+
+local function test_copilot_cli_rejects_tools()
+  process_requests = {}
+  ---@type AIGenerateResult?
+  local result
+  ai.generate_with_tools({
+    model = "copilot-cli,thinking=low",
+    prompt = "diff",
+    tools = {
+      {
+        name = "read_context",
+        description = "Read context",
+        parameters = { type = "object", properties = {} },
+        run = function(_, done) done("context") end,
+      },
+    },
+  }, function(generate_result)
+    result = generate_result
+  end)
+  assert_true(vim.wait(1000, function() return result ~= nil end, 10), "tool rejection did not complete")
+  assert_true(not result.ok, "copilot CLI should reject tool-enabled generation")
+  assert_true(result.error:find("tool calling", 1, true) ~= nil, "copilot CLI tool rejection error")
+  assert_eq(#process_requests, 0, "copilot CLI should reject tools before spawning")
+end
+
 local function test_transport_error()
   routes = {}
   local result = generate_sync({ model = "gemini3", prompt = "diff" })
@@ -332,6 +451,9 @@ local function run()
   test_openai_incomplete()
   test_copilot_generate_and_session_cache()
   test_copilot_missing_oauth()
+  test_copilot_cli_generate()
+  test_copilot_cli_errors()
+  test_copilot_cli_rejects_tools()
 
   vim.env.GEMINI_API_KEY = "gemini-test-key"
   test_transport_error()

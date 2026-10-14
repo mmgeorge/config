@@ -25,7 +25,7 @@ local ok, err = xpcall(function()
 
   local fallback = load_with_gemini_key(nil)
   assert_eq(fallback.commit, "copilot,model=gpt-4.1", "fallback commit default")
-  assert_eq(fallback.pr_create, "copilot,model=gpt-4.1", "fallback PR create default")
+  assert_eq(fallback.pr_create, "copilot-cli,model=gpt-5.6-luna,thinking=low", "fallback PR create default")
 end, debug.traceback)
 
 os.getenv = original_getenv

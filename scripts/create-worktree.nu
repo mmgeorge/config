@@ -1,3 +1,5 @@
+use worktree-process.nu run-git-command
+
 def send-wezterm-user-variable [name: string, value: string] {
   let encoded_value = $value | encode base64
   print -n $"\u{1b}]1337;SetUserVar=($name)=($encoded_value)\u{7}"
@@ -89,7 +91,7 @@ def main [
     $start_point
   }
 
-  mut git_arguments = ['-C' $repository_path 'worktree' 'add']
+  mut git_arguments = ['-c' 'core.hooksPath=/dev/null' '-C' $repository_path 'worktree' 'add']
   if $new_branch != '' {
     $git_arguments = $git_arguments | append ['--no-track' '-b' $new_branch]
   }
@@ -99,10 +101,9 @@ def main [
   print $"git ($git_arguments | str join ' ')"
   print
 
-  ^git ...$git_arguments
-  let git_exit_code = $env.LAST_EXIT_CODE? | default 0
-  if $git_exit_code != 0 {
-    print --stderr $"Worktree creation failed with exit code ($git_exit_code)"
+  let git_result = run-git-command $git_arguments
+  if $git_result.exit_code != 0 {
+    print --stderr $"Worktree creation failed with exit code ($git_result.exit_code)"
     send-wezterm-user-variable 'WORKTREE_CREATE_FAILED' $workspace_name
     start-development-shell $repository_path
     return

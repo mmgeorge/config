@@ -44,6 +44,10 @@ local fake_action = {}
 local notifications = {}
 local active_workspace = 'default'
 local active_tab_title
+local spawned_tabs = {}
+local split_panes = {}
+local startup_commands = {}
+local focused_pane
 local fake_repository = {
   common_dir = 'D:/repo/.git',
   pane_path = 'D:/repo',
@@ -132,8 +136,8 @@ assert_equal(worktree.settings.creation_runner_path, wezterm_dir .. '/../scripts
 worktree.settings.debug = false
 assert_equal(type(worktree.menu), 'function', 'worktree module must load with the branch-source model')
 assert_equal(worktree.settings.branch_prefix, 'mmgeorge/', 'default branch prefix must use mmgeorge')
-assert_equal(worktree.settings.layouts.by_repo.maps.branch_prefix, 'matt9222/',
-  'maps repository must retain the matt9222 prefix')
+assert_equal(worktree.settings.layouts.by_repo.webgis.branch_prefix, 'matt9222/',
+  'webgis repository must retain the matt9222 prefix')
 
 local fake_window = {}
 function fake_window:active_workspace()
@@ -147,7 +151,22 @@ function fake_window:active_tab()
   }
 end
 function fake_window:mux_window()
-  return {}
+  return {
+    spawn_tab = function(_, spec)
+      local tab = {
+        set_title = function(_, title)
+          spec.title = title
+        end,
+      }
+      local pane = {
+        send_text = function(_, command)
+          table.insert(startup_commands, command)
+        end,
+      }
+      table.insert(spawned_tabs, spec)
+      return tab, pane
+    end,
+  }
 end
 function fake_window:perform_action(action)
   current_action = action
@@ -159,6 +178,20 @@ end
 local fake_pane = {}
 function fake_pane:get_current_working_dir()
   return { file_path = fake_repository.pane_path }
+end
+function fake_pane:split(spec)
+  table.insert(split_panes, spec)
+  return {
+    send_text = function(_, command)
+      table.insert(startup_commands, command)
+    end,
+  }
+end
+function fake_pane:send_text(command)
+  table.insert(startup_commands, command)
+end
+function fake_pane:activate()
+  focused_pane = self
 end
 
 local function choose_id(id)
@@ -234,6 +267,9 @@ assert_equal(current_action.spec.title, 'Start point from local for repo',
   'new branch local source must show local refs')
 
 choose_id('main')
+worktree.settings.layouts.by_repo.repo = {
+  tabs = worktree.settings.layouts.by_repo.webgis.tabs,
+}
 current_action.spec.action(fake_window, fake_pane, 'progress')
 assert_equal(current_action.kind, 'workspace', 'new local branch must switch to a progress workspace immediately')
 assert_equal(current_action.spec.name, 'repo:mmgeorge/progress',
@@ -242,6 +278,8 @@ assert_equal(current_action.spec.spawn.cwd, 'D:/repo',
   'progress runner must start from the existing repository path')
 assert_equal(current_action.spec.spawn.args[1], 'nu',
   'progress workflow must use the cross-platform Nushell runner')
+assert_equal(current_spawn_contains('--no-config-file'), false,
+  'progress runner must not suppress the user Nushell configuration')
 assert_equal(current_spawn_contains(
   'create-worktree.nu --repository-path D:/repo --worktree-path D:/mmgeorge/progress --start-point main --new-branch mmgeorge/progress'), true,
   'progress workspace must receive the complete worktree creation request')
@@ -262,9 +300,28 @@ fake_repository.worktrees = table.concat({
 }, '\n')
 active_workspace = 'repo:mmgeorge/progress'
 worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_READY', active_workspace)
-worktree.handle_update_status(fake_window, fake_pane)
 assert_equal(active_tab_title, 'main',
-  'successful progress runner completion must apply the repository layout')
+  'successful creation must apply the layout without waiting for a status event')
+assert_equal(#spawned_tabs, 1, 'WebGIS layout must create its Copilot tab')
+assert_equal(spawned_tabs[1].title, 'copilot', 'second tab must use the WebGIS title')
+assert_equal(spawned_tabs[1].cwd, 'D:/mmgeorge/progress', 'Copilot tab must start in the new worktree')
+assert_equal(#split_panes, 1, 'WebGIS layout must create its development split')
+assert_equal(split_panes[1].direction, 'Bottom', 'development split must remain below the editor')
+assert_equal(focused_pane, fake_pane, 'WebGIS layout must focus the editor pane')
+assert_equal(#startup_commands, 3, 'each configured WebGIS pane must receive its startup command')
+assert_equal(startup_commands[1], 'nvim\n', 'editor startup must remain attached to the primary pane')
+assert_equal(startup_commands[2],
+  worktree.settings.layouts.by_repo.webgis.tabs[1].panes[1].first_run_commands.commands[1] .. '\n',
+  'development startup must remain attached to the split pane')
+assert_equal(startup_commands[3],
+  worktree.settings.layouts.by_repo.webgis.tabs[2].first_run_commands.commands[1] .. '\n',
+  'Copilot startup must retain its configured WebGIS instructions and skills')
+worktree.handle_update_status(fake_window, fake_pane)
+worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_READY', active_workspace)
+assert_equal(#spawned_tabs, 1, 'later status and repeated readiness events must not duplicate tabs')
+assert_equal(#split_panes, 1, 'later events must not duplicate splits')
+assert_equal(#startup_commands, 3, 'later events must not rerun startup commands')
+worktree.settings.layouts.by_repo.repo = nil
 active_workspace = 'default'
 
 open_branch_source('new')
@@ -275,6 +332,7 @@ active_workspace = 'repo:mmgeorge/failed'
 worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_FAILED', active_workspace)
 assert_equal(notification_contains('Worktree creation failed'), true,
   'failed progress runner completion must remain visible to the user')
+assert_equal(#spawned_tabs, 1, 'failed creation must not create layout tabs')
 active_workspace = 'default'
 
 open_branch_source('existing')
@@ -328,6 +386,27 @@ assert_equal(current_spawn_contains('--new-branch'), false,
   'existing local branch must not ask the progress runner to create a branch')
 assert_equal(current_spawn_contains('--use-cached-remote-base'), false,
   'existing local branch must preserve its selected local tip')
+
+fake_repository.worktrees = fake_repository.worktrees .. table.concat({
+  '',
+  'worktree D:/mmgeorge/local-only',
+  'HEAD def456',
+  'branch refs/heads/local-only',
+  '',
+}, '\n')
+worktree.settings.layouts.by_repo.repo = {
+  tabs = worktree.settings.layouts.by_repo.webgis.tabs,
+}
+worktree.handle_user_var_changed(fake_window, fake_pane, 'WORKTREE_CREATE_READY', 'repo:local-only')
+assert_equal(#spawned_tabs, 1, 'background completion must not apply its layout to the current workspace')
+active_workspace = 'repo:local-only'
+worktree.handle_update_status(fake_window, fake_pane)
+assert_equal(#spawned_tabs, 2, 'background completion must retain its layout for workspace activation')
+assert_equal(#split_panes, 2, 'workspace activation must apply the deferred development split')
+worktree.handle_update_status(fake_window, fake_pane)
+assert_equal(#spawned_tabs, 2, 'deferred layout must also apply exactly once')
+worktree.settings.layouts.by_repo.repo = nil
+active_workspace = 'default'
 
 fake_repository = {
   common_dir = 'D:/code/test-wt/.bare',

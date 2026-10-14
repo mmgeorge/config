@@ -84,11 +84,17 @@ def wg [
     winget $command ...$auto_flags ...$rest
 }
 
-def test [
-  mode?: string # Pass "run" to insert "pnpm vitest run --browser.headless" instead of "pnpm vitest".
+# Show the available WebGIS development commands.
+def webgis [] {
+  help webgis
+}
+
+# Pick a spec file and insert its pnpm test command into the command line.
+def "webgis test" [
+  mode?: string # Pass "run" for "pnpm core:test" instead of "pnpm core:test-watch".
   --all # Include spec files whose paths contain "3d" or "widget"; filtered out by default.
 ] {
-  let prefix = if $mode == "run" { "pnpm vitest run --browser.headless " } else { "pnpm vitest " }
+  let prefix = if $mode == "run" { "pnpm core:test " } else { "pnpm core:test-watch " }
   commandline edit --insert $prefix
   let all_files = (^fd --type f --hidden --exclude .git --glob "*.spec.ts" | lines)
   let files = if $all {
@@ -101,6 +107,76 @@ def test [
     commandline edit --insert $path
   }
 }
+
+# Show the available WebGIS CDN build commands.
+def "webgis cdn" [] {
+  help webgis cdn
+}
+
+def "webgis cdn debug" [
+  --grunt-only # Reassemble existing AMD and ESM output without rebuilding prerequisites.
+] {
+  do --capture-errors {
+    let repo_root = (^git rev-parse --show-toplevel | str trim)
+    let core_root = ($repo_root | path join "packages" "core-packages" "core")
+    if not ($core_root | path join "package.json" | path exists) {
+      error make {msg: "Run this command from a WebGIS SDK checkout."}
+    }
+    cd $repo_root
+
+    let amd_root = ($core_root | path join "output" "cdn" "amd" "esri")
+    let esm_entry = ($core_root | path join "output" "cdn" "esm" "@arcgis" "core" "Map.js")
+    if $grunt_only {
+      let required_amd = ["Map.js" "support/arcadeUtils.js" "views/2d/layers/features/FeaturePipelineWorker.js"]
+      let missing_amd = ($required_amd | where {|entry| not ($amd_root | path join $entry | path exists) })
+      if not ($missing_amd | is-empty) {
+        let missing = ($missing_amd | str join ", ")
+        error make {msg: $"AMD build output is missing: ($missing). Run `webgis cdn debug` without --grunt-only first."}
+      }
+      if not ($esm_entry | path exists) {
+        error make {msg: "ESM build output is missing. Run `webgis cdn debug` without --grunt-only first."}
+      }
+    } else {
+      print "> pnpm --filter=@arcgis/core build-source"
+      pnpm --filter=@arcgis/core build-source
+      print "> pnpm --filter=@arcgis/core build-rollup --build cdn --module amd --no-minify"
+      pnpm --filter=@arcgis/core build-rollup --build cdn --module amd --no-minify
+      if not ($esm_entry | path exists) {
+        print "> ESM not found. Performing one-time build."
+        print "> pnpm --filter=@arcgis/core build-rollup --build cdn --module esm --no-minify"
+        pnpm --filter=@arcgis/core build-rollup --build cdn --module esm --no-minify
+      }
+    }
+    print "> pnpm --filter=@arcgis/core exec grunt --gruntfile Gruntfile.cjs distDebug"
+    pnpm --filter=@arcgis/core exec grunt --gruntfile Gruntfile.cjs distDebug
+  }
+}
+
+def "webgis cdn release" [] {
+  do --capture-errors {
+    print "> pnpm --filter=@arcgis/core build-source"
+    pnpm --filter=@arcgis/core build-source
+    print "> pnpm --filter=@arcgis/core build-cdn"
+    pnpm --filter=@arcgis/core build-cdn
+  }
+}
+
+def "webgis serve" [--port (-p): int = 3001] {
+  caddy file-server --root packages/core-packages/core --domain localhost --listen :($port)
+}
+
+def "webgis check" [] {
+  pnpm run core:typecheck
+}
+
+def "webgis start" [] {
+  pnpm run core:start
+}
+
+def "webgis update" [url] {
+  pnpm run update-test-hashes $url
+}
+
 
 # def get_copilot_instruction_dirs [] {
 #     let default_dir = ($env.XDG_CONFIG_HOME | path join "copilot")
@@ -126,11 +202,12 @@ def --wrapped co [...args] {
     let allowed_tools = [
         'shell(python)'
         'shell(python:*)'
+        'shell(pnpm)'
+        'shell(pnpm:*)'
         'shell(git)'
         'shell(git:*)'
         'shell(nu-check)'
         'shell(nu-check:*)'
-        'shell(pnpm run dev)'
         'shell(printf)'
         'shell(printf:*)'
         'shell(echo)'
@@ -184,8 +261,8 @@ def --wrapped co [...args] {
         # --deny-tool 'shell'
         --deny-tool 'shell(git commit)'
         --deny-tool 'shell(git commit:*)'
-        --deny-tool 'shell(gh)'
-        --deny-tool 'shell(gh:*)'
+        # --deny-tool 'shell(gh)'
+        # --deny-tool 'shell(gh:*)'
         --deny-tool 'shell(az)'
         --deny-tool 'shell(az:*)'
         --deny-tool 'shell(azcopy)'
@@ -194,10 +271,11 @@ def --wrapped co [...args] {
         # --deny-tool 'shell(python:*)'
         # --disable-builtin-mcps
         # --allow-all-urls
-        # --add-dir '/Users/matt9222/Developer'
-        # --add-dir '/Users/matt9222/datasets'
-        # --add-dir '/Users/matt9222/.cargo'
-        # --add-dir '/Users/matt9222/Developer/maps/screenshots'
+        --add-dir '/Users/matt9222/Developer'
+        --add-dir '/Users/matt9222/datasets'
+        --add-dir '/Users/matt9222/.cargo'
+        --add-dir '/Users/matt9222/Developer/webgis/screenshots/'
+        --add-dir '/Users/matt9222/config'
         # --add-dir '/Users/matt9222/Developer/agents'
         # --add-dir '/Users/matt9222/config/copilot/.github/instructions'
     ]
@@ -361,7 +439,7 @@ def lst [len: int = 50] {
 }
 
 def cat [file: path] {
-  if (($file | path parse).extension | str downcase) in ["toml", "json"] {
+  if (($file | path parse).extension | str lowercase) in ["toml", "json"] {
     open $file
   } else {
     bat -pP $file
@@ -443,7 +521,7 @@ def ai [prompt: string] {
 }
 
 def screenshot-local-path [
-  repo_root: path
+  screenshots_root: path
   url: string
 ] {
   let parsed = (
@@ -455,12 +533,12 @@ def screenshot-local-path [
   if ($parsed | is-empty) {
     null
   } else {
-    $repo_root | path join ".screenshots" $parsed.0.namespace $"($parsed.0.hash).png"
+    $screenshots_root | path join ".screenshots" $parsed.0.namespace $"($parsed.0.hash).png"
   }
 }
 
 def screenshot-accept-local-references [
-  repo_root: path
+  screenshots_root: path
   log_path: path
 ] {
   let log = (open --raw $log_path | ansi strip)
@@ -474,8 +552,8 @@ def screenshot-accept-local-references [
   mut seen = []
 
   for failure in $failures {
-    let expected_path = (screenshot-local-path $repo_root $failure.expectedUrl)
-    let actual_path = (screenshot-local-path $repo_root $failure.actualUrl)
+    let expected_path = (screenshot-local-path $screenshots_root $failure.expectedUrl)
+    let actual_path = (screenshot-local-path $screenshots_root $failure.actualUrl)
 
     if ($expected_path == null) or ($actual_path == null) or ($expected_path in $seen) {
       continue
@@ -516,8 +594,24 @@ def screenshotSync [
   }
 
   let repo_root = ($repo_result.stdout | str trim)
+  let core_package_root = ($repo_root | path join "packages/core-packages/core")
+  let is_core_monorepo = (($core_package_root | path join "package.json") | path exists)
+  let screenshots_root = if $is_core_monorepo {
+    $core_package_root
+  } else {
+    $repo_root
+  }
   let test_targets = if $target == null {
-    ["tests/screenshotTests2d" "tests/screenshotTests3d"]
+    let tests_root = if $is_core_monorepo {
+      "packages/core-packages/core/tests"
+    } else {
+      "tests"
+    }
+
+    [
+      ($tests_root | path join "screenshotTests2d")
+      ($tests_root | path join "screenshotTests3d")
+    ]
   } else {
     let requested_path = ($target | path expand)
 
@@ -542,16 +636,28 @@ def screenshotSync [
   print $"Running screenshot tests: ($test_targets | str join ' ')"
   print $"Log: ($log_path)"
 
-  ^bash -c 'set -o pipefail
+  with-env {
+    AGENT: "1"
+    VITEST_HEADLESS: "true"
+    VITEST_DISABLE_INLINE_REPORTS: "true"
+  } {
+    ^bash -c 'set -o pipefail
 log_path="$1"
 shift
 cd "$1"
 shift
-AGENT=1 VITEST_HEADLESS=true VITEST_DISABLE_INLINE_REPORTS=true pnpm vitest --run --browser.headless --browser.ui=false "$@" 2>&1 | tee "$log_path"
-exit ${PIPESTATUS[0]}' bash $log_path $repo_root ...$test_targets
+test_mode="$1"
+shift
+if [ "$test_mode" = "core-monorepo" ]; then
+  pnpm core:test "$@" 2>&1 | tee "$log_path"
+else
+  pnpm vitest --run --browser.headless --browser.ui=false "$@" 2>&1 | tee "$log_path"
+fi
+exit ${PIPESTATUS[0]}' bash $log_path $repo_root (if $is_core_monorepo { "core-monorepo" } else { "legacy" }) ...$test_targets
+  }
 
   let test_exit_code = $env.LAST_EXIT_CODE
-  let sync_result = (screenshot-accept-local-references $repo_root $log_path)
+  let sync_result = (screenshot-accept-local-references $screenshots_root $log_path)
 
   print $"Accepted ($sync_result.accepted) local screenshot reference(s)"
 
@@ -828,7 +934,8 @@ $env.config.menus ++= [
     source: { |buffer, position|
       history
       | where command =~ $buffer
-      | where ($it.command | str length) > 10
+      | where ($it.command | str length) > 8
+      | sort-by start_timestamp --reverse
       | uniq-by "command"
       | each { |it| {value: $it.command, description: ($it.start_timestamp | into datetime | format date "%Y-%m-%d")} }
     }
@@ -876,12 +983,12 @@ let carapace_completer = {|spans|
         }
       } | str join '.*')
 
-      let lower_pattern = ($pattern | str downcase)
+      let lower_pattern = ($pattern | str lowercase)
       $files
       | where {|f| $f =~ ('(?i)' + $regex) }
       | sort-by {|f|
-        let lower_f = ($f | str downcase)
-        let basename = ($f | path basename | str downcase)
+        let lower_f = ($f | str lowercase)
+        let basename = ($f | path basename | str lowercase)
         # Score: prefer contiguous matches in basename, then in full path, then by length
         if ($basename | str contains $lower_pattern) {
           0
