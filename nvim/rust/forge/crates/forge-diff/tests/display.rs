@@ -29,11 +29,19 @@ fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
         assert!(chunk.decorations <= limits.decorations.min(8192));
         assert_eq!(
             chunk.decorations,
-            chunk.rows.iter().map(|row| row.emphasis.len() + 1).sum()
+            chunk
+                .rows
+                .iter()
+                .map(|row| row.emphasis.len() + 1)
+                .sum::<usize>()
         );
         assert_eq!(
             chunk.text_bytes,
-            chunk.rows.iter().map(|row| row.text.len() + 1).sum()
+            chunk
+                .rows
+                .iter()
+                .map(|row| row.text.len() + 1)
+                .sum::<usize>()
         );
         rows.extend(chunk.rows);
         match chunk.state {

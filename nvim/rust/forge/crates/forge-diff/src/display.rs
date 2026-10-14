@@ -1,13 +1,16 @@
 //! Demand-driven rows preserve raw targets while bounding each delivery independently.
 
-use std::ops::Range;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    ops::Range,
+};
 
 use crate::body::{BodyKind, BodyPolicy, UnavailableReason};
 use crate::cache::AnalysisHandle;
 use crate::intraline::{FallbackReason, IntralinePolicy, IntralineResult, compare_replacement};
 use crate::raw::{RawDiff, RawHunkId};
 use crate::source::{SourceCoordinate, SourceSide};
-use crate::syntax::SyntaxHandle;
+use crate::syntax::{SyntaxHandle, SyntaxRange};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisplayHunk {
@@ -71,6 +74,7 @@ pub struct DisplayCursor {
     terminal: Option<DisplayState>,
     emphasis: Option<(RawHunkId, IntralineResult)>,
     compact_group_edges: bool,
+    context: usize,
     structural: Vec<StructuralContext>,
     before_index: usize,
     after_index: usize,
@@ -81,6 +85,86 @@ struct StructuralContext {
     label: Option<String>,
     before: Vec<Candidate>,
     after: Vec<Candidate>,
+}
+
+#[derive(Default)]
+struct ContextPlan {
+    label: Option<String>,
+    leading_scope: [Option<SyntaxRange>; 2],
+    trailing_scope: [Option<SyntaxRange>; 2],
+    selected: BTreeSet<(usize, usize)>,
+}
+
+impl ContextPlan {
+    fn collect(
+        diff: &RawDiff,
+        group: &DisplayHunk,
+        old: Option<&SyntaxHandle>,
+        new: Option<&SyntaxHandle>,
+    ) -> Self {
+        let mut plan = Self::default();
+        for (index, side, syntax) in [(0, SourceSide::Old, old), (1, SourceSide::New, new)] {
+            let Some(syntax) = syntax else {
+                continue;
+            };
+            for hunk in &diff.hunks()[group.raw_range.clone()] {
+                let lines = if side == SourceSide::Old {
+                    &hunk.old_lines
+                } else {
+                    &hunk.new_lines
+                };
+                for row in lines.clone() {
+                    let Some(context) = syntax.hunk_context(row) else {
+                        continue;
+                    };
+                    plan.leading_scope[index].get_or_insert(context.scope);
+                    plan.trailing_scope[index] = Some(context.scope);
+                    if plan.label.is_none() || side == SourceSide::New {
+                        let source = syntax.source().text();
+                        let start = source[..context.scope.start_byte]
+                            .rfind('\n')
+                            .map_or(0, |position| position + 1);
+                        let end = source[start..]
+                            .find('\n')
+                            .map_or(source.len(), |position| start + position);
+                        plan.label = Some(source[start..end].trim().to_owned());
+                    }
+                    for row in context.before.into_iter().chain(context.after) {
+                        if let Some(coordinates) = unchanged_coordinates(diff, side, row) {
+                            plan.selected.insert(coordinates);
+                        }
+                    }
+                }
+            }
+        }
+        plan
+    }
+
+    fn related(&self, next: &Self) -> bool {
+        for side in [1, 0] {
+            if let (Some(previous), Some(next)) =
+                (self.trailing_scope[side], next.leading_scope[side])
+            {
+                return (previous.start_byte <= next.start_byte
+                    && previous.end_byte >= next.end_byte)
+                    || (next.start_byte <= previous.start_byte
+                        && next.end_byte >= previous.end_byte);
+            }
+        }
+        false
+    }
+
+    fn extend(&mut self, next: Self) {
+        if next.label.is_some() {
+            self.label = next.label;
+        }
+        for side in 0..2 {
+            if next.trailing_scope[side].is_some() {
+                self.trailing_scope[side] = next.trailing_scope[side];
+            }
+        }
+        self.selected.extend(next.selected);
+    }
 }
 
 #[derive(Default)]
@@ -112,51 +196,128 @@ impl Default for ChunkLimits {
 }
 
 impl DisplayCursor {
+    /// Returns the source declaration introducing a group's innermost changed scope.
     pub fn context_label(&self, index: usize) -> Option<&str> {
         self.structural.get(index)?.label.as_deref()
     }
 
-    /// Adds source-bound parent rows without changing the raw membership of any display group.
-    /// Only unchanged rows are shared as context. Changes in other groups retain their own targets.
-    pub fn with_syntax_context(mut self, old: Option<&SyntaxHandle>, new: Option<&SyntaxHandle>) -> Self {
+    /// Merges related scopes across at most twice the context radius between padded windows.
+    /// Raw identities remain intact. Shared boundaries appear once, outside changed rows.
+    pub fn with_syntax_context(
+        mut self,
+        old: Option<&SyntaxHandle>,
+        new: Option<&SyntaxHandle>,
+    ) -> Self {
         let old_offset = source_offsets(self.diff.source().old.bytes());
         let new_offset = source_offsets(self.diff.source().new.bytes());
-        self.structural = self.group.iter().map(|group| {
-            let mut context = StructuralContext::default();
-            let mut selected = std::collections::BTreeSet::new();
-            for hunk in &self.diff.hunks()[group.raw_range.clone()] {
-                for (side, syntax, lines) in [(SourceSide::Old, old, &hunk.old_lines), (SourceSide::New, new, &hunk.new_lines)] {
-                    for row in lines.clone() {
-                        let Some(scope) = syntax.and_then(|syntax| syntax.hunk_context(row)) else { continue; };
-                        if context.label.is_none() || side == SourceSide::New { context.label = Some(scope.label); }
-                        for row in scope.before.into_iter().chain(scope.after) {
-                            if let Some((old, new)) = unchanged_coordinates(&self.diff, side, row) {
-                                selected.insert((old, new));
-                            }
-                        }
-                    }
+        let mut group: Vec<DisplayHunk> = Vec::new();
+        let mut plan: Vec<ContextPlan> = Vec::new();
+        for next in std::mem::take(&mut self.group) {
+            let context = ContextPlan::collect(&self.diff, &next, old, new);
+            if let Some(previous) = group.last_mut()
+                && next.old_lines.start.saturating_sub(previous.old_lines.end)
+                    <= self.context.saturating_mul(2)
+                && next.new_lines.start.saturating_sub(previous.new_lines.end)
+                    <= self.context.saturating_mul(2)
+                && plan
+                    .last()
+                    .is_some_and(|previous| previous.related(&context))
+            {
+                previous.old_lines.end = previous.old_lines.end.max(next.old_lines.end);
+                previous.new_lines.end = previous.new_lines.end.max(next.new_lines.end);
+                previous.raw_range.end = next.raw_range.end;
+                previous.raw_ids.extend(next.raw_ids);
+                plan.last_mut()
+                    .expect("merged group context")
+                    .extend(context);
+            } else {
+                group.push(next);
+                plan.push(context);
+            }
+        }
+        self.group = group;
+        let visible: Vec<_> = self
+            .group
+            .iter()
+            .map(|group| {
+                let first = &self.diff.hunks()[group.raw_range.start];
+                let last = &self.diff.hunks()[group.raw_range.end - 1];
+                if self.compact_group_edges {
+                    (
+                        first.old_lines.start..last.old_lines.end,
+                        first.new_lines.start..last.new_lines.end,
+                    )
+                } else {
+                    (group.old_lines.clone(), group.new_lines.clone())
+                }
+            })
+            .collect();
+        let mut owner = BTreeMap::new();
+        for (index, context) in plan.iter_mut().enumerate() {
+            context.selected.retain(|&(old, new)| {
+                let candidate = visible.partition_point(|(range, _)| range.end <= old);
+                !visible
+                    .get(candidate)
+                    .is_some_and(|(old_range, new_range)| {
+                        old_range.contains(&old) && new_range.contains(&new)
+                    })
+            });
+            for &(old, new) in &context.selected {
+                if old < visible[index].0.start && new < visible[index].1.start {
+                    owner.entry((old, new)).or_insert(index);
+                } else if old >= visible[index].0.end && new >= visible[index].1.end {
+                    owner.insert((old, new), index);
                 }
             }
-            let first = &self.diff.hunks()[group.raw_range.start];
-            let last = &self.diff.hunks()[group.raw_range.end - 1];
-            for (old, new) in selected {
-                let before = old < first.old_lines.start && new < first.new_lines.start;
-                let after = old >= last.old_lines.end && new >= last.new_lines.end;
-                if !before && !after { continue; }
-                let Some(&old_byte) = old_offset.get(old) else { continue; };
-                let Some(&new_byte) = new_offset.get(new) else { continue; };
-                let (bytes, advance_old) = line_range(self.diff.source().old.bytes(), old_byte);
-                let (_, advance_new) = line_range(self.diff.source().new.bytes(), new_byte);
-                let candidate = Candidate {
-                    kind: RowKind::Context,
-                    old: Some(SourceCoordinate { side: SourceSide::Old, line: old, byte_column: 0 }),
-                    new: Some(SourceCoordinate { side: SourceSide::New, line: new, byte_column: 0 }),
-                    raw_id: None, bytes, advance_old, advance_new, structural_before: Some(before),
+        }
+        self.structural = plan
+            .into_iter()
+            .enumerate()
+            .map(|(index, plan)| {
+                let mut context = StructuralContext {
+                    label: plan.label,
+                    ..Default::default()
                 };
-                if before { context.before.push(candidate); } else { context.after.push(candidate); }
-            }
-            context
-        }).collect();
+                for (old, new) in plan.selected {
+                    if owner.get(&(old, new)) != Some(&index) {
+                        continue;
+                    }
+                    let before = old < visible[index].0.start && new < visible[index].1.start;
+                    let Some(&old_byte) = old_offset.get(old) else {
+                        continue;
+                    };
+                    let Some(&new_byte) = new_offset.get(new) else {
+                        continue;
+                    };
+                    let (bytes, advance_old) = line_range(self.diff.source().old.bytes(), old_byte);
+                    let (_, advance_new) = line_range(self.diff.source().new.bytes(), new_byte);
+                    let candidate = Candidate {
+                        kind: RowKind::Context,
+                        old: Some(SourceCoordinate {
+                            side: SourceSide::Old,
+                            line: old,
+                            byte_column: 0,
+                        }),
+                        new: Some(SourceCoordinate {
+                            side: SourceSide::New,
+                            line: new,
+                            byte_column: 0,
+                        }),
+                        raw_id: None,
+                        bytes,
+                        advance_old,
+                        advance_new,
+                        structural_before: Some(before),
+                    };
+                    if before {
+                        context.before.push(candidate);
+                    } else {
+                        context.after.push(candidate);
+                    }
+                }
+                context
+            })
+            .collect();
         self
     }
 
@@ -203,6 +364,7 @@ impl DisplayCursor {
             terminal,
             emphasis: None,
             compact_group_edges,
+            context,
             structural: Vec::new(),
             before_index: 0,
             after_index: 0,
@@ -310,7 +472,11 @@ impl DisplayCursor {
             chunk.text_bytes += charge;
             chunk.decorations += decoration_charge;
             if let Some(before) = candidate.structural_before {
-                if before { self.before_index += 1; } else { self.after_index += 1; }
+                if before {
+                    self.before_index += 1;
+                } else {
+                    self.after_index += 1;
+                }
                 continue;
             }
             if candidate.old.is_some() {
@@ -394,7 +560,11 @@ impl DisplayCursor {
                 self.raw_index = group.raw_range.start;
                 self.initialized = true;
             }
-            if let Some(candidate) = self.structural.get(self.group_index).and_then(|context| context.before.get(self.before_index)) {
+            if let Some(candidate) = self
+                .structural
+                .get(self.group_index)
+                .and_then(|context| context.before.get(self.before_index))
+            {
                 return Some(candidate.clone());
             }
             let (kind, raw_id) = if self.raw_index < group.raw_range.end {
@@ -412,7 +582,11 @@ impl DisplayCursor {
             } else if !self.compact_group_edges && self.old.line < group.old_lines.end {
                 (RowKind::Context, None)
             } else {
-                if let Some(candidate) = self.structural.get(self.group_index).and_then(|context| context.after.get(self.after_index)) {
+                if let Some(candidate) = self
+                    .structural
+                    .get(self.group_index)
+                    .and_then(|context| context.after.get(self.after_index))
+                {
                     return Some(candidate.clone());
                 }
                 self.group_index += 1;
@@ -460,7 +634,9 @@ impl DisplayCursor {
 }
 
 fn source_offsets(source: &[u8]) -> Vec<usize> {
-    std::iter::once(0).chain(memchr::memchr_iter(b'\n', source).map(|position| position + 1)).collect()
+    std::iter::once(0)
+        .chain(memchr::memchr_iter(b'\n', source).map(|position| position + 1))
+        .collect()
 }
 
 fn unchanged_coordinates(diff: &RawDiff, side: SourceSide, line: usize) -> Option<(usize, usize)> {
@@ -470,12 +646,19 @@ fn unchanged_coordinates(diff: &RawDiff, side: SourceSide, line: usize) -> Optio
             SourceSide::Old => (&hunk.old_lines, &hunk.new_lines),
             SourceSide::New => (&hunk.new_lines, &hunk.old_lines),
         };
-        if selected.contains(&line) { return None; }
-        if selected.end > line { break; }
+        if selected.contains(&line) {
+            return None;
+        }
+        if selected.end > line {
+            break;
+        }
         offset += other.len() as isize - selected.len() as isize;
     }
     let other = line.checked_add_signed(offset)?;
-    Some(match side { SourceSide::Old => (line, other), SourceSide::New => (other, line) })
+    Some(match side {
+        SourceSide::Old => (line, other),
+        SourceSide::New => (other, line),
+    })
 }
 
 #[cfg(test)]

@@ -31,7 +31,7 @@ fn git(root: &Path, arguments: &[&str]) -> Vec<u8> {
             .env("GIT_AUTHOR_DATE", "2000-01-01T00:00:00Z")
             .env("GIT_COMMITTER_DATE", "2000-01-01T00:00:00Z");
     }
-    let output = read_command(
+    let output = std::thread::scope(|scope| scope.spawn(|| read_command(
         &mut command,
         CommandLimits {
             stdout_bytes: 64 * 1024,
@@ -39,7 +39,7 @@ fn git(root: &Path, arguments: &[&str]) -> Vec<u8> {
             timeout: Duration::from_secs(10),
         },
         || Ok(()),
-    )
+    )).join().expect("Git fixture command thread"))
     .unwrap();
     assert!(
         output.status.success(),
@@ -1687,6 +1687,69 @@ async fn display_group_context_stages_nearby_raw_hunks_only() {
 }
 
 #[tokio::test]
+async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
+    for (path, declaration, binding) in [
+        ("function.ts", "export function foo(): number {", "const"),
+        ("arrow.ts", "export const foo = (): number => {", "const"),
+        ("function.rs", "pub fn foo() -> i32 {", "let"),
+    ] {
+        let (directory, service, _, writer) = fixture().await;
+        let mut updates = service.subscribe_updates();
+        let mut original = vec![declaration.to_owned()];
+        original.extend((1..=44).map(|line| format!("    {binding} value_{line} = {line};")));
+        original.extend(["    return value_44;".into(), "}".into()]);
+        std::fs::write(directory.path().join(path), original.join("\n") + "\n").unwrap();
+        git(directory.path(), &["add", "--all"]);
+        git(directory.path(), &["commit", "-m", "semantic groups"]);
+        let mut changed = original.clone();
+        for row in [8, 13, 22, 36] {
+            changed[row] = format!("    {binding} value_{row} = {};", 900 + row);
+        }
+        std::fs::write(directory.path().join(path), changed.join("\n") + "\n").unwrap();
+        let opened = service.open(DocumentId(path.into()), directory.path().to_owned()).await.unwrap();
+        service.demand(input(&opened, path, 1, "demand")).await.unwrap();
+        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv()).await.unwrap().unwrap();
+        assert_eq!(update.phase, "context");
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        let selected = file(&snapshot, path, Some(StatusSection::Unstaged));
+        let loaded = body(&service, &snapshot, selected).await;
+        let headers: Vec<_> = loaded.block.iter().filter(|block| block.id.0.starts_with("hunk-header:")).collect();
+        assert_eq!(headers.len(), 2, "{path}");
+        assert_eq!(headers[0].text.wire_rows()[0], format!("@@ +3 -3 {declaration}"));
+        assert_eq!(headers[1].text.wire_rows()[0], format!("@@ +1 -1 {declaration}"));
+        assert_eq!(loaded.block.iter().flat_map(|block| block.text.wire_rows()).filter(|row| *row == declaration).count(), 1);
+        let bridge = format!("    {binding} value_18 = 18;");
+        let (block, row) = loaded.block.iter().find_map(|block| {
+            block.text.wire_rows().iter().position(|row| *row == bridge).map(|row| (block, row))
+        }).unwrap();
+        assert_eq!(block.target_at(TextPosition { row, column: 0 }), Some(&headers[0].metadata.target[0].id));
+        let mut captured = input(&snapshot, path, 2, "stage");
+        captured.location = body_location(selected, &loaded, block, row);
+        let outcome = service.input(captured).await.unwrap().finish().await.unwrap();
+        assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
+        writer.acknowledge(outcome.operation);
+        let index_path = format!(":{path}");
+        let index = String::from_utf8(git(directory.path(), &["show", &index_path])).unwrap();
+        for row in [8, 13, 22] { assert!(index.contains(&changed[row])); }
+        assert!(index.contains(&original[36]));
+        assert!(!index.contains(&changed[36]));
+        assert_eq!(std::fs::read_to_string(directory.path().join(path)).unwrap(), changed.join("\n") + "\n");
+
+        let snapshot = service.snapshot(&opened.document).await.unwrap();
+        let selected = file(&snapshot, path, Some(StatusSection::Staged));
+        let loaded = body(&service, &snapshot, selected).await;
+        let header = loaded.block.iter().find(|block| block.id.0.starts_with("hunk-header:")).unwrap();
+        let mut captured = input(&snapshot, path, 3, "unstage");
+        captured.location = body_location(selected, &loaded, header, 0);
+        let outcome = service.input(captured).await.unwrap().finish().await.unwrap();
+        assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
+        writer.acknowledge(outcome.operation);
+        assert_eq!(git(directory.path(), &["show", &index_path]), (original.join("\n") + "\n").as_bytes());
+        assert!(service.close(&opened.document));
+    }
+}
+
+#[tokio::test]
 async fn ignoring_staged_changes_unstages_and_persists_without_changing_worktree() {
     for kind in ["modified", "new", "deleted", "renamed", "partial"] {
         let (directory, service, _, writer) = fixture().await;
@@ -1947,7 +2010,7 @@ async fn optimistic_hunks_accept_stage_stage_unstage_before_git_and_preserve_con
             .text
             .wire_rows()
             .iter()
-            .any(|row| row.contains("Engine.run"))
+            .any(|row| row.contains("fn run() {"))
     }));
     let (block, row) = loaded
         .block
@@ -2049,7 +2112,7 @@ async fn optimistic_hunks_accept_stage_stage_unstage_before_git_and_preserve_con
                 .text
                 .wire_rows()
                 .iter()
-                .any(|row| row.contains("Engine.run"))
+                .any(|row| row.contains("fn run() {"))
         }));
     }
 }

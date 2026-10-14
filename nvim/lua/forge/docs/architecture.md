@@ -396,6 +396,14 @@ hunk targets, source coordinates, syntax, gutters, and fold metadata inside thos
 Lua validates the fragment through shared `forge.buffer` primitives and splices only that
 file's rows. Expanding one file does not serialize or validate unrelated headers or bodies.
 Body delivery does not advance the inventory revision.
+Native syntax adoption merges adjacent display groups when their scopes are equal or nested
+and the gap between their padded windows is at most six lines on both source sides.
+Each group retains the union of its raw hunk identities, so actions on bridge context stage
+or unstage exactly those edits. Larger gaps and unrelated sibling scopes remain separate.
+The display summary uses the innermost source declaration, including its signature, rather
+than only its name. Unchanged scope openers appear in the first containing group and closers
+in the last, with each source coordinate emitted once across the file's groups. Syntax
+adoption replaces the body generation before publishing the regrouped targets and rows.
 Read-only demand accepts an older inventory revision for a still-live file handle and
 serves its current generation. Future revisions, forged handles, and replayed input
 sequences remain invalid. This prevents unrelated context and mutation updates from

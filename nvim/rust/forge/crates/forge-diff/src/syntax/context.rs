@@ -15,7 +15,7 @@ pub struct HunkContext {
 
 impl SyntaxHandle {
     /// Finds parent boundaries and nearby siblings in the same parsed source used for highlights.
-    /// Context never determines which raw edits belong to a stageable display group.
+    /// Display grouping can use scope relationships without changing raw edit identities.
     pub fn hunk_context(&self, row: usize) -> Option<HunkContext> {
         let mut scope: Vec<_> = self.captures_intersecting_rows(row, row + 1)
             .filter(|capture| capture.family == SyntaxFamily::Context && capture.name.as_ref() == "scope")

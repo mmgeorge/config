@@ -1,93 +1,113 @@
-local fixture = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/support/status_fixture.lua")
 vim.loader.enable(false)
+local config = vim.fn.getcwd()
+vim.opt.runtimepath:prepend(config .. "/nvim")
+local builder = require("forge.builder")
+if vim.g.forge_manual_artifact_root then builder._set_artifact_root_for_test(vim.g.forge_manual_artifact_root) end
+assert(vim.fn.executable(builder.binary_path()) == 1, "build the release Forge host before this test")
 
-local forge = require("forge")
-local status = require("forge.status")
+local fixture = vim.fn.tempname() .. "-forge-semantic-hunks"
+vim.fn.mkdir(fixture, "p")
 
-local function assert_true(condition, message)
-  if not condition then error(message, 2) end
+---@param arguments string[]
+local function git(arguments)
+  local result = vim.system(vim.list_extend({ "git", "-C", fixture }, arguments), { text = true, timeout = 10000 }):wait()
+  assert(result.code == 0, result.stderr)
 end
 
-local function metadata(target)
-  return {
-    target = {},
-    decoration = {}, editable_region = {}, visible_decoration = {}, fold = {}, gutter = {},
-  }
-end
+---@type { path: string, declaration: string, binding: string }[]
+local source = {
+  { path = "function.ts", declaration = "export function foo(): number {", binding = "const" },
+  { path = "arrow.ts", declaration = "export const foo = (): number => {", binding = "const" },
+  { path = "function.rs", declaration = "pub fn foo() -> i32 {", binding = "let" },
+}
 
-local function merged_hunk_body(document)
-  local text = {
-          "@@ -57,26 +67,26 @@",
-          "  fn compact_neighbor(context: &gpu::Context) -> Self {",
-          "    let bind_group = context.create_bind_group(shaders::model::render::BindGroup1Descriptor {",
-          "      color_texture: color.clone(),",
-          "      normal_texture: normal.clone(),",
-          "      roughness_metallic_texture: metallic_roughness.clone(),",
-          "    });",
-          "    let particle_bind_group =",
-          "      context.create_bind_group(shaders::model::particle_render::BindGroup1Descriptor {",
-          "        color_texture: color,",
-          "      });",
-          "    // TODO: Initial size is not correct",
-          "    Self {",
-          "      particle_bind_group,",
-          "    }",
-        }
-  return fixture.body(document, text)
-end
-
-local function line_count(lines, needle)
-  local count = 0
-  for _, line in ipairs(lines) do
-    if line:find(needle, 1, true) then count = count + 1 end
+---@param entry { declaration: string, binding: string }
+---@param changed boolean
+---@return string[]
+local function source_rows(entry, changed)
+  local rows = { entry.declaration }
+  for row = 1, 44 do
+    local value = changed and vim.tbl_contains({ 8, 13, 22, 36 }, row) and 900 + row or row
+    rows[#rows + 1] = ("    %s value_%d = %d;"):format(entry.binding, row, value)
   end
-  return count
+  vim.list_extend(rows, { "    return value_44;", "}" })
+  return rows
 end
 
-local requested = {}
-status._set_runner_for_test(function(method, params, callback)
-  assert_true(method == "status", "Status hunk fixture must use the native route")
-  requested[#requested + 1] = params.operation
-  if params.operation == "open" then
-    callback(fixture.snapshot(params.document, { path = "src/compact_neighbor.rs" }))
-  elseif params.operation == "demand" then
-    callback(merged_hunk_body(params.input.document))
-  elseif params.operation == "close_view" then
-    callback(vim.NIL)
-  elseif params.operation == "close" then
-    callback({ closed = true })
-  else
-    error("unexpected native Status operation: " .. params.operation)
+git({ "init", "--quiet" })
+git({ "config", "user.name", "Forge Fixture" })
+git({ "config", "user.email", "forge@example.invalid" })
+git({ "config", "core.autocrlf", "false" })
+for _, entry in ipairs(source) do vim.fn.writefile(source_rows(entry, false), fixture .. "/" .. entry.path) end
+git({ "add", "." })
+git({ "commit", "--quiet", "-m", "semantic hunk fixture" })
+for _, entry in ipairs(source) do vim.fn.writefile(source_rows(entry, true), fixture .. "/" .. entry.path) end
+
+local client = require("forge.client")
+client._set_launcher_for_test(vim.system)
+local github = require("forge.integrations.gh")
+github.prs_for_branch_async = function(_, _, _, callback) vim.schedule(function() callback({ ok = true, prs = {} }) end) end
+github.current_pr_async = function(_, callback) vim.schedule(function() callback({ ok = true }) end) end
+---@type string[]
+local notices = {}
+local original_notify = vim.notify
+vim.notify = function(message, level)
+  if level == vim.log.levels.ERROR then notices[#notices + 1] = tostring(message) end
+end
+require("forge").setup({ about_auto_generate = false })
+local status = require("forge.status")
+local state = status.open({ workspace = fixture })
+---@type table<integer, boolean>
+local context_ready = {}
+local unsubscribe = client.subscribe_document(state.document, function(event, payload)
+  if event == "status.update" and payload.phase == "context" then
+    for _, body in ipairs(payload.body or {}) do context_ready[body.file] = true end
   end
 end)
 
-local ok, failure = xpcall(function()
-  forge.setup({ about_auto_generate = false })
-  local state = forge.open()
-  assert_true(vim.wait(2000, function() return state.replica.status == "Applied" end, 10),
-    "native Status did not apply the merged hunk snapshot")
-  vim.api.nvim_win_set_cursor(0, { 4, 0 })
-  vim.fn.maparg("<Tab>", "n", false, true).callback()
-  status.demand(state)
-  assert(vim.wait(2000, function() return state.replica.file[1].body ~= nil end))
-  local lines = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)
-  assert_true(line_count(lines, "@@ -57,26 +67,26 @@") == 1,
-    "native Status split one virtual hunk into multiple headers")
-  assert_true(line_count(lines, "let particle_bind_group =") == 1,
-    "native Status duplicated a neighboring virtual hunk")
-  assert_true(line_count(lines, "// TODO: Initial size is not correct") == 1,
-    "native Status omitted or duplicated bridge context between merged hunks")
-  assert_true(line_count(lines, "    Self {") == 1,
-    "native Status duplicated semantic context in the merged hunk")
-  assert_true(requested[1] == "open", "native Status did not request its document")
-  status.close(state)
-  assert_true(vim.wait(1000, function() return not state.active end, 10), "native Status did not close the merged hunk document")
+local success, failure = xpcall(function()
+  assert(vim.wait(10000, function() return state.ready and state.replica.status == "Applied" end, 10), "status did not open")
+  for _, entry in ipairs(source) do
+    local file
+    for _, candidate in ipairs(state.replica.inventory.file) do
+      if candidate.path == entry.path then file = candidate break end
+    end
+    assert(file, "missing file " .. entry.path)
+    local _, row = state.replica.sequence:position("file:" .. file.id)
+    vim.api.nvim_win_set_cursor(0, { row + 1, 0 })
+    require("forge.nodes").set_open(state.replica, 0, "file:" .. file.id, true)
+    status.demand(state)
+    assert(vim.wait(10000, function()
+      return context_ready[file.id] and state.replica.file[file.id].body and state.done[file.id] and not state.request_active
+    end, 10), "semantic context did not load for " .. entry.path)
+    local body = state.replica.file[file.id].body
+    ---@type string[]
+    local headers = {}
+    local declaration_count, closing_count, bridge_count, hidden_count = 0, 0, 0, 0
+    for _, block in pairs(body.block) do
+      for _, text in ipairs(block.text) do
+        if text:match("^@@") then headers[#headers + 1] = text end
+        if text == entry.declaration then declaration_count = declaration_count + 1 end
+        if text == "}" then closing_count = closing_count + 1 end
+        if text == ("    %s value_18 = 18;"):format(entry.binding) then bridge_count = bridge_count + 1 end
+        if text == ("    %s value_29 = 29;"):format(entry.binding) then hidden_count = hidden_count + 1 end
+      end
+    end
+    table.sort(headers)
+    local expected = { "@@ +1 -1 " .. entry.declaration, "@@ +3 -3 " .. entry.declaration }
+    assert(vim.deep_equal(headers, expected), entry.path .. ": " .. vim.inspect(headers))
+    assert(declaration_count == 1 and closing_count == 1, entry.path .. ": repeated or missing scope boundaries")
+    assert(bridge_count == 1, entry.path .. ": missing or duplicated bridge context")
+    assert(hidden_count == 0, entry.path .. ": distant changes merged")
+  end
+  assert(#notices == 0, table.concat(notices, "\n"))
 end, debug.traceback)
 
-status._set_runner_for_test(nil)
-if not ok then
-  vim.api.nvim_err_writeln(failure)
-  vim.cmd("cquit 1")
-end
-print("status_virtual_hunk_merge: native merged-hunk projection passed")
+unsubscribe()
+status.close(state)
+client.stop()
+assert(vim.wait(10000, function() return client._client.process == nil end, 20), "Forge host did not stop")
+vim.notify = original_notify
+assert(success, failure)
+print("status_virtual_hunk_merge: real TypeScript, arrow, and Rust semantic grouping passed")
 vim.cmd("qa!")
