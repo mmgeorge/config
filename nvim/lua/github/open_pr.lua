@@ -17,8 +17,16 @@ local compact_diff_options = {
   hunk_head_lines = 12,
 }
 
-local pr_system_prompt = [[You write GitHub pull request descriptions.
-Return ONLY the PR description paragraph. Do not include a title, markdown headings, checklist, code fences, explanation, alternatives, or preface.]]
+local pr_system_prompt = [[You write concise GitHub pull request descriptions for code reviewers.
+Return ONLY 2-4 sentences across one or two short prose paragraphs. Do not include a title, markdown headings, checklist, code fences, explanation, alternatives, or preface.
+
+Build the description around one controlling claim about what changed and what the reviewer should understand:
+- Lead with the feature, fix, or capability and its reviewer-visible outcome.
+- Explain the relevant pressure or prior limitation only when the supplied evidence establishes it.
+- Describe the operative mechanism through accurate ownership, data flow, contracts, or lifecycle boundaries.
+- State the concrete consequence that follows from that mechanism when the relationship is not self-evident.
+
+Use a before/now contrast only when the diff proves a change to existing behavior. Ground every claim in the supplied repository evidence. Use active voice, stable domain terms, and concrete actors, operations, and values. Do not invent motivations, guarantees, architectural terms, or user benefits. Do not enumerate files, commits, hunks, or tests. Avoid generic claims such as "improves", "enhances", "simplifies", "robust", or "flexible" unless the evidence states the exact work removed, behavior changed, or boundary enforced.]]
 
 local pr_header = [[Related #]]
 
@@ -291,7 +299,7 @@ local function build_context(branch, base_ref, diff_stat, raw_diff)
   local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, pr_context_limit.diff)
   local truncated = stat_truncated or diff_truncated
   local sections = {
-    "Generate a description for a draft GitHub PR.",
+    "Write the draft PR description from the repository evidence below.",
     "Base branch: " .. base_ref:gsub("^origin/", ""),
     "Comparison ref used for the diff: " .. base_ref,
     "Head branch: " .. branch,
@@ -314,13 +322,8 @@ local function build_context(branch, base_ref, diff_stat, raw_diff)
   end
 
   table.insert(sections, "Compact diff context:\n```diff\n" .. truncated_diff .. "\n```")
-  table.insert(sections, table.concat({
-    "Provide a PR description paragraph for the changes above.",
-    "3-4 sentence before/now story with precise, accessible prose.",
-    "Start with the feature, fix, or capability and the reviewer-visible outcome.",
-    "Then explain the old limitation and the new role-level architecture.",
-    "Name central constructs when they clarify ownership or a review boundary.",
-  }, " "))
+  table.insert(sections, "Treat the summary and diff as evidence. Synthesize the complete change into one coherent "
+    .. "operating story instead of enumerating files, commits, or hunks.")
   return table.concat(sections, "\n\n")
 end
 
@@ -509,7 +512,7 @@ end
 local function generate_description(context, callback)
   local ok_adapters, adapters = pcall(require, "ai.adapters")
   local selected = ok_adapters and adapters.get() or {}
-  local model = selected.pr_create or selected.commit or "copilot,model=gpt-4.1"
+  local model = selected.pr_create or selected.commit or "copilot-cli,model=gpt-5.6-luna,thinking=low"
 
   show_progress("Generating PR description with " .. model .. "...")
   require("ai").generate({
@@ -663,6 +666,8 @@ M._get_base_branch_for_test = function(cwd)
   return get_stored_base_branch(cwd)
 end
 M._default_base_branch_from_branches_for_test = default_base_branch_from_branches
+M._build_context_for_test = build_context
+M._pr_system_prompt_for_test = pr_system_prompt
 M._set_state_path_for_test = function(path)
   state_path_for_test = path
   state_cache = nil

@@ -96,7 +96,7 @@ M.settings = {
                 size = 0.25,
                 first_run_commands = {
                   commands = {
-                    'git submodule update --init --recursive; pnpm install; pnpm core:start',
+                    'pnpm install',
                   },
                 },
               },
@@ -105,7 +105,7 @@ M.settings = {
           { title = 'copilot',
             first_run_commands = {
               commands = {
-                'load-env { "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/Users/matt9222/Developer/maps/prompts", "COPILOT_SKILLS_DIR": "/Users/matt9222/Developer/maps/skills" }; co',
+                'load-env { "COPILOT_CUSTOM_INSTRUCTIONS_DIRS": "/Users/matt9222/Developer/webgis/prompts", "COPILOT_SKILLS_DIR": "/Users/matt9222/Developer/webgis/skills" }; co',
               },
             },
           },
@@ -1717,7 +1717,6 @@ end
 local function worktree_creation_command(repo, opts, workspace_name)
   local command = {
     'nu',
-    '--no-config-file',
     M.settings.creation_runner_path,
     '--repository-path',
     repo.main_path,
@@ -2596,49 +2595,9 @@ local function worktree_label(worktree, current_workspace, current_worktree)
   return prefix .. worktree.repo_name .. ' [' .. branch .. '] - ' .. target
 end
 
-function M.handle_user_var_changed(window, pane, name, value)
-  if name ~= 'WORKTREE_CREATE_READY' and name ~= 'WORKTREE_CREATE_FAILED' then
-    return
-  end
-
-  local pending = pending_creations()[value]
-  if not pending then
-    return
-  end
-
-  pending_creations()[value] = nil
-  if name == 'WORKTREE_CREATE_FAILED' then
-    notify(window, 'Worktree creation failed. The Git error remains visible in the workspace')
-    return
-  end
-
-  finish_created_worktree(window, {
-    main_path = pending.repo_main_path,
-  }, pending)
-end
-
-function M.handle_update_status(window, pane)
+local function apply_pending_layout(window, pane)
   local pending = pending_layouts()[window:active_workspace()]
   if not pending then
-    local pending_removal = pending_removals()[window:active_workspace()]
-    if pending_removal then
-      pending_removals()[pending_removal.target_workspace_name] = nil
-      remove_worktree(window, pending_removal)
-    end
-
-    local pending_session_removal = pending_session_removals()[window:active_workspace()]
-    if pending_session_removal then
-      pending_session_removals()[pending_session_removal.target_workspace_name] = nil
-      wait_for_workspace_to_close(
-        window,
-        pending_session_removal.source_workspace_name,
-        20,
-        function()
-          return finish_remove_session(window, pending_session_removal.source_workspace_name)
-        end,
-        'Could not close session ' .. pending_session_removal.source_workspace_name
-      )
-    end
     return
   end
 
@@ -2659,6 +2618,36 @@ function M.handle_update_status(window, pane)
       end
     end)
   end
+end
+
+function M.handle_user_var_changed(window, pane, name, value)
+  if name ~= 'WORKTREE_CREATE_READY' and name ~= 'WORKTREE_CREATE_FAILED' then
+    return
+  end
+
+  local pending = pending_creations()[value]
+  if not pending then
+    return
+  end
+
+  pending_creations()[value] = nil
+  if name == 'WORKTREE_CREATE_FAILED' then
+    notify(window, 'Worktree creation failed. The Git error remains visible in the workspace')
+    return
+  end
+
+  finish_created_worktree(window, {
+    main_path = pending.repo_main_path,
+  }, pending)
+
+  -- Apply the completed workspace layout without waiting for a periodic status event.
+  if window:active_workspace() == value then
+    apply_pending_layout(window, pane)
+  end
+end
+
+function M.handle_update_status(window, pane)
+  apply_pending_layout(window, pane)
 
   local pending_removal = pending_removals()[window:active_workspace()]
   if pending_removal then

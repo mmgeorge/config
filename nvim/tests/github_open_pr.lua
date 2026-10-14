@@ -345,14 +345,21 @@ local function run_tests()
   end, "create flow base confirmation did not render")
   press("y")
   wait_for(function() return generated_model == "test-pr-create-model" end, "PR create did not use pr_create adapter")
-  assert_true(generated_system:find("Return ONLY the PR description paragraph", 1, true) ~= nil, "PR prompt should request only a description")
+  assert_true(
+    generated_system:find("Build the description around one controlling claim", 1, true) ~= nil,
+    "PR prompt should establish a controlling claim"
+  )
+  assert_true(
+    generated_system:find("Use a before/now contrast only when the diff proves", 1, true) ~= nil,
+    "PR prompt should condition before/now framing on evidence"
+  )
   assert_true(
     generated_prompt:find("Compact diff context:", 1, true) ~= nil,
     "PR prompt should include compact diff context"
   )
   assert_true(
-    generated_prompt:find("Provide a PR description paragraph for the changes above", 1, true) ~= nil,
-    "PR prompt should include description instructions"
+    generated_prompt:find("Synthesize the complete change into one coherent operating story", 1, true) ~= nil,
+    "PR prompt should request a coherent synthesis"
   )
   wait_for(function()
     return opened_pull_request ~= nil

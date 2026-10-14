@@ -30,7 +30,7 @@ function M.get()
     inline = "copilot",
     cmd = "copilot",
     commit = "copilot,model=gpt-4.1",
-    pr_create = "copilot,model=gpt-4.1",
+    pr_create = "copilot-cli,model=gpt-5.6-luna,thinking=low",
     inline_edit = "copilot-mini",
   }
 end

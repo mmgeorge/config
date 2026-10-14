@@ -1,0 +1,43 @@
+[
+  {
+    "skills": ["maps-sdk"],
+    "query": "One signed-in ArcGIS Play app session is connected, owned by the authenticated user, and can be saved. Create and persist an app for https://sampleserver6.arcgisonline.com/arcgis/rest/services/Census/MapServer/3 with a legend.",
+    "expected_behavior": [
+      "Consults the local FeatureLayer source or tests before external Maps SDK documentation",
+      "Uses the exact MapServer/3 layer endpoint in FeatureLayer.url",
+      "Uses ArcGIS map components and esri imports without adding CDN loader tags",
+      "Saves the owned app, follows the returned refresh state, and verifies editor, runtime, and view-state evidence"
+    ]
+  },
+  {
+    "skills": ["maps-sdk", "portal", "parquet"],
+    "query": "Find the census_blocks Parquet Feature Layer in the JSAPI organization at https://jsapi.maps.arcgis.com and build a Play app centered on Philadelphia.",
+    "expected_behavior": [
+      "Delegates item discovery to the portal skill and dataset inspection to the parquet skill",
+      "Resolves an exact item ID, item type, and Portal URL instead of relying on title alone",
+      "Constructs Portal, PortalItem, ParquetPortalItemData, and ParquetLayer using the local source pattern",
+      "Uses the requested Philadelphia viewpoint and applies a scale threshold for dense census blocks",
+      "Verifies that the live view contains a parquet layer and has no unexpected diagnostics"
+    ]
+  },
+  {
+    "skills": ["maps-sdk"],
+    "query": "Exactly one ArcGIS Play app session is connected. Inspect it without changing or saving it and tell me what it does.",
+    "expected_behavior": [
+      "Lists live Play sessions before assuming the current browser tab is connected",
+      "Reads code, diagnostics, runtime events, and live view state without editing the app",
+      "Reports zero sessions as a bridge connection problem",
+      "Separates successful view initialization from blocking editor or runtime errors"
+    ]
+  },
+  {
+    "skills": ["maps-sdk"],
+    "query": "Two ArcGIS Play sessions are connected: my owned existing app and a separate blank signed-in scratch document. Build and save the requested map only in the blank document without replacing my existing app.",
+    "expected_behavior": [
+      "Explains that play-mcp cannot create a browser document directly",
+      "Requires a separate blank Play app or scratch session before replacing buffers",
+      "Selects the new connected session by metadata rather than modifying the existing app",
+      "Saves and verifies the new document only after the requested app runs successfully"
+    ]
+  }
+]
