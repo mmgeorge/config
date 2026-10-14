@@ -37,7 +37,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             let source = output.inline_chunk(chunk)?;
             let mut rows = if chunk == 0 {
                 output.header().map_or(Ok(Vec::new()), |header|
-                    command_source_rows(self.profile, &header.kind, &header.title))?
+                    tool_source_rows(self.profile, &header.kind, &header.title))?
             } else { Vec::new() };
             if source.is_empty() && chunk == 0 {
                 rows.extend(tool_body_rows(self.profile,"no output",rows.is_empty())?);
@@ -237,7 +237,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         let duration = tool_duration(elapsed_ms);
         let mut row = vec![tool_heading(self.profile, kind, title, &duration)?];
         let title_rows = row.len();
-        if expanded { row.extend(command_source_rows(self.profile, kind, title)?); }
+        if expanded { row.extend(tool_source_rows(self.profile, kind, title)?); }
         row.extend(tool_output_rows(self.profile, output, expanded)?);
         let text = BufferText::from_rows(row)?;
         let range = TextRange {
@@ -376,7 +376,10 @@ fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str)
     Ok(best)
 }
 
-fn command_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<Vec<String>> {
+fn tool_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<Vec<String>> {
+    if kind == "tool_call" && title.contains('(') {
+        return tool_body_rows(profile, &format!("Call: {title}"), true);
+    }
     if kind != "command" { return Ok(Vec::new()); }
     let display = crate::permissions::command::display_command(title,
         crate::permissions::shell::CommandShell::default());
@@ -600,8 +603,11 @@ mod test {
         let rows = block.text.wire_rows();
         assert!(rows[0].starts_with("•    2s sem.sem_context({"));
         assert!(rows[0].contains('…'));
-        assert_eq!(rows.len(), 2);
-        assert_eq!(rows[1], "  └ response");
+        assert!(rows.len() > 2);
+        assert_eq!(*rows.last().unwrap(), "  └ response");
+        let call = rows[1..rows.len() - 1].iter()
+            .map(|row| row.trim().trim_start_matches('└').trim()).collect::<String>();
+        assert_eq!(call.strip_prefix("Call:").unwrap().trim(), format!("sem.sem_context({arguments})"));
         assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= profile.columns));
         Ok(())
     }
@@ -724,6 +730,30 @@ mod test {
             body.validate()?;
         }
         assert_eq!(tool_heading(&profile,"command","rg -n TODO src","1s")?, "• 1s rg -n TODO src");
+        Ok(())
+    }
+
+    #[test]
+    fn expanded_tools_preserve_arguments_beyond_the_heading_width() -> Result<()> {
+        let profile = WidthProfile { columns: 48, ..WidthProfile::default() };
+        let renderer = TranscriptRenderer::new(&profile)?;
+        let source = r#"fixture.inspect({"path":"src/deeply/nested/module.rs","offset":123,"limit":456})"#;
+        let call = crate::turn::ToolCall {
+            id: "call".into(), kind: "tool_call".into(), title: source.into(),
+            output: String::new(), started_at_ms: Some(0), completed_at_ms: Some(100),
+            task_id: None, status: "completed".into(), failed: false, change: Default::default(),
+        };
+        let mut output = ToolOutputView::new("call".into(), "tool result\n")?;
+        output.heading(&call);
+        let header = renderer.tool_header(BlockId("call".into()), TargetId("call".into()),
+            "tool_call", Some(100), false, source, true)?;
+        assert!(!header.text.row(0).unwrap().contains("456"));
+        let body = renderer.tool_body("call", &output, true, 0)?;
+        let rows = body.text.wire_rows();
+        let joined = rows.iter().map(|row| row.trim().trim_start_matches('└').trim()).collect::<String>();
+        assert!(joined.contains(source), "expanded call lost arguments: {joined}");
+        assert!(joined.contains("tool result"));
+        body.validate()?;
         Ok(())
     }
 

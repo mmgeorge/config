@@ -2859,6 +2859,16 @@ Codex publishes every tool lifecycle update to the owning turn. Tool records mer
 provider address and call ID, never by tool name or arguments. Repeating a control call with
 the same arguments creates a separate lifetime. Replayed updates retain the original start
 and completion timestamps. Accepted control effects deduplicate by provider call identity.
+MCP and dynamic calls include deterministically ordered, credential-redacted arguments in
+their titles. Dynamic call completion retains every text output block and treats a false
+success flag as failure even when the provider lifecycle status is completed.
+Expanded tool bodies include the complete call with wrapped arguments independently of
+the single-line heading's width limit.
+Thread start and resume request automatic reasoning summaries in native configuration,
+and every explicit turn start requests the same summary mode. Readable summary deltas
+retain item and section identities. Completed reasoning items replace those sections
+with authoritative snapshots, including sections delivered without deltas. Summary part
+boundaries create no content, and raw reasoning remains separate from readable summaries.
 Catalog and background-terminal connections observe shared app-server broadcasts without
 answering provider requests. Only the connection owning the active turn responds to controls
 and approvals. An observer must not reject a broadcast, because its response can win the race

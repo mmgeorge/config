@@ -141,17 +141,18 @@ local ok, failure = xpcall(function()
   local function refresh()
     local count = #requests
     owner.sync()
-    assert(vim.wait(500, function() return #requests > count end, 1))
+    assert(vim.wait(500, function()
+      return #requests > count and requests[#requests].params.operation == "sync"
+    end, 1))
     return requests[#requests]
   end
-  for _ = 1, 3 do
-    refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
-  end
-  assert(#notices == 1, "repeated refresh failure flooded notifications: " .. vim.inspect(notices))
-  assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
-  refresh().callback({ patch = {} })
   refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
-  assert(#notices == 2, "a failure after successful recovery was suppressed")
+  local failed_count = #requests
+  for _ = 1, 3 do owner.sync() end
+  assert(#requests == failed_count, "failed presentation retried a request requiring reopening")
+  assert(owner.failure and owner.failure:find("Reopen Harness to retry", 1, true))
+  assert(#notices == 1, "refresh failure flooded notifications: " .. vim.inspect(notices))
+  assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
   assert(owner.close())
 end, debug.traceback)
 client.request_for = original_request

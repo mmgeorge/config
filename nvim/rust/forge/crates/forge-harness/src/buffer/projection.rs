@@ -2450,7 +2450,7 @@ mod tests {
         project_at, project_at_with_separator, session_event_text,
     };
     use forge_buffer::width::WidthProfile;
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
 
     use crate::{
@@ -3157,7 +3157,7 @@ mod tests {
             assert_eq!(&groups[0].id, &*retained_id);
             assert!(!groups[0].metadata.fold[0].closed, "the latest running tool lost its preview");
             for owner in 1..=ordinal {
-                assert!(projected.tool.contains_key(&format!("turn-{owner}:shared-call")),
+                assert!(projected.tool.contains_key(&format!("{}:shared-call", exchange.turn[owner as usize - 1].id())),
                     "grouping replaced a tool's provider-turn identity");
             }
             event.activity.as_mut().unwrap().status = Some("completed".into());

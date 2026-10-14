@@ -1017,6 +1017,15 @@ async fn normalize_event_in_workspace(
         append_output_event(output, event);
         return;
     }
+    if let Some(events) = normalize_reasoning(method, &params, address.clone()) {
+        for event in events {
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send_wait(event.clone()).await;
+            }
+            append_output_event(output, event);
+        }
+        return;
+    }
     if let Some(event) = normalize_message(method, &params, address.clone(), output) {
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send_wait(event.clone()).await;
@@ -1132,7 +1141,6 @@ async fn normalize_event_in_workspace(
     let tool_event = is_tool_lifecycle_event(&method_lower, &params);
     let plan_event = method_lower.contains("plan");
     let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
-    let reasoning_summary_event = method_lower == "item/reasoning/summarytextdelta";
     let assistant_event = method_lower.contains("agentmessage");
     let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
     let kind = if tool_event {
@@ -1142,8 +1150,6 @@ async fn normalize_event_in_workspace(
         "error"
     } else if plan_event {
         "plan"
-    } else if reasoning_summary_event {
-        "reasoning_summary"
     } else if reasoning_event {
         "reasoning"
     } else {
@@ -1182,20 +1188,7 @@ async fn normalize_event_in_workspace(
         let task_update = plan_event
             .then(|| normalize_task_update(method, &params))
             .flatten();
-        let provider_message_id = reasoning_summary_event.then(|| {
-            let item_id = pointer_string(&params, &["/itemId", "/item_id", "/item/id"])
-                .unwrap_or_else(|| "reasoning".into());
-            let summary_index = params
-                .pointer("/summaryIndex")
-                .or_else(|| params.pointer("/summary_index"))
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            format!("{item_id}:summary:{summary_index}")
-        });
-        let mut data = json!({ "method": method, "params": params });
-        if let Some(provider_message_id) = provider_message_id {
-            data["provider_message_id"] = Value::String(provider_message_id);
-        }
+        let data = json!({ "method": method, "params": params });
         let event = BackendEvent {
             address,
             received_at_ms: None,
@@ -1212,6 +1205,65 @@ async fn normalize_event_in_workspace(
         }
         append_output_event(output, event);
     }
+}
+
+fn normalize_reasoning(
+    method: &str,
+    params: &Value,
+    address: Option<crate::backend::ProviderAddress>,
+) -> Option<Vec<BackendEvent>> {
+    let delta = method.eq_ignore_ascii_case("item/reasoning/summaryTextDelta");
+    let boundary = method.eq_ignore_ascii_case("item/reasoning/summaryPartAdded");
+    let lifecycle = matches!(method, "item/started" | "item/completed")
+        && params.pointer("/item/type").and_then(Value::as_str) == Some("reasoning");
+    if !delta && !boundary && !lifecycle {
+        return None;
+    }
+    if boundary {
+        return Some(Vec::new());
+    }
+    let item_id = pointer_string(params, &["/itemId", "/item_id", "/item/id"])?;
+    let sections = if delta {
+        vec![(
+            params
+                .get("summaryIndex")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            params.get("delta").and_then(Value::as_str)?.to_owned(),
+        )]
+    } else {
+        params
+            .pointer("/item/summary")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter_map(|(index, text)| text.as_str().map(|text| (index as u64, text.to_owned())))
+            .collect()
+    };
+    Some(
+        sections
+            .into_iter()
+            .map(|(index, text)| {
+                let mut data = json!({"method":method,"params":params,
+            "provider_message_id":format!("{item_id}:summary:{index}")});
+                if lifecycle {
+                    data["message_update"] = json!("snapshot");
+                }
+                BackendEvent {
+                    address: address.clone(),
+                    received_at_ms: None,
+                    turn_boundary: None,
+                    kind: "reasoning_summary".into(),
+                    text: Some(text),
+                    data,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Preserve message identity and phase across Codex item snapshots and text deltas.
@@ -1796,7 +1848,7 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
     let generic_item = kind == ToolActivityKind::ToolCall
         && !item_type.is_empty()
         && !matches!(item_type.as_str(), "mcptoolcall" | "dynamictoolcall");
-    let title = mcp_tool_title(item)
+    let title = callable_tool_title(item)
         .or_else(|| builtin_tool_title(item))
         .or_else(|| {
             [
@@ -1830,9 +1882,10 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
     } else {
         mcp_tool_output(item)
             .or_else(|| {
-                item.get("contentItems")
-                    .and_then(first_text)
-                    .map(strip_ansi_escapes::strip_str)
+                item.get("contentItems").and_then(Value::as_array).map(|contents| {
+                    contents.iter().filter_map(first_text)
+                        .map(strip_ansi_escapes::strip_str).collect::<Vec<_>>().join("\n")
+                }).filter(|text| !text.is_empty())
             })
             .or_else(|| {
                 item.get("aggregatedOutput")
@@ -1851,7 +1904,8 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
                     })
             })
     };
-    let status = item
+    let status = item.get("success").and_then(Value::as_bool)
+        .filter(|success| !success).map(|_| "failed".to_owned()).or_else(|| item
         .get("status")
         .or_else(|| envelope.get("status"))
         .and_then(Value::as_str)
@@ -1870,7 +1924,7 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
             method_lower
                 .eq("item/mcptoolcall/progress")
                 .then(|| "inProgress".to_owned())
-        });
+        }));
     Some(ToolActivity {
         id,
         kind,
@@ -1993,28 +2047,44 @@ fn tool_title(value: &Value) -> Option<String> {
     }
 }
 
-fn mcp_tool_title(item: &Value) -> Option<String> {
-    item.get("type")
-        .and_then(Value::as_str)
-        .is_some_and(|item_type| item_type.eq_ignore_ascii_case("mcpToolCall"))
-        .then_some(())?;
-    let server = item.get("server").and_then(Value::as_str)?;
+fn callable_tool_title(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if !item_type.is_empty()
+        && !item_type.eq_ignore_ascii_case("mcpToolCall")
+        && !item_type.eq_ignore_ascii_case("dynamicToolCall")
+    {
+        return None;
+    }
     let tool = item.get("tool").and_then(Value::as_str)?;
-    let arguments = item
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
+    let namespace = item
+        .get("server")
+        .or_else(|| item.get("namespace"))
+        .and_then(Value::as_str);
+    let title = namespace
+        .filter(|namespace| !namespace.is_empty())
+        .map_or_else(
+            || tool.to_owned(),
+            |namespace| format!("{namespace}.{tool}"),
+        );
+    let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let arguments = match arguments {
+        Value::String(ref encoded) => serde_json::from_str(encoded).ok()?,
+        arguments => arguments,
+    };
     let mut arguments = redact_tool_arguments(&arguments);
     arguments.sort_all_objects();
     let arguments = serde_json::to_string(&arguments).ok()?;
-    compact_tool_title(&format!("{server}.{tool}({arguments})"))
+    compact_tool_title(&format!("{title}({arguments})"))
 }
 
 fn generic_tool_title(item: &Value) -> Option<String> {
     let title = item.get("type").and_then(Value::as_str)?;
     let mut details = redact_tool_arguments(item);
     details.sort_all_objects();
-    Some(format!("{title}({})", serde_json::to_string(&details).ok()?))
+    Some(format!(
+        "{title}({})",
+        serde_json::to_string(&details).ok()?
+    ))
 }
 
 fn builtin_tool_title(item: &Value) -> Option<String> {
@@ -2371,6 +2441,66 @@ mod test {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn reasoning_snapshots_reconcile_sections_without_losing_or_duplicating_text() {
+        let mut output = BackendOutput::default();
+        for message in [
+            json!({"method":"item/started","params":{"threadId":"thread","turnId":"turn",
+                "item":{"id":"reasoning","type":"reasoning","summary":[],"content":[]}}}),
+            json!({"method":"item/reasoning/summaryTextDelta","params":{"threadId":"thread","turnId":"turn",
+                "itemId":"reasoning","summaryIndex":0,"delta":"Partial"}}),
+            json!({"method":"item/reasoning/summaryPartAdded","params":{"threadId":"thread","turnId":"turn",
+                "itemId":"reasoning","summaryIndex":1}}),
+            json!({"method":"item/completed","params":{"threadId":"thread","turnId":"turn",
+                "item":{"id":"reasoning","type":"reasoning","summary":["Corrected first section","Snapshot only section"],
+                    "content":["raw reasoning must not become a summary"]}}}),
+        ] {
+            normalize_event(&message, &mut output, None).await;
+        }
+        assert_eq!(output.event.len(), 2);
+        assert_eq!(
+            output.event[0].text.as_deref(),
+            Some("Corrected first section")
+        );
+        assert_eq!(
+            output.event[1].text.as_deref(),
+            Some("Snapshot only section")
+        );
+        assert_eq!(output.event[0].message_id(), Some("reasoning:summary:0"));
+        assert_eq!(output.event[1].message_id(), Some("reasoning:summary:1"));
+        assert!(
+            output
+                .event
+                .iter()
+                .all(|event| event.kind == "reasoning_summary" && event.message_snapshot())
+        );
+    }
+
+    #[tokio::test]
+    async fn dynamic_calls_retain_arguments_all_output_and_failure_status() {
+        let mut output = BackendOutput::default();
+        for method in ["item/started", "item/completed"] {
+            normalize_event(&json!({"method":method,"params":{"threadId":"thread","turnId":"turn",
+                "item":{"id":"dynamic","type":"dynamicToolCall","tool":"fixture_read",
+                    "namespace":"fixture","arguments":"{\"path\":\"README.md\",\"api_key\":\"secret\"}",
+                    "status":if method == "item/started" { "inProgress" } else { "completed" },
+                    "success":if method == "item/completed" { json!(false) } else { Value::Null },
+                    "contentItems":[{"type":"inputText","text":"first block"},{"type":"inputText","text":"second block"}]}}}),
+                &mut output, None).await;
+        }
+        assert_eq!(output.event.len(), 1);
+        let activity = output.event[0].activity.as_ref().unwrap();
+        assert_eq!(
+            activity.title,
+            "fixture.fixture_read({\"api_key\":\"[REDACTED]\",\"path\":\"README.md\"})"
+        );
+        assert_eq!(
+            activity.output.as_deref(),
+            Some("first block\nsecond block")
+        );
+        assert_eq!(activity.status.as_deref(), Some("failed"));
+    }
 
     #[tokio::test]
     async fn separates_readable_reasoning_summaries_from_raw_reasoning() {
@@ -2887,7 +3017,7 @@ mod test {
             .as_ref()
             .expect("control tool activity");
         assert_eq!(activity.id, "plan-edit-1");
-        assert_eq!(activity.title, "harness_plan_edit");
+        assert_eq!(activity.title, "harness_plan_edit({\"expected_version\":1,\"plan\":{\"overview\":\"Updated overview\"},\"plan_id\":\"plan-1\"})");
         assert_eq!(activity.status.as_deref(), Some("completed"));
         assert_eq!(activity.output.as_deref(), Some("Plan edit accepted."));
     }

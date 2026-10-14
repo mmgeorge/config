@@ -214,6 +214,7 @@ impl CodexBackend {
 
     async fn configured_parameters(&self, mut parameter: Value, request: &BackendRequest,
         process: &mut CodexJsonRpc, output: &mut BackendOutput) -> Result<Value> {
+        parameter["config"]["model_reasoning_summary"] = json!("auto");
         if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
             let mut config = resources.configure(process,output,&request.workspace).await?;
             if let Some(existing) = parameter.get("config").and_then(Value::as_object) {
@@ -882,8 +883,9 @@ impl CodexBackend {
         request: &BackendRequest,
         thread_id: &str,
         continuing_exchange: bool,
-        params: Value,
+        mut params: Value,
     ) -> Result<(Value, bool, Vec<Value>)> {
+        params["summary"] = json!("auto");
         let request_id = process.send_request("turn/start", params).await?;
         self.active_turn_by_session.lock().await.insert(
             request.runtime_key()?,
@@ -2057,6 +2059,11 @@ mod test {
                             .unwrap();
                     assert_eq!(request["method"], method);
                     assert_eq!(request["params"]["serviceTier"], serde_json::to_value(service_tier).unwrap());
+                    if method == "turn/start" {
+                        assert_eq!(request["params"]["summary"], "auto");
+                    } else {
+                        assert_eq!(request["params"]["config"]["model_reasoning_summary"], "auto");
+                    }
                     let mut messages = vec![
                         json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
                         json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-answer","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),

@@ -2101,14 +2101,14 @@ mod tests {
         }
         let controller = registry.resolve(&session_id).await?;
         let broker = controller.broker.lock().await;
-        let history_length = controller.presentation.lock().unwrap().history_entries().len();
+        let history_revision = controller.presentation.lock().unwrap().revision();
         for target in [None, Some(session_id.clone())] {
             let text = tokio::time::timeout(Duration::from_secs(1),
                 service.generate_text(target, "commit-workspace", TextGeneration::CommitMessage, "Staged diff:\n+change"),
             ).await??;
             assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
         }
-        assert_eq!(controller.presentation.lock().unwrap().history_entries().len(), history_length);
+        assert_eq!(controller.presentation.lock().unwrap().revision(), history_revision);
         let requests = backend.request.lock().unwrap();
         assert_eq!(requests.len(), 2);
         for (request, purpose, model, input) in requests.iter() {
