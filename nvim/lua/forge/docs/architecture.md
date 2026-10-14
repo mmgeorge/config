@@ -19,6 +19,12 @@ arguments and calls the synchronous, non-inlined `forge::run` entry point.
 generated async code in the library compilation unit. Both targets use the same
 release profile with incremental compilation, no debug symbols, and LTO disabled.
 
+Executable acquisition depends on the host OS. Windows launches a process-owned copy
+so Cargo can replace the build output while an editor runs. macOS and Linux launch
+the cached build output directly, retaining the old executable for running processes
+when Cargo replaces its path. Unix release leaves that shared file intact. Reusing
+the executable avoids the first-execution delay measured for each fresh copy on macOS.
+
 Forge uses one Rust host for repository operations, GitHub operations, generated
 documents, analysis, and Harness sessions. Lua owns Neovim buffers, windows, editing
 callbacks, and editor effects. Public Status, branch comparisons, local previews,
@@ -691,7 +697,7 @@ forge/
 │   └── datetime.lua           Relative/absolute date formatting + date highlight ranges
 │
 ├── harness/                 Thin Neovim client for the Rust Harness broker
-│   ├── builder.lua            Manual build paths and process-owned executable copies
+│   ├── builder.lua            Manual build paths and Windows process-owned executable copies
 │   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
 │   ├── protocol.lua           JSONL request/message codec
 │   └── backends/              Lua launch descriptors for Codex, Copilot, ACP agents, and the test mock
@@ -790,7 +796,10 @@ before its lifecycle heading, prompt, and metrics. Rejection without revision re
 Question clarifications retain their branch ownership. Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
-retain their additional nesting. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
+retain their additional nesting. Adjacent visible tools share one group across provider-turn boundaries.
+Hidden reasoning and empty messages do not split that group. Visible commentary, file changes,
+questions, and other timeline content retain their boundaries. Each grouped tool keeps its original
+turn identity for output lookup, actions, and expansion. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
@@ -1703,9 +1712,18 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   Otherwise, Lua initializes or reuses the most recently selected Harness backend
   and session, and Rust calls that backend's isolated `generate_text()` with the
   session's selected model and the commit comparison's diff. Fresh startup restores
-  the remembered backend and its latest same-workspace session through normal
-  Harness initialization. The commit request supplies its own workspace and never
-  submits a conversational turn. Copilot uses its SDK and Codex uses an ephemeral
+  the remembered backend and its latest same-workspace session through shared
+  client initialization, even before the Harness UI opens. An explicit
+  `harness.backend` configuration overrides the remembered preference. Reusing
+  an initialized host preserves its selected backend and session. The commit request supplies its own workspace and never
+  submits a conversational turn. Copilot starts a separate SDK client with its normal
+  authentication home and normal client mode, so isolated generation reuses the account
+  selected by the CLI, including credentials stored in the OS keychain. SDK Empty mode
+  disables keychain access and therefore does not implement conversation-only isolation.
+  Session configuration disables tools, skills, hooks, custom instructions, configuration
+  discovery, and conversation storage. Cleanup disconnects and deletes the generated
+  session. Isolation belongs to the conversation lifecycle, not a temporary Copilot home
+  that would hide the user's saved login. Codex uses an ephemeral
   app-server thread. Unsupported backends fail visibly without switching providers.
   `TextGeneration::CommitMessage` owns the shared Conventional Commit instructions
   and multiline output validation for both API and Harness generation.
@@ -3333,7 +3351,11 @@ Task completion commits the exchange outcome and agent state atomically. Interru
 cancels active and queued tasks and retains history and inbox content. Cleanup failure retains the
 child's capacity slot and adapter for an explicit retry. Runtime cleanup has a 30-second bound.
 Root cancellation, clearing, and access-policy transitions collect child execution before proceeding.
-Admission remains closed for the full collection and transition interval. A later explicit
+Admission remains closed until collection finishes and the transition acquires exclusive root
+execution ownership. The service then releases its collection guard before dispatching the transition,
+so resumed provider work can admit children and finish its parent-result drain. Exclusive execution
+ownership prevents another root from starting during policy application. Keeping the collection guard
+through resumed generation would deadlock that drain after the provider becomes idle. A later explicit
 follow-up retains its provider and model while inheriting the root's current access policy.
 Tool visibility changes preserve existing child conversations and resume interrupted root work
 within the same exchange. Plan phase completion and automatic checks reject active child execution,

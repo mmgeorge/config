@@ -1496,7 +1496,7 @@ async fn execute_task_transition(
             config.keys().any(|field|matches!(field.as_str(),"access" | "execution_mode" | "sandbox_enabled" | "backend" | "provider"))
                 || config.get("setting_fields").and_then(Value::as_array).is_some_and(|fields|fields.iter().filter_map(Value::as_str)
                     .any(|field|matches!(field.split('.').next(),Some("access" | "execution_mode" | "sandbox_enabled" | "backend" | "provider"))))));
-    let _child_quiescence = if changes_child_policy || matches!(action["action"].as_str(),Some("pause" | "clear" | "stop" | "cancel" | "undo" | "verify")) {
+    let child_quiescence = if changes_child_policy || matches!(action["action"].as_str(),Some("pause" | "clear" | "stop" | "cancel" | "undo" | "verify")) {
         Some(quiesce_children(controller).await?)
     } else {None};
     let execution = match Arc::clone(&controller.execution_admission).try_acquire_owned() {
@@ -1524,6 +1524,8 @@ async fn execute_task_transition(
         return Ok(());
     }
     controller.cancellation.arm(false);
+    // Release child collection after acquiring exclusive execution, before the transition resumes work.
+    drop(child_quiescence);
     drop(control);
     operation.state = "running".into();
     store.save_task_operation(operation)?;
@@ -2666,6 +2668,44 @@ mod tests {
         assert_eq!(controller.agent_coordinator.active_count(),0);
         assert_eq!(controller.agent_coordinator.task(&task_id).unwrap().state,crate::exchange::ExchangeState::Cancelled);
         service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn permission_transition_releases_child_quiescence_before_resuming() -> Result<()> {
+        for mode in ["write", "yolo"] {
+            let fixture = tempfile::tempdir()?;
+            let service = service();
+            let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+            let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+            let registry = service.registry().await?;
+            let controller = registry.resolve(&session_id).await?;
+            let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+            let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
+            let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+                "id":"interrupted", "session_id":session_id, "agent_id":session.primary_agent_id, "ordinal":1,
+                "prompt":"Explain the provider", "kind":"chat", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            store.save_exchange(&exchange)?;
+            let previous_execution = controller.execution_admission.acquire().await?;
+            let mut operation = admit_task_intent(&controller, &session_id, &Request {
+                id: 2, method: "task.transition".into(),
+                params: json!({"operation_id":"change-permission","action":"permission","mode":mode}),
+            }, &mut store)?;
+            assert!(operation.resume_after_transition);
+            drop(previous_execution);
+            let (sink, _output) = forge_protocol::outbound::channel();
+            tokio::time::timeout(Duration::from_secs(2), execute_task_transition(
+                &registry, &controller, &mut operation, &mut store, &sink,
+            )).await.context("resumed provider output remained blocked by transition quiescence")??;
+            assert!(!controller.agent_coordinator.is_quiescing());
+            let exchanges = store.list_exchange(&session_id)?;
+            assert!(exchanges.last().unwrap().completed_at_ms.is_some());
+            let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
+            assert_eq!(session.execution_mode, serde_json::from_value::<crate::session::PermissionMode>(json!(mode))?);
+            service.shutdown(Duration::from_secs(1)).await?;
+        }
         Ok(())
     }
 

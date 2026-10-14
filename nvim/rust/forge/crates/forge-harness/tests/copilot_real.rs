@@ -1,11 +1,34 @@
 use forge_harness::backend::copilot::CopilotBackend;
-use forge_harness::backend::{Backend, BackendCatalogRequest, BackendLaunch};
+use forge_harness::backend::{Backend, BackendCatalogRequest, BackendLaunch, TextGeneration};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::session::PermissionMode;
 use forge_protocol::message::Request;
 use serde_json::{Value, json};
 use std::process::Command;
 use std::time::Duration;
+
+#[tokio::test]
+#[ignore = "requires an authenticated Copilot CLI and performs a real model turn"]
+async fn isolated_commit_generation_uses_existing_login_without_starting_shared_client() {
+    let temporary = tempfile::tempdir().unwrap();
+    let backend = CopilotBackend::new(Vec::new()).unwrap();
+    let request = BackendCatalogRequest {
+        execution_owner: None,
+        harness_session_id: "copilot-isolated-commit".into(),
+        workspace: temporary.path().to_string_lossy().into_owned(),
+        access: Default::default(),
+        execution_mode: PermissionMode::Read,
+        backend_session_id: None,
+    };
+    let message = tokio::time::timeout(Duration::from_secs(120), backend.generate_text(
+        request.clone(), TextGeneration::CommitMessage, "default",
+        "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-# Instalattion\n+# Installation\n",
+    )).await.expect("Isolated commit generation timed out").unwrap();
+    assert!(!message.is_empty());
+    assert_eq!(backend.client_start_count(), 0, "generation started the shared conversation client");
+    assert!(backend.active_session_id_for(&request.harness_session_id).await.is_none());
+    backend.shutdown().await.unwrap();
+}
 
 #[tokio::test]
 #[ignore = "requires an authenticated pinned Copilot CLI and docs-mcp on PATH"]

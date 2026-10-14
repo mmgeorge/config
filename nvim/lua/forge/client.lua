@@ -1,6 +1,7 @@
 local M = {}
 
 local builder = require("forge.builder")
+local backend_preference = require("forge.harness.backend_preference")
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local protocol = require("forge.protocol")
@@ -493,6 +494,9 @@ end
 local function send_harness_initialize(callback, initialize_options)
   local client = state()
   local harness_config = config.options.harness
+  if not config.harness_backend_explicit and not session.harness.session then
+    harness_config.backend = backend_preference.load(harness_config.backends, harness_config.backend)
+  end
   local descriptor = backend_descriptor()
   local function initialized(result, request_error, error_detail)
     if request_error then

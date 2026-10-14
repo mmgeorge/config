@@ -7,9 +7,27 @@ local builder = require("rust_sidecar").new({ crate_name = "fixture", binary_tar
 })
 local original_system, original_hash = vim.system, vim.fn.sha256
 local original_executable, original_notify = vim.fn.executable, vim.notify
+local original_has, original_copyfile = vim.fn.has, vim.uv.fs_copyfile
 ---@type RustSidecarLease?
 local lease
 local succeeded, failure = xpcall(function()
+  vim.fn.has = function(feature) return feature == "win32" and 0 or original_has(feature) end
+  vim.uv.fs_copyfile = function() error("Unix startup copied the executable") end
+  vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")
+  vim.fn.writefile({ "Unix build output" }, builder.binary_path())
+  builder.acquire(builder.binary_path(), function(result, acquire_error)
+    assert(not acquire_error, acquire_error)
+    lease = result
+  end)
+  assert(lease and lease.path == builder.binary_path(), "Unix startup did not reuse the build output")
+  assert(not vim.uv.fs_stat(vim.fs.joinpath(root, "leases")), "Unix startup created an executable lease")
+  lease.release()
+  lease.release()
+  assert(vim.fn.readfile(builder.binary_path())[1] == "Unix build output", "Unix release removed the build output")
+  lease = nil
+  vim.uv.fs_copyfile = original_copyfile
+  builder._reset_for_test()
+  vim.fn.has = function(feature) return feature == "win32" and 1 or original_has(feature) end
   vim.system = function(command, _, callback)
     if command[1] ~= "tasklist" then error("startup invoked a compiler") end
     callback({ code = 0, signal = 0, stdout = ('"nvim.exe","%s","Console","1","1 K"\n')
@@ -141,6 +159,7 @@ local succeeded, failure = xpcall(function()
 end, debug.traceback)
 vim.system, vim.fn.sha256 = original_system, original_hash
 vim.fn.executable, vim.notify = original_executable, original_notify
+vim.fn.has, vim.uv.fs_copyfile = original_has, original_copyfile
 if lease then pcall(lease.release) end
 vim.fn.delete(root, "rf")
 if not succeeded then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

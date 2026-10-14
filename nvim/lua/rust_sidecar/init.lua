@@ -5,7 +5,7 @@
 
 ---@class RustSidecarLease
 ---@field path string
----@field release fun() Removes the process-owned copy after exit.
+---@field release fun() Removes a Windows process-owned copy after exit. Leaves the shared Unix executable intact.
 
 ---@class RustSidecarSpec
 ---@field crate_name string
@@ -24,7 +24,7 @@
 ---@field build_command fun(): string[]
 ---@field build fun(callback: fun(result: RustSidecarExecutableResult)) Runs Cargo asynchronously even when the executable exists. Concurrent build and ensure callers share one result.
 ---@field ensure fun(callback: fun(result: RustSidecarExecutableResult)) Builds a missing executable asynchronously and shares the result with pending callers.
----@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Copies the executable asynchronously for one process.
+---@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Copies the executable on Windows. Reuses the build output on Unix.
 ---@field _set_crate_dir_for_test fun(crate_dir: string?)
 ---@field _set_artifact_root_for_test fun(artifact_root: string?)
 ---@field _reset_for_test fun()
@@ -248,6 +248,10 @@ function M.new(spec)
 
   function builder.acquire(path, callback)
     start_lease_cleanup()
+    if vim.fn.has("win32") ~= 1 then
+      callback({ path = path, release = function() end })
+      return
+    end
     local lease_root = vim.fs.joinpath(builder.artifact_root(), "leases", ("%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()))
     local created, failure = pcall(vim.fn.mkdir, lease_root, "p")
     if not created then callback(nil, tostring(failure)) return end

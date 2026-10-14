@@ -1,7 +1,7 @@
 use crate::backend::TextGeneration;
 use anyhow::{Context, Result};
 use github_copilot_sdk::{
-    CliProgram, Client, ClientMode, ClientOptions, MessageOptions, SessionConfig,
+    CliProgram, Client, ClientOptions, MessageOptions, SessionConfig,
     SystemMessageConfig,
 };
 use std::{sync::Arc, time::Duration};
@@ -14,12 +14,7 @@ pub(super) async fn generate(
     model: &str,
     history: &str,
 ) -> Result<String> {
-    let directory = tempfile::Builder::new().prefix("forge-text-").tempdir()?;
-    let mut options = ClientOptions::new()
-        .with_cwd(workspace)
-        .with_mode(ClientMode::Empty)
-        .with_base_directory(directory.path())
-        .with_use_logged_in_user(true);
+    let mut options = ClientOptions::new().with_cwd(workspace);
     if let Some(program) = command.first() {
         options = options
             .with_program(CliProgram::Path(program.into()))

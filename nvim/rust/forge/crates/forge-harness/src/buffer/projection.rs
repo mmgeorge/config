@@ -1079,6 +1079,23 @@ impl TimelineRenderer<'_> {
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
     ) -> Result<()> {
+        let mut visible_content = Vec::with_capacity(visible.len());
+        for node in visible {
+            if let ExchangeNode::TurnContent {
+                turn_id, item: crate::turn::TurnItem::Message { id }, ..
+            } = node {
+                let turn = interaction.turn.iter().find(|turn| turn.id() == turn_id)
+                    .context("timeline content references a missing provider turn")?;
+                let message = turn.messages().iter().find(|message| message.id() == id)
+                    .context("timeline content references a missing message")?;
+                if matches!(message.kind(), crate::turn::MessageKind::Reasoning
+                    | crate::turn::MessageKind::ReasoningSummary) || message.text().trim().is_empty() {
+                    continue;
+                }
+            }
+            visible_content.push(*node);
+        }
+        let visible = visible_content;
         let mut question_turn = std::collections::HashSet::new();
         let mut preceding_turn = None;
         for node in interaction.node_list.iter() {
@@ -1121,13 +1138,6 @@ impl TimelineRenderer<'_> {
                                 .iter()
                                 .find(|message| message.id() == message_id)
                                 .context("timeline content references a missing message")?;
-                            if matches!(
-                                message.kind(),
-                                crate::turn::MessageKind::Reasoning
-                                    | crate::turn::MessageKind::ReasoningSummary
-                            ) {
-                                continue;
-                            }
                             let final_message = message.delivery() == crate::turn::MessageDelivery::Final;
                             if final_message {
                                 self.markdown(id, message.text(), response_role)?;
@@ -1154,8 +1164,9 @@ impl TimelineRenderer<'_> {
                                 continue;
                             }
                             let group = visible.iter().skip(position).take_while(|node| match node {
-                                ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { id }, .. }
-                                    if owner == turn_id => turn.tools().find(|tool| tool.id == *id)
+                                ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { id }, .. } =>
+                                    interaction.turn.iter().find(|turn| turn.id() == owner)
+                                        .and_then(|turn| turn.tools().find(|tool| tool.id == *id))
                                         .is_some_and(|tool| tool.kind != "file_change"),
                                 _ => false,
                             });
@@ -1163,6 +1174,7 @@ impl TimelineRenderer<'_> {
                             for node in group {
                                 let ExchangeNode::TurnContent {
                                     id,
+                                    turn_id: owner,
                                     item: crate::turn::TurnItem::Tool { id: tool_id },
                                     ..
                                 } = node
@@ -1170,6 +1182,8 @@ impl TimelineRenderer<'_> {
                                     unreachable!()
                                 };
                                 rendered_tool.insert(id.clone());
+                                let turn = interaction.turn.iter().find(|turn| turn.id() == owner)
+                                    .context("timeline content references a missing provider turn")?;
                                 let tool = turn
                                     .tools()
                                     .find(|tool| tool.id == *tool_id)
@@ -1180,30 +1194,31 @@ impl TimelineRenderer<'_> {
                                     .ends_with("harness_spawn_agent")
                                     && interaction.node_list.iter().any(|node| matches!(node,
                                         ExchangeNode::AgentReference { agent }
-                                            if agent.parent_turn_id.as_deref() == Some(turn_id.as_str())));
-                                if !(question_control && question_turn.contains(turn_id.as_str()) && !tool.failed
+                                            if agent.parent_turn_id.as_deref() == Some(owner.as_str())));
+                                if !(question_control && question_turn.contains(owner.as_str()) && !tool.failed
                                     && tool.state() == crate::turn::ToolState::Completed)
                                     && !(admitted_spawn && !tool.failed && tool.state() == crate::turn::ToolState::Completed) {
-                                    calls.push((id, tool));
+                                    calls.push((id, turn, tool));
                                 }
                             }
                             if calls.is_empty() { continue; }
                             let start = self.block.len();
                             self.margin += 2;
                             let count = calls.len();
-                            let last_tool_id = &calls.last().expect("nonempty tool group").1.id;
-                            let followed_in_turn = turn.items().iter().rposition(|item| matches!(item,
+                            let (_, last_turn, last_tool) = calls.last().expect("nonempty tool group");
+                            let last_tool_id = &last_tool.id;
+                            let followed_in_turn = last_turn.items().iter().rposition(|item| matches!(item,
                                 crate::turn::TurnItem::Tool { id } if id == last_tool_id
-                            )).is_some_and(|position| position + 1 < turn.items().len());
+                            )).is_some_and(|position| position + 1 < last_turn.items().len());
                             let settled = interaction.completed_at_ms.is_some() || calls
                                 .iter()
-                                .all(|(_, tool)| tool.state() != crate::turn::ToolState::Running)
+                                .all(|(_, _, tool)| tool.state() != crate::turn::ToolState::Running)
                                 && (followed_in_turn
-                                    || turn.state() != crate::turn::TurnState::Running);
+                                    || last_turn.state() != crate::turn::TurnState::Running);
                             let group_id = format!("{id}:tools");
-                            let label = tool_group_label(calls.iter().map(|(_, tool)| *tool), self.now_ms);
+                            let label = tool_group_label(calls.iter().map(|(_, _, tool)| *tool), self.now_ms);
                             self.literal(&group_id, &label, None)?;
-                            for (index, (_, tool)) in calls.into_iter().enumerate() {
+                            for (index, (_, turn, tool)) in calls.into_iter().enumerate() {
                                 let tool_start = self.block.len();
                                 self.tool(turn.id(), tool, &group_id, !settled && index + 1 == count)?;
                                 let node = format!("{}:{}:tool", turn.id(), tool.id);
@@ -3085,6 +3100,100 @@ mod tests {
         first.started_at_ms = None;
         assert_eq!(super::tool_group_label([&first, &second], 90_000),
             "▸ Ran 2 tools (1 failed)");
+    }
+
+    #[test]
+    fn adjacent_tools_share_one_group_across_turns_and_hidden_reasoning() -> anyhow::Result<()> {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"cross-turn", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect the repository", "kind":"chat", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None, thread_id: "thread".into(), turn_id: "turn-1".into(),
+            }),
+            turn_boundary: None, kind: "tool".into(), text: None, data: Value::Null,
+            activity: None, summary: None, task_update: None,
+        };
+        let render = |exchange: &Exchange| {
+            project_at(&TimelineEntry::Exchange {
+                id: exchange.id.clone(), created_at_ms: 0,
+                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+            }, &WidthProfile::default(), 100)
+        };
+        let mut first_group_id = None;
+        for ordinal in 1..=3 {
+            event.address.as_mut().unwrap().turn_id = format!("turn-{ordinal}");
+            event.turn_boundary = Some(TurnBoundary::Started);
+            event.activity = None;
+            event.text = None;
+            exchange.observe_turn(&event, ordinal * 10)?;
+            event.turn_boundary = None;
+            event.kind = "reasoning".into();
+            event.text = Some("Inspecting the next file".into());
+            event.data = json!({"message_id":format!("thought-{ordinal}")});
+            exchange.observe_turn(&event, ordinal * 10 + 1)?;
+            event.kind = "tool".into();
+            event.text = None;
+            event.data = Value::Null;
+            event.activity = Some(ToolActivity {
+                id: "shared-call".into(), kind: ToolActivityKind::Command,
+                title: format!("Inspect file {ordinal}"),
+                output: Some(format!("output-{ordinal}\n")), output_delta: false,
+                status: Some("in_progress".into()), change: Default::default(),
+            });
+            exchange.observe_turn(&event, ordinal * 10 + 2)?;
+            let projected = render(&exchange)?;
+            let groups = projected.entry.block.iter().filter(|block| block.id.0.ends_with(":tools"))
+                .collect::<Vec<_>>();
+            assert_eq!(groups.len(), 1, "hidden reasoning or provider turns split adjacent tools");
+            let retained_id = first_group_id.get_or_insert_with(|| groups[0].id.clone());
+            assert_eq!(&groups[0].id, &*retained_id);
+            assert!(!groups[0].metadata.fold[0].closed, "the latest running tool lost its preview");
+            for owner in 1..=ordinal {
+                assert!(projected.tool.contains_key(&format!("turn-{owner}:shared-call")),
+                    "grouping replaced a tool's provider-turn identity");
+            }
+            event.activity.as_mut().unwrap().status = Some("completed".into());
+            exchange.observe_turn(&event, ordinal * 10 + 3)?;
+            event.activity = None;
+            event.turn_boundary = Some(TurnBoundary::Finished {
+                outcome: crate::turn::TurnOutcome::Completed,
+            });
+            exchange.observe_turn(&event, ordinal * 10 + 4)?;
+        }
+        let projected = render(&exchange)?;
+        let group = projected.entry.block.iter().find(|block| block.id.0.ends_with(":tools")).unwrap();
+        assert!(group.text.row(0).unwrap().contains("Ran 3 tools"));
+        assert!(group.metadata.fold[0].closed);
+
+        event.address.as_mut().unwrap().turn_id = "turn-4".into();
+        event.turn_boundary = Some(TurnBoundary::Started);
+        exchange.observe_turn(&event, 40)?;
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("Now inspect the final file".into());
+        event.data = json!({"message_id":"commentary","phase":"commentary"});
+        exchange.observe_turn(&event, 41)?;
+        event.kind = "tool".into();
+        event.text = None;
+        event.data = Value::Null;
+        event.activity = Some(ToolActivity {
+            id: "shared-call".into(), kind: ToolActivityKind::Command, title: "Inspect final file".into(),
+            output: Some("final-output\n".into()), output_delta: false,
+            status: Some("completed".into()), change: Default::default(),
+        });
+        exchange.observe_turn(&event, 42)?;
+        let projected = render(&exchange)?;
+        assert_eq!(projected.entry.block.iter().filter(|block| block.id.0.ends_with(":tools")).count(), 2,
+            "visible commentary must separate tool groups");
+        Ok(())
     }
 
     #[test]
