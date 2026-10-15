@@ -80,7 +80,7 @@ local function build_spec(elicitation, host)
   return {
     owner = "plan_question",
     deadline = elicitation.deadline,
-    host = {
+    host = host.picker_host or {
       window_list = host.window_list or { host.transcript_win },
       control_win = host.control_win or host.transcript_win,
     },

@@ -337,7 +337,7 @@ impl CheckRunner {
                 super::applicability::resolve(
                     &RunRequest::default(),
                     &config,
-                    changes.as_deref().unwrap_or_default(),
+                    changes.as_deref(),
                     changes.is_some(),
                 )
             })
@@ -421,7 +421,7 @@ impl CheckRunner {
             super::CheckAdmission {
                 request,
                 overrides: overrides.enabled,
-                files: changes.clone().unwrap_or_default(),
+                files: changes.clone(),
                 cases: None,
                 has_scope: changes.is_some(),
                 shell,
@@ -627,7 +627,7 @@ impl CheckRunner {
             super::CheckAdmission {
                 request: Default::default(),
                 overrides: BTreeMap::new(),
-                files: Vec::new(),
+                files: Some(Vec::new()),
                 cases: None,
                 has_scope: true,
                 shell: CheckShell::default(),

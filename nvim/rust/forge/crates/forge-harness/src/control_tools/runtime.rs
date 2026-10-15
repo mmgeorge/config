@@ -357,7 +357,7 @@ impl ControlToolRuntime {
             "harness_goal_complete" | "harness_goal_blocked" | "harness_goal_status" => {
                 anyhow::ensure!(
                     self.context.has_active_goal,
-                    "goal control requires an active nonterminal goal"
+                    "goal control requires an active goal. Resume paused or blocked goals explicitly before reporting completion or blockage"
                 );
                 anyhow::ensure!(invocation.name != "harness_goal_complete" || !self.context.has_active_execution,
                     "plan execution completes only through harness_plan_phase_done in Verify");

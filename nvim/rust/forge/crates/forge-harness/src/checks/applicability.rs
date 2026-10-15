@@ -89,7 +89,7 @@ pub struct CheckApplicability {
 pub(super) fn resolve(
     request: &RunRequest,
     config: &CheckConfig,
-    files: &[String],
+    files: Option<&[String]>,
     has_scope: bool,
 ) -> Result<Vec<CheckApplicability>> {
     ensure!(
@@ -122,7 +122,7 @@ pub(super) fn resolve(
         .definitions
         .iter()
         .map(|check| {
-            let matched_files: Vec<_> = files
+            let matched_files: Vec<_> = files.unwrap_or_default()
                 .iter()
                 .filter(|path| check.trigger.matches_path(path))
                 .cloned()
@@ -143,6 +143,8 @@ pub(super) fn resolve(
                     false,
                     "No task change context. Select checks explicitly.".into(),
                 )
+            } else if files.is_none() {
+                (true, "Task changes unavailable. Automatic trigger requires verification.".into())
             } else if matched_files.is_empty() {
                 (false, "No matching task changes".into())
             } else {

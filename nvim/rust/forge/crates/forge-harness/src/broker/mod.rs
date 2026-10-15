@@ -879,7 +879,9 @@ impl HarnessBroker {
                 .unwrap_or_default(),
             has_active_elicitation: plan.as_ref().is_some_and(|plan| plan.elicitation.is_some()),
             has_active_execution: self.store.list_plan_execution(&self.session.id).ok()?.iter().any(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && !matches!(execution.state, PlanExecutionState::Complete | PlanExecutionState::Cancelled)),
-            has_active_goal: self.session.goal_id.is_some(),
+            has_active_goal: self.session.goal_id.as_deref()
+                .and_then(|goal_id| self.store.load_goal(goal_id).ok().flatten())
+                .is_some_and(|goal| goal.state == GoalState::Active),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             rustdoc: Some(Arc::clone(&self.rustdoc)),
             repository: None,
@@ -7767,8 +7769,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
             .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
         if let Some(access) = &access {
-            anyhow::ensure!(!access.sandbox || self.session.backend == "codex" || self.session.backend == "mock",
-                "current backend does not support sandbox configuration");
+            crate::backend::BackendKind::parse(&self.session.backend)?.validate_access(access)?;
         }
         if let Some(value) = params.get("shell") {
             configured.shell = serde_json::from_value(value.clone())?;

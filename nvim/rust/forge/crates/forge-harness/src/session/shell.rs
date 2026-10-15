@@ -52,11 +52,13 @@ impl CheckShell {
         self,
         executable: &std::path::Path,
         source: &str,
+        piped_input: bool,
     ) -> Result<tokio::process::Command> {
         ensure!(!source.trim().is_empty(), "check command is empty");
         let mut command = tokio::process::Command::new(executable);
         match self {
             Self::Nushell => {
+                if piped_input { command.arg("--stdin"); }
                 command.args(["--no-config-file", "--no-history", "-c", source]);
             }
             Self::System => {
@@ -71,7 +73,7 @@ impl CheckShell {
                 }
             }
         }
-        command.stdin(std::process::Stdio::null());
+        command.stdin(if piped_input { std::process::Stdio::piped() } else { std::process::Stdio::null() });
         Ok(command)
     }
 }
@@ -85,13 +87,14 @@ mod tests {
     async fn system_shell_preserves_native_exit_and_reports_powershell_errors() -> Result<()> {
         let shell = CheckShell::System;
         let executable = shell.executable()?;
-        let mut native = shell.command(&executable, "& pwsh -NoProfile -Command 'exit 13'")?;
+        let mut native = shell.command(&executable, "& pwsh -NoProfile -Command 'exit 13'", false)?;
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), native.output()).await??;
         assert_eq!(result.status.code(), Some(13));
         let mut invalid = shell.command(
             &executable,
             "Get-Content -LiteralPath 'missing-check-fixture-file'",
+            false,
         )?;
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), invalid.output()).await??;
@@ -105,7 +108,7 @@ mod tests {
             return Ok(());
         };
         let mut command =
-            CheckShell::Nushell.command(&executable, "print 'nushell output'; exit 9")?;
+            CheckShell::Nushell.command(&executable, "print 'nushell output'; exit 9", false)?;
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), command.output()).await??;
         assert_eq!(result.status.code(), Some(9));

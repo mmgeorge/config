@@ -137,7 +137,6 @@ pub struct CopilotBackend {
     turn_event_by_harness: Mutex<HashMap<String, Arc<CopilotTurnEvent>>>,
     control_router_by_harness: Mutex<HashMap<String, Arc<ControlToolRouter>>>,
     permission_context_by_harness: Mutex<HashMap<String, Arc<CopilotPermissionContext>>>,
-    completed_event_by_harness: Mutex<HashMap<String, String>>,
     permission_coordinator: Arc<PermissionCoordinator>,
 }
 
@@ -170,7 +169,6 @@ impl CopilotBackend {
             turn_event_by_harness: Mutex::new(HashMap::new()),
             control_router_by_harness: Mutex::new(HashMap::new()),
             permission_context_by_harness: Mutex::new(HashMap::new()),
-            completed_event_by_harness: Mutex::new(HashMap::new()),
             permission_coordinator,
         })
     }
@@ -211,6 +209,7 @@ impl CopilotBackend {
     }
 
     async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
+        BackendKind::Copilot.validate_access(&request.access)?;
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let mut active_session = session_slot.lock().await;
@@ -591,7 +590,6 @@ impl Backend for CopilotBackend {
         self.turn_event_by_harness.lock().await.clear();
         self.control_router_by_harness.lock().await.clear();
         self.permission_context_by_harness.lock().await.clear();
-        self.completed_event_by_harness.lock().await.clear();
         Ok(())
     }
 
@@ -713,11 +711,11 @@ impl Backend for CopilotBackend {
                     self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
                         decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
-                        self.completed_event_by_harness
-                            .lock()
-                            .await
-                            .insert(request.runtime_key()?, provider_event.id.clone());
-                        output.provider_checkpoint_id = Some(provider_event.id.clone());
+                        output.provider_checkpoint_id = if provider_event.ephemeral == Some(true) {
+                            provider_event.parent_id.clone()
+                        } else {
+                            Some(provider_event.id.clone())
+                        };
                         break;
                     }
                     if provider_event.event_type == "session.todos_changed" {
@@ -839,19 +837,22 @@ impl Backend for CopilotBackend {
             target_request.backend_session_id.clone(),
             request.checkpoint_id,
         ) {
-            (Some(source_session_id), Some(to_event_id)) => client
+            (Some(source_session_id), to_event_id) => client
                 .rpc()
                 .sessions()
                 .fork(SessionsForkRequest {
                     name: None,
                     session_id: SessionId::new(source_session_id),
-                    to_event_id: Some(to_event_id),
+                    to_event_id,
                 })
                 .await
                 .context("fork Copilot session")?
                 .session_id
                 .to_string(),
-            _ => self.session(&target_request).await?.id().to_string(),
+            _ => {
+                target_request.harness_session_id.clone_from(&request.target_harness_session_id);
+                self.session(&target_request).await?.id().to_string()
+            },
         };
         target_request.harness_session_id = request.target_harness_session_id;
         target_request.backend_session_id = Some(backend_session_id.clone());

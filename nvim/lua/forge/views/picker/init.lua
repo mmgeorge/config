@@ -13,6 +13,7 @@ local picker_state = require("forge.views.picker.state")
 local picker_window = require("forge.views.picker.window")
 
 local active = nil
+local install_action_keymaps
 local resize_group = vim.api.nvim_create_augroup("ForgePickerLayout", { clear = true })
 
 local function valid_window(win)
@@ -92,15 +93,33 @@ local function update_deadline_timer(instance)
   end))
 end
 
-local function input_footer()
+local function action_list(instance, input_only)
+  local actions = vim.list_extend(vim.deepcopy(instance.spec.action_list or {}),
+    vim.deepcopy(picker_state.page(instance.state, instance.spec).action_list or {}))
+  vim.list_extend(actions, vim.deepcopy(instance.spec.host.action_list or {}))
+  return input_only and vim.tbl_filter(function(action) return action.input == true end, actions) or actions
+end
+
+local function input_footer(instance)
   local segment_list = {}
+  local input_actions = action_list(instance, true)
+  local overridden = {}
+  for _, action in ipairs(input_actions) do
+    for _, key in ipairs(action.command and keymaps.view_keys_for("picker", action.command) or { action.key }) do
+      overridden[key] = true
+    end
+  end
   for _, command in ipairs({
     { id = "submit_input", label = "submit" },
     { id = "feedback", label = "options" },
     { id = "clear_input", label = "clear" },
   }) do
     local key = keymaps.view_keys_for("picker", command.id)[1]
-    if key then segment_list[#segment_list + 1] = key .. " " .. command.label end
+    if key and not overridden[key] then segment_list[#segment_list + 1] = key .. " " .. command.label end
+  end
+  for _, action in ipairs(input_actions) do
+    local key = action.command and keymaps.view_keys_for("picker", action.command)[1] or action.key
+    if key then segment_list[#segment_list + 1] = key .. " " .. (action.label or action.desc or action.id or "action") end
   end
   return table.concat(segment_list, "  ")
 end
@@ -185,11 +204,17 @@ local function render_view(instance)
   local width = math.max(30, bounds.width - 2)
   local selected = picker_state.selected_index(instance.state, instance.spec)
   local input_visible = instance.input_visible == true
+  local footer = page.footer
+  if not input_visible then
+    for _, action in ipairs(instance.spec.host.action_list or {}) do
+      if action.key and action.label then footer = (footer or "") .. "  " .. action.key .. " " .. action.label end
+    end
+  end
   local frame = layout.build(page, selected, width, {
     input_visible = input_visible,
     search_visible = (not page.search or not page.search.start_in_normal
       or instance.search_visible or valid_window(instance.search_win)) == true,
-    footer = input_visible and input_footer() or nil,
+    footer = input_visible and input_footer(instance) or footer,
   })
   frame.chosen_index_set = {}
   frame.option_highlight_by_index = {}
@@ -363,6 +388,7 @@ local function open_input(instance, kind)
       desc = "Clear and close picker input",
     })
   end
+  install_action_keymaps(instance, instance.input_buf, false, true)
   focus_input(instance, true)
 end
 
@@ -450,20 +476,23 @@ end
 ---@field command? string Configured picker command used instead of a literal key.
 ---@field modes? string|string[]
 ---@field desc? string
+---@field input? boolean Apply this action inside the freeform editor, overriding matching input bindings.
+---@field label? string Short label used in the freeform editor footer.
 ---@field callback? fun(context: ForgePickerSelectionContext, picker: table)
 
 ---@param instance table
 ---@param buf integer
 ---@param preserve boolean
-local function install_action_keymaps(instance, buf, preserve)
-  ---@type ForgePickerAction[]
-  local action_list = vim.list_extend(vim.deepcopy(instance.spec.action_list or {}),
-    vim.deepcopy(picker_state.page(instance.state, instance.spec).action_list or {}))
-  for _, action in ipairs(action_list) do
+---@param input_only? boolean
+install_action_keymaps = function(instance, buf, preserve, input_only)
+  for _, action in ipairs(action_list(instance, input_only)) do
     local keys = action.command and keymaps.view_keys_for("picker", action.command) or { action.key }
     for _, key in ipairs(keys) do
       if preserve then preserve_mapping(instance, buf, key) end
-      vim.keymap.set(action.modes or "n", key, function() run_action(instance, action) end, {
+      vim.keymap.set(action.modes or "n", key, function()
+        if input_only then after_input_mapping(instance, function() run_action(instance, action) end)
+        else run_action(instance, action) end
+      end, {
         buffer = buf,
         silent = true,
         nowait = true,

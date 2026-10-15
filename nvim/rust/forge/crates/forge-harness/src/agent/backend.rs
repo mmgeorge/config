@@ -65,7 +65,7 @@ impl AgentBackendFactory {
         let (profile_name, profile) = self.profiles.resolve(spawn.profile.as_deref())?;
         let provider = if profile.provider == "inherit" { root_provider } else { BackendKind::parse(&profile.provider)? };
         ensure!(provider != BackendKind::Mock || root_provider == BackendKind::Mock, "mock is not a user-selectable provider");
-        validate_access(provider, &root.access)?;
+        provider.validate_access(&root.access)?;
         let same_provider = provider == root_provider;
         let model = if profile.model == "inherit" { root.model.clone() } else { profile.model.clone() };
         let effort = if profile.reasoning_effort == "inherit" { root.effort.clone() } else { profile.reasoning_effort.clone() };
@@ -103,7 +103,7 @@ impl AgentBackendFactory {
 
     pub fn request(&self, root: &BackendRequest, agent: &Agent, message: String) -> Result<BackendRequest> {
         let selection = agent.selection.as_ref().context("child has no resolved provider selection")?;
-        validate_access(selection.provider, &root.access)?;
+        selection.provider.validate_access(&root.access)?;
         ensure!(agent.session_id == root.harness_session_id && !agent.is_primary(), "child request crosses root ownership");
         let message = if selection.instructions.trim().is_empty() { message }
             else { format!("Subagent profile instructions:\n{}\n\nAssigned task:\n{message}", selection.instructions) };
@@ -131,12 +131,6 @@ fn narrow_permission(root: crate::session::PermissionMode, selected: crate::sess
         (PermissionMode::Write, _) | (_, PermissionMode::Write) => PermissionMode::Write,
         _ => PermissionMode::Yolo,
     }
-}
-
-fn validate_access(provider: BackendKind, access: &crate::session::AccessPolicy) -> Result<()> {
-    ensure!(!access.sandbox || matches!(provider, BackendKind::Codex | BackendKind::Mock),
-        "selected backend cannot enforce the root's OS sandbox. Change the root access policy explicitly before spawning");
-    Ok(())
 }
 
 pub fn provider_name(provider: BackendKind) -> &'static str {

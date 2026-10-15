@@ -25,6 +25,13 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    /// Reject OS isolation requests that this provider cannot enforce.
+    pub(crate) fn validate_access(self, access: &crate::session::AccessPolicy) -> Result<()> {
+        anyhow::ensure!(!access.sandbox || matches!(self, Self::Codex | Self::Mock),
+            "This provider cannot enforce Forge's OS sandbox. Disable sandbox explicitly in /config before connecting");
+        Ok(())
+    }
+
     /// Parse one persisted backend name into the supported provider set.
     pub fn parse(value: &str) -> Result<Self> {
         match value {

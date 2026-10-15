@@ -97,7 +97,7 @@ impl HarnessBroker {
                 definition.scope = *scope;
             }
         }
-        let files = self.check_task_files(&execution, design).await?;
+        let files = self.check_task_files(&execution).await?;
         let cases = design
             .document
             .tests
@@ -272,6 +272,7 @@ impl HarnessBroker {
         Self::save_run(&mut execution, &run);
         self.store
             .save_execution_transition(&execution, &goal, None, None)?;
+        self.settle_task(None)?;
         self.publish_check_run(&mut execution, &run, &mut events)
             .await?;
         events.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);

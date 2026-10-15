@@ -2234,6 +2234,9 @@ repeat across prompts. Later messages and completion events resolve through the 
 record, so a reused counter cannot attach a new response to a completed execution.
 Root session idle settles any unfinished root turns before exchange completion, including the empty
 turn Copilot can start while an accepted execution-phase boundary is stopping the provider.
+Copilot fork checkpoints reference persisted events. An ephemeral idle notification contributes
+its durable parent ID, because the idle ID itself is absent from native history. Forking a
+conversation without a recorded boundary still creates a distinct native conversation.
 Copilot SDK subscriptions drain through independent `SessionEventStream` tasks before tracing,
 provider RPCs, or presentation processing. The prompt stream excludes raw
 `assistant.streaming_delta` and `assistant.tool_call_delta` telemetry, while retaining structured
@@ -3206,6 +3209,11 @@ Both pickers use the shared header countdown. A picker-owned timer updates only 
 leaving the input buffer, cursor, selection, and scroll position intact. Closing the picker
 releases this display timer without changing the Rust deadline. Session shutdown cancels the
 controller task before releasing provider and lease ownership.
+Harness picker hosts supply the configured interrupt actions to every hosted picker in normal
+and insert mode, including MCP, configuration, and questions. Interruption closes the picker
+and pauses its owning task without submitting an answer. Question freeform editors retain
+this binding. Shared picker actions explicitly opt into freeform input, override conflicting
+editor commands, and supply the corresponding footer.
 
 Read, Write, and YOLO select approval handling. Read asks before edits and untrusted
 commands, Write applies saved permission rules, and YOLO skips approval prompts. These
@@ -3218,6 +3226,9 @@ and provider. The directory picker adds or edits existing directories using comp
 confirms deletion, and marks covered paths. Full scope and disabled sandbox retain the list
 but make it inactive. Disabling the sandbox removes OS write restrictions, so the write-scope
 selector remains stored but inactive. Copilot does not expose these isolation controls.
+The shared provider access validator rejects sandbox-enabled Copilot and ACP sessions before
+creating or reusing a provider session. Root configuration and child admission use the same
+validator. The user must explicitly disable sandbox before connecting these providers.
 
 Other configuration uses the same interrupt/finalize/resume transition as approval changes. The
 broker validates and canonicalizes directory paths before committing settings. Provider
@@ -6147,6 +6158,12 @@ Failed state
 refreshes remain visible and retry after one, two, and four seconds. `/task refresh` requests a
 new authoritative snapshot. Failure, disconnect, and unknown operation outcomes suppress
 automatic queue draining. Queued input retains task identity and is not retargeted by a switch.
+Paused, blocked, failed, and stopping tasks retain queued input without admitting another turn.
+An explicit resume permits draining again. `/clear` and `/new` create another session even while
+the source is busy, leaving the source independently accessible instead of steering command text.
+Goal control admission requires an active goal, matching the goal observer's mutation boundary.
+Controls for paused, blocked, stalled, or completed goals reject rather than reporting success
+for a state transition that the observer will discard.
 
 
 ## Plan implementation and conformance
@@ -6242,7 +6259,13 @@ The runner compares the current checkpoint with the first checkpoint of the owni
 preserving the baseline across continuations and host recovery. Existing dirty files do not
 trigger checks unless that task changes them. Additions, deletions, and both rename paths remain
 part of the change set. Before a task baseline exists, automatic applicability remains unknown
-and runs select no commands. Explicit IDs or the separate run-all action bypass triggers.
+and standalone runs select no commands. An accepted plan without a checkpoint has unknown
+changes rather than an empty change set. Its automatic triggers require verification, with
+full-scope checks running normally and unresolved file or case scopes blocking completion.
+The runner never infers a complete change set from declaration files alone or silently broadens
+scoped coverage. Explicit IDs or the separate run-all action bypass triggers.
+Nushell receives `--stdin` before `-c` when scoped selectors are piped into a check. Shell
+construction owns both argument order and stdin configuration.
 
 Setup first discovers commands and then asks the user about areas, automatic suites, coverage,
 and cost through the shared question flow. The setup exchange retains its decision state across
@@ -6312,3 +6335,5 @@ terminates owned processes and preserves outputs. Recovery marks detached work i
 Resume reuses completed results only when configuration, scope, environment, and workspace
 identities still match. Passing gates enter manual Verify when actions exist, otherwise
 complete the plan. Manual defects return to Resolve and manual blockers preserve Verify.
+Checking updates the owning task phase before publishing the transition, so the header and
+the next Resolve or Verify exchange show the same phase.

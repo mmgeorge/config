@@ -157,45 +157,16 @@ impl HarnessBroker {
     pub(super) async fn check_task_files(
         &mut self,
         execution: &PlanExecutionRecord,
-        design: &crate::plan::DeclarationDesign,
-    ) -> Result<Vec<String>> {
-        if let Some(id) = &execution.baseline_checkpoint {
-            let baseline = self
-                .store
-                .load_checkpoint(id)?
-                .context("execution baseline checkpoint is missing")?;
-            let current = GitCheckpoint::new(&self.session.workspace)
-                .capture(
-                    &self.store.objects,
-                    &self.repositories,
-                    &self.session.id,
-                    self.clock.now_ms(),
-                )
-                .await?;
-            return Ok(baseline
-                .changed_paths(&current)?
-                .into_iter()
-                .map(|path| path.as_str().to_owned())
-                .collect());
-        }
-        let mut files = Vec::new();
-        for (path, baseline) in &design.baseline {
-            let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
-            if source.as_ref().is_none_or(|source| {
-                crate::plan::digest(source.as_bytes()) != baseline.source_digest
-            }) {
-                files.push(path.clone());
-            }
-        }
-        files.extend(
-            design
-                .proposed
-                .keys()
-                .filter(|path| !design.baseline.contains_key(*path))
-                .cloned(),
-        );
-        files.sort();
-        files.dedup();
-        Ok(files)
+    ) -> Result<Option<Vec<String>>> {
+        let Some(id) = &execution.baseline_checkpoint else {
+            return Ok(None);
+        };
+        let baseline = self.store.load_checkpoint(id)?
+            .context("execution baseline checkpoint is missing")?;
+        let current = GitCheckpoint::new(&self.session.workspace)
+            .capture(&self.store.objects, &self.repositories, &self.session.id, self.clock.now_ms())
+            .await?;
+        Ok(Some(baseline.changed_paths(&current)?.into_iter()
+            .map(|path| path.as_str().to_owned()).collect()))
     }
 }

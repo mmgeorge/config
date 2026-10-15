@@ -79,10 +79,10 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
         super::CheckAdmission {
             request: Default::default(),
             overrides: Default::default(),
-            files: vec![
+            files: Some(vec![
                 "src/nested/removed.rs".into(),
                 "src/generated/ignored.rs".into(),
-            ],
+            ]),
             cases: None,
             has_scope: true,
             shell: crate::session::CheckShell::Nushell,
@@ -153,12 +153,12 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
     let selected = request.selections(&config, &files, Some(&cases), true)?;
     assert!(matches!(&selected["scoped"], CheckSelection::Cases { cases } if cases.len() == 2));
     assert!(
-        super::applicability::resolve(&request, &config, &[], true)?
+        super::applicability::resolve(&request, &config, Some(&[]), true)?
             .iter()
             .all(|check| !check.selected)
     );
     assert!(
-        super::applicability::resolve(&request, &config, &files, false)?
+        super::applicability::resolve(&request, &config, Some(&files), false)?
             .iter()
             .all(|check| !check.selected)
     );
@@ -208,7 +208,7 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
             CheckAdmission {
                 request,
                 overrides: Default::default(),
-                files: vec!["src/source.rs".into()],
+                files: Some(vec!["src/source.rs".into()]),
                 cases: inventory,
                 has_scope: true,
                 shell: crate::session::CheckShell::Nushell,

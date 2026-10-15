@@ -84,7 +84,18 @@ local function picker_host(state)
   end
   local current = vim.api.nvim_get_current_win()
   local control_win = vim.tbl_contains(window_list, current) and current or state.composer_win or state.transcript_win
+  local actions = {}
+  for _, key in ipairs(keymaps.view_keys_for("harness", "cancel")) do
+    actions[#actions + 1] = {
+      key = key, modes = { "n", "i" }, desc = "Interrupt Harness task", input = true, label = "interrupt",
+      callback = function()
+        picker.close(true)
+        if session.harness == state then M.task_transition({ action = "pause" }) end
+      end,
+    }
+  end
   return {
+    action_list = actions,
     window_list = window_list,
     control_win = control_win,
     transcript_win = state.transcript_win,
@@ -792,10 +803,12 @@ function M.present_plan_question(force)
   if not force and not question_presentation.should_present(state) then return end
   question_presentation.mark_presented(state)
   state.plan_question_open = true
+  local host = picker_host(state)
   require("forge.views.harness.plan_question").open(elicitation, {
+    picker_host = host,
     transcript_win = state.transcript_win,
-    window_list = picker_host(state).window_list,
-    control_win = picker_host(state).control_win,
+    window_list = host.window_list,
+    control_win = host.control_win,
     allow_ask = owner ~= "plan_acceptance",
     answer = function(params, callback)
       client.request("question.answer", params, function(result, request_error)
@@ -988,8 +1001,10 @@ function M.drain()
     return
   end
   local current_task_id = state.session and state.session.current_task_id
+  local current_task = task_control.current(state)
   local first_queued = state.queue[1]
   state.queue_suspended = type(first_queued) == "table" and first_queued.task_id ~= current_task_id
+    or current_task ~= nil and vim.tbl_contains({ "paused", "blocked", "failed", "stopping" }, current_task.status)
   local next_entry = state.queue[1]
   local next_text = type(next_entry) == "table" and next_entry.text or next_entry
   if state.active_elicitation and state.active_elicitation.elicitation
@@ -1603,7 +1618,7 @@ function M.submit()
     M.fork_session()
     return
   end
-  if text == "/new" then
+  if text == "/new" or text == "/clear" then
     set_composer_text(state.composer_buf, "")
     require("forge.views.harness").new_session()
     return
@@ -1835,7 +1850,7 @@ function M.queue_submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
-  if text:match("^/task") or text:match("^/execute") or text:match("^/plan") or text:match("^/goal") or text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
+  if text:match("^/task") or text:match("^/execute") or text:match("^/plan") or text:match("^/goal") or text == "/new" or text == "/clear" or text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
   if text == "/fast" or text == "/ultrafast" or text:match("^/fast%s") or text:match("^/ultrafast%s") or text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)

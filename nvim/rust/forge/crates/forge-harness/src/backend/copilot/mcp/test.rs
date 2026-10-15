@@ -180,7 +180,7 @@ impl Fixture {
             execution_owner: None,
             harness_session_id: "mcp-failure".into(),
             workspace: self.directory.path().to_string_lossy().into_owned(),
-            access: Default::default(),
+            access: crate::session::AccessPolicy { sandbox: false, ..Default::default() },
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
         }
@@ -199,7 +199,7 @@ impl Fixture {
             effort: "auto".into(),
             context_window: None,
             service_tier: Default::default(),
-            access: Default::default(),
+            access: crate::session::AccessPolicy { sandbox: false, ..Default::default() },
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
             control_context: None,

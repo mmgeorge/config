@@ -54,6 +54,7 @@ impl AcpBackend {
     }
 
     async fn session(&self, mut request: BackendCatalogRequest, tools: Option<Vec<crate::control_tools::ControlToolDefinition>>) -> Result<Arc<AcpSession>> {
+        self.kind.validate_access(&request.access)?;
         let runtime_key = request.runtime_key()?;
         let mut session_map = self.session.lock().await;
         if let Some(session) = session_map.get(&runtime_key).cloned() {
@@ -72,7 +73,6 @@ impl AcpBackend {
             request.backend_session_id = self.conversation.lock().await.get(&request.runtime_key()?).cloned();
         }
         let has_history = request.backend_session_id.is_some();
-        ensure!(!request.access.sandbox, "This ACP adapter cannot enforce Forge's OS sandbox. Disable sandbox explicitly in /config before connecting");
         let state = Arc::new(AcpSessionState::new(self.kind, self.permission.clone()));
         let setting = crate::settings::SettingsStore::open(&self.settings_root)?.get(&request.workspace,&request.harness_session_id,
             if self.kind == BackendKind::Claude {"claude"} else {"antigravity"})?;

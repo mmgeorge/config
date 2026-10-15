@@ -34,7 +34,8 @@ pub struct CheckRunner {
 pub(crate) struct CheckAdmission {
     pub request: RunRequest,
     pub overrides: BTreeMap<String, bool>,
-    pub files: Vec<String>,
+    /// None means the task has no complete change inventory.
+    pub files: Option<Vec<String>>,
     /// Distinguishes an accepted empty case inventory from unavailable standalone discovery.
     pub cases: Option<Vec<CheckCase>>,
     pub has_scope: bool,
@@ -229,7 +230,7 @@ impl CheckRunner {
                 task_id,
                 snapshot,
                 overrides,
-                changed_files: files.clone(),
+                changed_files: files.clone().unwrap_or_default(),
             }),
             lifecycle: Vec::new(),
             completed_plan: None,
@@ -254,7 +255,7 @@ impl CheckRunner {
             workspace_digest: BTreeMap::new(),
             commands: Vec::new(),
         };
-        let applicability = super::applicability::resolve(&request, &effective, &files, has_scope)?;
+        let applicability = super::applicability::resolve(&request, &effective, files.as_deref(), has_scope)?;
         let requested: std::collections::BTreeSet<_> = applicability
             .iter()
             .filter(|item| item.selected)
@@ -271,7 +272,7 @@ impl CheckRunner {
                 .map(|id| (id.clone(), CheckSelection::All))
                 .collect()
         } else {
-            effective_request.selections(&effective, &files, cases.as_deref(), has_scope)?
+            effective_request.selections(&effective, files.as_deref().unwrap_or_default(), cases.as_deref(), has_scope)?
         };
         for index in effective.order()? {
             let definition = &effective.definitions[index];
@@ -304,6 +305,8 @@ impl CheckRunner {
                 && cases.is_none()
             {
                 (CheckState::ConfigurationError, Some("Added/modified case inventory is unavailable outside plan execution. Use changed_files or all in /checks setup, or supply explicit cases.".into()))
+            } else if selection.empty() && files.is_none() && has_scope {
+                (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Select full coverage explicitly or provide concrete files or cases.".into()))
             } else if selection.empty() {
                 (CheckState::Skipped, Some("No matching task changes".into()))
             } else if operation.is_none() {
@@ -588,17 +591,11 @@ impl CheckRunner {
         } else {
             run.commands[index].command.clone()
         };
-        let mut command = run.shell.command(executable, &source)?;
+        let mut command = run.shell.command(executable, &source, scoped)?;
         command
             .current_dir(directory)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        if scoped {
-            command.stdin(std::process::Stdio::piped());
-            if run.shell == crate::session::CheckShell::Nushell {
-                command.arg("--stdin");
-            }
-        }
         let mut child = crate::process::spawn_owned(command).context("start configured check")?;
         let input = if scoped {
             Some(
