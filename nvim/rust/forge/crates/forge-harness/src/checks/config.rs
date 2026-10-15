@@ -29,27 +29,9 @@ pub enum CheckScope {
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Supplies a shell command or a direct executable with argument bindings.
+/// Supplies a static command executed by the project's configured check shell.
 pub struct CheckOperation {
-    /// Shell source when args is absent, otherwise the executable name or path.
     pub command: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Direct arguments with Forge-owned file, package, or unit-test bindings.
-    pub args: Option<Vec<String>>,
-}
-
-impl CheckOperation {
-    /// Formats the executable and arguments for review without executing a shell.
-    pub fn display(&self) -> String {
-        match &self.args {
-            Some(args) => std::iter::once(self.command.as_str())
-                .chain(args.iter().map(String::as_str))
-                .map(|value| format!("{value:?}"))
-                .collect::<Vec<_>>()
-                .join(" "),
-            None => self.command.clone(),
-        }
-    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -141,9 +123,6 @@ impl CheckConfig {
                     "invalid command for {}",
                     definition.id
                 );
-                if let Some(args) = &operation.args {
-                    super::native::validate(operation, args)?;
-                }
             }
             match definition.scope {
                 CheckScope::ChangedFiles => ensure!(
