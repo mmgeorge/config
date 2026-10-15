@@ -74,7 +74,9 @@ impl CompactionMonitor {
         subscription_state: CompactionSubscription,
         turn_event: Arc<CopilotTurnEvent>,
     ) -> Self {
-        let mut subscription = session.subscribe();
+        let mut subscription = super::event_stream::SessionEventStream::new(session, |event| {
+            matches!(event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
+        });
         let manual = Arc::clone(&subscription_state.manual);
         let correlation = Arc::clone(&manual);
         let thread_id = session.id().to_string();

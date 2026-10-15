@@ -64,10 +64,10 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,
         forge_harness::backend::McpStatus::Connected);
     let failed = server.iter().find(|server| server.name == "broken").unwrap();
-    assert_eq!(failed.status, forge_harness::backend::McpStatus::Failed);
+    assert_eq!(failed.status, forge_harness::backend::McpStatus::Unavailable);
     assert!(failed.status_detail.as_ref().is_some_and(|detail| !detail.is_empty()));
     let log = std::fs::read_to_string(trace.session_status(&request.harness_session_id).path).unwrap();
-    assert!(log.contains("copilot.mcp.start_failed") && log.contains("broken"));
+    assert!(!log.contains("copilot.mcp.start_failed"));
     let session_id = backend.active_session_id_for(&request.harness_session_id).await.unwrap();
     let server = backend.mcp_list(request.clone()).await.unwrap();
     assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,

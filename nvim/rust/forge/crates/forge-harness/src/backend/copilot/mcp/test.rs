@@ -56,7 +56,7 @@ impl Fixture {
         std::fs::create_dir_all(&source).unwrap();
         let servers: serde_json::Map<String, Value> = names
             .iter()
-            .map(|name| ((*name).into(), json!({"command":"unused", "args":[]})))
+            .map(|name| ((*name).into(), json!({"command":std::env::current_exe().unwrap(), "args":[]})))
             .collect();
         std::fs::write(
             source.join("mcp.json"),
@@ -147,6 +147,14 @@ impl Fixture {
                 )
                 .await;
                 if method == "session.send" {
+                    for index in 0..4096 {
+                        write_message(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event",
+                            "params":{"sessionId":provider_session,"event":{"id":format!("stream-{index}"),
+                                "timestamp":"2026-10-14T00:00:00Z","type":if index % 2 == 0 {
+                                    "assistant.streaming_delta"
+                                } else { "assistant.tool_call_delta" },"ephemeral":true,
+                                "data":{"totalResponseSizeBytes":index}}}})).await;
+                    }
                     for (event_type, data) in [
                         ("assistant.message", json!({"content":"Repository answer"})),
                         ("assistant.idle", json!({})),

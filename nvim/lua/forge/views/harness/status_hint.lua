@@ -184,6 +184,7 @@ function M.render(transcript, commands, width)
   local inventory = transcript.background_terminals
   local terminal_count = inventory and inventory.supported and #(inventory.terminal or {}) or 0
   local terminal_text = inventory and inventory.unavailable and "Terminal status unavailable"
+    or inventory and inventory.starting and "Terminal status: starting"
     or terminal_count > 0 and ("%d terminal%s running"):format(terminal_count, terminal_count == 1 and "" or "s") or nil
   local terminal_chunks = terminal_text and { { terminal_text, "ForgeStatusHint" } } or nil
   if terminal_count > 0 then append_hint(terminal_chunks, hint_chunks(commands, "terminal_status", width)) end

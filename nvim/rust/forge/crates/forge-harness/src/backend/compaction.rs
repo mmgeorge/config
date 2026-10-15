@@ -109,7 +109,7 @@ pub struct CompactionContext {
 pub struct CompactionResult {
     /// Context meter tokens captured when compaction starts.
     pub context_tokens_before: Option<u64>,
-    /// Fresh context meter tokens observed during or after compaction.
+    /// First context meter tokens observed after confirmed completion.
     pub context_tokens_after: Option<u64>,
     /// Compaction model reported at operation start.
     pub model: Option<String>,
@@ -173,11 +173,11 @@ pub struct Compaction {
 }
 
 impl Compaction {
-    /// Record fresh context usage while running or awaiting the first completed reading.
+    /// Record the first context usage reading after confirmed completion.
     pub(crate) fn observe_context_usage(&mut self, used: u64) -> bool {
         if self.result.context_tokens_before.is_none()
-            || !matches!(self.state, CompactionState::Running | CompactionState::Completed)
-            || (self.state == CompactionState::Completed && self.result.context_tokens_after.is_some()) {
+            || self.state != CompactionState::Completed
+            || self.result.context_tokens_after.is_some() {
             return false;
         }
         self.result.context_tokens_after = Some(used);

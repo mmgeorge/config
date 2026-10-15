@@ -1019,11 +1019,13 @@ impl Backend for CodexBackend {
         else {
             return Ok(super::terminal::TerminalSnapshot {
                 supported: true,
+                starting: false,
                 terminal: Vec::new(),
             });
         };
         let mut snapshot = super::terminal::TerminalSnapshot {
             supported: true,
+            starting: false,
             terminal: Vec::new(),
         };
         let mut cursor: Option<String> = None;

@@ -1,4 +1,5 @@
 mod event_decoder;
+mod event_stream;
 mod compaction;
 mod text_generation;
 mod mcp;
@@ -11,8 +12,7 @@ use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendContextWindow, BackendDescriptor,
     BackendEvent, BackendEventSink, BackendForkRequest, BackendInput, BackendKind, BackendModel,
     BackendOutput, BackendRequest, CatalogCapability, CatalogMutation, McpDefinition, McpStatus,
-    McpToolDefinition, PromptMode, ProviderChangeSet, SkillDefinition, ToolActivity,
-    ToolActivityKind,
+    McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::{
     ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext,
@@ -77,7 +77,8 @@ impl Drop for CopilotTerminalMonitor {
 impl CopilotTerminalMonitor {
     /// Subscribe before the first query so terminal transitions cannot be lost at attachment.
     fn new(session: &SharedCopilotSession) -> Self {
-        let mut event = session.subscribe();
+        let mut event = event_stream::SessionEventStream::new(session,
+            |event| event.event_type == "session.background_tasks_changed");
         let session = Arc::downgrade(session);
         let monitored_session = session.clone();
         let (send, snapshot) = tokio::sync::watch::channel(None);
@@ -102,7 +103,6 @@ impl CopilotTerminalMonitor {
                         update = event.recv() => match update {
                             Ok(update) if update.event_type == "session.background_tasks_changed" => break,
                             Ok(_) => {},
-                            Err(error) if matches!(error.kind(), github_copilot_sdk::subscription::RecvErrorKind::Lagged(_)) => break,
                             Err(error) => {
                                 let _ = send.send(Some(Err(format!("Copilot terminal event stream closed: {error}"))));
                                 return;
@@ -529,10 +529,18 @@ impl Backend for CopilotBackend {
     }
 
     async fn background_terminals(&self, request: BackendCatalogRequest) -> Result<super::terminal::TerminalSnapshot> {
-        let session = match self.active_session(&request.runtime_key()?).await {
+        let session_slot = self.session_slot(&request.runtime_key()?).await;
+        let active_session = match session_slot.try_lock() {
+            Ok(binding) => binding.as_ref().map(|binding| Arc::clone(&binding.session)),
+            Err(_) => return Ok(super::terminal::TerminalSnapshot {
+                supported: true, starting: true, terminal: Vec::new(),
+            }),
+        };
+        let session = match active_session {
             Some(session) => session,
-            None if request.backend_session_id.is_some() => self.session(&Self::catalog_backend_request(&request)).await?,
-            None => return Ok(super::terminal::TerminalSnapshot { supported: true, terminal: Vec::new() }),
+            None => return Ok(super::terminal::TerminalSnapshot {
+                supported: true, starting: request.backend_session_id.is_some(), terminal: Vec::new(),
+            }),
         };
         let mut monitor_store = self.terminal_monitor.lock().await;
         let monitor = monitor_store.entry(request.runtime_key()?)
@@ -540,10 +548,11 @@ impl Backend for CopilotBackend {
         if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(&session)) {
             *monitor = CopilotTerminalMonitor::new(&session);
         }
-        let mut snapshot = monitor.snapshot.clone();
+        let snapshot = monitor.snapshot.clone();
         drop(monitor_store);
-        if snapshot.borrow().is_none() { snapshot.changed().await.context("Copilot terminal observer stopped")?; }
-        let result = snapshot.borrow().clone().context("Copilot terminal observer has no snapshot")?;
+        let Some(result) = snapshot.borrow().clone() else {
+            return Ok(super::terminal::TerminalSnapshot { supported: true, starting: true, terminal: Vec::new() });
+        };
         result.map_err(anyhow::Error::msg)
     }
 
@@ -609,7 +618,9 @@ impl Backend for CopilotBackend {
             .map_err(|_|anyhow::anyhow!("Copilot permission context lock poisoned"))?.checkpoint =
             request.control_context.as_ref().and_then(|context|context.checkpoint.clone());
         let session = self.session(&request).await?;
-        let mut subscription = session.subscribe();
+        let mut subscription = event_stream::SessionEventStream::new(&session, |event| {
+            !matches!(event.event_type.as_str(), "assistant.streaming_delta" | "assistant.tool_call_delta")
+        });
         let control_router = self.control_router(&request.runtime_key()?).await;
         let control_context = request
             .control_context
@@ -754,14 +765,7 @@ impl Backend for CopilotBackend {
                 }
                 invocation = control_stream.receive() => {
                     if let Some(invocation) = invocation {
-                        let result = apply_invocation(&invocation, &mut output);
-                        control_stream.publish_completion(
-                            invocation,
-                            result.as_ref().err().map(|error| format!("{error:#}")),
-                            &mut output,
-                            event_sink.as_ref(),
-                        ).await;
-                        if let Err(error) = result {
+                        if let Err(error) = apply_invocation(&invocation, &mut output) {
                             output.control_error = Some(format!("{error:#}"));
                         }
                     }
@@ -769,16 +773,7 @@ impl Backend for CopilotBackend {
             }
         }
         while let Ok(invocation) = control_stream.try_receive() {
-            let result = apply_invocation(&invocation, &mut output);
-            control_stream
-                .publish_completion(
-                    invocation,
-                    result.as_ref().err().map(|error| format!("{error:#}")),
-                    &mut output,
-                    event_sink.as_ref(),
-                )
-                .await;
-            if let Err(error) = result {
+            if let Err(error) = apply_invocation(&invocation, &mut output) {
                 output.control_error = Some(format!("{error:#}"));
             }
         }
@@ -1387,7 +1382,7 @@ fn model_options(
 #[derive(Default)]
 struct ControlToolRouter {
     sender: StandardMutex<Option<mpsc::Sender<ControlToolInvocation>>>,
-    runtime: StandardMutex<Option<ControlToolRuntime>>,
+    runtime: StandardMutex<Option<Arc<Mutex<ControlToolRuntime>>>>,
 }
 
 impl ControlToolRouter {
@@ -1406,16 +1401,15 @@ impl ControlToolRouter {
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
-            Some(ControlToolRuntime::new(context));
+            Some(Arc::new(Mutex::new(ControlToolRuntime::new(context))));
         Ok(ControlToolStream {
             router: Arc::clone(self),
             receiver,
-            next_activity_id: 0,
         })
     }
 
     async fn route(&self, invocation: ControlToolInvocation) -> Result<String> {
-        let (active_sender, admission, mut runtime) = {
+        let (active_sender, admission, runtime) = {
             let sender_guard = self
                 .sender
                 .lock()
@@ -1433,11 +1427,18 @@ impl ControlToolRouter {
                 .runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?
-                .take()
+                .clone()
                 .context("Copilot control tool ran without an active turn")?;
             drop(sender_guard);
             (active_sender, admission, runtime)
         };
+        let mut runtime = runtime.lock().await;
+        {
+            let sender = self.sender.lock()
+                .map_err(|_| anyhow::anyhow!("Copilot control-tool router lock poisoned"))?;
+            anyhow::ensure!(sender.as_ref().is_some_and(|current| current.same_channel(&active_sender)),
+                "Copilot control-tool invocation belongs to a collected turn");
+        }
         let result = runtime.invoke(invocation.clone()).await;
         let execution_finished = runtime.execution_finished();
         let failure_json = result
@@ -1454,11 +1455,6 @@ impl ControlToolRouter {
                 .is_some_and(|current| current.same_channel(&active_sender)),
             "Copilot control-tool result belongs to a collected turn"
         );
-        *self
-            .runtime
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
-            Some(runtime);
         drop(sender_guard);
         let result = match result {
             Ok(result) => result,
@@ -1481,7 +1477,6 @@ impl ControlToolRouter {
 struct ControlToolStream {
     router: Arc<ControlToolRouter>,
     receiver: mpsc::Receiver<ControlToolInvocation>,
-    next_activity_id: u64,
 }
 
 impl ControlToolStream {
@@ -1491,51 +1486,6 @@ impl ControlToolStream {
 
     fn try_receive(&mut self) -> Result<ControlToolInvocation, mpsc::error::TryRecvError> {
         self.receiver.try_recv()
-    }
-
-    /// Publish one completed Harness control call through the shared tool timeline.
-    async fn publish_completion(
-        &mut self,
-        invocation: ControlToolInvocation,
-        error: Option<String>,
-        output: &mut BackendOutput,
-        event_sink: Option<&BackendEventSink>,
-    ) {
-        self.next_activity_id += 1;
-        let event = BackendEvent {
-            received_at_ms: None,
-            address: None,
-            turn_boundary: None,
-            kind: "tool".into(),
-            text: None,
-            data: Value::Null,
-            activity: Some(ToolActivity {
-                id: format!("harness-control-{}", self.next_activity_id),
-                kind: ToolActivityKind::ToolCall,
-                title: invocation.name,
-                output: Some(
-                    error
-                        .clone()
-                        .unwrap_or_else(|| "Recorded by Forge Harness".into()),
-                ),
-                status: Some(
-                    if error.is_some() {
-                        "failed"
-                    } else {
-                        "completed"
-                    }
-                    .into(),
-                ),
-                change: ProviderChangeSet::default(),
-                output_delta: false,
-            }),
-            summary: None,
-            task_update: None,
-        };
-        if let Some(event_sink) = event_sink {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        output.event.push(event);
     }
 }
 
@@ -1922,33 +1872,6 @@ mod test {
             stream.receive().await.unwrap().name,
             "harness_goal_complete"
         );
-    }
-
-    #[tokio::test]
-    async fn publishes_control_tools_through_the_shared_timeline() {
-        let router = Arc::new(ControlToolRouter::default());
-        let mut stream = router
-            .activate(ControlTurnContext::inactive(PromptMode::Chat))
-            .unwrap();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
-        let mut output = BackendOutput::default();
-
-        stream
-            .publish_completion(
-                ControlToolInvocation {
-                    name: "harness_plan_read".into(),
-                    arguments: Value::Null,
-                },
-                None,
-                &mut output,
-                Some(&event_sink),
-            )
-            .await;
-
-        let activity = output.event[0].activity.as_ref().expect("tool activity");
-        assert_eq!(activity.title, "harness_plan_read");
-        assert_eq!(activity.status.as_deref(), Some("completed"));
-        assert_eq!(event_stream.try_recv().unwrap().kind, "tool");
     }
 
     #[test]

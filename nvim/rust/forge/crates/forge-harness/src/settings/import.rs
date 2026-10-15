@@ -339,7 +339,7 @@ mod test {
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace)?;
         let source = root.path().join("native.json");
-        let original = json!({"mcpServers":{"portable":{"command":"fixture","env":{"TOKEN":"native-token-fixture"}}},
+        let original = json!({"mcpServers":{"portable":{"command":std::env::current_exe()?,"env":{"TOKEN":"native-token-fixture"}}},
             "apiKey":"provider-authentication-fixture"}).to_string();
         std::fs::write(&source, &original)?;
         let workspace = workspace.to_string_lossy().into_owned();

@@ -756,6 +756,10 @@ fold ranges start on the same row. Native fold commands and split windows update
 shared buffer. Collapsed labels retain the same indentation and marker column as open headings.
 Tool groups inherit the same layout depth as commentary. Their rows start with the `•` marker
 without additional leading spaces. Output branches add two columns relative to that marker.
+Copilot assistant deltas render as commentary until the completed message supplies its tool
+requests. Messages that request tools retain commentary styling. Completed messages without
+tool requests become final responses. Completion replaces the streamed message by provider
+identity, preserving its position without appending duplicate text.
 Tool timings round to the nearest tenth in a fixed five-cell column, accommodating `99.9s`.
 Rounded values reaching 100 advance to the next unit, starting with minutes, so timer
 updates never shift command columns.
@@ -1123,6 +1127,13 @@ task transition admission. The client waits for the applied revision instead of 
 successful application. Unknown native resources require explicit import before mutation. Resource
 configuration does not write native provider settings. ACP exposes configured selection separately
 from server readiness because the protocol does not provide a server-status inventory.
+
+Copilot terminal status reads the session binding without waiting for initialization to release
+its lock. A busy binding returns a starting snapshot, which the footer renders as
+`Terminal status: starting`. Subsequent polls observe the ready session and its terminal inventory.
+Status polling never starts or resumes a provider session and never waits for the first inventory
+refresh. An absent session or pending first refresh returns a starting snapshot when appropriate.
+An initialization delay therefore does not consume the terminal query's eight-second deadline.
 
 The `/undo` specialization loads the active session's durable interaction records and lists
 checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
@@ -2162,7 +2173,13 @@ when their source path is outside that workspace. Provider-only entries show `Pr
 inferring a scope. Both pickers expose the source column and expand the definition path with Tab.
 MCP details retain the cached tool list. Runtime status refreshes preserve source metadata.
 Environment references resolve only into ephemeral provider launch payloads. Missing credentials mark optional default MCP
-resources unavailable, while explicitly enabled resources fail launch. Claude resource selection uses
+resources unavailable, while explicitly enabled resources fail launch. Stdio MCP launch preparation
+checks the executable against the server's working directory and effective PATH, including Windows
+executable and command-script suffixes and Unix executable permissions. Missing commands stay visible
+as unavailable rows and are omitted from every provider's launch payload without changing saved
+enablement. Before a prompt and after configuration changes, the broker logs `mcp.start_skipped` and emits a warning notification for
+each newly unavailable command. Repeated prompts suppress an unchanged warning until availability
+or the failure reason changes. HTTP and SSE servers do not require a local command. Claude resource selection uses
 strict MCP configuration and an ephemeral `forge-managed` plugin whose selected skill directories bind
 to canonical sources. Its SDK skill filter admits only those qualified plugin names. Antigravity starts with a private `GEMINI_HOME`
 configuration root. That root binds only selected skill definitions and links its private ACP state
@@ -2213,6 +2230,13 @@ request. Ambiguous concurrent calls retain a server-wide approval target.
 Copilot turn addresses include the provider interaction identity because native turn counters can
 repeat across prompts. Later messages and completion events resolve through the matching turn-start
 record, so a reused counter cannot attach a new response to a completed execution.
+Copilot SDK subscriptions drain through independent `SessionEventStream` tasks before tracing,
+provider RPCs, or presentation processing. The prompt stream excludes raw
+`assistant.streaming_delta` and `assistant.tool_call_delta` telemetry, while retaining structured
+message, reasoning, tool, usage, and lifecycle events. Compaction and terminal monitors admit only
+their event types. Each intake uses the shared encoded outbound queue limits and preserves event
+order, waiting for queue capacity when required. Dropping a consumer aborts its intake task.
+SDK stream failures remain explicit errors rather than silently discarding execution events.
 
 `CapabilityManifest` records required and optional operations, support, ownership, application boundary,
 and runtime availability. The `Backend` trait requires explicit identity, streaming, shutdown,
@@ -2781,6 +2805,11 @@ visible as failed timeline activities but never enter durable replay, preventing
 from being poisoned by an earlier validation failure. Started and completed lifecycle
 notifications update the rendered tool activity only. They never authorize a control mutation,
 because those notifications can precede validation or replay a rejected call after its response.
+Copilot uses its native tool events for Harness control-call activity, preserving the native tool
+and turn identities. The accepted-control channel carries replay data only and never adds a
+second, addressless completion. Concurrent SDK handlers share one asynchronously locked control
+runtime, so one call cannot make that runtime appear absent to another. Queued calls verify their
+turn ownership after acquiring the runtime before invoking it.
 A separate accepted-request identity set keeps successful provider request replays idempotent
 without allowing rejected requests to reserve that identity.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
@@ -2839,8 +2868,10 @@ and suppresses its history row. The shared activity timer refreshes elapsed whol
 the recorded compaction start. A terminal outcome restores the ordinary workflow status and
 projects a compaction event. Events with a summary or reported metrics have a collapsed detail fold.
 Events without details use a plain diamond marker and no fold. Event labels omit manual or automatic origin.
-The broker captures context-meter usage at compaction start and retains a fresh usage reading
-from the operation or its next update. Completed headings show the before/after token counts
+The broker captures context-meter usage at compaction start, preferring the provider's complete
+context composition over the last meter reading. It accepts the after reading only after the
+provider confirms completion. Usage received while compaction runs still updates the live
+meter, but cannot become the post-compaction value. Completed headings show the before/after token counts
 only when both readings exist. These readings survive lifecycle replays and session reloads,
 remain separate from provider conversation-token metrics, and stop changing once settled.
 Codex discards resume-time usage before requesting compaction so stale counts cannot become
@@ -3866,6 +3897,8 @@ the invocation's encoded size or invoking `ControlToolRuntime`. The invocation m
 failures and calls without a routed result release their reservations. Accepted invocations retain
 their order in the receiver. These limits count queued and reserved invocations. A dequeued
 invocation and the runtime's retained plan state have separate lifetimes.
+Synthetic turn ownership is retained only after the exchange admits that turn, so a rejected
+admission cannot replace the original failure with an unknown-turn error during cleanup.
 
 No unbounded Tokio channels remain in the root or Harness source. This inventory does not prove
 bounded total memory. Provider SDK buffering, accumulated transcript/output collections, decoded

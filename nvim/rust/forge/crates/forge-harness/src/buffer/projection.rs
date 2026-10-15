@@ -2164,21 +2164,19 @@ mod tests {
             exchange.observe_compaction(running.clone(), 1_000);
             assert!(!exchange.observe_compaction_usage("different-provider", 900_000));
             if usage_before_completion {
-                assert!(exchange.observe_compaction_usage("provider", 32_000));
+                assert!(!exchange.observe_compaction_usage("provider", 125_000));
             }
             let mut completed = running.clone();
             completed.state = CompactionState::Completed;
             completed.result = CompactionResult::default();
             exchange.observe_compaction(completed, 16_000);
-            if !usage_before_completion {
-                let waiting = project_at(&TimelineEntry::Exchange {
-                    id: "exchange".into(), created_at_ms: 0,
-                    exchange: exchange.clone(), agent_by_id: HashMap::new(),
-                }, &WidthProfile::default(), 16_000)?;
-                assert!(!waiting.entry.block.iter().flat_map(|block| block.text.wire_rows())
-                    .any(|row| row.contains("→")));
-                assert!(exchange.observe_compaction_usage("provider", 32_000));
-            }
+            let waiting = project_at(&TimelineEntry::Exchange {
+                id: "exchange".into(), created_at_ms: 0,
+                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+            }, &WidthProfile::default(), 16_000)?;
+            assert!(!waiting.entry.block.iter().flat_map(|block| block.text.wire_rows())
+                .any(|row| row.contains("→")));
+            assert!(exchange.observe_compaction_usage("provider", 32_000));
             assert!(!exchange.observe_compaction_usage("provider", 64_000));
             exchange.observe_compaction(running, 20_000);
             let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;

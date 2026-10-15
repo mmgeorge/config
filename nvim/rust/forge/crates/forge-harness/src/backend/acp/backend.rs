@@ -475,7 +475,7 @@ mod test {
         std::fs::create_dir(&workspace)?;
         let server_source = fixture.path().join("native.json");
         std::fs::write(&server_source, json!({"mcpServers":{"imported-server":{
-            "command":"fixture-must-not-launch","targets":["*"],"env":{"TOKEN":"native-credential-fixture"}
+            "command":std::env::current_exe()?,"targets":["*"],"env":{"TOKEN":"native-credential-fixture"}
         }}}).to_string())?;
         let skill_source = fixture.path().join("native-skill");
         std::fs::create_dir(&skill_source)?;

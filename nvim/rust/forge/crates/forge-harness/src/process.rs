@@ -40,27 +40,30 @@ pub(crate) fn command(program: &str, args: &[String]) -> Command {
 
 /// Resolve an installed executable without starting a shell or modifying its search path.
 pub(crate) fn executable(program: &str) -> Option<PathBuf> {
-    let requested = Path::new(program);
-    if requested.is_absolute() || requested.components().count() > 1 {
-        let metadata = requested.metadata().ok()?;
-        if !metadata.is_file() { return None; }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            if metadata.permissions().mode() & 0o111 == 0 { return None; }
-        }
-        return Some(requested.to_path_buf());
-    }
+    executable_at(program, &std::env::current_dir().ok()?, &std::env::var_os("PATH").unwrap_or_default())
+}
 
-    let search_path = std::env::var_os("PATH")?;
-    for directory in std::env::split_paths(&search_path) {
+/// Resolve a command against its launch directory and effective PATH without running it.
+pub(crate) fn executable_at(program: &str, working_directory: &Path, search_path: &std::ffi::OsStr) -> Option<PathBuf> {
+    if program.is_empty() { return None; }
+    let requested = Path::new(program);
+    let qualified = requested.is_absolute() || requested.components().count() > 1;
+    let directory: Vec<PathBuf> = if qualified {
+        vec![working_directory.to_path_buf()]
+    } else {
+        let directory = std::env::split_paths(search_path).map(|directory| working_directory.join(directory));
         #[cfg(windows)]
-        let extensions = ["exe", "com", "cmd", "bat", ""];
+        let directory = std::iter::once(working_directory.to_path_buf()).chain(directory);
+        directory.collect()
+    };
+    for directory in directory {
+        #[cfg(windows)]
+        let extensions = ["", "exe", "com", "cmd", "bat"];
         #[cfg(not(windows))]
         let extensions = [""];
         for extension in extensions {
             let candidate = if extension.is_empty() {
-                directory.join(program)
+                directory.join(requested)
             } else {
                 directory.join(format!("{program}.{extension}"))
             };

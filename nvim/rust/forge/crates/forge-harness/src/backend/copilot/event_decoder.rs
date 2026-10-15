@@ -6,7 +6,7 @@ use crate::backend::{
 };
 use crate::session::ContextUsage;
 use github_copilot_sdk::SessionEvent;
-use serde_json::Value;
+use serde_json::{Value, json};
 
 /// Normalizes stable Copilot SDK session events into the Harness interaction protocol.
 #[derive(Default)]
@@ -61,6 +61,12 @@ impl CopilotEventDecoder {
                         tool_definitions_tokens: result.tool_definitions_tokens.take(),
                         ..Default::default()
                     });
+                    if let Some(context) = &mut result.before_context {
+                        context.current_tokens = context.conversation_tokens.zip(context.system_tokens)
+                            .zip(context.tool_definitions_tokens)
+                            .and_then(|((conversation, system), tools)| conversation.checked_add(system)?.checked_add(tools));
+                        result.context_tokens_before = context.current_tokens;
+                    }
                 }
                 let compaction = crate::backend::Compaction {
                     id, thread_id,
@@ -127,7 +133,7 @@ impl CopilotEventDecoder {
                 .await;
             }
             "assistant.reasoning" => {
-                self.publish_final_text(
+                self.publish_text(
                     "reasoning",
                     string_field(&provider_event.data, &["content", "text"]),
                     provider_event,
@@ -137,7 +143,7 @@ impl CopilotEventDecoder {
                 .await;
             }
             "assistant.message" => {
-                self.publish_final_text(
+                self.publish_text(
                     "assistant_message",
                     string_field(&provider_event.data, &["content", "text"]),
                     provider_event,
@@ -302,6 +308,19 @@ impl CopilotEventDecoder {
         let Some(text) = text.filter(|text| !text.is_empty()) else {
             return;
         };
+        let mut data = serde_json::to_value(provider_event).unwrap_or(Value::Null);
+        if kind == "assistant_message" {
+            let final_answer = provider_event.event_type == "assistant.message"
+                && !provider_event.data.get("toolRequests").and_then(Value::as_array)
+                    .is_some_and(|requests| !requests.is_empty());
+            data["phase"] = json!(if final_answer { "final" } else { "commentary" });
+        }
+        if let Some(id) = provider_event.data.get("reasoningId").and_then(Value::as_str) {
+            data["provider_message_id"] = json!(id);
+        }
+        if matches!(provider_event.event_type.as_str(), "assistant.message" | "assistant.reasoning") {
+            data["message_update"] = json!("snapshot");
+        }
         publish(
             BackendEvent {
             received_at_ms: None,
@@ -309,7 +328,7 @@ impl CopilotEventDecoder {
                 turn_boundary: None,
                 kind: kind.into(),
                 text: Some(text),
-                data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
+                data,
                 activity: None,
                 summary: None,
                 task_update: None,
@@ -318,37 +337,6 @@ impl CopilotEventDecoder {
             event_sink,
         )
         .await;
-    }
-
-    async fn publish_final_text(
-        &self,
-        kind: &str,
-        text: Option<String>,
-        provider_event: &SessionEvent,
-        output: &mut BackendOutput,
-        event_sink: Option<&BackendEventSink>,
-    ) {
-        let message_id = string_field(&provider_event.data, &["messageId"]);
-        let already_streamed = output
-            .event
-            .iter()
-            .rev()
-            .take_while(|event| event.activity.is_none())
-            .any(|event| {
-                event.kind == kind
-                    && event.text.is_some()
-                    && message_id.as_ref().is_none_or(|message_id| {
-                        event
-                            .data
-                            .pointer("/data/messageId")
-                            .and_then(Value::as_str)
-                            == Some(message_id)
-                    })
-            });
-        if !already_streamed {
-            self.publish_text(kind, text, provider_event, output, event_sink)
-                .await;
-        }
     }
 }
 
@@ -409,6 +397,8 @@ async fn publish(
                 if let Some(existing) = previous.compaction().ok().flatten() {
                     let provider_event_id = event.data.get("provider_event_id").cloned();
                     let mut retained = compaction;
+                    retained.result.context_tokens_before = existing.result.context_tokens_before
+                        .or(retained.result.context_tokens_before);
                     retained.result.before_context = existing.result.before_context;
                     retained.result.model = retained.result.model.or(existing.result.model);
                     event.data = serde_json::to_value(retained).unwrap_or(event.data.clone());
@@ -443,13 +433,15 @@ async fn publish(
         && let Some(previous) = output.event.last_mut()
         && previous.kind == event.kind
         && previous.address == event.address
+        && previous.message_id() == event.message_id()
         && previous.activity.is_none()
     {
-        let incoming = event.text.unwrap_or_default();
-        previous
-            .text
-            .get_or_insert_with(String::new)
-            .push_str(&incoming);
+        if event.message_snapshot() {
+            previous.text = event.text;
+        } else {
+            previous.text.get_or_insert_with(String::new)
+                .push_str(event.text.as_deref().unwrap_or_default());
+        }
         previous.data = event.data;
         return;
     }

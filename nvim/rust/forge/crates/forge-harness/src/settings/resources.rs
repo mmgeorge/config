@@ -15,6 +15,8 @@ pub(crate) struct SessionResources {
     pub(crate) mcp: Vec<McpDefinition>,
     /// Contains resolved native launch payloads and must never be serialized into history.
     pub(crate) launch: Vec<(String, Value)>,
+    /// Maps resources skipped for missing executables to their user-facing explanation.
+    pub(crate) launch_notice: std::collections::HashMap<String, String>,
 }
 
 impl SessionResources {
@@ -64,6 +66,7 @@ impl SessionResources {
         }
         let mut mcp = Vec::new();
         let mut launch = Vec::new();
+        let mut launch_notice = std::collections::HashMap::new();
         let mut selected_name = HashSet::from(["forge-harness-control".to_owned()]);
         for definition in catalog.server {
             if !ResourceCatalog::supports_target(&definition.targets, target) { continue; }
@@ -73,8 +76,14 @@ impl SessionResources {
                     Ok(payload) => {
                         ensure!(selected_name.insert(definition.name.clone()),
                             "MCP server {} collides with another selected definition or Harness control", definition.name);
-                        launch.push((definition.name.clone(), payload));
-                        (McpStatus::Loading, None)
+                        if let Some(command) = unavailable_command(&payload, Path::new(&request.workspace)) {
+                            let message = format!("MCP server {} was not started: executable '{command}' was not found or is not executable. Install it and retry in /mcp.", definition.name);
+                            launch_notice.insert(definition.id.clone(), message.clone());
+                            (McpStatus::Unavailable, Some(message))
+                        } else {
+                            launch.push((definition.name.clone(), payload));
+                            (McpStatus::Loading, None)
+                        }
                     }
                     Err(error) if settings.desired.mcp.get(&definition.id) != Some(&true) => {
                         (McpStatus::Unavailable, Some(error.to_string()))
@@ -89,8 +98,21 @@ impl SessionResources {
                 tools: Vec::new(), tool_error: None,
             });
         }
-        Ok(Self { skill, selected_skill, mcp, launch })
+        Ok(Self { skill, selected_skill, mcp, launch, launch_notice })
     }
+}
+
+fn unavailable_command(payload: &Value, workspace: &Path) -> Option<String> {
+    if payload.get("type").and_then(Value::as_str) != Some("stdio") { return None; }
+    let command = payload.get("command")?.as_str()?;
+    let directory = payload.get("cwd").and_then(Value::as_str)
+        .map(|directory| workspace.join(directory)).unwrap_or_else(|| workspace.to_path_buf());
+    let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+    let path = payload.get("env").and_then(Value::as_object)
+        .and_then(|environment| environment.iter().find(|(name, _)| {
+            if cfg!(windows) { name.eq_ignore_ascii_case("PATH") } else { name.as_str() == "PATH" }
+        })).and_then(|(_, value)| value.as_str()).map(std::ffi::OsStr::new).unwrap_or(&inherited_path);
+    crate::process::executable_at(command, &directory, path).is_none().then(|| command.to_owned())
 }
 
 #[cfg(test)]
@@ -121,7 +143,7 @@ mod test {
                 else { format!("targets: {}\n", serde_json::to_string(&targets).unwrap()) };
             std::fs::write(skill_directory.join("SKILL.md"),
                 format!("---\nname: {name}\n{target_header}---\nFixture")).unwrap();
-            let mut server = serde_json::json!({"command":"fixture-must-not-launch"});
+            let mut server = serde_json::json!({"command":std::env::current_exe().unwrap()});
             if !targets.is_empty() { server["targets"] = serde_json::json!(targets); }
             let server_map = if directory == &global { &mut global_server } else { &mut local_server };
             server_map.insert(name.into(), server);
@@ -199,7 +221,7 @@ mod test {
         std::fs::write(global.join("skills/shared-skill/SKILL.md"), "---\nname: shared-skill\ndescription: Shared fixture\ntargets: [copilotcli]\n---\nFixture").unwrap();
         std::fs::write(workspace.join(".rulesync/skills/claude-only/SKILL.md"), "---\nname: claude-only\ntargets: [claudecode]\n---\nFixture").unwrap();
         std::fs::write(global.join("mcp.json"), serde_json::json!({"mcpServers": {
-            "selected": {"command":"fixture", "env":{"FIXTURE_TOKEN":"credential-fixture"}},
+            "selected": {"command":std::env::current_exe().unwrap(), "env":{"FIXTURE_TOKEN":"credential-fixture"}},
             "missing": {"command":"fixture", "envVars":["FORGE_RESOURCE_TEST_MISSING_81D3"]}
         }}).to_string()).unwrap();
         let mut store = SettingsStore::open(root.path()).unwrap();

@@ -129,7 +129,7 @@ mod test {
         std::fs::create_dir_all(&skill)?;
         std::fs::write(skill.join("SKILL.md"),"---\nname: selected\ndescription: fixture\n---\nUse this skill.")?;
         std::fs::write(definitions.join("mcp.json"),json!({"mcpServers":{
-            "selected":{"command":"fixture","env":{"CUSTOM_CREDENTIAL":"selected-secret-fixture"}}
+            "selected":{"command":std::env::current_exe().unwrap(),"env":{"CUSTOM_CREDENTIAL":"selected-secret-fixture"}}
         }}).to_string())?;
         crate::settings::SettingsStore::open(root.path())?.configure_catalog(root.path())?;
         let request = BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(),workspace:root.path().to_string_lossy().into_owned(),

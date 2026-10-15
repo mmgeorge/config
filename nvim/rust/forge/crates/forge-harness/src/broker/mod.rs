@@ -556,6 +556,7 @@ pub struct HarnessBroker {
     pub(crate) agent_backend_factory: crate::agent::AgentBackendFactory,
     child_backend_by_agent: HashMap<String, Arc<dyn Backend>>,
     diagnostic_native_thread: HashSet<String>,
+    mcp_notice: HashMap<String, String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
@@ -793,6 +794,7 @@ impl HarnessBroker {
             agent_backend_factory,
             child_backend_by_agent: HashMap::new(),
             diagnostic_native_thread: HashSet::new(),
+            mcp_notice: HashMap::new(),
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
             prompt_admission: None,
@@ -1764,6 +1766,10 @@ impl HarnessBroker {
                     effective.approval_timeout = Some(self.session.approval_timeout);
                     effective.answer_timeout = Some(self.session.answer_timeout);
                     settings.confirm_application(&self.session.id, operation, revision, effective)?;
+                }
+                if command == "configure" {
+                    let request = self.backend_catalog_request();
+                    self.notify_unavailable_mcp(&request, &mut Vec::new()).await?;
                 }
                 self.emit_backend_event(BackendEvent {
             received_at_ms: None,
@@ -4833,6 +4839,28 @@ Planning continuation: turn {} of {}.",
         .await
     }
 
+    async fn notify_unavailable_mcp(&mut self, request: &BackendCatalogRequest, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let target = match self.session.backend.as_str() {
+            "codex" => "codexcli",
+            "copilot" => "copilotcli",
+            "claude" => "claudecode",
+            "antigravity" => "antigravity-cli",
+            _ => return Ok(()),
+        };
+        let resources = crate::settings::SessionResources::load(&self.data_root, request, &self.session.backend, target)?;
+        for (id, message) in &resources.launch_notice {
+            if self.mcp_notice.get(id) == Some(message) { continue; }
+            self.trace.record(&self.session.id, "mcp.start_skipped", json!({"resource_id":id,"reason":message}));
+            self.emit_backend_event(BackendEvent {
+                received_at_ms: None, address: None, turn_boundary: None, kind: "error".into(),
+                text: Some(message.clone()), data: json!({"code":"mcp_command_missing","resource_id":id}),
+                activity: None, summary: None, task_update: None,
+            }, event).await?;
+        }
+        self.mcp_notice = resources.launch_notice;
+        Ok(())
+    }
+
     async fn prompt_provider_with_timeline(
         &mut self,
         mut request: BackendRequest,
@@ -4842,6 +4870,11 @@ Planning continuation: turn {} of {}.",
         parent_input: &mut crate::backend::ActiveSteering,
         deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
+        self.notify_unavailable_mcp(&BackendCatalogRequest {
+            execution_owner: request.execution_owner.clone(), harness_session_id: request.harness_session_id.clone(),
+            workspace: request.workspace.clone(), access: request.access.clone(), execution_mode: request.execution_mode,
+            backend_session_id: request.backend_session_id.clone(),
+        }, event).await?;
         let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(crate::backend::ExecutionOwner::root(&self.session.id),
             interaction.id.clone(),self.agent_coordinator.clone())?;
         if let Some(context) = &mut request.control_context {context.agent = Some(agent_scope);}
@@ -5380,7 +5413,8 @@ Planning continuation: turn {} of {}.",
         if let Some(mut compaction) = backend_event.compaction()? {
             if compaction.state == crate::backend::CompactionState::Running
                 && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str()) {
-                compaction.result.context_tokens_before = self.session.context_usage.as_ref().map(|usage| usage.used);
+                compaction.result.context_tokens_before = compaction.result.context_tokens_before
+                    .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
             }
             let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
             let previous_owner = self.compaction_exchange_owner(&compaction)?;
@@ -7972,7 +8006,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     fn retain_external_compaction(&mut self, mut compaction: crate::backend::Compaction, now_ms: i64) -> Result<()> {
         if compaction.state == crate::backend::CompactionState::Running
             && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str()) {
-            compaction.result.context_tokens_before = self.session.context_usage.as_ref().map(|usage| usage.used);
+            compaction.result.context_tokens_before = compaction.result.context_tokens_before
+                .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
         }
         self.save_session()?;
         if let Some(mut exchange) = self.compaction_exchange_owner(&compaction)? {
@@ -8269,16 +8304,16 @@ fn admit_addressless_turn(
     if event.address.is_some() || !owns_content {
         return Ok(());
     }
-    let address = synthetic_turn
-        .get_or_insert_with(|| crate::backend::ProviderAddress {
+    let address = synthetic_turn.clone()
+        .unwrap_or_else(|| crate::backend::ProviderAddress {
             owner: None,
             thread_id: format!("harness:{}", exchange.agent_id),
             turn_id: format!("{}:provider:{}", exchange.id, exchange.turn.len() + 1),
-        })
-        .clone();
+        });
     if exchange.turn.iter().all(|turn| turn.provider() != &address) {
         exchange.start_turn(address.clone(), now_ms)?;
     }
+    *synthetic_turn = Some(address.clone());
     event.address = Some(address);
     Ok(())
 }
