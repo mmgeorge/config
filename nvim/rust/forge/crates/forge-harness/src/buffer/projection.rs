@@ -1494,25 +1494,29 @@ impl TimelineRenderer<'_> {
         agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
+        let cancelled = exchange.state == crate::exchange::ExchangeState::Cancelled && !group.resolved;
+        let settled = group.resolved || cancelled;
         let answered = group.branch.iter().filter(|branch| branch.answer.is_some()).count();
         let label = if group.withdrawal.is_some() { "▸ Questions · Withdrawn".into() }
+            else if cancelled { format!("▸ Questions · Cancelled · {answered}/{} answered", group.branch.len()) }
             else { format!("▸ Questions · {answered}/{} answered", group.branch.len()) };
         self.literal(group.id, &label,
-            Some(TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
+            (!cancelled).then(|| TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
         let section = self.begin_section(2);
         for branch in &group.branch {
             let id = format!("{}:question:{}", group.id, branch.question.id);
             let status = branch.answer.as_deref().unwrap_or(if group.withdrawal.is_some() { "Withdrawn" }
+                else if cancelled { "Cancelled" }
                 else if group.resolved { "Resolved" } else { "Awaiting answer" });
             self.literal(&id, &format!("▸ {} · {status}", branch.question.question),
-                Some(TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
+                (!cancelled).then(|| TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
             let question_section = self.begin_section(2);
             for (index, option) in branch.question.options.iter().enumerate() {
                 self.literal(&format!("{id}:option:{index}"), &format!("○ {}: {}", option.label, option.description), None)?;
             }
             for (index, clarification) in branch.clarification.iter().enumerate() {
                 self.clarification(clarification, exchange, agents, depth,
-                    group.resolved || index + 1 < branch.clarification.len())?;
+                    settled || index + 1 < branch.clarification.len())?;
             }
             if let Some(answer) = &branch.answer {
                 let label = if branch.source == crate::session::ResolutionSource::Timeout { "Automatic timeout" } else { "You answered" };
@@ -1527,16 +1531,16 @@ impl TimelineRenderer<'_> {
                 self.prompt.push(block.id.clone());
                 self.push(block)?;
             }
-            self.finish_section(question_section, &id, group.resolved);
+            self.finish_section(question_section, &id, settled);
         }
         for clarification in &group.clarification {
-            self.clarification(clarification, exchange, agents, depth, group.resolved)?;
+            self.clarification(clarification, exchange, agents, depth, settled)?;
         }
         if let Some(reason) = group.withdrawal {
             self.markdown(&format!("{}:withdrawal", group.id),
                 &format!("Clarification withdrawn: {reason}"), MarkdownRole::Detail)?;
         }
-        self.finish_section(section, group.id, group.resolved);
+        self.finish_section(section, group.id, settled);
         Ok(())
     }
 

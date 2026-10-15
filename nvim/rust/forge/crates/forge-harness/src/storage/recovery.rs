@@ -1,7 +1,7 @@
 use super::SqliteStore;
 use crate::agent::AgentState;
 use crate::exchange::{Exchange, ExchangeState};
-use crate::turn::TurnState;
+use crate::turn::{TurnOutcome, TurnState};
 use anyhow::Result;
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 
@@ -22,7 +22,7 @@ impl SqliteStore {
             let mut exchange: Exchange = serde_json::from_str(&payload)?;
             if !matches!(
                 exchange.state,
-                ExchangeState::Running | ExchangeState::Queued
+                ExchangeState::Running | ExchangeState::Queued | ExchangeState::Finalizing
             ) {
                 continue;
             }
@@ -30,6 +30,9 @@ impl SqliteStore {
                 .turn
                 .iter()
                 .any(|turn| turn.state() == TurnState::Running);
+            if exchange.state == ExchangeState::Finalizing && !running_turn {
+                continue;
+            }
             if exchange.awaiting_input
                 && !running_turn
                 && exchange.execution_started_at_ms.is_none()
@@ -54,7 +57,23 @@ impl SqliteStore {
                     started.saturating_add(active.min(i64::MAX as u64) as i64)
                 },
             );
-            exchange.finish(ExchangeState::Interrupted, observed_at)?;
+            if exchange.state == ExchangeState::Finalizing {
+                let outcome = match exchange.finalization_outcome {
+                    Some(ExchangeState::Cancelled) => TurnOutcome::Cancelled,
+                    Some(ExchangeState::Failed) => TurnOutcome::Failed,
+                    _ => TurnOutcome::Interrupted,
+                };
+                for turn in &mut exchange.turn {
+                    if turn.state() == TurnState::Running {
+                        turn.finish(outcome, observed_at)?;
+                    }
+                }
+                if exchange.finalization_outcome == Some(ExchangeState::Complete) {
+                    exchange.finalization_outcome = Some(ExchangeState::Interrupted);
+                }
+            } else {
+                exchange.finish(ExchangeState::Interrupted, observed_at)?;
+            }
             transaction.execute(
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",
                 params![exchange.id, serde_json::to_string(&exchange)?],

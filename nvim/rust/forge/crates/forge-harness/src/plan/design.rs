@@ -411,7 +411,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json requires objective, requirements, background, decisions, design, checks and manual verification arrays, and tests; flows is an array of {title, description, root} objects and usage is optional")?;
+                    .context("invalid plan.json document")?;
                 continue;
             }
             match kind {

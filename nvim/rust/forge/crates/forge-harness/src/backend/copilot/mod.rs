@@ -76,9 +76,9 @@ impl Drop for CopilotTerminalMonitor {
 
 impl CopilotTerminalMonitor {
     /// Subscribe before the first query so terminal transitions cannot be lost at attachment.
-    fn new(session: &SharedCopilotSession) -> Self {
+    fn new(session: &SharedCopilotSession, trace: Arc<crate::trace::TraceStore>, harness_session_id: String) -> Self {
         let mut event = event_stream::SessionEventStream::new(session,
-            |event| event.event_type == "session.background_tasks_changed");
+            |event| event.event_type == "session.background_tasks_changed", trace, harness_session_id);
         let session = Arc::downgrade(session);
         let monitored_session = session.clone();
         let (send, snapshot) = tokio::sync::watch::channel(None);
@@ -219,7 +219,7 @@ impl CopilotBackend {
         if let Some(binding) = active_session.as_mut().filter(|binding| binding.tool_schema == tool_schema) {
             if binding.compaction.is_none() {
                 binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
-                    .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event)));
+                    .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event), Arc::clone(&self.trace), request.harness_session_id.clone()));
             }
             let session = &binding.session;
             if request.model != "default" {
@@ -264,6 +264,10 @@ impl CopilotBackend {
         let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
         // Dropping the old SDK session after resume unregisters the replacement's event router.
         if let Some(mut binding) = active_session.take() {
+            if let Some(mut monitor) = self.terminal_monitor.lock().await.remove(&request.runtime_key()?) {
+                monitor.task.abort();
+                let _ = (&mut monitor.task).await;
+            }
             drop(binding.compaction.take());
             if let Err(error) = binding.session.disconnect().await {
                 *active_session = Some(binding);
@@ -357,7 +361,7 @@ impl CopilotBackend {
             }
         } else { HashMap::new() };
         let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
-            .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event));
+            .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event, Arc::clone(&self.trace), request.harness_session_id.clone()));
         *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), tool_schema, compaction, mcp_failure, _profile: profile });
         Ok(session)
     }
@@ -531,22 +535,22 @@ impl Backend for CopilotBackend {
     async fn background_terminals(&self, request: BackendCatalogRequest) -> Result<super::terminal::TerminalSnapshot> {
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let active_session = match session_slot.try_lock() {
-            Ok(binding) => binding.as_ref().map(|binding| Arc::clone(&binding.session)),
+            Ok(binding) => binding,
             Err(_) => return Ok(super::terminal::TerminalSnapshot {
                 supported: true, starting: true, terminal: Vec::new(),
             }),
         };
-        let session = match active_session {
-            Some(session) => session,
+        let session = match active_session.as_ref() {
+            Some(binding) => &binding.session,
             None => return Ok(super::terminal::TerminalSnapshot {
-                supported: true, starting: request.backend_session_id.is_some(), terminal: Vec::new(),
+                supported: true, starting: false, terminal: Vec::new(),
             }),
         };
         let mut monitor_store = self.terminal_monitor.lock().await;
         let monitor = monitor_store.entry(request.runtime_key()?)
-            .or_insert_with(|| CopilotTerminalMonitor::new(&session));
-        if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(&session)) {
-            *monitor = CopilotTerminalMonitor::new(&session);
+            .or_insert_with(|| CopilotTerminalMonitor::new(session, Arc::clone(&self.trace), request.harness_session_id.clone()));
+        if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(session)) {
+            *monitor = CopilotTerminalMonitor::new(session, Arc::clone(&self.trace), request.harness_session_id.clone());
         }
         let snapshot = monitor.snapshot.clone();
         drop(monitor_store);
@@ -620,7 +624,7 @@ impl Backend for CopilotBackend {
         let session = self.session(&request).await?;
         let mut subscription = event_stream::SessionEventStream::new(&session, |event| {
             !matches!(event.event_type.as_str(), "assistant.streaming_delta" | "assistant.tool_call_delta")
-        });
+        }, Arc::clone(&self.trace), request.harness_session_id.clone());
         let control_router = self.control_router(&request.runtime_key()?).await;
         let control_context = request
             .control_context
@@ -706,6 +710,7 @@ impl Backend for CopilotBackend {
                     let provider_event = provider_event.context("receive Copilot session event")?;
                     self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
+                        decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
                         self.completed_event_by_harness
                             .lock()
                             .await

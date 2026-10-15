@@ -676,7 +676,7 @@ impl HarnessBroker {
                         crate::turn::ToolState::Completed | crate::turn::ToolState::Failed
                     ) && (matches!(tool.kind.as_str(), "command" | "shell" | "execute")
                         || matches!(
-                            tool.title.as_str(),
+                            tool.title.split('(').next().unwrap_or("").trim(),
                             "powershell" | "bash" | "shell" | "exec_command"
                         ))
                 })

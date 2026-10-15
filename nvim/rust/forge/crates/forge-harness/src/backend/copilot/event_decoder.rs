@@ -30,6 +30,37 @@ impl CopilotEventDecoder {
             publish(output.runtime.resolved_event(), output, event_sink).await;
         }
         match provider_event.event_type.as_str() {
+            "assistant.idle" | "session.idle" if provider_event.agent_id.is_none() => {
+                let unfinished = output.event.iter().enumerate().filter_map(|(index, event)| {
+                    if !matches!(event.turn_boundary, Some(crate::backend::TurnBoundary::Started)) {
+                        return None;
+                    }
+                    let address = event.address.as_ref()?;
+                    if Some(&address.thread_id) != output.backend_session_id.as_ref()
+                        || output.event[index + 1..].iter().any(|later| {
+                            later.address.as_ref() == Some(address)
+                                && matches!(later.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
+                        }) {
+                        return None;
+                    }
+                    Some(address.clone())
+                }).collect::<Vec<_>>();
+                for address in unfinished {
+                    publish(BackendEvent {
+                        received_at_ms: None,
+                        address: Some(address),
+                        turn_boundary: Some(crate::backend::TurnBoundary::Finished {
+                            outcome: crate::turn::TurnOutcome::Completed,
+                        }),
+                        kind: "turn_completed".into(),
+                        text: None,
+                        data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    }, output, event_sink).await;
+                }
+            }
             "session.compaction_start" | "session.compaction_complete" => {
                 let thread_id = provider_event.agent_id.clone().or_else(|| output.backend_session_id.clone());
                 let Some(thread_id) = thread_id else { return; };
@@ -461,7 +492,10 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
     {
         return;
     }
-    if update.title != "Copilot tool" {
+    if update.title != "Copilot tool"
+        && (incoming.data.pointer("/data/arguments").is_some_and(|arguments| !arguments.is_null())
+            || existing.title == "Copilot tool")
+    {
         existing.title = update.title;
     }
     existing.status = update.status;
@@ -485,6 +519,9 @@ fn tool_activity(provider_event: &SessionEvent) -> Option<ToolActivity> {
     let id = string_field(data, &["toolCallId", "id"])?;
     let title = string_field(data, &["toolName", "name", "toolDescription"])
         .unwrap_or_else(|| "Copilot tool".into());
+    let title = data.get("arguments").filter(|arguments| !arguments.is_null())
+        .and_then(|arguments| ToolActivity::call_title(&title, arguments))
+        .unwrap_or(title);
     let (status, output, output_delta) = match provider_event.event_type.as_str() {
         "tool.execution_start" => (Some("in_progress".into()), None, false),
         "tool.execution_partial_result" => (

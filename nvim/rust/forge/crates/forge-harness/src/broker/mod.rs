@@ -939,7 +939,7 @@ impl HarnessBroker {
                 })
             })
             .or_else(|| {
-                interaction.iter().rev().find_map(|interaction| {
+                interaction.iter().rev().filter(|interaction| interaction.awaiting_input).find_map(|interaction| {
                     interaction
                         .elicitation
                         .clone()
@@ -1726,7 +1726,11 @@ impl HarnessBroker {
         use crate::task::{TaskKind, TaskStatus};
         let command = required_text(&action, "action")?;
         match command.as_str() {
-            "pause" | "clear" => self.pause_task(command == "clear").await,
+            "pause" | "clear" => {
+                let (_, mut events) = self.pause_task(command == "clear").await?;
+                events.extend(self.cancel_settled_execution().await?.1);
+                Ok((serde_json::to_value(self.snapshot()?)?, events))
+            }
             "permission" | "configure" | "compact" => {
                 let permission: PermissionMode = if command == "permission" {
                     serde_json::from_value(action.get("mode").cloned().context("permission is required")?)?
@@ -8117,7 +8121,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.session.backend_session_id = Some(backend_session_id);
         }
         if let Some(context_usage) = output.metrics.context_usage {
-            self.session.context_usage = Some(context_usage);
+            let size = self.session.context_usage.as_ref()
+                .map_or(context_usage.size, |current| current.size);
+            self.session.context_usage = ContextUsage::reported(context_usage.used, size);
         }
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider;

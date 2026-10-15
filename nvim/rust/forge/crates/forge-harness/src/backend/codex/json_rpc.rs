@@ -2067,24 +2067,12 @@ fn callable_tool_title(item: &Value) -> Option<String> {
             |namespace| format!("{namespace}.{tool}"),
         );
     let arguments = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-    let arguments = match arguments {
-        Value::String(ref encoded) => serde_json::from_str(encoded).ok()?,
-        arguments => arguments,
-    };
-    let mut arguments = redact_tool_arguments(&arguments);
-    arguments.sort_all_objects();
-    let arguments = serde_json::to_string(&arguments).ok()?;
-    compact_tool_title(&format!("{title}({arguments})"))
+    ToolActivity::call_title(&title, &arguments)
 }
 
 fn generic_tool_title(item: &Value) -> Option<String> {
     let title = item.get("type").and_then(Value::as_str)?;
-    let mut details = redact_tool_arguments(item);
-    details.sort_all_objects();
-    Some(format!(
-        "{title}({})",
-        serde_json::to_string(&details).ok()?
-    ))
+    ToolActivity::call_title(title, item)
 }
 
 fn builtin_tool_title(item: &Value) -> Option<String> {
@@ -2162,49 +2150,6 @@ fn mcp_tool_output(item: &Value) -> Option<String> {
     result
         .get("structuredContent")
         .and_then(|content| serde_json::to_string_pretty(content).ok())
-}
-
-fn redact_tool_arguments(value: &Value) -> Value {
-    match value {
-        Value::Array(value_list) => {
-            Value::Array(value_list.iter().map(redact_tool_arguments).collect())
-        }
-        Value::Object(value_map) => Value::Object(
-            value_map
-                .iter()
-                .map(|(key, value)| {
-                    let value = if sensitive_tool_argument_key(key) {
-                        Value::String("[REDACTED]".into())
-                    } else {
-                        redact_tool_arguments(value)
-                    };
-                    (key.clone(), value)
-                })
-                .collect(),
-        ),
-        _ => value.clone(),
-    }
-}
-
-fn sensitive_tool_argument_key(key: &str) -> bool {
-    matches!(
-        key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
-        "token"
-            | "apikey"
-            | "key"
-            | "secret"
-            | "password"
-            | "passphrase"
-            | "authorization"
-            | "bearer"
-            | "cookie"
-            | "session"
-            | "credential"
-            | "accesstoken"
-            | "refreshtoken"
-            | "clientsecret"
-            | "privatekey"
-    )
 }
 
 fn format_mcp_text(text: &str) -> String {

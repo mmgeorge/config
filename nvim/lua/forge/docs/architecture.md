@@ -1101,8 +1101,9 @@ approvals, lease conflicts, execution confirmations, and planning questions ther
 same geometry and focus contract without duplicating popup mechanics.
 
 Configuration pickers never depend on the serialized provider-turn request lane to become visible.
-Harness resolves and caches backend model metadata when the view activates, then `/model` opens from
-that presentation cache even while a provider turn runs. Model, effort, service-tier, backend, and
+Harness resolves and caches backend model metadata when the view activates, then `/model` refreshes
+the catalog when it opens so persisted model and effort selections remain current during provider work.
+Model, effort, service-tier, backend, and
 execution-mode selections continue through their normal mutation owners. Configuration changes
 interrupt active work immediately, collect the current execution, apply and verify the requested
 revision, and resume the same exchange when its task remains active. Durable timeline events report
@@ -1132,7 +1133,8 @@ Copilot terminal status reads the session binding without waiting for initializa
 its lock. A busy binding returns a starting snapshot, which the footer renders as
 `Terminal status: starting`. Subsequent polls observe the ready session and its terminal inventory.
 Status polling never starts or resumes a provider session and never waits for the first inventory
-refresh. An absent session or pending first refresh returns a starting snapshot when appropriate.
+refresh. A pending first refresh returns a starting snapshot. An unattached restored conversation
+returns an empty snapshot, since a persisted provider identity does not mean startup is running.
 An initialization delay therefore does not consume the terminal query's eight-second deadline.
 
 The `/undo` specialization loads the active session's durable interaction records and lists
@@ -2230,13 +2232,22 @@ request. Ambiguous concurrent calls retain a server-wide approval target.
 Copilot turn addresses include the provider interaction identity because native turn counters can
 repeat across prompts. Later messages and completion events resolve through the matching turn-start
 record, so a reused counter cannot attach a new response to a completed execution.
+Root session idle settles any unfinished root turns before exchange completion, including the empty
+turn Copilot can start while an accepted execution-phase boundary is stopping the provider.
 Copilot SDK subscriptions drain through independent `SessionEventStream` tasks before tracing,
 provider RPCs, or presentation processing. The prompt stream excludes raw
 `assistant.streaming_delta` and `assistant.tool_call_delta` telemetry, while retaining structured
 message, reasoning, tool, usage, and lifecycle events. Compaction and terminal monitors admit only
 their event types. Each intake uses the shared encoded outbound queue limits and preserves event
 order, waiting for queue capacity when required. Dropping a consumer aborts its intake task.
-SDK stream failures remain explicit errors rather than silently discarding execution events.
+Intake retains a client handle and session identity rather than owning the SDK session. Before a
+tool-schema rebind, the adapter stops and joins the old terminal monitor, then disconnects and drops
+the old session before registering its replacement. Late SDK session disposal cannot unregister
+the replacement's event router.
+SDK lag notices are logged without ending the turn. Intake compares the next queued event's
+parent with its last durable event and replays any missing durable history before that event.
+Missing transient deltas are superseded by completed message snapshots. Closed subscriptions,
+missing recovery anchors, and failed history reads remain explicit errors.
 
 `CapabilityManifest` records required and optional operations, support, ownership, application boundary,
 and runtime availability. The `Backend` trait requires explicit identity, streaming, shutdown,
@@ -2255,7 +2266,8 @@ actual tool result rather than treating configuration as readiness evidence.
 identifier, ordered reasoning choices, context-window tiers, vision capability, and optional
 description. It never supplies a display label because the model identifier already owns that
 identity in the UI. The broker overlays durable reasoning and context selections per model before
-Lua receives the catalog. `views/harness/model_picker.lua` therefore owns only picker interaction
+Lua receives the catalog. Opening the picker reloads this catalog so saved selections cannot remain
+stale after a configuration change. `views/harness/model_picker.lua` owns only picker interaction
 state, field cycling, and presentation order. Copilot maps the selected context tier into native
 session creation and `set_model`, while Codex exposes only the controls returned by app-server.
 
@@ -2302,6 +2314,10 @@ commit together. Rollback changes history disposition while preserving execution
 Checkpoint capture errors include the source path and retain the finalizing exchange. Ctrl-C
 retries finalization even when no provider request is active. Goal resume retries finalization
 before activating the goal, so a failed retry leaves the goal paused and admits no new work.
+Explicit pause and clear also finalize an exchange waiting for user input. Closed exchanges
+retain their recorded questions in history but cannot expose them as active questions.
+Unanswered question rows in a cancelled exchange display Cancelled and cannot reopen a prompt.
+Internal pauses for configuration changes preserve waiting questions until work resumes.
 Execution admission retains one permit per session from request preparation through response
 delivery. A second execution cannot reset the first request's cancellation state. Cleanup owns
 a separate control permit that blocks new execution admission until cleanup returns. Status
@@ -2892,6 +2908,8 @@ shutdown ends the subscription, and controller disposal cancels its consumer tas
 Codex uses app-server `thread/compact/start` for `/compact`. Copilot uses the installed SDK's
 experimental `session.history.compact` RPC. Manual requests persist one `SessionEventKind::Compaction`
 before provider admission, retain the result or failure afterward, and never create a user exchange.
+Compaction updates used tokens while preserving the session's established context limit. The RPC's
+raw context-window report remains in the compaction details, and normal usage events own limit changes.
 `BackendCompactionRequest` carries the manual row identity into the provider adapter. Copilot's
 monitor correlates the native lifecycle with that identity and enriches the same row when native
 notifications provide more detail than the RPC result. Unsupported backends omit the command instead of receiving a synthetic
@@ -2904,6 +2922,9 @@ and completion timestamps. Accepted control effects deduplicate by provider call
 MCP and dynamic calls include deterministically ordered, credential-redacted arguments in
 their titles. Dynamic call completion retains every text output block and treats a false
 success flag as failure even when the provider lifecycle status is completed.
+Copilot tool calls use the same argument formatter for their native start events. Completion
+and progress events without arguments retain the start title, so collapsed rows and expanded
+call bodies preserve the invocation through the complete lifecycle.
 Expanded tool bodies include the complete call with wrapped arguments independently of
 the single-line heading's width limit.
 Thread start and resume request automatic reasoning summaries in native configuration,
@@ -6055,6 +6076,9 @@ committed phase and completion evidence, suspends unfinished attempts, and marks
 operations outcome-unknown. No recovered task starts a provider automatically.
 Exchange recovery retains the last persisted active elapsed coordinate. It excludes the
 offline interval and may omit activity after the last saved provider event.
+Recovery also settles unfinished provider turns in a finalizing exchange. A pending success
+becomes interrupted when those turns lack completion evidence, while checkpoint finalization
+remains pending for the normal retry path.
 The approval picker shares the configured Harness interrupt key. Interrupt closes the picker
 and pauses the task without approving the pending tool. Closing with `q` leaves approval pending.
 Review UI starts execution only when acceptance creates an initial acceptance record. An execution

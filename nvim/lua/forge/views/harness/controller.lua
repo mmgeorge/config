@@ -952,7 +952,10 @@ function M.cancel_turn()
     M.agent_action("interrupt", state.selected_agent_run_id)
     return
   end
-  if state.task_operation and state.task_operation.action == "pause" then return end
+  local operation = state.task_operation
+  if operation and operation.action == "pause"
+    and ({ submitting = true, accepted = true, stopping = true, running = true })[operation.state]
+  then return end
   M.task_transition({ action = "pause" })
 end
 function M.compact()
@@ -2012,10 +2015,6 @@ function M.select_model(on_confirm)
   model_pins.refresh(backend, function(_, pin_error)
     if pin_error then notifications.error("Failed to load Harness model pins: " .. pin_error, "Harness model") return end
     if not is_current() then return end
-    if state.model_backend == backend and type(state.model_list) == "table" then
-      open_model_picker(state.model_list)
-      return
-    end
     client.request("backend.models", {}, function(model_list, request_error)
       if request_error then notifications.error(request_error, "Harness model") return end
       if not is_current() then return end

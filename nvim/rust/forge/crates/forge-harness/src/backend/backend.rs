@@ -293,6 +293,44 @@ pub struct ToolActivity {
     pub output_delta: bool,
 }
 
+impl ToolActivity {
+    /// Formats a call with sorted, credential-redacted arguments, decoding JSON strings first.
+    /// Returns `None` for an empty name or invalid encoded JSON.
+    pub(super) fn call_title(name: &str, arguments: &Value) -> Option<String> {
+        let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
+        if name.is_empty() { return None; }
+        let arguments = match arguments {
+            Value::String(encoded) => serde_json::from_str(encoded).ok()?,
+            arguments => arguments.clone(),
+        };
+        let mut arguments = Self::redact_arguments(&arguments);
+        arguments.sort_all_objects();
+        Some(format!("{name}({})", serde_json::to_string(&arguments).ok()?))
+    }
+
+    fn redact_arguments(value: &Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.iter().map(Self::redact_arguments).collect()),
+            Value::Object(values) => Value::Object(values.iter().map(|(key, value)| {
+                let value = if Self::sensitive_argument(key) {
+                    Value::String("[REDACTED]".into())
+                } else {
+                    Self::redact_arguments(value)
+                };
+                (key.clone(), value)
+            }).collect()),
+            _ => value.clone(),
+        }
+    }
+
+    fn sensitive_argument(key: &str) -> bool {
+        matches!(key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+            "token" | "apikey" | "key" | "secret" | "password" | "passphrase"
+                | "authorization" | "bearer" | "cookie" | "session" | "credential"
+                | "accesstoken" | "refreshtoken" | "clientsecret" | "privatekey")
+    }
+}
+
 /// Defines one provider-reported file operation without consulting workspace state.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
