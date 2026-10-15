@@ -237,10 +237,20 @@ local function render_view(instance)
     frame.footer_line = nil
   end
   local previous = instance.frame and instance.frame.page_id == page.id and instance.frame or nil
-  frame = layout.viewport(frame, height, previous and previous.viewport_top, instance.content_offset or (previous and previous.content_offset))
+  local option_offset = previous and previous.selected_index == selected
+    and (instance.option_offset or previous.option_offset) or 0
+  frame = layout.viewport(frame, height, previous and previous.viewport_top,
+    instance.content_offset or (previous and previous.content_offset),
+    option_offset)
   frame.page_id = page.id
   instance.content_offset = nil
+  instance.option_offset = nil
   instance.frame = frame
+  if frame.option_scroll_max > 0 then
+    local scroll_keys = vim.list_extend(keymaps.view_keys_for("picker", "scroll_previous"),
+      keymaps.view_keys_for("picker", "scroll_next"))
+    border_footer = table.concat(scroll_keys, "/") .. " scroll  " .. (border_footer or footer or "")
+  end
   picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer)
   render.apply(instance.buf, frame)
   if valid_window(instance.search_win) then search_input.resize(instance.search_win, instance.win, frame) end
@@ -262,8 +272,14 @@ end
 
 ---@param pages integer
 function Picker.scroll_content(pages)
-  if not active or not active.frame.scroll_range then return end
-  active.content_offset = active.frame.content_offset + pages * active.frame.content_page_size
+  if not active then return end
+  if active.frame.scroll_range then
+    active.content_offset = active.frame.content_offset + pages * active.frame.content_page_size
+  elseif active.frame.option_scroll_max > 0 then
+    active.option_offset = active.frame.option_offset + pages * active.frame.option_page_size
+  else
+    return
+  end
   render_view(active)
 end
 
@@ -516,6 +532,8 @@ install_keymaps = function(instance)
   command_set.register(set, "feedback", function() confirm(instance, true) end)
   command_set.register(set, "page_previous", function() move_page(instance, -1) end)
   command_set.register(set, "page_next", function() move_page(instance, 1) end)
+  command_set.register(set, "scroll_previous", function() Picker.scroll_content(-1) end)
+  command_set.register(set, "scroll_next", function() Picker.scroll_content(1) end)
   command_set.register(set, "focus_input", function() focus_input(instance) end)
   command_set.register(set, "close", function() Picker.close(true) end)
   for _, command_id in ipairs(set.order) do

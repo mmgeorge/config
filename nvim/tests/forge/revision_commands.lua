@@ -38,7 +38,6 @@ local ok, failure = xpcall(function()
         elseif request.method == "harness.initialize" then
           harness_count = harness_count + 1
           emit(request.id, { session = { id = "shared-host" } })
-        elseif request.method == "plan.scope_deviation_review" then emit(request.id, {})
         else error("unexpected shared-host method " .. request.method) end
       end,
       kill = function() end,

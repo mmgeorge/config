@@ -31,8 +31,6 @@ local ok, error_message = xpcall(function()
           emit({ id = request.id, result = { protocol_version = require("forge.protocol").VERSION } })
         elseif request.method == "harness.initialize" then
           emit({ id = request.id, result = { session = { id = "receive-test" } } })
-        elseif request.method == "plan.scope_deviation_review" then
-          emit({ id = request.id, result = {} })
         elseif request.method == "trace.configure" then
           emit({ id = request.id, result = { enabled = request.params.enabled } })
         elseif request.method == "receive.test" then

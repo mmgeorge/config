@@ -37,6 +37,8 @@ local function question_page_list(elicitation, allow_ask)
       title = question.header or question.question or "Answer Question",
       subtitle = question.question ~= question.header and question.question or question.detail,
       column_headers = { "Answer", "Description" },
+      flexible_column = 2,
+      wrap_column = 2,
       option_list = options,
       selected_index = selected_index,
       initial_draft = selected_entry and model.input_text(selected_entry, answer) or "",

@@ -114,8 +114,6 @@ pub enum HarnessMethod {
     PlanDeclaration,
     #[serde(rename = "plan.list")]
     PlanList,
-    #[serde(rename = "plan.scope_deviation_review")]
-    PlanScopeDeviationReview,
     #[serde(rename = "plan.deviation.resolve")]
     PlanDeviationResolve,
     #[serde(rename = "question.answer")]

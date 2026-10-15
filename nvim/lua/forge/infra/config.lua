@@ -115,6 +115,8 @@
 ---@field feedback ForgeKeymap
 ---@field page_previous ForgeKeymap
 ---@field page_next ForgeKeymap
+---@field scroll_previous ForgeKeymap
+---@field scroll_next ForgeKeymap
 ---@field previous_value ForgeKeymap
 ---@field next_value ForgeKeymap
 ---@field focus_input ForgeKeymap
@@ -330,6 +332,8 @@ M.defaults = {
       feedback = "<Tab>",
       page_previous = { "<Left>", "[" },
       page_next = { "<Right>", "]" },
+      scroll_previous = "<PageUp>",
+      scroll_next = "<PageDown>",
       previous_value = { "<Left>", "r" },
       next_value = { "<Right>", "h" },
       focus_input = "go",

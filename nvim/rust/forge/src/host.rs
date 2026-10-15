@@ -43,7 +43,6 @@ impl RequestAdmission {
             method,
             "initialize"
                 | "harness.initialize"
-                | "plan.scope_deviation_review"
                 | "trace.configure"
                 | "turn.cancel"
                 | "turn.restart"

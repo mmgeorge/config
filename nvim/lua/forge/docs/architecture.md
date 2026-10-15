@@ -1085,6 +1085,14 @@ single or multiple selection, pages, responsive label/detail rows, and reserved 
 The renderer applies one frame with extmarks, while the window owner anchors a focusable float to the
 bottom of the union of the Harness transcript and composer windows.
 
+Question pages preserve separate Answer and Description columns. The shared layout's
+`wrap_column` selects a column for word wrapping, and `flexible_column` gives that column
+the available width after the other columns. Each option retains one selection identity
+across its rendered lines. The viewport keeps the selected option fully visible when it
+fits, retains the column headings and controls, and permits Page Up/Page Down within an
+option taller than the available body. Resizing reflows the rows without changing the
+selected answer or attached input.
+
 The picker buffer owns modal navigation and globally hides its focused cursor through Neovim's
 blend-100 TUI cursor contract. An optional `ForgePickerSearch` child owns fuzzy filtering,
 while `ForgePickerInput` owns multiline feedback and returns to the picker through `go`.

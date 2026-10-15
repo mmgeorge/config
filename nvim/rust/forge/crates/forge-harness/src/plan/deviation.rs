@@ -12,15 +12,6 @@ pub enum PlanDeviationKind {
     Scope,
 }
 
-/// Defines the configured review policy for scope deviations.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ScopeDeviationReview {
-    #[default]
-    Auto,
-    Prompt,
-}
-
 /// Defines the final review disposition of one deviation.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

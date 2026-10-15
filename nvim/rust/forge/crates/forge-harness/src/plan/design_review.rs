@@ -86,6 +86,7 @@ pub(super) fn project(
     let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
         BlockId("plan:flow-markdown".into()), &flow_text, width,
     )?;
+    let check_rows = configured_checks(document.design.as_ref().and_then(|design| design.check_configuration.as_ref()), Some(width))?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
@@ -101,6 +102,8 @@ pub(super) fn project(
                     row.metadata.decoration.push(decoration);
                 }
             }
+        } else if let Some(index) = row.id.0.strip_prefix("plan:configured-checks:").and_then(|index| index.parse::<usize>().ok()) {
+            row.text = BufferText::from_rows(&check_rows[index])?;
         } else if row.id.0.starts_with("plan:metadata:")
             && !row.id.0.starts_with("plan:metadata:checks:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
@@ -594,16 +597,9 @@ fn rows(
     }
     let start = overview.len();
     overview.push(section_header(BlockId("plan:section:checks".into()), "Configured checks")?);
-    let lines = if let Some(snapshot) = &design.check_configuration {
-        if snapshot.config.definitions.is_empty() { vec!["No automated checks configured.".into()] }
-        else { snapshot.config.order()?.into_iter().map(|index| {
-            let check = &snapshot.config.definitions[index];
-            format!("{} · {} · {:?} · {:?} · {} · trigger: {} · prerequisites: {}", check.area, check.name, check.category, check.scope,
-                if check.enabled {"Enabled"} else {"Disabled"}, check.trigger.description(), if check.depends_on.is_empty() {"None".into()} else {check.depends_on.join(", ")})
-        }).collect::<Vec<String>>() }
-    } else { vec!["Unconfigured · use /checks setup before submission.".into()] };
+    let lines = configured_checks(design.check_configuration.as_ref(), None)?;
     for (index,line) in lines.into_iter().enumerate() {
-        overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows([line])?,metadata:BlockMetadata::default()});
+        overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
     }
     fold(&mut overview, start, "plan:section:checks")?;
     navigation.anchor.extend(section_anchor);
@@ -611,6 +607,128 @@ fn rows(
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden, contextual_block))
+}
+
+fn configured_checks(
+    snapshot: Option<&crate::checks::ConfigSnapshot>,
+    width: Option<&WidthProfile>,
+) -> Result<Vec<Vec<String>>> {
+    use crate::checks::{CheckScope, CheckTrigger};
+
+    let Some(snapshot) = snapshot else {
+        return Ok(vec![vec![
+            "Unconfigured · use /checks setup before submission.".into(),
+        ]]);
+    };
+    if snapshot.config.definitions.is_empty() {
+        return Ok(vec![vec!["No automated checks configured.".into()]]);
+    }
+    let mut commands = HashMap::new();
+    for check in &snapshot.config.definitions {
+        let operation = match check.scope {
+            CheckScope::All => Some(&check.all),
+            CheckScope::ChangedFiles => check.files.as_ref(),
+            CheckScope::ChangedCases => check.cases.as_ref(),
+        }
+        .with_context(|| format!("{} has no command for its configured scope", check.name))?;
+        commands.insert(check.id.as_str(), operation.command.as_str());
+    }
+    let mut table = vec![["Stage", "Command", "Scope", "Triggers", "Requires"].map(str::to_owned)];
+    for index in snapshot.config.order()? {
+        let check = &snapshot.config.definitions[index];
+        let scope = match check.scope {
+            CheckScope::All => "All",
+            CheckScope::ChangedFiles => "Changed files",
+            CheckScope::ChangedCases => "Changed cases",
+        };
+        let trigger = match &check.trigger {
+            CheckTrigger::Paths { include, .. } => include.join(", "),
+            _ => check.trigger.description(),
+        };
+        let requires = check
+            .depends_on
+            .iter()
+            .map(|dependency| {
+                commands
+                    .get(dependency.as_str())
+                    .copied()
+                    .context("check prerequisite has no command")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        table.push([
+            format!(
+                "{:?}{}",
+                check.category,
+                if check.enabled { "" } else { " (disabled)" }
+            ),
+            commands[check.id.as_str()].to_owned(),
+            scope.to_owned(),
+            trigger,
+            if requires.is_empty() {
+                "—".into()
+            } else {
+                requires.join(", ")
+            },
+        ]);
+    }
+    let profile = width.cloned().unwrap_or_default();
+    let mut widths = [0; 5];
+    for row in &table {
+        for (column, cell) in row.iter().enumerate() {
+            widths[column] = widths[column].max(profile.cells(cell, 0)?);
+        }
+    }
+    let mut lines = Vec::new();
+    if width.is_some() {
+        let minimum = [5, 7, 5, 8, 8];
+        while widths.iter().sum::<usize>() + 12 >= profile.columns {
+            let Some(column) = (0..5)
+                .filter(|column| widths[*column] > minimum[*column])
+                .max_by_key(|column| widths[*column])
+            else {
+                break;
+            };
+            widths[column] -= 1;
+        }
+    }
+    for (index, row) in table.iter().enumerate() {
+        let wrapped = row
+            .iter()
+            .enumerate()
+            .map(|(column, cell)| {
+                let mut cell_profile = profile.clone();
+                cell_profile.columns = widths[column];
+                cell_profile.wrap_plain(cell, 0)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
+        let mut rendered = Vec::new();
+        for row_index in 0..height {
+            let cells = wrapped
+                .iter()
+                .enumerate()
+                .map(|(column, rows)| {
+                    let cell = rows.get(row_index).map(String::as_str).unwrap_or_default();
+                    Ok(format!(
+                        "{cell}{}",
+                        " ".repeat(widths[column].saturating_sub(profile.cells(cell, 0)?))
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            rendered.push(cells.join(" │ ").trim_end().to_owned());
+        }
+        lines.push(rendered);
+        if index == 0 {
+            lines.push(vec![
+                widths
+                    .iter()
+                    .map(|width| "─".repeat(*width))
+                    .collect::<Vec<_>>()
+                    .join("─┼─"),
+            ]);
+        }
+    }
+    Ok(lines)
 }
 
 fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
@@ -934,6 +1052,126 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_checks_show_scoped_commands_and_keep_repeated_stages() {
+        let mut document = crate::plan::document::test_fixture("checks", "Checks");
+        let mut design = super::super::DeclarationDesign::default();
+        design.check_configuration = Some(serde_json::from_value(serde_json::json!({
+            "digest": "checks",
+            "helper_digest": {},
+            "config": { "version": 2, "definitions": [
+                { "id": "format-internal", "name": "Format", "area": "format", "category": "format",
+                  "enabled": true, "scope": "all", "all": { "command": "format-all" },
+                  "trigger": { "kind": "paths", "include": ["src/**"], "exclude": ["private/**"] } },
+                { "id": "unit-internal", "name": "Unit", "area": "unit", "category": "test",
+                  "enabled": true, "scope": "changed_cases", "all": { "command": "unit-all" },
+                  "cases": { "command": "unit-cases" }, "depends_on": ["format-internal"],
+                  "trigger": { "kind": "any_change" } },
+                { "id": "integration-internal", "name": "Integration", "area": "integration", "category": "test",
+                  "enabled": true, "scope": "changed_files", "all": { "command": "integration-all" },
+                  "files": { "command": "integration-files" }, "depends_on": ["unit-internal"],
+                  "trigger": { "kind": "manual" } },
+                { "id": "optional-internal", "name": "Optional", "area": "optional", "category": "test",
+                  "enabled": false, "scope": "all", "all": { "command": "optional-all" },
+                  "trigger": { "kind": "manual" } }
+            ] }
+        })).unwrap());
+        document.design = Some(design);
+        let original = serde_json::to_vec(&document).unwrap();
+        let rendered = render(&document).unwrap();
+        let cells = rendered
+            .markdown
+            .lines()
+            .filter(|line| line.contains(" │ "))
+            .map(|line| line.split(" │ ").map(str::trim).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            cells,
+            vec![
+                vec!["Stage", "Command", "Scope", "Triggers", "Requires"],
+                vec!["Format", "format-all", "All", "src/**", "—"],
+                vec![
+                    "Test",
+                    "unit-cases",
+                    "Changed cases",
+                    "Any changed file",
+                    "format-all"
+                ],
+                vec![
+                    "Test",
+                    "integration-files",
+                    "Changed files",
+                    "Explicit runs only",
+                    "unit-cases"
+                ],
+                vec![
+                    "Test (disabled)",
+                    "optional-all",
+                    "All",
+                    "Explicit runs only",
+                    "—"
+                ],
+            ]
+        );
+        assert!(!rendered.markdown.contains("private/**"));
+        assert!(!rendered.markdown.contains("-internal"));
+        assert_eq!(serde_json::to_vec(&document).unwrap(), original);
+        let (blocks, _) = project(
+            &document,
+            &WidthProfile::default(),
+            &[],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            false,
+            None,
+            &HashSet::new(),
+        )
+        .unwrap();
+        let header = blocks
+            .iter()
+            .find(|block| block.id.0 == "plan:section:checks")
+            .unwrap();
+        let ending = blocks
+            .iter()
+            .find(|block| block.id == header.metadata.fold[0].end.block)
+            .unwrap();
+        assert!(ending.text.row(0).unwrap().contains("optional-all"));
+        for columns in [60, 100, 160] {
+            let profile = WidthProfile {
+                columns,
+                ..Default::default()
+            };
+            let (blocks, _) = project(
+                &document,
+                &profile,
+                &[],
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                false,
+                None,
+                &HashSet::new(),
+            )
+            .unwrap();
+            let checks = blocks
+                .iter()
+                .filter(|block| block.id.0.starts_with("plan:configured-checks:"))
+                .collect::<Vec<_>>();
+            for block in &checks {
+                for line in block.text.wire_rows() {
+                    assert!(
+                        profile.cells(line, 0).unwrap() < columns,
+                        "{columns}: {line}"
+                    );
+                }
+            }
+            if columns == 60 {
+                assert!(checks.iter().any(|block| block.text.row_count() > 1));
+            }
+        }
+    }
 
     #[test]
     fn change_only_edits_have_semantic_targets_and_closed_function_folds() {

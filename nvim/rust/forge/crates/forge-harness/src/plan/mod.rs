@@ -58,7 +58,7 @@ pub use audit::{
 };
 pub use deviation::{
     EffectivePlan, PlanDeviation, PlanDeviationDisposition, PlanDeviationKind,
-    PlanDeviationRequest, ScopeDeviationReview, build_effective_plan,
+    PlanDeviationRequest, build_effective_plan,
 };
 pub use document::*;
 #[cfg(test)]

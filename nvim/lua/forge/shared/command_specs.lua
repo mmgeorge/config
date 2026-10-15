@@ -159,6 +159,8 @@ M.view_specs = {
     { id = "feedback", label = "feedback", desc = "Select with additional feedback", modes = "n", pinned = false },
     { id = "page_previous", label = "previous page", desc = "Show the previous picker page", modes = "n", pinned = false },
     { id = "page_next", label = "next page", desc = "Show the next picker page", modes = "n", pinned = false },
+    { id = "scroll_previous", label = "scroll up", desc = "Scroll picker content up", modes = { "n", "i" }, pinned = false },
+    { id = "scroll_next", label = "scroll down", desc = "Scroll picker content down", modes = { "n", "i" }, pinned = false },
     { id = "focus_input", label = "edit", desc = "Switch between Harness options and feedback input", modes = "n", pinned = false },
     { id = "submit_input", label = "submit", desc = "Submit Harness option input", modes = { "n", "i" }, pinned = false },
     { id = "close", label = "close", desc = "Close the active picker", modes = "n", pinned = false },

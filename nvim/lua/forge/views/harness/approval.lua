@@ -133,9 +133,9 @@ local function build_spec(instance)
   local request, host = instance.request, instance.host
   local interrupt_keys = keymaps.view_keys_for("harness", "cancel")
   local actions = {}
-  for _, action in ipairs({ { "<PageUp>", -1 }, { "<PageDown>", 1 } }) do
+  for _, action in ipairs({ { "scroll_previous", -1 }, { "scroll_next", 1 } }) do
     actions[#actions + 1] = {
-      key = action[1], modes = { "n", "i" }, desc = "Scroll permission details",
+      command = action[1], modes = "i", desc = "Scroll permission details",
       callback = function() picker.scroll_content(action[2]) end,
     }
   end

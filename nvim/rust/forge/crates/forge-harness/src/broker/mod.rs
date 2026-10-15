@@ -34,7 +34,7 @@ use crate::plan::{
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
     PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
     PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
-    PlanState, ScopeDeviationReview, digest as plan_digest,
+    PlanState, digest as plan_digest,
 };
 use crate::protocol::HarnessMethod;
 use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
@@ -544,7 +544,6 @@ pub struct HarnessBroker {
     session: HarnessSession,
     capability: BackendCapability,
     goal_max_turns: u32,
-    scope_deviation_review: ScopeDeviationReview,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
@@ -791,7 +790,6 @@ impl HarnessBroker {
             session,
             capability,
             goal_max_turns: request.goal_max_turns,
-            scope_deviation_review: ScopeDeviationReview::Auto,
             permission_store,
             permission_coordinator,
             trace,
@@ -1163,7 +1161,6 @@ impl HarnessBroker {
             HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
             HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
             HarnessMethod::PlanList => self.observer.list_replanning_choices(),
-            HarnessMethod::PlanScopeDeviationReview => self.select_scope_deviation_review(params),
             HarnessMethod::PlanDeviationResolve => anyhow::bail!("task-based deviations are no longer supported"),
             HarnessMethod::QuestionAnswer => self.answer_question(params),
             HarnessMethod::QuestionSkip => self.skip_question(params),
@@ -1787,19 +1784,6 @@ impl HarnessBroker {
             session.clone(),
             vec![self.event("execution_mode_changed", session)?],
         ))
-    }
-
-    fn select_scope_deviation_review(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        self.scope_deviation_review = serde_json::from_value(
-            params
-                .get("policy")
-                .cloned()
-                .context("scope deviation review policy is required")?,
-        )?;
-        Ok((json!({ "policy": self.scope_deviation_review }), Vec::new()))
     }
 
     async fn resume_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {

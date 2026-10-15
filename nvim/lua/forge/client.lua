@@ -15,7 +15,6 @@ local shutdown_autocmd = false
 local RESERVED_METHOD = {
   initialize = true,
   ["harness.initialize"] = true,
-  ["plan.scope_deviation_review"] = true,
   ["trace.configure"] = true,
   ["turn.cancel"] = true,
   ["turn.restart"] = true,
@@ -507,26 +506,17 @@ local function send_harness_initialize(callback, initialize_options)
     client.snapshot = result
     local initialized_session_id = result and result.session and result.session.id
     if initialized_session_id then client.snapshot_by_id[initialized_session_id] = result end
-    local plan_config = harness_config.plan or {}
-    M.request_host("plan.scope_deviation_review", { policy = plan_config.scope_deviation_review or "auto" }, function(_, policy_error, policy_error_detail)
-      if policy_error then
+    client.harness_ready = true
+    session.harness.ready = true
+    M.request_host("trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
+      if failure then
         client.harness_ready = false
         session.harness.ready = false
-        finish_harness_start(callback, nil, policy_error, policy_error_detail)
+        finish_harness_start(callback, nil, failure)
         return
       end
-      client.harness_ready = true
-      session.harness.ready = true
-      M.request_host("trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
-        if failure then
-          client.harness_ready = false
-          session.harness.ready = false
-          finish_harness_start(callback, nil, failure)
-          return
-        end
-        require("forge.views.harness.settings").adopt(status)
-        finish_harness_start(callback, result, nil)
-      end)
+      require("forge.views.harness.settings").adopt(status)
+      finish_harness_start(callback, result, nil)
     end)
   end
   local backend_launch_by_provider = {}
