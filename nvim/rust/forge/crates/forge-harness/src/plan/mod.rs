@@ -90,6 +90,8 @@ pub use validation::{
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanState {
+    /// Retains the original request until project checks have been saved and validated.
+    ConfiguringChecks,
     Generating,
     AwaitingInput,
     AwaitingReview,

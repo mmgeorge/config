@@ -3013,6 +3013,16 @@ in one column across timer updates, tool groups, and expansion. Labels that exce
 use compact minutes, hours, or days. Timer updates do not scan peer tools to size this column.
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
+`/plan` validates project checks before admitting plan generation. Missing or invalid configuration
+retains the original request in a `ConfiguringChecks` plan and a `checks_setup` task phase. A separate
+setup exchange receives the request as tooling context and owns its questions. Configuration
+publication requires an explicit user answer. Closing the picker preserves the pending setup,
+while cancelling the plan cancels its setup exchange. Recovery retains the request and resumes
+setup rather than generating a design. A matching persisted configuration-save record plus a valid
+current snapshot permits the broker to transition to `Generating` and start one planning exchange
+with the original request. An intentionally empty configuration bypasses setup. Submission still
+validates the saved configuration in case it changed during planning.
+
 `/plan` uses `Planning` and `Planned` summaries, while plan revision uses `Revising plan` during work. A
 question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
 choices in the timeline, and opens the shared picker across the bottom of the complete Harness

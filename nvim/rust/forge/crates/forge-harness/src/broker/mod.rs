@@ -1506,12 +1506,17 @@ impl HarnessBroker {
             if let Some(plan) = task.plan_id.as_deref().map(|id| self.store.load_plan(id)).transpose()?.flatten() {
                 task.title = plan.title;
                 task.status = match plan.state {
+                    PlanState::ConfiguringChecks => TaskStatus::Waiting,
                     PlanState::AwaitingInput | PlanState::AwaitingReview => TaskStatus::Waiting,
                     PlanState::Failed => TaskStatus::Failed,
                     PlanState::Cancelled => TaskStatus::Cancelled,
                     _ => TaskStatus::Running,
                 };
-                task.phase = if plan.state == PlanState::AwaitingReview { "review" } else { "draft" }.into();
+                task.phase = match plan.state {
+                    PlanState::ConfiguringChecks => "checks_setup",
+                    PlanState::AwaitingReview => "review",
+                    _ => "draft",
+                }.into();
             }
         } else if let Some(goal) = task.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten() {
             task.status = match goal.state {
@@ -1678,6 +1683,9 @@ impl HarnessBroker {
                 if task.kind == TaskKind::Plan {
                     let plan_id = task.plan_id.clone().context("planning task has no plan")?;
                     let mut plan = self.store.load_plan(&plan_id)?.context("task plan is missing")?;
+                    if plan.state == PlanState::ConfiguringChecks {
+                        return self.configure_plan_checks(message.unwrap_or_default()).await;
+                    }
                     if plan.state == PlanState::Failed {
                         plan.generation.reset();
                         PlanStateMachine::apply(&mut plan, PlanEvent::RetryRequested, self.clock.now_ms())?;
@@ -1812,7 +1820,7 @@ impl HarnessBroker {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => PromptMode::Plan,
             ExchangeKind::PlanExecution => PromptMode::ExecutePlan,
             ExchangeKind::Chat if interaction.goal_id.is_some() => PromptMode::GoalContinuation,
-            ExchangeKind::Chat if interaction.plan_id.is_some() => PromptMode::PlanDiscussion,
+            ExchangeKind::Chat if interaction.plan_id.is_some() && interaction.check_setup.is_none() => PromptMode::PlanDiscussion,
             ExchangeKind::Chat => PromptMode::Chat,
         };
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
@@ -2495,6 +2503,10 @@ impl HarnessBroker {
                 .ask_question(json!({ "question_id": question_id, "text": text }))
                 .await;
         }
+        if self.current_plan_id()?.as_deref().map(|id| self.store.load_plan(id)).transpose()?.flatten()
+            .is_some_and(|plan| plan.state == PlanState::ConfiguringChecks) {
+            return self.configure_plan_checks(text).await;
+        }
         let active_plan = self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
@@ -3047,7 +3059,7 @@ impl HarnessBroker {
         let (mut value, mut event) = self
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
-                if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
+                if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some() && interaction.check_setup.is_none()
                     && interaction.plan_id.is_some() {
                     PromptMode::PlanDiscussion
                 } else { PromptMode::Chat },
@@ -3153,7 +3165,8 @@ impl HarnessBroker {
             .context("active interaction has no elicitation state")?;
         let feedback = elicitation.feedback();
         if interaction.check_setup.is_some() && elicitation.answer.iter().any(|answer|
-            !matches!(answer.response, PlanQuestionResponse::Skipped)) {
+            answer.source == crate::session::ResolutionSource::User
+                && !matches!(answer.response, PlanQuestionResponse::Skipped)) {
             interaction.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
         }
         interaction.awaiting_input = false;
@@ -3176,7 +3189,7 @@ impl HarnessBroker {
         let prompt = format!(
             "Harness resolved the pending questions and recorded their response sources. Do not call harness_question_answer or harness_question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
         );
-        let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
+        let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some() && interaction.check_setup.is_none()
             && interaction.plan_id.is_some() {
             self.run_planning_interaction(prompt, None).await?
         } else {
@@ -3280,8 +3293,10 @@ impl HarnessBroker {
         admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let input = BackendInput::from_text(text.clone());
-        self.run_interaction_input(text, mode, admission, input)
-            .await
+        let result = self.run_interaction_input(text, mode, admission, input).await?;
+        if mode == PromptMode::Chat {
+            Box::pin(self.advance_configured_plan(result)).await
+        } else { Ok(result) }
     }
 
     async fn run_planning_interaction(
@@ -3455,16 +3470,6 @@ Planning continuation: turn {} of {}.",
             .interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)
             .await?;
         interaction.mode = Some(self.session.execution_mode);
-        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
-            && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_err()
-        {
-            let reviewed = self.current_plan_id()?.as_deref()
-                .map(|id| self.store.load_plan(id)).transpose()?.flatten()
-                .is_some_and(|plan| plan.question_ledger.resolution.iter().any(|answer|
-                    answer.kind == crate::plan::PlanQuestionResolutionKind::Answered));
-            interaction.check_setup = Some(if reviewed { crate::checks::CheckSetupState::Reviewed }
-                else { crate::checks::CheckSetupState::Discovery });
-        }
         if new_interaction && let Some(admission) = admission.as_ref() {
             if self.check_setup { interaction.check_setup = Some(crate::checks::CheckSetupState::Discovery); }
             interaction.lifecycle.clone_from(&admission.lifecycle);
@@ -6573,6 +6578,12 @@ Planning continuation: turn {} of {}.",
             .store
             .load_plan(&plan_id)?
             .context("failed plan record is missing")?;
+        if plan.state == PlanState::ConfiguringChecks {
+            let task = self.current_task()?.context("pending plan has no task")?;
+            return Box::pin(self.transition_task(json!({
+                "action": "resume", "task_id": task.id,
+            }))).await;
+        }
         anyhow::ensure!(
             plan.state == PlanState::Failed,
             "/plan retry requires a failed plan"

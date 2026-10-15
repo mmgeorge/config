@@ -1,7 +1,9 @@
 # Project checks setup
 
 Inspect project manifests, existing scripts, CI, test runners, and repository instructions.
-For an empty directory, inspect the active plan's proposed tooling before choosing commands.
+For an empty directory, use the retained original planning request to establish the intended
+tooling before choosing commands. Limit discovery to check setup. Do not draft or implement
+the requested feature. Harness starts the original plan after valid configuration is saved.
 Discovery must be followed by a user conversation. Call harness_question_ask with one to three
 concrete questions before saving. Propose discovered functional areas and ask which suites run
 automatically, which remain explicit, and whether routine verification uses targeted or full

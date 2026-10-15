@@ -7,6 +7,8 @@ use super::{PlanRecord, PlanState};
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PlanEvent {
+    /// Admits generation after the setup exchange publishes valid project checks.
+    ChecksConfigured,
     QuestionAsked,
     FeedbackConsumed,
     PlanSubmitted,
@@ -24,6 +26,7 @@ impl PlanStateMachine {
     /// Apply one lifecycle event while enforcing the plan's legal transition graph.
     pub fn apply(plan: &mut PlanRecord, event: PlanEvent, now_ms: i64) -> Result<()> {
         let next_state = match (plan.state, event) {
+            (PlanState::ConfiguringChecks, PlanEvent::ChecksConfigured) => PlanState::Generating,
             (
                 PlanState::Generating | PlanState::Revising | PlanState::AwaitingInput,
                 PlanEvent::QuestionAsked,
@@ -48,7 +51,8 @@ impl PlanStateMachine {
                 }
             }
             (
-                PlanState::Generating
+                PlanState::ConfiguringChecks
+                | PlanState::Generating
                 | PlanState::AwaitingInput
                 | PlanState::AwaitingReview
                 | PlanState::Revising,
@@ -56,7 +60,8 @@ impl PlanStateMachine {
             ) => PlanState::Cancelled,
             (PlanState::Failed, PlanEvent::Cancelled) => PlanState::Cancelled,
             (
-                PlanState::Generating
+                PlanState::ConfiguringChecks
+                | PlanState::Generating
                 | PlanState::AwaitingInput
                 | PlanState::AwaitingReview
                 | PlanState::Revising,
@@ -111,6 +116,16 @@ mod test {
             created_at_ms: 1,
             updated_at_ms: 1,
         }
+    }
+
+    #[test]
+    fn check_setup_blocks_generation_until_configuration_is_published() {
+        let mut record = plan(PlanState::ConfiguringChecks);
+        assert!(PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 2).is_err());
+        assert!(PlanStateMachine::apply(&mut record, PlanEvent::QuestionAsked, 2).is_err());
+        PlanStateMachine::apply(&mut record, PlanEvent::ChecksConfigured, 3).unwrap();
+        PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 4).unwrap();
+        assert_eq!(record.state, PlanState::AwaitingReview);
     }
 
     #[test]

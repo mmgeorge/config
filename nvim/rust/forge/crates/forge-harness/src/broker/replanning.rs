@@ -49,10 +49,25 @@ impl HarnessBroker {
         mut document: PlanDocument,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut leading_event = Vec::new();
+        let checks_ready =
+            crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_ok();
         if document.design.is_none() {
-            let workspace = PathBuf::from(&self.session.workspace);
-            document.design = Some(tokio::task::spawn_blocking(move || crate::plan::DeclarationDesign::open(&workspace)).await??);
-            document.title = request.lines().next().unwrap_or("Declaration design").chars().take(100).collect();
+            if checks_ready {
+                let workspace = PathBuf::from(&self.session.workspace);
+                document.design = Some(
+                    tokio::task::spawn_blocking(move || {
+                        crate::plan::DeclarationDesign::open(&workspace)
+                    })
+                    .await??,
+                );
+            }
+            document.title = request
+                .lines()
+                .next()
+                .unwrap_or("Declaration design")
+                .chars()
+                .take(100)
+                .collect();
             document.overview = request.clone();
         }
         self.pause_task(false).await?;
@@ -69,7 +84,11 @@ impl HarnessBroker {
             session_id: self.session.id.clone(),
             request: request.clone(),
             title: document.title.clone(),
-            state: PlanState::Generating,
+            state: if checks_ready {
+                PlanState::Generating
+            } else {
+                PlanState::ConfiguringChecks
+            },
             working_path: working_path.to_string_lossy().into_owned(),
             document_version: document.version,
             model_revision: 0,
@@ -87,27 +106,45 @@ impl HarnessBroker {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
-        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), plan.title.clone(), crate::task::TaskKind::Plan, self.session.execution_mode, now_ms);
+        let mut task = crate::task::TaskRecord::new(
+            self.session.id.clone(),
+            plan.title.clone(),
+            crate::task::TaskKind::Plan,
+            self.session.execution_mode,
+            now_ms,
+        );
         task.plan_id = Some(plan.id.clone());
+        if !checks_ready {
+            task.phase = "checks_setup".into();
+        }
         task.operation_id = self.active_operation_id.clone();
         task.begin(now_ms)?;
         self.session.current_task_id = Some(task.id.clone());
-        self.store.select_task(&self.session, Some(&task), None, Some(&plan), &self.client_id)?;
+        self.store.select_task(
+            &self.session,
+            Some(&task),
+            None,
+            Some(&plan),
+            &self.client_id,
+        )?;
         if let Some(goal) = self.current_goal()?
             && goal.state == GoalState::Active
         {
             let (_, mut paused) = self.pause_goal().await?;
             leading_event.append(&mut paused);
         }
-        let (result, mut event) = self
-            .run_planning_interaction(
+        let (result, mut event) = if !checks_ready {
+            self.configure_plan_checks(prompt).await?
+        } else {
+            self.run_planning_interaction(
                 PlanPrompt::with_active_document(
                     PlanPrompt::draft(&request),
                     &document.model_json()?,
                 ),
                 Some(ExchangeAdmission::plan(prompt, Some(plan_id), false)),
             )
-            .await?;
+            .await?
+        };
         leading_event.append(&mut event);
         Ok((result, leading_event))
     }

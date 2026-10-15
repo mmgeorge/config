@@ -1,6 +1,115 @@
 use super::*;
 
 impl HarnessBroker {
+    /// Runs check discovery while retaining the original plan request and its task identity.
+    pub(super) async fn configure_plan_checks(
+        &mut self,
+        prompt: String,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let completed = Box::pin(
+            self.advance_configured_plan((serde_json::to_value(self.snapshot()?)?, Vec::new())),
+        )
+        .await?;
+        let plan_id = self
+            .current_plan_id()?
+            .context("check setup has no pending plan")?;
+        let plan = self
+            .store
+            .load_plan(&plan_id)?
+            .context("pending plan is missing")?;
+        if plan.state != PlanState::ConfiguringChecks {
+            return Ok(completed);
+        }
+        if self.find_active_interaction_elicitation()?.is_some() {
+            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+        }
+        let mut admission = ExchangeAdmission::chat(prompt);
+        admission.plan_id = Some(plan_id);
+        self.check_setup = true;
+        let result = self.run_interaction(format!(
+            "The user requested a plan. Project checks are missing or invalid, so configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{}\n\n{}",
+            plan.request, include_str!("../checks/setup.md")), PromptMode::Chat, Some(admission)).await;
+        self.check_setup = false;
+        result
+    }
+
+    /// Starts the retained plan only after this session records a matching configuration publication.
+    pub(super) async fn advance_configured_plan(
+        &mut self,
+        result: (Value, Vec<SessionEvent>),
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let Some(plan_id) = self.current_plan_id()? else {
+            return Ok(result);
+        };
+        let Some(mut plan) = self.store.load_plan(&plan_id)? else {
+            return Ok(result);
+        };
+        if plan.state != PlanState::ConfiguringChecks
+            || self.current_task()?.is_none_or(|task| {
+                !matches!(
+                    task.status,
+                    crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
+                )
+            })
+            || self.find_active_interaction_elicitation()?.is_some()
+        {
+            return Ok(result);
+        }
+        let Ok(snapshot) = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))
+        else {
+            return Ok(result);
+        };
+        let published = self.check_runner.history()?.iter().any(|run| {
+            run.context
+                .as_ref()
+                .is_some_and(|context| context.snapshot.digest == snapshot.digest)
+                && run.lifecycle.iter().any(|event| {
+                    matches!(
+                        event.kind,
+                        crate::checks::CheckEventKind::ConfigurationSaved
+                    ) && event.created_at_ms >= plan.created_at_ms
+                })
+        });
+        if !published {
+            return Ok(result);
+        }
+        let mut document = self
+            .plan_file
+            .read_working_document(&self.session.id, &plan_id)?;
+        if document.design.is_none() {
+            document.design = Some(crate::plan::DeclarationDesign::open(Path::new(
+                &self.session.workspace,
+            ))?);
+            self.plan_file
+                .write_working_document(&self.session.id, &plan_id, &document)?;
+        }
+        PlanStateMachine::apply(&mut plan, PlanEvent::ChecksConfigured, self.clock.now_ms())?;
+        let mut task = self
+            .current_task()?
+            .context("pending plan task is missing")?;
+        task.status = crate::task::TaskStatus::Running;
+        task.phase = "draft".into();
+        task.reason = None;
+        task.updated_at_ms = self.clock.now_ms();
+        self.store.select_task(
+            &self.session,
+            Some(&task),
+            None,
+            Some(&plan),
+            &self.client_id,
+        )?;
+        self.check_setup = false;
+        let mut admission = ExchangeAdmission::plan(String::new(), Some(plan_id), false);
+        admission.lifecycle = Some(WorkflowActivity::Planning.event(LifecycleAction::Started));
+        let (value, mut event) = self.run_planning_interaction(
+            PlanPrompt::with_active_document(format!(
+                "Project checks have been saved and validated at revision {}. Check setup is complete. Now begin the original planning request.\n\n{}",
+                snapshot.digest, PlanPrompt::draft(&plan.request)), &document.model_json()?), Some(admission)).await?;
+        let mut leading = result.1;
+        leading.append(&mut event);
+        Ok((value, leading))
+    }
+
     /// Refreshes the read-only check projection before acceptance without altering design metadata.
     pub(super) fn refresh_check_review(&mut self, plan_id: &str) -> Result<bool> {
         let mut plan = self
@@ -117,7 +226,8 @@ impl HarnessBroker {
                 RequestNotAdmitted("wait for active checks and agents before setup").into(),
             );
         }
-        if self.active_plan_awaits_input()? || self.active_plan_has_acceptance()? {
+        if self.active_plan_awaits_input()? || self.active_plan_has_acceptance()?
+            || self.find_active_interaction_elicitation()?.is_some() {
             return Err(RequestNotAdmitted(
                 "answer the active plan questions before starting separate check setup",
             )
