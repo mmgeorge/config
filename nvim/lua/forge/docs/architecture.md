@@ -2242,8 +2242,9 @@ their event types. Each intake uses the shared encoded outbound queue limits and
 order, waiting for queue capacity when required. Dropping a consumer aborts its intake task.
 Intake retains a client handle and session identity rather than owning the SDK session. Before a
 tool-schema rebind, the adapter stops and joins the old terminal monitor, then disconnects and drops
-the old session before registering its replacement. Late SDK session disposal cannot unregister
-the replacement's event router.
+the old session before registering its replacement. Catalog requests reuse an attached session
+without changing its tool schema. Only a request with a turn control context can refresh the
+schema, so catalog reads cannot disconnect an executing turn from its event stream.
 SDK lag notices are logged without ending the turn. Intake compares the next queued event's
 parent with its last durable event and replays any missing durable history before that event.
 Missing transient deltas are superseded by completed message snapshots. Closed subscriptions,
@@ -2308,9 +2309,12 @@ child Exchange, so later reuse of the Agent cannot change historical status.
 
 Mode restart interrupts provider Turns and pauses the existing Exchange. Resumption preserves its
 request, plan and goal associations, and initial checkpoint. Cancellation retains provider delivery
-while cleanup awaits terminal evidence. A 30-second cleanup failure remains retryable, with the
-Exchange finalizing and new request admission blocked. The terminal checkpoint and Exchange outcome
+while cleanup awaits terminal evidence. Copilot allows eight seconds for terminal acknowledgement.
+A cleanup failure remains retryable, with the Exchange finalizing and new request admission blocked.
+The terminal checkpoint and Exchange outcome
 commit together. Rollback changes history disposition while preserving execution outcomes.
+Cancelled finalization displays Stopping across status, exchange, and agent headings. Saving
+exchange describes finalization for other outcomes.
 Checkpoint capture errors include the source path and retain the finalizing exchange. Ctrl-C
 retries finalization even when no provider request is active. Goal resume retries finalization
 before activating the goal, so a failed retry leaves the goal paused and admits no new work.
@@ -6188,7 +6192,7 @@ its block-relative row, animation flag, and optional Working, Question, or Revie
 hint context. The buffer contract validates that the row exists. Lua reads this
 metadata from the committed sequence, never from label text or target suffixes.
 Active labels are Working, Planning, Revising plan, Compacting, Implementing, Verifying,
-Resolving, and Saving exchange. Completed headings retain Planned, Implemented,
+Resolving, Stopping, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
 
 `health.notice` resolves local failures before user approval waits and otherwise preserves the

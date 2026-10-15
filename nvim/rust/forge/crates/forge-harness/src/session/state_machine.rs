@@ -115,6 +115,7 @@ pub enum SessionPhase {
     },
     Finalizing {
         exchange_id: String,
+        outcome: Option<ExchangeState>,
         error: Option<String>,
     },
     Working {
@@ -211,6 +212,7 @@ impl SessionPhase {
         {
             return Self::Finalizing {
                 exchange_id: exchange.id.clone(),
+                outcome: exchange.finalization_outcome,
                 error: exchange.finalization_error.clone(),
             };
         }

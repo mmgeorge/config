@@ -216,7 +216,9 @@ impl CopilotBackend {
         let mut active_session = session_slot.lock().await;
         let tool_schema = ControlToolRegistry.definition_list_for_context(request.control_context.as_ref(), request.owner()?.is_root())
             .iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>();
-        if let Some(binding) = active_session.as_mut().filter(|binding| binding.tool_schema == tool_schema) {
+        if let Some(binding) = active_session.as_mut().filter(|binding|
+            request.control_context.is_none() || binding.tool_schema == tool_schema
+        ) {
             if binding.compaction.is_none() {
                 binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
                     .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event), Arc::clone(&self.trace), request.harness_session_id.clone()));

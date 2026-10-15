@@ -70,12 +70,7 @@
     },
     "play-mcp": {
       "targets": ["copilotcli"],
-      "command": "npx",
-      "args": [
-        "-y",
-        "--@webgis:registry=https://olympus.esri.com/artifactory/api/npm/npm-repo/",
-        "@webgis/play-mcp@latest"
-      ],
+      "command": "play-mcp",
       "default_tools_approval_mode": "approve"
     },
     "terminal-mcp": {

@@ -438,10 +438,13 @@ impl TimelineRenderer<'_> {
                         let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
                         format!("Compacting · {elapsed_seconds}s")
                     }
-                    SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
-                        || "Saving exchange".into(),
-                        |error| format!("Saving exchange failed · {error}"),
-                    ),
+                    SessionPhase::Finalizing { outcome, error, .. } => {
+                        let label = finalization_label(*outcome);
+                        error.as_ref().map_or_else(
+                            || label.into(),
+                            |error| format!("{label} failed · {error}"),
+                        )
+                    },
                     SessionPhase::Working {
                         reasoning_summary,
                         activity,
@@ -1907,7 +1910,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                 ExchangeState::Running if exchange.activity() == ExchangeActivity::WaitingForAgent => "Waiting for agents",
                 ExchangeState::Running if matches!(exchange.activity(), ExchangeActivity::Compacting { .. }) => "Compacting",
                 ExchangeState::Running => "Running",
-                ExchangeState::Finalizing => "Saving exchange",
+                ExchangeState::Finalizing => finalization_label(exchange.finalization_outcome),
                 ExchangeState::Complete => "Ran",
                 ExchangeState::Failed => "Failed",
                 ExchangeState::Cancelled => "Cancelled",
@@ -2039,6 +2042,10 @@ fn token_display(tokens: u64) -> String {
     }
 }
 
+fn finalization_label(outcome: Option<ExchangeState>) -> &'static str {
+    if outcome == Some(ExchangeState::Cancelled) { "Stopping" } else { "Saving exchange" }
+}
+
 fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let complete = interaction.completed_at_ms.is_some();
     let status = interaction.activity();
@@ -2047,7 +2054,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let activity = if interaction.state == ExchangeState::Cancelled {
         "Cancelled"
     } else if interaction.state == ExchangeState::Finalizing {
-        "Saving exchange"
+        finalization_label(interaction.finalization_outcome)
     } else if interaction.state == ExchangeState::Interrupted {
         "Interrupted"
     } else if interaction.state == ExchangeState::Failed {
@@ -4010,8 +4017,8 @@ mod tests {
             (SessionPhase::AwaitingApproval { exchange_id: "exchange".into() }, "Waiting for your approval", false, Some(StatusHint::Permission)),
             (SessionPhase::Compacting { started_at_ms: 1_000 }, "Compacting · 2s", true, None),
             (SessionPhase::Compacting { started_at_ms: 4_000 }, "Compacting · 0s", true, None),
-            (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
-            (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
+            (SessionPhase::Finalizing { exchange_id: "exchange".into(), outcome: Some(crate::exchange::ExchangeState::Complete), error: None }, "Saving exchange", true, None),
+            (SessionPhase::Finalizing { exchange_id: "exchange".into(), outcome: Some(crate::exchange::ExchangeState::Complete), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
             (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for agents · 2 running", true, Some(StatusHint::Working)),
             (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 2, max_turn: 20, duration_ms: 0, started_at_ms: Some(0), activity: WorkflowActivity::Planning }, "Planning · 3s", true, Some(StatusHint::Working)),
             (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 3, max_turn: 20, duration_ms: 0, started_at_ms: Some(0), activity: WorkflowActivity::Revising }, "Revising plan · 3s", true, Some(StatusHint::Working)),
