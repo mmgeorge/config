@@ -217,6 +217,12 @@ struct ExchangeRuntime {
     active_wait: Option<ActiveWait>,
 }
 
+impl ExchangeRuntime {
+    fn retractable_before_tools(&self) -> bool {
+        self.retraction_eligible && self.tool_gate.as_ref().is_some_and(|gate| !gate.ready())
+    }
+}
+
 impl Drop for ExchangeRuntime {
     fn drop(&mut self) {
         if let Some(gate) = &self.tool_gate {
@@ -333,6 +339,7 @@ enum ExecutionCleanup {
 /// Coordinates execution interruption without discarding pending provider evidence.
 pub struct TurnCancellation {
     requested: Arc<AtomicBool>,
+    submission_cancelled: Arc<AtomicBool>,
     restore_prompt: AtomicBool,
     restart: AtomicBool,
     cleanup: tokio::sync::watch::Sender<ExecutionCleanup>,
@@ -344,6 +351,7 @@ impl TurnCancellation {
     fn new() -> Self {
         Self {
             requested: Arc::new(AtomicBool::new(false)),
+            submission_cancelled: Arc::new(AtomicBool::new(false)),
             restore_prompt: AtomicBool::new(false),
             restart: AtomicBool::new(false),
             cleanup: tokio::sync::watch::channel(ExecutionCleanup::Idle).0,
@@ -355,6 +363,7 @@ impl TurnCancellation {
     /// Clear cancellation state before dispatching the next broker request.
     pub fn arm(&self, retraction_allowed: bool) {
         self.requested.store(false, Ordering::Release);
+        self.submission_cancelled.store(false, Ordering::Release);
         self.restore_prompt.store(false, Ordering::Release);
         self.restart.store(false, Ordering::Release);
         self.cleanup.send_replace(ExecutionCleanup::Idle);
@@ -364,6 +373,7 @@ impl TurnCancellation {
 
     /// Request cancellation without waiting for the broker's serialized request lane.
     pub fn request(&self, restore_prompt: bool) {
+        self.submission_cancelled.store(true, Ordering::Release);
         self.restore_prompt.store(restore_prompt, Ordering::Release);
         self.requested.store(true, Ordering::Release);
         self.notify.notify_waiters();
@@ -384,6 +394,7 @@ impl TurnCancellation {
         );
         self.restart.store(restart, Ordering::Release);
         self.restore_prompt.store(restore_prompt, Ordering::Release);
+        self.submission_cancelled.store(true, Ordering::Release);
         self.cleanup.send_replace(ExecutionCleanup::Pending);
         Ok(())
     }
@@ -864,6 +875,7 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
             checkpoint: self.exchange_runtime.as_ref().and_then(|runtime| runtime.tool_gate.clone()),
             agent: None,
             checks: None,
@@ -3461,6 +3473,7 @@ Planning continuation: turn {} of {}.",
                 .all(|exchange| exchange.state != ExchangeState::Finalizing),
             "an exchange is still finalizing; retry cleanup before starting more work"
         );
+        self.backend.prepare_turn(&self.session.id).await?;
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission
             .as_ref()
@@ -3669,6 +3682,15 @@ Planning continuation: turn {} of {}.",
                 if !cancelled {
                     self.record_execution_failure(&mut interaction, format!("{error:#}")).await?;
                 }
+                let retract_before_tools = cancelled
+                    && self.turn_cancellation.restores_prompt()
+                    && self.capability.native_turn_rollback
+                    && self.exchange_runtime.as_ref().is_some_and(ExchangeRuntime::retractable_before_tools);
+                if retract_before_tools
+                    && self.retract_cancelled_interaction(&interaction, &mut event).await?
+                {
+                    return Err(anyhow::Error::new(TurnRetracted { prompt: interaction.prompt }));
+                }
                 let final_checkpoint_id = self
                     .capture_final_checkpoint(&mut interaction, outcome)
                     .await?;
@@ -3678,7 +3700,7 @@ Planning continuation: turn {} of {}.",
                     let objects = self.store.objects.clone();
                     tokio::task::spawn_blocking(move || before.equivalent(&after, &objects)).await.context("checkpoint comparison worker failed")??
                 } else { false };
-                let retraction_eligible = cancelled
+                let retraction_eligible = !retract_before_tools && cancelled
                     && self.turn_cancellation.restores_prompt()
                     && self.capability.native_turn_rollback
                     && workspace_unchanged
@@ -3686,58 +3708,10 @@ Planning continuation: turn {} of {}.",
                         .exchange_runtime
                         .as_ref()
                         .is_some_and(|runtime| runtime.retraction_eligible);
-                if retraction_eligible {
-                    match self
-                        .backend
-                        .rollback_cancelled_turn_for(&self.session.id)
-                        .await
-                    {
-                        Ok(true) => {
-                            self.exchange_runtime.take();
-                            self.store.delete_exchange(&interaction.id)?;
-                            self.emit_live(
-                                BackendEvent {
-            received_at_ms: None,
-                                    address: None,
-                                    turn_boundary: None,
-                                    kind: "timeline_exchange_retracted".into(),
-                                    text: None,
-                                    data: json!({
-                                        "exchange_id": interaction.id,
-                                        "prompt": interaction.prompt.clone(),
-                                    }),
-                                    activity: None,
-                                    summary: None,
-                                    task_update: None,
-                                },
-                                &mut event,
-                            )
-                            .await?;
-                            return Err(anyhow::Error::new(TurnRetracted {
-                                prompt: interaction.prompt,
-                            }));
-                        }
-                        Ok(false) => {}
-                        Err(rollback_error) => {
-                            self.emit_live(
-                                BackendEvent {
-            received_at_ms: None,
-                                    address: None,
-                                    turn_boundary: None,
-                                    kind: "error".into(),
-                                    text: Some(format!(
-                                        "Cancelled turn could not be retracted: {rollback_error:#}"
-                                    )),
-                                    data: Value::Null,
-                                    activity: None,
-                                    summary: None,
-                                    task_update: None,
-                                },
-                                &mut event,
-                            )
-                            .await?;
-                        }
-                    }
+                if retraction_eligible
+                    && self.retract_cancelled_interaction(&interaction, &mut event).await?
+                {
+                    return Err(anyhow::Error::new(TurnRetracted { prompt: interaction.prompt }));
                 }
                 if let Some(runtime) = self.exchange_runtime.take() {
                     finish_synthetic_turn(
@@ -4903,7 +4877,11 @@ Planning continuation: turn {} of {}.",
         if outcome.is_err() && let Some(gate) = &runtime.tool_gate {
             gate.complete(Err("provider turn ended before checkpoint admission completed".into()))?;
         }
-        let outcome = if let Some(task) = runtime.checkpoint.as_mut() {
+        let retract_before_tools = outcome.as_ref().is_err_and(|error| error.is::<TurnCancelled>())
+            && cancellation.restores_prompt()
+            && self.capability.native_turn_rollback
+            && runtime.retractable_before_tools();
+        let outcome = if !retract_before_tools && let Some(task) = runtime.checkpoint.as_mut() {
             let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
             let saved = self.finish_initial_checkpoint(&mut runtime, interaction, result);
             checkpoint_failed |= saved.is_err();
@@ -4968,6 +4946,42 @@ Planning continuation: turn {} of {}.",
         }
         self.exchange_runtime = Some(runtime);
         outcome
+    }
+
+    async fn retract_cancelled_interaction(
+        &mut self,
+        interaction: &Exchange,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<bool> {
+        match self.backend.rollback_cancelled_turn_for(&self.session.id).await {
+            Ok(true) => {
+                self.store.delete_exchange(&interaction.id)?;
+                self.exchange_runtime.take();
+                self.emit_live(
+                    BackendEvent {
+                        received_at_ms: None, address: None, turn_boundary: None,
+                        kind: "timeline_exchange_retracted".into(), text: None,
+                        data: json!({"exchange_id": interaction.id, "prompt": interaction.prompt}),
+                        activity: None, summary: None, task_update: None,
+                    },
+                    event,
+                ).await?;
+                Ok(true)
+            }
+            Ok(false) => Ok(false),
+            Err(error) => {
+                self.emit_live(
+                    BackendEvent {
+                        received_at_ms: None, address: None, turn_boundary: None,
+                        kind: "error".into(),
+                        text: Some(format!("Cancelled turn could not be retracted: {error:#}")),
+                        data: Value::Null, activity: None, summary: None, task_update: None,
+                    },
+                    event,
+                ).await?;
+                Ok(false)
+            }
+        }
     }
 
     /// Retry finalization without submitting provider input or replaying tool execution.
@@ -7411,9 +7425,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let access = params.get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
             .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
-        if let Some(access) = &access {
-            crate::backend::BackendKind::parse(&self.session.backend)?.validate_access(access)?;
-        }
         if let Some(value) = params.get("shell") {
             configured.shell = serde_json::from_value(value.clone())?;
             configured.shell.executable()?;
@@ -7559,6 +7570,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled());
         if let Some(access) = access { configured.access = access; }
+        configured.access = crate::backend::BackendKind::parse(&configured.backend)?.resolve_access(configured.access);
         if let Some(selection) = resource_selection {
             self.backend.reconcile_settings(BackendCatalogRequest {
                 execution_owner: None,
@@ -8141,6 +8153,7 @@ mod test {
         async fn cleanup_execution(&self, _: &str) -> Result<()> { Ok(()) }
         async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
         async fn active_session_id_for(&self, _: &str) -> Option<String> { None }
+        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> { Ok(true) }
         async fn prompt_stream(&self, request: BackendRequest, _sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             self.started.notify_one();
             request.control_context.as_ref().and_then(|context|context.checkpoint.as_ref())
@@ -8149,6 +8162,44 @@ mod test {
             std::fs::write(Path::new(&request.workspace).join("seed.txt"), "tool changed workspace\n")?;
             Ok(crate::backend::BackendOutput::default())
         }
+    }
+
+    #[tokio::test]
+    async fn cancellation_rewinds_before_checkpoint_barrier_without_waiting_for_scan() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let started = Arc::new(Notify::new());
+        let tool_ran = Arc::new(AtomicBool::new(false));
+        broker.backend = Arc::new(CheckpointBackend {
+            started: Arc::clone(&started), tool_ran: Arc::clone(&tool_ran),
+        });
+        broker.capability.native_turn_rollback = true;
+        let repositories = Arc::clone(&broker.repositories);
+        let handle = repositories.open(repository.path().to_owned()).await?.context("fixture repository")?;
+        let operation = repositories.writes.admit(vec![forge_git::mutation::MutationScope::WorktreeFiles(
+            handle.identity.worktree.clone().context("fixture worktree")?)], 0)?;
+        let held = repositories.writes.start(operation)?.context("fixture mutation admission")?;
+        let cancellation = broker.turn_cancellation();
+        cancellation.arm(true);
+        let cancel = async {
+            started.notified().await;
+            cancellation.request(true);
+        };
+        let execution = broker.run_interaction("Undo this new prompt".into(), PromptMode::Chat,
+            Some(ExchangeAdmission::chat("Undo this new prompt".into())));
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            tokio::join!(execution, cancel).0
+        }).await;
+        held.finish(forge_git::mutation::OperationCompletion::Completed)?;
+        repositories.writes.take_receipt(operation);
+        let error = result.context("cancellation waited for the blocked checkpoint scan")?.unwrap_err();
+        assert!(error.is::<TurnRetracted>(), "{error:#}");
+        assert!(!tool_ran.load(Ordering::SeqCst));
+        assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
+        assert!(broker.exchange_runtime.is_none());
+        assert_eq!(std::fs::read_to_string(repository.path().join("seed.txt"))?, "seed\n");
+        Ok(())
     }
 
     #[tokio::test]
@@ -8333,6 +8384,26 @@ mod test {
         assert!(task[0].parent_reported);
         assert_eq!(task[0].parent_exchange_id,exchange[0].id);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn sandbox_preferences_resolve_on_load_and_configuration_for_each_provider() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let preferences = crate::settings::PortableSettings {
+            access: Some(crate::session::AccessPolicy::default()), ..Default::default()
+        };
+        for provider in ["copilot", "claude", "antigravity", "mock", "codex"] {
+            broker.session.backend = provider.into();
+            broker.session.access.sandbox = true;
+            preferences.apply(&mut broker.session, true).unwrap();
+            assert_eq!(broker.session.access.sandbox, provider == "codex");
+            broker.configure_session(json!({"access":crate::session::AccessPolicy::default()})).await.unwrap();
+            let stored = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+            assert_eq!(stored.access.sandbox, provider == "codex");
+        }
+        assert!(preferences.access.unwrap().sandbox);
     }
 
     #[tokio::test]

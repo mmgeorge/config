@@ -212,6 +212,7 @@ impl HarnessMethod {
         matches!(
             self,
             Self::PromptSubmit
+                | Self::ChecksSetup
                 | Self::AgentStart
                 | Self::ExchangeResume
                 | Self::PlanAccept

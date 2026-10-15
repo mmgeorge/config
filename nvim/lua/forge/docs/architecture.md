@@ -2117,9 +2117,19 @@ callbacks through `PermissionCoordinator` and returns native once-only decisions
 remain answerable in Yolo. Native provider policy can still reject an action before a callback reaches
 Forge. Antigravity enterprise terminal policy can also execute a command without an ACP callback, so
 its approval capability remains limited even when personal OAuth approval checks pass.
-ACP currently requires explicit sandbox disabling because these adapters do not enforce the
-Forge OS sandbox contract. The configuration picker permits disabling an inherited sandbox requirement
-for ACP while rejecting attempts to enable unsupported isolation.
+`BackendKind::supports_sandbox` owns the OS sandbox allowlist, which currently includes only Codex.
+Portable settings resolve sandbox to off for Copilot, ACP providers, and the test adapter on session
+creation, recovery, and configuration. Shared requested preferences remain independent of the effective
+provider policy, so switching to Codex preserves its requested isolation. Child profiles and their
+requests resolve access against the child's provider rather than inheriting unsupported root isolation.
+The configuration picker uses the provider's `os_sandbox` capability, displays `Disabled (unsupported)`,
+and prevents enabling unsupported isolation.
+
+Check setup uses ordinary provider execution admission, not the installation/authentication cleanup
+lock. Its model turn therefore remains steerable and interruptible while preserving exclusive execution
+and finalization. Ctrl-C with composer text follows immediate prompt delivery, including Copilot's native
+immediate steering. An empty composer submits a pause intent with output-free prompt retraction
+enabled. Explicit pause actions retain their existing pause-only behavior.
 
 `SettingsStore` owns revisioned global, workspace, and session layers in `settings.db`. Unspecified
 fields inherit. Resource selections overlay by canonical source identity, and provider tuning remains
@@ -2320,7 +2330,10 @@ child Exchange, so later reuse of the Agent cannot change historical status.
 
 Mode restart interrupts provider Turns and pauses the existing Exchange. Resumption preserves its
 request, plan and goal associations, and initial checkpoint. Cancellation retains provider delivery
-while cleanup awaits terminal evidence. Copilot allows eight seconds for terminal acknowledgement.
+while cleanup awaits terminal evidence. Copilot fences submission before attempting an abort.
+A turn still preparing its session has no provider execution to collect, so cleanup returns
+immediately and the broker drops preparation. A submitted turn retains its event reader until
+native idle evidence arrives, with an eight-second bound on abort and collection.
 A cleanup failure remains retryable, with the Exchange finalizing and new request admission blocked.
 The terminal checkpoint and Exchange outcome
 commit together. Rollback changes history disposition while preserving execution outcomes.
@@ -2438,9 +2451,25 @@ to release any retained transport, then either retracts or cancels the interacti
 submitted `prompt.submit` remains retractable only while the provider has produced no assistant
 message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
 do not consume that eligibility. Codex maps an eligible retraction to app-server
-`thread/rollback`, the broker deletes the provisional interaction and restores pre-submit plan or
-goal control state, and Lua returns the exact prompt to HarnessInput. Copilot advertises no turn
-rollback capability, so it always follows ordinary cancellation. Once visible activity or a file
+`thread/rollback`. Copilot uses the pinned SDK's typed `session.history.truncate` API,
+targeting the first actual root `user.message` event from that submission, not the send-response ID,
+a subagent event, or a later reminder. This rewinds conversation history without executing
+`/rewind` as model input. A pre-submit native tail cursor bounds history verification when abort
+precedes the user-event notification. Successful empty history after that cursor proves a queued
+message never entered conversation history. Expired cursors and failed reads remain explicit errors.
+The broker deletes the provisional interaction and restores pre-submit plan or
+goal control state, and Lua returns the exact prompt to HarnessInput without overwriting newer typing.
+If cancellation arrives while the initial checkpoint barrier still denies tools, the broker
+can prove the turn never gained workspace mutation access without comparing workspace snapshots.
+An otherwise output-free native rewind then cancels pending baseline acquisition and removes the
+provisional exchange immediately. It does not wait for the repository scan or capture a final
+checkpoint. Once the barrier releases tools, normal checkpoint comparison remains required.
+Each broker invocation clears stale native rewind identity before preparation. The broker's
+submission-cancellation flag also fences turns that have not activated their provider reader yet.
+Copilot serializes both initial and steering sends against stop admission, so an in-flight native
+send must settle before abort, while a canceled preparation cannot send afterward.
+Native rewind failures preserve the exchange and notify instead of pretending history was removed.
+Once visible activity or a file
 change occurs, the broker finalizes partial timeline state and persists the interaction as
 cancelled. This split prevents the composer from presenting text that still exists in provider
 history while preserving the quick-regret workflow for a genuinely output-free turn.

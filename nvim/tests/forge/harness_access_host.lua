@@ -61,6 +61,9 @@ local success, failure = xpcall(function()
   assert(recovered.session.access.sandbox == false and #recovered.session.access.writable_directory == 1)
   assert(recovered.session.current_task_id == task_id)
 end, debug.traceback)
+local state = require("forge.session").harness
+require("forge.views.harness.workspace").release(state)
+if state.presentation then state.presentation.close() end
 client.stop()
 if not success then error(failure) end
 print("harness_access_host: passed")

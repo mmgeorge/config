@@ -1,0 +1,345 @@
+use super::*;
+use crate::backend::ExecutionOwner;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
+
+#[derive(Clone, Copy, PartialEq)]
+enum NativeUserDelivery {
+    Streaming,
+    HistoryOnly,
+    NotRecorded,
+    ExpiredHistory,
+}
+
+#[tokio::test]
+async fn cancellation_during_copilot_startup_does_not_wait_or_send() -> Result<()> {
+    let (_fixture, backend, request) = fixture()?;
+    let session_id = request.runtime_key()?;
+    let slot = backend.session_slot(&session_id).await;
+    let startup = slot.lock().await;
+    let (sink, _events) = crate::backend::events::channel();
+    let mut prompt = Box::pin(backend.prompt_stream(request, Some(sink)));
+    assert!(futures_util::poll!(prompt.as_mut()).is_pending());
+    assert!(backend.has_active_turn(&session_id).await);
+    tokio::time::timeout(
+        std::time::Duration::from_millis(100),
+        backend.cleanup_execution(&session_id),
+    )
+    .await
+    .context("cancellation waited for provider startup")??;
+    drop(prompt);
+    drop(startup);
+    assert_eq!(backend.client_start_count(), 0);
+    assert!(!backend.has_active_turn(&session_id).await);
+    assert!(backend.rollback_cancelled_turn_for(&session_id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_submission_fence_survives_cleanup_before_turn_activation() -> Result<()> {
+    let turn = CopilotTurnEvent::default();
+    let cancelled = Arc::new(AtomicBool::new(true));
+    let _active = turn.activate(None, Some(cancelled))?;
+    let error = turn
+        .send(async { panic!("a canceled startup sent a native prompt") })
+        .await
+        .unwrap_err();
+    assert!(error.is::<crate::broker::TurnCancelled>());
+    assert!(!turn.stop().await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_cleanup_waits_for_committed_send_and_blocks_late_steering() -> Result<()> {
+    let turn = CopilotTurnEvent::default();
+    let active = turn.activate(None, None)?;
+    let (release, released) = tokio::sync::oneshot::channel();
+    let mut sending = Box::pin(turn.send(async {
+        released.await?;
+        Ok("send-response-id".into())
+    }));
+    assert!(futures_util::poll!(sending.as_mut()).is_pending());
+    let mut stopping = Box::pin(turn.stop());
+    assert!(futures_util::poll!(stopping.as_mut()).is_pending());
+    release.send(()).unwrap();
+    sending.await?;
+    assert!(stopping.await?);
+    assert!(
+        turn.send(async { panic!("steering escaped a stop fence") })
+            .await
+            .is_err()
+    );
+    drop(active);
+    tokio::time::timeout(std::time::Duration::from_millis(100), turn.wait_finished()).await?;
+    assert!(
+        turn.retraction_target().is_err(),
+        "missing native event identity was silently accepted"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_stop_retains_native_submission_after_consumer_drop() -> Result<()> {
+    let turn = CopilotTurnEvent::default();
+    let active = turn.activate(None, None)?;
+    turn.send(async { Ok("transport-id".into()) }).await?;
+    drop(active);
+    assert!(!turn.is_active());
+    assert!(
+        turn.stop().await?,
+        "dropping a consumer must not suppress native abort"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_native_rewind_targets_the_first_root_user_event_and_retries_failures() -> Result<()>
+{
+    for first_failure in [
+        None,
+        Some(json!({"error":{"code":-32601,"message":"history truncation unavailable"}})),
+        Some(json!({"result":{"eventsRemoved":0}})),
+    ] {
+        native_rewind(first_failure, NativeUserDelivery::Streaming).await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_new_admission_cannot_rewind_an_earlier_cancelled_turn() -> Result<()> {
+    let (_fixture, backend, request) = fixture()?;
+    let session_id = request.runtime_key()?;
+    let turn = backend.turn_event(&session_id).await;
+    let active = turn.activate(None, None)?;
+    turn.send(async { Ok("transport-id".into()) }).await?;
+    turn.observe(&serde_json::from_value(json!({
+        "id":"previous-user", "type":"user.message", "timestamp":"2026-10-15T17:00:00Z", "data":{}
+    }))?)?;
+    assert!(turn.stop().await?);
+    drop(active);
+    assert!(
+        matches!(turn.retraction_target()?, CopilotRetraction::Event(id) if id == "previous-user")
+    );
+    backend.prepare_turn(&session_id).await?;
+    assert!(backend.rollback_cancelled_turn_for(&session_id).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_rewind_verifies_history_when_abort_precedes_the_user_event() -> Result<()> {
+    native_rewind(None, NativeUserDelivery::HistoryOnly).await?;
+    native_rewind(None, NativeUserDelivery::NotRecorded).await?;
+    native_rewind(None, NativeUserDelivery::ExpiredHistory).await
+}
+
+async fn native_rewind(first_failure: Option<Value>, delivery: NativeUserDelivery) -> Result<()> {
+    let (_fixture, backend, request) = fixture()?;
+    let session_id = request.runtime_key()?;
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    let client =
+        Client::from_streams(client_read, client_write, PathBuf::from(&request.workspace))?;
+    *backend.client.lock().await = Some(client);
+    let (sent, sent_ready) = tokio::sync::oneshot::channel();
+    let retry = first_failure.is_some();
+    let server = async move {
+        let create = read_request(&mut server_read).await?;
+        assert_eq!(create["method"], "session.create");
+        let native_session_id = create["params"]["sessionId"]
+            .as_str()
+            .context("SDK omitted session identity")?;
+        respond(
+            &mut server_write,
+            &create,
+            json!({"result":{"sessionId":native_session_id,"workspacePath":"."}}),
+        )
+        .await?;
+        let todos = read_request(&mut server_read).await?;
+        assert_eq!(todos["method"], "session.plan.readSqlTodosWithDependencies");
+        respond(
+            &mut server_write,
+            &todos,
+            json!({"result":{"rows":[],"dependencies":[]}}),
+        )
+        .await?;
+        let tail = read_request(&mut server_read).await?;
+        assert_eq!(tail["method"], "session.eventLog.tail");
+        respond(
+            &mut server_write,
+            &tail,
+            json!({"result":{"cursor":"pre-submit"}}),
+        )
+        .await?;
+        let send = read_request(&mut server_read).await?;
+        assert_eq!(send["method"], "session.send");
+        assert_ne!(send["params"]["prompt"], "/rewind");
+        respond(
+            &mut server_write,
+            &send,
+            json!({"result":{"messageId":"transport-response-id"}}),
+        )
+        .await?;
+        if delivery == NativeUserDelivery::Streaming {
+            for (id, agent) in [
+                ("child-user", Some("child")),
+                ("root-user", None),
+                ("reminder", None),
+            ] {
+                write_frame(
+                    &mut server_write,
+                    json!({
+                        "jsonrpc":"2.0", "method":"session.event", "params":{
+                            "sessionId":native_session_id, "event":{
+                                "id":id, "type":"user.message", "timestamp":"2026-10-15T17:00:00Z",
+                                "agentId":agent, "data":{"content":"fixture"}
+                            }
+                        }
+                    }),
+                )
+                .await?;
+            }
+        }
+        sent.send(()).unwrap();
+        let abort = read_request(&mut server_read).await?;
+        assert_eq!(abort["method"], "session.abort");
+        respond(&mut server_write, &abort, json!({"result":{}})).await?;
+        write_frame(&mut server_write, json!({
+            "jsonrpc":"2.0", "method":"session.event", "params":{
+                "sessionId":native_session_id, "event":{
+                    "id":"idle", "type":"assistant.idle", "timestamp":"2026-10-15T17:00:01Z", "data":{}
+                }
+            }
+        })).await?;
+        if delivery != NativeUserDelivery::Streaming {
+            let history = read_request(&mut server_read).await?;
+            assert_eq!(history["method"], "session.eventLog.read");
+            assert_eq!(history["params"]["cursor"], "pre-submit");
+            assert_eq!(history["params"]["agentScope"], "primary");
+            assert_eq!(history["params"]["types"], json!(["user.message"]));
+            let events = if delivery == NativeUserDelivery::HistoryOnly {
+                json!([{"id":"root-user", "type":"user.message", "timestamp":"2026-10-15T17:00:00Z", "data":{}}])
+            } else {
+                json!([])
+            };
+            respond(
+                &mut server_write,
+                &history,
+                json!({"result":{
+                    "cursor":"after-submit", "cursorStatus":if delivery == NativeUserDelivery::ExpiredHistory { "expired" } else { "ok" },
+                    "hasMore":false, "events":events,
+                }}),
+            )
+            .await?;
+            if matches!(
+                delivery,
+                NativeUserDelivery::NotRecorded | NativeUserDelivery::ExpiredHistory
+            ) {
+                return Ok(());
+            }
+        }
+        for attempt in 0..if retry { 2 } else { 1 } {
+            let rewind = read_request(&mut server_read).await?;
+            assert_eq!(rewind["method"], "session.history.truncate");
+            assert_eq!(rewind["params"]["sessionId"], native_session_id);
+            assert_eq!(rewind["params"]["eventId"], "root-user");
+            let response = if attempt == 0 {
+                first_failure
+                    .clone()
+                    .unwrap_or_else(|| json!({"result":{"eventsRemoved":3}}))
+            } else {
+                json!({"result":{"eventsRemoved":3}})
+            };
+            respond(&mut server_write, &rewind, response).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let execution = async {
+        let (sink, _events) = crate::backend::events::channel();
+        let prompt = backend.prompt_stream(request, Some(sink));
+        let cleanup = async {
+            sent_ready.await?;
+            backend.cleanup_execution(&session_id).await
+        };
+        tokio::try_join!(prompt, cleanup)?;
+        if delivery == NativeUserDelivery::ExpiredHistory {
+            let error = backend
+                .rollback_cancelled_turn_for(&session_id)
+                .await
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("history boundary expired"),
+                "{error:#}"
+            );
+            return Ok(());
+        }
+        if retry {
+            let error = backend
+                .rollback_cancelled_turn_for(&session_id)
+                .await
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("history truncation unavailable")
+                    || format!("{error:#}").contains("removed no history events"),
+                "{error:#}"
+            );
+        }
+        assert!(backend.rollback_cancelled_turn_for(&session_id).await?);
+        assert!(backend.rollback_cancelled_turn_for(&session_id).await?);
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::try_join!(server, execution)
+    })
+    .await
+    .context("native Copilot cancellation/rewind did not settle")??;
+    Ok(())
+}
+
+fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
+    let fixture = tempfile::tempdir()?;
+    let backend = CopilotBackend::new_with_permission_coordinator(
+        Vec::new(),
+        PermissionCoordinator::transient(fixture.path())?,
+        Arc::new(crate::trace::TraceStore::open(fixture.path())?),
+        None,
+    )?;
+    let request = CopilotBackend::catalog_backend_request(&BackendCatalogRequest {
+        execution_owner: Some(ExecutionOwner::root("copilot-cancel")),
+        harness_session_id: "copilot-cancel".into(),
+        workspace: fixture.path().to_string_lossy().into_owned(),
+        access: BackendKind::Copilot.resolve_access(crate::session::AccessPolicy::default()),
+        execution_mode: PermissionMode::Read,
+        backend_session_id: None,
+    });
+    Ok((fixture, backend, request))
+}
+
+async fn read_request(reader: &mut DuplexStream) -> Result<Value> {
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        header.push(reader.read_u8().await?);
+    }
+    let length = std::str::from_utf8(&header)?
+        .trim()
+        .strip_prefix("Content-Length: ")
+        .context("invalid SDK frame header")?
+        .parse::<usize>()?;
+    let mut body = vec![0; length];
+    reader.read_exact(&mut body).await?;
+    Ok(serde_json::from_slice(&body)?)
+}
+
+async fn respond(writer: &mut DuplexStream, request: &Value, mut response: Value) -> Result<()> {
+    response["jsonrpc"] = json!("2.0");
+    response["id"] = request["id"].clone();
+    write_frame(writer, response).await
+}
+
+async fn write_frame(writer: &mut DuplexStream, value: Value) -> Result<()> {
+    let body = serde_json::to_vec(&value)?;
+    writer
+        .write_all(format!("Content-Length: {}\r\n\r\n", body.len()).as_bytes())
+        .await?;
+    writer.write_all(&body).await?;
+    writer.flush().await?;
+    Ok(())
+}

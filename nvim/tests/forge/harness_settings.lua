@@ -50,7 +50,7 @@ controller.configure = function(params, _, completed)
   end)
 end
 local success, failure = xpcall(function()
-  state = { session = configured_session, capability = { model_selection = true, native_compact = true }, busy = true }
+  state = { session = configured_session, capability = { model_selection = true, native_compact = true, os_sandbox = true }, busy = true }
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local instance = picker._state_for_test()
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
@@ -112,6 +112,21 @@ local success, failure = xpcall(function()
   instance.spec.action_list[1].callback({ option = provider })
   assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")
   assert(picker.is_open("harness-config"))
+  picker.close()
+  configured_session.backend = "copilot"
+  configured_session.provider_label = "Copilot CLI"
+  configured_session.access.sandbox = false
+  state.capability.os_sandbox = false
+  settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
+  instance = picker._state_for_test()
+  text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
+  assert(text:find("Disabled (unsupported)", 1, true) and not text:find("Disable to connect", 1, true), text)
+  local sandbox_failure
+  local original_error = require("forge.infra.notifications").error
+  require("forge.infra.notifications").error = function(message) sandbox_failure = message end
+  instance.spec.action_list[2].callback({ option = sandbox })
+  require("forge.infra.notifications").error = original_error
+  assert(sandbox_failure and not configured_session.access.sandbox, "unsupported provider enabled sandbox")
   picker.close()
   settings.log("settings-session", "on")
   assert(enabled)

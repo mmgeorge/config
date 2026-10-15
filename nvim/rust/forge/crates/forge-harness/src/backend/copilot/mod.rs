@@ -3,6 +3,9 @@ mod event_stream;
 mod compaction;
 mod text_generation;
 mod mcp;
+mod turn;
+#[cfg(test)]
+mod turn_test;
 
 use crate::agent::AgentCapability;
 use crate::backend::approval::{
@@ -22,9 +25,10 @@ use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
+use turn::{CopilotRetraction, CopilotTurnEvent};
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::{
-    CommandsInvokeRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
+    CommandsInvokeRequest, EventLogReadRequest, EventsAgentScope, EventsCursorStatus, HistoryTruncateRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
     McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, McpStartServerRequest, SessionsForkRequest,
     SkillsConfigSetDisabledSkillsRequest, SkillsDisableRequest, SkillsEnableRequest,
     SlashCommandInvocationResult,
@@ -460,11 +464,12 @@ impl CopilotBackend {
 
 fn capability() -> BackendCapability {
     BackendCapability {
+        os_sandbox: BackendKind::Copilot.supports_sandbox(),
         native_fork: true,
         native_compact: true,
         compaction: super::CompactionCapability { lifecycle: true, background: true, summary: true, metrics: true },
         native_steer: true,
-        native_turn_rollback: false,
+        native_turn_rollback: true,
         native_goal: false,
         model_selection: true,
         effort_selection: true,
@@ -609,7 +614,8 @@ impl Backend for CopilotBackend {
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Copilot)?;
         let event_sink = skills.sink(event_sink);
-        let _turn_event_guard = turn_event.activate(event_sink.clone())?;
+        let _turn_event_guard = turn_event.activate(event_sink.clone(),
+            request.control_context.as_ref().and_then(|context| context.submission_cancelled.clone()))?;
         self.permission_context(&request.runtime_key()?)
             .await
             .configure(
@@ -697,17 +703,19 @@ impl Backend for CopilotBackend {
             "{}\n\n{}",
             request.interaction_contract(), provider_text
         );
-        self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
-        session
-            .send(MessageOptions::new(prompt))
-            .await
-            .context("send Copilot prompt")?;
+        let history = session.rpc().event_log().tail().await.context("capture Copilot pre-submit history boundary")?;
+        turn_event.set_history_cursor(history.cursor)?;
+        turn_event.send(async {
+            self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
+            session.send(MessageOptions::new(prompt)).await.context("send Copilot prompt")
+        }).await?;
         let mut execution_control_call = std::collections::HashSet::new();
         let mut execution_turn_stopped = false;
         loop {
             tokio::select! {
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
+                    turn_event.observe(&provider_event)?;
                     self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
                         decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
@@ -1171,6 +1179,10 @@ impl Backend for CopilotBackend {
         self.turn_event(session_id).await.is_active()
     }
 
+    async fn prepare_turn(&self, session_id: &str) -> Result<()> {
+        self.turn_event(session_id).await.reset()
+    }
+
     async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
         let text = input.text().to_owned();
         self.trace.record(session_id, "copilot.session.steer", json!({"text":text}));
@@ -1178,10 +1190,10 @@ impl Backend for CopilotBackend {
             .active_session(session_id)
             .await
             .context("Copilot session has not started")?;
-        session
-            .send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
-            .await
-            .context("steer active Copilot turn")?;
+        self.turn_event(session_id).await.send(async {
+            session.send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
+                .await.context("steer active Copilot turn")
+        }).await?;
         if matches!(input, super::SteeringInput::User(_)) {
             self.turn_event(session_id).await.publish_steering(text).await?;
         }
@@ -1189,79 +1201,63 @@ impl Backend for CopilotBackend {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        if let Some(session) = self.active_session(session_id).await {
+        if self.turn_event(session_id).await.stop().await?
+            && let Some(session) = self.active_session(session_id).await {
             session.abort().await.context("abort active Copilot turn")?;
         }
         Ok(())
     }
 
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
-        self.cancel_session(session_id).await?;
+        let turn_event = self.turn_event(session_id).await;
         tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            while self.has_active_turn(session_id).await {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            if turn_event.stop().await? {
+                let session = self.active_session(session_id).await.context("Submitted Copilot session is missing")?;
+                session.abort().await.context("abort active Copilot turn")?;
+                turn_event.wait_finished().await;
             }
-        }).await.context("Copilot cancellation was acknowledged but terminal completion remains unknown")?;
+            Ok::<_, anyhow::Error>(())
+        }).await.context("Copilot execution did not stop within 8 seconds")??;
         Ok(())
+    }
+
+    async fn rollback_cancelled_turn_for(&self, session_id: &str) -> Result<bool> {
+        let turn_event = self.turn_event(session_id).await;
+        let target = turn_event.retraction_target()?;
+        if matches!(target, CopilotRetraction::Unsent) { return Ok(true); }
+        let session = self.active_session(session_id).await.context("Copilot session is missing for rewind")?;
+        let event_id = match target {
+            CopilotRetraction::Event(event_id) => event_id,
+            CopilotRetraction::History(mut cursor) => loop {
+                let history = session.rpc().event_log().read(EventLogReadRequest {
+                    cursor: Some(cursor.clone()), agent_scope: Some(EventsAgentScope::Primary),
+                    types: Some(json!(["user.message"])), max: Some(1), wait_ms: Some(0),
+                }).await.context("verify cancelled Copilot submission in native history")?;
+                anyhow::ensure!(history.cursor_status == EventsCursorStatus::Ok,
+                    "Copilot rewind history boundary expired");
+                if let Some(event) = history.events.into_iter().find(|event|
+                    event.agent_id.is_none() && event.event_type == "user.message")
+                { break event.id; }
+                if !history.has_more {
+                    turn_event.finish_retraction()?;
+                    return Ok(true);
+                }
+                anyhow::ensure!(history.cursor != cursor, "Copilot rewind history cursor did not advance");
+                cursor = history.cursor;
+            },
+            CopilotRetraction::Unsent => unreachable!(),
+        };
+        let result = session.rpc().history().truncate(HistoryTruncateRequest { event_id }).await
+            .context("rewind output-free Copilot turn")?;
+        anyhow::ensure!(result.events_removed > 0, "Copilot rewind removed no history events");
+        turn_event.finish_retraction()?;
+        Ok(true)
     }
 
     async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
         self.active_session(session_id)
             .await
             .map(|session| session.id().to_string())
-    }
-}
-
-/// Coordinates acknowledged steering events with the currently active Copilot turn.
-#[derive(Default)]
-struct CopilotTurnEvent {
-    event_sink: StandardMutex<Option<BackendEventSink>>,
-}
-
-impl CopilotTurnEvent {
-    /// Attach one event sink for the active turn and clear it when the turn exits.
-    fn activate(&self, event_sink: Option<BackendEventSink>) -> Result<CopilotTurnEventGuard<'_>> {
-        *self
-            .event_sink
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn event lock poisoned"))? = event_sink;
-        Ok(CopilotTurnEventGuard { owner: self })
-    }
-
-    fn is_active(&self) -> bool {
-        self.event_sink
-            .lock()
-            .expect("Copilot turn event lock poisoned")
-            .is_some()
-    }
-
-    /// Publish steering only after the Copilot SDK accepts the immediate message.
-    async fn publish_steering(&self, text: String) -> Result<()> {
-        let event_sink = self
-            .event_sink
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn event lock poisoned"))?
-            .clone();
-        if let Some(event_sink) = event_sink {
-            event_sink
-                .send_wait(BackendEvent::steering_input(text))
-                .await
-                .map_err(|_| anyhow::anyhow!("Copilot turn event receiver closed"))?;
-        }
-        Ok(())
-    }
-}
-
-/// Clears the active Copilot event sink across success and failure exits.
-struct CopilotTurnEventGuard<'a> {
-    owner: &'a CopilotTurnEvent,
-}
-
-impl Drop for CopilotTurnEventGuard<'_> {
-    fn drop(&mut self) {
-        if let Ok(mut event_sink) = self.owner.event_sink.lock() {
-            *event_sink = None;
-        }
     }
 }
 
@@ -1760,6 +1756,7 @@ mod test {
         assert!(descriptor.capability.native_steer);
         assert!(descriptor.capability.native_fork);
         assert!(descriptor.capability.native_compact);
+        assert!(descriptor.capability.native_turn_rollback);
         assert!(descriptor.capability.agent.observe);
     }
 
@@ -1976,7 +1973,7 @@ mod test {
     async fn publishes_steering_only_while_a_copilot_turn_is_active() {
         let turn_event = CopilotTurnEvent::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
-        let turn_guard = turn_event.activate(Some(event_sink)).unwrap();
+        let turn_guard = turn_event.activate(Some(event_sink), None).unwrap();
 
         turn_event
             .publish_steering("accepted".into())

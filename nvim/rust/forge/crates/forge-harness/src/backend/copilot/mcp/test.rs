@@ -139,6 +139,7 @@ impl Fixture {
                         json!({"rows":[],"dependencies":[]})
                     }
                     "session.send" => json!({"messageId":"reply"}),
+                    "session.eventLog.tail" => json!({"cursor":"before-prompt"}),
                     other => panic!("unexpected Copilot request {other}"),
                 };
                 write_message(

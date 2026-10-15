@@ -973,9 +973,14 @@ begin_request = function(text, from_composer)
   else client.request(method, params, receive) end
 end
 
+---@return nil
 function M.cancel_turn()
   local state = harness_state()
   if state.host_error then M.render() return end
+  if composer_text(state.composer_buf) ~= "" then
+    M.submit()
+    return
+  end
   if state.selected_agent_run_id then
     M.agent_action("interrupt", state.selected_agent_run_id)
     return
@@ -984,7 +989,7 @@ function M.cancel_turn()
   if operation and operation.action == "pause"
     and ({ submitting = true, accepted = true, stopping = true, running = true })[operation.state]
   then return end
-  M.task_transition({ action = "pause" })
+  M.task_transition({ action = "pause", restore_prompt_if_no_output = true })
 end
 function M.compact()
   if not (harness_state().capability and harness_state().capability.native_compact) then

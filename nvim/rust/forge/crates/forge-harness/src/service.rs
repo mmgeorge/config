@@ -1192,7 +1192,7 @@ async fn route_request(
             params:json!({"operation_id":operation_id,"action":"configure","config":{"settings_revision":mutation.revision,"setting_fields":mutation.field}}) };
         return route_task_transition(registry,controller,session_id,request,message_sink).await;
     }
-    let _setup_admission = if matches!(method, HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate | HarnessMethod::ChecksSetup) {
+    let _setup_admission = if matches!(method, HarnessMethod::BackendSetup | HarnessMethod::BackendAuthenticate) {
         let control = Arc::clone(&controller.control_admission).try_acquire_owned()
             .context("Provider setup cannot run while cleanup is pending")?;
         let execution = Arc::clone(&controller.execution_admission).try_acquire_owned()
@@ -1544,14 +1544,16 @@ async fn execute_task_transition(
         Err(tokio::sync::TryAcquireError::NoPermits) => {
             let restart = operation.resume_after_transition
                 && matches!(action["action"].as_str(), Some("permission" | "configure" | "compact"));
-            controller.cancellation.begin_cleanup(restart, false)?;
+            let restore_prompt = action["action"] == "pause"
+                && action["restore_prompt_if_no_output"].as_bool() == Some(true);
+            controller.cancellation.begin_cleanup(restart, restore_prompt)?;
             let approval_owner = crate::backend::ExecutionOwner::root(&controller.catalog_request.read().await.harness_session_id);
                 controller.permission.cancel_owner(&approval_owner, None).await?;
             if let Err(error) = controller.backend.cleanup_execution(&operation.session_id).await {
                 controller.cancellation.fail_cleanup(&error);
                 return Err(error.context("collect current task before transition"));
             }
-            controller.cancellation.request(false);
+            controller.cancellation.request(restore_prompt);
             // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
             tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
                 .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??
@@ -1792,7 +1794,7 @@ async fn acquire_request_broker(
     method: HarnessMethod,
 ) -> Result<(MutexGuard<'_, HarnessBroker>, Option<OwnedSemaphorePermit>)> {
     // Provider requests and check setup retain admission from their owning request lane.
-    let admitted = method.requires_provider_fork() || method == HarnessMethod::ChecksSetup;
+    let admitted = method.requires_provider_fork();
     let admission = if admitted {
         None
     } else {
@@ -2922,6 +2924,95 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checks_setup_can_be_interrupted_while_provider_startup_is_pending() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let execution = service.prepare(Some(&session_id), HarnessMethod::ChecksSetup).await?.unwrap();
+        let maintenance = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let setup = async {
+            let _execution = execution;
+            service.dispatch(Some(session_id.clone()), Request {
+                id: 2, method: "checks.setup".into(), params: json!({}),
+            }, &sink).await
+        };
+        tokio::pin!(setup);
+        assert!(futures_util::poll!(setup.as_mut()).is_pending());
+        let stopping = service.dispatch(Some(session_id.clone()), Request {
+            id: 3, method: "task.transition".into(),
+            params: json!({"operation_id":"interrupt-check-setup","action":"pause"}),
+        }, &sink);
+        tokio::pin!(stopping);
+        assert!(futures_util::poll!(stopping.as_mut()).is_pending());
+        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        assert_eq!(store.load_task_operation(&session_id, "interrupt-check-setup")?.unwrap().state, "stopping",
+            "check setup retained cleanup admission instead of accepting interruption");
+        drop(maintenance);
+        let (setup_result, stop_result) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::join!(setup, stopping)
+        }).await.context("check setup interruption did not settle promptly")?;
+        setup_result?;
+        stop_result?;
+        assert_eq!(store.load_task_operation(&session_id, "interrupt-check-setup")?.unwrap().state, "completed");
+        assert_eq!(store.list_exchange(&session_id)?.last().unwrap().state, crate::exchange::ExchangeState::Cancelled);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pause_intent_retracts_output_free_submission_when_requested() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        anyhow::ensure!(std::process::Command::new("git")
+            .args(["init", "-q"]).current_dir(fixture.path()).status()?.success(),
+            "failed to initialize retraction test repository");
+        let data = tempfile::tempdir()?;
+        let service = service();
+        let mut initialization = initialize(&fixture, "blocking");
+        initialization.data_root = data.path().to_string_lossy().into_owned();
+        let opened = service.open_session(1, initialization).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let execution = service.prepare(Some(&session_id), HarnessMethod::PromptSubmit).await?.unwrap();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let prompt = async {
+            let _execution = execution;
+            service.dispatch(Some(session_id.clone()), Request {
+                id: 2, method: "prompt.submit".into(), params: json!({"text":"Restore this exact prompt"}),
+            }, &sink).await
+        };
+        let stop = async {
+            let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+            while store.list_exchange(&session_id)?.is_empty() { tokio::task::yield_now().await; }
+            service.dispatch(Some(session_id.clone()), Request {
+                id: 3, method: "task.transition".into(),
+                params: json!({"operation_id":"retract-prompt","action":"pause","restore_prompt_if_no_output":true}),
+            }, &sink).await
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(prompt, stop)
+        }).await.context("output-free pause intent did not settle")??;
+        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        assert!(store.list_exchange(&session_id)?.is_empty(), "{:?}", store.list_exchange(&session_id)?);
+        assert_eq!(store.load_task_operation(&session_id, "retract-prompt")?.unwrap().state, "completed");
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(1), output.recv()).await??
+                .context("prompt retraction response is missing")?;
+            let response: Value = serde_json::from_slice(frame.bytes())?;
+            if response["id"] == 2 {
+                assert_eq!(response["error"]["code"], "turn_retracted");
+                assert_eq!(response["error"]["data"]["prompt"], "Restore this exact prompt");
+                break;
+            }
+        }
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn execution_admission_excludes_overlapping_work_and_pending_cleanup() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
@@ -2938,6 +3029,14 @@ mod tests {
         drop(cleanup);
         let resumed = service.prepare(None, HarnessMethod::ExchangeResume).await.unwrap().unwrap();
         drop(resumed);
+        let setup = service.prepare(None, HarnessMethod::ChecksSetup).await.unwrap().unwrap();
+        assert!(service.prepare(None, HarnessMethod::PromptSubmit).await.is_err());
+        assert!(service.prepare(None, HarnessMethod::ChecksSetup).await.is_err());
+        let cleanup = Arc::clone(&controller.control_admission).try_acquire_owned()
+            .expect("check setup must not retain cleanup admission while its model runs");
+        assert!(service.prepare(None, HarnessMethod::TurnCancel).await.unwrap().is_none());
+        drop(cleanup);
+        drop(setup);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 

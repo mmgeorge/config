@@ -40,7 +40,7 @@ pub fn prepare_provider_fork(
         .get("session_id")
         .and_then(Value::as_str)
         .unwrap_or(default_source_session_id);
-    let source = store
+    let mut source = store
         .load_session(source_session_id)?
         .context("source session not found")?;
     anyhow::ensure!(
@@ -51,6 +51,7 @@ pub fn prepare_provider_fork(
         source.backend == configured_backend,
         "source session uses a different configured backend"
     );
+    source.access = crate::backend::BackendKind::parse(&source.backend)?.resolve_access(source.access);
 
     let target_session_id = Uuid::new_v4().to_string();
     let fork_point = ProviderForkPoint {

@@ -350,20 +350,28 @@ async fn interrupted_child_retains_conversation_and_all_children_guard_workspace
 }
 
 #[tokio::test]
-async fn child_admission_and_followup_reject_unsupported_root_sandbox() -> Result<()> {
+async fn child_admission_and_followup_disable_unsupported_root_sandbox() -> Result<()> {
     let repository = repository();
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(),data.path(),false);
     let admission = admit_child_fixture(&mut broker,"policy")?;
-    let root = broker.backend_request(BackendInput::from_text(""),PromptMode::Chat);
+    let mut root = broker.backend_request(BackendInput::from_text(""),PromptMode::Chat);
+    root.access.sandbox = true;
     assert!(root.access.sandbox);
     for provider in [crate::backend::BackendKind::Copilot,crate::backend::BackendKind::Claude,crate::backend::BackendKind::Antigravity] {
-        save_child_profile(&broker, "blocked", crate::agent::AgentProfile { provider:crate::agent::provider_name(provider).into(), ..Default::default() })?;
-        let spawn = crate::agent::SpawnAgentRequest { profile: Some("blocked".into()), text: "Inspect".into() };
-        assert!(broker.agent_backend_factory.resolve(&root,crate::backend::BackendKind::Codex,&spawn).await.unwrap_err().to_string().contains("OS sandbox"));
+        broker.agent_backend_factory.register(Arc::new(RoutingBackend {kind:provider,
+            turn:std::sync::atomic::AtomicUsize::new(0),request:Default::default(),reject_steering:false}));
+        save_child_profile(&broker, "unsandboxed", crate::agent::AgentProfile {
+            provider:crate::agent::provider_name(provider).into(),model:"fixture-model".into(),
+            reasoning_effort:"low".into(),..Default::default()
+        })?;
+        let spawn = crate::agent::SpawnAgentRequest { profile: Some("unsandboxed".into()), text: "Inspect".into() };
+        let selected = broker.agent_backend_factory.resolve(&root,crate::backend::BackendKind::Codex,&spawn).await?;
+        assert!(!selected.access.sandbox);
         let mut agent = admission.agent.clone();
         agent.selection.as_mut().unwrap().provider = provider;
-        assert!(broker.agent_backend_factory.request(&root,&agent,"Follow-up".into()).unwrap_err().to_string().contains("OS sandbox"));
+        assert!(!broker.agent_backend_factory.request(&root,&agent,"Follow-up".into())?.access.sandbox);
+        assert!(root.access.sandbox);
     }
     Ok(())
 }

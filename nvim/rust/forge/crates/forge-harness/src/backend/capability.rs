@@ -95,8 +95,8 @@ impl CapabilityManifest {
         add("approval_rules", "Security", "Saved approval rules", true, "forge", flags.permission_control,
             "immediate", "Forge persists rules and answers individual provider requests");
         add("os_sandbox", "Security", "Enforce OS sandbox", false, "provider",
-            matches!(descriptor.kind, BackendKind::Codex | BackendKind::Mock), "session_restart",
-            "Unsupported isolation requirements block execution rather than silently disabling isolation");
+            descriptor.kind.supports_sandbox(), "session_restart",
+            "Only allowlisted providers enable OS isolation. Other providers resolve sandbox preferences to disabled");
         add("background_terminals", "Provider", "Inspect background terminals", false, "provider",
             flags.background_terminals, "immediate",
             "Requires an explicit provider terminal inventory");

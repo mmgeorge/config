@@ -67,6 +67,7 @@ enum CodexTurnState {
 
 fn capability() -> BackendCapability {
     BackendCapability {
+        os_sandbox: BackendKind::Codex.supports_sandbox(),
         native_fork: true,
         native_compact: true,
         compaction: super::CompactionCapability { lifecycle: true, background: false, summary: false, metrics: false },

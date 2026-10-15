@@ -45,6 +45,7 @@ impl AgentBackendFactory {
         request.effort = "default".into();
         request.backend_session_id = None;
         request.control_context = None;
+        request.access = provider.resolve_access(request.access);
         let backend = self.build(provider)?;
         let capability = backend.descriptor().capability;
         let model = tokio::time::timeout(std::time::Duration::from_secs(30),backend.model_list(request)).await
@@ -65,7 +66,6 @@ impl AgentBackendFactory {
         let (profile_name, profile) = self.profiles.resolve(spawn.profile.as_deref())?;
         let provider = if profile.provider == "inherit" { root_provider } else { BackendKind::parse(&profile.provider)? };
         ensure!(provider != BackendKind::Mock || root_provider == BackendKind::Mock, "mock is not a user-selectable provider");
-        provider.validate_access(&root.access)?;
         let same_provider = provider == root_provider;
         let model = if profile.model == "inherit" { root.model.clone() } else { profile.model.clone() };
         let effort = if profile.reasoning_effort == "inherit" { root.effort.clone() } else { profile.reasoning_effort.clone() };
@@ -75,7 +75,7 @@ impl AgentBackendFactory {
             else { narrow_permission(root.execution_mode, serde_json::from_value(serde_json::json!(profile.permission_mode))?) };
         let mut selection = AgentSelection { profile: profile_name, instructions: profile.instructions, provider, model, reasoning_effort: effort,
             context_window: if same_provider && profile.model == "inherit" { root.context_window.clone() } else { None },
-            service_tier, access: root.access.clone(), execution_mode };
+            service_tier, access: provider.resolve_access(root.access.clone()), execution_mode };
         ensure!(service_tier == crate::backend::ServiceTier::Standard || matches!(provider, BackendKind::Codex | BackendKind::Mock),
             "profile {} requests a speed tier unsupported by {}", selection.profile, provider_name(provider));
         if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
@@ -103,14 +103,14 @@ impl AgentBackendFactory {
 
     pub fn request(&self, root: &BackendRequest, agent: &Agent, message: String) -> Result<BackendRequest> {
         let selection = agent.selection.as_ref().context("child has no resolved provider selection")?;
-        selection.provider.validate_access(&root.access)?;
         ensure!(agent.session_id == root.harness_session_id && !agent.is_primary(), "child request crosses root ownership");
         let message = if selection.instructions.trim().is_empty() { message }
             else { format!("Subagent profile instructions:\n{}\n\nAssigned task:\n{message}", selection.instructions) };
         Ok(BackendRequest { execution_owner: Some(ExecutionOwner { session_id: agent.session_id.clone(), agent_id: agent.id.clone() }),
             harness_session_id: root.harness_session_id.clone(), workspace: root.workspace.clone(), input: BackendInput::from_text(message),
             mode: PromptMode::Chat, model: selection.model.clone(), effort: selection.reasoning_effort.clone(),
-            context_window: selection.context_window.clone(), service_tier: selection.service_tier, access: root.access.clone(),
+            context_window: selection.context_window.clone(), service_tier: selection.service_tier,
+            access: selection.provider.resolve_access(root.access.clone()),
             execution_mode: narrow_permission(root.execution_mode, selection.execution_mode), backend_session_id: agent.provider_thread_id.clone(), control_context: None })
     }
 }

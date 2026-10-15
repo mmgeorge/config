@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// Carries the broker-owned control state visible to one provider turn.
 #[derive(Clone)]
 pub struct ControlTurnContext {
+    pub(crate) submission_cancelled: Option<Arc<std::sync::atomic::AtomicBool>>,
     pub checkpoint: Option<crate::checkpoint::ToolGate>,
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
     pub(crate) checks: Option<Arc<crate::checks::CheckToolScope>>,
@@ -56,6 +57,7 @@ impl ControlTurnContext {
     /// Build an inert context for backend calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
+            submission_cancelled: None,
             checkpoint: None,
             agent: None,
             checks: None,
@@ -488,6 +490,7 @@ mod test {
         let workspace = tempfile::tempdir().unwrap().keep();
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
+            submission_cancelled: None,
             checkpoint: None,
             agent: None,
             checks: None,

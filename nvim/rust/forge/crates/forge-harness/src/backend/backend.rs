@@ -25,10 +25,21 @@ pub enum BackendKind {
 }
 
 impl BackendKind {
+    /// Report OS sandbox support from the provider allowlist.
+    pub fn supports_sandbox(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+
+    /// Resolve requested isolation for the selected provider without changing shared preferences.
+    pub(crate) fn resolve_access(self, mut access: crate::session::AccessPolicy) -> crate::session::AccessPolicy {
+        access.sandbox &= self.supports_sandbox();
+        access
+    }
+
     /// Reject OS isolation requests that this provider cannot enforce.
     pub(crate) fn validate_access(self, access: &crate::session::AccessPolicy) -> Result<()> {
-        anyhow::ensure!(!access.sandbox || matches!(self, Self::Codex | Self::Mock),
-            "This provider cannot enforce Forge's OS sandbox. Disable sandbox explicitly in /config before connecting");
+        anyhow::ensure!(!access.sandbox || self.supports_sandbox(),
+            "This provider cannot enforce Forge's OS sandbox");
         Ok(())
     }
 
@@ -56,6 +67,9 @@ pub struct BackendDescriptor {
 /// Represents backend features that control visible Harness actions.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendCapability {
+    #[serde(default)]
+    /// Enables OS isolation controls only for providers on the sandbox allowlist.
+    pub os_sandbox: bool,
     pub native_fork: bool,
     /// Supports an explicit provider compaction request.
     pub native_compact: bool,
@@ -615,6 +629,11 @@ pub trait Backend: Send + Sync {
 
     /// Return whether one Harness session currently owns an in-flight provider turn.
     async fn has_active_turn(&self, session_id: &str) -> bool;
+
+    /// Clear provisional native turn identity before admitting the next broker invocation.
+    async fn prepare_turn(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
 
     /// Stop native continuation through the active reader before acquiring the broker lock.
     /// The caller races reader readiness against broker availability and may cancel this wait.
@@ -1266,6 +1285,7 @@ pub(crate) fn mock_plan_document_from_prompt(prompt: &str) -> Option<crate::plan
 /// Describe the synthetic backend used by isolated Harness workflow fixtures.
 pub(crate) fn mock_capability() -> BackendCapability {
     BackendCapability {
+        os_sandbox: BackendKind::Mock.supports_sandbox(),
         native_fork: true,
         native_compact: true,
         compaction: CompactionCapability { lifecycle: true, background: false, summary: true, metrics: true },
@@ -1290,6 +1310,24 @@ pub(crate) fn mock_capability() -> BackendCapability {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn sandbox_allowlist_preserves_codex_preferences_and_disables_other_providers() {
+        for provider in [super::BackendKind::Codex, super::BackendKind::Copilot,
+            super::BackendKind::Claude, super::BackendKind::Antigravity, super::BackendKind::Mock] {
+            let requested = crate::session::AccessPolicy::default();
+            let effective = provider.resolve_access(requested.clone());
+            assert_eq!(provider.supports_sandbox(), provider == super::BackendKind::Codex);
+            assert_eq!(effective.sandbox, provider.supports_sandbox());
+            assert!(requested.sandbox);
+            assert_eq!(effective.write_access, requested.write_access);
+            assert_eq!(effective.writable_directory, requested.writable_directory);
+            assert_eq!(effective.windows_sandbox, requested.windows_sandbox);
+            provider.validate_access(&effective).unwrap();
+            let disabled = crate::session::AccessPolicy { sandbox: false, ..requested };
+            assert!(!provider.resolve_access(disabled).sandbox);
+        }
+    }
+
     #[test]
     fn provider_instructions_describe_staged_edits_and_revision_scoped_reports() {
         let prompt = super::HARNESS_SYSTEM_MESSAGE;

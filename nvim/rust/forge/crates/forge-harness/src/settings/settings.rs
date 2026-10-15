@@ -65,6 +65,7 @@ impl PortableSettings {
     /// Apply validated portable choices while preserving provider-local model identity.
     pub fn apply(&self, session: &mut crate::session::HarnessSession, native_compact: bool) -> Result<()> {
         if let Some(access) = &self.access { session.access = access.clone().validate()?; }
+        session.access = crate::backend::BackendKind::parse(&session.backend)?.resolve_access(session.access.clone());
         if let Some(shell) = self.shell { shell.executable()?; session.shell = shell; }
         if let Some(permission) = self.default_write_permission { session.default_write_permission = permission; }
         if let Some(permission) = self.plan_permission { session.plan_permission = Some(permission); }

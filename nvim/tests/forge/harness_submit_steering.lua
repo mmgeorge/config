@@ -71,4 +71,17 @@ state.status = { kind = "working" }
 draft("queue during unsupported active generation")
 controller.submit()
 assert(#calls == 4 and state.queue[1].text == "queue during unsupported active generation")
+state.queue, state.pending_steer = {}, {}
+state.capability.native_steer = true
+transition = nil
+draft("steer checks setup immediately")
+controller.cancel_turn()
+assert(#calls == 5 and calls[5].method == "turn.steer", "Ctrl-C did not send the composer immediately")
+assert(calls[5].params.text == "steer checks setup immediately" and #state.queue == 0)
+assert(text() == "" and transition == nil, "Ctrl-C paused instead of delivering the steering message")
+reply({})
+draft("")
+controller.cancel_turn()
+assert(transition.action == "pause" and transition.restore_prompt_if_no_output == true and #calls == 5,
+  "empty Ctrl-C must retract an output-free submission instead of only pausing")
 print("harness_submit_steering: passed")

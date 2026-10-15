@@ -139,11 +139,7 @@ impl CompactionMonitor {
                         normalized.data = serde_json::to_value(compaction)
                             .expect("compaction is JSON serializable");
                     }
-                    let active_sink = turn_event
-                        .event_sink
-                        .lock()
-                        .expect("Copilot turn event lock poisoned")
-                        .clone();
+                    let active_sink = turn_event.event_sink();
                     if let Some(active_sink) = active_sink {
                         let _ = active_sink.send_wait(normalized.clone()).await;
                     }

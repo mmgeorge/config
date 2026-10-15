@@ -212,8 +212,8 @@ function M.open(state, host)
       end
       if id == "sandbox" or id == "write-access" or id == "windows-sandbox" then
         local policy = access.policy(active)
-        local supported = active.backend == "codex" or active.backend == "mock"
-        if not supported and (id ~= "sandbox" or not policy.sandbox) then
+        local supported = state.capability and state.capability.os_sandbox == true
+        if not supported then
           notifications.error("This provider does not expose sandbox configuration", "Harness access")
           return
         end
@@ -228,7 +228,7 @@ function M.open(state, host)
         apply_access(policy)
         return
       elseif id == "writable-directories" then
-        if active.backend ~= "codex" and active.backend ~= "mock" then
+        if not (state.capability and state.capability.os_sandbox) then
           notifications.error("This provider does not expose sandbox configuration", "Harness access")
           return
         end
@@ -267,7 +267,7 @@ function M.open(state, host)
     end
     build_spec = function()
       local policy = access.policy(active)
-      local supported = active.backend == "codex" or active.backend == "mock"
+      local supported = state.capability and state.capability.os_sandbox == true
       local provider_setup = (active.backend == "claude" or active.backend == "antigravity") and {
         id = "provider-setup", label = "Provider setup",
         columns = { "Provider setup", "Install / sign in", "Manage the ACP runtime and OAuth login" },
@@ -287,7 +287,7 @@ function M.open(state, host)
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
             { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
-              or (policy.sandbox and picker_field.render("Disable to connect", true) or "Unsupported"), "OS isolation, independent of approval mode" } },
+              or "Disabled (unsupported)", "OS isolation, independent of approval mode" } },
             { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },
             { id = "writable-directories", label = "Additional writable directories", columns = { "Additional writable directories", tostring(#policy.writable_directory), "Enter to add, edit, or remove" } },
             { id = "windows-sandbox", label = "Windows sandbox", columns = { "Windows sandbox", picker_field.render(policy.windows_sandbox, true), "Windows only · MXC requires host support" } },
