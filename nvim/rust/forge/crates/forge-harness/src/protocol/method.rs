@@ -108,8 +108,8 @@ pub enum HarnessMethod {
     PlanAnswerQuestions,
     #[serde(rename = "plan.cancel")]
     PlanCancel,
-    #[serde(rename = "plan.activate")]
-    PlanActivate,
+    #[serde(rename = "plan.get")]
+    PlanGet,
     #[serde(rename = "plan.declaration")]
     PlanDeclaration,
     #[serde(rename = "plan.list")]
@@ -197,6 +197,16 @@ impl HarnessMethod {
     pub fn decode(method: &str) -> anyhow::Result<Self> {
         Self::deserialize(serde::de::value::StrDeserializer::<serde::de::value::Error>::new(method))
             .map_err(|_| anyhow::anyhow!("unknown Harness broker method"))
+    }
+
+    /// Identifies explicit workflow operations whose outcome may settle the selected task.
+    pub fn settles_task(self) -> bool {
+        matches!(self,
+            Self::TaskTransition | Self::PromptSubmit | Self::ExchangeResume
+            | Self::PlanAccept | Self::PlanAcceptanceBegin | Self::PlanRequestChanges
+            | Self::QuestionAnswer | Self::QuestionSkip | Self::QuestionAsk | Self::QuestionContinue
+            | Self::ApprovalContinue | Self::GoalSet | Self::GoalPause | Self::GoalResume
+            | Self::GoalClear | Self::GoalContinue | Self::ExchangeRequestChanges | Self::TurnCancel)
     }
 
     /// Return whether dispatch must await provider-fork readiness.

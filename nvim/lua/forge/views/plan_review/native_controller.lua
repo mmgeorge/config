@@ -114,7 +114,6 @@ local function refresh_winbar(review)
 end
 
 local function adopt_revision(review, result)
-  session.harness.active_plan = result.plan
   if result.review_error then notice(result.review_error) return false end
   local updated, failure = review.owner.update(result.plan, result.review)
   if not updated then notice(failure) return false end
@@ -255,10 +254,7 @@ local function commands(review)
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
-    if not review.plan.historical_revision and session.harness.active_plan
-      and session.harness.active_plan.id == review.plan.id then
-      require("forge.views.harness.controller").abort_plan()
-    end
+    if not review.plan.historical_revision then submit(review, "plan.cancel", {}) end
   end)
   command_set.register(set, "request_changes", function()
     if review.plan.historical_revision then return end

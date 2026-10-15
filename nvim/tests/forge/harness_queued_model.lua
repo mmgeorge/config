@@ -53,19 +53,25 @@ local success, failure = xpcall(function()
   assert(requests[3].method == "prompt.submit" and requests[3].params.text == "explain this\nand this")
   assert(state.session.model == "gpt-5.6-sol" and #state.queue == 0)
 
+  local original_transition = controller.task_transition
+  controller.task_transition = function(action, _, callback)
+    requests[#requests + 1] = { method = "task.transition", params = action.config,
+      callback = function()
+        state.session.model, state.session.effort = action.config.model, action.config.effort
+        callback(true)
+      end }
+  end
   compose("/model")
   controller.queue_submit()
-  assert(selection and #requests == 3, "queued /model did not open the picker")
+  assert(selection and #requests == 3, "/model did not open the picker immediately")
   selection({ model = "picked", effort = "high", context_window = 64000 })
-  assert(#requests == 3 and #state.queue == 1, "picker applied the model during the active turn")
-  local rows = require("forge.render.harness.queue").build(state.queue, 100)
-  assert(rows[2][1][1]:find("/model picked high", 1, true), "queue preview lost the selected model")
-  assert(rows[#rows][1][1] == " ", "queued input should leave a blank row before the composer")
-  state.busy = false
-  controller.drain()
-  assert(requests[4].params.model == "picked" and requests[4].params.context_window == 64000)
+  assert(#requests == 4 and #state.queue == 0, "model-only configuration waited behind active work")
+  assert(requests[4].method == "task.transition" and requests[4].params.model == "picked"
+    and requests[4].params.context_window == 64000)
   configured(requests[4])
   assert(#requests == 4 and #state.queue == 0, "model-only entry submitted an empty prompt")
+  controller.task_transition = original_transition
+  state.busy = false
 
   compose("/model invalid xhigh never run")
   controller.queue_submit()

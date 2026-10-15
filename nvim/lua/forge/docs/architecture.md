@@ -3064,7 +3064,9 @@ produced it and increments the artifact count in the winbar. The delta uses the 
 tree while labeling the canonical plan as an artifact, so revision history stays attached to its
 causal turn instead of creating a sibling `Plan revision created` event or dumping the complete plan
 into the timeline. Harness never opens PlanReview automatically. `op` selects a session artifact
-through the floating no-preview picker, marks it active, and opens its physical working copy.
+through the floating no-preview picker and opens its physical working copy through `plan.get`.
+The picker selects the current task's plan first. Browsing another plan or revision never selects
+a task. Each review document captures its session, plan, and revision digest independently.
 `C` creates an inline annotation at the current source line. Cursor focus expands its editable body,
 while leaving the annotation collapses it into a compact rendered box. Request changes records
 line/body input, then Rust resolves every line to its exact semantic target before starting another
@@ -6028,7 +6030,16 @@ so alternate separators do not hide a session from its worktree.
 `TaskRecord` identifies a conversation-scoped Plan, Execute, or Goal workflow, its saved
 permission, phase, lifecycle status, generation, and attempt identity. Plan and goal records
 retain their workflow-specific evidence. `current_task_id` selects the task independently of
-the conversation permission. Clearing a task retains its history and artifacts.
+the conversation permission. The selected task owns the current plan through `TaskRecord.plan_id`.
+`HarnessSession` does not store a second plan selection. Pausing a task retains its plan association and hides planning
+input until explicit resumption. Clearing a task retains its history and artifacts.
+
+Read requests and independent metadata writes do not settle tasks or clear active waits. The
+observer serves state, session, task, plan, and exchange queries without selecting an execution
+owner. Lookup failures remain request errors. Only explicit workflow operations reconcile task
+outcomes. Review annotations and questions retain their document's plan identity even while
+another task is selected. Requesting revisions or accepting a reviewed plan selects its owning
+task explicitly after validation. Cancelling a review addresses that plan's task directly.
 
 `/task` lists the current task first and previous tasks by activity. `/task new` offers the
 three workflow kinds. `/task resume`, `/task pause`, and `/task clear` operate on the selected
@@ -6061,8 +6072,10 @@ checkpoint finalization, and applies the latest intent. Superseded intents canno
 provider attempt. Ctrl-C submits a pause intent. Backend goal continuation stays inside the
 service-owned execution lifetime rather than relying on Lua to submit the next turn.
 The execution permit, rather than a contended broker mutex, identifies provider work that needs
-cleanup. Catalog and snapshot readers cannot cause an idle permission change to interrupt the
-provider. Cleanup after the steering receiver has settled is a no-op, while steering input still
+cleanup. Admitted execution waits up to ten seconds for transient broker ownership. Settled
+mutations retain an execution permit while waiting for that mutex and through response delivery.
+Catalog readers and background subscriptions cannot reject admitted work or cause idle goal
+controls to interrupt the provider. Cleanup after the steering receiver has settled is a no-op, while steering input still
 requires an active receiver. The execution permit remains held through finalization and delivery.
 `task.operation` queries the original ID after uncertain acknowledgement and never replays it.
 User cancellation remains a cancelled operation across broker and service error boundaries.

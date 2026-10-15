@@ -57,7 +57,12 @@ local function prune_pending_settings(state)
     local inflight = state.configuring_config and state.configuring_config[field]
     if pending[field] == applied and (inflight == nil or inflight == applied) then pending[field] = nil end
   end
-  if not next(pending) then state.pending_config, state.pending_config_validate = nil, false end
+  if not next(pending) then
+    state.pending_config, state.pending_config_validate = nil, false
+    local completed = state.pending_config_completed
+    state.pending_config_completed = nil
+    if completed then completed(true) end
+  end
 end
 
 ---Parse model configuration separately from its optional queued prompt.
@@ -66,6 +71,13 @@ local function model_command(text)
   local model, remainder = text:match("^/model%s+(%S+)%s*(.*)$")
   if not model then return nil end
   local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
+  if effort then
+    local known = vim.tbl_contains({ "default", "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra" }, effort)
+    for _, candidate in ipairs(session.harness.model_list or {}) do
+      known = known or vim.tbl_contains(candidate.reasoning or {}, effort)
+    end
+    if not known then return nil, nil, "Unknown reasoning effort: " .. effort end
+  end
   return { model = model, effort = effort }, prompt or ""
 end
 
@@ -79,7 +91,7 @@ end
 
 local function picker_host(state)
   local window_list = {}
-  for _, win in ipairs({ state.transcript_win, state.composer_win }) do
+  for _, win in pairs({ state.transcript_win, state.composer_win }) do
     if win and vim.api.nvim_win_is_valid(win) then window_list[#window_list + 1] = win end
   end
   local current = vim.api.nvim_get_current_win()
@@ -545,6 +557,9 @@ local function on_event(event, payload)
     state.cancel_requested = false
     state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
     state.configuring, state.configuration_debounce = false, false
+    state.configuring_config = nil
+    if state.pending_config_completed then state.pending_config_completed(false) end
+    state.pending_config_completed = nil
     if state.configuration_completion then state.configuration_completion.complete(false) end
     state.configuration_completion, state.task_config = nil, nil
     state.approval, state.active_wait, state.dismissed_approval_id = {}, nil, nil
@@ -995,9 +1010,14 @@ function M.drain()
   if state.pending_config then
     local pending_config = state.pending_config
     local validate_selection = state.pending_config_validate == true
+    local completed = state.pending_config_completed
     state.pending_config = nil
     state.pending_config_validate = false
-    configure_now(pending_config, validate_selection)
+    state.pending_config_completed = nil
+    configure_now(pending_config, validate_selection, function(applied)
+      if completed then completed(applied) end
+      if applied then vim.schedule(M.drain) end
+    end)
     return
   end
   local current_task_id = state.session and state.session.current_task_id
@@ -1136,11 +1156,11 @@ function M.open_timeline_entry()
       if not opened then notifications.error(failure, "ForgeHarness") return end
       vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
     elseif action.kind == "plan" then
-      client.request_for(state.session.id, "plan.activate", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
+      local session_id, generation = state.session.id, client.host_generation()
+      client.request_for(session_id, "plan.get", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
+        if not state.session or state.session.id ~= session_id or client.host_generation() ~= generation then return end
         if failure then notifications.error(failure, "Harness artifact") return end
-        if not plan.historical_revision then state.active_plan = plan end
         require("forge.views.plan_review").open(plan)
-        synchronize_state()
       end)
     end
   end)
@@ -1157,21 +1177,29 @@ end
 
 function M.open_artifact_picker()
   local state = harness_state()
-  local artifact_list = state.artifact or {}
+  local session_id, generation = state.session.id, client.host_generation()
+  local function current()
+    return state.session and state.session.id == session_id and client.host_generation() == generation
+  end
+  local artifact_list = vim.deepcopy(state.artifact or {})
+  local current_id = state.active_plan and state.active_plan.id
+  table.sort(artifact_list, function(left, right)
+    if (left.id == current_id) ~= (right.id == current_id) then return left.id == current_id end
+    return (left.updated_at_ms or 0) > (right.updated_at_ms or 0)
+  end)
   local option_list = vim.tbl_map(function(artifact)
       local title = artifact.title and artifact.title ~= "" and artifact.title or "[unnamed plan]"
       return { label = title, detail = artifact.state or "unknown", value = artifact }
     end, artifact_list)
   open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
-    if not artifact then return end
-    client.request("plan.activate", { plan_id = artifact.id }, function(plan, request_error)
+    if not artifact or not current() then return end
+    client.request_for(session_id, "plan.get", { plan_id = artifact.id }, function(plan, request_error)
+      if not current() then return end
       if request_error then
         notifications.error(request_error, "Harness artifact")
         return
       end
-      state.active_plan = plan
       require("forge.views.plan_review").open(plan)
-      synchronize_state()
     end)
   end, "This session has no artifacts.")
 end
@@ -1850,17 +1878,8 @@ function M.queue_submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
-  if text:match("^/task") or text:match("^/execute") or text:match("^/plan") or text:match("^/goal") or text == "/new" or text == "/clear" or text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
-  if text == "/fast" or text == "/ultrafast" or text:match("^/fast%s") or text:match("^/ultrafast%s") or text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" then M.submit() return end
-  if text == "/model" then
-    M.select_model(function(next_config)
-      local command = "/model " .. next_config.model .. (next_config.effort and (" " .. next_config.effort) or "")
-      state.queue[#state.queue + 1] = { text = command, config = next_config, task_id = state.session and state.session.current_task_id }
-      prompt_history.record(command)
-      if composer_text(state.composer_buf) == text then set_composer_text(state.composer_buf, "") end
-      M.refresh_winbar()
-      M.drain()
-    end)
+  if not require("forge.views.harness.completion.command_source").queues_execution(text) then
+    M.submit()
     return
   end
   local _, _, failure = model_command(text)
@@ -1913,9 +1932,9 @@ function M.change_effort(direction)
   local state = harness_state()
   local current = selected_setting(state, "effort")
   local session_id = state.session and state.session.id
-  client.request("backend.models", {}, function(model_list, failure)
+  require("forge.views.harness.provider_catalog").models(false, function(model_list, failure)
     if failure then notifications.error(failure, "Harness effort") return end
-    if not state.session or state.session.id ~= session_id then return end
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
     local model_id = selected_setting(state, "model")
     for _, model in ipairs(model_list or {}) do
       if model.id == model_id or (model_id == "default" and model.is_default) then
@@ -1946,9 +1965,21 @@ function M.select_effort()
   }
   local state = harness_state()
   local session_id = state.session and state.session.id
-  client.request("backend.models", {}, function(model_list, failure)
-    if failure then notifications.error(failure, "Harness effort") return end
-    if not state.session or state.session.id ~= session_id then return end
+  local loading_owner = "harness-effort-loading-" .. tostring(session_id)
+  local loading = state.model_backend ~= (state.session and state.session.backend) or type(state.model_list) ~= "table"
+  if loading then
+    picker.open({ owner = loading_owner, host = picker_host(state), page_list = { {
+      id = "effort-loading", title = "Select Reasoning Effort", option_list = {}, empty_text = "Loading reasoning options...", footer = "q close",
+    } }, on_confirm = function() return false end })
+  end
+  require("forge.views.harness.provider_catalog").models(false, function(model_list, failure)
+    if failure then
+      if loading and picker.is_open(loading_owner) then picker.close() end
+      notifications.error(failure, "Harness effort")
+      return
+    end
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
+    if loading and not picker.is_open(loading_owner) then return end
     local model_id = selected_setting(state, "model")
     local choice = {}
     for _, model in ipairs(model_list or {}) do
@@ -1987,16 +2018,25 @@ function M.select_model(on_confirm)
   local state = harness_state()
   local backend = state.session and state.session.backend or config.options.harness.backend
   local session_id = state.session and state.session.id
+  local loading_owner = "harness-model-loading-" .. tostring(session_id)
+  local loading = state.model_backend ~= backend or type(state.model_list) ~= "table"
   local function is_current()
     return harness_state() == state and state.session and state.session.id == session_id
       and state.session.backend == backend
+      and (not loading or picker.is_open(loading_owner))
   end
   if state.capability.model_selection ~= true then
     notifications.warn("The current backend does not support model selection", "ForgeHarness")
     return
   end
+  if loading then
+    picker.open({ owner = loading_owner, host = picker_host(state), page_list = { {
+      id = "model-loading", title = "Select Model", option_list = {}, empty_text = "Loading models...", footer = "q close",
+    } }, on_confirm = function() return false end })
+  end
   local function open_model_picker(model_list)
     if not is_current() then return end
+    loading = false
     if type(model_list) ~= "table" or #model_list == 0 then
       local current = harness_state().session and harness_state().session.model or config.options.harness.model
       picker.open({
@@ -2023,15 +2063,24 @@ function M.select_model(on_confirm)
       model_list = model_list,
       backend = backend,
       is_current = is_current,
-      current_model = state.session and (state.session.resolved_model or state.session.model),
+      current_model = selected_setting(state, "model") == "default" and state.session.resolved_model
+        or selected_setting(state, "model"),
       on_confirm = on_confirm,
     })
   end
   model_pins.refresh(backend, function(_, pin_error)
-    if pin_error then notifications.error("Failed to load Harness model pins: " .. pin_error, "Harness model") return end
+    if pin_error then
+      if loading and picker.is_open(loading_owner) then picker.close() end
+      notifications.error("Failed to load Harness model pins: " .. pin_error, "Harness model")
+      return
+    end
     if not is_current() then return end
-    client.request("backend.models", {}, function(model_list, request_error)
-      if request_error then notifications.error(request_error, "Harness model") return end
+    require("forge.views.harness.provider_catalog").models(false, function(model_list, request_error)
+      if request_error then
+        if loading and picker.is_open(loading_owner) then picker.close() end
+        notifications.error(request_error, "Harness model")
+        return
+      end
       if not is_current() then return end
       state.model_backend = backend
       state.model_list = vim.deepcopy(model_list or {})
@@ -2048,6 +2097,7 @@ function M.open_skill_picker()
   end
   provider_picker.open_skills({
     host = picker_host(state),
+    is_current = function() return harness_state() == state end,
     on_insert = function(text) set_composer_text(harness_state().composer_buf, text) end,
   })
 end
@@ -2124,7 +2174,7 @@ end
 function M.resolve_runtime_model()
   local state = harness_state()
   local backend = state.session and state.session.backend
-  client.request("backend.models", {}, function(model_list, request_error)
+  require("forge.views.harness.provider_catalog").models(true, function(model_list, request_error)
     if request_error then notifications.error("Failed to resolve Harness model: " .. request_error, "ForgeHarness") end
     if request_error then return end
     state.model_backend = backend
@@ -2248,7 +2298,8 @@ configure_now = function(next_config, validate_selection, completed)
     prune_pending_settings(state)
     M.refresh_winbar()
     if next_config.model and not result.resolved_model then M.resolve_runtime_model() end
-    if completed then completed(true) else vim.schedule(M.drain) end
+    if completed then completed(true) end
+    vim.schedule(M.drain)
   end)
 end
 
@@ -2279,6 +2330,8 @@ function M.configure(next_config, validate_selection, completed)
   end
   if state.busy or state.task_operation then
     state.pending_config, state.pending_config_validate = nil, false
+    if state.pending_config_completed then state.pending_config_completed(false) end
+    state.pending_config_completed = nil
     local requested = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
     state.task_config = requested
     if state.configuration_completion then state.configuration_completion.complete(false) end
@@ -2292,7 +2345,7 @@ function M.configure(next_config, validate_selection, completed)
     M.task_transition({ action = "configure", config = requested }, nil, function(applied)
       if state.task_config == requested then state.task_config = nil end
       if state.configuration_completion == configuration then state.configuration_completion = nil end
-      configuration.complete(false)
+      configuration.complete(applied)
     end)
     return
   end
@@ -2304,6 +2357,10 @@ function M.configure(next_config, validate_selection, completed)
   if state.busy or state.configuring or tuning_only then
     state.pending_config = vim.tbl_extend("force", state.pending_config or {}, next_config)
     state.pending_config_validate = state.pending_config_validate == true or validate_selection == true
+    if completed then
+      if state.pending_config_completed then state.pending_config_completed(false) end
+      state.pending_config_completed = completed
+    end
     prune_pending_settings(state)
     if tuning_only then
       local revision = (state.configuration_revision or 0) + 1
@@ -2325,6 +2382,9 @@ function M.configure(next_config, validate_selection, completed)
     return
   end
   local merged = vim.tbl_extend("force", state.pending_config or {}, next_config)
+  if completed and state.pending_config_completed then state.pending_config_completed(false) end
+  completed = completed or state.pending_config_completed
+  state.pending_config_completed = nil
   validate_selection = validate_selection == true or state.pending_config_validate == true
   state.pending_config, state.pending_config_validate = nil, false
   state.configuration_revision = (state.configuration_revision or 0) + 1

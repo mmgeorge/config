@@ -60,6 +60,7 @@
       "Get-Volume *": "allow",
       "Group-Object": "allow",
       "Group-Object *": "allow",
+      "Invoke-RestMethod *": "allow",
       "Join-Path": "allow",
       "Join-Path *": "allow",
       "Measure-Object": "allow",

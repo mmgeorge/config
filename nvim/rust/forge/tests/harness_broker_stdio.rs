@@ -242,6 +242,7 @@ struct BrokerProcess {
     pending_response: std::collections::HashMap<u64, Value>,
     consumed_bytes: usize,
     consumed_frames: usize,
+    next_query_id: u64,
 }
 
 impl BrokerProcess {
@@ -269,6 +270,7 @@ impl BrokerProcess {
             pending_response: Default::default(),
             consumed_bytes: 0,
             consumed_frames: 0,
+            next_query_id: 10_000,
         };
         broker.request(json!({"id": 0, "method": "initialize", "params": {"protocol_version": forge_protocol::WIRE_VERSION}}));
         let handshake = broker.read_response(0);
@@ -321,21 +323,57 @@ impl BrokerProcess {
         message
     }
 
-    fn read_backend_event(&mut self, expected_kind: &str) -> Value {
+    fn wait_for_exchanges(
+        &mut self,
+        turn_request_id: u64,
+        session_id: Option<&str>,
+        ready: impl Fn(&Value) -> bool,
+    ) -> Value {
+        let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let message = self.read_message();
-            if let Some(id) = message.get("id").and_then(Value::as_u64) {
-                panic!(
-                    "response {id} arrived before expected backend event {expected_kind}: {message}"
-                );
+            let query_id = self.next_query_id;
+            self.next_query_id += 1;
+            self.request(
+                json!({"id":query_id,"session_id":session_id,"method":"exchange.list","params":{}}),
+            );
+            let messages = self.read_response(query_id);
+            assert!(
+                !self.pending_response.contains_key(&turn_request_id),
+                "turn settled before the expected live state: {:?}",
+                self.pending_response.get(&turn_request_id)
+            );
+            let response = messages.last().unwrap();
+            assert!(response.get("error").is_none(), "{response}");
+            let snapshot = &response["result"];
+            if ready(snapshot) {
+                return snapshot.clone();
             }
-            if message.get("event").and_then(Value::as_str) == Some("backend_event")
-                && message.pointer("/payload/kind").and_then(Value::as_str) == Some(expected_kind)
-            {
-                return message;
-            }
+            assert!(
+                Instant::now() < deadline,
+                "live state did not arrive: {snapshot}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
         }
     }
+}
+
+fn has_assistant_output(snapshot: &Value) -> bool {
+    snapshot.as_array().is_some_and(|exchanges| {
+        exchanges.iter().any(|exchange| {
+            exchange["turn"].as_array().is_some_and(|turns| {
+                turns.iter().any(|turn| {
+                    turn["message"].as_array().is_some_and(|messages| {
+                        messages.iter().any(|message| {
+                            message["kind"] == "assistant"
+                                && message["text"]
+                                    .as_str()
+                                    .is_some_and(|text| !text.is_empty())
+                        })
+                    })
+                })
+            })
+        })
+    })
 }
 
 impl Drop for BrokerProcess {
@@ -380,31 +418,60 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
             "effort": "medium"
         }
     }));
-    assert!(broker.read_response(1).last().unwrap().get("error").is_none());
+    assert!(
+        broker
+            .read_response(1)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
     broker.request(json!({
         "id": 2,
         "method": "task.transition",
         "params": { "operation_id": "planning-stack-test", "action": "plan", "text": "Plan a fixture" }
     }));
-    assert_eq!(broker.read_response(2).last().unwrap()["result"]["state"], "accepted");
+    assert_eq!(
+        broker.read_response(2).last().unwrap()["result"]["state"],
+        "accepted"
+    );
     loop {
         let message = broker.read_message();
         if message["event"] == "task_operation" && message["payload"]["state"] == "failed" {
-            assert!(message["payload"]["error"].as_str().unwrap()
-                .contains("forge-unavailable-provider-fixture"));
+            assert!(
+                message["payload"]["error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("forge-unavailable-provider-fixture")
+            );
             break;
         }
     }
     broker.request(json!({ "id": 3, "method": "state.get", "params": {} }));
-    assert!(broker.read_response(3).last().unwrap().get("error").is_none());
+    assert!(
+        broker
+            .read_response(3)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
     broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
-    assert_eq!(broker.read_response(4).last().unwrap()["result"]["shutdown"], true);
+    assert_eq!(
+        broker.read_response(4).last().unwrap()["result"]["shutdown"],
+        true
+    );
 }
 
 #[test]
-fn streams_mock_backend_events_before_the_jsonl_response() {
+fn streams_plan_document_changes_before_the_jsonl_response() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repository.path().join(".forge.json"),
+        br#"{"checks":{"version":2,"definitions":[]}}"#,
+    )
+    .unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),
@@ -441,30 +508,48 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
         "params": { "text": "/plan build the feature" }
     }));
     let planned = broker.read_response(2);
-    let event_name = planned
+    let notifications = planned
         .iter()
-        .filter_map(|message| message.get("event").and_then(Value::as_str))
+        .filter(|message| message["event"] == "document_changed")
         .collect::<Vec<_>>();
-    assert!(event_name.contains(&"backend_event"));
-    assert_eq!(
-        event_name
+    assert!(
+        !notifications.is_empty(),
+        "plan changes must stream before the response: {planned:?}"
+    );
+    let mut previous_revision = 0;
+    for notification in notifications {
+        let revision = notification["payload"]["revision"].as_u64().unwrap();
+        assert!(revision > previous_revision, "{notification}");
+        previous_revision = revision;
+    }
+    assert!(
+        !planned.iter().any(|message| message
+            .pointer("/payload/kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "assistant_message" || kind.starts_with("timeline_"))),
+        "Rust-owned source content must stay behind document notifications: {planned:?}"
+    );
+    assert!(
+        planned
             .iter()
-            .filter(|event| **event == "backend_event")
-            .count(),
-        2
+            .any(|message| message["event"] == "exchange_complete")
     );
-    let backend_kind = planned
-        .iter()
-        .filter(|message| message.get("event").and_then(Value::as_str) == Some("backend_event"))
-        .filter_map(|message| message.pointer("/payload/kind").and_then(Value::as_str))
-        .collect::<Vec<_>>();
+    assert!(
+        planned
+            .iter()
+            .any(|message| message["event"] == "plan_created")
+    );
+    let response = planned.last().unwrap();
+    assert!(response.get("error").is_none(), "{response}");
     assert_eq!(
-        backend_kind,
-        vec!["timeline_exchange_started", "assistant_message"]
+        planned
+            .iter()
+            .find(|message| message["event"] == "plan_created")
+            .unwrap()
+            .pointer("/payload/plan/state")
+            .and_then(Value::as_str),
+        Some("awaiting_review")
     );
-    assert!(event_name.contains(&"exchange_complete"));
-    assert!(event_name.contains(&"plan_created"));
-    assert!(planned.last().unwrap().get("error").is_none());
 
     broker.request(json!({ "id": 3, "method": "shutdown", "params": {} }));
     let stopped = broker.read_response(3);
@@ -604,11 +689,9 @@ fn creates_a_new_session_while_the_source_turn_continues() {
         "method": "prompt.submit",
         "params": { "text": "keep the source busy" }
     }));
-    let turn_started = broker.read_message();
-    assert_eq!(
-        turn_started.get("event").and_then(Value::as_str),
-        Some("backend_event")
-    );
+    broker.wait_for_exchanges(2, Some(&source_session_id), |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
+    });
 
     let new_started = Instant::now();
     broker.request(json!({
@@ -732,19 +815,20 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
             .and_then(Value::as_str),
         Some("turn_cancelled")
     );
-    assert!(cancelled_turn.iter().any(|message| {
-        message.get("event").and_then(Value::as_str) == Some("backend_event")
-            && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_exchange_cancelled")
-    }));
+    assert!(
+        cancellation
+            .iter()
+            .chain(&cancelled_turn)
+            .any(|message| message["event"] == "document_changed")
+    );
 
-    broker.request(json!({ "id": 4, "method": "state.get", "params": {} }));
+    broker.request(json!({ "id": 4, "method": "exchange.list", "params": {} }));
     let snapshot = broker.read_response(4);
     assert_eq!(
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/exchange/0/state")
+            .pointer("/result/0/state")
             .and_then(Value::as_str),
         Some("cancelled")
     );
@@ -767,17 +851,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
     let initialized = broker.read_response(1);
     assert!(initialized.last().unwrap().get("error").is_none());
     broker.request(json!({"id":2,"method":"prompt.submit","params":{"text":"first active turn"}}));
-    loop {
-        let event = broker.read_message();
-        assert_ne!(
-            event["id"].as_u64(),
-            Some(2),
-            "first turn ended before shutdown: {event}"
-        );
-        if event.pointer("/payload/kind").and_then(Value::as_str) == Some("assistant_message") {
-            break;
-        }
-    }
+    broker.wait_for_exchanges(2, None, has_assistant_output);
     broker
         .request(json!({"id":3,"method":"session.new","params":{"name":"second active session"}}));
     let created = broker.read_response(3);
@@ -788,19 +862,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
         .and_then(Value::as_str)
         .unwrap();
     broker.request(json!({"id":4,"session_id":child,"method":"prompt.submit","params":{"text":"second active turn"}}));
-    loop {
-        let event = broker.read_message();
-        assert_ne!(
-            event["id"].as_u64(),
-            Some(4),
-            "second turn ended before shutdown: {event}"
-        );
-        if event["session_id"].as_str() == Some(child)
-            && event.pointer("/payload/kind").and_then(Value::as_str) == Some("assistant_message")
-        {
-            break;
-        }
-    }
+    broker.wait_for_exchanges(4, Some(child), has_assistant_output);
     broker.request(json!({"id":5,"method":"shutdown","params":{}}));
     let stopped = broker.read_response(5);
     assert_eq!(
@@ -866,11 +928,9 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
         "method": "prompt.submit",
         "params": { "text": "create the requested file" }
     }));
-    let started = broker.read_message();
-    assert_eq!(
-        started.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_exchange_started")
-    );
+    broker.wait_for_exchanges(2, None, |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
+    });
 
     broker.request(json!({
         "id": 3,
@@ -925,12 +985,9 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
 
     broker.request(json!({ "id": 6, "method": "state.get", "params": {} }));
     let snapshot = broker.read_response(6);
-    let interaction = snapshot
-        .last()
-        .unwrap()
-        .pointer("/result/exchange")
-        .and_then(Value::as_array)
-        .unwrap();
+    broker.request(json!({ "id": 7, "method": "exchange.list", "params": {} }));
+    let exchanges = broker.read_response(7);
+    let interaction = exchanges.last().unwrap()["result"].as_array().unwrap();
     assert_eq!(interaction.len(), 1);
     assert_eq!(interaction[0]["state"], "complete");
     assert_eq!(interaction[0]["node_list"].as_array().unwrap().len(), 1);
@@ -948,6 +1005,11 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
 fn retracts_an_output_free_planning_turn_and_restores_control_state() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repository.path().join(".forge.json"),
+        br#"{"checks":{"version":2,"definitions":[]}}"#,
+    )
+    .unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),
@@ -1029,22 +1091,23 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
             .and_then(Value::as_str),
         Some(prompt)
     );
-    assert!(retracted.iter().any(|message| {
-        message.get("event").and_then(Value::as_str) == Some("backend_event")
-            && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_exchange_retracted")
-    }));
+    assert!(
+        cancellation
+            .iter()
+            .chain(&retracted)
+            .any(|message| message["event"] == "document_changed")
+    );
 
     broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
     let snapshot = broker.read_response(5);
+    broker.request(json!({ "id": 7, "method": "exchange.list", "params": {} }));
+    let exchanges = broker.read_response(7);
     assert_eq!(
-        snapshot
-            .last()
+        exchanges.last().unwrap()["result"]
+            .as_array()
             .unwrap()
-            .pointer("/result/exchange")
-            .and_then(Value::as_array)
-            .map(Vec::len),
-        Some(0)
+            .len(),
+        0
     );
     assert_eq!(
         snapshot
@@ -1105,8 +1168,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
         "method": "prompt.submit",
         "params": { "text": "show output before cancellation" }
     }));
-    broker.read_backend_event("timeline_exchange_started");
-    broker.read_backend_event("assistant_message");
+    broker.wait_for_exchanges(2, None, has_assistant_output);
     broker.request(json!({
         "id": 3,
         "method": "turn.cancel",
@@ -1122,10 +1184,11 @@ fn visible_output_prevents_cancelled_turn_retraction() {
             .and_then(Value::as_str),
         Some("turn_cancelled")
     );
-    assert!(cancelled.iter().any(|message| {
-        message.pointer("/payload/kind").and_then(Value::as_str)
-            == Some("timeline_exchange_cancelled")
-    }));
+    broker.request(json!({"id": 10, "method":"exchange.list", "params":{}}));
+    let snapshot = broker.read_response(10);
+    let snapshot = &snapshot.last().unwrap()["result"];
+    assert_eq!(snapshot[0]["state"], "cancelled");
+    assert!(has_assistant_output(snapshot));
 
     broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
     broker.read_response(4);
@@ -1169,11 +1232,9 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
         "method": "prompt.submit",
         "params": { "text": "change the workspace" }
     }));
-    let started = broker.read_message();
-    assert_eq!(
-        started.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_exchange_started")
-    );
+    broker.wait_for_exchanges(2, None, |snapshot| {
+        snapshot.pointer("/0/state").and_then(Value::as_str) == Some("running")
+    });
     let changed_path = repository.path().join("mock-provider-change.txt");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
     while !changed_path.exists() && std::time::Instant::now() < deadline {
@@ -1204,6 +1265,11 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
 fn persists_acknowledged_steering_on_the_active_interaction() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
+    std::fs::write(
+        repository.path().join(".forge.json"),
+        br#"{"checks":{"version":2,"definitions":[]}}"#,
+    )
+    .unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),
@@ -1246,7 +1312,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         "method": "prompt.submit",
         "params": { "text": "/plan refactor X" }
     }));
-    broker.read_backend_event("assistant_message");
+    broker.wait_for_exchanges(2, None, has_assistant_output);
     broker.request(json!({
         "id": 3,
         "method": "turn.steer",
@@ -1261,53 +1327,23 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             .and_then(Value::as_bool),
         Some(true)
     );
-    let mut event_list: Vec<_> = steered
-        .iter()
-        .filter(|message| message.get("id").is_none())
-        .cloned()
-        .collect();
-    while !event_list.iter().any(|message| {
-        message.pointer("/payload/kind").and_then(Value::as_str) == Some("timeline_node_updated")
-            && message
-                .pointer("/payload/data/node/kind")
-                .and_then(Value::as_str)
-                == Some("exchange_input")
-    }) {
-        event_list.push(broker.read_message());
-    }
-    let steering_event = event_list
-        .iter()
-        .find(|message| {
-            message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_node_updated")
-                && message
-                    .pointer("/payload/data/node/kind")
-                    .and_then(Value::as_str)
-                    == Some("exchange_input")
-        })
-        .unwrap();
-    assert_eq!(
-        steering_event
-            .pointer("/payload/kind")
-            .and_then(Value::as_str),
-        Some("timeline_node_updated")
-    );
-    assert_eq!(
-        steering_event
-            .pointer("/payload/data/node/prompt/text")
-            .and_then(Value::as_str),
-        Some("And be sure to modify Y")
-    );
+    let snapshot = broker.wait_for_exchanges(2, None, |snapshot| {
+        snapshot
+            .pointer("/0/node_list/1/prompt/text")
+            .and_then(Value::as_str)
+            == Some("And be sure to modify Y")
+    });
+    assert_eq!(snapshot[0]["node_list"][1]["kind"], "exchange_input");
 
     broker.request(json!({ "id": 4, "method": "turn.cancel", "params": {} }));
     broker.read_response(4);
     broker.read_response(2);
-    broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
+    broker.request(json!({ "id": 5, "method": "exchange.list", "params": {} }));
     let snapshot = broker.read_response(5);
     let interaction = snapshot
         .last()
         .unwrap()
-        .pointer("/result/exchange")
+        .pointer("/result")
         .and_then(Value::as_array)
         .unwrap();
     assert_eq!(interaction.len(), 1);
@@ -1487,19 +1523,20 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
             .and_then(Value::as_str),
         Some("turn_cancelled")
     );
-    assert!(cancelled_turn.iter().any(|message| {
-        message.get("event").and_then(Value::as_str) == Some("backend_event")
-            && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_exchange_cancelled")
-    }));
+    assert!(
+        cancellation
+            .iter()
+            .chain(&cancelled_turn)
+            .any(|message| message["event"] == "document_changed")
+    );
 
-    broker.request(json!({ "id": 4, "method": "state.get", "params": {} }));
+    broker.request(json!({ "id": 4, "method": "exchange.list", "params": {} }));
     let snapshot = broker.read_response(4);
     assert_eq!(
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/exchange/0/state")
+            .pointer("/result/0/state")
             .and_then(Value::as_str),
         Some("cancelled")
     );

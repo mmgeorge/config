@@ -1,43 +1,6 @@
 use super::*;
 
-#[derive(Serialize)]
-struct PlanChoice {
-    id: String,
-    created_at_ms: i64,
-    title: String,
-    session_name: String,
-    revision_count: u32,
-    implemented: bool,
-    state: PlanState,
-    digest: Option<String>,
-    task: Option<crate::task::TaskRecord>,
-}
-
 impl HarnessBroker {
-    /// List submitted plans in the current workspace with durable completion evidence.
-    pub(super) fn list_replanning_choices(&self) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut choices = Vec::new();
-        for session in [&self.session] {
-            let execution = self.store.list_plan_execution(&session.id)?;
-            for plan in self.store.list_plan(&session.id)? {
-                choices.push(PlanChoice {
-                    implemented: execution.iter().any(|record| {
-                        record.plan_id == plan.id && record.state == PlanExecutionState::Complete
-                    }),
-                    task: self.store.list_task(&session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id)),
-                    digest: plan.review_digest.clone(),
-                    id: plan.id,
-                    created_at_ms: plan.created_at_ms,
-                    title: plan.title,
-                    session_name: session.name.clone(),
-                    revision_count: plan.model_revision,
-                    state: plan.state,
-                });
-            }
-        }
-        Ok((serde_json::to_value(choices)?, Vec::new()))
-    }
-
     /// Seed a new planning exchange from an immutable revision in the same workspace.
     pub(super) async fn replan(&mut self, selection: &str) -> Result<(Value, Vec<SessionEvent>)> {
         let fields = selection.split_whitespace().collect::<Vec<_>>();
@@ -129,7 +92,6 @@ impl HarnessBroker {
         task.operation_id = self.active_operation_id.clone();
         task.begin(now_ms)?;
         self.session.current_task_id = Some(task.id.clone());
-        self.session.active_plan_id = Some(plan_id.clone());
         self.store.select_task(&self.session, Some(&task), None, Some(&plan), &self.client_id)?;
         if let Some(goal) = self.current_goal()?
             && goal.state == GoalState::Active

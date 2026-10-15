@@ -171,25 +171,34 @@ function M.open(state, host)
   request(session_id, "trace.status", {}, function(status)
     if not state.session or state.session.id ~= session_id then return end
     local pending = false
-    local active = assert(state.session)
+    local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
+      state.pending_config or {}, state.task_config or {})
+    local configuration_revision = 0
+    local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
     local timeout_focus = { approval_timeout = "amount", answer_timeout = "amount" }
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
       if not state.session or state.session.id ~= session_id then return end
-      pending = true
+      configuration_revision = configuration_revision + 1
+      local revision = configuration_revision
+      configuration_pending = true
+      active = vim.tbl_extend("force", active, params)
       local session = require("forge.session")
       local previous = session.harness
       session.activate_harness(state)
       require("forge.views.harness.controller").configure(params, false, function(applied)
-        pending = false
         if not state.session or state.session.id ~= session_id then return end
-        active = assert(state.session)
+        if revision ~= configuration_revision then return end
+        configuration_pending = false
+        active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
+          state.pending_config or {}, state.task_config or {})
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
       session.activate_harness(previous)
+      if picker.is_open("harness-config") then picker.update(build_spec()) end
     end
     local function apply_access(policy, completed)
       configure({ access = policy }, function(applied) if applied and completed then completed() end end)
@@ -244,7 +253,7 @@ function M.open(state, host)
       elseif id == "plan-revisions" then
         configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
       elseif id == "subagent-tools" then
-        configure({ subagent_tools = state.subagent_tools ~= true })
+        configure({ subagent_tools = (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) ~= true })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -266,7 +275,8 @@ function M.open(state, host)
       return {
         owner = "harness-config", host = host,
         page_list = { {
-          id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown"),
+          id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown")
+            .. (configuration_pending and " · Changes pending" or ""),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
             { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
@@ -275,7 +285,7 @@ function M.open(state, host)
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
-            { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render(state.subagent_tools == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
+            { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
               or (policy.sandbox and picker_field.render("Disable to connect", true) or "Unsupported"), "OS isolation, independent of approval mode" } },
             { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },

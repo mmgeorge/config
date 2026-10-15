@@ -4,6 +4,7 @@ client.host_generation = function() return 1 end
 client.host_accepting = function() return true end
 local state = require("forge.session").harness
 state.session = { id = "tests-session" }
+state.active_plan = { id = "unrelated-current-plan" }
 state.transcript_win = vim.api.nvim_get_current_win()
 local notices = {}
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
@@ -162,6 +163,7 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(review.buf, 0, 1, false)[1] == heading)
   assert(#rename_marks() == 0, "successful rename retained its overlay")
   assert(opened == 1 and closed == 0, "rename reopened the native document")
+  assert(state.active_plan.id == "unrelated-current-plan", "editing a review changed the current plan")
 
   pending = nil
   vim.api.nvim_win_set_cursor(window, { 3, 0 })

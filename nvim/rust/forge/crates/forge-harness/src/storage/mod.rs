@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 45;
+const SESSION_FORMAT_VERSION: u32 = 46;
 const PREFERENCE_FORMAT_VERSION: u32 = 40;
 
 /// Stores one session with the exact durable format that produced it.
@@ -38,6 +38,14 @@ pub struct SqliteStore {
 }
 
 impl SqliteStore {
+    /// Keeps related observations on one committed SQLite snapshot while writers continue.
+    pub(crate) fn read_snapshot<Value>(&self, read: impl FnOnce() -> Result<Value>) -> Result<Value> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let value = read()?;
+        transaction.commit()?;
+        Ok(value)
+    }
+
     /// Holds an operating-system lock so lease expiry cannot admit a second live runtime.
     pub(crate) fn lock_session(&mut self, session_id: &str) -> Result<()> {
         if self.session_lock.contains_key(session_id) { return Ok(()); }
@@ -1129,13 +1137,11 @@ fn discard_incompatible_plan_state(
     connection: &Connection,
     session: &mut HarnessSession,
 ) -> Result<()> {
-    if let Some(plan_id) = session.active_plan_id.as_ref() {
-        let supported: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=10)",
-            [plan_id], |row| row.get(0))?;
-        if !supported {
-            session.active_plan_id = None;
-        }
+    if let Some(task_id) = session.current_task_id.as_ref() {
+        let incompatible: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_record task JOIN plan_record plan ON plan.id=json_extract(task.payload,'$.plan_id') WHERE task.id=?1 AND coalesce(json_extract(plan.payload,'$.schema_version'),0)<>10)",
+            [task_id], |row| row.get(0))?;
+        if incompatible { session.current_task_id = None; }
     }
 
     if let Some(goal_id) = session.goal_id.as_ref() {
@@ -1300,7 +1306,7 @@ mod test {
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         let mut stored = session("current", "D:/work");
-        stored.active_plan_id = Some("old-plan".into());
+        stored.current_task_id = Some("old-task".into());
         stored.goal_id = Some("old-goal".into());
         store.save_session(&stored).unwrap();
         store
@@ -1312,15 +1318,17 @@ mod test {
             .unwrap();
         store.connection.execute("INSERT INTO plan_execution_record(id,session_id,payload) VALUES('old-execution','current',?1)",
             [r#"{"id":"old-execution","goal_id":"old-goal","schema_version":4}"#]).unwrap();
+        store.connection.execute("INSERT INTO task_record(id,session_id,payload) VALUES('old-task','current',?1)",
+            [r#"{"plan_id":"old-plan"}"#]).unwrap();
         assert!(store.list_plan("current").unwrap().is_empty());
         assert!(store.list_plan_execution("current").unwrap().is_empty());
         let reopened = store.load_session("current").unwrap().unwrap();
-        assert!(reopened.active_plan_id.is_none() && reopened.goal_id.is_none());
+        assert!(reopened.current_task_id.is_none() && reopened.goal_id.is_none());
         assert_eq!(reopened.name, "current");
         let leased = store
             .acquire_session_lease("current", "client", 10)
             .unwrap();
-        assert!(leased.active_plan_id.is_none() && leased.goal_id.is_none());
+        assert!(leased.current_task_id.is_none() && leased.goal_id.is_none());
     }
 
     fn session(id: &str, workspace: &str) -> HarnessSession {
@@ -1350,7 +1358,6 @@ mod test {
             current_task_id: None, default_write_permission: crate::session::PermissionMode::Write, plan_permission: None,
             created_at_ms: 1,
             updated_at_ms: 1,
-            active_plan_id: None,
             goal_id: None,
             lease_owner: None,
             lease_expires_at_ms: None,

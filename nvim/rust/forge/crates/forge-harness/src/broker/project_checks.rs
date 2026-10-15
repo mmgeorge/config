@@ -133,9 +133,7 @@ impl HarnessBroker {
                 || "/checks setup".into(),
                 |id| format!("/checks setup {id}"),
             ));
-        let plan = self
-            .session
-            .active_plan_id
+        let plan = self.current_plan_id()?
             .as_ref()
             .map(|id| self.plan_file.read_working_document(&self.session.id, id))
             .transpose()?
@@ -147,7 +145,7 @@ impl HarnessBroker {
         self.check_setup = false;
         if result.is_ok()
             && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_ok()
-            && let Some(plan_id) = self.session.active_plan_id.clone()
+            && let Some(plan_id) = self.current_plan_id()?
         {
             self.refresh_check_review(&plan_id)?;
         }

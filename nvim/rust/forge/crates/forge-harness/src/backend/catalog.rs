@@ -1,6 +1,22 @@
 use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 
+/// Applies saved model controls while retaining provider defaults for unset values.
+pub(crate) fn select_model_settings(
+    model_list: &mut [super::BackendModel],
+    preference: Option<&crate::session::HarnessPreference>,
+) {
+    for model in model_list {
+        let setting = preference.and_then(|preference| preference.model_setting.get(&model.id));
+        model.selected_reasoning = setting
+            .and_then(|setting| setting.reasoning.clone())
+            .or_else(|| model.default_reasoning.clone());
+        model.selected_context_window = setting
+            .and_then(|setting| setting.context_window.clone())
+            .or_else(|| model.default_context_window.clone());
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Identifies the definition's scope independently of its enablement preference.

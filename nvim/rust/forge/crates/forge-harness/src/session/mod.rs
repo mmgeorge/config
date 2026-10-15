@@ -160,7 +160,6 @@ pub struct HarnessSession {
     pub plan_permission: Option<PermissionMode>,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
-    pub active_plan_id: Option<String>,
     pub goal_id: Option<String>,
     pub lease_owner: Option<String>,
     pub lease_expires_at_ms: Option<i64>,

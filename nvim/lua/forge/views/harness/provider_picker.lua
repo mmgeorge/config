@@ -5,6 +5,7 @@ local provider_catalog = require("forge.views.harness.provider_catalog")
 local M = {}
 local owner = "harness-provider-catalog"
 local mcp_generation = 0
+local skills_generation = 0
 local loading_icon_list = { "○", "◔", "◑", "◕", "●", "◕", "◑", "◔" }
 
 ---@alias ForgeResourceScope "global"|"workspace"
@@ -85,12 +86,19 @@ end
 
 ---@param options table
 function M.open_skills(options)
+  skills_generation = skills_generation + 1
+  local owner = owner .. "-skills-" .. skills_generation
+  picker.open({ owner = owner, host = options.host, page_list = { {
+    id = "provider-skills", title = "Manage Skills", option_list = {}, empty_text = "Loading skills...", footer = "q close",
+  } }, on_confirm = function() return false end })
   provider_catalog.skills(true, function(skill_list, request_error)
+    if not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
     if request_error then
+      picker.close()
       notifications.error(request_error, "Harness skills")
       return
     end
-    local busy = false
+    local pending_by_id = {}
     local current_skill_list = skill_list or {}
     local expanded_by_id = {}
     local function spec()
@@ -114,6 +122,7 @@ function M.open_skills(options)
           {
             id = "provider-skills",
             title = "Manage Skills",
+            subtitle = next(pending_by_id) and "Changes pending" or nil,
             column_headers = { "Skill", "Source", "Description" },
             option_list = option_list,
             empty_text = "The provider advertised no user-invocable skills.",
@@ -127,18 +136,28 @@ function M.open_skills(options)
             desc = "Enable or disable provider skill",
             callback = function(context)
               local skill = context.option and context.option.value
-              if not skill or busy then return end
-              busy = true
-              provider_catalog.set_skill_enabled(skill.name, not skill.enabled, function(_, toggle_error)
+              if not skill or (options.is_current and not options.is_current()) then return end
+              local id = skill.resource_id or skill.name
+              local change = {}
+              pending_by_id[id] = change
+              skill.enabled = not skill.enabled
+              picker.update(spec())
+              provider_catalog.set_skill_enabled(skill.name, skill.enabled, function(_, toggle_error)
+                if pending_by_id[id] ~= change then return end
+                pending_by_id[id] = nil
                 if toggle_error then
                   notifications.error(toggle_error, "Harness skills")
                 end
+                if not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
+                if next(pending_by_id) then picker.update(spec()) return end
                 provider_catalog.skills(true, function(refreshed, refresh_error)
-                  busy = false
+                  if not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
                   if refresh_error then
                     notifications.error(refresh_error, "Harness skills")
+                    picker.update(spec())
                     return
                   end
+                  if next(pending_by_id) then return end
                   current_skill_list = refreshed or {}
                   if picker.is_open(owner) then picker.update(spec()) end
                 end)
@@ -206,7 +225,7 @@ function M.open_mcp(options)
     local loading_name = nil
     local animation_index = 1
     local animation_timer = nil
-    local busy = false
+    local pending_by_id = {}
     local closed = false
     local refreshing = false
     local refresh_ticks = 0
@@ -228,12 +247,12 @@ function M.open_mcp(options)
     end
 
     local function refresh()
-      if closed or refreshing or not picker.is_open(owner) then return end
+      if closed or refreshing or next(pending_by_id) or not picker.is_open(owner) then return end
       refreshing = true
       provider_catalog.mcp(true, function(refreshed, refresh_error)
         refreshing = false
         if closed or not picker.is_open(owner) then return end
-        busy = false
+        if next(pending_by_id) then return end
         stop_animation()
         if refresh_error then
           notifications.error(refresh_error, "Harness MCP")
@@ -259,7 +278,7 @@ function M.open_mcp(options)
         animation_index = animation_index % #loading_icon_list + 1
         picker.update(build_spec())
         refresh_ticks = refresh_ticks + 1
-        if refresh_ticks >= 17 and not busy and not refreshing then
+        if refresh_ticks >= 17 and not next(pending_by_id) and not refreshing then
           refresh_ticks = 0
           refresh()
         end
@@ -276,14 +295,14 @@ function M.open_mcp(options)
           detail = table.concat({
             definition.transport or "unknown",
             token_label(definition.token_count, definition.token_estimated),
-            definition.name == loading_name and "starting" or mcp_status_label(definition),
+            pending_by_id[definition.resource_id or definition.name] and "pending" or mcp_status_label(definition),
           }, "  "),
           columns = {
             mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
             source_label(definition.scope),
             definition.transport or "unknown",
             token_label(definition.token_count, definition.token_estimated),
-            definition.name == loading_name and "starting" or mcp_status_label(definition),
+            pending_by_id[definition.resource_id or definition.name] and "pending" or mcp_status_label(definition),
           },
           child_line_list = expanded_by_id[definition.resource_id or definition.name] and tool_line_list(definition) or nil,
         }
@@ -295,6 +314,7 @@ function M.open_mcp(options)
           {
             id = "provider-mcp",
             title = "Manage MCP Servers",
+            subtitle = next(pending_by_id) and "Changes pending" or nil,
             column_headers = { "Server", "Source", "Transport", "Tokens", "Status" },
             option_list = option_list,
             empty_text = "The provider advertised no MCP servers.",
@@ -308,19 +328,27 @@ function M.open_mcp(options)
             desc = "Enable or disable MCP server",
             callback = function(context)
               local definition = context.option and context.option.value
-              if not definition or busy or refreshing or closed then return end
+              if not definition or closed then return end
               if options.is_current and not options.is_current() then return end
-              busy = true
-              if options.on_mutation_start then options.on_mutation_start(definition, not definition.enabled) end
+              local id = definition.resource_id or definition.name
+              local change = {}
+              pending_by_id[id] = change
+              local enabled = not definition.enabled
+              if options.on_mutation_start then options.on_mutation_start(definition, enabled) end
+              definition.enabled, definition.status = enabled, "loading"
               start_animation(definition.name)
-              provider_catalog.set_mcp_enabled(definition.name, not definition.enabled, function(result, toggle_error)
+              picker.update(build_spec())
+              provider_catalog.set_mcp_enabled(definition.name, enabled, function(result, toggle_error)
+                if pending_by_id[id] ~= change then return end
+                pending_by_id[id] = nil
                 if toggle_error then
                   if options.on_mutation_error then options.on_mutation_error(toggle_error) end
                   notifications.error(toggle_error, "Harness MCP")
-                  refresh()
-                  return
+                elseif options.on_mutation then
+                  options.on_mutation(result or {})
                 end
-                if options.on_mutation then options.on_mutation(result or {}) end
+                if closed or not picker.is_open(owner) or (options.is_current and not options.is_current()) then return end
+                if next(pending_by_id) then picker.update(build_spec()) return end
                 refresh()
               end, definition.resource_id)
             end,

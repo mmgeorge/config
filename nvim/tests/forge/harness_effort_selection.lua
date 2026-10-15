@@ -3,9 +3,14 @@ local client = require("forge.client")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local task = require("forge.views.harness.task")
+local keymaps = require("forge.shared.keymaps")
 local requests, transition, errors = {}, {}, {}
 local header = ""
 client.request = function(method, params, callback)
+  if method == "backend.models" then
+    callback({ { id = "test", reasoning = { "minimal", "low", "medium", "high" } } })
+    return
+  end
   assert(method == "session.configure", method)
   requests[#requests + 1] = { params = params, callback = callback }
 end
@@ -33,15 +38,30 @@ local function acknowledge(index)
   requests[index].callback(vim.tbl_extend("force", state.session, requests[index].params))
 end
 state.busy = false
-controller.change_effort(1)
-controller.change_effort(-1)
+local composer = vim.api.nvim_create_buf(false, true)
+keymaps.setup_view_keymaps(composer, "harness", state.command_set)
+local function press_effort(command_id, mode)
+  vim.api.nvim_buf_call(composer, function()
+    local key = keymaps.view_keys_for("harness", command_id)[1]
+    local mapping = vim.fn.maparg(key, mode, false, true)
+    assert(mapping.buffer == 1 and type(mapping.callback) == "function",
+      command_id .. " must be mapped in " .. mode .. " mode")
+    mapping.callback()
+  end)
+end
+press_effort("effort_up", "i")
+press_effort("effort_down", "i")
 settled()
 assert(#requests == 0 and state.pending_config == nil, "cancelled idle selection reached provider")
-controller.change_effort(-1)
+press_effort("effort_up", "n")
+press_effort("effort_down", "n")
+settled()
+assert(#requests == 0 and state.pending_config == nil, "normal-mode effort changes did not cancel")
+press_effort("effort_down", "n")
 settled()
 assert(#requests == 1 and requests[1].params.effort == "low")
 assert(header:find("low", 1, true) and not header:find("*", 1, true), header)
-controller.change_effort(-1)
+press_effort("effort_down", "i")
 settled()
 assert(#requests == 1, "idle configuration overlapped another request")
 acknowledge(1)
@@ -91,5 +111,6 @@ controller.toggle_service_tier("ultrafast")
 assert(state.configuration_error:find("does not support ultrafast", 1, true))
 assert(#requests == count and not state.pending_config)
 assert(#errors == 0, table.concat(errors, "\n"))
+vim.api.nvim_buf_delete(composer, { force = true })
 print("harness_effort_selection: passed")
 vim.cmd("qa!")

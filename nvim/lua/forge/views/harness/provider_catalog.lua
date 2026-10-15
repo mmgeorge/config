@@ -11,6 +11,8 @@ local M = {}
 local skill_cache = {}
 ---@type table<string, ForgeProviderCatalogEntry>
 local mcp_cache = {}
+---@type table<string, ForgeProviderCatalogEntry>
+local model_cache = {}
 
 ---@return string
 local function cache_key()
@@ -60,6 +62,38 @@ end
 ---@param callback fun(value: table[]?, error: string?)
 function M.mcp(force, callback)
   request_catalog(mcp_cache, "backend.mcp", force, callback)
+end
+
+---@param force boolean?
+---@param callback fun(value: table[]?, error: string?)
+function M.models(force, callback)
+  local state = session.harness
+  local backend = state.session and state.session.backend
+  local function deliver(value, failure)
+    if failure then callback(nil, failure) return end
+    local models = vim.deepcopy(value or {})
+    local selected = vim.tbl_extend("force", state.session or {}, state.configuring_config or {},
+      state.pending_config or {}, state.task_config or {})
+    for _, model in ipairs(models) do
+      if model.id == selected.model or (selected.model == "default" and model.is_default) then
+        if selected.effort and selected.effort ~= "default" then model.selected_reasoning = selected.effort end
+        if selected.context_window ~= nil then model.selected_context_window = selected.context_window end
+      end
+    end
+    callback(models, nil)
+  end
+  if not force and backend == state.model_backend and type(state.model_list) == "table" then
+    deliver(state.model_list, nil)
+    return
+  end
+  local key = cache_key()
+  request_catalog(model_cache, "backend.models", force, function(value, failure)
+    if key ~= cache_key() then return end
+    if not failure then
+      state.model_backend, state.model_list = backend, vim.deepcopy(value or {})
+    end
+    deliver(value, failure)
+  end)
 end
 
 local function mutate(method, cache, name, enabled, callback, resource_id)
@@ -124,6 +158,7 @@ end
 function M.clear()
   skill_cache = {}
   mcp_cache = {}
+  model_cache = {}
 end
 
 return M

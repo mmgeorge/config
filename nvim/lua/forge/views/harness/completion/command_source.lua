@@ -75,6 +75,14 @@ function CommandSource.accepts_prompt(text)
   return false
 end
 
+---@param text string
+---@return boolean
+function CommandSource.queues_execution(text)
+  local token = text:match("^%s*(%S+)")
+  if token == "/model" then return text:match("^%s*/model%s+%S+%s+%S+%s+%S") ~= nil end
+  return not token or token:sub(1, 1) ~= "/" or token == "/compact"
+end
+
 ---@return ForgeHarnessCommandSource
 function CommandSource.new()
   return setmetatable({
@@ -172,7 +180,7 @@ function CommandSource:request_model_list(callback)
   self.model_callback_list[#self.model_callback_list + 1] = deliver
   if #self.model_callback_list > 1 then return end
   local request_callback_list = self.model_callback_list
-  client.request("backend.models", {}, function(model_list, request_error)
+  provider_catalog.models(false, function(model_list, request_error)
     local callback_list = request_callback_list
     if self.model_callback_list == request_callback_list then self.model_callback_list = {} end
     if request_error then

@@ -1,6 +1,7 @@
 pub mod approval;
 mod acp;
 mod catalog;
+pub(crate) use catalog::select_model_settings;
 mod compaction;
 pub use compaction::{BackendCompactionRequest, Compaction, CompactionCapability, CompactionContext, CompactionCost, CompactionResult, CompactionState, CompactionTokenCost, CompactionUsage};
 pub(crate) mod mcp;

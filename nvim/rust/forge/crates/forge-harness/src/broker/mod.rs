@@ -4,6 +4,8 @@ mod project_checks;
 mod fork;
 mod new_session;
 mod replanning;
+mod observation;
+pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
@@ -524,12 +526,11 @@ impl ExchangeAdmission {
 pub struct HarnessBroker {
     checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
-    runtime_epoch: String,
-    snapshot_revision: AtomicU64,
+    observer: Arc<observation::BrokerObserver>,
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
-    plan_file: PlanFileStore,
+    plan_file: Arc<PlanFileStore>,
     check_runner: Arc<crate::checks::CheckRunner>,
     check_setup: bool,
     /// Shares admitted review documents between view requests and serialized question turns.
@@ -681,7 +682,6 @@ impl HarnessBroker {
                             current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
-                            active_plan_id: None,
                             goal_id: None,
                             lease_owner: None,
                             lease_expires_at_ms: None,
@@ -738,7 +738,7 @@ impl HarnessBroker {
         session = store.load_session(&session.id)?.context("session disappeared during recovery")?;
         if store.list_task(&session.id)?.iter().any(|task| Some(&task.id) == session.current_task_id.as_ref()
             && task.kind == crate::task::TaskKind::Plan && task.status == crate::task::TaskStatus::Paused) {
-            session.active_plan_id = None;
+
             store.save_owned_session(&session, &request.client_id)?;
         }
         let agent_registry = load_agent_registry(&store, &session.id)?;
@@ -760,15 +760,27 @@ impl HarnessBroker {
         let check_runner = crate::checks::CheckRunner::open(PathBuf::from(&session.workspace),
             data_root.join(&session.id).join("checks"), Arc::clone(&presentation),
             store.objects.clone(), Arc::clone(&runtime.repositories))?;
+        let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
+        let observer = Arc::new(observation::BrokerObserver {
+            data_root: data_root.clone(), session_id: session.id.clone(),
+            runtime_epoch: Uuid::new_v4().to_string(), snapshot_revision: AtomicU64::new(0),
+            metadata: RwLock::new(observation::ObservationMetadata {
+                revision: 0,
+                capability: capability.clone(), active_wait: None,
+                no_checkpoint: matches!(workspace_kind, WorkspaceKind::Untracked(_)),
+            }),
+            plan_file: Arc::clone(&plan_file), permission_coordinator: Arc::clone(&permission_coordinator),
+            permission_store: Arc::clone(&permission_store), agent_coordinator: Arc::clone(&agent_coordinator),
+            check_runner: Arc::clone(&check_runner), presentation: Arc::clone(&presentation), trace: Arc::clone(&trace),
+        });
         let broker = Self {
             active_operation_id: None,
-            runtime_epoch: Uuid::new_v4().to_string(),
-            snapshot_revision: AtomicU64::new(0),
+            observer,
             repositories: Arc::clone(&runtime.repositories),
             checkpoint: match &workspace_kind { WorkspaceKind::Git(workspace) => Some(GitCheckpoint::new(workspace)), _ => None },
             diff: Arc::clone(&runtime.diff),
             store,
-            plan_file: PlanFileStore::new(&data_root, &session.workspace),
+            plan_file,
             check_runner,
             check_setup: false,
             workspace_kind,
@@ -845,9 +857,7 @@ impl HarnessBroker {
         &self,
         mode: PromptMode,
     ) -> Option<crate::control_tools::ControlTurnContext> {
-        let plan = self
-            .session
-            .active_plan_id
+        let plan = self.current_plan_id().ok().flatten()
             .as_deref()
             .and_then(|plan_id| self.store.load_plan(plan_id).ok().flatten());
         let document = plan.as_ref().and_then(|plan| {
@@ -896,209 +906,12 @@ impl HarnessBroker {
 
     /// Build the initial snapshot returned by the initialize response.
     pub fn snapshot(&self) -> Result<BrokerSnapshot> {
-        let mut session = self.session.clone();
-        (session.approval_timeout, session.answer_timeout) = self.permission_coordinator.input_timeouts(&session.id)?;
-        let goal = self
-            .session
-            .goal_id
-            .as_deref()
-            .map(|id| self.store.load_goal(id))
-            .transpose()?
-            .flatten();
-        let active_plan = self
-            .session
-            .active_plan_id
-            .as_deref()
-            .map(|id| self.store.load_plan(id))
-            .transpose()?
-            .flatten();
-        if let Some(plan) = active_plan.as_ref() {
-            self.record_plan_trace("snapshot_plan_state", plan_trace_fields(plan));
-        }
-        let interaction = self.store.list_exchange(&self.session.id)?;
-        let active_elicitation = active_plan
-            .as_ref()
-            .and_then(|plan| {
-                plan.acceptance
-                    .as_ref()
-                    .map(|acceptance| ActiveElicitation {
-                        owner: ElicitationOwner::PlanAcceptance,
-                        plan_id: Some(plan.id.clone()),
-                        exchange_id: None,
-                        elicitation: acceptance.elicitation.clone(),
-                    })
-            })
-            .or_else(|| {
-                active_plan.as_ref().and_then(|plan| {
-                    plan.elicitation
-                        .clone()
-                        .map(|elicitation| ActiveElicitation {
-                            owner: ElicitationOwner::Plan,
-                            plan_id: Some(plan.id.clone()),
-                            exchange_id: None,
-                            elicitation,
-                        })
-                })
-            })
-            .or_else(|| {
-                interaction.iter().rev().filter(|interaction| interaction.awaiting_input).find_map(|interaction| {
-                    interaction
-                        .elicitation
-                        .clone()
-                        .map(|elicitation| ActiveElicitation {
-                            owner: ElicitationOwner::Interaction,
-                            plan_id: interaction.plan_id.clone(),
-                            exchange_id: Some(interaction.id.clone()),
-                            elicitation,
-                        })
-                })
-            });
-        let plan_list = self.store.list_plan(&self.session.id)?;
-        let lifecycle_list = self.store.list_plan_lifecycle(&self.session.id)?;
-        let execution_list = self.store.list_plan_execution(&self.session.id)?;
-        let goal_execution = goal.as_ref().and_then(|goal| {
-            execution_list
-                .iter()
-                .rev()
-                .find(|execution| execution.goal_id == goal.id)
-                .cloned()
-        });
-        let active_wait = self.active_wait_projection.clone();
-        let session_event_list = self.store.list_session_event(&self.session.id)?;
-        let mut status = crate::session::state_machine::SessionPhase::resolve(
-            active_plan.as_ref(),
-            active_wait.as_ref(),
-            interaction.last(),
-        );
-        if status == crate::session::state_machine::SessionPhase::Idle && self.agent_coordinator.active_count() > 0 {
-            status = crate::session::state_machine::SessionPhase::WaitingForAgent {agent_count:self.agent_coordinator.active_count()};
-        }
-        if let Some(execution) = goal_execution.as_ref() { Self::execution_status(&mut status, execution); }
-        if let Some(started_at_ms) = session_event_list.iter().rev().find_map(|event| match &event.detail {
-            SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running =>
-                    Some(compaction.started_at_ms.unwrap_or(event.created_at_ms)),
-            _ => None,
-        }) {
-            status = crate::session::state_machine::SessionPhase::Compacting { started_at_ms };
-        }
-        self.record_plan_trace(
-            "status_projected",
-            json!({ "session_id": self.session.id, "status": status }),
-        );
-        let agent_run_list = self.agent_registry.list();
-        let mut agent_exchange_list = Vec::new();
-        for run in &agent_run_list {
-            agent_exchange_list.extend(self.store.list_agent_exchange(&run.id)?);
-        }
-        let timeline = TimelineProjector::build(TimelineProjection {
-            interaction_list: interaction.clone(),
-            plan_list: &plan_list,
-            lifecycle_list,
-            execution_list,
-            deviation_list: self.store.list_plan_deviation(&self.session.id)?,
-            audit_list: self.store.list_plan_audit(&self.session.id)?,
-            resolution_list: self.store.list_plan_resolution(&self.session.id)?,
-            agent_run_list: agent_run_list.clone(),
-            agent_exchange_list: agent_exchange_list.clone(),
-            session_event_list,
-            plan_file: &self.plan_file,
-        })?;
-        let mut timeline = TimelineProjector::with_checks(timeline,self.check_runner.history()?);
-        if let Some(run) = self.check_runner.active()?.and_then(|id|self.check_runner.history().ok()?.into_iter().find(|run|run.id == id)) {
-            status = run.status();
-        }
-        if status.visible() {
-            timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
-                id: format!("{}:status", self.session.id),
-                created_at_ms: 0,
-                status: status.clone(),
-            });
-        }
-        let approval = self
-            .permission_coordinator
-            .pending_list()?
-            .into_iter()
-            .filter(|approval| {
-                interaction
-                    .iter()
-                    .chain(agent_exchange_list.iter())
-                    .any(|exchange| approval.exchange_id.as_deref() == Some(exchange.id.as_str()))
-            })
-            .collect();
-        Ok(BrokerSnapshot {
-            subagent_tools:self.agent_coordinator.enabled(),
-            runtime_epoch: self.runtime_epoch.clone(),
-            snapshot_revision: self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1,
-            task_operation: self.store.latest_task_operation(&self.session.id)?
-                .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
-                    || operation.exchange_id.as_deref() == interaction.last().map(|exchange| exchange.id.as_str()))
-                .map(|operation| operation.view()),
-            session,
-            task: self.store.list_task(&self.session.id)?,
-            exchange: interaction,
-            capability: self.capability.clone(),
-            no_checkpoint: matches!(self.workspace_kind, WorkspaceKind::Untracked(_)),
-            restore_recovery: crate::checkpoint::RestoreJournal::progress(&self.store.objects, &self.session.id)?
-                .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
-                .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
-            goal,
-            active_plan,
-            active_elicitation,
-            artifact: plan_list
-                .iter()
-                .filter(|plan| !plan.working_path.is_empty())
-                .map(ArtifactSummary::from)
-                .collect(),
-            timeline,
-            status,
-            timeline_revision: self
-                .presentation
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .revision(),
-            goal_execution,
-            active_wait,
-            prompt_history: self.store.list_prompt_history()?,
-            agent: AgentSnapshot {
-                summary: agent_summaries(&agent_run_list, &agent_exchange_list),
-                run: agent_run_list,
-                exchange: agent_exchange_list,
-            },
-            approval,
-        })
+        self.observer.publish(self)
     }
 
-    pub(crate) fn capture_plan_review(
-        &self,
-        plan_id: &str,
-        expected_digest: &str,
-    ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        anyhow::ensure!(
-            !plan_id.is_empty() && plan_id.len() <= 256,
-            "invalid plan identity"
-        );
-        let plan = self
-            .store
-            .load_plan(plan_id)?
-            .context("plan review record is missing")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        anyhow::ensure!(
-            plan.review_digest.as_deref() == Some(expected_digest),
-            "plan review digest changed"
-        );
-        let mut source = self.plan_file.capture_review_source(
-            &self.session.id,
-            &plan.id,
-            (plan.submitted_version == Some(plan.document_version)).then_some(
-                if plan.state == PlanState::Accepted { plan.accepted_revision.unwrap_or(plan.model_revision) } else { plan.model_revision }),
-            expected_digest,
-        )?;
-        source.execution_review = self.execution_review(plan_id)?;
-        Ok(source)
+    /// Shares the read-only session boundary with out-of-band controls.
+    pub(crate) fn observer(&self) -> Arc<observation::BrokerObserver> {
+        Arc::clone(&self.observer)
     }
 
     /// Route one client request through the owning feature boundary.
@@ -1136,10 +949,10 @@ impl HarnessBroker {
             self.active_operation_id = None;
         }
         let mutation_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.mutation"));
-        let mut outcome = self.dispatch_inner(method, request.params).await;
+        let mut outcome = Box::pin(self.dispatch_inner(method, request.params)).await;
         if let Some(stage) = mutation_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
         let settle_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.settle_task"));
-        if !matches!(method, HarnessMethod::StateGet | HarnessMethod::TaskList | HarnessMethod::PlanList)
+        if method.settles_task()
             && !outcome.as_ref().is_err_and(|error| error.is::<RequestNotAdmitted>()) {
             if let Err(error) = self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}"))) {
                 outcome = Err(error.context("persist task outcome"));
@@ -1148,7 +961,7 @@ impl HarnessBroker {
         if let Some(stage) = settle_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
         match outcome {
             Ok((value, mut event)) => {
-                self.active_wait_projection = None;
+                if method.settles_task() { self.active_wait_projection = None; }
                 let reconcile_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.timeline_reconcile"));
                 let timeline_patch = match self.reconcile_after_dispatch() {
                     Ok(timeline_patch) => timeline_patch,
@@ -1207,7 +1020,7 @@ impl HarnessBroker {
                 }
             }
             Err(error) => {
-                self.active_wait_projection = None;
+                if method.settles_task() { self.active_wait_projection = None; }
                 let mut event = Vec::new();
                 if let Ok(timeline_patch) = self.reconcile_after_dispatch()
                     && !timeline_patch.is_empty()
@@ -1259,7 +1072,7 @@ impl HarnessBroker {
         event_sink: BackendEventSink,
     ) -> DispatchResult {
         self.event_sink = Some(event_sink);
-        let result = self.dispatch(request).await;
+        let result = Box::pin(self.dispatch(request)).await;
         self.event_sink = None;
         result
     }
@@ -1327,18 +1140,18 @@ impl HarnessBroker {
                 let document = serde_json::from_value(params["document"].clone())?;
                 Ok((serde_json::to_value(self.agent_backend_factory.profiles.save(&revision, document)?)?, Vec::new()))
             }
-            HarnessMethod::PermissionsOpen => self.open_permission_document(),
-            HarnessMethod::PermissionsSave => self.save_permission_document(params),
+            HarnessMethod::PermissionsOpen => self.observer.open_permission_document(),
+            HarnessMethod::PermissionsSave => self.observer.save_permission_document(params),
             HarnessMethod::SessionPermissionMode => self.select_execution_mode(params),
             HarnessMethod::SessionMode => self.select_execution_mode(params),
             HarnessMethod::ExchangeResume => self.resume_exchange(params).await,
             HarnessMethod::PromptSubmit => self.submit_prompt(params).await,
-            HarnessMethod::HistoryRecord => self.record_prompt_history(params),
+            HarnessMethod::HistoryRecord => self.observer.record_prompt_history(params, self.clock.now_ms()),
             HarnessMethod::QueueEditLast => {
                 anyhow::bail!("prompt queue ownership lives in the Neovim client")
             }
             HarnessMethod::PlanAccept => self.accept_plan(params).await,
-            HarnessMethod::PlanAcceptanceBegin => self.begin_plan_acceptance(params),
+            HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)).await,
             HarnessMethod::PlanAcceptanceCancel => self.cancel_plan_acceptance(),
             HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
             HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
@@ -1346,10 +1159,10 @@ impl HarnessBroker {
             HarnessMethod::PlanRustdocSource => self.rustdoc_source(params).await,
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
             HarnessMethod::PlanAnswerQuestions => self.answer_plan_review_questions(params).await,
-            HarnessMethod::PlanCancel => self.cancel_plan(),
-            HarnessMethod::PlanActivate => self.activate_plan(params),
+            HarnessMethod::PlanCancel => self.cancel_plan(params),
+            HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
             HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
-            HarnessMethod::PlanList => self.list_replanning_choices(),
+            HarnessMethod::PlanList => self.observer.list_replanning_choices(),
             HarnessMethod::PlanScopeDeviationReview => self.select_scope_deviation_review(params),
             HarnessMethod::PlanDeviationResolve => anyhow::bail!("task-based deviations are no longer supported"),
             HarnessMethod::QuestionAnswer => self.answer_question(params),
@@ -1364,7 +1177,7 @@ impl HarnessBroker {
             HarnessMethod::GoalClear => self.clear_goal().await,
             HarnessMethod::GoalContinue => self.continue_goal().await,
             HarnessMethod::ExchangeList => Ok((
-                serde_json::to_value(self.list_exchange_review()?)?,
+                serde_json::to_value(self.observer.list_exchange_review()?)?,
                 Vec::new(),
             )),
             HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params),
@@ -1380,8 +1193,8 @@ impl HarnessBroker {
             HarnessMethod::SessionNew | HarnessMethod::SessionClear => {
                 self.new_session(params).await
             }
-            HarnessMethod::SessionList => self.list_session(params),
-            HarnessMethod::SessionPreview => self.preview_session(params),
+            HarnessMethod::SessionList => self.observer.list_session(params),
+            HarnessMethod::SessionPreview => self.observer.preview_session(params),
             HarnessMethod::SessionResume => self.resume_session(params).await,
             HarnessMethod::SessionRename => self.rename_session(params),
             HarnessMethod::SessionConfigure => self.configure_session(params).await,
@@ -1434,7 +1247,7 @@ impl HarnessBroker {
                 "backend_session_id":self.session.backend_session_id,"conversation":"main"
             }));
             let mut admission = ExchangeAdmission::chat(question.body.clone());
-            admission.plan_id = self.session.active_plan_id.clone();
+            admission.plan_id = Some(question.plan_id.clone());
             let (result, mut update) = self.run_interaction(
                 format!("{instructions}\n\n{}", question.prompt),
                 PromptMode::PlanQuestion,
@@ -1614,22 +1427,29 @@ impl HarnessBroker {
         })
     }
 
-    fn open_permission_document(&self) -> Result<(Value, Vec<SessionEvent>)> {
-        let (path, source) = self
-            .permission_store
-            .read()
-            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-            .open();
-        Ok((json!({ "path": path, "source": source }), Vec::new()))
+    fn current_plan_id(&self) -> Result<Option<String>> {
+        Ok(self.current_task()?.and_then(|task| task.plan_id))
     }
 
-    fn save_permission_document(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let source = required_text(&params, "source")?;
-        self.permission_store
-            .write()
-            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-            .save(&source)?;
-        self.open_permission_document()
+    async fn select_review_task(&mut self, plan: &PlanRecord) -> Result<Vec<SessionEvent>> {
+        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
+        let mut task = self.store.list_task(&self.session.id)?.into_iter()
+            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
+            .context("reviewed plan has no owning task")?;
+        anyhow::ensure!(!task.status.terminal(), "reviewed plan belongs to a completed task");
+        if self.session.current_task_id.as_deref() == Some(task.id.as_str())
+            && task.status != crate::task::TaskStatus::Paused {
+            return Ok(Vec::new());
+        }
+        let (_, events) = self.pause_task(false).await?;
+        task.status = crate::task::TaskStatus::Waiting;
+        task.reason = None;
+        task.generation += 1;
+        task.updated_at_ms = self.clock.now_ms();
+        self.session.current_task_id = Some(task.id.clone());
+        self.session.goal_id = task.goal_id.clone();
+        self.store.select_task(&self.session, Some(&task), None, None, &self.client_id)?;
+        Ok(events)
     }
 
     fn current_task(&self) -> Result<Option<crate::task::TaskRecord>> {
@@ -1659,7 +1479,7 @@ impl HarnessBroker {
 
             }
         }
-        self.session.active_plan_id = None;
+
         self.session.goal_id = None;
         if clear { self.session.current_task_id = None; }
         self.store.select_task(&self.session, task.as_ref(), None, None, &self.client_id)?;
@@ -1793,7 +1613,7 @@ impl HarnessBroker {
                     if permission.is_write_default() { task.last_write_permission = permission; }
                     if waiting {
                         task.status = TaskStatus::Waiting;
-                        self.session.active_plan_id = task.plan_id.clone();
+
                         self.session.goal_id = task.goal_id.clone();
                     }
                     self.store.save_task(&task)?;
@@ -1832,7 +1652,7 @@ impl HarnessBroker {
                 }
                 self.pause_task(false).await?;
                 self.session.current_task_id = Some(task.id.clone());
-                self.session.active_plan_id = task.plan_id.clone();
+
                 self.session.goal_id = task.goal_id.clone();
                 self.select_execution_mode(json!({"mode": task.permission}))?;
                 task.begin(self.clock.now_ms())?;
@@ -1905,7 +1725,7 @@ impl HarnessBroker {
                 let digest = plan.review_digest.clone().context("submitted plan has no digest")?;
                 if let Some(expected) = action.get("digest").and_then(Value::as_str) { anyhow::ensure!(expected == digest, "plan changed after selection"); }
                 self.pause_task(false).await?;
-                self.session.active_plan_id = Some(plan.id.clone());
+
                 self.session.current_task_id = None;
                 if let Some(task) = self.store.list_task(&self.session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id)) {
                     self.session.current_task_id = Some(task.id);
@@ -2000,6 +1820,10 @@ impl HarnessBroker {
                     .all(|turn| turn.state() != crate::turn::TurnState::Running),
             "the latest Harness exchange is not paused for resumption"
         );
+        if let Some(mut task) = self.current_task()?.filter(|task| task.status == crate::task::TaskStatus::Paused) {
+            task.begin(self.clock.now_ms())?;
+            self.store.save_task(&task)?;
+        }
         let mode = match interaction.kind {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => PromptMode::Plan,
             ExchangeKind::PlanExecution => PromptMode::ExecutePlan,
@@ -2428,7 +2252,6 @@ impl HarnessBroker {
         Ok(())
     }
 
-
     async fn apply_agent_lifecycle(
         &mut self,
         backend_event: &BackendEvent,
@@ -2443,12 +2266,6 @@ impl HarnessBroker {
         Ok(None)
     }
 
-    fn record_prompt_history(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let text = required_text(&params,"text")?;
-        self.store.record_prompt_history(&text,self.clock.now_ms())?;
-        Ok((serde_json::to_value(self.store.list_prompt_history()?)?,Vec::new()))
-    }
-
     async fn list_backend_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut model_list = self
             .backend
@@ -2457,17 +2274,13 @@ impl HarnessBroker {
         let preference = self
             .store
             .load_preference(&self.session.workspace, &self.session.backend)?;
-        for model in &mut model_list {
-            let setting = preference
-                .as_ref()
-                .and_then(|preference| preference.model_setting.get(&model.id));
-            model.selected_reasoning = setting
-                .and_then(|setting| setting.reasoning.clone())
-                .or_else(|| model.default_reasoning.clone());
-            model.selected_context_window = setting
-                .and_then(|setting| setting.context_window.clone())
-                .or_else(|| model.default_context_window.clone());
-        }
+        crate::backend::select_model_settings(&mut model_list, preference.as_ref());
+        let event = self.resolve_default_model(&model_list)?;
+        Ok((serde_json::to_value(model_list)?, event))
+    }
+
+    /// Publishes an unresolved default model without replacing an explicit selection.
+    pub(crate) fn resolve_default_model(&mut self, model_list: &[crate::backend::BackendModel]) -> Result<Vec<SessionEvent>> {
         if self.session.model == "default"
             && self.session.resolved_model.is_none()
             && let Some(model) = model_list
@@ -2477,12 +2290,9 @@ impl HarnessBroker {
         {
             self.session.resolved_model = Some(model.id.clone());
             self.save_session()?;
-            return Ok((
-                serde_json::to_value(model_list)?,
-                vec![self.event("session_configured", serde_json::to_value(&self.session)?)?],
-            ));
+            return Ok(vec![self.event("session_configured", serde_json::to_value(&self.session)?)?]);
         }
-        Ok((serde_json::to_value(model_list)?, Vec::new()))
+        Ok(Vec::new())
     }
 
     async fn submit_prompt(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -2588,7 +2398,7 @@ impl HarnessBroker {
         anyhow::ensure!(self.check_runner.active()?.is_none(), "wait for or cancel the active check run before starting source work");
         let text = required_text(&params, "text")?;
         if text.trim() == "/plan" {
-            return self.list_replanning_choices();
+            return self.observer.list_replanning_choices();
         }
         if text == "/read" {
             return self.select_execution_mode(json!({ "mode": "read" }));
@@ -2603,7 +2413,8 @@ impl HarnessBroker {
             return self.new_session(Value::Null).await;
         }
         if text == "/plan cancel" {
-            return self.cancel_plan();
+            let plan_id = self.current_task()?.and_then(|task| task.plan_id).context("no current planning task")?;
+            return self.cancel_plan(json!({"plan_id":plan_id}));
         }
         if text == "/plan retry" {
             return self.retry_plan().await;
@@ -2611,9 +2422,11 @@ impl HarnessBroker {
         if let Some(selection) = text.strip_prefix("/replan ") {
             return self.replan(selection).await;
         }
-        let failed_plan_active = self
-            .session
-            .active_plan_id
+        if !text.starts_with('/')
+            && let Some(task) = self.current_task()?.filter(|task| task.status == crate::task::TaskStatus::Paused) {
+            return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id,"text":text}))).await;
+        }
+        let failed_plan_active = self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -2662,9 +2475,7 @@ impl HarnessBroker {
                 "action":"resume", "task_id":task.id, "text":text,
             }))).await;
         }
-        if let Some(plan) = self
-            .session
-            .active_plan_id
+        if let Some(plan) = self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -2700,9 +2511,7 @@ impl HarnessBroker {
                 .ask_question(json!({ "question_id": question_id, "text": text }))
                 .await;
         }
-        let active_plan = self
-            .session
-            .active_plan_id
+        let active_plan = self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -3059,9 +2868,7 @@ impl HarnessBroker {
     }
 
     fn active_plan_awaits_input(&self) -> Result<bool> {
-        Ok(self
-            .session
-            .active_plan_id
+        Ok(self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -3072,9 +2879,7 @@ impl HarnessBroker {
     }
 
     fn active_plan_has_acceptance(&self) -> Result<bool> {
-        Ok(self
-            .session
-            .active_plan_id
+        Ok(self.current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -3085,14 +2890,11 @@ impl HarnessBroker {
     }
 
     fn active_plan_acceptance(&self) -> Result<PlanRecord> {
-        let plan_id = self
-            .session
-            .active_plan_id
-            .as_deref()
-            .context("no active plan")?;
+        let current_plan_id = self.current_plan_id()?;
+        let plan_id = current_plan_id.as_deref().context("no active plan")?;
         let plan = self
             .store
-            .load_plan(plan_id)?
+            .load_plan(&plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
             plan.state == PlanState::AwaitingReview && plan.acceptance.is_some(),
@@ -3474,14 +3276,11 @@ impl HarnessBroker {
     }
 
     fn active_elicitation_plan(&self) -> Result<PlanRecord> {
-        let plan_id = self
-            .session
-            .active_plan_id
-            .as_deref()
-            .context("no active plan")?;
+        let current_plan_id = self.current_plan_id()?;
+        let plan_id = current_plan_id.as_deref().context("no active plan")?;
         let plan = self
             .store
-            .load_plan(plan_id)?
+            .load_plan(&plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
             plan.state == PlanState::AwaitingInput && plan.elicitation.is_some(),
@@ -3508,10 +3307,7 @@ impl HarnessBroker {
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut accumulated_event = Vec::new();
         loop {
-            let plan_id = self
-                .session
-                .active_plan_id
-                .clone()
+            let plan_id = self.current_plan_id()?
                 .context("planning continuation has no active plan")?;
             let before_document = self
                 .plan_file
@@ -3678,7 +3474,7 @@ Planning continuation: turn {} of {}.",
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
             && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_err()
         {
-            let reviewed = self.session.active_plan_id.as_deref()
+            let reviewed = self.current_plan_id()?.as_deref()
                 .map(|id| self.store.load_plan(id)).transpose()?.flatten()
                 .is_some_and(|plan| plan.question_ledger.resolution.iter().any(|answer|
                     answer.kind == crate::plan::PlanQuestionResolutionKind::Answered));
@@ -3798,14 +3594,13 @@ Planning continuation: turn {} of {}.",
         }
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
             && !input.text().contains("Active declaration design:") {
-            let plan_id = self
-                .session
-                .active_plan_id
+            let current_plan_id = self.current_plan_id()?;
+            let plan_id = current_plan_id
                 .as_deref()
                 .context("planning turn has no active plan")?;
             let document = self
                 .plan_file
-                .read_working_document(&self.session.id, plan_id)?;
+                .read_working_document(&self.session.id, &plan_id)?;
             let context = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
             input = match input {
                 BackendInput::Text { text } => BackendInput::from_text(format!("{context}{text}")),
@@ -4042,9 +3837,7 @@ Planning continuation: turn {} of {}.",
 
         if mode == PromptMode::Plan || (mode == PromptMode::PlanDiscussion
             && (!output.plan_edit.is_empty() || !output.design_patch.is_empty() || output.plan_submit.is_some())) {
-            let mut plan = self
-                .session
-                .active_plan_id
+            let mut plan = self.current_plan_id()?
                 .as_deref()
                 .map(|plan_id| self.store.load_plan(plan_id))
                 .transpose()?
@@ -4387,7 +4180,7 @@ Planning continuation: turn {} of {}.",
         self.store.save_exchange(&interaction)?;
         let can_finalize_incrementally = !continuing
             && mode == PromptMode::Chat
-            && self.session.active_plan_id.is_none()
+            && self.current_plan_id()?.is_none()
             && interaction.plan_id.is_none()
             && interaction.execution_id.is_none()
             && interaction.elicitation.is_none()
@@ -5020,12 +4813,12 @@ Planning continuation: turn {} of {}.",
                                 let result = if interaction.plan_id.as_deref() != Some(plan_id.as_str()) {
                                     Err(anyhow::anyhow!("review belongs to another plan"))
                                 } else if let Some(revision) = revision {
-                                    self.capture_plan_revision(&plan_id, revision).and_then(|source| {
+                                    self.observer.capture_plan_revision(&plan_id, revision).and_then(|source| {
                                         anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&source.document)?) == digest,
                                             "plan revision changed before opening");
                                         Ok(source)
                                     })
-                                } else { self.capture_plan_review(&plan_id, &digest) };
+                                } else { self.observer.capture_plan_review(&plan_id, &digest) };
                                 let _ = response.send(result);
                             }
                             RevisionReviewRequest::Decide { method, params, response } => {
@@ -5034,9 +4827,9 @@ Planning continuation: turn {} of {}.",
                                     Err(anyhow::anyhow!("review decision belongs to another plan"))
                                 } else {
                                     match method {
-                                        HarnessMethod::PlanAcceptanceBegin => self.begin_plan_acceptance(params),
+                                        HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)).await,
                                         HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)).await,
-                                        HarnessMethod::PlanCancel => self.cancel_plan(),
+                                        HarnessMethod::PlanCancel => self.cancel_plan(params),
                                         HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
                                         HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
                                         _ => Err(anyhow::anyhow!("unsupported revision review decision")),
@@ -6022,7 +5815,7 @@ Planning continuation: turn {} of {}.",
         &self,
         interaction: Option<&Exchange>,
     ) -> Result<crate::session::state_machine::SessionPhase> {
-        let active_plan = self.session.active_plan_id.as_deref()
+        let active_plan = self.current_plan_id()?.as_deref()
             .map(|id| self.store.load_plan(id)).transpose()?.flatten();
         let mut status = crate::session::state_machine::SessionPhase::resolve(
             active_plan.as_ref(),
@@ -6130,13 +5923,8 @@ Planning continuation: turn {} of {}.",
         ))
     }
 
-    fn begin_plan_acceptance(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = params
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| self.session.active_plan_id.clone())
-            .context("no plan awaits review")?;
+    async fn begin_plan_acceptance(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan_id = required_text(&params, "plan_id")?;
         let mut plan = self
             .store
             .load_plan(&plan_id)?
@@ -6156,7 +5944,7 @@ Planning continuation: turn {} of {}.",
             );
         }
         anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
-        let reviewed = self.capture_plan_review(&plan.id, &review_digest)?;
+        let reviewed = self.observer.capture_plan_review(&plan.id, &review_digest)?;
         if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.plan_id == plan.id) {
             anyhow::ensure!(execution.pending_revision_reason.is_some(), "execution already exists. Use /goal resume to continue it");
             let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
@@ -6196,20 +5984,16 @@ Planning continuation: turn {} of {}.",
                 "saved plan source changed after the review action"
             );
         }
+        let mut events = self.select_review_task(&plan).await?;
         acceptance.saved_source_digest = Some(reviewed.saved_digest);
         plan.acceptance = Some(acceptance);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        self.session.active_plan_id = Some(plan.id.clone());
+
         self.save_session()?;
         let snapshot = self.snapshot()?;
-        Ok((
-            serde_json::to_value(&snapshot)?,
-            vec![self.event(
-                "plan_acceptance_started",
-                serde_json::to_value(&snapshot.active_elicitation)?,
-            )?],
-        ))
+        events.push(self.event("plan_acceptance_started", serde_json::to_value(&snapshot.active_elicitation)?)?);
+        Ok((serde_json::to_value(&snapshot)?, events))
     }
 
     fn cancel_plan_acceptance(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6246,7 +6030,7 @@ Planning continuation: turn {} of {}.",
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        self.session.active_plan_id = Some(plan.id.clone());
+
         self.save_session()?;
         records.complete(json!({"count":selected.len(), "version":document.version}));
         let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
@@ -6258,12 +6042,7 @@ Planning continuation: turn {} of {}.",
         let trace = crate::plan::edit_trace::PlanEditTrace::new(Arc::clone(&self.trace), &self.session.id, "plan.entity.rename", &params);
         let mutation = trace.stage("rename.total");
         let preflight = trace.stage("rename.preflight");
-        let plan_id = params
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| self.session.active_plan_id.clone())
-            .context("no plan awaits review")?;
+        let plan_id = required_text(&params, "plan_id")?;
         let symbol = params.get("symbol").and_then(Value::as_str);
         let entity_name = params.get("entity_name").and_then(Value::as_str).unwrap_or_default().to_owned();
         let new_name = required_text(&params, "name")?;
@@ -6311,7 +6090,7 @@ Planning continuation: turn {} of {}.",
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
-        self.session.active_plan_id = Some(plan.id.clone());
+
         self.save_session()?;
         records.complete(json!({"version":version}));
         let payload = json!({
@@ -6386,12 +6165,7 @@ Planning continuation: turn {} of {}.",
             "execution mode {} is unavailable for this backend",
             execution_mode.label()
         );
-        let plan_id = params
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| self.session.active_plan_id.clone())
-            .context("no plan awaits review")?;
+        let plan_id = required_text(&params, "plan_id")?;
         let mut plan = self
             .store
             .load_plan(&plan_id)?
@@ -6411,7 +6185,7 @@ Planning continuation: turn {} of {}.",
             );
         }
         anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
-        let reviewed = self.capture_plan_review(&plan.id, &digest)?;
+        let reviewed = self.observer.capture_plan_review(&plan.id, &digest)?;
         let accepted_document = &reviewed.document;
         let accepted_render = &reviewed.rendered;
         anyhow::ensure!(accepted_document.design.is_some(), "execution requires a semantic plan");
@@ -6431,6 +6205,7 @@ Planning continuation: turn {} of {}.",
             anyhow::ensure!(self.capability.native_compact, "current backend does not support context compaction");
             anyhow::ensure!(self.session.backend_session_id.is_some(), "current session has no provider conversation to compact");
         }
+        let mut selection_events = self.select_review_task(&plan).await?;
         let compact_event = if self.session.plan_compact {
             self.compact_session().await?.1
         } else {
@@ -6443,7 +6218,6 @@ Planning continuation: turn {} of {}.",
         plan.acceptance = None;
         if plan.state != PlanState::Accepted { PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?; }
 
-        self.session.active_plan_id = Some(plan.id.clone());
         let objective = format!("Complete accepted plan: {}", plan.title);
         let now_ms = self.clock.now_ms();
         let goal = GoalRecord {
@@ -6504,7 +6278,8 @@ Planning continuation: turn {} of {}.",
         execution_record.progress = Default::default();
         execution_record.observed_source = execution_record.progress.source_digest.clone();
         self.store.accept_task(&self.session, &task, &goal, &plan, &execution_record, &lifecycle, &self.client_id)?;
-        let mut pre_execution_event = compact_event;
+        selection_events.extend(compact_event);
+        let mut pre_execution_event = selection_events;
         self.emit_live(
             BackendEvent {
             received_at_ms: None,
@@ -6614,12 +6389,7 @@ Planning continuation: turn {} of {}.",
     }
 
     async fn request_plan_changes(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = params
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| self.session.active_plan_id.clone())
-            .context("no plan awaits review")?;
+        let plan_id = required_text(&params, "plan_id")?;
         let mut plan = self
             .store
             .load_plan(&plan_id)?
@@ -6633,7 +6403,7 @@ Planning continuation: turn {} of {}.",
             .and_then(Value::as_str)
             .or(plan.review_digest.as_deref())
             .context("submitted plan digest is missing")?;
-        let reviewed = self.capture_plan_review(&plan.id, expected_digest)?;
+        let reviewed = self.observer.capture_plan_review(&plan.id, expected_digest)?;
         if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,
@@ -6682,6 +6452,7 @@ Planning continuation: turn {} of {}.",
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
+        let mut selection_events = self.select_review_task(&plan).await?;
         let instruction = PlanPrompt::with_manual_changes(PlanPrompt::revision(
             &document_json,
             &feedback,
@@ -6691,7 +6462,6 @@ Planning continuation: turn {} of {}.",
         PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
         plan.generation.reset();
         self.store.save_plan(&plan)?;
-        self.session.active_plan_id = Some(plan.id.clone());
 
         self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
@@ -6721,7 +6491,9 @@ Planning continuation: turn {} of {}.",
             .await
         {
             Ok((mut result, mut event)) => {
-                event.insert(0, leading_event);
+                selection_events.push(leading_event);
+                selection_events.append(&mut event);
+                event = selection_events;
                 result["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
                 Ok((result, event))
             }
@@ -6729,16 +6501,13 @@ Planning continuation: turn {} of {}.",
         }
     }
 
-    fn cancel_plan(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = self
-            .session
-            .active_plan_id
-            .clone()
-            .context("no plan awaits review")?;
+    fn cancel_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan_id = required_text(&params, "plan_id")?;
         let mut plan = self
             .store
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
+        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
         if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
             .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
             let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
@@ -6790,11 +6559,22 @@ Planning continuation: turn {} of {}.",
                 self.store.save_exchange(&exchange)?;
             }
         }
-        self.session.active_plan_id = None;
 
-        self.save_session()?;
+        if let Some(mut task) = self.store.list_task(&self.session.id)?.into_iter()
+            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str())) {
+            task.status = crate::task::TaskStatus::Cancelled;
+            task.reason = Some("Plan cancelled by user".into());
+            task.generation += 1;
+            task.updated_at_ms = self.clock.now_ms();
+            self.store.save_task(&task)?;
+            if self.session.current_task_id.as_deref() == Some(task.id.as_str()) {
+                self.session.current_task_id = None;
+                self.session.goal_id = None;
+                self.save_session()?;
+            }
+        }
         Ok((
-            serde_json::to_value(&plan)?,
+            serde_json::to_value(self.snapshot()?)?,
             vec![self.event(
                 "plan_cancelled",
                 json!({ "plan": plan, "lifecycle": lifecycle }),
@@ -6803,10 +6583,7 @@ Planning continuation: turn {} of {}.",
     }
 
     async fn retry_plan(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = self
-            .session
-            .active_plan_id
-            .clone()
+        let plan_id = self.current_plan_id()?
             .context("no failed plan can be retried")?;
         let mut plan = self
             .store
@@ -6841,18 +6618,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     /// Read a submitted revision after validating its owning session and revision range.
-    pub(crate) fn capture_plan_revision(
-        &self,
-        plan_id: &str,
-        revision: u32,
-    ) -> Result<crate::plan::review_source::PlanReviewSource> {
-        let plan = self.store.load_plan(plan_id)?.context("plan artifact not found")?;
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        anyhow::ensure!(revision > 0 && revision <= plan.model_revision, "plan revision is unavailable");
-        let mut source = self.plan_file.capture_revision_source(&self.session.id, &plan.id, revision)?;
-        source.execution_review = self.execution_review(plan_id)?;
-        Ok(source)
-    }
 
     fn read_plan_declaration(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let plan_id = required_text(&params, "plan_id")?;
@@ -6872,43 +6637,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             crate::plan::calls::present(&path, design.proposed.get(&path).context("proposed declaration not found")?, design.proposed_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text.clone()
         };
         Ok((json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }), Vec::new()))
-    }
-
-    fn activate_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = required_text(&params, "plan_id")?;
-        let plan = self
-            .store
-            .load_plan(&plan_id)?
-            .context("plan artifact not found")?;
-        anyhow::ensure!(
-            plan.session_id == self.session.id,
-            "plan belongs to another session"
-        );
-        anyhow::ensure!(
-            !plan.working_path.is_empty(),
-            "plan artifact is not ready for review"
-        );
-        if let Some(revision) = params.get("revision").filter(|value| !value.is_null()) {
-            let revision: u32 = serde_json::from_value(revision.clone())?;
-            let stranded = plan.state == PlanState::Accepted && !self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.plan_id == plan.id);
-            if revision != plan.model_revision || (plan.state != PlanState::AwaitingReview && !stranded) {
-                let source = self.capture_plan_revision(&plan.id, revision)?;
-                let mut historical = serde_json::to_value(&plan)?;
-                historical["title"] = serde_json::json!(source.document.title);
-                historical["working_path"] = serde_json::json!(source.path);
-                historical["document_version"] = serde_json::json!(source.document.version);
-                historical["model_revision"] = serde_json::json!(revision);
-                historical["historical_revision"] = serde_json::json!(revision);
-                historical["review_digest"] = serde_json::json!(crate::plan::digest(&serde_json::to_vec(&source.document)?));
-                return Ok((historical, Vec::new()));
-            }
-        }
-        self.session.active_plan_id = Some(plan.id.clone());
-        self.save_session()?;
-        Ok((
-            serde_json::to_value(&plan)?,
-            vec![self.event("plan_activated", serde_json::to_value(plan)?)?],
-        ))
     }
 
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -7206,7 +6934,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         Ok(continuing)
     }
 
-
     fn active_goal(&self) -> Result<GoalRecord> {
         let goal_id = self.session.goal_id.as_deref().context("no active goal")?;
         self.store
@@ -7262,14 +6989,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         comment.created_at_ms = self.clock.now_ms();
         self.store.save_exchange_comment(&comment)?;
         Ok((serde_json::to_value(comment)?, Vec::new()))
-    }
-
-    fn list_exchange_review(&self) -> Result<Vec<Exchange>> {
-        let mut interaction_list = self.store.list_exchange(&self.session.id)?;
-        for interaction in &mut interaction_list {
-            interaction.comment = self.store.list_exchange_comment(&interaction.id)?;
-        }
-        Ok(interaction_list)
     }
 
     async fn request_exchange_changes(
@@ -7571,77 +7290,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 payload: serde_json::to_value(child)?,
             }],
         ))
-    }
-
-    fn list_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let scope = params
-            .get("scope")
-            .and_then(Value::as_str)
-            .unwrap_or("repo");
-        let session = if scope == "all" {
-            self.store.list_session(None)?
-        } else {
-            let workspace = params
-                .get("workspace")
-                .and_then(Value::as_str)
-                .map(Path::new)
-                .map(crate::workspace::resolve)
-                .transpose()?
-                .map(|kind| match kind {
-                    WorkspaceKind::Git(path) | WorkspaceKind::Untracked(path) => {
-                        path.to_string_lossy().into_owned()
-                    }
-                })
-                .unwrap_or_else(|| self.session.workspace.clone());
-            self.store.list_session(Some(&workspace))?
-        };
-        Ok((serde_json::to_value(session)?, Vec::new()))
-    }
-
-    fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let session_id = required_text(&params, "session_id")?;
-        let preview_session = self
-            .store
-            .load_session(&session_id)?
-            .context("session not found")?;
-        let interaction = self.store.list_exchange(&session_id)?;
-        let plan_list = self.store.list_plan(&session_id)?;
-        let agent_run_list = self
-            .store
-            .list_agent_run(&session_id)?
-            .into_iter()
-            .filter(|agent| !agent.is_primary())
-            .collect::<Vec<_>>();
-        let mut agent_exchange_list = Vec::new();
-        for run in &agent_run_list {
-            agent_exchange_list.extend(self.store.list_agent_exchange(&run.id)?);
-        }
-        let timeline = TimelineProjector::build(TimelineProjection {
-            interaction_list: interaction.clone(),
-            plan_list: &plan_list,
-            lifecycle_list: self.store.list_plan_lifecycle(&session_id)?,
-            execution_list: self.store.list_plan_execution(&session_id)?,
-            deviation_list: self.store.list_plan_deviation(&session_id)?,
-            audit_list: self.store.list_plan_audit(&session_id)?,
-            resolution_list: self.store.list_plan_resolution(&session_id)?,
-            agent_run_list: agent_run_list.clone(),
-            agent_exchange_list: agent_exchange_list.clone(),
-            session_event_list: self.store.list_session_event(&session_id)?,
-            plan_file: &self.plan_file,
-        })?;
-        let timeline = TimelineProjector::with_checks(timeline,crate::checks::CheckRunner::saved_history(&self.data_root.join(&session_id).join("checks"))?);
-        let preview = SessionPreview {
-            lines: preview_lines(&timeline)?,
-            session: preview_session,
-            exchange: interaction,
-            timeline,
-            agent: AgentSnapshot {
-                summary: agent_summaries(&agent_run_list, &agent_exchange_list),
-                run: agent_run_list,
-                exchange: agent_exchange_list,
-            },
-        };
-        Ok((serde_json::to_value(preview)?, Vec::new()))
     }
 
     async fn resume_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -8239,7 +7887,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             &self.session.id,
             event,
             json!({
-                "active_plan_id": self.session.active_plan_id,
+                "active_plan_id": self.current_plan_id().ok().flatten(),
                 "fields": fields,
             }),
         );
@@ -8823,7 +8471,6 @@ mod test {
             Some("provider failed".into()));
     }
 
-
     use super::*;
 
     #[cfg(windows)]
@@ -9027,7 +8674,7 @@ mod test {
             &plan.id, plan.model_revision, document.version, document.clone()).unwrap();
         plan.review_digest = Some(checksum.clone());
         broker.store.save_plan(&plan).unwrap();
-        let source = broker.capture_plan_review(&plan.id, &checksum).unwrap();
+        let source = broker.observer.capture_plan_review(&plan.id, &checksum).unwrap();
         let review = crate::plan::review_document::PlanReviewDocument::new(
             forge_buffer::identity::DocumentId("delete-tests".into()), forge_buffer::identity::ViewId("view".into()),
             source, Default::default(), None).unwrap();
@@ -9072,7 +8719,7 @@ mod test {
         assert!(broker.delete_plan_tests(params).unwrap_err().to_string().contains("plan changed"));
         assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), updated);
         let reopened: PlanRecord = serde_json::from_value(result["plan"].clone()).unwrap();
-        let source = broker.capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap()).unwrap();
+        let source = broker.observer.capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("keep"));
         let review = crate::plan::review_document::PlanReviewDocument::new(
             forge_buffer::identity::DocumentId("after-delete".into()), forge_buffer::identity::ViewId("after-view".into()),
@@ -9093,7 +8740,7 @@ mod test {
         assert_eq!(saved_revision, document);
         assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
         broker.capability.execution_mode_list = vec![PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo];
-        broker.begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest})).unwrap();
+        broker.begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest})).await.unwrap();
         broker.cancel_plan_acceptance().unwrap();
         assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
         let invalid = broker.dispatch(Request { id: 2, method: "plan.accept".into(),
@@ -9133,7 +8780,7 @@ mod test {
         assert!(result.response.error().is_none(),"{:?}",result.response.error());
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(plan.state,PlanState::AwaitingReview);
-        let source = broker.capture_plan_review(&plan.id,plan.review_digest.as_deref().unwrap()).unwrap();
+        let source = broker.observer.capture_plan_review(&plan.id,plan.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("requested_change"));
         let line = source.rendered.navigation.anchor.iter().find(|anchor| matches!(anchor.target,crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().line;
         let result = broker.dispatch(Request { id:2,method:"plan.request_changes".into(),params:json!({"plan_id":plan.id,"comment":"Refine the API name","annotations":[{"start_line":line,"end_line":line,"body":"Use reviewed_change"}]}) }).await;
@@ -9143,7 +8790,7 @@ mod test {
         revised.manual_changes = vec!["Renamed requested_change to reviewed_change".into(),
             "Removed planned tests: tests/change.rs::obsolete_case".into()];
         broker.store.save_plan(&revised).unwrap();
-        let source = broker.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
+        let source = broker.observer.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
         for (path, expected) in [("Objective", &overview.objective), ("Design", &overview.design),
@@ -9258,7 +8905,7 @@ mod test {
         assert!(passed_phase.summary.as_ref().is_some_and(|summary| !summary.is_empty()));
         assert_eq!(text.matches("Plan accepted:").count(), 1);
         assert!(!text.contains("Accept plan:") && !text.contains("Execution started") && !text.contains("Plan turn complete"));
-        let review = broker.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
+        let review = broker.observer.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(review.execution_review.unwrap().contains("Verification assessments"));
     }
 
@@ -9284,7 +8931,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, _: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             if self.cancelled { return Err(anyhow::Error::new(TurnCancelled)) }
@@ -9346,7 +8992,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             let context = request.control_context.unwrap();
@@ -9420,7 +9065,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
@@ -9535,9 +9179,9 @@ mod test {
                     assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), before,
                         "pending revision resume started provider work before review");
                 }
-                let events = if decision == "reject" { broker.cancel_plan().unwrap().1 }
-                    else if decision == "changes" { broker.request_plan_changes(json!({"comment":"Retain the approved scope"})).await.unwrap().1 }
-                    else { broker.begin_plan_acceptance(json!({"plan_id":plan.id})).unwrap().1 };
+                let events = if decision == "reject" { broker.cancel_plan(json!({"plan_id":plan.id})).unwrap().1 }
+                    else if decision == "changes" { broker.request_plan_changes(json!({"plan_id":plan.id,"comment":"Retain the approved scope"})).await.unwrap().1 }
+                    else { broker.begin_plan_acceptance(json!({"plan_id":plan.id})).await.unwrap().1 };
                 let updated = broker.snapshot().unwrap().goal_execution.unwrap();
                 assert_eq!(updated.id, execution_id);
                 assert_eq!(updated.phase, execution.phase);
@@ -9547,7 +9191,7 @@ mod test {
                 assert_eq!(updated.state, if decision == "paused_accept" { PlanExecutionState::Paused } else { PlanExecutionState::Active });
                 if decision == "reject" {
                     let restored = broker.store.load_plan(&plan.id).unwrap().unwrap();
-                    let source = broker.capture_plan_review(&plan.id, restored.review_digest.as_deref().unwrap()).unwrap();
+                    let source = broker.observer.capture_plan_review(&plan.id, restored.review_digest.as_deref().unwrap()).unwrap();
                     assert_eq!(source.document, original);
                     assert_eq!(updated.revision_history[0].approval, "rejected");
                 }
@@ -9568,7 +9212,7 @@ mod test {
             assert!(revised.document.design.contains("score reset"));
             assert!(revised.proposed.contains_key("added.rs"));
             assert!(!revised.baseline.contains_key("added.rs"), "implemented additions must not become the original baseline");
-            assert!(broker.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
+            assert!(broker.observer.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
         }
     }
 
@@ -9662,7 +9306,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
@@ -9846,7 +9489,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -10059,7 +9701,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
@@ -10208,7 +9849,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -10535,7 +10175,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -10575,7 +10214,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -10637,7 +10275,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -10755,7 +10392,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>)
             -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, apply_invocation};
@@ -10794,6 +10430,57 @@ mod test {
                 _ => panic!("unexpected planning continuation {turn}"),
             }
             Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn plan_queries_preserve_the_selected_task_and_pending_review() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.submit_prompt_inner(json!({"text":"/plan preserve review ownership"})).await.unwrap();
+        let current = broker.snapshot().unwrap().active_plan.unwrap();
+        let mut older = current.clone();
+        older.id = "older-review".into();
+        broker.store.save_plan(&older).unwrap();
+        let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
+        for params in [json!({"plan_id":older.id}), json!({"plan_id":older.id,"revision":older.model_revision})] {
+            let result = broker.dispatch(Request { id:1,method:"plan.get".into(),params }).await;
+            assert!(result.response.error().is_none(), "{:?}",result.response.error());
+            assert_eq!(result.response.result().unwrap()["id"], older.id);
+            assert_eq!(broker.current_plan_id().unwrap().as_deref(), Some(current.id.as_str()));
+            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected);
+        }
+        for (method,params) in [
+            ("plan.get",json!({"plan_id":"missing"})),
+            ("session.preview",json!({"session_id":"missing"})),
+            ("plan.declaration",json!({"plan_id":"missing","path":"src/lib.rs","revision":1})),
+        ] {
+            let result = broker.dispatch(Request { id:2,method:method.into(),params }).await;
+            assert!(result.response.error().is_some(), "{method}");
+            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected, "{method}");
+            assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::AwaitingReview);
+        }
+        assert!(broker.observer.plan(json!({"plan_id":older.id})).is_ok());
+        assert_eq!(broker.current_plan_id().unwrap().as_deref(), Some(current.id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn failed_metadata_requests_preserve_an_unrelated_goal_task() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.create_task(crate::task::TaskKind::Goal, "Unrelated work".into(), None, None).unwrap();
+        let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
+        for (method,params) in [
+            ("session.preview",json!({"session_id":"missing"})),
+            ("plan.get",json!({"plan_id":"missing"})),
+            ("session.rename",json!({})),
+            ("exchange.comment.save",json!({})),
+        ] {
+            let result = broker.dispatch(Request { id:1,method:method.into(),params }).await;
+            assert!(result.response.error().is_some(), "{method}");
+            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected, "{method}");
         }
     }
 
@@ -10870,10 +10557,18 @@ mod test {
         let params = json!({"review":input,"draft_source_digest":digest,"draft_annotation":[{
             "id":"question","kind":"question","source":{"start_line":line,"end_line":line,"body":"Why this API?"}
         }]});
+        let mut other = before.clone();
+        other.id = "different-current-plan".into();
+        broker.store.save_plan(&other).unwrap();
+        broker.create_task(crate::task::TaskKind::Plan, "Different task".into(), Some(other.id.clone()), None).unwrap();
+        let selected_task = serde_json::to_value(broker.current_task().unwrap()).unwrap();
         let result = broker.dispatch(Request { id:2,method:"plan.questions.answer".into(),params:params.clone() }).await;
         assert!(result.response.error().is_none(), "{:?}", result.response.error());
         let snapshot = broker.snapshot().unwrap();
         let after = snapshot.active_plan.as_ref().unwrap();
+        assert_eq!(after.id, other.id);
+        assert_eq!(snapshot.exchange.last().unwrap().plan_id.as_deref(), Some(before.id.as_str()));
+        assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected_task);
         assert_eq!(after.review_digest, before.review_digest);
         assert_eq!(after.model_revision, before.model_revision);
         assert_eq!(broker.session.backend_session_id, thread);
@@ -10930,7 +10625,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -11038,7 +10732,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -11113,7 +10806,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -11163,7 +10855,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -11221,7 +10912,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -11318,7 +11008,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(
             &self,
@@ -11503,7 +11192,6 @@ mod test {
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
 
-
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -11670,7 +11358,6 @@ mod test {
             current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
             created_at_ms: 0,
             updated_at_ms: 0,
-            active_plan_id: None,
             goal_id: None,
             lease_owner: Some("one".into()),
             lease_expires_at_ms: Some(20),
@@ -11906,7 +11593,6 @@ mod test {
         );
         assert!(run_list[0].provider_thread_id.is_none());
     }
-
 
     #[tokio::test]
     async fn publishes_and_persists_resolved_model_before_provider_turn_starts() {
@@ -12181,9 +11867,6 @@ mod test {
             settled_json
         );
     }
-
-
-
 
     #[tokio::test]
     async fn shares_prompt_history_across_repository_sessions() {
@@ -13567,7 +13250,7 @@ mod test {
             assert!(planned.response.error().is_none());
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             assert!(matches!(plan.state, PlanState::AwaitingInput | PlanState::AwaitingReview));
-            let cancelled = broker.dispatch(Request { id:2, method:"plan.cancel".into(), params:json!({}) }).await;
+            let cancelled = broker.dispatch(Request { id:2, method:"plan.cancel".into(), params:json!({"plan_id":plan.id}) }).await;
             assert!(cancelled.response.error().is_none());
             let snapshot = broker.snapshot().unwrap();
             assert!(snapshot.active_plan.is_none());
@@ -13579,7 +13262,6 @@ mod test {
                 .all(|exchange| exchange.completed_at_ms.is_some() && !exchange.awaiting_input));
         }
     }
-
 
     #[tokio::test]
     async fn cancel_terminates_a_failed_plan_without_reopening_input() {
@@ -13970,8 +13652,6 @@ mod test {
         assert_eq!(restored[1].turn.len(), 1);
     }
 
-
-
     #[tokio::test]
     async fn rejected_agent_admissions_preserve_names_without_orphaned_identity() -> Result<()> {
         let repository = repository();
@@ -14027,7 +13707,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, _request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::backend::{ProviderAddress, TurnBoundary};
@@ -14174,7 +13853,6 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
 
         async fn prompt_stream(&self, request: BackendRequest, event_sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             let mut output = self.inner.prompt_stream(request, event_sink).await?;

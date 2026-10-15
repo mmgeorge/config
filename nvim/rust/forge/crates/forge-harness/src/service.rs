@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
@@ -161,16 +161,15 @@ impl HarnessService {
                 let mut source = if let Some(source) = controller.revision_review.capture(plan_id, digest, *revision).await? {
                     source
                 } else {
-                    let broker = controller.broker.lock().await;
                     if let Some(revision) = revision {
-                        let source = broker.capture_plan_revision(plan_id, *revision)?;
+                        let source = controller.observer.capture_plan_revision(plan_id, *revision)?;
                         ensure!(
                             crate::plan::digest(&serde_json::to_vec(&source.document)?) == *digest,
                             "plan revision changed before opening"
                         );
                         source
                     } else {
-                        broker.capture_plan_review(plan_id, digest)?
+                        controller.observer.capture_plan_review(plan_id, digest)?
                     }
                 };
                 if source.document.design.is_some() {
@@ -391,7 +390,7 @@ impl HarnessService {
         let capture_stage = edit_trace.as_ref().map(|trace| trace.stage("service.capture_submission"));
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete
+            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete
         ) {
             let params = request
                 .params
@@ -465,7 +464,7 @@ impl HarnessService {
                 });
             }
         }
-        let result = route_request(registry, session_id, request, method, sink, &self.syntax).await;
+        let result = Box::pin(route_request(registry, session_id, request, method, sink, &self.syntax)).await;
         if let Some(stage) = edit_total { stage.complete(json!({"status":if result.is_ok() { "completed" } else { "failed" }})); }
         drop(prompt_admission);
         result
@@ -600,6 +599,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    observer: Arc<crate::broker::BrokerObserver>,
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
@@ -616,7 +616,8 @@ struct SessionController {
     cancellation: Arc<TurnCancellation>,
     backend: Arc<dyn crate::backend::Backend>,
     catalog_request: Arc<RwLock<crate::backend::BackendCatalogRequest>>,
-    mcp_discovery: Mutex<crate::backend::mcp::McpDiscovery>,
+    mcp_revision: AtomicU64,
+    mcp_discovery: Mutex<(u64, crate::backend::mcp::McpDiscovery)>,
     permission: Arc<crate::backend::approval::PermissionCoordinator>,
 }
 
@@ -639,6 +640,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            observer: broker.observer(),
             timeout_task: Mutex::new(None),
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
@@ -654,7 +656,8 @@ impl SessionController {
             cancellation: broker.turn_cancellation(),
             backend: broker.backend_handle(),
             catalog_request: Arc::new(RwLock::new(catalog_request)),
-            mcp_discovery: Mutex::new(crate::backend::mcp::McpDiscovery::default()),
+            mcp_revision: AtomicU64::new(0),
+            mcp_discovery: Mutex::new((0, crate::backend::mcp::McpDiscovery::default())),
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
         })
@@ -1053,6 +1056,41 @@ async fn route_request(
     }
     let controller = registry.resolve(&session_id).await?;
     controller.attach_compaction(message_sink).await?;
+    if let Some(value) = controller.observer.query(method, request.params.clone())? {
+        message_sink.send_response(Response::success(request.id, value)?).await?;
+        return Ok(());
+    }
+    if method == HarnessMethod::BackendModels {
+        let catalog = controller.catalog_request.read().await.clone();
+        let selected = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
+            .load_session(&session_id)?.context("model catalog session is missing")?;
+        let mut model_list = tokio::time::timeout(Duration::from_secs(30), controller.backend.model_list(crate::backend::BackendRequest {
+            execution_owner: catalog.execution_owner,
+            harness_session_id: catalog.harness_session_id,
+            workspace: catalog.workspace,
+            input: crate::backend::BackendInput::from_text(String::new()),
+            mode: crate::backend::PromptMode::Chat,
+            model: selected.model,
+            effort: selected.effort,
+            context_window: selected.context_window,
+            service_tier: selected.service_tier,
+            access: catalog.access,
+            execution_mode: catalog.execution_mode,
+            backend_session_id: catalog.backend_session_id,
+            control_context: None,
+        })).await.context("model catalog exceeded 30 seconds")??;
+        let preference = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
+            .load_preference(&selected.workspace, &selected.backend)?;
+        crate::backend::select_model_settings(&mut model_list, preference.as_ref());
+        let event = if let Ok(mut broker) = controller.broker.try_lock() {
+            broker.resolve_default_model(&model_list)?
+        } else {
+            Vec::new()
+        };
+        for event in event { message_sink.send_event(event).await?; }
+        message_sink.send_response(Response::success(request.id, model_list)?).await?;
+        return Ok(());
+    }
     if method == HarnessMethod::InputTimeoutConfigure {
         let catalog = controller.catalog_request.read().await.clone();
         let mut settings = crate::settings::SettingsStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
@@ -1164,19 +1202,20 @@ async fn route_request(
     if method == HarnessMethod::BackendSetup {
         let install = request.params.get("install").and_then(Value::as_bool).unwrap_or(false);
         let result = controller.backend.setup(controller.catalog_request.read().await.clone(), install).await?;
-        *controller.mcp_discovery.lock().await = Default::default();
+        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
         message_sink.send_response(Response::success(request.id, result)?).await?;
         return Ok(());
     }
     if method == HarnessMethod::BackendAuthenticate {
         let method = request.params["method"].as_str().context("authentication method is required")?.to_owned();
         controller.backend.authenticate(controller.catalog_request.read().await.clone(), method).await?;
-        *controller.mcp_discovery.lock().await = Default::default();
+        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
         message_sink.send_response(Response::success(request.id, json!({"authenticated":true}))?).await?;
         return Ok(());
     }
     if method == HarnessMethod::BackendCapabilities {
-        let manifest = controller.backend.capabilities(controller.catalog_request.read().await.clone()).await?;
+        let manifest = tokio::time::timeout(Duration::from_secs(30), controller.backend.capabilities(controller.catalog_request.read().await.clone()))
+            .await.context("capability discovery exceeded 30 seconds")??;
         message_sink.send_response(Response::success(request.id, manifest)?).await?;
         return Ok(());
     }
@@ -1226,12 +1265,12 @@ async fn route_request(
         let provider = request.params["provider"].as_str().context("child model catalog requires provider")?;
         let provider = crate::backend::BackendKind::parse(provider)?;
         let catalog = controller.catalog_request.read().await.clone();
-        let models = controller.agent_backend_factory.catalog(provider,crate::backend::BackendRequest {
+        let models = tokio::time::timeout(Duration::from_secs(30), controller.agent_backend_factory.catalog(provider,crate::backend::BackendRequest {
             execution_owner:catalog.execution_owner,harness_session_id:catalog.harness_session_id,workspace:catalog.workspace,
             input:crate::backend::BackendInput::from_text(String::new()),mode:crate::backend::PromptMode::Chat,
             model:"default".into(),effort:"default".into(),context_window:None,service_tier:Default::default(),
             access:catalog.access,execution_mode:catalog.execution_mode,backend_session_id:None,control_context:None,
-        }).await?;
+        })).await.context("child model catalog exceeded 30 seconds")??;
         message_sink.send_response(Response::success(request.id,models)?).await?;
         return Ok(());
     }
@@ -1265,7 +1304,7 @@ async fn route_request(
     let _child_quiescence = if matches!(method, HarnessMethod::GoalPause | HarnessMethod::GoalClear) {
         Some(quiesce_children(&controller).await?)
     } else {None};
-    let mut broker = acquire_request_broker(&controller, method).await?;
+    let (mut broker, _admission) = acquire_request_broker(&controller, method).await?;
     let (data_root, lease_session_id, client_id) = broker.lease_identity();
     let (heartbeat_stop, heartbeat_stopped) = tokio::sync::oneshot::channel();
     let heartbeat = tokio::spawn(run_lease_heartbeat(
@@ -1299,7 +1338,7 @@ async fn route_request(
     let shutdown = method == HarnessMethod::Shutdown;
     let continuation_store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
     let continuation_owner = continuation_store.latest_task_operation(&session_id)?.map(|operation| operation.id);
-    let mut result = broker.dispatch_stream(request, event_sink).await;
+    let mut result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
     event_forwarder.await??;
     let mut continuing = result.response.error().is_none()
         && result.event.iter().any(|event| event.event == "goal_continue_requested");
@@ -1415,7 +1454,7 @@ async fn route_task_transition(
     }
     operation.state = "accepted".into();
     if operation.action["action"] == "configure" {
-        *controller.mcp_discovery.lock().await = Default::default();
+        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
     }
     if let Some(revision) = operation.action.pointer("/config/settings_revision").and_then(Value::as_u64) {
         crate::settings::SettingsStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
@@ -1424,9 +1463,9 @@ async fn route_task_transition(
     retain_configuration_event(&mut store, &operation)?;
     operation.exchange_id = store.list_exchange(&session_id)?.last().map(|exchange| exchange.id.clone());
     sink.send_control_wait(Message::Response(Response::success(request.id, json!({"id":operation.id,"state":operation.state}))?)).await?;
-    let result = execute_task_transition(&registry, &controller, &mut operation, &mut store, sink).await;
+    let result = Box::pin(execute_task_transition(&registry, &controller, &mut operation, &mut store, sink)).await;
     if operation.action["action"] == "configure" {
-        *controller.mcp_discovery.lock().await = Default::default();
+        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
     }
     match result {
         Ok(()) => if operation.state != "superseded" { operation.state = "completed".into(); },
@@ -1592,7 +1631,7 @@ async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, req
         }
         Ok::<(), anyhow::Error>(())
     });
-    let result = broker.dispatch_stream(request, event_sink).await;
+    let result = Box::pin(broker.dispatch_stream(request, event_sink)).await;
     forwarder.await??;
     let continuing = result.event.iter().any(|event| event.event == "goal_continue_requested");
     for event in result.event { sink.send_event(event).await?; }
@@ -1751,10 +1790,28 @@ async fn resume_session(
 async fn acquire_request_broker(
     controller: &SessionController,
     method: HarnessMethod,
-) -> Result<MutexGuard<'_, HarnessBroker>> {
-    let broker = controller.broker.lock();
-    tokio::pin!(broker);
-    if matches!(method, HarnessMethod::GoalPause | HarnessMethod::GoalClear) {
+) -> Result<(MutexGuard<'_, HarnessBroker>, Option<OwnedSemaphorePermit>)> {
+    // Provider requests and check setup retain admission from their owning request lane.
+    let admitted = method.requires_provider_fork() || method == HarnessMethod::ChecksSetup;
+    let admission = if admitted {
+        None
+    } else {
+        match Arc::clone(&controller.execution_admission).try_acquire_owned() {
+            Ok(admission) => Some(admission),
+            Err(_) if matches!(method, HarnessMethod::GoalPause | HarnessMethod::GoalClear) => None,
+            Err(error) => return Err(error).context(
+                "This operation requires a settled session. Use a task transition while execution is active"),
+        }
+    };
+    if admitted || admission.is_some() {
+        let broker = tokio::time::timeout(Duration::from_secs(10), controller.broker.lock())
+            .await
+            .context("Session maintenance did not release the broker within 10 seconds")?;
+        return Ok((broker, admission));
+    }
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let broker = controller.broker.lock();
+        tokio::pin!(broker);
         let session_id = controller
             .catalog_request
             .read()
@@ -1769,8 +1826,11 @@ async fn acquire_request_broker(
                 method == HarnessMethod::GoalClear,
             ) => result?,
         }
-    }
-    Ok(broker.await)
+        Ok(broker.await)
+    })
+    .await
+    .context("Provider execution did not release the session within 10 seconds")?
+    .map(|broker| (broker, None))
 }
 
 async fn quiesce_children(controller: &SessionController) -> Result<crate::agent::AgentQuiescence> {
@@ -1812,7 +1872,7 @@ async fn route_control_request(
         } else {
             if let Some(stage) = revision_lane { stage.complete(json!({"source":"broker"})); }
             let wait = trace.map(|trace| trace.stage("service.broker_lock_wait"));
-            let mut broker = acquire_request_broker(controller, method).await?;
+            let (mut broker, _admission) = acquire_request_broker(controller, method).await?;
             if let Some(stage) = wait { stage.complete(json!({})); }
             let result = broker.dispatch(request.clone()).await;
             (result.response, result.event)
@@ -1832,9 +1892,8 @@ async fn route_control_request(
                     source
                 } else {
                     let wait = trace.map(|trace| trace.stage("service.recapture_lock_wait"));
-                    let broker = controller.broker.lock().await;
                     if let Some(stage) = wait { stage.complete(json!({})); }
-                    broker.capture_plan_review(plan_id, digest)?
+                    controller.observer.capture_plan_review(plan_id, digest)?
                 };
                 if let Some(stage) = capture { stage.complete(json!({"count":source.document.design.as_ref().map_or(0, |design|design.proposed.len())})); }
                 let expected_version = crate::plan::edit_trace::measure(trace, "service.reuse_review_caches", || controller.plan_review.prepare_update(&document, &mut source))?;
@@ -1996,18 +2055,14 @@ async fn route_control_request(
         }
         HarnessMethod::BackendSkills => Some(Response::success(
             request.id,
-            controller
-                .backend
-                .skill_list(catalog_request.clone())
-                .await?,
+            tokio::time::timeout(Duration::from_secs(30), controller.backend.skill_list(catalog_request.clone()))
+                .await.context("skill discovery exceeded 30 seconds")??,
         )?),
         HarnessMethod::BackendMcp => {
-            let server_list = controller
-                .mcp_discovery
-                .lock()
-                .await
-                .snapshot(controller.backend.clone(), catalog_request.clone())
-                .await?;
+            let revision = controller.mcp_revision.load(Ordering::Acquire);
+            let mut discovery = controller.mcp_discovery.lock().await;
+            if discovery.0 != revision { *discovery = (revision, Default::default()); }
+            let server_list = discovery.1.snapshot(controller.backend.clone(), catalog_request.clone()).await?;
             Some(Response::success(request.id, server_list)?)
         }
         _ => None,
@@ -2450,6 +2505,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_queries_complete_while_execution_owns_the_broker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let _execution = Arc::clone(&controller.execution_admission).try_acquire_owned().unwrap();
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (method, params) in [
+            ("history.record", json!({"text":"prompt recorded during execution"})),
+            ("state.get", json!({})),
+            ("task.list", json!({})),
+            ("plan.list", json!({})),
+            ("agent.list", json!({})),
+            ("exchange.list", json!({})),
+            ("session.list", json!({"scope":"all"})),
+            ("session.preview", json!({"session_id":session_id})),
+            ("permissions.open", json!({})),
+        ] {
+            tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()),
+                Request { id: 2, method: method.into(), params }, &sink))
+                .await.unwrap_or_else(|_| panic!("{method} waited for execution")).unwrap();
+            let frame = output.recv().await.unwrap().unwrap();
+            let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(value["id"], 2, "{method}: {value}");
+            assert!(value["error"].is_null(), "{method}: {value}");
+            if method == "state.get" {
+                assert_eq!(value["result"]["prompt_history"][0], "prompt recorded during execution");
+            }
+        }
+        let error = tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()),
+            Request { id: 3, method: "session.configure".into(), params: json!({"effort":"high"}) }, &sink))
+            .await.expect("unsupported direct mutation must reject without waiting").unwrap_err();
+        assert!(error.to_string().contains("requires a settled session"), "{error:#}");
+        drop(broker);
+        drop(_execution);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn configuration_acknowledgement_does_not_wait_for_mcp_discovery() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let broker = controller.broker.lock().await;
+        let discovery = controller.mcp_discovery.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let configuring = service.dispatch(Some(session_id.clone()), Request {
+            id: 2, method: "task.transition".into(),
+            params: json!({"operation_id":"configure-responsive","action":"configure","config":{"effort":"low"}}),
+        }, &sink);
+        tokio::pin!(configuring);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = &mut configuring => panic!("configuration completed before its owner released: {result:?}"),
+                frame = output.recv() => {
+                    let frame = frame.unwrap().unwrap();
+                    let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+                    assert_eq!(value["result"]["state"], "accepted", "{value}");
+                }
+            }
+        }).await.expect("configuration acknowledgement waited for MCP discovery");
+        assert!(controller.mcp_revision.load(Ordering::Acquire) > 0);
+        drop(discovery);
+        drop(broker);
+        tokio::time::timeout(Duration::from_secs(2), &mut configuring).await.unwrap().unwrap();
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn root_model_catalog_bypasses_the_active_broker_lock() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let mut store = SqliteStore::open(&fixture.path().join("data")).unwrap();
+        let preference = serde_json::from_value(json!({
+            "model":"default", "effort":"medium",
+            "model_setting":{"mock-model":{"reasoning":"high","context_window":"default"}}
+        })).unwrap();
+        store.save_preference(fixture.path().to_str().unwrap(), "mock", &preference).unwrap();
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()),
+            Request { id: 2, method: "backend.models".into(), params: json!({}) }, &sink))
+            .await.expect("root model selection must remain available during provider execution").unwrap();
+        let frame = output.recv().await.unwrap().unwrap();
+        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+        assert_eq!(value["id"], 2, "{value}");
+        assert!(value["error"].is_null(), "{value}");
+        assert_eq!(value["result"][0]["id"], "mock-model");
+        assert_eq!(value["result"][0]["selected_reasoning"], "high");
+        assert_eq!(value["result"][0]["selected_context_window"], "default");
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn idle_root_model_catalog_publishes_and_persists_default_resolution() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        service.dispatch(Some(session_id.clone()),
+            Request { id: 2, method: "backend.models".into(), params: json!({}) }, &sink).await.unwrap();
+        let mut configured = false;
+        loop {
+            let frame = output.recv().await.unwrap().unwrap();
+            let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+            if value["event"] == "session_configured" {
+                configured = value["payload"]["resolved_model"] == "mock-model";
+            }
+            if value["id"] == 2 {
+                assert_eq!(value["result"][0]["selected_reasoning"], "medium");
+                break;
+            }
+        }
+        assert!(configured, "idle catalog did not publish default model resolution");
+        let store = SqliteStore::open(&fixture.path().join("data")).unwrap();
+        assert_eq!(store.load_session(&session_id).unwrap().unwrap().resolved_model.as_deref(), Some("mock-model"));
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
     async fn child_model_catalog_bypasses_the_active_root_broker_lock() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
@@ -2755,6 +2942,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn admitted_execution_waits_for_broker_maintenance() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await
+            .unwrap();
+        let execution = service
+            .prepare(None, HarnessMethod::PromptSubmit)
+            .await
+            .unwrap()
+            .unwrap();
+        let registry = service.registry().await.unwrap();
+        let controller = registry
+            .resolve(&registry.initial_session_id)
+            .await
+            .unwrap();
+        let maintenance = controller.broker.lock().await;
+        let mut acquisition = Box::pin(acquire_request_broker(
+            &controller,
+            HarnessMethod::PromptSubmit,
+        ));
+        assert!(
+            futures_util::poll!(acquisition.as_mut()).is_pending(),
+            "admitted execution must wait for transient broker ownership"
+        );
+        drop(maintenance);
+        let broker = tokio::time::timeout(Duration::from_secs(2), acquisition)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(broker);
+        drop(execution);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn settled_mutations_wait_for_maintenance_without_provider_cleanup() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
+        let mut controller = SessionController::new(broker);
+        let backend = Arc::new(SteeringBackend {
+            request: Mutex::new(Vec::new()),
+        });
+        Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+        for method in [
+            HarnessMethod::SessionConfigure,
+            HarnessMethod::PlanCancel,
+            HarnessMethod::GoalPause,
+            HarnessMethod::GoalClear,
+        ] {
+            let maintenance = controller.broker.lock().await;
+            let mut acquisition = Box::pin(acquire_request_broker(&controller, method));
+            assert!(futures_util::poll!(acquisition.as_mut()).is_pending());
+            assert!(
+                backend.request.lock().await.is_empty(),
+                "maintenance cannot trigger provider cleanup"
+            );
+            assert!(controller.execution_admission.try_acquire().is_err());
+            drop(maintenance);
+            let admitted = tokio::time::timeout(Duration::from_secs(2), acquisition).await??;
+            assert!(controller.execution_admission.try_acquire().is_err());
+            drop(admitted);
+            assert!(controller.execution_admission.try_acquire().is_ok());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn failed_initialization_can_retry_and_concurrent_open_has_one_owner() {
         let fixture = tempfile::tempdir().unwrap();
         let blocked = fixture.path().join("blocked");
@@ -2978,6 +3234,7 @@ mod tests {
             request: Mutex::new(Vec::new()),
         });
         Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+        let _execution = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
         for method in [HarnessMethod::GoalPause, HarnessMethod::GoalClear] {
             let owner = controller.broker.lock().await;
             let mut admission = Box::pin(acquire_request_broker(&controller, method));
@@ -3009,6 +3266,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn goal_control_timeout_includes_a_blocked_provider_stop() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
+        let mut controller = SessionController::new(broker);
+        let backend = Arc::new(SteeringBackend { request: Mutex::new(Vec::new()) });
+        Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+        let _admission = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
+        let _execution = controller.broker.lock().await;
+        let _provider_stop = backend.request.lock().await;
+        let error = tokio::time::timeout(Duration::from_secs(11),
+            acquire_request_broker(&controller, HarnessMethod::GoalPause))
+            .await.context("blocked provider stop escaped the control deadline")?
+            .err().context("blocked provider stop unexpectedly succeeded")?;
+        assert!(error.to_string().contains("within 10 seconds"), "{error:#}");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn goal_control_acquires_broker_when_no_provider_reader_starts() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
@@ -3020,6 +3295,7 @@ mod tests {
                     None,
         )?;
         Arc::get_mut(&mut controller).unwrap().backend = Arc::new(backend);
+        let _execution = Arc::clone(&controller.execution_admission).try_acquire_owned()?;
         for method in [HarnessMethod::GoalPause, HarnessMethod::GoalClear] {
             let owner = controller.broker.lock().await;
             let mut admission = Box::pin(acquire_request_broker(&controller, method));

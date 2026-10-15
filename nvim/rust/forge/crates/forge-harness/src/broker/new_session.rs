@@ -58,7 +58,6 @@ pub fn prepare_new_session(
         current_task_id: None, default_write_permission: preference.as_ref().map_or(source.default_write_permission, |value| value.default_write_permission), plan_permission: preference.as_ref().map_or(source.plan_permission, |value| value.plan_permission),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
-        active_plan_id: None,
         goal_id: None,
         lease_owner: Some(client_id.to_owned()),
         lease_expires_at_ms: Some(now_ms + 30_000),

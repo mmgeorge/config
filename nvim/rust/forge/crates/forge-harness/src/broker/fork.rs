@@ -78,7 +78,7 @@ pub fn prepare_provider_fork(
     };
     child.context_usage.clone_from(&source.context_usage);
     child.execution_mode = PermissionMode::Read;
-    child.active_plan_id = None;
+
     child.current_task_id = None;
     child.goal_id = None;
     child.created_at_ms = now_ms;

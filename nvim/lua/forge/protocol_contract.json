@@ -1,5 +1,5 @@
 {
-  "version": 14,
+  "version": 15,
   "node": {
     "kind": [
       "exchange",
@@ -155,10 +155,6 @@
       "required": {}
     },
     "plan_cancelled": {
-      "route": "refresh",
-      "required": {}
-    },
-    "plan_activated": {
       "route": "refresh",
       "required": {}
     },

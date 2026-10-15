@@ -112,6 +112,7 @@ M.empty_diff_rows = {}
 ---@field rename_revision integer?
 ---@field rename_status string?
 ---@field pending_config_validate boolean?
+---@field pending_config_completed (fun(applied: boolean))?
 ---@field pending_mode string?
 ---@field mode_restart_requested boolean?
 ---@field mode_restart {accepted: boolean, finished: boolean, applying: boolean, cancelled?: boolean, stopping?: boolean}?

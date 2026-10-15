@@ -21,6 +21,8 @@ pub(crate) struct PlanReviewStore {
 
 /// Captures one unanswered question and the immutable design context used to answer it.
 pub(crate) struct PlanReviewQuestion {
+    /// Plan that owns the captured annotation and design.
+    pub plan_id: String,
     /// Stable identity of the question's annotation.
     pub id: String,
     /// Exact editable text captured at submission.
@@ -127,7 +129,7 @@ impl PlanReviewStore {
             let thread = super::review_annotation::thread_context(document.annotation.annotation(), annotation);
             let prompt = format!("Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}", annotation.source.body);
             ensure!(prompt.len() <= 8 * 1024 * 1024, "plan question context exceeds 8 MiB");
-            question.push(PlanReviewQuestion { id:annotation.id.clone(), body:annotation.source.body.clone(), prompt });
+            question.push(PlanReviewQuestion { plan_id:document.source.document.plan_id.clone(), id:annotation.id.clone(), body:annotation.source.body.clone(), prompt });
         }
         Ok(question)
     }
