@@ -155,6 +155,8 @@ Run the focused adapter checks from the repository root:
 
 ```text
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_query.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_failures.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_source_transfer.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup_roots.lua
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/plan_workspace_definition.lua
@@ -169,7 +171,7 @@ from the plan-navigation tests and install npm dependencies offline.
 
 The host fixture invokes the real Harness control runtime through a mock model
 and real language server. It checks disabled admission, dependency definitions,
-hover, outlines, diagnostics, supported additional operations, unsaved buffers,
+all eight focused tools, diagnostics, supported definition kinds, unsaved buffers,
 background startup, and reuse of that server when the editor opens source. Set `forge_test_manual` to keep the
 successful fixture open for Terminal MCP inspection. The resulting
 `forge_lsp_test` object exposes its workspace, buffer, client identity, query,

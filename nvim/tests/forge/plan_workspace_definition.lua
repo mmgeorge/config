@@ -15,7 +15,7 @@ write(target_path, "export interface Value { count: number }\r\n")
 local original_clients, original_attached, original_attach = vim.lsp.get_clients, vim.lsp.buf_is_attached, vim.lsp.buf_attach_client
 local request_count, attachment_count, cancelled, source_buffer = 0, 0, 0, nil
 local handler, submitted, delayed
-local client = { id = 951, config = { root_dir = directory, filetypes = { "typescript" } }, offset_encoding = "utf-16" }
+local client = { id = 951, name = "first", config = { root_dir = directory, filetypes = { "typescript" } }, offset_encoding = "utf-16" }
 function client:is_stopped() return false end
 function client:supports_method(method) return method == "textDocument/definition" end
 function client:cancel_request() cancelled = cancelled + 1 end
@@ -92,11 +92,11 @@ local success, failure = xpcall(function()
   await = request()
   local unavailable, unavailable_error, unavailable_notice = await()
   assert(not unavailable and not unavailable_error and unavailable_notice:find("No running", 1, true))
-  local other = setmetatable({ id = 952 }, { __index = client })
+  local other = setmetatable({ id = 952, name = "second" }, { __index = client })
   vim.lsp.get_clients = function() return { client, other } end
   await = request()
   local ambiguous, ambiguous_error, ambiguous_notice = await()
-  assert(not ambiguous and not ambiguous_error and ambiguous_notice:find("Multiple running", 1, true))
+  assert(not ambiguous and not ambiguous_error and ambiguous_notice == "ambiguous_server: first, second")
 end, debug.traceback)
 vim.lsp.get_clients, vim.lsp.buf_is_attached, vim.lsp.buf_attach_client = original_clients, original_attached, original_attach
 vim.api.nvim_del_augroup_by_id(group)

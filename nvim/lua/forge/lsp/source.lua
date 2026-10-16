@@ -1,4 +1,13 @@
 local M = {}
+
+---@param path string
+---@param failure string
+---@return string
+function M.read_failure(path, failure)
+  if failure:find("ENOENT", 1, true) then return "path_not_found: " .. path end
+  if failure:find("EACCES", 1, true) or failure:find("EPERM", 1, true) then return "access_denied: " .. path end
+  return "read_failed: " .. path .. " — " .. failure
+end
 ---@type table<integer, { count: integer, owned: boolean }>
 local leases = {}
 
@@ -38,20 +47,24 @@ function M.inside(path, root)
 end
 
 ---@param path string
----@param limit integer
+---@param limit integer?
 ---@param receive fun(contents: string?, failure: string?)
 function M.read(path, limit, receive)
   vim.uv.fs_open(path, "r", 438, function(open_error, descriptor)
-    if open_error then vim.schedule(function() receive(nil, open_error) end) return end
+    if open_error then vim.schedule(function() receive(nil, M.read_failure(path, open_error)) end) return end
     vim.uv.fs_fstat(descriptor, function(stat_error, stat)
-      if stat_error or not stat or stat.type ~= "file" or stat.size > limit then
+      if stat_error or not stat or stat.type ~= "file" or limit and stat.size > limit then
         vim.uv.fs_close(descriptor)
-        vim.schedule(function() receive(nil, stat_error or "Source is not a regular file within the size limit") end)
+        local failure = stat_error and M.read_failure(path, stat_error)
+          or (stat and stat.type ~= "file" and "invalid_path: " .. path .. " is not a regular file.")
+          or (limit and "source_limit: " .. path .. " exceeds the " .. math.floor(limit / 1024) .. " KiB read limit.")
+          or ("read_failed: No file metadata for " .. path)
+        vim.schedule(function() receive(nil, failure) end)
         return
       end
       vim.uv.fs_read(descriptor, stat.size, 0, function(read_error, contents)
         vim.uv.fs_close(descriptor)
-        vim.schedule(function() receive(contents, read_error) end)
+        vim.schedule(function() receive(contents, read_error and M.read_failure(path, read_error)) end)
       end)
     end)
   end)
@@ -98,12 +111,12 @@ end
 ---@param workspace? string
 ---@return vim.lsp.Client?, string?
 function M.select_client(path, filetype, buffer, method, workspace)
-  local candidates = {}
+  local candidates, unsupported = {}, {}
   for _, client in ipairs(vim.lsp.get_clients()) do
     local attached = buffer and vim.lsp.buf_is_attached(buffer, client.id)
     local config = client.config --[[@as vim.lsp.Config]]
     local language = attached or vim.tbl_contains(config.filetypes or {}, filetype)
-    if language and not client:is_stopped() and client:supports_method(method or "textDocument/definition", buffer)
+    if language and not client:is_stopped()
       and (not workspace or M.belongs(client, workspace)) then
       local specificity = -1
       for _, folder in ipairs(client.workspace_folders or {}) do
@@ -112,16 +125,34 @@ function M.select_client(path, filetype, buffer, method, workspace)
       end
       local root = client.root_dir or client.config.root_dir
       if type(root) == "string" and M.inside(path, root) then specificity = math.max(specificity, #M.canonical(root)) end
-      if specificity >= 0 or workspace then candidates[#candidates + 1] = { client = client, attached = attached == true, specificity = specificity } end
+      if specificity >= 0 or workspace then
+        if not method or client:supports_method(method, buffer) then
+          candidates[#candidates + 1] = { client = client, attached = attached == true, specificity = specificity }
+        else unsupported[#unsupported + 1] = client.name end
+      end
     end
   end
   table.sort(candidates, function(left, right)
     if left.attached ~= right.attached then return left.attached end
     return left.specificity > right.specificity
   end)
-  if #candidates == 0 then return nil, "No running project language server supports this operation for the source" end
+  if #candidates == 0 then
+    if #unsupported > 0 then
+      table.sort(unsupported)
+      local label = ({ ["textDocument/prepareCallHierarchy"] = "call hierarchy", ["textDocument/typeDefinition"] = "type definition",
+        ["textDocument/implementation"] = "implementation lookup", ["workspace/symbol"] = "workspace symbols" })[method]
+        or (method or "this operation"):match("[^/]+$")
+      return nil, "unsupported: " .. table.concat(unsupported, ", ") .. " does not support " .. label .. "."
+    end
+    return nil, "unavailable: No running " .. filetype .. " language server for this project."
+  end
   if candidates[2] and candidates[1].attached == candidates[2].attached and candidates[1].specificity == candidates[2].specificity then
-    return nil, "Multiple running language servers match this source. Attach the intended server to the source buffer."
+    local names = {}
+    for _, candidate in ipairs(candidates) do
+      if candidate.attached == candidates[1].attached and candidate.specificity == candidates[1].specificity then names[#names + 1] = candidate.client.name end
+    end
+    table.sort(names)
+    return nil, "ambiguous_server: " .. table.concat(names, ", ")
   end
   return candidates[1].client
 end

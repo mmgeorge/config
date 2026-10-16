@@ -1098,7 +1098,11 @@ impl HarnessBroker {
             HarnessMethod::ChecksList | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksSaveDefaults => self.project_checks(method, params).await,
             HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
             HarnessMethod::TaskTransition => self.transition_task(params).await,
-            HarnessMethod::LspAuthorize | HarnessMethod::LspRespond | HarnessMethod::TaskOperation | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
+            HarnessMethod::LspAuthorize
+            | HarnessMethod::LspRespond
+            | HarnessMethod::LspAnalyze
+            | HarnessMethod::TaskOperation
+            | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
             HarnessMethod::StateGet => Ok((serde_json::to_value(self.snapshot()?)?, Vec::new())),
             HarnessMethod::TraceStatus => {
                 Ok((serde_json::to_value(self.trace.status())?, Vec::new()))
@@ -5415,13 +5419,22 @@ Planning continuation: turn {} of {}.",
             self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event).await?;
             return Ok(());
         }
-        if backend_event.address.as_ref().is_some_and(|address|
-            address.owner.as_ref().is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id))
-                || self.diagnostic_native_thread.contains(&address.thread_id)
-                || self.agent_registry.get_by_thread(&address.thread_id).is_some_and(|agent| !agent.is_primary())) {
-            self.trace.record(&self.session.id,"provider.event.rejected",json!({
+        if backend_event.address.as_ref().is_some_and(|address| {
+            address.owner.as_ref().is_some_and(|owner| {
+                owner != &crate::backend::ExecutionOwner::root(&self.session.id)
+            }) || self.diagnostic_native_thread.contains(&address.thread_id)
+                || self
+                    .agent_registry
+                    .get_by_thread(&address.thread_id)
+                    .is_some_and(|agent| !agent.is_primary())
+        }) {
+            self.trace.record(
+                &self.session.id,
+                "provider.event.rejected",
+                json!({
                 "event_type":backend_event.kind,"code":"foreign_or_native_child_execution",
-            }));
+                }),
+            );
             return Ok(());
         }
         if self.route_settled_parent_event(interaction, &backend_event, event).await? {

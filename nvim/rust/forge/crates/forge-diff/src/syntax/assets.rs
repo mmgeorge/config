@@ -87,6 +87,7 @@ impl SyntaxLanguage {
             "scm" => "query",
             "yml" => "yaml",
             "jsx" | "mjs" | "cjs" => "javascript",
+            "mts" | "cts" => "typescript",
             _ => extension,
         })
     }

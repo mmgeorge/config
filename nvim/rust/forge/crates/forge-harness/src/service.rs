@@ -989,10 +989,48 @@ async fn route_request(
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
 ) -> Result<()> {
-    if matches!(method, HarnessMethod::LspAuthorize | HarnessMethod::LspRespond) {
-        let id = request.params["id"].as_str().context("LSP response requires id")?;
+    if matches!(
+        method,
+        HarnessMethod::LspAuthorize | HarnessMethod::LspRespond | HarnessMethod::LspAnalyze
+    ) {
+        let id = request.params["id"]
+            .as_str()
+            .context("LSP response requires id")?;
         let result = if method == HarnessMethod::LspAuthorize {
-            registry.runtime.lsp.authorize(&session_id, id, serde_json::from_value(request.params["paths"].clone())?).await?
+            registry
+                .runtime
+                .lsp
+                .authorize(
+                    &session_id,
+                    id,
+                    serde_json::from_value(request.params["paths"].clone())?,
+                )
+                .await?
+        } else if method == HarnessMethod::LspAnalyze {
+            registry
+                .runtime
+                .lsp
+                  .analyze_part(
+                    &session_id,
+                    id,
+                    request.params["path"]
+                        .as_str()
+                        .context("analysis requires path")?,
+                    request.params["source"]
+                        .as_str()
+                        .context("analysis requires source")?
+                        .to_owned(),
+                      match (request.params.get("source_offset"), request.params.get("source_total")) {
+                          (None, None) => None,
+                          (Some(offset), Some(total)) => Some((
+                              usize::try_from(offset.as_u64().context("invalid source offset")?)?,
+                              usize::try_from(total.as_u64().context("invalid source size")?)?,
+                          )),
+                          _ => anyhow::bail!("source transfer requires offset and total"),
+                      },
+                      syntax,
+                )
+                .await?
         } else {
             registry.runtime.lsp.respond(&session_id, id, request.params["result"].clone(),
                 request.params["failure"].as_str().map(str::to_owned))?;

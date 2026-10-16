@@ -29,7 +29,9 @@ read-only.
 Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
 `expected_version`, and `check_ids`. The tool updates the plan's `checks` list
 without changing repository settings or executing commands. Repeated IDs do not
-create repeated plan entries. `checks_run` accepts multiple `ids`, or
+create repeated plan entries, and adding only already-selected checks leaves the
+plan version unchanged. The tool is available during plan authoring and Resolve.
+`checks_run` accepts multiple `ids`, or
 `all: true` for every enabled check. Explicit runs execute even when earlier
 evidence remains current.
 

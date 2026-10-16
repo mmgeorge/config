@@ -7,13 +7,22 @@ pub enum HarnessMethod {
     LspAuthorize,
     #[serde(rename = "lsp.respond")]
     LspRespond,
-    #[serde(rename = "checks.list")] ChecksList,
-    #[serde(rename = "checks.setup")] ChecksSetup,
-    #[serde(rename = "checks.override")] ChecksOverride,
-    #[serde(rename = "checks.run")] ChecksRun,
-    #[serde(rename = "checks.status")] ChecksStatus,
-    #[serde(rename = "checks.cancel")] ChecksCancel,
-    #[serde(rename = "checks.save_defaults")] ChecksSaveDefaults,
+    #[serde(rename = "lsp.analyze")]
+    LspAnalyze,
+    #[serde(rename = "checks.list")]
+    ChecksList,
+    #[serde(rename = "checks.setup")]
+    ChecksSetup,
+    #[serde(rename = "checks.override")]
+    ChecksOverride,
+    #[serde(rename = "checks.run")]
+    ChecksRun,
+    #[serde(rename = "checks.status")]
+    ChecksStatus,
+    #[serde(rename = "checks.cancel")]
+    ChecksCancel,
+    #[serde(rename = "checks.save_defaults")]
+    ChecksSaveDefaults,
     #[serde(rename = "task.list")]
     TaskList,
     #[serde(rename = "task.transition")]

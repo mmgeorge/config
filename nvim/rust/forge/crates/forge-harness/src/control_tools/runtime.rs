@@ -162,10 +162,17 @@ impl ControlToolRuntime {
         if matches!(invocation.name.as_str(), "design_patch" | "plan_submit")
             && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
-            "lsp" => {
-                let scope = self.context.lsp.as_ref().context("LSP tools require an enabled active editor interaction")?;
-                let message = scope.invoke(invocation.arguments).await?;
-                Ok(ControlToolResult { invocation: None, message })
+            name if super::lsp::is_tool(name) => {
+                let scope = self
+                    .context
+                    .lsp
+                    .as_ref()
+                    .context("LSP tools require an enabled active editor interaction")?;
+                let message = scope.invoke(&invocation.name, invocation.arguments).await?;
+                Ok(ControlToolResult {
+                    invocation: None,
+                    message,
+                })
             }
             "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel" => {
                 let scope = self.context.checks.as_ref().context("check tools require an authenticated root interaction")?;
@@ -478,8 +485,10 @@ mod test {
         let initial = context.plan_document.clone().unwrap();
         let mut runtime = ControlToolRuntime::new(context);
         let invocation = |version, ids| ControlToolInvocation { name: "plan_checks_add".into(), arguments: json!({"plan_id":"plan","expected_version":version,"check_ids":ids}) };
-        assert!(runtime.invoke(invocation(99, vec!["manual"])).await.is_err());
-        assert!(runtime.invoke(invocation(1, vec!["missing"])).await.is_err());
+        let stale = runtime.invoke(invocation(99, vec!["manual"])).await.unwrap_err();
+        assert!(stale.to_string().contains("plan identity or version changed"), "{stale:#}");
+        let missing = runtime.invoke(invocation(1, vec!["missing"])).await.unwrap_err();
+        assert!(missing.to_string().contains("unknown planned check: missing"), "{missing:#}");
         let accepted = runtime.invoke(invocation(1, vec!["manual", "manual"])).await.unwrap();
         assert!(accepted.message.contains("Check preview"));
         let staged = runtime.plan_document().unwrap().clone();

@@ -4,6 +4,7 @@ local M = {}
 ---@class ForgeLspStartupJob
 ---@field path string
 ---@field filetype string
+---@field name string
 ---@field started integer
 ---@field client? integer
 ---@field buffer? integer
@@ -61,12 +62,12 @@ local function launch(state, config, path, filetype, accept_root, on_settled)
       return
     end
   end
-  local job = { path = path, filetype = filetype, started = vim.uv.now(), on_settled = on_settled }
+  local job = { path = path, filetype = filetype, name = config.name, started = vim.uv.now(), on_settled = on_settled }
   state.jobs[key] = job
   state.timer:again()
-  source.read(path, 1024 * 1024, function(contents, failure)
+  source.read(path, nil, function(contents, failure)
     if state.closed then return end
-    if failure then settle(job, "Could not read LSP startup source: " .. failure) return end
+    if failure then settle(job, "startup_failed: " .. config.name .. " — " .. failure) return end
     local buffer, owned, open_error = source.open(path, contents, filetype)
     if not buffer then settle(job, open_error) return end
     job.buffer = buffer
@@ -84,14 +85,14 @@ local function launch(state, config, path, filetype, accept_root, on_settled)
       if not root and resolved.workspace_required then settle(job) return end
       local ok, identity = pcall(vim.lsp.start, resolved, { bufnr = buffer, reuse_client = resolved.reuse_client })
       if not ok or not identity then
-        settle(job, "Could not start " .. config.name .. ": " .. tostring(identity or "server launch failed"))
+        settle(job, "startup_failed: " .. config.name .. " — " .. tostring(identity or "Server launch failed."))
       else job.client = identity end
     end)
     local ok, root_error = pcall(function()
       if type(resolved.root_dir) == "function" then resolved.root_dir(buffer, start)
       else start(resolved.root_dir or (resolved.root_markers and vim.fs.root(buffer, resolved.root_markers))) end
     end)
-    if not ok then settle(job, "Could not resolve " .. config.name .. " root: " .. tostring(root_error)) end
+    if not ok then settle(job, "startup_failed: " .. config.name .. " — " .. tostring(root_error)) end
   end)
 end
 
@@ -102,8 +103,8 @@ local function poll(state)
     if not job.done then
       local client = job.client and vim.lsp.get_client_by_id(job.client)
       if client and client.initialized and not client:is_stopped() then settle(job)
-      elseif job.client and (not client or client:is_stopped()) then settle(job, "Language server stopped during initialization")
-      elseif vim.uv.now() - job.started >= 60000 then settle(job, "timeout: language server initialization exceeded 60 seconds") end
+      elseif job.client and (not client or client:is_stopped()) then settle(job, "startup_failed: " .. job.name .. " stopped during initialization.")
+      elseif vim.uv.now() - job.started >= 60000 then settle(job, "timeout: " .. job.name .. " initialization exceeded 60 seconds.") end
       pending = pending or not job.done
     end
   end
@@ -236,6 +237,14 @@ end
 ---@param receive fun(failure?: string)
 ---@return fun() cancel
 function M.wait(workspace, path, receive)
+  if path and not source.loaded(path) then
+    local stat, failure = vim.uv.fs_stat(path)
+    if not stat then
+      local cancelled = false
+      vim.schedule(function() if not cancelled then receive(source.read_failure(path, failure or "Source is unavailable.")) end end)
+      return function() cancelled = true end
+    end
+  end
   local state = M.start(workspace)
   if path and source.inside(path, workspace) then prepare_path(state, source.canonical(path)) end
   local timer, started, finished = assert(vim.uv.new_timer()), vim.uv.now(), false
@@ -252,17 +261,19 @@ function M.wait(workspace, path, receive)
     if state.failure then finish(state.failure) return end
     poll(state)
     local filetype = path and vim.filetype.match({ filename = path })
-    local failure
+    local failure, ready = nil, false
     for _, client in ipairs(vim.lsp.get_clients({ _uninitialized = true })) do
       local config = client.config --[[@as vim.lsp.Config]]
       if source.belongs(client, workspace) and not client:is_stopped()
-        and (not filetype or vim.tbl_contains(config.filetypes or {}, filetype))
-        and not client.initialized then return end
+        and (not filetype or vim.tbl_contains(config.filetypes or {}, filetype)) then
+        if not client.initialized or client.progress and next(client.progress.pending or {}) ~= nil then return end
+        ready = true
+      end
     end
     for _, job in pairs(state.jobs) do
       if not filetype or job.filetype == filetype then
         if not job.done then return end
-        failure = failure or job.failure
+        if not ready or path and source.canonical(job.path) == source.canonical(path) then failure = failure or job.failure end
       end
     end
     finish(failure)

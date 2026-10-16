@@ -49,9 +49,16 @@ impl BackendRequest {
             crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
             crate::session::CheckShell::System => "the system login shell",
         };
-        let lsp = if self.control_context.as_ref().and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available()) {
-            "\nLSP exploration is enabled. Prefer lsp for semantic code exploration: workspace_symbols finds names, document_symbols outlines a file, definition/type_definition/implementation resolve a position, references and calls trace use, and hover explains types. Use exact one-based positions from results. Inspect file diagnostics after edits, but stale or unknown diagnostics do not prove a successful typecheck. Results use live editor contents and mark unsaved buffers. Request only needed results and follow next_offset when necessary. Use text search for literals or when LSP is unavailable."
-        } else { "" };
+        let lsp = if self
+            .control_context
+            .as_ref()
+            .and_then(|context| context.lsp.as_ref())
+            .is_some_and(|scope| scope.available())
+        {
+            "\nLSP exploration is enabled. Prefer lsp_overview for a public directory map, lsp_symbols to find names and exact positions, and lsp_context for declarations, documentation, and source bodies. Target lsp_definition (definition, type, or implementation), lsp_context, lsp_references, and lsp_calls with a short or qualified symbol, optionally a file, or an exact path/line/column. A path/line/symbol selects an occurrence. Ambiguity returns candidates; select one rather than guessing. Use lsp_paths with from/to selectors to find bounded static call chains between known endpoints. Positions are one-based Unicode code points. Matching excerpt lines use >, while declaration headers carry reusable columns. Keep token_budget small and follow next_offset or next_line only when needed. Queries share editor language servers and wait for initialization. Use lsp_diagnostics after edits, but stale or unknown diagnostics do not prove a successful typecheck. lsp_status is for readiness or capability issues, not a prerequisite to each query. Use text search for literals or when semantic queries are unavailable."
+        } else {
+            ""
+        };
         format!(
             "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use checks_run and checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}{lsp}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")

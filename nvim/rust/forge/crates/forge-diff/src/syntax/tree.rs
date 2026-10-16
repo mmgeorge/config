@@ -10,7 +10,7 @@ use crate::source::{SourceIdentity, SourceVersion};
 use crate::workers::WorkBudget;
 
 use super::query::{CompiledQuery, source};
-use super::service::{SYNTAX_LINE_LIMIT, stop_error};
+use super::service::stop_error;
 use super::{SyntaxError, SyntaxLanguage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -140,6 +140,7 @@ pub(super) fn parse(
     source: SourceVersion,
     language: SyntaxLanguage,
     budget: &WorkBudget,
+    line_limited: bool,
 ) -> Result<ParsedSyntax, SyntaxError> {
     budget.check().map_err(stop_error)?;
     let parsed = ParsedSyntax {
@@ -151,14 +152,7 @@ pub(super) fn parse(
         tree: Vec::new(),
         line: Vec::new(),
     };
-    if parsed
-        .source
-        .text()
-        .lines()
-        .take(SYNTAX_LINE_LIMIT + 1)
-        .count()
-        > SYNTAX_LINE_LIMIT
-    {
+    if line_limited {
         return Ok(parsed);
     }
     let line = std::iter::once(0)

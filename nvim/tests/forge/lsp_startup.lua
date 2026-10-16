@@ -1,5 +1,5 @@
 local startup = require("forge.lsp.startup")
-local query = require("forge.lsp.query")
+local query = require("forge.lsp.semantic")
 local source = require("forge.lsp.source")
 local directory = vim.fn.tempname()
 vim.fn.mkdir(directory, "p")
@@ -53,9 +53,21 @@ local success, failure = xpcall(function()
   vim.wait(150, function() return done end, 5)
   assert(not done and not queried, "query resolved while the server was initializing")
   client.initialized = true
+  client.progress = { pending = { indexing = "Indexing" } }
+  vim.wait(150, function() return done end, 5)
+  assert(not done and not queried, "query ran while the server reported indexing")
+  client.progress.pending = {}
   assert(vim.wait(1000, function() return done end, 5), "query did not resume after initialization")
   assert(not error and result.hover == "ready", tostring(error))
   assert(calls == 1, "query created a duplicate server")
+  local missing, missing_done
+  startup.wait(directory, directory .. "/missing.lua", function(failure) missing, missing_done = failure, true end)
+  assert(vim.wait(1000, function() return missing_done end, 5))
+  assert(missing:find("path_not_found:", 1, true) and calls == 1)
+  local recovered, recovery_error
+  startup.wait(directory, path, function(failure) recovered, recovery_error = true, failure end)
+  assert(vim.wait(1000, function() return recovered end, 5))
+  assert(not recovery_error, "missing source poisoned the valid startup waiter")
   local cancelled = false
   client.initialized = false
   local cancel = startup.wait(directory, path, function() cancelled = true end)

@@ -7,7 +7,6 @@ use std::sync::{
 use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
-use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::{Semaphore, oneshot};
 
@@ -18,137 +17,14 @@ use crate::permissions::{
 use crate::session::PermissionMode;
 use forge_protocol::{message::SessionEvent, outbound::MessageSender};
 
-const REPLY_BYTES: usize = 8192;
-const HOVER_BYTES: usize = 4096;
+mod contract;
+mod render;
+use contract::Arguments;
+pub(crate) use contract::definitions;
+use render::Reply;
 
-#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum Operation {
-    Status,
-    Definition,
-    TypeDefinition,
-    Implementation,
-    References,
-    Hover,
-    DocumentSymbols,
-    WorkspaceSymbols,
-    Calls,
-    Diagnostics,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct Arguments {
-    operation: Operation,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    line: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    column: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    query: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    direction: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    limit: Option<u32>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    offset: Option<u32>,
-}
-
-impl Arguments {
-    fn validate(&self) -> Result<()> {
-        let position = matches!(
-            self.operation,
-            Operation::Definition
-                | Operation::TypeDefinition
-                | Operation::Implementation
-                | Operation::References
-                | Operation::Hover
-                | Operation::Calls
-        );
-        ensure!(
-            matches!(
-                self.operation,
-                Operation::Status | Operation::WorkspaceSymbols
-            ) || self.path.is_some(),
-            "operation requires path"
-        );
-        ensure!(
-            !position || (self.line.is_some() && self.column.is_some()),
-            "position operation requires line and column"
-        );
-        ensure!(
-            position || (self.line.is_none() && self.column.is_none()),
-            "line and column only apply to position operations"
-        );
-        ensure!(
-            self.line.is_none_or(|value| value > 0) && self.column.is_none_or(|value| value > 0),
-            "line and column are one-based"
-        );
-        ensure!(
-            self.operation != Operation::WorkspaceSymbols || self.query.is_some(),
-            "workspace_symbols requires query"
-        );
-        ensure!(
-            self.query.is_none()
-                || matches!(
-                    self.operation,
-                    Operation::WorkspaceSymbols | Operation::DocumentSymbols
-                ),
-            "query only applies to symbol operations"
-        );
-        ensure!(
-            self.query
-                .as_ref()
-                .is_none_or(|value| !value.trim().is_empty() && value.len() <= 256),
-            "query must contain 1-256 bytes"
-        );
-        ensure!(
-            self.path
-                .as_ref()
-                .is_none_or(|value| !value.is_empty() && value.len() <= 4096),
-            "path must contain 1-4096 bytes"
-        );
-        ensure!(
-            if self.operation == Operation::Calls {
-                matches!(self.direction.as_deref(), Some("incoming" | "outgoing"))
-            } else {
-                self.direction.is_none()
-            },
-            "calls requires direction incoming or outgoing; other operations reject direction"
-        );
-        ensure!(
-            self.limit.is_none_or(|value| (1..=50).contains(&value)),
-            "limit must be between 1 and 50"
-        );
-        ensure!(
-            self.operation != Operation::Hover || (self.limit.is_none() && self.offset.is_none()),
-            "hover does not accept pagination"
-        );
-        Ok(())
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Row {
-    path: String,
-    line: u32,
-    column: u32,
-    text: String,
-    modified: Option<bool>,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Reply {
-    rows: Vec<Row>,
-    source: String,
-    next_offset: Option<u32>,
-    warnings: Option<Vec<String>>,
-    hover: Option<String>,
-    freshness: Option<String>,
+pub(crate) fn is_tool(name: &str) -> bool {
+    contract::NAMES.contains(&name)
 }
 
 #[derive(Default)]
@@ -161,6 +37,13 @@ struct Pending {
     session: String,
     scope: Arc<LspScope>,
     result: oneshot::Sender<Result<Reply>>,
+    upload: Option<AnalysisUpload>,
+}
+
+struct AnalysisUpload {
+    path: String,
+    total: usize,
+    source: String,
 }
 
 struct Flight {
@@ -306,6 +189,112 @@ impl LspService {
         Ok(Value::Object(allowed))
     }
 
+    /// Receives ordered source chunks within the active request lifetime.
+    pub(crate) async fn analyze_part(
+        &self,
+        session: &str,
+        id: &str,
+        path: &str,
+        source: String,
+        position: Option<(usize, usize)>,
+        syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
+    ) -> Result<Value> {
+        let Some((offset, total)) = position else {
+            return self.analyze(session, id, path, source, syntax).await;
+        };
+        let scope = {
+            let pending = self.pending.lock().unwrap();
+            let request = pending.get(id).context("cancelled: LSP request is no longer active.")?;
+            ensure!(request.session == session, "invalid_request: LSP session mismatch.");
+            request.scope.clone()
+        };
+        scope.authorize(path).await?;
+        let assembled = {
+            let mut pending = self.pending.lock().unwrap();
+            let request = pending.get_mut(id).context("cancelled: LSP request is no longer active.")?;
+            scope.check()?;
+            if offset == 0 {
+                ensure!(request.upload.is_none(), "invalid_request: Source transfer already active.");
+                request.upload = Some(AnalysisUpload { path: path.into(), total, source: String::new() });
+            }
+            let upload = request.upload.as_mut().context("invalid_request: Source transfer is missing.")?;
+            ensure!(upload.path == path && upload.total == total && upload.source.len() == offset,
+                "invalid_request: Source transfer identity or offset mismatch.");
+            ensure!(source.len() <= total.saturating_sub(offset) && (!source.is_empty() || total == 0),
+                "invalid_request: Source chunk exceeds declared size or is empty.");
+            upload.source.push_str(&source);
+            if upload.source.len() == total { request.upload.take().map(|upload| upload.source) } else { None }
+        };
+        match assembled {
+            Some(source) => self.analyze(session, id, path, source, syntax).await,
+            None => Ok(json!({"pending":true})),
+        }
+    }
+
+    /// Analyze an authorized live snapshot on the host's shared syntax workers.
+    pub(crate) async fn analyze(
+        &self,
+        session: &str,
+        id: &str,
+        path: &str,
+        source: String,
+        syntax: &Arc<forge_diff::syntax::SyntaxEngine>,
+    ) -> Result<Value> {
+        let scope = {
+            let pending = self.pending.lock().unwrap();
+            let request = pending.get(id).context("LSP request is no longer active")?;
+            ensure!(
+                request.session == session,
+                "LSP request belongs to another session"
+            );
+            request.scope.clone()
+        };
+        scope.authorize(path).await?;
+        let language = forge_diff::syntax::SyntaxLanguage::for_path(path)
+            .context("unsupported source language")?;
+        ensure!(
+            matches!(
+                language,
+                forge_diff::syntax::SyntaxLanguage::Rust
+                    | forge_diff::syntax::SyntaxLanguage::Typescript
+                    | forge_diff::syntax::SyntaxLanguage::Tsx
+                    | forge_diff::syntax::SyntaxLanguage::Javascript
+                    | forge_diff::syntax::SyntaxLanguage::Lua
+            ),
+            "unsupported structural language"
+        );
+        let request = forge_diff::syntax::SyntaxRequest {
+            source: forge_diff::source::SourceVersion::new(
+                source.into_bytes(),
+                forge_diff::source::Representation::Raw,
+            )?,
+            language,
+            priority: forge_diff::workers::WorkPriority::Foreground,
+            deadline: Some(std::time::Instant::now() + Duration::from_secs(10)),
+        };
+        let analysis = syntax.analyze_full(request);
+        tokio::pin!(analysis);
+        let mut tick = tokio::time::interval(Duration::from_millis(25));
+        let handle = loop {
+            tokio::select! {
+                result = &mut analysis => break result.map_err(|failure| anyhow::anyhow!("source analysis failed: {failure:?}"))?,
+                _ = tick.tick() => {
+                    scope.check()?;
+                    ensure!(self.pending.lock().unwrap().contains_key(id), "LSP request is no longer active");
+                }
+            }
+        };
+        scope.check()?;
+        let declarations: Vec<_> = handle.declarations().into_iter().map(|declaration| json!({
+            "name":declaration.name,"kind":declaration.kind,"signature":declaration.signature,
+            "visibility":declaration.visibility,"line":declaration.line,"column":declaration.column,
+            "start_line":declaration.start_line,"end_line":declaration.end_line,"parent":declaration.parent,"depth":declaration.depth,
+                "range_start_line":declaration.range_start_line,"range_start_column":declaration.range_start_column,
+                "range_end_line":declaration.range_end_line,"range_end_column":declaration.range_end_column,
+        })).collect();
+        Ok(json!({"declarations":declarations, "complete":handle.tree_count() > 0}))
+    }
+
     /// Settle exactly one matching editor response while preserving its scope validation.
     pub(crate) fn respond(
         &self,
@@ -358,12 +347,12 @@ impl LspScope {
     fn check(&self) -> Result<()> {
         ensure!(
             self.active.load(Ordering::Acquire) && !self.cancelled.load(Ordering::Acquire),
-            "LSP interaction is no longer active"
+            "cancelled: LSP request cancelled."
         );
         ensure!(
             self.selection.enabled.load(Ordering::Acquire)
                 && self.selection.generation.load(Ordering::Acquire) == self.generation,
-            "LSP tools are disabled or their configuration changed"
+            "cancelled: LSP tools were disabled or their configuration changed."
         );
         Ok(())
     }
@@ -378,8 +367,8 @@ impl LspScope {
         };
         let absolute = match tokio::fs::canonicalize(&absolute).await {
             Ok(path) => path,
-            Err(_) => tokio::fs::canonicalize(absolute.parent().context("path has no parent")?)
-                .await?
+            Err(_) => tokio::fs::canonicalize(absolute.parent().context("invalid_path: Path has no parent.")?)
+                .await.map_err(|_| anyhow::anyhow!("path_not_found: {}", path.display()))?
                 .join(absolute.file_name().context("path has no file name")?),
         };
         let path = absolute
@@ -398,17 +387,16 @@ impl LspScope {
         )?;
         ensure!(
             decision.decision == PermissionDecision::Allow,
-            "read policy does not authorize this LSP path"
+            "access_denied: {}", absolute.display()
         );
         self.check()?;
         Ok(absolute)
     }
 
     /// Execute an allowlisted query and emit only bounded, authorized text.
-    pub(crate) async fn invoke(self: &Arc<Self>, value: Value) -> Result<String> {
+    pub(crate) async fn invoke(self: &Arc<Self>, name: &str, value: Value) -> Result<String> {
         self.check()?;
-        let mut arguments: Arguments = serde_json::from_value(value)?;
-        arguments.validate()?;
+        let mut arguments = Arguments::parse(name, value).map_err(|failure| anyhow::anyhow!("invalid_argument: {failure}"))?;
         if let Some(path) = &arguments.path {
             arguments.path = Some(
                 self.authorize(path)
@@ -418,18 +406,23 @@ impl LspScope {
                     .replace('\\', "/"),
             );
         }
+        for target in [&mut arguments.from, &mut arguments.to].into_iter().flatten() {
+            if let Some(path) = &target.path {
+                target.path = Some(self.authorize(path).await?.to_string_lossy().trim_start_matches("\\\\?\\").replace('\\', "/"));
+            }
+        }
         let _slot = self
             .service
             .slots
             .try_acquire()
-            .context("busy: four LSP requests are already active")?;
+            .context("busy: All LSP request slots are occupied.")?;
         let sender = self
             .service
             .sender
             .lock()
             .unwrap()
             .clone()
-            .context("unavailable: no editor connection")?;
+            .context("disconnected: No editor connection.")?;
         let id = uuid::Uuid::new_v4().to_string();
         let (complete, result) = oneshot::channel();
         self.service.pending.lock().unwrap().insert(
@@ -438,6 +431,7 @@ impl LspScope {
                 session: self.session.clone(),
                 scope: self.clone(),
                 result: complete,
+                upload: None,
             },
         );
         let flight = Flight {
@@ -451,93 +445,28 @@ impl LspScope {
             event: "lsp.request".into(),
             payload: json!({"id":id,"workspace":self.workspace,"arguments":arguments}),
         };
-        let received = tokio::time::timeout(Duration::from_secs(75), async {
+        let timeout = if arguments.operation == contract::Operation::Paths { 105 } else { 75 };
+        let received = tokio::time::timeout(Duration::from_secs(timeout), async {
             sender.send_event(event).await?;
             tokio::pin!(result);
             let mut tick = tokio::time::interval(Duration::from_millis(25));
             loop { tokio::select! {
-                result = &mut result => break result.context("editor connection closed during LSP request")?,
+                result = &mut result => break result.context("disconnected: Editor connection closed during LSP request.")?,
                 _ = tick.tick() => self.check()?,
             } }
-        }).await.context("timeout: editor did not finish LSP startup and query within 75 seconds").and_then(|result| result);
+        }).await.context("timeout: Editor did not complete LSP startup and query within its deadline.").and_then(|result| result);
         drop(flight);
         self.check()?;
         let reply = received?;
-        ensure!(
-            reply.rows.len() <= 50 && reply.source.len() <= 256,
-            "invalid LSP result size"
-        );
-        let operation = serde_json::to_value(arguments.operation)?
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let mut output = if arguments.operation == Operation::Hover {
-            format!("{operation}: source={}\n", single_line(&reply.source, 256))
-        } else {
-            format!(
-                "{operation}: {} results | source={}\n",
-                reply.rows.len(),
-                single_line(&reply.source, 256)
-            )
-        };
-        if let Some(freshness) = reply.freshness {
-            ensure!(
-                matches!(freshness.as_str(), "current" | "stale" | "unknown"),
-                "invalid diagnostics freshness"
-            );
-            output.push_str(&format!(
-                "freshness={freshness}; LSP findings are not a full typecheck\n"
-            ));
-        }
-        if let Some(hover) = reply.hover {
-            append(&mut output, &truncate(&hover, HOVER_BYTES));
-        }
-        let mut next_offset = reply.next_offset;
-        for (index, row) in reply.rows.iter().enumerate() {
+        for row in reply.rows.iter().chain(&reply.omitted_visibility) {
             ensure!(row.path.len() <= 4096, "LSP result path exceeds 4096 bytes");
-            if self.authorize(&row.path).await.is_err() {
-                append(&mut output, "Results omitted by read policy\n");
-                continue;
-            }
-            ensure!(
-                row.line > 0 && row.column > 0,
-                "invalid LSP result position"
-            );
-            let display = display_path(&row.path, &self.workspace);
-            let line = format!(
-                "{}:{}:{} | {}{}\n",
-                single_line(&display, 4096),
-                row.line,
-                row.column,
-                single_line(&row.text, 160),
-                if row.modified == Some(true) {
-                    " [unsaved]"
-                } else {
-                    ""
-                }
-            );
-            if output.len() + line.len() > REPLY_BYTES - 1024 {
-                next_offset = Some(arguments.offset.unwrap_or(0) + index as u32);
-                break;
-            }
-            output.push_str(&line);
-        }
-        if let Some(offset) = next_offset {
-            append(
-                &mut output,
-                &format!("next_offset={offset} (fresh query)\n"),
-            );
-        }
-        if let Some(warnings) = reply.warnings {
-            for warning in warnings.into_iter().take(3) {
-                append(
-                    &mut output,
-                    &format!("partial: {}\n", single_line(&warning, 160)),
-                );
+            self.authorize(&row.path).await?;
+            if let Some(path) = &row.excerpt_path {
+                self.authorize(path).await?;
             }
         }
         self.check()?;
-        Ok(output)
+        render::render(reply, &arguments, &self.workspace)
     }
 }
 
@@ -547,18 +476,6 @@ impl Drop for LspLease {
     fn drop(&mut self) {
         self.0.active.store(false, Ordering::Release);
     }
-}
-
-fn truncate(text: &str, maximum: usize) -> String {
-    if text.len() <= maximum {
-        return text.into();
-    }
-    let suffix = if maximum >= 13 { "\n[truncated]\n" } else { "" };
-    let mut end = maximum.saturating_sub(suffix.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    format!("{}{suffix}", &text[..end])
 }
 
 fn display_path(path: &str, workspace: &Path) -> String {
@@ -575,7 +492,9 @@ fn display_path(path: &str, workspace: &Path) -> String {
             prefix == root
         }
     });
-    if prefix_matches && path.as_bytes().get(root.len()) == Some(&b'/') {
+    if prefix_matches && path.len() == root.len() {
+        ".".into()
+    } else if prefix_matches && path.as_bytes().get(root.len()) == Some(&b'/') {
         path[root.len() + 1..].into()
     } else {
         path
@@ -589,70 +508,29 @@ fn single_line(text: &str, maximum: usize) -> String {
         .take(maximum)
         .collect()
 }
-fn append(output: &mut String, text: &str) {
-    output.push_str(&truncate(text, REPLY_BYTES.saturating_sub(output.len())));
-}
-
-/// Defines a compact provider-neutral schema without protocol-specific objects.
-pub(crate) fn definition() -> super::ControlToolDefinition {
-    super::ControlToolDefinition {
-        name: "lsp",
-        description: "Query project language servers using live editor contents, waiting for initialization when needed. Positions are one-based Unicode characters. Position operations require path/line/column. Symbols use query; calls require direction. Diagnostics inspect one file and do not prove a full typecheck. Lists default to 20 rows; use next_offset for more. Read-only operations.",
-        input_schema: json!({"type":"object","additionalProperties":false,"required":["operation"],"properties":{
-            "operation":{"type":"string","enum":["status","definition","type_definition","implementation","references","hover","document_symbols","workspace_symbols","calls","diagnostics"]},
-            "path":{"type":"string","minLength":1,"maxLength":4096,"description":"Source file, relative to workspace or absolute. Optional for status/workspace_symbols to select a server."},
-            "line":{"type":"integer","minimum":1},"column":{"type":"integer","minimum":1},
-            "query":{"type":"string","minLength":1,"maxLength":256,"description":"Required for workspace_symbols; optional literal name filter for document_symbols."},
-            "direction":{"type":"string","enum":["incoming","outgoing"]},
-            "limit":{"type":"integer","minimum":1,"maximum":50},"offset":{"type":"integer","minimum":0}
-        }}),
-    }
-}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn contract_rejects_misleading_arguments_and_stays_small() {
-        assert!(serde_json::to_vec(&definition().mcp_value()).unwrap().len() <= 3072);
-        for value in [
-            json!({"operation":"definition","path":"a.rs"}),
-            json!({"operation":"status","line":1}),
-            json!({"operation":"calls","path":"a","line":1,"column":1}),
-            json!({"operation":"hover","path":"a","line":1,"column":1,"offset":0}),
-            json!({"operation":"diagnostics","path":"a","query":"name"}),
-            json!({"operation":"workspace_symbols","query":""}),
-            json!({"operation":"status","limit":51}),
+    fn focused_contract_rejects_irrelevant_arguments() {
+        for (name, value) in [
+            ("lsp_definition", json!({"path":"a.rs"})),
+            ("lsp_status", json!({"line":1})),
+            ("lsp_calls", json!({"path":"a","line":1,"column":1})),
+            (
+                "lsp_context",
+                json!({"path":"a","line":1,"column":1,"offset":0}),
+            ),
+            ("lsp_diagnostics", json!({"path":"a","query":"name"})),
+            ("lsp_symbols", json!({"query":""})),
+            ("lsp_symbols", json!({"limit":0})),
         ] {
-            assert!(
-                serde_json::from_value::<Arguments>(value)
-                    .unwrap()
-                    .validate()
-                    .is_err()
-            );
+            assert!(Arguments::parse(name, value).is_err());
         }
-        assert!(
-            serde_json::from_value::<Arguments>(json!({"operation":"status","client_id":1}))
-                .is_err()
-        );
-        for maximum in 0..100 {
-            assert!(truncate(&"😀".repeat(100), maximum).len() <= maximum);
-        }
-        assert_eq!(
-            display_path("/repo/src/main.rs", Path::new("/repo")),
-            "src/main.rs"
-        );
-        assert_eq!(
-            display_path("/repository/main.rs", Path::new("/repo")),
-            "/repository/main.rs"
-        );
-        if cfg!(windows) {
-            assert_eq!(
-                display_path("d:/repo/src/main.rs", Path::new("D:/Repo")),
-                "src/main.rs"
-            );
-        }
+        assert!(Arguments::parse("lsp", json!({})).is_err());
+        assert_eq!(definitions().len(), 9);
     }
 
     async fn fixture() -> (
@@ -688,7 +566,10 @@ mod tests {
         let (directory, service, scope, _lease, mut receiver) = fixture().await;
         let work = tokio::spawn(async move {
             scope
-                .invoke(json!({"operation":"hover","path":"source.rs","line":1,"column":1}))
+                .invoke(
+                    "lsp_context",
+                    json!({"path":"source.rs","line":1,"column":1}),
+                )
                 .await
         });
         let frame = receiver.recv().await.unwrap().unwrap();
@@ -718,17 +599,13 @@ mod tests {
             .respond(
                 "session",
                 id,
-                json!({"rows":[],"source":"buffer (unsaved) version=2","hover":"😀".repeat(10000)}),
+                json!({"rows":[{"path":path,"line":1,"column":8,"text":"pub fn source()","modified":true}],"source":"buffer"}),
                 None,
             )
             .unwrap();
         let output = work.await.unwrap().unwrap();
-        assert!(output.starts_with("hover: source=") && !output.contains("0 results"));
-        assert!(
-            output.len() <= REPLY_BYTES
-                && output.contains("unsaved")
-                && output.contains("truncated")
-        );
+        assert!(output.contains("source.rs (unsaved)") && output.contains("pub fn source()"));
+        assert!(!output.contains('|'));
         assert!(service.respond("session", id, json!({}), None).is_err());
     }
 
@@ -736,7 +613,7 @@ mod tests {
     async fn dropping_a_query_and_disabling_tools_release_authority() {
         let (_directory, service, scope, lease, mut receiver) = fixture().await;
         let active = scope.clone();
-        let work = tokio::spawn(async move { active.invoke(json!({"operation":"status"})).await });
+        let work = tokio::spawn(async move { active.invoke("lsp_status", json!({})).await });
         receiver.recv().await.unwrap().unwrap();
         work.abort();
         assert!(work.await.unwrap_err().is_cancelled());
@@ -749,5 +626,45 @@ mod tests {
             "reenabling revived old request authority"
         );
         drop(lease);
+    }
+
+    #[tokio::test]
+    async fn chunked_analysis_preserves_large_source_and_request_ownership() {
+        let (directory, service, scope, _lease, mut receiver) = fixture().await;
+        let task = tokio::spawn(async move { scope.invoke("lsp_status", json!({})).await });
+        let frame = receiver.recv().await.unwrap().unwrap();
+        let event: Value = serde_json::from_slice(frame.bytes()).unwrap();
+        let id = event["payload"]["id"].as_str().unwrap();
+        let path = directory.path().join("source.rs").to_string_lossy().into_owned();
+        let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(forge_diff::workers::AnalysisPool::new(
+            forge_diff::workers::PoolLimits { workers: 1, jobs: 2, input_bytes: 1024 * 1024 },
+        )));
+        let source = format!("{}pub fn beyond_previous_limits() {{}}\n", "// Unicode α and source padding for a large file\n".repeat(11000));
+        assert!(source.len() > 512 * 1024);
+        let rendering = syntax.analyze(forge_diff::syntax::SyntaxRequest {
+            source: forge_diff::source::SourceVersion::new(source.as_bytes().to_vec(), forge_diff::source::Representation::Raw).unwrap(),
+            language: forge_diff::syntax::SyntaxLanguage::Rust,
+            priority: forge_diff::workers::WorkPriority::Foreground,
+            deadline: None,
+        }).await.unwrap();
+        assert_eq!(rendering.tree_count(), 0, "rendering cutoff changed");
+        let mut offset = 0;
+        let mut result = json!(null);
+        while offset < source.len() {
+            let mut end = (offset + 32768).min(source.len());
+            while !source.is_char_boundary(end) { end -= 1; }
+            result = service.analyze_part("session", id, &path, source[offset..end].into(), Some((offset, source.len())), &syntax).await.unwrap();
+            if end < source.len() { assert_eq!(result, json!({"pending":true})); }
+            offset = end;
+        }
+        assert_eq!(result["complete"], true);
+        assert_eq!(result["declarations"][0]["name"], "beyond_previous_limits");
+        assert_eq!(result["declarations"][0]["line"], 11001);
+        assert!(service.analyze_part("other", id, &path, "x".into(), Some((0, 2)), &syntax).await.is_err());
+        assert!(service.analyze_part("session", id, &path, "x".into(), Some((1, 2)), &syntax).await.is_err());
+        service.analyze_part("session", id, &path, "x".into(), Some((0, 2)), &syntax).await.unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(service.pending.lock().unwrap().is_empty());
     }
 }

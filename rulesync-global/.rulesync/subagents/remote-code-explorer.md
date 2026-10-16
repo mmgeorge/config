@@ -57,9 +57,9 @@ Stop early if the last 3 tool calls produced no new information. Summarize what 
 
 ## Existing project LSP
 
-When `lsp` is available and the question concerns a dependency already indexed by the current project's running server, read-only `definition`, `type_definition`, `implementation`, and `hover` queries may inspect that resolved dependency. Use `references` or one-level `calls` only when needed to explain its use in the project. This exception does not authorize unrelated local repository exploration.
+When the focused LSP tools are available and the question concerns a dependency already indexed by the current project's server, use `lsp_definition` with kind `definition`, `type`, or `implementation`, then `lsp_context` at a returned position. Use `lsp_references` or one-level `lsp_calls` only when needed to explain use within the project. Pass `scope: "all"` when dependency results are required. Copy returned one-based Unicode positions. Keep `token_budget` bounded and follow continuations only when needed.
 
-Use exact returned one-based Unicode positions, request bounded results, and follow `next_offset` only when necessary. Results reflect the project's installed version and may include marked unsaved buffers. Do not infer upstream or latest-version behavior from them. Continue using docs-mcp and official upstream source for remote research. Do not install dependencies or start servers, and treat stale or unknown diagnostics as inconclusive.
+This exception does not authorize unrelated local repository exploration. Do not install dependencies or start servers. Missing dependencies remain a remote source or documentation research task.
 
 ## Rust Crates - Start With Docs MCP
 

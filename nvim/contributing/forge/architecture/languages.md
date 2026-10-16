@@ -23,11 +23,25 @@ body projection.
 
 ## Agent LSP queries
 
-`lsp` exposes read-only semantic operations independently of declaration
-planning and Tree-sitter support. Its enabled-only model guidance recommends
-symbol discovery, navigation, references, calls, hover, and file diagnostics.
-The [tool reference](../../../docs/forge/lsp-tools.md) defines arguments, output,
-and limits.
+Nine focused `lsp_*` tools expose source overview, symbol discovery, navigation,
+context, references, calls, call paths, diagnostics, and status independently of plan navigation.
+The enabled-only model guidance and explorer profiles recommend overview/symbol
+lookup followed by shared name-or-position selectors. The [tool reference](../../../docs/forge/lsp-tools.md)
+defines arguments, formatting, and limits.
+
+`SourceDeclaration` extraction operates on the native `SyntaxHandle` for Rust,
+TypeScript/TSX, JavaScript/JSX, and Lua. It retains source ranges, exact identifier
+positions, signatures, nesting, and declared visibility. It does not alter the
+plan-specific declaration projection. Native parsing uses the shared syntax
+workers. Extracted declaration lists and query results remain request-scoped.
+The existing exact-source syntax cache is unchanged.
+
+Lua captures authorized live snapshots and calls the correlated `lsp.analyze`
+route. Rust validates the active request scope before native analysis, then checks
+it throughout the await. This route bypasses the busy broker lock, like
+`lsp.authorize` and `lsp.respond`. Rust validates returned paths and renders one
+shared location gutter with budgeted source excerpts, or aligned call trees. Snapshot guards cover every
+contributing buffer and disk source, including semantic destinations.
 
 The shared Lua LSP source adapter owns client selection, hidden source buffers,
 and reference-counted buffer leases. Agent queries use live editor contents.
@@ -40,7 +54,7 @@ startup or buffer cleanup, because server configurations can resolve roots from
 libuv process callbacks. Queued callbacks recheck workspace closure before acting.
 It releases hidden buffer leases after initialization and never stops shared
 servers when Harness closes. Agent queries also prepare explicit project files
-and await initialization before selecting a client. No generated project or
+and await initialization and reported work-done progress before selecting a client. No generated project or
 source is required.
 
 Startup considers one source per directory and enabled configuration within its
@@ -52,8 +66,9 @@ queries into separate workspaces retain separate editor-owned clients.
 
 Rust owns one interaction scope per root or child turn, the read policy, and the
 setting generation. It admits at most four requests per host, each with a
-60-second startup wait and a separate ten-second operation deadline. The Rust
-transport watchdog allows 75 seconds for both phases and delivery. Correlated
+60-second startup wait and a separate ten-second operation deadline. Path searches
+allow 30 seconds after startup. The Rust transport watchdog allows 75 seconds for
+ordinary queries and 105 seconds for path searches, including startup and delivery. Correlated
 `lsp.request` events reach an editor adapter
 independently of the selected view. The `lsp.authorize` and `lsp.respond` routes
 bypass the busy broker lock. Target authorization precedes editor reads, and Rust
@@ -109,8 +124,8 @@ submission retain their independent structural and internal-reference checks.
 
 ## Native syntax analysis bounds
 
-Native syntax analysis applies the 10,000-line cutoff independently to each source
-version. It has no source-byte reservation, retained-memory rejection, capture-count
+Native rendering analysis applies the 10,000-line cutoff independently to each source
+version. Explicit agent structural queries bypass that cutoff. Analysis has no source-byte reservation, retained-memory rejection, capture-count
 limit, injection-count limit, or decoration-count limit. The shared worker pool still
 queues work and propagates cancellation. Its byte admission excludes syntax sources,
 which are already retained by their owners. The cache retains up to 256 results and
@@ -169,3 +184,40 @@ that both can render while new admission remains saturated until the last cursor
 This closes the cursor's direct-reference accounting bypass. Generated row ownership, per-cursor
 group and emphasis storage, independent source/result clones, worker memory, and live feature
 integration still require their own accounting and lifecycle work.
+
+
+### Agent target resolution and path search
+
+`forge.lsp.target` resolves declaration names and exact source occurrences for
+all position-based tools. File lookup uses the captured structural snapshot.
+Workspace lookup asks existing language servers for bounded candidates and
+validates exact qualified names against authorized snapshots. Ambiguous and
+incomplete searches fail before the requested semantic operation begins.
+Explicit file and directory symbol searches filter structural declarations before
+pagination. Unscoped symbol searches use workspace symbols, with rust-analyzer's
+all-symbol query mode and optional dependency scope. Server search limits cannot
+truncate a file-scoped inventory.
+
+`forge.lsp.paths` traverses outgoing call hierarchy edges after preparing both
+endpoints. The query owns its request budget, cycle checks, route queue, and
+captured source identities. It retains no cross-query results. All native sends,
+including retries, consume the shared request budget. Every visited source file
+is captured so a changed buffer or disk snapshot invalidates the whole result.
+Rust renders only complete paths within the response budget.
+
+Explicit agent structural queries use `SyntaxEngine::analyze_full` without a
+source-byte or line cutoff. Rendering continues to use `analyze` with its existing
+line cutoff. Cache keys separate cutoff results from full parsing for large sources.
+The `lsp.analyze` route accepts ordered UTF-8 source chunks, validates the active
+request and read authority for every chunk, and assembles one source under the
+pending request. Cancellation releases unfinished transfer state. Chunking preserves
+the transport frame limit without rejecting large source files.
+
+List arguments accept any positive result limit. Lua bounds transport batches,
+and Rust applies the response budget with continuation positions. Structured
+visibility omissions carry names, positions, and total count through authorization
+and rendering. Optional structural or semantic enrichment failures retain valid
+primary results. Source changes, revoked authority, and cancelled requests remain
+fatal. Empty results, incomplete coverage, unsupported capabilities, startup
+failure, and disconnected servers have distinct output messages without retry
+instructions.

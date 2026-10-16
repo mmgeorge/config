@@ -819,10 +819,24 @@ impl Backend for MockBackend {
             retained.lock().expect("mock control context poisoned")
                 .insert(request.runtime_key()?, context.clone());
         }
-        if self.lsp_probe && let Some(arguments) = request.input.text().strip_prefix("LSP ") {
-            let context = request.control_context.clone().context("fixture has no control context")?;
-            let invocation = crate::control_tools::ControlToolInvocation { name: "lsp".into(), arguments: serde_json::from_str(arguments)? };
-            let text = match crate::control_tools::ControlToolRuntime::new(context).invoke(invocation).await {
+        if self.lsp_probe
+            && let Some(arguments) = request.input.text().strip_prefix("LSP ")
+        {
+            let context = request
+                .control_context
+                .clone()
+                .context("fixture has no control context")?;
+            let mut arguments: Value = serde_json::from_str(arguments)?;
+            let name = arguments
+                .as_object_mut()
+                .and_then(|value| value.remove("tool"))
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .context("LSP fixture requires tool name")?;
+            let invocation = crate::control_tools::ControlToolInvocation { name, arguments };
+            let text = match crate::control_tools::ControlToolRuntime::new(context)
+                .invoke(invocation)
+                .await
+            {
                 Ok(result) => result.message,
                 Err(error) => format!("LSP error: {error:#}"),
             };

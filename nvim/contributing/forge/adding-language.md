@@ -111,3 +111,12 @@ All `crates/...` paths above are relative to `nvim/rust/forge/`.
 | No running client matches | Check the configured filetype, project root, initialization, and definition capability |
 | Only proposed references fail | Check saved-plan resolution rather than adding generated source or querying an unrelated workspace |
 | A language fixture downloads many dependencies | Replace those dependencies with tiny relative local packages |
+
+## Agent source context
+
+Extend native `SourceDeclaration` extraction when adding a language to the focused
+LSP tools. Cover identifier coordinates, declaration/body/documentation ranges,
+nesting, and declared visibility. Unknown visibility must remain explicit. Add
+fixture assertions for overview, context, and semantic destinations without
+changing the independent plan-projection adapter. Verify the editor's configured
+server through the real Harness host fixture and confirm client reuse.

@@ -49,14 +49,7 @@ pub struct ControlToolRegistry;
 impl ControlToolRegistry {
     /// Build the complete provider-neutral control-tool definition list.
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
-        vec![
-            lsp::definition(),
-            ControlToolDefinition { name: "plan_checks_add", description: "Add enabled configured checks to the active draft plan, including nonautomatic checks. Does not run checks or edit repository settings. Duplicate IDs are ignored. Returns the plan version and check preview.", input_schema: strict_object_input_schema(vec![("plan_id", string_schema()), ("expected_version", json!({"type":"integer","minimum":1})), ("check_ids", json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128}))], &["plan_id", "expected_version", "check_ids"]) },
-            ControlToolDefinition {name:"checks_list",description:"Read saved project checks, supported scopes, task overrides, configuration revision, and run history. Never invents default commands.",input_schema:strict_object_input_schema(vec![],&[])},
-            ControlToolDefinition {name:"checks_configure",description:"Save version-2 project checks during /checks setup or missing-configuration planning bootstrap after the user answers setup questions. Each check requires area and trigger independently of scope. Preserves other .forge.json fields. Inspect checks first for expected_revision. Optional helpers are Nushell under .forge/checks/ with source and expected_digest (null for new files). Validates helper syntax without running configured checks.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks)).expect("checks schema")},
-            ControlToolDefinition {name:"checks_run",description:"Run checks matching actual task changes outside plan execution. Explicit ids or selections bypass triggers for those suites. all:true explicitly runs all enabled full suites. Disabled checks cannot run. Returns run_id. Wait for completion before editing source. Unsupported scopes are configuration errors, never a full-suite fallback.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest)).expect("checks schema")},
-            ControlToolDefinition {name:"checks_status",description:"Read an owned check run and its recorded results. Optional wait_ms waits for progress, up to 30000 milliseconds. Does not rerun checks.",input_schema:strict_object_input_schema(vec![("run_id",string_schema()),("wait_ms",json!({"type":"integer","minimum":0,"maximum":30000}))],&["run_id"])},
-            ControlToolDefinition {name:"checks_cancel",description:"Cancel an owned active check run. Retains output and execution admission until process collection finishes.",input_schema:strict_object_input_schema(vec![("run_id",string_schema())],&["run_id"])},
+        let mut definitions = vec![
             ControlToolDefinition {
                 name:"agent_spawn",
                 description:"Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
@@ -126,6 +119,18 @@ impl ControlToolRegistry {
                 input_schema: strict_object_input_schema(
                     vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"})),("start_line",json!({"type":"integer","minimum":1})),("end_line",json!({"type":"integer","minimum":1}))],
                     &["plan_id"],
+                ),
+            },
+            ControlToolDefinition {
+                name: "plan_checks_add",
+                description: "Add existing project check IDs to the active plan during authoring or Resolve. Requires the current plan ID and version. Returns the updated plan version and check preview without changing project settings or executing checks. Repeated IDs are deduplicated, and already-selected checks leave the version unchanged.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("plan_id", string_schema()),
+                        ("expected_version", json!({"type":"integer","minimum":1})),
+                        ("check_ids", json!({"type":"array","minItems":1,"items":string_schema()})),
+                    ],
+                    &["plan_id", "expected_version", "check_ids"],
                 ),
             },
             ControlToolDefinition {
@@ -204,7 +209,9 @@ impl ControlToolRegistry {
                     &["status"],
                 ),
             },
-        ]
+        ];
+        definitions.extend(lsp::definitions());
+        definitions
     }
 
     /// Expose plan mutation only while authoring a plan or resolving an execution.
@@ -217,28 +224,64 @@ impl ControlToolRegistry {
     }
 
     /// Select tools from authenticated root ownership and current optional-tool authority.
-    pub fn definition_list_for_context(&self, context: Option<&ControlTurnContext>, root: bool) -> Vec<ControlToolDefinition> {
-        let phase = context.and_then(|context|context.execution.as_ref().map(|execution|execution.phase));
-        self.definition_list().into_iter().filter(|definition| {
-            if definition.name == "lsp" {return context.and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available());}
-            if !root {return definition.name.starts_with("repository_") && context.is_some_and(|context|context.repository.is_some());}
-            if is_agent_tool(definition.name) {return context.and_then(|context|context.agent.as_ref()).is_some_and(|scope|scope.available());}
-            !matches!(definition.name,"plan_checks_add" | "design_patch" | "plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
-        }).map(|mut definition| {
-            if definition.name == "agent_spawn"
-                && let Some(schema) = context.and_then(|context|context.agent.as_ref()).and_then(|scope|scope.profile_schema()) {
-                definition.input_schema["properties"]["profile"] = schema;
-            }
-            definition
-        }).collect()
+    pub fn definition_list_for_context(
+        &self,
+        context: Option<&ControlTurnContext>,
+        root: bool,
+    ) -> Vec<ControlToolDefinition> {
+        let phase =
+            context.and_then(|context| context.execution.as_ref().map(|execution| execution.phase));
+        self.definition_list()
+            .into_iter()
+            .filter(|definition| {
+                if lsp::is_tool(definition.name) {
+                    return context
+                        .and_then(|context| context.lsp.as_ref())
+                        .is_some_and(|scope| scope.available());
+                }
+                if !root {
+                    return definition.name.starts_with("repository_")
+                        && context.is_some_and(|context| context.repository.is_some());
+                }
+                if is_agent_tool(definition.name) {
+                    return context
+                        .and_then(|context| context.agent.as_ref())
+                        .is_some_and(|scope| scope.available());
+                }
+                !matches!(
+                    definition.name,
+                    "plan_checks_add" | "design_patch" | "plan_submit"
+                ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
+            })
+            .map(|mut definition| {
+                if definition.name == "agent_spawn"
+                    && let Some(schema) = context
+                        .and_then(|context| context.agent.as_ref())
+                        .and_then(|scope| scope.profile_schema())
+                {
+                    definition.input_schema["properties"]["profile"] = schema;
+                }
+                definition
+            })
+            .collect()
     }
 
     /// Advertise optional root tools before an ACP transport admits its first turn.
-    pub fn definition_list_for_owner(&self, owner: &crate::backend::ExecutionOwner, agent_tools: bool, lsp_tools: bool) -> Vec<ControlToolDefinition> {
-        self.definition_list().into_iter().filter(|definition| {
-            if definition.name == "lsp" { return lsp_tools; }
-            owner.is_root() && (!is_agent_tool(definition.name) || agent_tools)
-        }).collect()
+    pub fn definition_list_for_owner(
+        &self,
+        owner: &crate::backend::ExecutionOwner,
+        agent_tools: bool,
+        lsp_tools: bool,
+    ) -> Vec<ControlToolDefinition> {
+        self.definition_list()
+            .into_iter()
+            .filter(|definition| {
+                if lsp::is_tool(definition.name) {
+                    return lsp_tools;
+                }
+                owner.is_root() && (!is_agent_tool(definition.name) || agent_tools)
+            })
+            .collect()
     }
 
     /// Convert the canonical definitions into the MCP tool-list shape.
@@ -299,9 +342,12 @@ pub fn apply_invocation(
             output.question_withdrawal =
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
-        "agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt"
-        | "agent_list" | "agent_activity" | "agent_tool_output" => {},
-        "lsp" | "plan_checks_add" | "plan_phase_done" | "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel" => {},
+        "agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt" | "agent_list"
+        | "agent_activity" | "agent_tool_output" => {}
+        "lsp_overview" | "lsp_symbols" | "lsp_definition" | "lsp_context" | "lsp_references"
+        | "lsp_calls" | "lsp_paths" | "lsp_diagnostics" | "lsp_status" | "plan_checks_add"
+        | "plan_phase_done" | "checks_list" | "checks_configure" | "checks_run"
+        | "checks_status" | "checks_cancel" => {}
         "goal_complete" => output.evidence.structured_complete = true,
         "goal_blocked" => output.evidence.structured_blocked = true,
         "goal_status" => output.evidence.tool_called = true,

@@ -40,7 +40,23 @@ function M.handle(event, payload, session_id, generation)
     next_batch()
   end
   local completed = false
-  local cancel = query.request(payload.workspace, payload.arguments, authorize, function(result, failure)
+  local function analyze(path, contents, receive)
+    if not current() then receive(nil, "editor connection changed") return end
+    local offset = 0
+    local function next_part()
+      if not current() then receive(nil, "editor connection changed") return end
+      local ending = math.min(#contents, offset + 32768)
+      while ending < #contents and contents:byte(ending + 1) >= 128 and contents:byte(ending + 1) < 192 do ending = ending - 1 end
+      client.request_for(session_id, "lsp.analyze", { id = payload.id, path = path,
+        source = contents:sub(offset + 1, ending), source_offset = offset, source_total = #contents }, function(result, failure)
+        if failure then receive(nil, failure) return end
+        offset = ending
+        if offset < #contents then next_part() else receive(result) end
+      end)
+    end
+    next_part()
+  end
+  local cancel = query.request(payload.workspace, payload.arguments, authorize, analyze, function(result, failure)
     completed = true
     pending[payload.id] = nil
     if not current() then return end

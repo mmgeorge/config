@@ -39,6 +39,7 @@ pub struct SyntaxEngine {
 struct SyntaxKey {
     source: SourceIdentity,
     language: SyntaxLanguage,
+    line_limited: bool,
 }
 
 struct SyntaxState {
@@ -90,11 +91,28 @@ impl SyntaxEngine {
         self: &Arc<Self>,
         request: SyntaxRequest,
     ) -> Result<SyntaxHandle, SyntaxError> {
+        self.analyze_with_policy(request, true).await
+    }
+
+    /// Parses source for explicit structural queries without the rendering line cutoff.
+    /// Worker admission, request deadlines, and cancellation still apply.
+    pub async fn analyze_full(
+        self: &Arc<Self>,
+        request: SyntaxRequest,
+    ) -> Result<SyntaxHandle, SyntaxError> {
+        self.analyze_with_policy(request, false).await
+    }
+
+    async fn analyze_with_policy(
+        self: &Arc<Self>,
+        request: SyntaxRequest,
+        line_limited: bool,
+    ) -> Result<SyntaxHandle, SyntaxError> {
         loop {
             let changed = self.pool.admission_changed();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            match self.analyze_admitted(request.clone()).await {
+            match self.analyze_admitted(request.clone(), line_limited).await {
                 Err(SyntaxError::Busy | SyntaxError::Pool(crate::workers::PoolError::Busy)) => {
                     if let Some(deadline) = request.deadline {
                         tokio::time::timeout_at(deadline.into(), changed)
@@ -112,10 +130,12 @@ impl SyntaxEngine {
     async fn analyze_admitted(
         self: &Arc<Self>,
         request: SyntaxRequest,
+        line_limited: bool,
     ) -> Result<SyntaxHandle, SyntaxError> {
         let key = SyntaxKey {
             source: request.source.identity(),
             language: request.language,
+            line_limited: line_limited && request.source.text().lines().take(SYNTAX_LINE_LIMIT + 1).count() > SYNTAX_LINE_LIMIT,
         };
         let (interest, mut receiver, work) = {
             let mut state = self.state.lock().expect("syntax state poisoned");
@@ -175,7 +195,7 @@ impl SyntaxEngine {
         };
         if let Some((permit, mut completion)) = work {
             permit.submit(move |budget| {
-                let result = parse(request.source, request.language, &budget);
+                let result = parse(request.source, request.language, &budget, key.line_limited);
                 completion.publish(result);
             });
         }

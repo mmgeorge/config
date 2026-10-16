@@ -44,14 +44,14 @@ function M.request(source, current, receive)
   guard:start(50, 50, vim.schedule_wrap(function()
     if not valid() then finish(nil, nil, "cancelled") end
   end))
-  read(source.path, 1024 * 1024, function(contents, failure)
+  read(source.path, nil, function(contents, failure)
     if finished then return end
     if not valid() then finish(nil, nil, "cancelled") return end
     if failure then finish(nil, failure) return end
     if vim.fn.sha256(contents) ~= source.digest then finish(nil, nil, "Source changed since this plan was captured") return end
     local path = canonical(source.path)
     buffer = named(path)
-    client, failure = select_client(path, source.filetype, buffer)
+    client, failure = select_client(path, source.filetype, buffer, "textDocument/definition")
     if not client then finish(nil, nil, failure) return end
     local source_rows = rows(contents)
     if buffer and vim.api.nvim_buf_is_loaded(buffer) then

@@ -18,7 +18,9 @@ pub use configuration::ConfigurationFormat;
 pub use visibility::DeclarationVisibility;
 pub use declaration::{DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;
+mod structure;
 mod tree;
+pub use structure::SourceDeclaration;
 
 pub use assets::SyntaxLanguage;
 pub use context::HunkContext;
