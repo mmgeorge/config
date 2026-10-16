@@ -22,6 +22,12 @@ static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sy
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Proposed check commands, distinct from executed verification evidence.
+    pub check_preview: Vec<crate::checks::CheckPreview>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    /// Input identity preventing edited plans from displaying obsolete commands.
+    pub check_preview_source: String,
     /// Captures read-only project checks displayed with a submitted design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub check_configuration: Option<crate::checks::ConfigSnapshot>,
@@ -53,6 +59,8 @@ fn default_line_width() -> usize {
 impl Default for DeclarationDesign {
     fn default() -> Self {
         Self {
+            check_preview: Vec::new(),
+            check_preview_source: String::new(),
             check_configuration: None,
             cargo_lock: BTreeMap::new(),
             validation: None,
@@ -68,7 +76,7 @@ impl Default for DeclarationDesign {
 }
 
 impl DeclarationDesign {
-    /// Format and validate one submission using the shared lazy source resolver.
+    /// Format and validate one submission using only captured declaration evidence.
     pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
         self.check_workspace(workspace)?;
         self.validated_revision(workspace).await
@@ -93,11 +101,24 @@ impl DeclarationDesign {
             }
         }
         design.validate()?;
-        let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false, None).await?;
-        let report = resolver.validate_sources(&design).await?;
+        let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
+        let report = resolver.validate(&design);
         report.ensure_valid()?;
         design.validation = Some(report);
+        design.check_preview = crate::checks::preview_plan(workspace, &design).await?;
+        design.check_preview_source = design.check_preview_fingerprint()?;
         Ok(design)
+    }
+
+    /// Identifies only the planned inputs that determine check selection.
+    pub(crate) fn check_preview_fingerprint(&self) -> Result<String> {
+        let manifests: BTreeMap<_, _> = self.proposed.iter().filter(|(path, _)| path.ends_with("Cargo.toml") || path.ends_with("package.json") || path.ends_with("pnpm-workspace.yaml")).collect();
+        Ok(super::digest(&serde_json::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, manifests))?))
+    }
+
+    /// Rejects cached command previews after selection inputs change.
+    pub(crate) fn check_preview_current(&self) -> Result<bool> {
+        Ok(!self.check_preview.is_empty() && self.check_preview_source == self.check_preview_fingerprint()?)
     }
 
     /// Initialize plan settings without discovering or extracting workspace files.
@@ -810,7 +831,7 @@ mod tests {
         std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&config).unwrap()).unwrap();
         let (submitted, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
         assert!(submitted.design.unwrap().check_configuration.is_some());
-        assert!(rendered.markdown.contains("Score tests"));
+        assert!(rendered.markdown.contains("echo test > should-not-exist.txt"));
         assert!(!workspace.path().join("should-not-exist.txt").exists());
         assert!(serde_json::to_value(store.read_submitted_document("session", "validation", 1).unwrap().design.unwrap().document).unwrap().get("checks").is_none());
     }

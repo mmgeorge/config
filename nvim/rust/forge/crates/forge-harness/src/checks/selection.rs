@@ -10,6 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 pub struct CheckCase {
     pub file: String,
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional executable target, such as lib, bin:cli, or test:gameplay.
+    pub target: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -47,6 +50,7 @@ impl CheckSelection {
                         !case.name.is_empty() && !case.name.contains('\0'),
                         "invalid test case name"
                     );
+                    ensure!(case.target.as_ref().is_none_or(|target| !target.is_empty() && target.len() <= 256 && !target.chars().any(char::is_control)), "invalid test target");
                 }
                 cases.sort();
                 cases.dedup();
@@ -84,6 +88,7 @@ impl RunRequest {
         config: &CheckConfig,
         files: &[String],
         cases: Option<&[CheckCase]>,
+        new_cases: Option<&[CheckCase]>,
         has_scope: bool,
     ) -> Result<BTreeMap<String, CheckSelection>> {
         let known: BTreeSet<_> = config
@@ -132,14 +137,14 @@ impl RunRequest {
                                 .collect(),
                         }
                     }
-                    CheckScope::ChangedCases => {
+                    CheckScope::ChangedCases | CheckScope::NewCases => {
                         ensure!(
                             has_scope,
                             "{} requires explicit cases outside a task execution",
                             definition.id
                         );
                         CheckSelection::Cases {
-                            cases: cases
+                            cases: (if definition.scope == CheckScope::NewCases { new_cases } else { cases })
                                 .unwrap_or_default()
                                 .iter()
                                 .filter(|case| definition.trigger.matches_path(&case.file))

@@ -15,6 +15,15 @@ pub enum CheckTrigger {
         /// Project-relative patterns supporting `*`, `?`, and whole-component `**`.
         include: Vec<String>,
         /// Patterns that remove individual paths from the included set.
+        #[serde(default)]
+        exclude: Vec<String>,
+    },
+    /// Runs once when task-relative changes match these file patterns.
+    FilesChanged {
+        /// Project-relative patterns supporting `*`, `?`, and whole-component `**`.
+        include: Vec<String>,
+        #[serde(default)]
+        /// Patterns removing paths from the included set.
         exclude: Vec<String>,
     },
     /// Runs only through explicit selection or as another check's prerequisite.
@@ -24,7 +33,7 @@ pub enum CheckTrigger {
 impl CheckTrigger {
     /// Rejects unsupported patterns instead of silently broadening automatic coverage.
     pub(crate) fn validate(&self) -> Result<()> {
-        if let Self::Paths { include, exclude } = self {
+        if let Self::Paths { include, exclude } | Self::FilesChanged { include, exclude } = self {
             ensure!(
                 !include.is_empty() && include.len() + exclude.len() <= 128,
                 "path triggers require 1 to 128 patterns"
@@ -48,7 +57,7 @@ impl CheckTrigger {
         match self {
             Self::AnyChange => "Any changed file".into(),
             Self::Manual => "Explicit runs only".into(),
-            Self::Paths { include, exclude } => {
+            Self::Paths { include, exclude } | Self::FilesChanged { include, exclude } => {
                 let included = include.join(", ");
                 if exclude.is_empty() {
                     included
@@ -64,7 +73,7 @@ impl CheckTrigger {
         match self {
             Self::AnyChange => true,
             Self::Manual => false,
-            Self::Paths { include, exclude } => {
+            Self::Paths { include, exclude } | Self::FilesChanged { include, exclude } => {
                 include.iter().any(|pattern| path_matches(pattern, path))
                     && !exclude.iter().any(|pattern| path_matches(pattern, path))
             }
@@ -200,7 +209,7 @@ pub(super) fn resolve(
         .collect())
 }
 
-fn path_matches(pattern: &str, path: &str) -> bool {
+pub(super) fn path_matches(pattern: &str, path: &str) -> bool {
     let pattern: Vec<_> = pattern.split('/').collect();
     let path: Vec<_> = path.split('/').collect();
     let mut matched = vec![false; path.len() + 1];

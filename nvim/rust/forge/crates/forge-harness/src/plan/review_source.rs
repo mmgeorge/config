@@ -10,7 +10,6 @@ pub(crate) struct PlanReviewSource {
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<tokio::sync::OnceCell<std::sync::Mutex<(crate::declaration::DeclarationResolver, crate::declaration::DeclarationResolver)>>>,
-    pub resolver_sources: std::sync::Arc<tokio::sync::OnceCell<()>>,
     pub historical: bool,
     pub public_only: bool,
     /// Keeps referenced file sides visible without changing the public filter.
@@ -81,7 +80,6 @@ impl PlanFileStore {
             trace: None,
             execution_review: None,
             resolver: Default::default(),
-            resolver_sources: Default::default(),
             public_only: true,
             collapse: Default::default(),
             revealed: Default::default(),
@@ -147,7 +145,6 @@ impl PlanFileStore {
             trace: None,
             execution_review: None,
             resolver: Default::default(),
-            resolver_sources: Default::default(),
             public_only: true,
             collapse: Default::default(),
             revealed: Default::default(),

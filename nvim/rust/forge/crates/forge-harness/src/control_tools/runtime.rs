@@ -3,7 +3,6 @@ use crate::backend::{BackendOutput, PromptMode};
 use crate::plan::{
     PlanDocument, PlanState, render_plan, validate_workspace_references,
 };
-use crate::rustdoc::{RustdocResolver, validate_plan_rust_api};
 use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
@@ -26,7 +25,6 @@ pub struct ControlTurnContext {
     pub has_active_execution: bool,
     pub has_active_goal: bool,
     pub workspace_root: Option<PathBuf>,
-    pub rustdoc: Option<Arc<RustdocResolver>>,
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
     pub execution: Option<crate::plan::execution::ExecutionControlSender>,
 }
@@ -47,7 +45,6 @@ impl std::fmt::Debug for ControlTurnContext {
             .field("has_active_execution", &self.has_active_execution)
             .field("has_active_goal", &self.has_active_goal)
             .field("workspace_root", &self.workspace_root)
-            .field("rustdoc_available", &self.rustdoc.is_some())
             .field("repository_available", &self.repository.is_some())
             .finish()
     }
@@ -71,7 +68,6 @@ impl ControlTurnContext {
             has_active_execution: false,
             has_active_goal: false,
             workspace_root: None,
-            rustdoc: None,
             repository: None,
             execution: None,
         }
@@ -285,34 +281,11 @@ impl ControlToolRuntime {
                     .context("plan submission has no workspace root")?;
                 validate_workspace_references(document, workspace_root)?;
                 render_plan(document)?;
-                let resolver = self
-                    .context
-                    .rustdoc
-                    .as_ref()
-                    .context("plan submission has no Rust API validation service")?;
-                let mut validated_document = document.clone();
-                let report = validate_plan_rust_api(resolver, &mut validated_document).await?;
-                self.plan_document = Some(validated_document);
+                self.plan_document = Some(document.clone());
                 self.terminal = true;
                 Ok(ControlToolResult {
                     invocation: Some(invocation),
-                    message: if report.warning.is_empty() {
-                        self.plan_version_message("Plan passed canonical submission validation")
-                    } else {
-                        format!(
-                            "{} {} Rust API validation warning(s): {}",
-                            self.plan_version_message(
-                                "Plan passed canonical submission validation"
-                            ),
-                            report.warning.len(),
-                            report
-                                .warning
-                                .iter()
-                                .map(|warning| format!("{}: {}", warning.path, warning.message))
-                                .collect::<Vec<_>>()
-                                .join("; ")
-                        )
-                    },
+                    message: self.plan_version_message("Plan passed canonical submission validation"),
                 })
             }
             "harness_question_ask" => {
@@ -486,7 +459,6 @@ mod test {
     }
 
     fn planning_context() -> ControlTurnContext {
-        let cache_dir = tempfile::tempdir().unwrap().keep();
         let workspace = tempfile::tempdir().unwrap().keep();
         crate::checks::configure_fixture(&workspace);
         ControlTurnContext {
@@ -506,17 +478,7 @@ mod test {
             workspace_root: Some(workspace),
             repository: None,
             execution: None,
-            rustdoc: Some(Arc::new(
-                RustdocResolver::new(crate::rustdoc::RustdocResolverConfig {
-                    crates_io_base: "http://127.0.0.1:9".into(),
-                    cache_dir,
-                    cargo_source: crate::rustdoc::CargoSourceResolverConfig {
-                        cargo_executable: PathBuf::from("missing-cargo"),
-                        cargo_home: tempfile::tempdir().unwrap().keep(),
-                    },
-                })
-                .unwrap(),
-            )),
+
         }
     }
 
@@ -635,21 +597,22 @@ mod test {
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         design.document.design = "Expose a typed API.".into();
         design.proposed.insert("tsconfig.json".into(), "{\"compilerOptions\":{\"noLib\":true}}".into());
-        design.proposed.insert("api.ts".into(), "export interface Api { item: Missing; }\n".into());
+        design.proposed.insert("api.ts".into(), "import { Missing } from './model';\nexport interface Api { item: Missing; }\n".into());
+        design.proposed.insert("model.ts".into(), "export interface Item {}\n".into());
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
         let submit = |version| ControlToolInvocation { name:"harness_plan_submit".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":version}) };
         let error = runtime.invoke(submit(1)).await.unwrap_err();
         let failure:serde_json::Value = serde_json::from_str(&crate::control_tools::control_tool_failure_json(&submit(1), &error, runtime.plan_document())).unwrap();
         assert_eq!(failure["code"], "declaration_validation_failed");
-        assert!(failure["violation"][0]["path"].as_str().unwrap().starts_with("api.ts:1:"));
-        runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-export interface Api { item: Missing; }\n+export interface Api { item: string; }\n*** End Patch"}) }).await.unwrap();
+        assert!(failure["violation"][0]["path"].as_str().unwrap().starts_with("api.ts:"));
+        runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-import { Missing } from './model';\n-export interface Api { item: Missing; }\n+import { Item } from './model';\n+export interface Api { item: Item; }\n*** End Patch"}) }).await.unwrap();
         runtime.invoke(submit(2)).await.unwrap();
         assert!(runtime.plan_document().unwrap().design.as_ref().unwrap().validation.is_some());
     }
 
     #[tokio::test]
-    async fn returns_rust_api_violations_to_the_submit_tool_and_keeps_editing_open() {
+    async fn external_api_validation_does_not_block_submission() {
         let mut context = planning_context();
         context.plan_document.as_mut().unwrap().dependencies.push(
             crate::plan::PlanDependencyChange {
@@ -679,33 +642,16 @@ mod test {
             );
         let mut runtime = ControlToolRuntime::new(context);
 
-        let error = runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_submit".into(),
-                arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
-            })
-            .await
-            .unwrap_err()
-            .to_string();
-
-        assert!(error.contains("dependencies.0.version"), "{error}");
-        assert!(
-            error.contains("invalid Cargo version requirement"),
-            "{error}"
-        );
-        assert!(
-            runtime
-                .invoke(ControlToolInvocation {
-                    name: "harness_plan_read".into(),
-                    arguments: json!({ "plan_id": "plan" }),
-                })
-                .await
-                .is_ok()
-        );
+        let result = runtime.invoke(ControlToolInvocation {
+            name: "harness_plan_submit".into(),
+            arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
+        }).await.unwrap();
+        assert!(result.message.contains("passed canonical submission validation"));
+        assert!(runtime.terminal);
     }
 
     #[tokio::test]
-    async fn returns_network_validation_warnings_without_rejecting_submission() {
+    async fn external_dependency_submission_needs_no_analysis_service() {
         let mut context = planning_context();
         context.plan_document.as_mut().unwrap().dependencies.push(
             crate::plan::PlanDependencyChange {
@@ -748,9 +694,8 @@ mod test {
                 .message
                 .contains("passed canonical submission validation")
         );
-        assert!(result.message.contains("Rust API validation warning"));
-        assert!(result.message.contains("partially skipped"));
-        assert!(result.message.contains("datafusion"));
+        assert!(!result.message.contains("warning"));
+        assert!(runtime.plan_document().unwrap().dependencies[0].resolved_version.is_none());
     }
 
     #[tokio::test]

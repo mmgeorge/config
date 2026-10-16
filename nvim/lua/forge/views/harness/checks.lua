@@ -14,9 +14,9 @@ local owner = "forge-harness-checks"
 ---@field trigger {kind: string, include?: string[], exclude?: string[]}
 ---@field scope string
 ---@field directory string
----@field all {command: string}
----@field files? {command: string}|userdata
----@field cases? {command: string}|userdata
+---@field all {command: string, args?: string[]}
+---@field files? {command: string, args?: string[]}|userdata
+---@field cases? {command: string, args?: string[]}|userdata
 ---@field depends_on string[]
 
 ---@class ForgeCheckCatalog
@@ -29,6 +29,7 @@ local owner = "forge-harness-checks"
 ---@field active_run? string|userdata
 ---@field applicability? {id: string, selected: boolean, reason: string, matched_files: string[]}[]
 ---@field changed_files? string[]|userdata
+---@field preview? {id: string, command: string, reason: string, selected: boolean, pending: boolean}[]
 
 ---@param value any
 ---@return boolean
@@ -37,7 +38,17 @@ local function present(value) return type(value) == "table" or type(value) == "s
 ---@param scope string
 ---@return string
 local function scope_label(scope)
-  return ({ all = "All", changed_files = "Changed files", changed_cases = "Added/modified cases" })[scope] or scope
+  return ({ all = "All", changed_files = "Changed files", changed_cases = "Added/modified cases", new_cases = "New cases" })[scope] or scope
+end
+
+---@param operation {command: string, args?: string[]}
+---@return string
+local function operation_label(operation)
+  local parts = { operation.command }
+  for _, argument in ipairs(type(operation.args) == "table" and operation.args or {}) do
+    parts[#parts + 1] = vim.json.encode(argument)
+  end
+  return table.concat(parts, " ")
 end
 
 ---@param state ForgeHarnessPresentationState
@@ -122,30 +133,47 @@ function Checks.open(state, host, setup)
 
   local function latest(check)
     for index = #(catalog.history or {}), 1, -1 do
+      local matches = {}
+      local duration_ms = 0
+      local priority = { configuration_error = 8, failed = 7, blocked = 6, interrupted = 5, running = 4, pending = 3, skipped = 2, passed = 1 }
+      local result
       for _, command in ipairs(catalog.history[index].commands or {}) do
         if present(command.context) and command.context.definition_id == check.id then
+          matches[#matches + 1] = command
           local completed = command.completed_at_ms
           if type(completed) ~= "number" and command.state == "running" then
             local seconds, microseconds = vim.uv.gettimeofday()
             completed = seconds * 1000 + microseconds / 1000
           end
-          local duration = type(command.started_at_ms) == "number" and type(completed) == "number"
-              and string.format("%.1fs", (completed - command.started_at_ms) / 1000) or ""
-          return command, duration
+          if type(command.started_at_ms) == "number" and type(completed) == "number" then
+            duration_ms = duration_ms + completed - command.started_at_ms
+          end
+          if not result or (priority[command.state] or 0) > (priority[result.state] or 0) then result = command end
         end
+      end
+      if result then
+        result = vim.deepcopy(result)
+        result.expanded = matches
+        return result, duration_ms > 0 and string.format("%.1fs", duration_ms / 1000) or ""
       end
     end
     return nil, ""
   end
 
   local function details(check)
-    local result = { "Directory: " .. (check.directory or "."), "All: " .. check.all.command }
+    local result = { "Directory: " .. (check.directory or "."), "All: " .. operation_label(check.all) }
     result[#result + 1] = "Prerequisites: " .. (#(check.depends_on or {}) > 0 and table.concat(check.depends_on, ", ") or "None")
     result[#result + 1] = "Trigger: " .. vim.json.encode(check.trigger)
     result[#result + 1] = "Area: " .. check.area
     result[#result + 1] = applicability(check)
-    if present(check.files) then result[#result + 1] = "Files: " .. check.files.command end
-    if present(check.cases) then result[#result + 1] = "Cases: " .. check.cases.command end
+    if present(check.files) then result[#result + 1] = "Files: " .. operation_label(check.files) end
+    if present(check.cases) then result[#result + 1] = "Cases: " .. operation_label(check.cases) end
+    for _, preview in ipairs(catalog.preview or {}) do
+      if preview.id == check.id then
+        result[#result + 1] = (preview.pending and "Pending: " or preview.selected and "Will run: " or "Not selected: ") .. preview.command
+        result[#result + 1] = preview.reason
+      end
+    end
     local command = latest(check)
     if command then
       if type(command.error) == "string" then result[#result + 1] = command.error end
@@ -154,6 +182,10 @@ function Checks.open(state, host, setup)
         if present(command.context.resolved) then result[#result + 1] = "Resolved: " .. vim.json.encode(command.context.resolved) end
       end
       result[#result + 1] = "Output: " .. command.output
+      for _, invocation in ipairs(command.expanded or {}) do
+        result[#result + 1] = invocation.state .. ": " .. invocation.command
+        result[#result + 1] = "Output: " .. invocation.output
+      end
     end
     return result
   end
@@ -167,7 +199,7 @@ function Checks.open(state, host, setup)
     else
       local scopes = { "all" }
       if present(check.files) then scopes[#scopes + 1] = "changed_files" end
-      if present(check.cases) then scopes[#scopes + 1] = "changed_cases" end
+      if present(check.cases) then scopes[#scopes + 1] = "changed_cases" scopes[#scopes + 1] = "new_cases" end
       local index = vim.fn.index(scopes, scope)
       overrides.scopes[check.id] = scopes[(index + direction) % #scopes + 1]
     end

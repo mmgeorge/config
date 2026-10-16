@@ -15,7 +15,7 @@ fn definition(id: &str, command: &str) -> CheckDefinition {
         trigger: CheckTrigger::AnyChange,
         scope: CheckScope::All,
         directory: ".".into(),
-        all: CheckOperation {
+        all: CheckOperation { args: None, package_manager: None,
             command: command.into(),
         },
         files: None,
@@ -39,6 +39,213 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
         Arc::new(forge_git::store::RepositoryStore::default()),
     )
     .unwrap()
+}
+
+fn direct_operation(command: &str, args: &[&str], manager: Option<PackageManager>) -> CheckOperation {
+    CheckOperation { command: command.into(), args: Some(args.iter().map(|argument| (*argument).into()).collect()), package_manager: manager }
+}
+
+fn node_workspace(root: &std::path::Path, pnpm: bool) -> Result<()> {
+    std::fs::write(root.join("package.json"), r#"{"name":"root","private":true,"workspaces":["packages/*","!packages/excluded"]}"#)?;
+    if pnpm { std::fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n")?; }
+    for name in ["0", "1", "excluded"] {
+        let directory = root.join("packages").join(name);
+        std::fs::create_dir_all(directory.join("src"))?;
+        std::fs::write(directory.join("package.json"), serde_json::to_vec(&serde_json::json!({"name":name}))?)?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn package_resolution_deduplicates_and_respects_membership() -> Result<()> {
+    for manager in [PackageManager::Npm, PackageManager::Pnpm] {
+        let workspace = tempfile::tempdir()?;
+        node_workspace(workspace.path(), manager == PackageManager::Pnpm)?;
+        let operation = direct_operation("npm", &["test", "--workspace={package.name}"], Some(manager));
+        let mut resolver = super::invocation::InvocationResolver::default();
+        let invocations = resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["packages/0/src/one.ts".into(), "packages/0/src/deleted.ts".into(), "packages/1/src/two.ts".into()] }).await?;
+        assert_eq!(invocations.len(), 2);
+        assert_eq!(invocations[0].args, ["test", "--workspace=0"]);
+        assert_eq!(invocations[0].files.len(), 2);
+        assert!(resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["packages/excluded/src/one.ts".into()] }).await.is_err());
+        assert!(resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["package-lock.json".into()] }).await.is_err());
+    }
+    for manager in [PackageManager::Npm, PackageManager::Pnpm] {
+        let workspace = tempfile::tempdir()?;
+        std::fs::write(workspace.path().join("package.json"), r#"{"name":"single"}"#)?;
+        let operation = direct_operation("npm", &["--prefix", "{package.directory}", "test"], Some(manager));
+        let invocations = super::invocation::InvocationResolver::default().resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["src/one.js".into(), "src/two.js".into()] }).await?;
+        assert_eq!(invocations.len(), 1);
+        assert_eq!(invocations[0].package.as_ref().unwrap().name.as_deref(), Some("single"));
+        assert!(std::path::Path::new(&invocations[0].args[1]).is_absolute());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_cancellation_stops_the_owned_process() -> Result<()> {
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let requested = cancelled.clone();
+    let signal = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        requested.store(true, std::sync::atomic::Ordering::Release);
+    });
+    let start = std::time::Instant::now();
+    let result = super::invocation::capture("nu", &["--no-config-file".into(), "-c".into(), "sleep 10sec".into()], std::path::Path::new("."), Some(cancelled.as_ref()), None, 3).await;
+    signal.await?;
+    assert!(result.unwrap_err().to_string().contains("interrupted"));
+    assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_directory_failure_does_not_retain_execution_admission() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("one", "print done")]);
+    let runner = make_runner(workspace.path(), data.path());
+    let prepared = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None, crate::session::CheckShell::Nushell, "test".into())?;
+    std::fs::write(data.path().join(&prepared.id), "blocks directory creation")?;
+    assert!(runner.run(prepared, None, None).await.is_err());
+    assert!(runner.active()?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::write(workspace.path().join("echo.nu"), "def main [value: string] { print $value }")?;
+    let mut check = definition("file", "exit 91");
+    check.scope = CheckScope::ChangedFiles;
+    check.files = Some(direct_operation("nu", &["--no-config-file", "echo.nu", "{file.path}"], None));
+    save(workspace.path(), vec![check]);
+    let runner = make_runner(workspace.path(), data.path());
+    let path = "src/spaces $value; [quoted].rs";
+    let prepared = runner.prepare_request(RunRequest { ids: vec!["file".into()], selections: BTreeMap::from([("file".into(), CheckSelection::Files { files: vec![path.into()] })]), ..Default::default() }, None, crate::session::CheckShell::Nushell, "test".into())?;
+    let run = runner.run(prepared, None, None).await?;
+    assert_eq!(run.state, CheckState::Passed);
+    assert_eq!(std::fs::read_to_string(&run.commands[0].stdout)?.trim(), path);
+    Ok(())
+}
+
+#[tokio::test]
+async fn every_package_prerequisite_must_pass() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    node_workspace(workspace.path(), false)?;
+    let mut prerequisite = definition("packages", "exit 0");
+    prerequisite.scope = CheckScope::ChangedFiles;
+    prerequisite.files = Some(direct_operation("nu", &["--no-config-file", "-c", "exit {package.name}"], Some(PackageManager::Npm)));
+    let mut dependent = definition("dependent", "'ran' | save should-not-exist.txt");
+    dependent.depends_on = vec!["packages".into()];
+    save(workspace.path(), vec![prerequisite, dependent]);
+    let runner = make_runner(workspace.path(), data.path());
+    let prepared = runner.prepare(ConfigSnapshot::load(workspace.path())?, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(vec!["packages/0/src/one.ts".into(), "packages/1/src/two.ts".into()]), cases: None, new_cases: None, has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "test".into(), task_id: None, revision: 0 })?;
+    let run = runner.run(prepared, None, None).await?;
+    assert_eq!(run.commands.len(), 3);
+    assert_eq!(run.commands[0].state, CheckState::Passed);
+    assert_eq!(run.commands[1].state, CheckState::Failed);
+    assert_eq!(run.commands[2].state, CheckState::Skipped);
+    assert!(!workspace.path().join("should-not-exist.txt").exists());
+    Ok(())
+}
+
+#[test]
+fn new_case_scope_keeps_modified_cases_separate() -> Result<()> {
+    let mut check = definition("new", "exit 0");
+    check.scope = CheckScope::NewCases;
+    check.cases = Some(CheckOperation { command: "handler".into(), args: None, package_manager: None });
+    let config = CheckConfig { version: 2, definitions: vec![check] };
+    let new = CheckCase { file: "src/lib.rs".into(), name: "new_case".into(), target: Some("lib".into()) };
+    let modified = CheckCase { name: "modified_case".into(), ..new.clone() };
+    let selected = RunRequest::default().selections(&config, &["src/lib.rs".into()], Some(&[new.clone(), modified]), Some(std::slice::from_ref(&new)), true)?;
+    assert_eq!(selected["new"], CheckSelection::Cases { cases: vec![new] });
+    Ok(())
+}
+
+#[test]
+fn advertised_schema_accepts_file_trigger_and_direct_package_arguments() -> Result<()> {
+    let mut check = definition("packages", "exit 0");
+    check.scope = CheckScope::ChangedFiles;
+    check.files = Some(direct_operation("cargo", &["test", "--package", "{package.name}", "--tests"], Some(PackageManager::Cargo)));
+    let mut value = serde_json::to_value(CheckConfig { version: 2, definitions: vec![check] })?;
+    value["definitions"][0]["trigger"] = serde_json::json!({"kind":"files_changed", "include":["**/*.rs"]});
+    serde_json::from_value::<CheckConfig>(value.clone())?.validate()?;
+    let schema = serde_json::to_value(schemars::schema_for!(CheckConfig))?;
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&value), "advertised schema rejects files_changed: {}", validator.iter_errors(&value).map(|error| error.to_string()).collect::<Vec<_>>().join("; "));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::create_dir_all(workspace.path().join("src"))?;
+    std::fs::create_dir_all(workspace.path().join("tests"))?;
+    std::fs::write(workspace.path().join("Cargo.toml"), "[package]\nname='native-fixture'\nversion='0.1.0'\nedition='2024'\n")?;
+    std::fs::write(workspace.path().join("Cargo.lock"), "version = 4\n[[package]]\nname = 'native-fixture'\nversion = '0.1.0'\n")?;
+    std::fs::write(workspace.path().join("src/lib.rs"), "#[test] fn added() {}\n#[test] fn existing() {}\n#[test] #[ignore] fn ignored() {}\n")?;
+    std::fs::write(workspace.path().join("tests/gameplay.rs"), "#[test] fn integration() {}\n")?;
+    let mut packages = definition("packages", "exit 99");
+    packages.scope = CheckScope::ChangedFiles;
+    packages.files = Some(direct_operation("cargo", &["test", "--release", "--locked", "--package", "{package.name}", "--tests"], Some(PackageManager::Cargo)));
+    let mut new = definition("new", "exit 99");
+    new.scope = CheckScope::NewCases;
+    new.cases = Some(direct_operation("cargo", &["test", "--release", "--locked", "--package", "{package.name}", "{case.target_args}", "--", "{case.name}", "--exact"], Some(PackageManager::Cargo)));
+    save(workspace.path(), vec![packages, new]);
+    let runner = make_runner(workspace.path(), data.path());
+    let case = CheckCase { file: "src/lib.rs".into(), name: "added".into(), target: Some("lib".into()) };
+    let prepared = runner.prepare(ConfigSnapshot::load(workspace.path())?, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(vec!["src/lib.rs".into()]), cases: Some(vec![case.clone()]), new_cases: Some(vec![case.clone()]), has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "plan".into(), task_id: None, revision: 1 })?;
+    let run = runner.run(prepared, None, None).await?;
+    assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
+    assert!(std::fs::read_to_string(&run.commands[0].stdout)?.contains("integration"));
+    let output = std::fs::read_to_string(&run.commands[1].stdout)?;
+    assert!(output.contains("test added ... ok"));
+    assert!(!output.contains("test existing ... ok"));
+    for name in ["missing", "ignored"] {
+        let request = RunRequest { ids: vec!["new".into()], selections: BTreeMap::from([("new".into(), CheckSelection::Cases { cases: vec![CheckCase { name: name.into(), ..case.clone() }] })]), ..Default::default() };
+        let prepared = runner.prepare_request(request, None, crate::session::CheckShell::Nushell, "explicit".into())?;
+        let run = runner.run(prepared, None, None).await?;
+        assert_eq!(run.commands.iter().find(|command| command.context.as_ref().unwrap().definition_id == "new").unwrap().state, CheckState::ConfigurationError);
+    }
+    std::fs::write(workspace.path().join("tests/custom.rs"), "fn main() { std::fs::write(\"custom-ran\", \"yes\").unwrap(); }")?;
+    let manifest = workspace.path().join("Cargo.toml");
+    std::fs::write(&manifest, std::fs::read_to_string(&manifest)? + "\n[[test]]\nname='custom'\nharness=false\n")?;
+    let request = RunRequest { ids: vec!["new".into()], selections: BTreeMap::from([("new".into(), CheckSelection::Cases { cases: vec![CheckCase { file: "tests/custom.rs".into(), name: "declared".into(), target: Some("test:custom".into()) }] })]), ..Default::default() };
+    let prepared = runner.prepare_request(request, None, crate::session::CheckShell::Nushell, "custom".into())?;
+    let run = runner.run(prepared, None, None).await?;
+    assert_eq!(run.state, CheckState::ConfigurationError);
+    assert!(!workspace.path().join("custom-ran").exists(), "custom harness must not run during native discovery");
+    Ok(())
+}
+
+#[tokio::test]
+async fn preview_matches_execution_and_manifest_changes_invalidate_bindings() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    node_workspace(workspace.path(), false)?;
+    let mut check = definition("packages", "exit 0");
+    check.scope = CheckScope::ChangedFiles;
+    check.files = Some(direct_operation("nu", &["--no-config-file", "-c", "exit {package.name}"], Some(PackageManager::Npm)));
+    save(workspace.path(), vec![check]);
+    let snapshot = ConfigSnapshot::load(workspace.path())?;
+    let files = vec!["packages/0/src/new.js".into()];
+    let preview = super::preview::resolve(workspace.path(), &snapshot.config, &files, None, None, false).await?;
+    assert!(preview[0].selected && !preview[0].pending);
+    let pending = super::preview::resolve(workspace.path(), &snapshot.config, &files, None, None, true).await?;
+    assert!(pending[0].pending);
+    let runner = make_runner(workspace.path(), data.path());
+    let prepared = runner.prepare(snapshot, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(files), cases: None, new_cases: None, has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "test".into(), task_id: None, revision: 0 })?;
+    let resolved = runner.resolve(prepared).await?;
+    assert_eq!(preview[0].command, resolved.commands[0].command);
+    assert!(runner.history()?.is_empty(), "preview must not create run history");
+    std::fs::write(workspace.path().join("packages/0/package.json"), r#"{"name":"renamed"}"#)?;
+    let run = runner.run(resolved, None, None).await?;
+    assert_eq!(run.state, CheckState::ConfigurationError);
+    assert!(run.commands[0].error.as_deref().unwrap().contains("configuration changed"));
+    Ok(())
 }
 
 #[tokio::test]
@@ -84,6 +291,7 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
                 "src/generated/ignored.rs".into(),
             ]),
             cases: None,
+            new_cases: None,
             has_scope: true,
             shell: crate::session::CheckShell::Nushell,
             trigger: "Task".into(),
@@ -121,7 +329,7 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
         exclude: vec!["src/generated/**".into()],
     };
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(CheckOperation {
+    check.files = Some(CheckOperation { args: None, package_manager: None,
         command: "files".into(),
     });
     let mut config = CheckConfig {
@@ -135,7 +343,7 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
         "other/file.rs".into(),
     ];
     let request = RunRequest::default();
-    let selected = request.selections(&config, &files, None, true)?;
+    let selected = request.selections(&config, &files, None, None, true)?;
     assert_eq!(
         selected["scoped"],
         CheckSelection::Files {
@@ -145,12 +353,12 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
     config.definitions[0].scope = CheckScope::ChangedCases;
     let cases = files
         .iter()
-        .map(|file| CheckCase {
+        .map(|file| CheckCase { target: None,
             file: file.clone(),
             name: "case".into(),
         })
         .collect::<Vec<_>>();
-    let selected = request.selections(&config, &files, Some(&cases), true)?;
+    let selected = request.selections(&config, &files, Some(&cases), None, true)?;
     assert!(matches!(&selected["scoped"], CheckSelection::Cases { cases } if cases.len() == 2));
     assert!(
         super::applicability::resolve(&request, &config, Some(&[]), true)?
@@ -177,11 +385,11 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'unexpected full suite' | save unexpected.txt");
     check.scope = CheckScope::ChangedCases;
-    check.cases = Some(CheckOperation {command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()});
+    check.cases = Some(CheckOperation { args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()});
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let case_selection = CheckSelection::Cases {
-        cases: vec![CheckCase {
+        cases: vec![CheckCase { target: None,
             file: "tests/unit.rs".into(),
             name: "selected_case".into(),
         }],
@@ -210,6 +418,7 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
                 overrides: Default::default(),
                 files: Some(vec!["src/source.rs".into()]),
                 cases: inventory,
+                new_cases: None,
                 has_scope: true,
                 shell: crate::session::CheckShell::Nushell,
                 trigger: "Case inventory regression".into(),
@@ -369,7 +578,7 @@ fn selection_deduplicates_without_broadening_and_rejects_escape_paths() -> Resul
         .is_err()
     );
     let requested = CheckSelection::Cases {
-        cases: vec![CheckCase {
+        cases: vec![CheckCase { target: None,
             file: "src/test.rs".into(),
             name: "one".into(),
         }],
@@ -434,7 +643,7 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'wrong all' | save all-ran.txt");
-    check.files = Some(CheckOperation {
+    check.files = Some(CheckOperation { args: None, package_manager: None,
         command: "print 'no receipt'".into(),
     });
     save(workspace.path(), vec![check]);
@@ -466,7 +675,7 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "exit 0");
-    check.files = Some(CheckOperation {command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
+    check.files = Some(CheckOperation { args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/name $var; [case].rs".to_owned();

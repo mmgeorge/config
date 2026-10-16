@@ -183,6 +183,12 @@ impl CheckRun {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains configured identity, requested coverage, and the handler's resolved coverage.
 pub struct CheckCommand {
+    #[serde(default)]
+    /// Configured direct operation before package bindings resolve.
+    pub operation: Option<super::CheckOperation>,
+    #[serde(default)]
+    /// Frozen direct invocation executed without shell interpolation.
+    pub invocation: Option<super::invocation::CheckInvocation>,
     pub definition_id: String,
     pub name: String,
     /// Functional area retained with the run's frozen configuration.

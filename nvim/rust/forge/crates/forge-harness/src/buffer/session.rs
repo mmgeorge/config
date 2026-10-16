@@ -100,6 +100,12 @@ pub enum PresentationRequest {
     PlanAction {
         input: DocumentInput,
     },
+    /// Complete an on-demand project-LSP lookup against the originating review action.
+    PlanDefinition {
+        input: DocumentInput,
+        source: crate::plan::WorkspaceDefinition,
+        target: crate::plan::DefinitionLocation,
+    },
     PlanSaveAnnotations {
         document: DocumentId,
         saved_source_digest: String,
@@ -222,6 +228,7 @@ impl SessionPresentation {
             }
             PresentationRequest::PlanOpen { .. }
             | PresentationRequest::PlanAction { .. }
+            | PresentationRequest::PlanDefinition { .. }
             | PresentationRequest::PlanSaveAnnotations { .. }
             | PresentationRequest::PlanView { .. }
             | PresentationRequest::PlanClose { .. } => {

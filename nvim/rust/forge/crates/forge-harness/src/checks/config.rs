@@ -25,13 +25,31 @@ pub enum CheckScope {
     All,
     ChangedFiles,
     ChangedCases,
+    /// Runs only tests marked new in the accepted plan.
+    NewCases,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Supplies a static command executed by the project's configured check shell.
+/// Supplies shell source or a direct executable with resolved argument bindings.
 pub struct CheckOperation {
+    /// Shell source when args is absent, otherwise an executable name or path.
     pub command: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Direct arguments. Bound values remain individual arguments, never shell source.
+    pub args: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Chooses workspace discovery when arguments refer to package context.
+    pub package_manager: Option<super::packages::PackageManager>,
+}
+
+impl CheckOperation {
+    /// Renders the complete configured invocation for review and permission matching.
+    pub fn display(&self) -> String {
+        self.args.as_ref().map_or_else(|| self.command.clone(), |args| {
+            super::invocation::display(&self.command, args)
+        })
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -123,6 +141,7 @@ impl CheckConfig {
                     "invalid command for {}",
                     definition.id
                 );
+                super::invocation::validate(operation)?;
             }
             match definition.scope {
                 CheckScope::ChangedFiles => ensure!(
@@ -130,7 +149,7 @@ impl CheckConfig {
                     "{} does not implement file selection",
                     definition.id
                 ),
-                CheckScope::ChangedCases => ensure!(
+                CheckScope::ChangedCases | CheckScope::NewCases => ensure!(
                     definition.cases.is_some(),
                     "{} does not implement case selection",
                     definition.id

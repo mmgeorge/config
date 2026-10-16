@@ -76,6 +76,9 @@ pub struct CallPosition {
     pub line: u32,
     /// Zero-based byte column in the captured source.
     pub column: u32,
+    /// Exact captured expression, separate from the inferred target name.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub expression: String,
 }
 
 /// Saved behavioral intent and ordered references belonging to one callable.
@@ -179,6 +182,7 @@ pub(crate) fn from_extracted(
                     source: Some(CallPosition {
                         line: call.line,
                         column: call.column,
+                        expression: call.expression,
                     }),
                 })
                 .collect()),
@@ -583,14 +587,6 @@ pub(crate) fn parse(
                     break;
                 }
                 let name = value.trim();
-                ensure!(
-                    !name.is_empty()
-                        && name
-                            .chars()
-                            .all(|character| character.is_alphanumeric()
-                                || "_:.<>#".contains(character)),
-                    "Function uses contain only a qualified target name, without arguments: {name}"
-                );
                 names.push((name.to_owned(), kind));
                 occurrence_count += 1;
                 ensure!(
@@ -683,24 +679,28 @@ pub(crate) fn parse(
         }
         let call = names
             .into_iter()
-            .map(|(name, kind)| {
+            .map(|(name, kind)| -> Result<CallSite> {
                 let unresolved = function
                     .binding
                     .iter()
                     .any(|binding| name == *binding || name.starts_with(&format!("{binding}.")));
-                let mut call = remaining
+                let captured = remaining
                     .get_mut(&(name.clone(), kind))
-                    .and_then(std::collections::VecDeque::pop_front)
-                    .unwrap_or_else(|| CallSite {
+                    .and_then(std::collections::VecDeque::pop_front);
+                ensure!(captured.as_ref().is_some_and(|call| call.source.is_some())
+                    || (!name.is_empty() && name.chars().all(|character| character.is_alphanumeric()
+                        || if matches!(DeclarationOverview::filetype(path), "typescript" | "tsx") { "_:.<>#$" } else { "_:.<>#" }.contains(character))),
+                    "Function uses contain only a qualified target name, without arguments: {name}");
+                let mut call = captured.unwrap_or_else(|| CallSite {
                         kind,
                         name,
                         source: None,
                         unresolved,
                     });
                 call.unresolved |= unresolved;
-                call
+                Ok(call)
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
         output.push(FunctionBody { evidence,
             owner: function.owner.clone(),
             change: sections.change,
@@ -719,6 +719,32 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_receiver_expressions_round_trip_without_an_lsp() {
+        let path = "main.ts";
+        let source = "export class RenderState { getStage(): unknown { return undefined; } run(options: unknown) { options.$view.scale; this.getStage()?.labelManager.symbolFader; options.$view.scale; } }";
+        let (declaration, extracted) = DeclarationOverview::extract_with_calls(path, source).unwrap();
+        let declaration = DeclarationOverview::format_with_width(path, &declaration, 80).unwrap();
+        let captured = from_extracted(extracted);
+        let combined = combined(path, &declaration, &captured).unwrap();
+        let (_, parsed) = parse(path, &combined, &captured).unwrap();
+        assert_eq!(parsed, captured);
+        let expressions = parsed.iter().flat_map(|function| function.call.iter().flatten())
+            .filter_map(|call| call.source.as_ref().map(|source| source.expression.as_str())).collect::<Vec<_>>();
+        assert_eq!(expressions.iter().filter(|expression| **expression == "options.$view.scale").count(), 2);
+        assert!(expressions.contains(&"this.getStage()?.labelManager.symbolFader"));
+        for call in parsed.iter().flat_map(|function| function.call.iter().flatten()) {
+            let position = call.source.as_ref().unwrap();
+            let token = &source.lines().nth(position.line as usize - 1).unwrap()[position.column as usize..];
+            let member = position.expression.rsplit('.').next().unwrap().trim_start_matches('?');
+            assert!(token.starts_with(member), "{}: {token}", position.expression);
+        }
+        assert!(parse(path, &combined, &[]).is_err(), "new authored expressions bypassed qualified-target validation");
+        let authored = "export function run(): void;\n  Accesses\n    Options.$view\n";
+        assert!(parse(path, authored, &[]).is_ok());
+        assert!(parse(path, &authored.replace("Options.$view", "fn(value)"), &[]).is_err());
+    }
 
     #[test]
     fn presentation_cache_tracks_declarations_and_reference_metadata() {

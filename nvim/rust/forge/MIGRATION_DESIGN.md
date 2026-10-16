@@ -1600,7 +1600,7 @@ file nvim/rust/forge/migration.toml
    ├─ Modify config shared-consumer list to delay deletion until its last production caller switches
    └─ Modify config completion evidence with exact test commands and results
 
-file nvim/lua/forge/docs/architecture.md
+file nvim/contributing/forge/architecture/README.md
 └─ Route current ownership documentation at the corresponding implementation gate.
    ├─ Modify docs process, repository, buffer, syntax, review, Harness, and recovery contracts
    ├─ Modify docs native editing, folding, completion, and startup behavior

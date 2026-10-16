@@ -12,7 +12,6 @@ mod limits;
 pub mod permissions;
 pub mod plan;
 pub mod protocol;
-pub mod rustdoc;
 pub(crate) mod declaration;
 pub mod service;
 pub mod session;

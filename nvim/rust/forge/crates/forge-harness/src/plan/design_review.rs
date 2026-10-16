@@ -86,7 +86,7 @@ pub(super) fn project(
     let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
         BlockId("plan:flow-markdown".into()), &flow_text, width,
     )?;
-    let check_rows = configured_checks(document.design.as_ref().and_then(|design| design.check_configuration.as_ref()), Some(width))?;
+    let check_rows = review_checks(document.design.as_ref(), Some(width))?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
@@ -596,8 +596,8 @@ fn rows(
         });
     }
     let start = overview.len();
-    overview.push(section_header(BlockId("plan:section:checks".into()), "Configured checks")?);
-    let lines = configured_checks(design.check_configuration.as_ref(), None)?;
+    overview.push(section_header(BlockId("plan:section:checks".into()), if design.check_preview_current()? { "Planned checks" } else { "Configured checks" })?);
+    let lines = review_checks(Some(design), None)?;
     for (index,line) in lines.into_iter().enumerate() {
         overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
     }
@@ -607,6 +607,21 @@ fn rows(
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden, contextual_block))
+}
+
+fn review_checks(design: Option<&super::DeclarationDesign>, width: Option<&WidthProfile>) -> Result<Vec<Vec<String>>> {
+    if let Some(design) = design && design.check_preview_current()? {
+        let mut table = vec![["Stage", "Command", "Scope", "Why", "Status"].map(str::to_owned)];
+        for preview in &design.check_preview {
+            table.push([
+                format!("{:?}", preview.category), preview.command.clone(),
+                format!("{:?}", preview.scope), preview.reason.clone(),
+                (if preview.pending { "Pending validation" } else if preview.selected { "Will run" } else { "Not selected" }).into(),
+            ]);
+        }
+        return render_check_table(table, width);
+    }
+    configured_checks(design.and_then(|design| design.check_configuration.as_ref()), width)
 }
 
 fn configured_checks(
@@ -628,10 +643,10 @@ fn configured_checks(
         let operation = match check.scope {
             CheckScope::All => Some(&check.all),
             CheckScope::ChangedFiles => check.files.as_ref(),
-            CheckScope::ChangedCases => check.cases.as_ref(),
+            CheckScope::ChangedCases | CheckScope::NewCases => check.cases.as_ref(),
         }
         .with_context(|| format!("{} has no command for its configured scope", check.name))?;
-        commands.insert(check.id.as_str(), operation.command.as_str());
+        commands.insert(check.id.as_str(), operation.display());
     }
     let mut table = vec![["Stage", "Command", "Scope", "Triggers", "Requires"].map(str::to_owned)];
     for index in snapshot.config.order()? {
@@ -640,9 +655,10 @@ fn configured_checks(
             CheckScope::All => "All",
             CheckScope::ChangedFiles => "Changed files",
             CheckScope::ChangedCases => "Changed cases",
+            CheckScope::NewCases => "New cases",
         };
         let trigger = match &check.trigger {
-            CheckTrigger::Paths { include, .. } => include.join(", "),
+            CheckTrigger::Paths { include, .. } | CheckTrigger::FilesChanged { include, .. } => include.join(", "),
             _ => check.trigger.description(),
         };
         let requires = check
@@ -651,7 +667,7 @@ fn configured_checks(
             .map(|dependency| {
                 commands
                     .get(dependency.as_str())
-                    .copied()
+                    .map(String::as_str)
                     .context("check prerequisite has no command")
             })
             .collect::<Result<Vec<_>>>()?;
@@ -671,6 +687,10 @@ fn configured_checks(
             },
         ]);
     }
+    render_check_table(table, width)
+}
+
+fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> Result<Vec<Vec<String>>> {
     let profile = width.cloned().unwrap_or_default();
     let mut widths = [0; 5];
     for row in &table {
@@ -1171,6 +1191,25 @@ mod tests {
                 assert!(checks.iter().any(|block| block.text.row_count() > 1));
             }
         }
+    }
+
+    #[test]
+    fn planned_check_commands_are_invalidated_when_plan_inputs_change() {
+        let mut document = crate::plan::document::test_fixture("preview", "Preview");
+        let design = document.design.get_or_insert_with(Default::default);
+        design.check_preview = vec![crate::checks::CheckPreview {
+            id: "package-tests".into(), category: crate::checks::CheckCategory::Test,
+            command: "cargo test --package combat --tests".into(), scope: crate::checks::CheckScope::ChangedFiles,
+            reason: "Changed: crates/combat/src/lib.rs".into(), pending: false, selected: true,
+        }];
+        design.check_preview_source = design.check_preview_fingerprint().unwrap();
+        let rendered = render(&document).unwrap();
+        assert!(rendered.markdown.contains("Planned checks"));
+        assert!(rendered.markdown.contains("cargo test --package combat --tests"));
+        assert!(rendered.markdown.contains("Will run"));
+        document.design.as_mut().unwrap().proposed.insert("new.rs".into(), "fn added();".into());
+        let rendered = render(&document).unwrap();
+        assert!(!rendered.markdown.contains("cargo test --package combat --tests"));
     }
 
     #[test]

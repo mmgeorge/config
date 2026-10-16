@@ -198,7 +198,6 @@ impl PlanReviewStore {
             if previous.proposed == current.proposed && previous.baseline == current.baseline
                 && previous.proposed_calls == current.proposed_calls && previous.baseline_calls == current.baseline_calls {
                 source.resolver = Arc::clone(&document.source.resolver);
-                source.resolver_sources = Arc::clone(&document.source.resolver_sources);
             }
         }
         Ok(document.source.document.version)
@@ -215,136 +214,69 @@ impl PlanReviewStore {
         document.update(source, trace)
     }
 
-    /// Resolve snapshot declarations before acquiring external evidence for an unresolved jump.
+    /// Prepare only the saved proposal and baseline declaration indexes.
     pub(crate) async fn prepare_declaration_jump(
         &self,
         input: &DocumentInput,
         trace: Option<&crate::declaration::trace::DeclarationTrace>,
     ) -> Result<()> {
-        let captured = {
-            let lock_stage = trace.map(|trace| trace.stage("review_lock", None));
-            let store = self
-                .document
-                .lock()
-                .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
-            if let Some(stage) = lock_stage {
-                stage.complete(serde_json::json!({}));
-            }
-            let (document, admission) = store
-                .get(&input.document)
-                .context("plan review document is closed")?;
-            admission.check()?;
-            let target = document
-                .check_input(input)?
-                .context("plan review input has no source target")?;
-            let Some(design) = &document.source.document.design else {
-                return Ok(());
-            };
-            if document.source.resolver.get().is_none() {
-                let stage = trace.map(|trace| trace.stage("prepare_local", None));
-                let proposed = crate::declaration::DeclarationResolver::local(
-                    &document.source.workspace,
-                    design,
-                    false,
-                )?;
-                let baseline = crate::declaration::DeclarationResolver::local(
-                    &document.source.workspace,
-                    design,
-                    true,
-                )?;
-                ensure!(
-                    document
-                        .source
-                        .resolver
-                        .set(Mutex::new((proposed, baseline)))
-                        .is_ok(),
-                    "declaration resolver was already initialized"
-                );
-                if let Some(stage) = stage {
-                    stage.complete(serde_json::json!({}));
-                }
-            }
-            {
-                let mut resolver = document
-                    .source
-                    .resolver
-                    .get()
-                    .unwrap()
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
-                resolver.0.trace = trace.cloned();
-                resolver.1.trace = trace.cloned();
-            }
-            let anchor = document
-                .target
-                .get(&target)
-                .context("plan review source target is missing")?;
-            let row = document
-                .document
-                .block(&input.block)
-                .and_then(|block| block.text.row(input.position.row))
-                .context("plan review input row is missing")?;
-            let stage = trace.map(|trace| trace.stage("preflight", None));
-            let result = document.resolve_declaration(anchor, row, input.position.column)?;
-            if let Some(stage) = stage {
-                stage.complete(serde_json::json!({"cached":document.source.resolver_sources.get().is_some(),"resolution":result}));
-            }
-            if matches!(
-                result,
-                crate::declaration::DeclarationResolution::Resolved { .. }
-                    | crate::declaration::DeclarationResolution::Intrinsic
-            ) {
-                return Ok(());
-            }
-            let resolver = document
-                .source
-                .resolver
-                .get()
-                .unwrap()
-                .lock()
-                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
-            let requires_fetch = (
-                resolver.0.requires_source_fetch(),
-                resolver.1.requires_source_fetch(),
-            );
-            if resolver.0.library_sources_checked()
-                && resolver.1.library_sources_checked()
-                && !requires_fetch.0
-                && !requires_fetch.1
-            {
-                return Ok(());
-            }
-            (
-                Arc::clone(&document.source.resolver),
-                Arc::clone(&document.source.resolver_sources),
-                design.clone(),
-                (resolver.0.clone(), resolver.1.clone()),
-                requires_fetch,
-            )
-        };
-        let stage = trace.map(|trace| trace.stage("prepare_external", None));
-        let prepare = async {
-            let (mut proposed, mut baseline) = captured.3;
-            proposed.prepare_sources(&captured.2).await?;
-            baseline.prepare_sources(&captured.2).await?;
-            *captured
-                .0
-                .get()
-                .context("declaration resolver is unavailable")?
-                .lock()
-                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? =
-                (proposed, baseline);
-            Ok::<_, anyhow::Error>(())
-        };
-        let cargo = captured.4.0 || captured.4.1;
-        prepare.await?;
-        if cargo {
-            let _ = captured.1.set(());
-        }
-        if let Some(stage) = stage {
-            stage.complete(serde_json::json!({"cargo":cargo}));
+        let store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get(&input.document).context("plan review document is closed")?;
+        admission.check()?;
+        document.check_input(input)?;
+        let Some(design) = &document.source.document.design else { return Ok(()); };
+        if document.source.resolver.get().is_none() {
+            let mut proposed = crate::declaration::DeclarationResolver::planned(&document.source.workspace, design, false)?;
+            let mut baseline = crate::declaration::DeclarationResolver::planned(&document.source.workspace, design, true)?;
+            proposed.trace = trace.cloned();
+            baseline.trace = trace.cloned();
+            document.source.resolver.set(Mutex::new((proposed, baseline)))
+                .map_err(|_| anyhow::anyhow!("declaration resolver was already initialized"))?;
         }
         Ok(())
+    }
+
+    /// Accept a definition only while its original action and source remain current.
+    pub(crate) fn definition(&self, input: &DocumentInput, source: &super::WorkspaceDefinition, target: &super::DefinitionLocation) -> Result<serde_json::Value> {
+        let store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get(&input.document).context("plan review document is closed")?;
+        admission.check()?;
+        ensure!(input.action == "jump_entity" && document.view.get(&input.view) == Some(&input.sequence), "definition action was superseded");
+        let identity = document.input_target(input)?.context("definition action has no target")?;
+        let anchor = document.target.get(&identity).context("definition target is unavailable")?;
+        let row = document.document.block(&input.block).and_then(|block| block.text.row(input.position.row)).context("definition row is unavailable")?;
+        ensure!(document.workspace_definition(anchor, row, input.position.column)?.as_ref() == Some(source), "definition source changed");
+        ensure!(target.line > 0 && std::path::Path::new(&target.path).is_absolute(), "invalid definition location");
+        let side = match &anchor.target {
+            super::PlanReviewTarget::Call { side, .. } | super::PlanReviewTarget::Declaration { side, .. } => side.as_str(),
+            _ => anyhow::bail!("definition target is unavailable"),
+        };
+        let design = document.source.document.design.as_ref().unwrap();
+        let absolute = dunce::canonicalize(&target.path).context("definition file is unavailable")?;
+        ensure!(absolute.is_file(), "definition target is not a file");
+        let workspace = dunce::canonicalize(&document.source.workspace)?;
+        if !target.modified && let Ok(relative) = absolute.strip_prefix(&workspace) {
+            let relative = relative.to_string_lossy().replace('\\', "/");
+            if let Some(baseline) = design.baseline.get(&relative)
+                && let Some(real) = super::design::workspace_source(&workspace, &relative)?
+                && super::digest(real.as_bytes()) == baseline.source_digest
+            {
+                let saved_path = if side == "baseline" { &relative } else { design.moved.get(&relative).unwrap_or(&relative) };
+                let saved = if side == "baseline" { Some(&baseline.text) } else { design.proposed.get(saved_path) };
+                if let Some(saved) = saved
+                    && let Some(position) = super::workspace_definition::map_position(&relative, &real, saved, forge_diff::syntax::DeclarationPosition { line: target.line, column: target.column })?
+                {
+                    let name = saved.lines().nth(position.line.saturating_sub(1) as usize)
+                        .and_then(|line| line.get(position.column as usize..)).unwrap_or("")
+                        .chars().take_while(|character| character.is_alphanumeric() || *character == '_' || *character == '$').collect();
+                    return document.declaration_destination(side, crate::declaration::DeclarationDestination {
+                        path: document.source.workspace.join(saved_path).to_string_lossy().into_owned(),
+                        line: position.line, column: position.column, name, proposed: true, module_file: false,
+                    });
+                }
+            }
+        }
+        Ok(serde_json::json!({"source":target}))
     }
 
     pub(crate) fn action(&self, input: DocumentInput) -> Result<serde_json::Value> {
@@ -961,9 +893,6 @@ impl PlanReviewDocument {
                 && let Some(destination) = index.destination(&self.source.document, &self.source.workspace, identity, side == "baseline")? {
                 return Ok(crate::declaration::DeclarationResolution::Resolved {destination});
             }
-            if let Some(destination) = super::references::PlanReferenceIndex::lua_source_call(&self.source.document, &self.source.workspace, path, name, side == "baseline")? {
-                return Ok(crate::declaration::DeclarationResolution::Resolved {destination});
-            }
             let resolver = self.source.resolver.get().context("declaration resolver is unavailable")?;
             let mut resolver = resolver.lock().map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
             let resolver = if side == "baseline" { &mut resolver.1 } else { &mut resolver.0 };
@@ -1016,24 +945,74 @@ impl PlanReviewDocument {
         })
     }
 
+    fn workspace_definition(&self, anchor: &PlanNavigationAnchor, row: &str, column: usize) -> Result<Option<super::WorkspaceDefinition>> {
+        use forge_diff::syntax::{DeclarationCalls, DeclarationOverview, DeclarationPosition};
+        let Some(design) = &self.source.document.design else { return Ok(None); };
+        let (path, side) = match &anchor.target {
+            super::PlanReviewTarget::Call { path, side, .. } | super::PlanReviewTarget::Declaration { path, side, .. } => (path, side),
+            _ => return Ok(None),
+        };
+        let source_path = if side == "baseline" { path } else {
+            design.moved.iter().find(|(_, destination)| *destination == path).map(|(original, _)| original).unwrap_or(path)
+        };
+        let Some(baseline) = design.baseline.get(source_path) else { return Ok(None); };
+        let Some(source) = super::design::workspace_source(&self.source.workspace, source_path)? else { return Ok(None); };
+        if super::digest(source.as_bytes()) != baseline.source_digest { return Ok(None); }
+        let position = match &anchor.target {
+            super::PlanReviewTarget::Call { owner, name, kind, .. } => {
+                let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
+                let Some(function) = calls.get(path).into_iter().flatten().find(|function| function.owner == *owner) else { return Ok(None); };
+                let captured = function.call.iter().flatten().filter(|call| call.name == *name && call.kind == *kind)
+                    .filter_map(|call| call.source.as_ref()).collect::<Vec<_>>();
+                let Some(first) = captured.first() else { return Ok(None); };
+                // One displayed target may represent several occurrences. Distinct receivers must not be guessed.
+                if captured.iter().any(|candidate| candidate.expression != first.expression) { return Ok(None); }
+                let extracted = DeclarationCalls::extract(source_path, &source, false).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let originals = extracted.iter().find(|function| function.owner == *owner)
+                    .into_iter().flat_map(|function| &function.call).filter(|call| {
+                        call.line == first.line && call.column == first.column
+                            && (first.expression.is_empty() || call.expression == first.expression)
+                            || first.expression.is_empty() && call.name == *name
+                    }).collect::<Vec<_>>();
+                let Some(original) = originals.first() else { return Ok(None); };
+                if originals.iter().any(|candidate| candidate.expression != original.expression) { return Ok(None); }
+                Some(DeclarationPosition { line: original.line, column: original.column })
+            }
+            super::PlanReviewTarget::Declaration { line, column: saved_column, .. } => {
+                let saved = if side == "baseline" { &baseline.text } else {
+                    let Some(saved) = design.proposed.get(path) else { return Ok(None); };
+                    saved
+                };
+                let position = DeclarationOverview::token_position(path, saved, DeclarationPosition {
+                    line: *line, column: saved_column.unwrap_or(0),
+                }, row, column).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                if super::workspace_definition::map_position(path, saved, &baseline.text, position)?.is_none() { return Ok(None); }
+                super::workspace_definition::map_position(path, saved, &source, position)?
+            }
+            _ => None,
+        };
+        Ok(position.map(|position| super::WorkspaceDefinition {
+            path: self.source.workspace.join(source_path).to_string_lossy().into_owned(),
+            digest: baseline.source_digest.clone(), line: position.line, column: position.column,
+            filetype: DeclarationOverview::filetype(path).into(),
+        }))
+    }
+
     fn jump_declaration(
         &self,
         anchor: &PlanNavigationAnchor,
         row: &str,
         column: usize,
     ) -> Result<serde_json::Value> {
+        if let Some(source) = self.workspace_definition(anchor, row, column)? {
+            return Ok(serde_json::json!({"workspace_definition":source}));
+        }
         use crate::declaration::DeclarationResolution;
         let result = self.resolve_declaration(anchor, row, column)?;
         let side = match &anchor.target {
             super::PlanReviewTarget::Declaration { side, .. } | super::PlanReviewTarget::Call { side, .. } => side,
             _ => anyhow::bail!("select a declaration type, import, or call"),
         };
-        let design = self
-            .source
-            .document
-            .design
-            .as_ref()
-            .context("declaration design is unavailable")?;
         let destination = match result {
             DeclarationResolution::Resolved { destination } => destination,
             DeclarationResolution::Intrinsic => {
@@ -1047,6 +1026,11 @@ impl PlanReviewDocument {
                 return Ok(serde_json::json!({"message":reason}));
             }
         };
+        self.declaration_destination(side, destination)
+    }
+
+    fn declaration_destination(&self, side: &str, destination: crate::declaration::DeclarationDestination) -> Result<serde_json::Value> {
+        let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
         if destination.module_file {
             let relative = std::path::Path::new(&destination.path)
                 .strip_prefix(&self.source.workspace)
@@ -1276,11 +1260,6 @@ impl PlanReviewDocument {
     }
 
     fn check_input(&self, input: &DocumentInput) -> Result<Option<TargetId>> {
-        input.validate()?;
-        ensure!(
-            input.document == self.id && input.revision == self.document.revision(),
-            "plan review input revision changed"
-        );
         let sequence = self
             .view
             .get(&input.view)
@@ -1288,6 +1267,15 @@ impl PlanReviewDocument {
         ensure!(
             input.sequence.0 > sequence.0,
             "plan review input was superseded"
+        );
+        self.input_target(input)
+    }
+
+    fn input_target(&self, input: &DocumentInput) -> Result<Option<TargetId>> {
+        input.validate()?;
+        ensure!(
+            input.document == self.id && input.revision == self.document.revision(),
+            "plan review input revision changed"
         );
         let block = self
             .document
@@ -1835,20 +1823,7 @@ mod tests {
             resolver.get().is_some(),
             "first jump did not acquire sources"
         );
-        assert!(
-            review
-                .document
-                .lock()
-                .unwrap()
-                .get(&input.document)
-                .unwrap()
-                .0
-                .source
-                .resolver_sources
-                .get()
-                .is_none(),
-            "a local declaration jump acquired external sources"
-        );
+
         let resolved = review.action(input.clone()).unwrap();
         assert!(resolved["jump"].is_object(), "{resolved}");
         assert!(
@@ -1946,13 +1921,13 @@ mod tests {
         source
             .resolver
             .set(Mutex::new((
-                crate::declaration::DeclarationResolver::local(
+                crate::declaration::DeclarationResolver::planned(
                     temporary.path(),
                     captured_design,
                     false,
                 )
                 .unwrap(),
-                crate::declaration::DeclarationResolver::local(
+                crate::declaration::DeclarationResolver::planned(
                     temporary.path(),
                     captured_design,
                     true,
@@ -2168,7 +2143,6 @@ mod tests {
             .unwrap();
         assert!(source.public_only);
         source.public_only = false;
-        let dependency_sources = Arc::clone(&source.resolver_sources);
         let document = PlanReviewDocument::new(
             DocumentId("review".into()),
             ViewId("view".into()),
@@ -2238,10 +2212,7 @@ mod tests {
                     && destination[jump.position.column..].starts_with("MovementInput"),
                 "{needle}: {result}"
             );
-            assert!(
-                dependency_sources.get().is_none(),
-                "{needle} acquired unavailable Bevy sources"
-            );
+
         }
     }
 
@@ -2415,7 +2386,7 @@ mod tests {
     }
 
     #[test]
-    fn baseline_property_jump_opens_uncaptured_source_without_changing_the_plan() {
+    fn baseline_property_jump_requests_the_real_member_without_changing_the_plan() {
         let temporary = tempfile::tempdir().unwrap();
         std::fs::write(
             temporary.path().join("client.ts"),
@@ -2446,7 +2417,7 @@ mod tests {
             "run.ts".into(),
             crate::plan::calls::extract(
                 "run.ts",
-                "export function run(client: Client) { client.count; }",
+                caller,
             )
             .unwrap(),
         );
@@ -2475,9 +2446,9 @@ mod tests {
                 .source
                 .resolver
                 .set(std::sync::Mutex::new((
-                    crate::declaration::DeclarationResolver::local(temporary.path(), design, false)
+                    crate::declaration::DeclarationResolver::planned(temporary.path(), design, false)
                         .unwrap(),
-                    crate::declaration::DeclarationResolver::local(temporary.path(), design, true)
+                    crate::declaration::DeclarationResolver::planned(temporary.path(), design, true)
                         .unwrap(),
                 )))
                 .is_ok()
@@ -2494,16 +2465,18 @@ mod tests {
             .jump_declaration(&anchor, "  Client.count", 10)
             .unwrap();
         assert_eq!(
-            std::path::Path::new(result["source"]["path"].as_str().unwrap()),
-            temporary.path().join("client.ts")
+            std::path::Path::new(result["workspace_definition"]["path"].as_str().unwrap()),
+            temporary.path().join("run.ts")
         );
-        assert_eq!(result["source"]["line"], 1);
-        assert_eq!(result["source"]["column"], 26);
+        assert_eq!(result["workspace_definition"]["line"], 2);
+        assert_eq!(result["workspace_definition"]["column"], caller.lines().nth(1).unwrap().find("count").unwrap());
         assert!(result.get("declarations").is_none());
         assert_eq!(
             serde_json::to_vec(&document.source.document).unwrap(),
             saved
         );
+        std::fs::write(temporary.path().join("run.ts"), caller.replace("client.count", "client.other")).unwrap();
+        assert!(document.workspace_definition(&anchor, "  Client.count", 10).unwrap().is_none());
     }
     #[test]
     fn property_navigation_reveals_filtered_uses_and_previews_planned_rename() {

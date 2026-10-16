@@ -1,7 +1,6 @@
 //! Resolves declaration references once for validation and source navigation.
 
 mod sources;
-mod cache;
 pub(crate) mod trace;
 #[cfg(test)]
 mod tests;
@@ -9,7 +8,7 @@ mod typescript;
 pub(crate) mod exposure;
 
 use crate::plan::DeclarationDesign;
-use anyhow::{Context, Result};
+use anyhow::Result;
 use forge_diff::syntax::{
     DeclarationIndex, DeclarationIndexTiming, DeclarationPosition, DeclarationReference, DeclarationSymbol,
     SymbolVisibility,
@@ -132,11 +131,9 @@ struct IndexedFile {
 
 #[derive(Clone, Default)]
 struct RustPackage {
-    edition: String,
     source_manifest: Option<PathBuf>,
     dependency: HashMap<String, String>,
     incomplete: bool,
-    no_std: bool,
     no_implicit_prelude: bool,
 }
 
@@ -172,7 +169,6 @@ fn accessible(
 pub(crate) struct DeclarationResolver {
     workspace: PathBuf,
     snapshot: BTreeMap<String, String>,
-    cargo_lock: BTreeMap<String, String>,
     workspace_files: HashSet<String>,
     changed: HashSet<String>,
     baseline: bool,
@@ -181,15 +177,8 @@ pub(crate) struct DeclarationResolver {
     module: HashMap<(String, Vec<String>), PathBuf>,
     pending_module: HashMap<(String, Vec<String>), (PathBuf, bool)>,
     warning: Vec<String>,
-    typescript: typescript::TypescriptEnvironment,
-    rust_library: bool,
-    library_checked: bool,
-    source_cache: Option<cache::RustSourceCache>,
-    source_request: BTreeMap<String, String>,
-    source_acquired: bool,
     bytes: usize,
     file_limit: Option<usize>,
-    source_enabled: bool,
     /// Correlates navigation work with the currently admitted review input.
     pub(crate) trace: Option<trace::DeclarationTrace>,
     work: ResolutionWork,
@@ -226,90 +215,18 @@ impl DeclarationResolver {
         let DeclarationResolution::Resolved { destination } = resolution else { return None; };
         self.file.get(Path::new(&destination.path))?.index.symbol.iter().find(|symbol| symbol.position.line == destination.line && symbol.position.column == destination.column).map(|symbol| symbol.role)
     }
-    /// Index snapshot declarations and discover dependency sources only when reached.
-    pub(crate) fn local(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
-        let mut resolver = Self::snapshot(workspace, design, baseline, true)?;
-        sources::project(&mut resolver)?;
-        resolver.typescript_environment()?;
-        if !resolver.package.is_empty() {
-            resolver.source_cache = Some(cache::RustSourceCache::new(home::cargo_home()?));
-        }
-        Ok(resolver)
-    }
-    /// Prepare cached sources and toolchain roots without resolving the Cargo graph.
-    pub(crate) async fn prepare(
-        workspace: &Path,
-        design: &DeclarationDesign,
-        baseline: bool,
-        trace: Option<trace::DeclarationTrace>,
-    ) -> Result<Self> {
-        let stage = trace.as_ref().map(|trace| trace.stage("prepare_resolver", Some(baseline)));
-        let mut resolver = Self::local(workspace, design, baseline)?;
-        resolver.trace = trace;
-        resolver.prepare_sources(design).await?;
-        if let Some(stage) = stage { stage.complete(resolver.statistics()); }
-        Ok(resolver)
-    }
-
-    /// Report whether a reached dependency requires Cargo source acquisition.
-    pub(crate) fn requires_source_fetch(&self) -> bool {
-        !self.source_acquired && !self.source_request.is_empty()
-    }
-
-    /// Avoid repeating toolchain discovery when rust-src is unavailable.
-    pub(crate) fn library_sources_checked(&self) -> bool {
-        self.library_checked
-    }
-
-    /// Extend available evidence while retaining indexes and outstanding source requests.
-    pub(crate) async fn prepare_sources(&mut self, design: &DeclarationDesign) -> Result<()> {
-        if !self.package.is_empty() && !self.library_checked {
-            sources::standard_library(self).await?;
-        }
-        if self.requires_source_fetch() {
-            self.acquire(design).await?;
-        }
-        Ok(())
-    }
-
-    /// Retry unavailable reached sources once through Cargo without modifying the workspace.
-    pub(crate) async fn acquire(&mut self, design: &DeclarationDesign) -> Result<()> {
-        let mut acquired = Self::snapshot(&self.workspace, design, self.baseline, true)?;
-        acquired.trace = self.trace.clone();
-        acquired.source_request = self.source_request.clone();
-        acquired.source_acquired = true;
-        if !sources::acquire(&mut acquired).await? {
-            self.source_acquired = true;
-            self.warning.extend(acquired.warning);
-            return Ok(());
-        }
-        acquired.typescript_environment()?;
-        *self = acquired;
-        Ok(())
-    }
-
     /// Resolve declarations exclusively from saved plan files without consulting workspace sources.
     pub(crate) fn planned(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
-        let mut resolver = Self::snapshot(workspace, design, baseline, false)?;
+        let mut resolver = Self::snapshot(workspace, design, baseline)?;
         sources::project(&mut resolver)?;
         resolver.bound_reference_files();
         Ok(resolver)
     }
 
-    /// Validate with cached evidence, acquiring only missing reached dependency sources.
-    pub(crate) async fn validate_sources(&mut self, design: &DeclarationDesign) -> Result<DeclarationValidation> {
-        let report = self.validate(design);
-        if self.requires_source_fetch() {
-            self.prepare_sources(design).await?;
-            return Ok(self.validate(design));
-        }
-        Ok(report)
-    }
-
-    /// Create an isolated lexical snapshot before acquiring external evidence.
-    fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool, source_enabled: bool) -> Result<Self> {
-        let workspace = if source_enabled { dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()) } else { normalize(workspace) };
-        let mut snapshot: BTreeMap<String, String> = if baseline {
+    /// Index the selected saved snapshot without discovering source files.
+    fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
+        let workspace = normalize(workspace);
+        let snapshot: BTreeMap<String, String> = if baseline {
             design
                 .baseline
                 .iter()
@@ -325,23 +242,9 @@ impl DeclarationResolver {
             .cloned()
             .collect();
         let changed = design.changed_paths().into_iter().collect();
-        let source_paths = snapshot.keys().filter(|path| path.ends_with(".rs")).cloned().collect::<Vec<_>>();
-        for path in source_paths.into_iter().filter(|_| source_enabled) {
-            for directory in Path::new(&path).ancestors().skip(1) {
-                let manifest = directory.join("Cargo.toml").to_string_lossy().replace('\\', "/");
-                if snapshot.contains_key(&manifest) || workspace_files.contains(&manifest) {
-                    continue;
-                }
-                if let Ok(text) = std::fs::read_to_string(workspace.join(&manifest)) {
-                    anyhow::ensure!(text.len() <= 1024 * 1024, "{manifest}: manifest exceeds 1 MiB");
-                    snapshot.insert(manifest, text);
-                }
-            }
-        }
         let mut resolver = Self {
             workspace,
             snapshot,
-            cargo_lock: design.cargo_lock.clone(),
             workspace_files,
             changed,
             baseline,
@@ -350,15 +253,8 @@ impl DeclarationResolver {
             module: HashMap::new(),
             pending_module: HashMap::new(),
             warning: Vec::new(),
-            typescript: Default::default(),
-            rust_library: false,
-            library_checked: false,
-            source_cache: None,
-            source_request: BTreeMap::new(),
-            source_acquired: false,
             bytes: 0,
             file_limit: None,
-            source_enabled,
             trace: None,
             work: Default::default(),
         };
@@ -388,7 +284,6 @@ impl DeclarationResolver {
         statistics["packages"] = serde_json::json!(self.package.len());
         statistics["pending_modules"] = serde_json::json!(self.pending_module.len());
         statistics["bytes"] = serde_json::json!(self.bytes);
-        statistics["rust_library"] = serde_json::json!(self.rust_library);
         statistics
     }
 
@@ -396,7 +291,7 @@ impl DeclarationResolver {
         let path = normalize(path);
         if let Ok(relative) = path.strip_prefix(&self.workspace) {
             let key = relative.to_string_lossy().replace('\\', "/");
-            // Captured removals stay absent, while untouched dependencies load on demand.
+            // Uncaptured and removed files remain outside plan validation.
             if matches!(
                 path.extension().and_then(|extension| extension.to_str()),
                 Some("rs" | "ts" | "tsx" | "mts" | "cts" | "toml" | "json" | "jsonc")
@@ -409,7 +304,7 @@ impl DeclarationResolver {
                 }
             }
         }
-        if self.source_enabled { std::fs::read_to_string(path).ok() } else { None }
+        None
     }
 
     fn load_file(&mut self, path: &Path, package: &str, module: &[String]) -> Result<bool> {
@@ -474,20 +369,12 @@ impl DeclarationResolver {
                 self.changed
                     .contains(&path.to_string_lossy().replace('\\', "/"))
             });
-        let original = if self.source_enabled && self.file_limit.is_none() && !self.baseline && !proposed && path.starts_with(&self.workspace) {
-            std::fs::read_to_string(&path)
-                .ok()
-                .and_then(|source| DeclarationIndex::extract(&path.to_string_lossy(), &source).ok())
-                .map(Arc::new)
-        } else {
-            None
-        };
         self.file.insert(
             path.clone(),
             IndexedFile {
                 path: path.clone(),
                 index,
-                original,
+                original: None,
                 package: package.into(),
                 module: module.to_vec(),
                 proposed,
@@ -528,18 +415,12 @@ impl DeclarationResolver {
         }
         if !self.load_file(&path, package, module)? {
             self.package.entry(package.into()).or_default().incomplete = true;
-            if !path.starts_with(&self.workspace)
-                && self.package.get(package).is_some_and(|state| state.source_manifest.is_some())
-            {
-                self.source_request.insert(path.to_string_lossy().into_owned(), "module source is unavailable".into());
-            }
             return Ok(());
         }
         let index = self.file[&path].index.clone();
         let state = self.package.entry(package.into()).or_default();
         state.incomplete |= index.incomplete;
         if module.is_empty() {
-            state.no_std = index.no_std;
             state.no_implicit_prelude = index.no_implicit_prelude;
         }
         let directory = path.parent().unwrap_or(Path::new("."));
@@ -610,15 +491,9 @@ impl DeclarationResolver {
         &mut self,
         identity: String,
         manifest_path: PathBuf,
-        manifest: &toml::Value,
         dependency: HashMap<String, String>,
     ) {
-        let edition = manifest.get("package")
-            .and_then(|package| package.get("edition"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or("2015").to_owned();
         self.package.insert(identity, RustPackage {
-            edition,
             source_manifest: Some(normalize(&manifest_path)),
             dependency,
             ..Default::default()
@@ -664,15 +539,6 @@ impl DeclarationResolver {
                 error: false,
                 reason: warning.clone(),
             });
-        }
-        if !self.rust_library
-            && !self.package.is_empty()
-            && !report
-                .diagnostic
-                .iter()
-                .any(|diagnostic| diagnostic.reason.contains("rust-src"))
-        {
-            report.diagnostic.push(DeclarationDiagnostic { path:"plan".into(),line:1,column:0,reference:String::new(),error:false,reason:"rust-src is unavailable. Run `rustup component add rust-src` in the workspace. Standard-library and prelude checks are disabled.".into() });
         }
         for file in files {
             for reference in &file.index.reference {
@@ -1201,41 +1067,7 @@ impl DeclarationResolver {
             return DeclarationResolution::Intrinsic;
         }
         if !package.no_implicit_prelude && !file.index.no_implicit_prelude {
-            if !self.rust_library {
-                return unverified("rust-src is unavailable, so prelude resolution is disabled");
-            }
-            let library = if package.no_std { "core" } else { "std" };
-            let path = [
-                vec![
-                    "prelude".into(),
-                    format!(
-                        "rust_{}",
-                        if package.edition.is_empty() {
-                            "2015"
-                        } else {
-                            &package.edition
-                        }
-                    ),
-                ],
-                reference.path.clone(),
-            ]
-            .concat();
-            let result = self.rust_member(
-                library,
-                &[],
-                &path,
-                reference.value_namespace,
-                RustAccess {
-                    package: library,
-                    scope: &[],
-                    navigation,
-                    macro_namespace: reference.macro_namespace,
-                },
-                &mut HashSet::new(),
-            );
-            if !matches!(result, DeclarationResolution::Invalid { .. }) {
-                return result;
-            }
+            return unverified("External and prelude references are unchecked during planning");
         }
         self.missing_rust(&file.package, &reference.path.join("::"))
     }
@@ -1293,47 +1125,12 @@ impl DeclarationResolver {
                     )
                 }
             }
-            "std" | "core" | "alloc" => {
-                if self.rust_library {
-                    self.rust_member(first, &[], &path[1..], value, origin, visited)
-                } else {
-                    unverified(
-                        "rust-src is unavailable, so standard-library resolution is disabled",
-                    )
-                }
-            }
+            "std" | "core" | "alloc" => unverified(
+                "External standard-library references are unchecked during planning",
+            ),
             _ => {
                 if self.rust_bound(package, scope, first, value, origin.macro_namespace) {
                     return self.rust_member(package, scope, path, value, origin, visited);
-                }
-                if self.package.get(package).and_then(|state| state.dependency.get(first))
-                    .is_some_and(|identity| identity.starts_with("unavailable:")) {
-                    if let Some(mut cache) = self.source_cache.take() {
-                        let stage = self.trace.as_ref().map(|trace| trace.stage("cached_dependency", Some(self.baseline)));
-                        let result = cache.dependency(self, package, first);
-                        self.source_cache = Some(cache);
-                        let cached = match &result {
-                            Ok(cache::DependencySource::Available(identity)) => {
-                                self.package.get_mut(package).unwrap().dependency.insert(first.into(), identity.clone());
-                                true
-                            }
-                            Ok(cache::DependencySource::Unavailable { reason }) => {
-                                self.source_request.insert(format!("{package}:{first}"), reason.clone());
-                                false
-                            }
-                            Err(error) => {
-                                self.source_request.insert(format!("{package}:{first}"), format!("{error:#}"));
-                                false
-                            }
-                        };
-                        if let Some(stage) = stage {
-                            stage.complete(serde_json::json!({"package":package,"alias":first,
-                                "cached":cached,"requires_fetch":self.requires_source_fetch()}));
-                        }
-                        if let Err(error) = result {
-                            return unverified(&format!("cached dependency source cannot be located: {error:#}"));
-                        }
-                    }
                 }
                 if let Some(dependency) = self
                     .package

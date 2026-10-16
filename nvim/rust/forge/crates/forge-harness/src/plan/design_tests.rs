@@ -42,6 +42,9 @@ pub struct DesignTestFile {
 pub struct DesignTestCase {
     /// Includes the module qualification when needed to identify the test.
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional runner target used when a name belongs to multiple executables.
+    pub target: Option<String>,
     /// Distinguishes additions, edits, removals, and unchanged coverage.
     pub change: DesignTestChange,
     /// Describes the scenario and expected result, or the reason for removal.
@@ -86,6 +89,7 @@ pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
         ensure!(!file.cases.is_empty(), "plan test file requires at least one case: {}", file.file);
         let mut names = BTreeSet::new();
         for case in &file.cases {
+            ensure!(case.target.as_ref().is_none_or(|target| !target.is_empty() && target.len() <= 256 && !target.chars().any(char::is_control)), "invalid planned test target");
             ensure!(!case.name.is_empty() && case.name.trim() == case.name
                 && !case.name.chars().any(char::is_control), "plan test requires a nonempty, single-line name");
             ensure!(names.insert(&case.name), "duplicate plan test: {}: {}", file.file, case.name);

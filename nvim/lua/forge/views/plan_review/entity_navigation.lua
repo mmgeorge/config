@@ -3,14 +3,10 @@ local entity_info = require("forge.views.plan_review.entity_info")
 local notifications = require("forge.infra.notifications")
 
 local M = {}
-local request_generation = 0
 
----@class ForgeRustdocNavigationOptions
+---@class ForgePlanNavigationOptions
 ---@field source_line integer
----@field plan_id string
----@field expected_version integer
 ---@field workspace_root string
----@field request fun(params: table, callback: fun(result: table?, request_error: string?))
 
 ---@param model ForgePlanTaskModel
 ---@param entity ForgePlanEntity
@@ -29,27 +25,6 @@ local function jump_to_declaration(model, entity, buf, win)
     vim.cmd(("normal! %dG"):format(display_line))
     vim.api.nvim_win_set_cursor(win, { display_line, target_col })
   end)
-end
-
----@param result table
----@param win integer
-local function open_source(result, win)
-  if type(result.path) ~= "string" or result.path == ""
-      or type(result.line) ~= "number" or result.line < 1
-      or type(result.column) ~= "number" or result.column < 1 then
-    notifications.error("Harness returned an invalid Rust source location", "PlanReview Rust source")
-    return
-  end
-  local opened, open_error = pcall(vim.api.nvim_win_call, win, function()
-    vim.cmd("edit " .. vim.fn.fnameescape(result.path))
-    local source_buf = vim.api.nvim_win_get_buf(win)
-    vim.bo[source_buf].readonly = true
-    vim.bo[source_buf].modifiable = false
-    vim.api.nvim_win_set_cursor(win, { result.line, result.column - 1 })
-  end)
-  if not opened then
-    notifications.error(tostring(open_error), "PlanReview Rust source")
-  end
 end
 
 ---@param target ForgePlanWorkspaceTarget
@@ -77,7 +52,7 @@ end
 ---@param model ForgePlanTaskModel?
 ---@param buf integer
 ---@param win integer
----@param options ForgeRustdocNavigationOptions
+---@param options ForgePlanNavigationOptions
 ---@return boolean handled
 function M.jump(model, buf, win, options)
   if not model then
@@ -100,37 +75,8 @@ function M.jump(model, buf, win, options)
     jump_to_declaration(model, entity, buf, win)
     return true
   end
-  local target = model:rustdoc_target_at_position(options.source_line, line, opening_cursor[2])
-  if not target then
-    notifications.info("Cursor is not on a plan entity or external Rust symbol", "ForgePlanReview")
-    return false
-  end
-  request_generation = request_generation + 1
-  local generation = request_generation
-  options.request(vim.tbl_extend("force", target, {
-    plan_id = options.plan_id,
-    expected_version = options.expected_version,
-  }), function(result, request_error)
-    vim.schedule(function()
-      if generation ~= request_generation then return end
-      if not vim.api.nvim_buf_is_valid(buf)
-          or not vim.api.nvim_win_is_valid(win)
-          or vim.api.nvim_win_get_buf(win) ~= buf
-          or not vim.deep_equal(vim.api.nvim_win_get_cursor(win), opening_cursor) then
-        return
-      end
-      if request_error then
-        notifications.error(request_error, "PlanReview Rust source")
-        return
-      end
-      if type(result) ~= "table" then
-        notifications.error("Harness returned no Rust source location", "PlanReview Rust source")
-        return
-      end
-      open_source(result, win)
-    end)
-  end)
-  return true
+  notifications.info("This plan reference has no captured source definition", "ForgePlanReview")
+  return false
 end
 
 return M

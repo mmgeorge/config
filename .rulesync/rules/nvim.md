@@ -9,6 +9,12 @@ Use the **neovim-lua-dev** skill for Lua and Neovim plugin work. It covers Neovi
 
 Read the relevant skill reference section before modifying that subsystem.
 
+For Forge work, start with `nvim/contributing/forge/README.md` and follow its
+task-specific architecture and procedure links. Keep the affected contributor
+documents and `nvim/docs/forge/` user documentation up to date with behavior and
+workflow changes. Maintain documentation in those directories rather than adding
+new architecture material under `nvim/lua/forge/`.
+
 When editing Neovim Lua plugin code, use LuaLS/EmmyLua annotations for public APIs, table-shaped state, callback boundaries, and tests. Prefer `---@class`, `---@field`, `---@alias`, `---@param`, `---@return`, and `---@type` so LSP diagnostics, completion, and jump-to-definition stay useful.
 
 Diagnostics come from `lua-language-server`. Check the whole plugin from the CLI with `lua-language-server --check nvim/lua/forge --logpath <scratch-outside-repo>` using the scoop build because the Mason build crashes `--check` on a locale bug. Config lives at `nvim/.luarc.json` with LuaJIT, the `vim` global, and `checkThirdParty = false`. Lazydev supplies the real `vim` runtime types in-editor.

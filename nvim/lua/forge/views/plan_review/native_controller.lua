@@ -85,24 +85,6 @@ local function effect(review, captured, fields)
   }, fields))
 end
 
-local function rustdoc(review, result, captured, source)
-  local target = result.anchor.target
-  if target.target_type ~= "flow_edge" or target.reference_kind ~= "external_entity" then
-    notifications.info("This plan target has no external Rust documentation", "ForgePlanReview") return
-  end
-  if review.owner.is_current(captured) then
-    client.request_for(review.session_id, source and "plan.rustdoc.source" or "plan.rustdoc.hover", {
-      plan_id = review.plan.id, expected_version = result.version, json_path = result.anchor.json_path,
-      selection = result.rustdoc_selection,
-    }, function(resolved, failure)
-      if not review.owner.is_current(captured) then return end
-      if failure then notice(failure) return end
-      if source then effect(review, captured, { kind = "open_file", path = resolved.path,
-        row = math.max(0, resolved.line - 1), column = math.max(0, resolved.column - 1) })
-      else show_document(review, resolved.document, "Rust documentation") end
-    end)
-  end
-end
 
 local function refresh_winbar(review)
   local plan = review.plan
@@ -123,13 +105,14 @@ local function adopt_revision(review, result)
 end
 
 local function action(review, name)
+  if review.cancel_definition then review.cancel_definition() review.cancel_definition = nil end
   if name == "rename_entity" and session.harness.busy then notice("A Harness request is already running") return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
     notice("Only plans awaiting review can be renamed") return
   end
   if review.plan.historical_revision and (name == "comment" or name == "question" or name == "delete") then return end
   local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
-  review.owner.action(name, function(result, failure, captured)
+  local function receive(result, failure, captured)
     if (name == "rename_entity" or name == "jump_entity" or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf
@@ -173,11 +156,22 @@ local function action(review, name)
       end)
     elseif name == "references" and type(result.references) == "table" then
       require("forge.views.plan_review.references").open(review, result.references, captured)
+    elseif type(result.workspace_definition) == "table" then
+      review.cancel_definition = require("forge.views.plan_review.workspace_definition").request(result.workspace_definition,
+        function() return review.owner.is_current(captured)
+          and vim.api.nvim_win_is_valid(review.win)
+          and vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor) end,
+        function(target, lookup_failure, message)
+          review.cancel_definition = nil
+          if lookup_failure then notice(lookup_failure)
+          elseif target then review.owner.definition(captured, result.workspace_definition, target, receive)
+          elseif message and message ~= "cancelled" then notifications.info(message, "ForgePlanReview") end
+        end)
     elseif type(result.message) == "string" then notifications.info(result.message, "ForgePlanReview")
     elseif type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype, result.selection)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
-      if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else rustdoc(review, result, captured, false) end
+      if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else notifications.info("External references are unchecked during planning", "ForgePlanReview") end
     elseif (name == "jump_entity" or name:find("reveal_reference:", 1, true) == 1) and type(result.jump) == "table" then
       effect(review, captured, { kind = "cursor", jump = true, block = result.jump.block, position = result.jump.position })
     elseif name == "open" and type(result.anchor) == "table" and type(result.anchor.target) == "table"
@@ -185,8 +179,9 @@ local function action(review, name)
       require("forge.views.plan_review.dependency_browser").open(result.anchor.target.name)
     elseif type(result.source) == "table" then
       effect(review, captured, { kind = "open_file", path = result.source.path, row = result.source.line - 1, column = result.source.column or 0 })
-    else rustdoc(review, result, captured, true) end
-  end)
+    else notifications.info("This target has no captured source definition", "ForgePlanReview") end
+  end
+  review.owner.action(name, receive)
 end
 
 local function submit(review, method, params)

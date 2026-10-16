@@ -21,6 +21,8 @@ pub use design_tests::DesignTestChange;
 pub(crate) use design_tests::DesignTestSelection;
 pub(crate) mod calls;
 mod references;
+mod workspace_definition;
+pub use workspace_definition::{DefinitionLocation, WorkspaceDefinition};
 mod reference_context;
 pub use calls::{CallKind, CallSite, CallPosition, FunctionBody};
 mod design_review;
@@ -946,7 +948,7 @@ impl PlanFileStore {
                 .is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design))
             {
                 design.validation = Some(
-                    crate::declaration::DeclarationResolver::local(&self.workspace, design, false)?
+                    crate::declaration::DeclarationResolver::planned(&self.workspace, design, false)?
                         .validate(design),
                 );
             }

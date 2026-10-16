@@ -49,7 +49,7 @@ impl PlanReferenceIndex {
         let Some(design) = &document.design else {
             return Self::legacy(document, workspace);
         };
-        let mut resolver = DeclarationResolver::local(workspace, design, baseline)?;
+        let mut resolver = DeclarationResolver::planned(workspace, design, baseline)?;
         resolver.bound_reference_files();
         Self::extract(design, baseline, resolver)
     }
@@ -498,7 +498,7 @@ impl PlanReferenceIndex {
             .map(|symbol| symbol.name.clone())
             .or_else(|| function.map(|function| function.owner.clone()))
             .unwrap_or_default();
-        let mut destination = crate::declaration::DeclarationDestination {
+        let destination = crate::declaration::DeclarationDestination {
             path: workspace.join(path).to_string_lossy().into_owned(),
             line: *line,
             column: *column,
@@ -506,141 +506,9 @@ impl PlanReferenceIndex {
             name,
             module_file: false,
         };
-        if !baseline && let Some(original) = design.baseline.get(path) {
-            let previous = DeclarationIndex::extract(path, &original.text)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let existed = symbol.is_some_and(|symbol| {
-                previous.symbol.iter().any(|previous| {
-                    previous.name == symbol.name && same_scope(&previous.scope, &symbol.scope)
-                })
-            }) || function.is_some_and(|function| {
-                DeclarationCalls::extract(path, &original.text, true).is_ok_and(|previous| {
-                    previous
-                        .iter()
-                        .any(|previous| previous.owner == function.owner)
-                })
-            });
-            if existed {
-                let Some(source) = super::design::workspace_source(workspace, path)? else {
-                    return Ok(Some(destination));
-                };
-                let original = DeclarationIndex::extract(path, &source)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                let position = symbol.and_then(|symbol| {
-                    original
-                        .symbol
-                        .iter()
-                        .find(|original| {
-                            original.name == symbol.name && original.scope == symbol.scope
-                        })
-                        .map(|symbol| symbol.position)
-                });
-                let position = position.or_else(|| {
-                    function.and_then(|function| {
-                        DeclarationCalls::extract(path, &source, false)
-                            .ok()?
-                            .into_iter()
-                            .find(|original| original.owner == function.owner)
-                            .map(|function| forge_diff::syntax::DeclarationPosition {
-                                line: function.line,
-                                column: function.column,
-                            })
-                    })
-                });
-                if let Some(position) = position {
-                    destination.line = position.line;
-                    destination.column = position.column;
-                    destination.proposed = false;
-                }
-            }
-        }
         Ok(Some(destination))
     }
 
-    /// Resolve an uncaptured Lua require target by reading bounded module candidates lazily.
-    pub(crate) fn lua_source_call(
-        document: &PlanDocument,
-        workspace: &std::path::Path,
-        path: &str,
-        name: &str,
-        baseline: bool,
-    ) -> Result<Option<crate::declaration::DeclarationDestination>> {
-        if !path.ends_with(".lua") {
-            return Ok(None);
-        }
-        let design = document.design.as_ref().unwrap();
-        let text = if baseline {
-            &design.baseline[path].text
-        } else {
-            &design.proposed[path]
-        };
-        let index =
-            DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let normalized = name.replace(':', ".");
-        let Some((alias, member)) = normalized.split_once('.') else {
-            return Ok(None);
-        };
-        let Some(module) = index
-            .import
-            .iter()
-            .find(|import| import.alias.as_deref() == Some(alias))
-            .and_then(|import| import.source.as_deref())
-        else {
-            return Ok(None);
-        };
-        let module = module.replace('.', "/");
-        let mut candidates = BTreeSet::new();
-        for directory in std::path::Path::new(path).ancestors().skip(1).take(16) {
-            for prefix in [directory.to_path_buf(), directory.join("lua")] {
-                candidates.insert(
-                    prefix
-                        .join(format!("{module}.lua"))
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                );
-                candidates.insert(
-                    prefix
-                        .join(format!("{module}/init.lua"))
-                        .to_string_lossy()
-                        .replace('\\', "/"),
-                );
-            }
-        }
-        let mut destination = Vec::new();
-        for path in candidates {
-            if design.proposed.contains_key(&path) || design.baseline.contains_key(&path) {
-                continue;
-            }
-            let Some(source) = super::design::workspace_source(workspace, &path)? else {
-                continue;
-            };
-            for function in DeclarationCalls::extract(&path, &source, false)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?
-            {
-                if function
-                    .owner
-                    .replace(':', ".")
-                    .split_once('.')
-                    .map_or(function.owner.as_str(), |(_, member)| member)
-                    == member
-                {
-                    destination.push(crate::declaration::DeclarationDestination {
-                        path: workspace.join(&path).to_string_lossy().into_owned(),
-                        line: function.line,
-                        column: function.column,
-                        proposed: false,
-                        name: function.owner,
-                        module_file: false,
-                    });
-                }
-            }
-        }
-        Ok(if destination.len() == 1 {
-            destination.pop()
-        } else {
-            None
-        })
-    }
 
     /// Require a unique proposed definition that has no corresponding source declaration.
     pub(crate) fn rename_definition(
@@ -1541,47 +1409,8 @@ mod tests {
             .destination(&document, workspace.path(), identity, false)
             .unwrap()
             .unwrap();
-        assert!(!destination.proposed);
-        assert_eq!(destination.line, 2);
-    }
-
-    #[test]
-    fn lua_source_calls_read_only_the_required_module() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(workspace.path().join("lua")).unwrap();
-        std::fs::write(
-            workspace.path().join("lua/client.lua"),
-            "local M = {}\nfunction M.send() return 1 end\nreturn M\n",
-        )
-        .unwrap();
-        std::fs::write(
-            workspace.path().join("lua/unrelated.lua"),
-            "invalid source {",
-        )
-        .unwrap();
-        let mut document = super::super::document::test_fixture("lua", "Lua");
-        let mut design = super::super::DeclarationDesign::default();
-        design.proposed.insert(
-            "lua/run.lua".into(),
-            "local client = require('client')\nlocal function run()\n".into(),
-        );
-        document.design = Some(design);
-        let destination = PlanReferenceIndex::lua_source_call(
-            &document,
-            workspace.path(),
-            "lua/run.lua",
-            "client.send",
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        assert!(
-            destination.path.ends_with("lua/client.lua")
-                || destination.path.ends_with("lua\\client.lua")
-        );
-        assert_eq!(destination.line, 2);
-        assert!(!destination.proposed);
-        assert_eq!(document.design.as_ref().unwrap().proposed.len(), 1);
+        assert!(destination.proposed);
+        assert_eq!(destination.line, 4);
     }
 
     #[test]

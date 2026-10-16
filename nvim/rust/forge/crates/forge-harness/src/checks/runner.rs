@@ -38,6 +38,8 @@ pub(crate) struct CheckAdmission {
     pub files: Option<Vec<String>>,
     /// Distinguishes an accepted empty case inventory from unavailable standalone discovery.
     pub cases: Option<Vec<CheckCase>>,
+    /// Newly added cases only, distinct from new and modified inventory.
+    pub new_cases: Option<Vec<CheckCase>>,
     pub has_scope: bool,
     pub shell: crate::session::CheckShell,
     pub trigger: String,
@@ -207,6 +209,7 @@ impl CheckRunner {
             overrides,
             files,
             cases,
+            new_cases,
             has_scope,
             shell,
             trigger,
@@ -221,7 +224,6 @@ impl CheckRunner {
         }
         let id = uuid::Uuid::new_v4().to_string();
         let directory = self.root.join(&id);
-        std::fs::create_dir_all(&directory)?;
         let mut run = CheckRun {
             id: id.clone(),
             revision,
@@ -272,7 +274,7 @@ impl CheckRunner {
                 .map(|id| (id.clone(), CheckSelection::All))
                 .collect()
         } else {
-            effective_request.selections(&effective, files.as_deref().unwrap_or_default(), cases.as_deref(), has_scope)?
+            effective_request.selections(&effective, files.as_deref().unwrap_or_default(), cases.as_deref(), new_cases.as_deref(), has_scope)?
         };
         for index in effective.order()? {
             let definition = &effective.definitions[index];
@@ -302,13 +304,13 @@ impl CheckRunner {
                 )
             } else if selection.empty()
                 && matches!(selection, CheckSelection::Cases { .. })
-                && cases.is_none()
+                && (if definition.scope == super::CheckScope::NewCases { new_cases.is_none() } else { cases.is_none() })
             {
-                (CheckState::ConfigurationError, Some("Added/modified case inventory is unavailable outside plan execution. Use changed_files or all in /checks setup, or supply explicit cases.".into()))
+                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Use changed_files or all in /checks setup, or supply explicit cases.".into()))
             } else if selection.empty() && files.is_none() && has_scope {
                 (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Select full coverage explicitly or provide concrete files or cases.".into()))
             } else if selection.empty() {
-                (CheckState::Skipped, Some("No matching task changes".into()))
+                (CheckState::Skipped, Some(if definition.scope == super::CheckScope::NewCases { "No new tests in the accepted plan" } else { "No matching task changes" }.into()))
             } else if operation.is_none() {
                 (
                     CheckState::ConfigurationError,
@@ -320,8 +322,10 @@ impl CheckRunner {
             let position = run.commands.len();
             run.commands.push(CommandCheck {
                 id: format!("{id}:{position}"),
-                command: operation.unwrap_or(&definition.all).command.clone(),
+                command: operation.unwrap_or(&definition.all).display(),
                 context: Some(CheckCommand {
+                    operation: operation.filter(|operation| operation.args.is_some()).cloned(),
+                    invocation: None,
                     definition_id: definition.id.clone(),
                     name: definition.name.clone(),
                     area: definition.area.clone(),
@@ -358,6 +362,56 @@ impl CheckRunner {
         Ok(run)
     }
 
+    /// Freezes package bindings before review, authorization, or process admission.
+    pub(crate) async fn resolve(&self, mut run: CheckRun) -> Result<CheckRun> {
+        let mut resolver = super::invocation::InvocationResolver::default();
+        let mut commands = Vec::new();
+        for mut check in std::mem::take(&mut run.commands) {
+            let context = check.context.as_ref().context("check context is missing")?;
+            if check.state != CheckState::Pending || context.invocation.is_some() || context.operation.is_none() {
+                commands.push(check);
+                continue;
+            }
+            match resolver.resolve(&self.workspace, &context.directory, context.operation.as_ref().unwrap(), &context.selection).await {
+                Ok(invocations) => {
+                    ensure!(!invocations.is_empty(), "nonempty check selection resolved to no commands");
+                    for invocation in invocations {
+                        let mut expanded = check.clone();
+                        expanded.command = invocation.display();
+                        let context = expanded.context.as_mut().unwrap();
+                        if let Some(package) = &invocation.package {
+                            context.name = format!("{} · {}", context.name, package.name.as_deref().unwrap_or(&package.directory));
+                        }
+                        if !invocation.files.is_empty() {
+                            context.matched_files = invocation.files.clone();
+                            context.reason = format!("Changed: {}", invocation.files.join(", "));
+                        }
+                        if !invocation.cases.is_empty() {
+                            context.reason = format!("Selected plan tests: {}", invocation.cases.iter().map(|case| case.name.as_str()).collect::<Vec<_>>().join(", "));
+                        }
+                        context.invocation = Some(invocation);
+                        commands.push(expanded);
+                    }
+                }
+                Err(error) => {
+                    check.state = CheckState::ConfigurationError;
+                    check.error = Some(format!("{error:#}"));
+                    commands.push(check);
+                }
+            }
+        }
+        for (position, check) in commands.iter_mut().enumerate() {
+            check.id = format!("{}:{position}", run.id);
+            let directory = self.root.join(&run.id);
+            check.stdout = directory.join(format!("{position}.stdout"));
+            check.stderr = directory.join(format!("{position}.stderr"));
+            check.output = directory.join(format!("{position}.output"));
+            check.context.as_mut().unwrap().receipt = directory.join(format!("{position}.selection.json"));
+        }
+        run.commands = commands;
+        Ok(run)
+    }
+
     /// Runs the same serial dependency-aware lifecycle for automatic gates and on-demand requests.
     pub(crate) async fn run(
         self: &Arc<Self>,
@@ -365,6 +419,8 @@ impl CheckRunner {
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CheckRun> {
+        let run = self.resolve(run).await?;
+        std::fs::create_dir_all(self.root.join(&run.id))?;
         let cancelled = self.admit(&run.id)?;
         self.run_admitted(run, sink, external_cancelled, cancelled)
             .await
@@ -438,17 +494,18 @@ impl CheckRunner {
             let context = run.commands[index].context.as_ref().unwrap().clone();
             if run.commands[index].state == CheckState::Pending {
                 for dependency in &context.depends_on {
-                    let prerequisite = run
+                    let prerequisites: Vec<_> = run
                         .commands
                         .iter()
-                        .find(|check| {
+                        .filter(|check| {
                             check
                                 .context
                                 .as_ref()
                                 .is_some_and(|value| &value.definition_id == dependency)
                         })
-                        .context("missing prerequisite command")?;
-                    if prerequisite.state != CheckState::Passed {
+                        .collect();
+                    ensure!(!prerequisites.is_empty(), "missing prerequisite command");
+                    if let Some(prerequisite) = prerequisites.iter().find(|check| check.state != CheckState::Passed) {
                         run.commands[index].state =
                             if prerequisite.error.as_deref() == Some("Disabled for this task") {
                                 CheckState::ConfigurationError
@@ -496,7 +553,9 @@ impl CheckRunner {
                 .execute(run, index, sink, cancelled, external_cancelled)
                 .await
             {
-                run.commands[index].state = CheckState::ConfigurationError;
+                run.commands[index].state = if cancelled.load(Ordering::Acquire)
+                    || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
+                { CheckState::Interrupted } else { CheckState::ConfigurationError };
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
@@ -581,17 +640,36 @@ impl CheckRunner {
             directory.starts_with(self.workspace.canonicalize()?),
             "check directory escapes the project"
         );
-        let executable = run
-            .executable
-            .as_ref()
-            .context("configured check shell is unavailable")?;
-        let scoped = !matches!(context.selection, CheckSelection::All);
+        let native = context.invocation.as_ref();
+        if let Some(invocation) = native {
+            for (path, expected) in &invocation.inputs {
+                let actual = std::fs::read(self.workspace.join(super::config::relative_path(path)?))?;
+                ensure!(&crate::plan::digest(&actual) == expected, "Package configuration changed after check resolution: {path}. Refresh and rerun checks.");
+            }
+        }
+        if let Some(invocation) = native && let Some(discovery) = &invocation.discovery {
+            let output = super::invocation::capture(&invocation.program, discovery, &directory, Some(cancelled), external_cancelled, 120).await?;
+            let output = String::from_utf8(output).context("Cargo test inventory is not UTF-8")?;
+            let names: std::collections::BTreeSet<_> = output.lines().filter_map(|line| line.strip_suffix(": test")).collect();
+            for case in &invocation.cases {
+                ensure!(names.contains(case.name.as_str()), "Declared test was not discovered in the selected Cargo target: {}", case.name);
+            }
+            run.commands[index].context.as_mut().unwrap().resolved = Some(CheckSelection::Cases { cases: invocation.cases.clone() });
+        }
+        let scoped = native.is_none() && !matches!(context.selection, CheckSelection::All);
         let source = if scoped && run.shell == crate::session::CheckShell::Nushell {
             format!("$in | {}", run.commands[index].command)
         } else {
             run.commands[index].command.clone()
         };
-        let mut command = run.shell.command(executable, &source, scoped)?;
+        let mut command = if let Some(invocation) = native {
+            let mut command = crate::process::command(&invocation.program, &invocation.args);
+            command.stdin(std::process::Stdio::null());
+            command
+        } else {
+            let executable = run.executable.as_ref().context("configured check shell is unavailable")?;
+            run.shell.command(executable, &source, scoped)?
+        };
         command
             .current_dir(directory)
             .stdout(std::process::Stdio::piped())
@@ -661,6 +739,14 @@ impl CheckRunner {
         stdout_file.flush().await?;
         stderr_file.flush().await?;
         let status = status.context("check process status missing")?;
+        if let Some(invocation) = native && !invocation.cases.is_empty() && !killed && status.success() {
+            let output = std::fs::read(&run.commands[index].stdout)?;
+            let output = strip_ansi_escapes::strip(&output);
+            let output = String::from_utf8_lossy(&output);
+            for case in &invocation.cases {
+                ensure!(output.lines().any(|line| line.trim() == format!("test {} ... ok", case.name)), "Declared test did not execute successfully: {}. Zero matches, ignored tests, and nonstandard output cannot prove coverage.", case.name);
+            }
+        }
         run.commands[index].exit_code = status.code();
         run.commands[index].state = if killed {
             CheckState::Interrupted
@@ -745,6 +831,8 @@ impl CheckRunner {
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<String> {
+        let run = self.resolve(run).await?;
+        std::fs::create_dir_all(self.root.join(&run.id))?;
         let cancelled = self.admit(&run.id)?;
         let id = run.id.clone();
         if let Err(error) = self.publish(&run, sink.as_ref()).await {
@@ -764,7 +852,7 @@ impl CheckRunner {
     }
 }
 
-fn operation<'definition>(
+pub(super) fn operation<'definition>(
     definition: &'definition CheckDefinition,
     selection: &CheckSelection,
 ) -> Option<&'definition super::CheckOperation> {

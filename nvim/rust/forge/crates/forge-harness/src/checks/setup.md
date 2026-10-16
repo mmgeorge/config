@@ -39,13 +39,48 @@ changed_files with a helper that maps source files to real tests, or all within 
 A cases handler can still support explicit case selection. Use changed_cases defaults only
 for checks intentionally restricted to cases added or modified by an accepted plan.
 Each definition also has
-enabled, scope (all, changed_files, changed_cases), directory (project-relative, default "."),
+enabled, scope (all, changed_files, changed_cases, new_cases), directory (project-relative, default "."),
 all: {command}, optional files: {command}, optional cases: {command}, and depends_on: [id].
 Use static single-line commands for the configured shell. Choose execution order in definitions.
 Prefer build/check, test, lint, then format when no project constraint requires another order.
 Declare dependencies only when a check truly requires a successful prerequisite. Independent
 checks continue after failures. An explicitly empty definitions list is valid for projects
 without automated checks. Do not introduce dummy successful commands.
+
+Operations also support a direct form: {command: "cargo", args: [...], package_manager: "cargo"}.
+When args is present, command is an executable and args are separate process arguments, not shell
+source. package_manager is optional and supports cargo, npm, and pnpm. It is required for package
+bindings. Supported bindings are {file.path}, {package.name}, {package.directory},
+{package.manifest}, and {workspace.directory}. Bindings expand inside individual arguments.
+File paths are project-relative. Package directory, package manifest, and workspace directory
+bindings expand to absolute paths, so they remain valid with a configured working directory.
+Forge discovers workspace membership and runs identical resolved commands once, retaining all
+triggering paths. No group_by or run_per setting is needed. The files_changed trigger spelling
+is accepted for paths triggers. Exclude build output and dependency directories in trigger rules.
+
+For tests of changed Cargo packages, use changed_files and a files operation with command cargo,
+package_manager cargo, and args ["test", "--package", "{package.name}", "--tests"], adding the
+repository's required profile/features flags. --tests selects unit and integration test targets.
+For npm use ["run", "test", "--workspace={package.name}"]. For pnpm use
+["--filter", "{package.name}", "test"]. Keep an explicit all operation for full-suite requests.
+For both single-package and workspace Node projects, npm also supports
+["--prefix", "{package.directory}", "run", "test"] and pnpm supports
+["--dir", "{package.directory}", "test"]. Root lockfiles and workspace manifests need a separate
+workspace-wide rule. Do not silently treat them as changes to one member package.
+
+new_cases selects only tests marked new in the accepted plan, including new tests in existing
+files. changed_cases still selects new and modified tests. Both use the cases operation. An
+empty accepted inventory means no tests selected. Missing plan inventory is an error. Native
+Cargo case operations use args ["test", "--package", "{package.name}", "{case.target_args}",
+"--", "{case.name}", "--exact"]. case.target_args expands to one target selector. Set target in
+the plan test entry to lib, bin:<name>, or test:<name> when source ownership is ambiguous. Forge
+lists the selected target's tests before execution and requires the declared test to execute.
+npm/pnpm case selection still requires a runner-specific scoped helper and a validated receipt.
+Package discovery does not provide Jest, Vitest, or arbitrary script test-name discovery.
+
+Check listings and submitted plans show concrete invocations and selection reasons when the
+required package metadata exists. A plan changing package manifests displays pending validation
+until implementation. Do not present previews as executed or passing checks.
 
 Scoped handlers read one JSON object from stdin:
 {version: 1, check_id, workspace, selection: {kind: "files", files: [...]}

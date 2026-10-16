@@ -115,9 +115,14 @@ impl HarnessBroker {
                     .map(|case| crate::checks::CheckCase {
                         file: file.file.clone(),
                         name: case.name.clone(),
+                        target: case.target.clone(),
                     })
             })
             .collect();
+        let new_cases = design.document.tests.iter().flat_map(|file| {
+            file.cases.iter().filter(|case| case.change == crate::plan::DesignTestChange::New)
+                .map(|case| crate::checks::CheckCase { file: file.file.clone(), name: case.name.clone(), target: case.target.clone() })
+        }).collect();
         let mut run = self.check_runner.prepare(
             snapshot,
             crate::checks::CheckAdmission {
@@ -125,6 +130,7 @@ impl HarnessBroker {
                 overrides: overrides.enabled,
                 files,
                 cases: Some(cases),
+                new_cases: Some(new_cases),
                 has_scope: true,
                 shell,
                 trigger: "Plan execution".into(),

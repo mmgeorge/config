@@ -1,0 +1,7 @@
+{
+  "name": "plan-navigation-fixture",
+  "private": true,
+  "dependencies": {
+    "tiny-value": "file:./dependency"
+  }
+}

@@ -57,8 +57,8 @@ here, but it does not resolve this chain successfully.
 
 `Calls` and `Accesses` provide dependency navigation, review evidence, and
 implementation-difference reporting. They are not a full TypeScript type check.
-Submission separately validates imports and signature references. The documented
-contract treats body references as descriptive evidence, not completion gates.
+Submission separately validates imports and signature references. Incoming-use validation also consumes resolved internal body references when admitting new
+internal declarations. Preserve that gate independently of source-backed LSP navigation.
 
 ### Proposed resolution
 
@@ -112,3 +112,20 @@ analysis from request failures and preserve both explicitly.
 - Malformed targets and unattached reference blocks still fail validation.
 - After deploying the fix, retry the blocked integration declaration patches
   against saved revision 6 without restarting the plan.
+
+## Implemented migration contract
+
+Navigation queries the running project LSP only when the reviewer requests a definition and the
+selected occurrence still maps to captured real source. Hidden buffers contain actual project
+files. They contain no generated declarations or stub bodies. The implementation adds no jump
+cache and creates no dependency-analysis directory.
+
+Tree-sitter retains extraction and presentation ownership. Harness retains proposal navigation,
+structural checks, and internal incoming-use validation. External dependency/API checking and
+plan-triggered Cargo or registry acquisition are removed. Unavailable external references remain
+unchecked and cannot block plan saving or submission. Completion and full plan typechecking are
+outside this migration.
+
+Reusable fixtures live under `nvim/tests/forge/fixtures/plan_navigation`. Rust and TypeScript use
+tiny relative local dependencies. The live integration test copies the fixtures into disposable
+workspaces and exercises the real PlanReview, Harness host, and project language servers.

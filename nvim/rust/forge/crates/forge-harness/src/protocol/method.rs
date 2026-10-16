@@ -98,10 +98,6 @@ pub enum HarnessMethod {
     PlanEntityRename,
     #[serde(rename = "plan.tests.delete")]
     PlanTestsDelete,
-    #[serde(rename = "plan.rustdoc.hover")]
-    PlanRustdocHover,
-    #[serde(rename = "plan.rustdoc.source")]
-    PlanRustdocSource,
     #[serde(rename = "plan.request_changes")]
     PlanRequestChanges,
     #[serde(rename = "plan.questions.answer")]

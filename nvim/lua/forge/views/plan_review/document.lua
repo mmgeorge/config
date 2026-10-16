@@ -495,6 +495,17 @@ function M.attach(options, callback)
       if not owner.views[window] then open_view(window) end
     end
   end
+  ---@param captured table
+  ---@param source ForgeWorkspaceDefinition
+  ---@param target ForgeDefinitionLocation
+  ---@param receive fun(result: table?, failure: string?, captured: table)
+  function owner.definition(captured, source, target, receive)
+    if not owner.is_current(captured) then return end
+    request({ operation = "plan_definition", input = captured, source = source, target = target }, function(result, failure)
+      if owner.is_current(captured) then receive(result, failure, captured) end
+    end)
+  end
+
   function owner.action(action, receive, window)
     if not owner.attached() then return false end
     if action == "comment" or action == "question" then

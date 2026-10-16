@@ -2,6 +2,9 @@ mod applicability;
 mod changes;
 mod config;
 mod model;
+mod invocation;
+mod packages;
+mod preview;
 mod runner;
 mod selection;
 #[cfg(test)]
@@ -18,6 +21,9 @@ pub use model::{CheckEvent, CheckEventKind, CheckRun, CheckSetupState, CheckStat
 pub(crate) use runner::CheckAdmission;
 pub use runner::CheckRunner;
 pub use selection::{CheckCase, CheckReceipt, CheckSelection, RunRequest};
+pub use packages::PackageManager;
+pub use preview::CheckPreview;
+pub(crate) use preview::plan as preview_plan;
 pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::CheckToolScope;
 pub(crate) use tools::ConfigureChecks;

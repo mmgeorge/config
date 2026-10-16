@@ -1,6 +1,5 @@
 use crate::control_tools::ControlToolInvocation;
 use crate::plan::{PlanDocument, PlanMutationError, PlanValidationError, PlanViolation};
-use crate::rustdoc::RustApiValidationError;
 use anyhow::Error;
 use jsonschema::ValidationError;
 use jsonschema::error::ValidationErrorKind;
@@ -346,16 +345,6 @@ pub(crate) fn control_tool_failure_json(
                 expected_shape:None,
                 hint:Some("Patch the declaration or its import, then submit the current version again.".into()),
             }).collect())
-        } else if let Some(validation_error) = error.downcast_ref::<RustApiValidationError>() {
-            (
-                failure_phase(invocation),
-                "rust_api_validation_failed".to_owned(),
-                validation_error
-                    .violation
-                    .iter()
-                    .map(plan_violation)
-                    .collect(),
-            )
         } else {
             let message = format!("{error:#}");
             (

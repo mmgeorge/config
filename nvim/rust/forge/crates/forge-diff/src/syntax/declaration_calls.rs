@@ -24,6 +24,8 @@ pub struct DeclarationCall {
     pub kind: DeclarationCallKind,
     /// Qualified callable name, or a receiver expression without type evidence.
     pub name: String,
+    /// Exact source expression, independent of inferred declaration identity.
+    pub expression: String,
     /// One-based source line of the call target.
     pub line: u32,
     /// Zero-based source byte column of the call target.
@@ -708,7 +710,7 @@ fn call_name(
         .collect::<String>();
     if name
         .chars()
-        .all(|character| character.is_alphanumeric() || "_:.<>#".contains(character))
+        .all(|character| character.is_alphanumeric() || "_:.<>#$".contains(character))
     {
         name
     } else {
@@ -786,9 +788,10 @@ fn calls(
                 output.push(DeclarationCall {
                     kind: DeclarationCallKind::Call,
                     name,
+                    expression: contents(function, source).into(),
                     unresolved: shadowed_target(function, source, returns, binding),
-                    line: function.start_position().row as u32 + 1,
-                    column: function.start_position().column as u32,
+                    line: reference_token(function).start_position().row as u32 + 1,
+                    column: reference_token(function).start_position().column as u32,
                 });
             }
         }
@@ -823,6 +826,7 @@ fn calls(
                             base_type(contents(owner, source)),
                             contents(field, source)
                         ),
+                        expression: contents(field, source).into(),
                         unresolved: false,
                         line: field.start_position().row as u32 + 1,
                         column: field.start_position().column as u32,
@@ -846,10 +850,11 @@ fn calls(
         output.push(DeclarationCall {
             kind: if callable.contains(&name) { DeclarationCallKind::Callback } else { DeclarationCallKind::Property },
             name,
+            expression: contents(node, source).into(),
             unresolved: member_access(node, source).is_none()
                 || shadowed_target(node, source, returns, binding),
-            line: node.start_position().row as u32 + 1,
-            column: node.start_position().column as u32,
+            line: reference_token(node).start_position().row as u32 + 1,
+            column: reference_token(node).start_position().column as u32,
         });
     }
     if matches!(node.kind(), "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier")
@@ -865,6 +870,7 @@ fn calls(
         output.push(DeclarationCall {
             kind: if callback { DeclarationCallKind::Callback } else { DeclarationCallKind::Value },
             unresolved: false, name,
+            expression: contents(node, source).into(),
             line: node.start_position().row as u32 + 1,
             column: node.start_position().column as u32,
         });
@@ -880,6 +886,18 @@ fn calls(
         *binding = previous;
     }
     Ok(())
+}
+
+fn reference_token(node: Node<'_>) -> Node<'_> {
+    if node.kind() == "generic_function" {
+        return node.child_by_field_name("function").map(reference_token).unwrap_or(node);
+    }
+    node.child_by_field_name("field")
+        .or_else(|| node.child_by_field_name("property"))
+        .or_else(|| node.child_by_field_name("method"))
+        .or_else(|| node.child_by_field_name("index"))
+        .or_else(|| node.child_by_field_name("name").filter(|_| matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")))
+        .unwrap_or(node)
 }
 
 fn invocation_target(mut node: Node<'_>) -> bool {

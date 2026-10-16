@@ -252,6 +252,9 @@ impl HarnessService {
                 }
                 return Ok(result);
             }
+            crate::buffer::session::PresentationRequest::PlanDefinition { input, source, target } => {
+                return controller.plan_review.definition(input, source, target);
+            }
             crate::buffer::session::PresentationRequest::PlanSaveAnnotations {
                 document,
                 saved_source_digest,
@@ -1237,7 +1240,7 @@ async fn route_request(
         let task = store.list_task(&session_id)?.into_iter().find(|task| Some(&task.id) == session.current_task_id.as_ref() && !task.status.terminal());
         let task_id = task.as_ref().map(|task|task.id.as_str());
         let result = match method {
-            HarnessMethod::ChecksList => controller.checks.catalog(task_id)?,
+            HarnessMethod::ChecksList => controller.checks.catalog_preview(task_id).await?,
             HarnessMethod::ChecksStatus => serde_json::to_value(controller.checks.status(request.params["run_id"].as_str().context("run_id required")?,request.params["wait_ms"].as_u64().unwrap_or(0)).await?)?,
             HarnessMethod::ChecksCancel => {
                 let id = request.params["run_id"].as_str().context("run_id required")?;

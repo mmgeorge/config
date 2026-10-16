@@ -5,6 +5,8 @@ globs:
   - 'nvim/lua/plugins/forge.lua'
   - 'nvim/lua/rust_sidecar/**/*'
   - 'nvim/rust/forge/**/*'
+  - 'nvim/contributing/forge/**/*'
+  - 'nvim/docs/forge/**/*'
 ---
 
 # Forge Plugin Rules
@@ -74,7 +76,22 @@ instructions. Keep protocol handshake validation. Do not add automatic rebuilds
 or fallback executables when protocol versions differ.
 
 
-Keep `nvim/lua/forge/docs/architecture.md` up to date when changing Forge subsystem boundaries, data flow, buffer types, render pipelines, state ownership, or cross-module invariants. The Rulesync rule directs agent workflows, while the architecture document explains system structure and ownership boundaries.
+## Contributor Documentation
+
+Start Forge work at `nvim/contributing/forge/README.md`. Read the architecture
+overview and the task-specific chapter or procedure linked there before changing
+the relevant subsystem. Architecture lives under
+`nvim/contributing/forge/architecture/`. Language integration, Tree-sitter updates,
+and build/test procedures live directly under `nvim/contributing/forge/`.
+User-facing documentation lives under `nvim/docs/forge/`.
+
+Keep the affected documentation up to date in the same change. Update architecture
+when subsystem ownership, data flow, buffer behavior, persistence, protocol,
+resource limits, or failure boundaries change. Update contribution procedures
+when integration steps, build commands, or required verification change. Update
+user docs when commands or observable behavior change. Maintain the contributor
+index and links after moving or splitting documents. Do not append unrelated
+implementation history to the architecture overview.
 
 Forge is a standalone local Neovim plugin. Trouble must not own this
 feature: do not place Forge code under `trouble/sources`, do not register a

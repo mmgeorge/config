@@ -30,14 +30,13 @@ use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, PlanAcceptance, PlanCallable, PlanDocument, PlanElicitation,
+    ArtifactSummary, PlanAcceptance, PlanDocument, PlanElicitation,
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
     PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
     PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
     PlanState, digest as plan_digest,
 };
 use crate::protocol::HarnessMethod;
-use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
 use crate::session::{
     ContextUsage, PermissionMode, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
@@ -241,20 +240,6 @@ struct ChildExchangeRuntime {
     task: TaskTracker,
 }
 
-struct RustdocTarget {
-    plan_id: String,
-    expected_version: u64,
-    selection: String,
-    receiver: String,
-    receiver_package: String,
-    receiver_version: String,
-    callable: Option<PlanCallable>,
-}
-
-fn rustdoc_callable(callable: Option<&PlanCallable>) -> Result<&PlanCallable> {
-    callable.context("selected flow edge has no Rust callable")
-}
-
 /// Represents one request result plus asynchronous events emitted before its response.
 pub struct DispatchResult {
     pub response: Response,
@@ -270,7 +255,6 @@ pub struct BrokerRuntime {
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
-    rustdoc: Arc<RustdocResolver>,
 }
 
 impl BrokerRuntime {
@@ -300,9 +284,6 @@ impl BrokerRuntime {
         let permission_coordinator =
             Arc::new(PermissionCoordinator::new(Arc::clone(&permission_store)));
         let trace = Arc::new(TraceStore::open(&data_root)?);
-        let rustdoc = Arc::new(RustdocResolver::new(RustdocResolverConfig::production(
-            &data_root,
-        )?)?);
         let backend = Arc::<dyn Backend>::from(crate::backend::build(
             request.backend.clone(),
             Arc::clone(&permission_coordinator),
@@ -317,7 +298,6 @@ impl BrokerRuntime {
             permission_store,
             permission_coordinator,
             trace,
-            rustdoc,
         }))
     }
 
@@ -562,7 +542,6 @@ pub struct HarnessBroker {
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
-    rustdoc: Arc<RustdocResolver>,
     event_sink: Option<BackendEventSink>,
     clock: Box<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
@@ -808,7 +787,6 @@ impl HarnessBroker {
             permission_store,
             permission_coordinator,
             trace,
-            rustdoc: Arc::clone(&runtime.rustdoc),
             plan_review: Arc::new(crate::plan::review_document::PlanReviewStore::default()),
             revision_review: Arc::new(crate::plan::revision_review::RevisionReview::default()),
             event_sink: None,
@@ -907,7 +885,6 @@ impl HarnessBroker {
                 .and_then(|goal_id| self.store.load_goal(goal_id).ok().flatten())
                 .is_some_and(|goal| goal.state == GoalState::Active),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
-            rustdoc: Some(Arc::clone(&self.rustdoc)),
             repository: None,
             execution: None,
         })
@@ -1169,8 +1146,6 @@ impl HarnessBroker {
             HarnessMethod::PlanAcceptanceCancel => self.cancel_plan_acceptance(),
             HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
             HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
-            HarnessMethod::PlanRustdocHover => self.rustdoc_hover(params).await,
-            HarnessMethod::PlanRustdocSource => self.rustdoc_source(params).await,
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
             HarnessMethod::PlanAnswerQuestions => self.answer_plan_review_questions(params).await,
             HarnessMethod::PlanCancel => self.cancel_plan(params),
@@ -1283,162 +1258,6 @@ impl HarnessBroker {
         Ok((json!({"annotation":self.plan_review.annotations(&document)?}), event))
     }
 
-    async fn rustdoc_hover(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let target = self
-            .resolve_rustdoc_target(&params, "plan.rustdoc.hover")
-            .await?;
-        let hover = if target.selection == "receiver" {
-            self.rustdoc
-                .type_hover(
-                    &target.receiver_package,
-                    &target.receiver_version,
-                    &target.receiver,
-                )
-                .await?
-        } else {
-            let callable = rustdoc_callable(target.callable.as_ref())?;
-            self.rustdoc
-                .callable_hover(
-                    &target.receiver_package,
-                    &target.receiver_version,
-                    &target.receiver,
-                    &callable.name,
-                    callable.kind,
-                )
-                .await?
-        };
-        let mut width = forge_buffer::width::WidthProfile::default();
-        width.columns = 60;
-        let content = format!("```rust\n{}\n```\n\n{}", hover.signature, hover.docs);
-        let rendered = forge_buffer::markdown::MarkdownRenderer::render(
-            forge_buffer::identity::BlockId("rustdoc".into()),
-            &content,
-            &width,
-        )?;
-        let document = forge_buffer::document::BufferDocument::new(
-            forge_buffer::identity::DocumentId(format!("plan:rustdoc:{}", uuid::Uuid::new_v4())),
-            vec![rendered.block],
-        )?;
-        let mut result = serde_json::to_value(hover)?;
-        result["document"] = serde_json::to_value(document.snapshot())?;
-        Ok((result, Vec::new()))
-    }
-
-    async fn rustdoc_source(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let target = self
-            .resolve_rustdoc_target(&params, "plan.rustdoc.source")
-            .await?;
-        let location = if target.selection == "receiver" {
-            self.rustdoc
-                .type_source(
-                    &target.receiver_package,
-                    &target.receiver_version,
-                    &target.receiver,
-                )
-                .await?
-        } else {
-            let callable = rustdoc_callable(target.callable.as_ref())?;
-            self.rustdoc
-                .callable_source(
-                    &target.receiver_package,
-                    &target.receiver_version,
-                    &target.receiver,
-                    &callable.name,
-                    callable.kind,
-                )
-                .await?
-        };
-        let current = self
-            .plan_file
-            .read_working_document(&self.session.id, &target.plan_id)?;
-        anyhow::ensure!(
-            current.version == target.expected_version,
-            "plan version changed before Rust source resolved"
-        );
-        Ok((serde_json::to_value(location)?, Vec::new()))
-    }
-
-    async fn resolve_rustdoc_target(
-        &mut self,
-        params: &Value,
-        method: &str,
-    ) -> Result<RustdocTarget> {
-        let plan_id = params
-            .get("plan_id")
-            .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires plan_id"))?
-            .to_owned();
-        let expected_version = params
-            .get("expected_version")
-            .and_then(Value::as_u64)
-            .with_context(|| format!("{method} requires expected_version"))?;
-        let json_path = params
-            .get("json_path")
-            .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires json_path"))?;
-        let selection = params
-            .get("selection")
-            .and_then(Value::as_str)
-            .with_context(|| format!("{method} requires selection"))?
-            .to_owned();
-        anyhow::ensure!(
-            matches!(selection.as_str(), "receiver" | "callable"),
-            "{method} selection must be receiver or callable"
-        );
-        let mut document = self
-            .plan_file
-            .read_working_document(&self.session.id, &plan_id)?;
-        anyhow::ensure!(
-            document.version == expected_version,
-            "plan version changed before Rust documentation resolved"
-        );
-        let document_value = serde_json::to_value(&document)?;
-        let edge = document_value
-            .pointer(json_path)
-            .context("Rust documentation flow edge no longer exists")
-            .and_then(|value| {
-                serde_json::from_value::<crate::plan::PlanFlowEdge>(value.clone())
-                    .context("Rust documentation path does not identify a flow edge")
-            })?;
-        let crate::plan::EntityReference::ExternalEntity {
-            name: receiver,
-            dependency: Some(receiver_dependency),
-            ..
-        } = &edge.target
-        else {
-            anyhow::bail!("Rust documentation requires an external typed receiver");
-        };
-        let receiver = receiver.clone();
-        let receiver_dependency = receiver_dependency.clone();
-        let callable = edge.callable;
-        let dependency_index = document
-            .dependencies
-            .iter()
-            .position(|dependency| dependency.name == receiver_dependency)
-            .context("Rust receiver dependency is not declared by this plan")?;
-        if document.dependencies[dependency_index].resolved_version.is_none() {
-            let dependency = &document.dependencies[dependency_index];
-            let version = self
-                .rustdoc
-                .resolve_version(&dependency.name, &dependency.version)
-                .await?;
-            document.dependencies[dependency_index].resolved_version = Some(version);
-        }
-        let receiver_package = document.dependencies[dependency_index].name.clone();
-        let receiver_version = document.dependencies[dependency_index]
-            .resolved_version
-            .clone()
-            .context("Rust receiver dependency version was not resolved")?;
-        Ok(RustdocTarget {
-            plan_id,
-            expected_version,
-            selection,
-            receiver,
-            receiver_package,
-            receiver_version,
-            callable,
-        })
-    }
 
     fn current_plan_id(&self) -> Result<Option<String>> {
         Ok(self.current_task()?.and_then(|task| task.plan_id))
@@ -3877,15 +3696,12 @@ Planning continuation: turn {} of {}.",
                     .read_working_document(&self.session.id, &plan.id)?;
                 anyhow::ensure!(
                     validated_document.version == submission.expected_version,
-                    "plan version changed before Rust API validation"
+                    "plan version changed before submission validation"
                 );
                 let validation_warning = if let Some(design) = &mut validated_document.design {
                     *design = design.validated(Path::new(&self.session.workspace)).await?;
                     design.validation.as_ref().unwrap().warnings()
-                } else { match validate_plan_rust_api(&self.rustdoc, &mut validated_document).await {
-                        Ok(report) => report.warning,
-                        Err(error) => error.violation,
-                    } };
+                } else { Vec::new() };
                 let previous_document = if plan.model_revision == 0 { None } else {
                     Some(self.plan_file.read_submitted_document(&self.session.id, &plan.id, plan.model_revision)?)
                 };
@@ -8670,7 +8486,7 @@ mod test {
         let config = crate::checks::CheckConfig {version:2,definitions:commands.into_iter().enumerate().map(|(index,command)| crate::checks::CheckDefinition {
             id:format!("check-{index}"),name:format!("Check {index}"),category:crate::checks::CheckCategory::Check,enabled:true,
             area:"Fixture".into(),trigger:crate::checks::CheckTrigger::AnyChange,scope:Default::default(),directory:".".into(),
-            all:crate::checks::CheckOperation {command},files:None,cases:None,depends_on:Vec::new()
+            all:crate::checks::CheckOperation { args: None, package_manager: None,command},files:None,cases:None,depends_on:Vec::new()
         }).collect()};
         std::fs::write(repository.join(".forge.json"),serde_json::to_vec(&json!({"checks":config})).unwrap()).unwrap();
         design.document.verification=if manual { vec!["Observe manual result".into()] } else { Vec::new() };

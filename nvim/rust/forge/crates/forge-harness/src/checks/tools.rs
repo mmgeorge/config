@@ -159,7 +159,7 @@ impl CheckToolScope {
             self.runner.refresh_changes().await?;
         }
         let result = match name {
-            "harness_checks_list" => self.runner.catalog(self.task_id.as_deref())?,
+            "harness_checks_list" => self.runner.catalog_preview(self.task_id.as_deref()).await?,
             "harness_checks_configure" => {
                 ensure!(
                     self.setup && self.setup_reviewed,
@@ -221,6 +221,7 @@ impl CheckToolScope {
                     self.shell,
                     "Agent requested".into(),
                 )?;
+                let run = self.runner.resolve(run).await?;
                 let target_list = run
                     .commands
                     .iter()
@@ -310,6 +311,22 @@ impl CheckToolScope {
 }
 
 impl CheckRunner {
+    /// Adds concrete task commands without starting checks or publishing run history.
+    pub(crate) async fn catalog_preview(&self, task_id: Option<&str>) -> Result<Value> {
+        let mut catalog = self.catalog(task_id)?;
+        if let Ok(snapshot) = ConfigSnapshot::load(&self.workspace) {
+            let overrides = self.overrides(task_id)?;
+            let mut config = snapshot.config;
+            for definition in &mut config.definitions {
+                if let Some(enabled) = overrides.enabled.get(&definition.id) { definition.enabled = *enabled; }
+                if let Some(scope) = overrides.scopes.get(&definition.id) { definition.scope = *scope; }
+            }
+            if let Some(files) = self.changes.files()? {
+                catalog["preview"] = serde_json::to_value(super::preview::resolve(&self.workspace, &config, &files, None, None, false).await?)?;
+            }
+        }
+        Ok(catalog)
+    }
     /// Projects saved configuration, task controls, and history without inventing defaults.
     pub(crate) fn catalog(&self, task_id: Option<&str>) -> Result<Value> {
         let document = super::config::read_document(&self.workspace)?;
@@ -389,7 +406,7 @@ impl CheckRunner {
                     "file selection is unsupported"
                 );
                 ensure!(
-                    !matches!(scope, super::CheckScope::ChangedCases) || definition.cases.is_some(),
+                !matches!(scope, super::CheckScope::ChangedCases | super::CheckScope::NewCases) || definition.cases.is_some(),
                     "case selection is unsupported"
                 );
             }
@@ -423,6 +440,7 @@ impl CheckRunner {
                 overrides: overrides.enabled,
                 files: changes.clone(),
                 cases: None,
+                new_cases: None,
                 has_scope: changes.is_some(),
                 shell,
                 trigger,
@@ -629,6 +647,7 @@ impl CheckRunner {
                 overrides: BTreeMap::new(),
                 files: Some(Vec::new()),
                 cases: None,
+                new_cases: None,
                 has_scope: true,
                 shell: CheckShell::default(),
                 trigger: "Configuration saved".into(),

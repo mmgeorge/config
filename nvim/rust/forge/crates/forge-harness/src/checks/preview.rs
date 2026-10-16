@@ -1,0 +1,166 @@
+use super::{CheckCategory, CheckConfig, CheckScope, CheckSelection, RunRequest};
+use anyhow::Result;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::{collections::BTreeMap, path::Path};
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+/// Describes a proposed command without recording it as an executed check.
+pub struct CheckPreview {
+    /// Saved definition identity used to correlate preview and execution.
+    pub id: String,
+    /// Execution stage shown before the command.
+    pub category: CheckCategory,
+    /// Concrete command, or the template when implementation is still required.
+    pub command: String,
+    /// Requested coverage policy.
+    pub scope: CheckScope,
+    /// Selection reason or the unresolved prerequisite.
+    pub reason: String,
+    /// Whether package metadata or implementation is still unavailable.
+    pub pending: bool,
+    /// Whether the proposed change set selects this definition.
+    pub selected: bool,
+}
+
+/// Resolves planned changes with the same invocation resolver used during Checking.
+pub(crate) async fn plan(
+    workspace: &Path,
+    design: &crate::plan::DeclarationDesign,
+) -> Result<Vec<CheckPreview>> {
+    let Some(snapshot) = &design.check_configuration else {
+        return Ok(Vec::new());
+    };
+    let files = design.changed_paths();
+    let mut changed = Vec::new();
+    let mut new = Vec::new();
+    for file in &design.document.tests {
+        for case in &file.cases {
+            let selection = super::CheckCase {
+                file: file.file.clone(),
+                name: case.name.clone(),
+                target: case.target.clone(),
+            };
+            if case.change == crate::plan::DesignTestChange::New {
+                new.push(selection.clone());
+            }
+            if matches!(
+                case.change,
+                crate::plan::DesignTestChange::New | crate::plan::DesignTestChange::Modified
+            ) {
+                changed.push(selection);
+            }
+        }
+    }
+    let invalidated = design.changed_paths().into_iter().any(|path| {
+        path.ends_with("Cargo.toml")
+            || path.ends_with("Cargo.lock")
+            || path.ends_with("package.json")
+            || path.ends_with("pnpm-workspace.yaml")
+    });
+    resolve(
+        workspace,
+        &snapshot.config,
+        &files,
+        Some(&changed),
+        Some(&new),
+        invalidated,
+    )
+    .await
+}
+
+/// Builds a read-only preview from task inputs without creating run history or output files.
+pub(super) async fn resolve(
+    workspace: &Path,
+    config: &CheckConfig,
+    files: &[String],
+    cases: Option<&[super::CheckCase]>,
+    new_cases: Option<&[super::CheckCase]>,
+    metadata_pending: bool,
+) -> Result<Vec<CheckPreview>> {
+    let request = RunRequest::default();
+    let applicability = super::applicability::resolve(&request, config, Some(files), true)?;
+    let request = RunRequest {
+        ids: applicability
+            .iter()
+            .filter(|item| item.selected)
+            .map(|item| item.id.clone())
+            .collect(),
+        ..Default::default()
+    };
+    let selection = if request.ids.is_empty() {
+        BTreeMap::new()
+    } else {
+        request.selections(config, files, cases, new_cases, true)?
+    };
+    let mut resolver = super::invocation::InvocationResolver::default();
+    let mut result = Vec::new();
+    for index in config.order()? {
+        let definition = &config.definitions[index];
+        let applicable = applicability
+            .iter()
+            .find(|item| item.id == definition.id)
+            .unwrap();
+        let scope = selection
+            .get(&definition.id)
+            .cloned()
+            .unwrap_or(CheckSelection::All);
+        let operation = super::runner::operation(definition, &scope).unwrap_or(&definition.all);
+        let mut preview = CheckPreview {
+            id: definition.id.clone(),
+            category: definition.category,
+            command: operation.display(),
+            scope: definition.scope,
+            reason: applicable.reason.clone(),
+            pending: false,
+            selected: applicable.selected,
+        };
+        if applicable.selected && scope.empty() {
+            preview.selected = false;
+            preview.pending = matches!(scope, CheckSelection::Cases { .. })
+                && (if definition.scope == CheckScope::NewCases {
+                    new_cases.is_none()
+                } else {
+                    cases.is_none()
+                });
+            preview.reason = if preview.pending {
+                "Plan case inventory is unavailable"
+            } else if definition.scope == CheckScope::NewCases {
+                "No new tests in this plan"
+            } else {
+                "No matching changes"
+            }
+            .into();
+        } else if applicable.selected && operation.args.is_some() {
+            if metadata_pending && operation.package_manager.is_some() {
+                preview.pending = true;
+                preview.reason =
+                    "Package manifests change in this plan. Resolve commands after implementation."
+                        .into();
+            } else {
+                match resolver
+                    .resolve(workspace, &definition.directory, operation, &scope)
+                    .await
+                {
+                    Ok(invocations) => {
+                        for invocation in invocations {
+                            let mut item = preview.clone();
+                            item.command = invocation.display();
+                            if !invocation.files.is_empty() {
+                                item.reason = format!("Changed: {}", invocation.files.join(", "));
+                            }
+                            result.push(item);
+                        }
+                        continue;
+                    }
+                    Err(error) => {
+                        preview.pending = true;
+                        preview.reason = format!("Pending validation: {error:#}");
+                    }
+                }
+            }
+        }
+        result.push(preview);
+    }
+    Ok(result)
+}
