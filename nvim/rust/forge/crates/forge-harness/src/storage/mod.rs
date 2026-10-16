@@ -317,7 +317,10 @@ impl SqliteStore {
         let Some(payload) = payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION) else {
             return Ok(None);
         };
-        Ok(Some(serde_json::from_value(payload["preference"].clone())?))
+        let Some(preference) = payload.get("preference").filter(|preference| preference.is_object()) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_value(preference.clone())?))
     }
 
     /// Persist the last model controls selected for one backend and workspace.
@@ -1753,6 +1756,35 @@ mod test {
             )
             .unwrap();
         assert_eq!(outdated_count, 1);
+    }
+
+    #[test]
+    fn ignores_incompatible_preference_envelopes_without_rewriting_them() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(temporary.path()).unwrap();
+        for (workspace, payload) in [
+            ("flat", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "model": "old", "effort": "low"})),
+            ("null", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": null})),
+            ("scalar", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": 1})),
+        ] {
+            let encoded = encode(&payload).unwrap();
+            store.connection.execute(
+                "INSERT INTO preference_record(workspace,backend,payload) VALUES(?1,'codex',?2)",
+                params![workspace, encoded],
+            ).unwrap();
+            assert!(store.load_preference(workspace, "codex").unwrap().is_none());
+            let retained: String = store.connection.query_row(
+                "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='codex'",
+                [workspace], |row| row.get(0),
+            ).unwrap();
+            assert_eq!(retained, encoded);
+        }
+        store.connection.execute(
+            "INSERT INTO preference_record(workspace,backend,payload) VALUES('current','codex',?1)",
+            [encode(&serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION,
+                "preference": {"model":"current-model", "effort":"high"}})).unwrap()],
+        ).unwrap();
+        assert_eq!(store.load_preference("current", "codex").unwrap().unwrap().model, "current-model");
     }
 
     #[test]

@@ -123,6 +123,8 @@ impl CapabilityManifest {
             add(id,"Harness",label,false,"forge",true,"immediate",
                 "Harness owns child identity, fresh history, task queues, cancellation, and durable outcomes");
         }
+        add("lsp_tools","Settings","Query running editor language servers",false,"forge",true,"server_restart",
+            "Off by default. Read-only agent queries; interactive plan navigation stays available");
         add("subagent_tools","Settings","Enable root model delegation tools",false,"forge",true,"server_restart",
             "Off by default. Manual child spawning remains available and children cannot delegate");
         add("native_agent_suppression","Provider","Disable provider-native agent tools",false,"provider",

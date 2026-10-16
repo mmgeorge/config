@@ -37,6 +37,9 @@ function HarnessSnapshot.apply(state, result)
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
+  if state.session and state.session.workspace then
+    require("forge.lsp.startup").start(state.session.workspace)
+  end
   if previous_session_id == (result.session and result.session.id or nil)
     and previous_context_usage and not state.session.context_usage
   then
@@ -49,6 +52,7 @@ function HarnessSnapshot.apply(state, result)
   end
   state.capability = result.capability or {}
   state.subagent_tools = result.subagent_tools == true
+  state.lsp_tools = result.lsp_tools == true
   state.timeline_revision = result.timeline_revision or 0
   state.status = result.status or { kind = "idle" }
   state.artifact = vim.deepcopy(result.artifact or {})

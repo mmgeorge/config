@@ -729,6 +729,7 @@ local function on_event(event, payload)
     if payload.operation_id then state.pending_mode = nil end
     local configuration = state.configuration_completion
     if configuration and state.task_operation and payload.operation_id == state.task_operation.id then
+      if state.task_config and type(state.task_config.lsp_tools) == "boolean" then state.lsp_tools = state.task_config.lsp_tools end
       if state.task_config and type(state.task_config.subagent_tools) == "boolean" then
         state.subagent_tools = state.task_config.subagent_tools
       end
@@ -2296,6 +2297,7 @@ configure_now = function(next_config, validate_selection, completed)
       return
     end
     state.session = result
+    if type(next_config.lsp_tools) == "boolean" then state.lsp_tools = next_config.lsp_tools end
     if type(next_config.subagent_tools) == "boolean" then
       state.subagent_tools = next_config.subagent_tools
     end

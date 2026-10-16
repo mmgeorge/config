@@ -3,7 +3,7 @@ use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
 use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
 use crate::session::{ContextUsage, PermissionMode};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -715,6 +715,7 @@ pub fn build(
             acp::AcpBackend::new(kind, launch.command, permission_coordinator, settings_root)?,
         )),
         BackendKind::Mock => Ok(Box::new(MockBackend {
+            lsp_probe: launch.command.first().is_some_and(|value| value == "lsp-tools"),
             delay: match launch.command.first().map(String::as_str) {
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
@@ -746,6 +747,7 @@ pub fn build(
 }
 
 struct MockBackend {
+    lsp_probe: bool,
     retained_control: Option<std::sync::Mutex<std::collections::HashMap<String, crate::control_tools::ControlTurnContext>>>,
     permission: Option<std::sync::Arc<approval::PermissionCoordinator>>,
     delay: Option<Duration>,
@@ -816,6 +818,19 @@ impl Backend for MockBackend {
             && let Some(context) = &request.control_context {
             retained.lock().expect("mock control context poisoned")
                 .insert(request.runtime_key()?, context.clone());
+        }
+        if self.lsp_probe && let Some(arguments) = request.input.text().strip_prefix("LSP ") {
+            let context = request.control_context.clone().context("fixture has no control context")?;
+            let invocation = crate::control_tools::ControlToolInvocation { name: "harness_lsp".into(), arguments: serde_json::from_str(arguments)? };
+            let text = match crate::control_tools::ControlToolRuntime::new(context).invoke(invocation).await {
+                Ok(result) => result.message,
+                Err(error) => format!("LSP error: {error:#}"),
+            };
+            let event = BackendEvent { received_at_ms: None, address: None, turn_boundary: None,
+                kind: "assistant_message".into(), text: Some(text), data: Value::Null,
+                activity: None, summary: None, task_update: None };
+            if let Some(sink) = event_sink { sink.send_wait(event.clone()).await?; }
+            return Ok(BackendOutput { event: vec![event], capability: mock_capability(), ..Default::default() });
         }
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
@@ -1343,6 +1358,7 @@ mod test {
     #[tokio::test]
     async fn applies_steering_to_the_same_planning_turn() {
         let backend = Arc::new(MockBackend {
+            lsp_probe: false,
             retained_control: None,
             permission: None,
             delay: Some(Duration::from_millis(50)),

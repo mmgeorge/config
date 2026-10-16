@@ -39,6 +39,8 @@ pub struct PortableSettings {
     pub answer_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
+    /// Enables read-only tools backed by the connected editor language servers.
+    pub lsp_tools: Option<bool>,
     #[serde(default)]
     /// Records selection by source identity, independent of provider display names.
     pub skill: BTreeMap<String, bool>,
@@ -56,6 +58,7 @@ impl PortableSettings {
         if overriding.plan_compact.is_some() { self.plan_compact = overriding.plan_compact; }
         if overriding.plan_auto_approve_revisions.is_some() { self.plan_auto_approve_revisions = overriding.plan_auto_approve_revisions; }
         if overriding.subagent_tools.is_some() { self.subagent_tools = overriding.subagent_tools; }
+        if overriding.lsp_tools.is_some() { self.lsp_tools = overriding.lsp_tools; }
         if overriding.approval_timeout.is_some() { self.approval_timeout = overriding.approval_timeout; }
         if overriding.answer_timeout.is_some() { self.answer_timeout = overriding.answer_timeout; }
         self.skill.extend(overriding.skill);

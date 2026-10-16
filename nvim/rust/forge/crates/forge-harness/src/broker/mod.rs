@@ -142,6 +142,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
     pub subagent_tools:bool,
+    pub lsp_tools:bool,
     pub runtime_epoch: String,
     pub snapshot_revision: u64,
     pub task_operation: Option<Value>,
@@ -248,6 +249,7 @@ pub struct DispatchResult {
 
 /// Owns provider, permission, and analysis infrastructure shared by every session controller.
 pub struct BrokerRuntime {
+    pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     workspace_kind: WorkspaceKind,
@@ -291,6 +293,7 @@ impl BrokerRuntime {
             data_root.clone(),
         )?);
         Ok(Arc::new(Self {
+            lsp: Arc::new(Default::default()),
             repositories,
             diff,
             workspace_kind,
@@ -525,6 +528,7 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
     checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
     observer: Arc<observation::BrokerObserver>,
@@ -743,6 +747,7 @@ impl HarnessBroker {
         let agent_registry = load_agent_registry(&store, &session.id)?;
         let agent_coordinator = crate::agent::AgentCoordinator::new(session.id.clone());
         agent_coordinator.set_enabled(shared.desired.subagent_tools.unwrap_or(false));
+        runtime.lsp.set_enabled(&session.id, shared.desired.lsp_tools.unwrap_or(false));
         for task in store.list_agent_task(&session.id)? {
             let agent = agent_registry.get(&task.agent_id).cloned().context("stored task has no owning child")?;
             agent_coordinator.retain(agent, task)?;
@@ -761,6 +766,7 @@ impl HarnessBroker {
             store.objects.clone(), Arc::clone(&runtime.repositories))?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
+            lsp: runtime.lsp.clone(),
             data_root: data_root.clone(), session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(), snapshot_revision: AtomicU64::new(0),
             metadata: RwLock::new(observation::ObservationMetadata {
@@ -773,6 +779,7 @@ impl HarnessBroker {
             check_runner: Arc::clone(&check_runner), presentation: Arc::clone(&presentation), trace: Arc::clone(&trace),
         });
         let broker = Self {
+            lsp: runtime.lsp.clone(),
             active_operation_id: None,
             observer,
             repositories: Arc::clone(&runtime.repositories),
@@ -892,6 +899,7 @@ impl HarnessBroker {
                 .is_some_and(|goal| goal.state == GoalState::Active),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             repository: None,
+            lsp: None,
             execution: None,
         })
     }
@@ -1090,7 +1098,7 @@ impl HarnessBroker {
             HarnessMethod::ChecksList | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksSaveDefaults => self.project_checks(method, params).await,
             HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
             HarnessMethod::TaskTransition => self.transition_task(params).await,
-            HarnessMethod::TaskOperation | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
+            HarnessMethod::LspAuthorize | HarnessMethod::LspRespond | HarnessMethod::TaskOperation | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
             HarnessMethod::StateGet => Ok((serde_json::to_value(self.snapshot()?)?, Vec::new())),
             HarnessMethod::TraceStatus => {
                 Ok((serde_json::to_value(self.trace.status())?, Vec::new()))
@@ -1890,14 +1898,24 @@ impl HarnessBroker {
                 incoming.delivery = crate::agent::MessageDelivery::Attached;
                 incoming.task_id = Some(admission.task.id.clone());
             }
-            let request = self.agent_backend_factory.request(&self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat), &admission.agent,message)?;
+            let mut request = self.agent_backend_factory.request(&self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat), &admission.agent,message)?;
             let backend = self.agent_backend_factory.build(admission.agent.selection.as_ref().context("child selection missing")?.provider)?;
             let cancellation = self.agent_coordinator.cancellation(&admission.agent.id,&admission.task.id)?;
+            let lsp_lease = if self.lsp.enabled(&self.session.id) {
+                let policy = self.permission_store.read().map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?.compiled().clone();
+                let (scope, lease) = self.lsp.scope(self.session.id.clone(), admission.task.id.clone(), PathBuf::from(&self.session.workspace),
+                    policy, request.execution_mode, Arc::new(AtomicBool::new(false)));
+                let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+                context.lsp = Some(scope);
+                context.workspace_root = Some(PathBuf::from(&self.session.workspace));
+                request.control_context = Some(context);
+                Some(lease)
+            } else { None };
             self.store.save_agent_run(&admission.agent)?;
             self.agent_registry.insert(admission.agent.clone());
             self.agent_coordinator.retain(admission.agent.clone(),admission.task.clone())?;
             self.child_backend_by_agent.insert(admission.agent.id.clone(),backend.clone());
-            Ok(crate::agent::AgentRuntime {backend,permission:self.permission_coordinator.clone(),request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender()})
+            Ok(crate::agent::AgentRuntime {backend,permission:self.permission_coordinator.clone(),request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender(),lsp_lease})
         })();
         match prepared {
             Ok(runtime) => {
@@ -3573,13 +3591,16 @@ Planning continuation: turn {} of {}.",
                 self.session.id.clone(),
                 interaction.id.clone(),
                 PathBuf::from(&self.session.workspace),
-                policy,
+                policy.clone(),
                 self.session.execution_mode,
                 Arc::clone(&self.turn_cancellation.requested),
                 Arc::clone(&self.repositories),
                 Arc::clone(&self.diff),
             )?;
+        let (lsp_scope, lsp_lease) = self.lsp.scope(self.session.id.clone(), interaction.id.clone(),
+            PathBuf::from(&self.session.workspace), policy, self.session.execution_mode, self.turn_cancellation.requested.clone());
         if let Some(context) = &mut backend_request.control_context {
+            context.lsp = Some(lsp_scope);
             context.repository = Some(repository_scope);
             context.has_active_elicitation |= interaction.elicitation.is_some();
         }
@@ -3592,6 +3613,7 @@ Planning continuation: turn {} of {}.",
             .prompt_with_timeline(backend_request, &mut interaction, &mut event)
             .await;
         drop(repository_lease);
+        drop(lsp_lease);
         let mut output = match output {
             Ok(output) => output,
             Err(error) => {
@@ -7579,7 +7601,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         configured.plan_compact = plan_compact;
         if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
-        let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled());
+        let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
+        let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled())
+            || lsp_tools.is_some_and(|enabled|enabled != self.lsp.enabled(&self.session.id));
         if let Some(access) = access { configured.access = access; }
         configured.access = crate::backend::BackendKind::parse(&configured.backend)?.resolve_access(configured.access);
         if let Some(selection) = resource_selection {
@@ -7614,6 +7638,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             if params.get("approval_timeout").is_some() { portable.approval_timeout = Some(self.session.approval_timeout); changed = true; }
             if params.get("answer_timeout").is_some() { portable.answer_timeout = Some(self.session.answer_timeout); changed = true; }
             if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
+            if let Some(enabled) = lsp_tools {portable.lsp_tools = Some(enabled);changed = true;}
             let revision = if changed { settings.update(snapshot.revision,crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
             if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
                 settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
@@ -7621,6 +7646,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
         }
         if let Some(enabled) = subagent_tools {self.agent_coordinator.set_enabled(enabled);}
+        if let Some(enabled) = lsp_tools {self.lsp.set_enabled(&self.session.id, enabled);}
         if delegation_registry_changed && params.get("settings_revision").is_none() {
             self.backend.cleanup_execution(&self.session.id).await?;
         }

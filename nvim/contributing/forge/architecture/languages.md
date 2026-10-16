@@ -21,6 +21,49 @@ promised capability. Rust, TypeScript, TSX, and Lua have plan-specific adapters.
 Configuration formats retain their values rather than using executable-language
 body projection.
 
+## Agent LSP queries
+
+`harness_lsp` exposes read-only semantic operations independently of declaration
+planning and Tree-sitter support. Its enabled-only model guidance recommends
+symbol discovery, navigation, references, calls, hover, and file diagnostics.
+The [tool reference](../../../docs/forge/lsp-tools.md) defines arguments, output,
+and limits.
+
+The shared Lua LSP source adapter owns client selection, hidden source buffers,
+and reference-counted buffer leases. Agent queries use live editor contents.
+Plan navigation retains its captured digest and rejects changed or unsaved source
+that differs from that capture. Opening Harness warms enabled editor LSP
+configurations against real project files. `forge.lsp.startup` uses Neovim's
+configuration and client reuse, preserving the editor's server ownership. It
+dispatches root-resolution callbacks onto Neovim's main loop before client
+startup or buffer cleanup, because server configurations can resolve roots from
+libuv process callbacks. Queued callbacks recheck workspace closure before acting.
+It releases hidden buffer leases after initialization and never stops shared
+servers when Harness closes. Agent queries also prepare explicit project files
+and await initialization before selecting a client. No generated project or
+source is required.
+
+Startup considers one source per directory and enabled configuration within its
+bounded scan. It resolves candidates using the original server root callback,
+preferring a root containing the repository before falling back to the closest
+nested workspace. Deeper independent workspaces are skipped once identified.
+Discovery and a concurrent first query share pending startup work. Explicit
+queries into separate workspaces retain separate editor-owned clients.
+
+Rust owns one interaction scope per root or child turn, the read policy, and the
+setting generation. It admits at most four requests per host, each with a
+60-second startup wait and a separate ten-second operation deadline. The Rust
+transport watchdog allows 75 seconds for both phases and delivery. Correlated
+`lsp.request` events reach an editor adapter
+independently of the selected view. The `lsp.authorize` and `lsp.respond` routes
+bypass the busy broker lock. Target authorization precedes editor reads, and Rust
+checks returned paths again before publishing bounded text. Cancellation drops
+the pending identity and sends `lsp.cancel`. Late replies cannot revive it.
+
+The adapter uses pull diagnostics when supported and otherwise reads Neovim's
+diagnostic store. Unknown freshness remains explicit. Harness retains no query
+result cache and creates no dependency projects.
+
 Package discovery uses manifests and workspace membership rather than syntax or
 LSP results. The check configuration chooses the package manager explicitly.
 Cargo supports native exact-case execution through its standard test harness.

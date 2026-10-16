@@ -406,6 +406,10 @@ local function dispatch_message(message, timing)
       return
     end
   end
+  if message.event == "lsp.request" or message.event == "lsp.cancel" then
+    require("forge.lsp.bridge").handle(message.event, message.payload, message.session_id, client.generation)
+    return
+  end
   if message.event then
     local event_snapshot = client.snapshot_by_id[message.session_id]
     if event_snapshot and (message.event == "plan_question" or message.event == "plan_question_updated") then
@@ -920,6 +924,7 @@ end
 ---@param reason string?
 ---@param on_stopped fun()?
 function M.stop(reason, on_stopped)
+  if package.loaded["forge.lsp.bridge"] then require("forge.lsp.bridge").close() end
   reason = reason or "Forge host stopped"
   local client = state()
   if on_stopped then

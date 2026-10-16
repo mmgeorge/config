@@ -1,5 +1,5 @@
 {
-  "version": 16,
+  "version": 17,
   "node": {
     "kind": [
       "exchange",
@@ -218,6 +218,20 @@
       "required": {
         "transfer_id": "string",
         "part": "object"
+      }
+    },
+    "lsp.request": {
+      "route": "transport",
+      "required": {
+        "id": "string",
+        "workspace": "string",
+        "arguments": "object"
+      }
+    },
+    "lsp.cancel": {
+      "route": "transport",
+      "required": {
+        "id": "string"
       }
     }
   },

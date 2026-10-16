@@ -149,6 +149,33 @@ By default the fixture uses Neovim temporary directories. Set `forge_test_scratc
 only when retaining a failed workspace is needed, and remove that directory after
 investigation. Do not add scratch reports or test output to the repository.
 
+## Verify agent LSP tools
+
+Run the focused adapter checks from the repository root:
+
+```text
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_query.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup_roots.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/plan_workspace_definition.lua
+```
+
+After rebuilding the release host, run `nvim/tests/forge/lsp_tools_host.lua` in
+a fresh Neovim with the plugin on its runtimepath. Set `forge_test_language` to
+`lua`, `typescript`, or `rust`. The TypeScript case uses `forge_test_tsgo` or
+the `tsgo` executable. The Rust case accepts `forge_test_rust_analyzer` or asks
+rustup for the installed analyzer. Fixtures reuse the tiny local dependencies
+from the plan-navigation tests and install npm dependencies offline.
+
+The host fixture invokes the real Harness control runtime through a mock model
+and real language server. It checks disabled admission, dependency definitions,
+hover, outlines, diagnostics, supported additional operations, unsaved buffers,
+background startup, and reuse of that server when the editor opens source. Set `forge_test_manual` to keep the
+successful fixture open for Terminal MCP inspection. The resulting
+`forge_lsp_test` object exposes its workspace, buffer, client identity, query,
+and request functions. Close the host and delete its temporary workspace and
+data directories after manual inspection.
+
 ## Static and documentation checks
 
 From the repository root, verify whitespace and the affected documentation links:

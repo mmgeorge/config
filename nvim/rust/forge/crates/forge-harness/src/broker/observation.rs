@@ -2,6 +2,7 @@ use super::*;
 
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
+    pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
     pub(super) runtime_epoch: String,
@@ -183,6 +184,7 @@ impl BrokerObserver {
             .collect();
         Ok(BrokerSnapshot {
             subagent_tools:self.agent_coordinator.enabled(),
+            lsp_tools:self.lsp.enabled(&source_session.id),
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: revision,
             task_operation: store.latest_task_operation(&source_session.id)?

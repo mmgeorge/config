@@ -344,6 +344,11 @@ when older sessions become invisible. `:ForgeHarness` therefore resumes current 
 while `/clear` remains the explicit boundary for creating a new session. Resumed sessions retain
 their persisted execution mode. New and forked sessions establish a fresh Read boundary.
 
+Preference loading requires both the current version and a nested `preference`
+object. Records with an incompatible envelope are treated as absent without
+rewriting or deleting their rows, including older flat records carrying the same
+version number. Valid current preferences remain independent of session history.
+
 The Provider row in `/config` and `/backend` open the same shared picker over selectable providers.
 Selecting another provider requires an explicit New chat or Resume session destination. The resume
 picker searches and previews only that provider's sessions in the current workspace. Switching is

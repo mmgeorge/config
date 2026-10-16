@@ -252,6 +252,8 @@ function M.open(state, host)
         configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
       elseif id == "subagent-tools" then
         configure({ subagent_tools = (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) ~= true })
+      elseif id == "lsp-tools" then
+        configure({ lsp_tools = (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) ~= true })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -284,6 +286,7 @@ function M.open(state, host)
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
             { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
+            { id = "lsp-tools", label = "LSP tools", columns = { "LSP tools", picker_field.render((active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true and "On" or "Off", true), "Read-only agent queries through editor language servers" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
               or "Disabled (unsupported)", "OS isolation, independent of approval mode" } },
             { id = "read-access", label = "Read access", columns = { "Read access", picker_field.render(policy.read_access, true), "Approval scope for reported file reads · not OS confinement" } },

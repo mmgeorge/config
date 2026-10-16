@@ -83,6 +83,7 @@ local function finish_start(state, result, start_error, error_detail, callback)
 end
 
 function M.open()
+  require("forge.lsp.startup").start(vim.fn.getcwd())
   local state = session.harness
   if valid_window(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)

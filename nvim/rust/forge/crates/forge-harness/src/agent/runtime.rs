@@ -15,6 +15,7 @@ pub struct AgentRuntime {
     pub task_id: String,
     pub cancellation: watch::Receiver<bool>,
     pub sender: AgentCommandSender,
+    pub(crate) lsp_lease: Option<crate::control_tools::lsp::LspLease>,
 }
 
 impl AgentRuntime {
@@ -59,6 +60,7 @@ impl AgentRuntime {
           }
           request.input = crate::backend::BackendInput::from_text(feedback);
         };
+        drop(self.lsp_lease.take());
         let runtime_key = self.request.runtime_key()?;
         let retained = match tokio::time::timeout(std::time::Duration::from_secs(2),self.backend.active_session_id_for(&runtime_key)).await {
             Ok(retained) => retained,

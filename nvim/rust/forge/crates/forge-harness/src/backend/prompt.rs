@@ -49,8 +49,11 @@ impl BackendRequest {
             crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
             crate::session::CheckShell::System => "the system login shell",
         };
+        let lsp = if self.control_context.as_ref().and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available()) {
+            "\nLSP exploration is enabled. Prefer harness_lsp for semantic code exploration: workspace_symbols finds names, document_symbols outlines a file, definition/type_definition/implementation resolve a position, references and calls trace use, and hover explains types. Use exact one-based positions from results. Inspect file diagnostics after edits, but stale or unknown diagnostics do not prove a successful typecheck. Results use live editor contents and mark unsaved buffers. Request only needed results and follow next_offset when necessary. Use text search for literals or when LSP is unavailable."
+        } else { "" };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use harness_checks_run and harness_checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use harness_checks_run and harness_checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}{lsp}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }

@@ -77,7 +77,7 @@ impl AcpBackend {
         let setting = crate::settings::SettingsStore::open(&self.settings_root)?.get(&request.workspace,&request.harness_session_id,
             if self.kind == BackendKind::Claude {"claude"} else {"antigravity"})?;
         *state.tool_definition.write().await = tools.unwrap_or_else(||crate::control_tools::ControlToolRegistry
-            .definition_list_for_owner(&request.owner().expect("validated runtime owner"),setting.desired.subagent_tools.unwrap_or(false)));
+            .definition_list_for_owner(&request.owner().expect("validated runtime owner"),setting.desired.subagent_tools.unwrap_or(false), setting.desired.lsp_tools.unwrap_or(false)));
         let control = ControlServer::start(state.clone()).await?;
         let target = if self.kind == BackendKind::Claude { "claudecode" } else { "antigravity-cli" };
         let resources = crate::settings::SessionResources::load(&self.settings_root, &request,

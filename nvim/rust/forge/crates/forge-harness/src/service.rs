@@ -382,6 +382,7 @@ impl HarnessService {
         }
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
+        registry.runtime.lsp.attach(sink.clone());
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
         let mut prompt_admission = None;
         let edit_trace = if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate) {
@@ -482,6 +483,7 @@ impl HarnessService {
         tokio::time::timeout(deadline, async {
             let mut child_quiescence = Vec::new();
             if let Some(registry) = self.registry.lock().await.clone() {
+                registry.runtime.lsp.close();
                 let controller_list: Vec<_> = registry
                     .controller_by_id
                     .read()
@@ -987,6 +989,18 @@ async fn route_request(
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
 ) -> Result<()> {
+    if matches!(method, HarnessMethod::LspAuthorize | HarnessMethod::LspRespond) {
+        let id = request.params["id"].as_str().context("LSP response requires id")?;
+        let result = if method == HarnessMethod::LspAuthorize {
+            registry.runtime.lsp.authorize(&session_id, id, serde_json::from_value(request.params["paths"].clone())?).await?
+        } else {
+            registry.runtime.lsp.respond(&session_id, id, request.params["result"].clone(),
+                request.params["failure"].as_str().map(str::to_owned))?;
+            json!({"accepted":true})
+        };
+        message_sink.send_response(Response::success(request.id, result)?).await?;
+        return Ok(());
+    }
     if matches!(method, HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin) {
         let data_root = PathBuf::from(&registry.initialize.data_root);
         let parameter = request.params;

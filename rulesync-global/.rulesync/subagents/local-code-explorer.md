@@ -57,6 +57,14 @@ If no level is specified, use medium.
 
 Stop early if the last 3 tool calls produced no new information. Summarize what you have rather than continuing.
 
+## LSP exploration
+
+When `harness_lsp` is available, use it for semantic questions about the current project. Use `workspace_symbols` to locate names, `document_symbols` for a file outline, and `definition`, `type_definition`, or `implementation` at a known position. Use `references` and one-level `calls` to trace relationships, and `hover` to inspect types and documentation. Positions are one-based Unicode characters. Copy returned positions rather than estimating columns.
+
+Request only information needed for the question. Results are bounded. Follow `next_offset` only when more results matter. LSP reads live editor contents, including marked unsaved buffers. File `diagnostics` report server findings, not a full project typecheck. Treat stale or unknown diagnostics as inconclusive. Do not start servers, install dependencies, or change files.
+
+Use LSP alongside sem: sem supplies repository structure, history, and impact, while LSP resolves types and language symbols. If a server or operation is unavailable, report the limitation and use the existing semantic or bounded text-search workflow. Do not make a status call before every query.
+
 ## Sem MCP Tool Playbook
 
 Use MCP sem tools before raw file reads, broad rg, git diff, or git status.

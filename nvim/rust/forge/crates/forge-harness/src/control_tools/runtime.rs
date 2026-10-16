@@ -26,6 +26,7 @@ pub struct ControlTurnContext {
     pub has_active_goal: bool,
     pub workspace_root: Option<PathBuf>,
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
+    pub(crate) lsp: Option<Arc<super::lsp::LspScope>>,
     pub execution: Option<crate::plan::execution::ExecutionControlSender>,
 }
 
@@ -69,6 +70,7 @@ impl ControlTurnContext {
             has_active_goal: false,
             workspace_root: None,
             repository: None,
+            lsp: None,
             execution: None,
         }
     }
@@ -160,6 +162,11 @@ impl ControlToolRuntime {
         if matches!(invocation.name.as_str(), "harness_design_apply_patch" | "harness_plan_submit")
             && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
+            "harness_lsp" => {
+                let scope = self.context.lsp.as_ref().context("LSP tools require an enabled active editor interaction")?;
+                let message = scope.invoke(invocation.arguments).await?;
+                Ok(ControlToolResult { invocation: None, message })
+            }
             "harness_checks_list" | "harness_checks_configure" | "harness_checks_run" | "harness_checks_status" | "harness_checks_cancel" => {
                 let scope = self.context.checks.as_ref().context("check tools require an authenticated root interaction")?;
                 let message = scope.invoke(&invocation.name, invocation.arguments).await?;
@@ -533,6 +540,7 @@ mod test {
             has_active_goal: false,
             workspace_root: Some(workspace),
             repository: None,
+            lsp: None,
             execution: None,
 
         }
