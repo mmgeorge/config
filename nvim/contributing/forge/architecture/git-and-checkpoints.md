@@ -186,16 +186,45 @@ including pre-existing staged and unstaged content. Steering within an exchange 
 its baseline. Each later exchange captures the current workspace before starting.
 
 `CheckpointRecord` stores an existing Git tree ID, complete content overrides, deletions,
-file modes, and sampled checkout conversion rules. Capture never creates commits, changes
-refs, stages files, or writes the user's index. `forge_git::checkpoint` enumerates the tree,
-index, and nonignored worktree entries through gix. Matching non-racy index metadata avoids
-reading clean files. A bounded process-local cache reuses unchanged dirty file identities.
-New or uncertain content streams through a 64 KiB buffer and is published only when it
-actually differs from the Git baseline. A second metadata observation rejects captures
-that observe concurrent changes. This is optimistic validation, not a filesystem snapshot.
+file modes, sampled checkout conversion rules, and explicit Git LFS exclusions. Capture never
+creates commits, changes refs, stages files, or writes the user's index. Native Git status uses
+the index to select changed files, while a concurrent `git ls-files` supplies tracked and
+nonignored untracked names. Status refreshes a private temporary copy of the index through
+`GIT_INDEX_FILE`, so its physical file-size observations never alter the user's staging.
+The temporary directory owns that copy and removes it after capture, including failed captures.
+Both bounded commands retain repository admission until both children exit. Attribute
+resolution shares one gix attribute stack and reads selected values
+directly, without rebuilding a content-conversion pipeline for every path.
+
+Git LFS files remain outside checkpoint ownership. Status excludes `filter=lfs` paths before
+content comparison, and capture never opens their contents, runs their filters, or copies
+their objects. Saved exclusions include untracked LFS names. Reads, comparison, and restore
+exclude the union of saved and current LFS paths, including overrides from older records.
+Changing attributes later cannot make a saved exclusion restorable. A pending restore journal
+rejects a path that becomes LFS before reading or writing its contents.
+
+Clean ordinary files come from existing tree metadata, not a second walk of worktree files.
+Only changed files, unsupported non-LFS conversions, and platform-specific symlinks require
+content acquisition. Conversion-sensitive clean files use the refreshed index sizes and Git
+object headers to preserve their physical line endings without a second worktree metadata scan.
+A process-local cache compares status, index identity, path names, configuration, selected attributes,
+refreshed checkout sizes, and captured source metadata before reuse.
+
+The initial status inventory defines the candidate boundary. An ordinary clean file edited
+after that inventory belongs to the next checkpoint. Each candidate retains the bytes acquired
+during its read, and a later source change prevents reuse of that acquisition. Capture does not
+rescan every clean file or run status a second time. This preserves per-file capture semantics,
+not an atomic filesystem snapshot.
+
+Checkpoint capture and SQLite persistence must finish in under one second on the large WebGIS
+worktree with its normal small set of non-LFS edits. The `checkpoint_latency` release example
+measures fresh capture, reuse, and a new session with temporary durable storage, and fails if
+any iteration reaches one second. Fresh capture means empty Harness caches, not flushed operating
+system filesystem caches. Repositories with large changed non-LFS files still require reading
+and durably storing those bytes.
 
 Clean files resolve through the recorded tree, independently of the current branch.
-Checkout rules are sampled with Git attribute precedence. External filters and encodings
+Checkout rules are sampled with Git attribute precedence. Non-LFS external filters and encodings
 use captured raw overrides rather than running commands during restoration. Individual
 source reads traverse only the requested tree path. Large baseline acquisition streams
 through a temporary file using a bounded, 30-second `git cat-file` operation. Missing

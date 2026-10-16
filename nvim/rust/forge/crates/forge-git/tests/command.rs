@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-use forge_git::command::{CommandLimits, read_command};
+use forge_git::command::{CommandLimits, read_command, read_command_pair};
 
 fn fixture(name: &str) -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
@@ -35,6 +35,41 @@ fn preserves_both_streams_and_nonzero_exit_status() {
     assert!(output.stdout.ends_with(b"saved stdout\n"));
     assert_eq!(output.stderr.len(), 96 * 1024 + b"saved stderr\n".len());
     assert!(output.stderr.ends_with(b"saved stderr\n"));
+}
+
+#[test]
+fn paired_reads_preserve_both_failures_and_streams() {
+    let (first, second) = read_command_pair(
+        fixture("command_child_failure"),
+        fixture("command_child_failure"),
+        CommandLimits {
+            stdout_bytes: 128 * 1024,
+            stderr_bytes: 128 * 1024,
+            ..limits()
+        },
+        || Ok(()),
+    ).unwrap();
+    for output in [first, second] {
+        assert_eq!(output.status.code(), Some(7));
+        assert!(output.stdout.ends_with(b"saved stdout\n"));
+        assert!(output.stderr.ends_with(b"saved stderr\n"));
+    }
+}
+
+#[test]
+fn paired_reads_cancel_both_children_before_returning() {
+    let started = Instant::now();
+    let error = read_command_pair(
+        fixture("command_child_wait"),
+        fixture("command_child_wait"),
+        limits(),
+        || {
+            anyhow::ensure!(started.elapsed() < Duration::from_millis(100), "cancel pair");
+            Ok(())
+        },
+    ).unwrap_err();
+    assert!(error.to_string().contains("cancel pair"));
+    assert!(started.elapsed() < Duration::from_secs(2));
 }
 
 #[test]

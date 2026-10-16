@@ -30,7 +30,7 @@ pub struct BaseFile {
     pub checkout: CheckoutRule,
 }
 
-/// Supplies metadata-only candidates without using content-comparing status.
+/// Supplies changed paths from Git status and baseline metadata without scanning clean files.
 #[derive(Debug, Eq, PartialEq)]
 pub struct CheckpointInventory {
     /// Existing commit, or no commit in an unborn repository.
@@ -39,26 +39,12 @@ pub struct CheckpointInventory {
     pub tree: Option<String>,
     /// Existing committed files. Trees are read, file blobs are not.
     pub base: BTreeMap<String, BaseFile>,
-    /// Path and whether Git's index proves it unchanged from the base.
-    pub candidate: BTreeMap<String, bool>,
-    /// Working-file observations used to recheck clean candidates before capture.
-    pub observation: BTreeMap<String, crate::snapshot::WorktreeStamp>,
-    /// Case-sensitive baseline names replaced by differently cased directory entries.
+    /// Changed paths and non-LFS conversions requiring raw capture.
+    pub candidate: BTreeSet<String>,
+    /// Paths outside checkpoint ownership because their filter is Git LFS.
+    pub excluded: BTreeSet<String>,
+    /// Baseline spellings replaced by case-only renames on Windows.
     pub missing: BTreeSet<String>,
-}
-
-impl CheckpointInventory {
-    /// Rechecks whether a candidate still matches the clean version observed during discovery.
-    pub fn unchanged(&self, root: &Path, path: &str) -> Result<bool> {
-        if self.candidate.get(path) != Some(&true) {
-            return Ok(false);
-        }
-        let current = crate::snapshot::read_worktree_stamp(
-            root,
-            &crate::RepositoryPath::new(path_bytes(path)?)?,
-        )?;
-        Ok(self.observation.get(path) == Some(&current))
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -67,6 +53,12 @@ pub struct CheckpointSignature {
     status: Vec<u8>,
     index: Option<(u64, std::time::SystemTime)>,
     observation: Vec<crate::snapshot::WorktreeStamp>,
+    paths: Vec<crate::snapshot::PathRecord>,
+    names: Vec<u8>,
+    attributes: Vec<crate::snapshot::WorktreeStamp>,
+    config: Vec<u8>,
+    checkout: BTreeMap<String, [gix::attrs::State; 6]>,
+    checkout_size: BTreeMap<String, u32>,
 }
 
 /// Checks checkpoint reuse without enumerating committed trees or creating checkpoint objects.
@@ -74,17 +66,33 @@ pub struct CheckpointSignature {
 /// Runs a bounded, read-only Git status under the caller's repository admission. HEAD,
 /// index identity, untracked paths, and metadata of already-dirty files all participate.
 pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<CheckpointSignature> {
+    let started = std::time::Instant::now();
     let repository = gix::open(root)?;
     let index = match std::fs::metadata(repository.index_path()) {
         Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
     };
-    let output = crate::command::read_command(
-        std::process::Command::new("git").current_dir(root).args([
-            "--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch",
+    let temporary = tempfile::tempdir()?;
+    let temporary_index = temporary.path().join("index");
+    if index.is_some() {
+        std::fs::copy(repository.index_path(), &temporary_index)?;
+    }
+    let mut status = std::process::Command::new("git");
+    #[cfg(windows)]
+    status.args(["-c", "core.ignoreCase=false"]);
+    status.current_dir(root).env("GIT_INDEX_FILE", &temporary_index).args([
+            "-c", "core.splitIndex=false", "status", "--porcelain=v2", "-z", "--branch",
             "--untracked-files=all", "--ignore-submodules=none", "--no-renames",
-        ]),
+            "--", ".", ":(exclude,attr:filter=lfs)",
+        ]);
+    let mut names = std::process::Command::new("git");
+    #[cfg(windows)]
+    names.args(["-c", "core.ignoreCase=false"]);
+    names.current_dir(root).args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
+    let (output, names) = crate::command::read_command_pair(
+        status,
+        names,
         crate::command::CommandLimits {
             stdout_bytes: 32 * 1024 * 1024,
             stderr_bytes: 64 * 1024,
@@ -93,187 +101,143 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
         &mut *check,
     )?;
     ensure!(output.status.success(), "checkpoint status failed: {}", String::from_utf8_lossy(&output.stderr));
+    ensure!(names.status.success(), "checkpoint path inventory failed: {}", String::from_utf8_lossy(&names.stderr));
     let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash(), 32 * 1024 * 1024, 250_000)?;
     let mut observation = Vec::with_capacity(paths.len());
-    for path in paths {
+    for path in &paths {
         check()?;
         observation.push(crate::snapshot::read_worktree_stamp(root, &path.path)?);
     }
-    Ok(CheckpointSignature { status: output.stdout, index, observation })
+    let mut attributes = Vec::new();
+    for name in names.stdout.split(|byte| *byte == 0).filter(|name| {
+        *name == b".gitattributes" || name.ends_with(b"/.gitattributes")
+    }) {
+        attributes.push(crate::snapshot::read_worktree_stamp(root, &crate::RepositoryPath::new(name.to_vec())?)?);
+    }
+    let mut config = Vec::new();
+    repository.config_snapshot().write_to(&mut config)?;
+    let identity = crate::discover_identity(root)?.ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
+    config.extend(crate::content::conversion::read_info(&identity, check)?.unwrap_or_default());
+    let command_elapsed = started.elapsed();
+    let checkout = checkout_attributes(root, &names.stdout.split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty()).map(path_key).collect(), check)?;
+    let refreshed = gix::index::File::at_or_default(&temporary_index, repository.object_hash(), false, Default::default())?;
+    let checkout_size = refreshed.entries().iter()
+        .map(|entry| (path_key(entry.path(&refreshed)), entry.stat.size)).collect();
+    eprintln!("checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}", command_elapsed.as_millis(), (started.elapsed()-command_elapsed).as_millis(), names.stdout.len(), checkout.len());
+    Ok(CheckpointSignature { status: output.stdout, index, observation, paths, names: names.stdout, attributes, config, checkout, checkout_size })
 }
 
 /// Reads existing trees and eligible paths without writing any Git object, ref, or index.
 pub fn inventory(
     root: &Path,
+    signature: &CheckpointSignature,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<CheckpointInventory> {
     let repository = gix::open(root)?;
-    let identity = crate::discover_identity(root)?
-        .ok_or_else(|| anyhow::anyhow!("missing repository identity"))?;
-    let info = crate::content::conversion::read_info(&identity, check)?;
     let head = repository.head()?.id().map(|id| id.to_string());
     let tree = repository.head_tree_id_or_empty()?;
-    let mut base = BTreeMap::new();
-    let (pipeline, _) = repository.filter_pipeline(None)?;
-    let (_, mut attributes) = pipeline.into_parts();
-    if head.is_some() {
-        for entry in repository
-            .find_tree(tree.detach())?
-            .traverse()
-            .breadthfirst
-            .files()?
-        {
-            check()?;
-            if entry.mode.is_tree() {
-                continue;
-            }
-            let path = path_key(entry.filepath.as_ref());
-            base.insert(
-                path.clone(),
-                BaseFile {
-                    object_id: entry.oid.to_string(),
-                    mode: entry.mode.value() as u32,
-                    checkout: checkout_rule(
-                        &repository,
-                        &identity,
-                        &mut attributes,
-                        info.as_deref(),
-                        &path,
-                        check,
-                    )?,
-                },
-            );
-        }
-    }
-    let index = repository.index_or_empty()?;
-    let mut candidate: BTreeMap<_, _> = base.keys().map(|path| (path.clone(), false)).collect();
-    let mut observation = BTreeMap::new();
-    let options = repository.stat_options()?;
-    for entry in index.entries() {
-        check()?;
-        let path = path_key(entry.path(&index));
-        if entry.mode.bits() == 0o040000
-            && entry
-                .flags
-                .contains(gix::index::entry::Flags::SKIP_WORKTREE)
-        {
-            let prefix = format!("{}/", path.trim_end_matches('/'));
-            for (name, clean) in &mut candidate {
-                if name.starts_with(&prefix) {
-                    *clean = true;
-                }
-            }
-            continue;
-        }
-        observation.insert(path.clone(), crate::snapshot::read_worktree_stamp(
-            root,
-            &crate::RepositoryPath::new(path_bytes(&path)?)?,
-        )?);
-        let native = root.join(native_path(&path)?);
-        let skipped = entry
-            .flags
-            .contains(gix::index::entry::Flags::SKIP_WORKTREE)
-            && std::fs::symlink_metadata(&native)
-                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
-        let clean = if let Some(base) = base.get_mut(&path) {
-            let matched = entry.id.to_string() == base.object_id
-                && entry.mode.bits() == base.mode
-                && !entry.stat.is_racy(index.timestamp(), options)
-                && gix::index::fs::Metadata::from_path_no_follow(&native)
-                    .ok()
-                    .and_then(|stat| gix::index::entry::Stat::from_fs(&stat).ok())
-                    .is_some_and(|stat| entry.stat.matches(&stat, options));
-            if skipped {
-                true
-            } else if matched
-                && base.checkout.unsupported.is_none()
-                && !(cfg!(windows) && base.mode == 0o120000)
-            {
-                let blob_size = repository.find_header(entry.id)?.size();
-                let physical_size = u64::from(entry.stat.size);
-                if physical_size >= blob_size && physical_size <= blob_size.saturating_mul(2) {
-                    // Index size records the checked-out representation even after eol configuration changes.
-                    base.checkout = CheckoutRule {
-                        crlf: physical_size > blob_size,
-                        automatic: false,
-                        unsupported: None,
-                    };
-                    true
-                } else {
-                    false
-                }
-            } else {
-                false
-            }
-        } else {
-            false
-        };
-        candidate.insert(path, clean);
-    }
-    let mut present = BTreeSet::new();
-    let mut walk = repository.dirwalk_iter(
-        index,
-        Vec::<gix::bstr::BString>::new(),
-        Default::default(),
-        repository
-            .dirwalk_options()?
-            .emit_untracked(gix::dir::walk::EmissionMode::Matching)
-            .emit_tracked(true),
-    )?;
-    for item in walk.by_ref() {
-        check()?;
-        let item = item?;
-        if matches!(
-            item.entry.status,
-            gix::dir::entry::Status::Untracked | gix::dir::entry::Status::Tracked
-        ) && item.entry.disk_kind != Some(gix::dir::entry::Kind::Directory)
-        {
-            let path = path_key(item.entry.rela_path.as_ref());
-            present.insert(path.clone());
-            candidate.entry(path).or_insert(false);
-        }
-    }
-    ensure!(
-        walk.into_outcome().is_some(),
-        "checkpoint directory enumeration did not complete"
-    );
+    let tree_id = head.as_ref().map(|_| tree.to_string());
+    let mut base = tree_files(root, tree_id.as_deref())?;
+    let mut candidate = signature.paths.iter()
+        .map(|entry| path_key(entry.path.raw())).collect::<BTreeSet<_>>();
+    let paths = base.keys().chain(candidate.iter()).cloned()
+        .chain(signature.names.split(|byte| *byte == 0).filter(|path| !path.is_empty()).map(path_key))
+        .collect::<BTreeSet<_>>();
+    let listed = signature.names.split(|byte| *byte == 0).filter(|path| !path.is_empty())
+        .map(path_key).collect::<BTreeSet<_>>();
+    let missing = paths.difference(&listed).cloned().collect::<BTreeSet<_>>();
+    let additional = if missing.is_empty() { BTreeMap::new() } else { checkout_attributes(root, &missing, check)? };
+    let empty = std::array::from_fn(|_| gix::attrs::State::Unspecified);
+    let mut excluded = BTreeSet::new();
     #[allow(unused_mut)]
     let mut missing = BTreeSet::new();
+    let auto_crlf = repository.config_snapshot().string("core.autocrlf")
+        .is_some_and(|value| value.eq_ignore_ascii_case(b"true") || value.eq_ignore_ascii_case(b"input"));
+    for path in &paths {
+        check()?;
+        let state = signature.checkout.get(path).or_else(|| additional.get(path)).unwrap_or(&empty);
+        let Some(mut rule) = checkout_rule(&repository, state) else {
+            excluded.insert(path.clone());
+            candidate.remove(path);
+            base.remove(path);
+            continue;
+        };
+        if let Some(file) = base.get_mut(path) {
+            if rule.unsupported.is_some() || (cfg!(windows) && file.mode == 0o120000) {
+                candidate.insert(path.clone());
+            } else if !candidate.contains(path) && file.mode != 0o120000 && file.mode != 0o160000
+                && (auto_crlf || [0, 3, 4].into_iter().any(|index|
+                    !matches!(state[index], gix::attrs::State::Unspecified | gix::attrs::State::Unset)))
+            {
+                if let Some(size) = signature.checkout_size.get(path) {
+                    let physical_size = u64::from(*size);
+                    let blob_size = repository.find_header(gix::ObjectId::from_hex(file.object_id.as_bytes())?)?.size();
+                    if physical_size >= blob_size && physical_size <= blob_size.saturating_mul(2) {
+                        rule.crlf = physical_size > blob_size;
+                        rule.automatic = false;
+                    } else {
+                        candidate.insert(path.clone());
+                    }
+                }
+            }
+            file.checkout = rule;
+        }
+    }
     #[cfg(windows)]
     {
-        let spelling = present
-            .iter()
-            .map(|path| (path.to_lowercase(), path))
-            .collect::<BTreeMap<_, _>>();
-        for path in base.keys() {
-            if spelling
-                .get(&path.to_lowercase())
-                .is_some_and(|current| *current != path)
+        let spelling = base.keys().map(|path| (path.to_lowercase(), path)).collect::<BTreeMap<_, _>>();
+        for path in &candidate {
+            if let Some(original) = spelling.get(&path.to_lowercase())
+                && *original != path
             {
-                missing.insert(path.clone());
-                candidate.insert(path.clone(), false);
+                missing.insert((*original).clone());
             }
         }
-    }
-    for (path, clean) in &mut candidate {
-        check()?;
-        let current = crate::snapshot::read_worktree_stamp(
-            root,
-            &crate::RepositoryPath::new(path_bytes(path)?)?,
-        )?;
-        if observation.get(path).is_some_and(|previous| previous != &current) {
-            *clean = false;
+        for path in &missing {
+            candidate.remove(path);
         }
-        observation.insert(path.clone(), current);
     }
     Ok(CheckpointInventory {
-        head: head.clone(),
-        tree: head.map(|_| tree.to_string()),
+        head,
+        tree: tree_id,
         base,
         candidate,
-        observation,
+        excluded,
         missing,
     })
+}
+
+/// Resolve LFS exclusions from attributes without opening asset contents or invoking filters.
+pub fn lfs_paths(root: &Path, paths: &BTreeSet<String>) -> Result<BTreeSet<String>> {
+    if crate::discover_identity(root)?.is_none() { return Ok(BTreeSet::new()); }
+    Ok(checkout_attributes(root, paths, &mut || Ok(()))?.into_iter()
+        .filter_map(|(path, state)| matches!(&state[2], gix::attrs::State::Value(value)
+            if value.as_ref().as_bstr() == b"lfs".as_bstr()).then_some(path)).collect())
+}
+
+fn checkout_attributes(
+    root: &Path,
+    paths: &BTreeSet<String>,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<BTreeMap<String, [gix::attrs::State; 6]>> {
+    let identity = crate::discover_identity(root)?.ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
+    let repository = gix::open(root)?;
+    let info = crate::content::conversion::read_info(&identity, check)?;
+    let (pipeline, _) = repository.filter_pipeline(None)?;
+    let (_, mut attributes) = pipeline.into_parts();
+    let mut result = BTreeMap::new();
+    for path in paths {
+        let state = crate::content::conversion::resolve_attribute_states(
+            &repository, &identity, &crate::RepositoryPath::new(path_bytes(path)?)?,
+            &mut attributes, info.as_deref(), check,
+        )?;
+        if state.iter().any(|state| *state != gix::attrs::State::Unspecified) {
+            result.insert(path.clone(), state.try_into()
+                .map_err(|_| anyhow::anyhow!("checkpoint attribute selection changed shape"))?);
+        }
+    }
+    Ok(result)
 }
 
 /// Reads a Git tree without consulting the current index or worktree.
@@ -460,23 +424,13 @@ pub fn write_blob(root: &Path, file: &BaseFile, output: &mut impl Write) -> Resu
 
 fn checkout_rule(
     repository: &gix::Repository,
-    identity: &crate::RepositoryIdentity,
-    attributes: &mut gix::worktree::Stack,
-    info: Option<&[u8]>,
-    path: &str,
-    check: &mut dyn FnMut() -> Result<()>,
-) -> Result<CheckoutRule> {
+    state: &[gix::attrs::State; 6],
+) -> Option<CheckoutRule> {
     use gix::attrs::State;
     use gix::filter::plumbing::eol::{AttributesDigest as Digest, AutoCrlf, Configuration, Mode};
-    let selection = crate::content::conversion::resolve_attributes(
-        repository,
-        identity,
-        &crate::RepositoryPath::new(path_bytes(path)?)?,
-        attributes,
-        info,
-        check,
-    )?;
-    let state = selection.attribute;
+    if matches!(&state[2], State::Value(value) if value.as_ref().as_bstr() == b"lfs".as_bstr()) {
+        return None;
+    }
     let extract = |state: &State| match state {
         State::Set => Some(Digest::Text),
         State::Unset => Some(Digest::Binary),
@@ -542,7 +496,7 @@ fn checkout_rule(
     if !rule.crlf {
         rule.automatic = false;
     }
-    Ok(rule)
+    Some(rule)
 }
 
 /// Finds one baseline entry without traversing unrelated directories.

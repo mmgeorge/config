@@ -279,45 +279,7 @@ pub(crate) fn resolve_attributes(
     info: Option<&[u8]>,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<AttributeSelection> {
-    let relative = PathBuf::from(resolve_argument(path)?);
-    let mut selected = gix::attrs::search::Outcome::default();
-    selected.initialize_with_selection(&Default::default(), ATTRIBUTE_NAMES);
-    cache
-        .at_path(relative.as_path(), None, &local.objects)?
-        .matching_attributes(&mut selected);
-    let mut attribute = selected
-        .iter_selected()
-        .map(|item| item.assignment.state.to_owned())
-        .collect::<Vec<_>>();
-    // gix-worktree 0.56 places info attributes below nested worktree rules.
-    // Reapply this highest-priority source with the collected macro definitions.
-    let info_path = repository.common_directory.join("info/attributes");
-    if let Some(bytes) = info {
-        let mut collection = cache.attributes_collection().clone();
-        let mut overrides = gix::attrs::Search::default();
-        overrides.add_patterns_buffer(bytes, info_path, None, &mut collection, true);
-        selected.initialize_with_selection(&collection, ATTRIBUTE_NAMES);
-        let case = if local
-            .config_snapshot()
-            .boolean("core.ignoreCase")
-            .unwrap_or(false)
-        {
-            gix::attrs::glob::pattern::Case::Fold
-        } else {
-            gix::attrs::glob::pattern::Case::Sensitive
-        };
-        overrides.pattern_matching_relative_path(
-            path.raw().as_bstr(),
-            case,
-            Some(false),
-            &mut selected,
-        );
-        for (position, item) in selected.iter_selected().enumerate() {
-            if item.location.source.is_some() {
-                attribute[position] = item.assignment.state.to_owned();
-            }
-        }
-    }
+    let attribute = resolve_attribute_states(local, repository, path, cache, info, check)?;
     attribute_digest(&attribute)?;
     let mut serialized = b"*".to_vec();
     for (name, state) in ATTRIBUTE_NAMES.iter().zip(&attribute) {
@@ -367,6 +329,58 @@ pub(crate) fn resolve_attributes(
         outcome: selected,
         attribute,
     })
+}
+
+/// Resolve attribute values without constructing a content-conversion pipeline outcome.
+pub(crate) fn resolve_attribute_states(
+    local: &gix::Repository,
+    repository: &RepositoryIdentity,
+    path: &RepositoryPath,
+    cache: &mut gix::worktree::Stack,
+    info: Option<&[u8]>,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<Vec<State>> {
+    let relative = PathBuf::from(resolve_argument(path)?);
+    let mut selected = gix::attrs::search::Outcome::default();
+    selected.initialize_with_selection(&Default::default(), ATTRIBUTE_NAMES);
+    cache
+        .at_path(relative.as_path(), None, &local.objects)?
+        .matching_attributes(&mut selected);
+    let mut attribute = selected
+        .iter_selected()
+        .map(|item| item.assignment.state.to_owned())
+        .collect::<Vec<_>>();
+    // gix-worktree 0.56 places info attributes below nested worktree rules.
+    // Reapply this highest-priority source with the collected macro definitions.
+    let info_path = repository.common_directory.join("info/attributes");
+    if let Some(bytes) = info {
+        let mut collection = cache.attributes_collection().clone();
+        let mut overrides = gix::attrs::Search::default();
+        overrides.add_patterns_buffer(bytes, info_path, None, &mut collection, true);
+        selected.initialize_with_selection(&collection, ATTRIBUTE_NAMES);
+        let case = if local
+            .config_snapshot()
+            .boolean("core.ignoreCase")
+            .unwrap_or(false)
+        {
+            gix::attrs::glob::pattern::Case::Fold
+        } else {
+            gix::attrs::glob::pattern::Case::Sensitive
+        };
+        overrides.pattern_matching_relative_path(
+            path.raw().as_bstr(),
+            case,
+            Some(false),
+            &mut selected,
+        );
+        for (position, item) in selected.iter_selected().enumerate() {
+            if item.location.source.is_some() {
+                attribute[position] = item.assignment.state.to_owned();
+            }
+        }
+    }
+    check()?;
+    Ok(attribute)
 }
 
 pub(super) fn verify_context(

@@ -2,6 +2,155 @@ use super::*;
 use crate::storage::SqliteStore;
 use std::collections::BTreeSet;
 
+#[test]
+fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
+    use super::super::restore::{RestoreJournal, RestorePreview};
+    let repository = repository();
+    let root = repository.path();
+    fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
+    for name in ["edited.asset", "deleted.asset", "renamed.asset"] {
+        fs::write(root.join(name), "original asset\n").unwrap();
+    }
+    git(root, &["-c", "filter.lfs.process=", "-c", "filter.lfs.clean=", "-c",
+        "filter.lfs.required=false", "add", "."]);
+    git(root, &["commit", "-qm", "LFS fixtures"]);
+    git(root, &["config", "filter.lfs.process", ""]);
+    git(root, &["config", "filter.lfs.clean", "false"]);
+    git(root, &["config", "filter.lfs.smudge", "false"]);
+    git(root, &["config", "filter.lfs.required", "true"]);
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    assert!(before.file.is_empty());
+    assert_eq!(before.excluded.len(), 3);
+    assert!(before.read(&objects, "edited.asset", 1024).unwrap().is_none());
+
+    fs::write(root.join("edited.asset"), "new asset bytes\n").unwrap();
+    fs::remove_file(root.join("deleted.asset")).unwrap();
+    fs::rename(root.join("renamed.asset"), root.join("replacement.asset")).unwrap();
+    fs::write(root.join("untracked.asset"), "untracked asset\n").unwrap();
+    let lfs_only = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    assert!(lfs_only.file.is_empty());
+    assert!(lfs_only.excluded.contains("untracked.asset"));
+    assert!(before.changed_paths(&lfs_only).unwrap().is_empty());
+    fs::write(root.join("tracked.txt"), "changed\n").unwrap();
+    let after = checkpoint.capture_native(&objects, "session", 2, || Ok(())).unwrap();
+    assert_eq!(before.changed_paths(&after).unwrap(), vec!["tracked.txt"]);
+    assert_eq!(after.file.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(), vec!["tracked.txt"]);
+    let preview = RestorePreview::prepare(&objects, root, &after, &before).unwrap();
+    assert_eq!(preview.path.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["tracked.txt"]);
+    RestoreJournal::begin(&objects, preview).unwrap().apply(&objects, &mut || Ok(())).unwrap();
+    assert_eq!(fs::read_to_string(root.join("tracked.txt")).unwrap(), "before\n");
+    assert_eq!(fs::read_to_string(root.join("edited.asset")).unwrap(), "new asset bytes\n");
+    assert!(!root.join("deleted.asset").exists());
+    assert!(root.join("replacement.asset").exists());
+    assert!(root.join("untracked.asset").exists());
+
+    fs::write(root.join(".gitattributes"), "*.asset -filter\n").unwrap();
+    assert!(before.read(&objects, "edited.asset", 1024).unwrap().is_none());
+    let after_rules = checkpoint.capture_native(&objects, "session", 3, || Ok(())).unwrap();
+    let preview = RestorePreview::prepare(&objects, root, &after_rules, &lfs_only).unwrap();
+    assert!(!preview.path.iter().any(|entry| lfs_only.excluded.contains(&entry.path)));
+}
+
+#[test]
+fn older_checkpoint_overrides_do_not_restore_current_lfs_assets() {
+    use super::super::restore::RestorePreview;
+    let repository = repository();
+    let root = repository.path();
+    fs::write(root.join("legacy.asset"), "initial\n").unwrap();
+    git(root, &["add", "legacy.asset"]);
+    git(root, &["commit", "-qm", "ordinary asset"]);
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    fs::write(root.join("legacy.asset"), "modified\n").unwrap();
+    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    assert!(after.file.iter().any(|file| file.path == "legacy.asset"));
+    fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
+    assert!(after.read(&objects, "legacy.asset", 1024).unwrap().is_none());
+    assert!(before.changed_paths(&after).unwrap().is_empty());
+    assert!(RestorePreview::prepare(&objects, root, &after, &before).unwrap().path.is_empty());
+}
+
+#[test]
+fn clean_checkout_preserves_physical_line_endings_and_invalidates_reuse() {
+    let repository = repository();
+    let root = repository.path();
+    git(root, &["config", "core.autocrlf", "true"]);
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    assert_eq!(before.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"before\n");
+    fs::write(root.join("tracked.txt"), b"before\r\n").unwrap();
+    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    assert_eq!(after.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"before\r\n");
+    assert_ne!(before.id, after.id);
+    assert_eq!(before.changed_paths(&after).unwrap(), vec!["tracked.txt"]);
+}
+
+#[test]
+fn global_attribute_changes_invalidate_cached_checkpoint_ownership() {
+    let repository = repository();
+    let root = repository.path();
+    let attributes = root.join(".git/global-attributes");
+    fs::write(&attributes, "").unwrap();
+    git(root, &["config", "core.attributesfile", attributes.to_str().unwrap()]);
+    fs::write(root.join("new.asset"), "asset bytes\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    assert_eq!(before.file.len(), 1);
+    fs::write(&attributes, "*.asset filter=lfs\n").unwrap();
+    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    assert!(after.file.is_empty());
+    assert!(after.excluded.contains("new.asset"));
+    assert!(before.changed_paths(&after).unwrap().is_empty());
+}
+
+#[test]
+fn restore_rejects_a_saved_journal_when_its_path_becomes_lfs() {
+    use super::super::restore::{RestoreJournal, RestorePreview};
+    let repository = repository();
+    let root = repository.path();
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(root);
+    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    fs::write(root.join("new.asset"), "asset bytes\n").unwrap();
+    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    let preview = RestorePreview::prepare(&objects, root, &after, &before).unwrap();
+    let mut journal = RestoreJournal::begin(&objects, preview).unwrap();
+    fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
+    let error = journal.apply(&objects, &mut || Ok(())).unwrap_err();
+    assert!(error.to_string().contains("excluded by Git LFS"), "{error:#}");
+    assert_eq!(fs::read(root.join("new.asset")).unwrap(), b"asset bytes\n");
+}
+
+#[test]
+fn private_checkpoint_index_preserves_a_split_index_and_staged_content() {
+    let repository = repository();
+    let root = repository.path();
+    fs::write(root.join("tracked.txt"), "staged\n").unwrap();
+    git(root, &["add", "tracked.txt"]);
+    git(root, &["update-index", "--split-index"]);
+    let index = fs::read(root.join(".git/index")).unwrap();
+    fs::write(root.join("tracked.txt"), "unstaged\n").unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let objects = ObjectStore::open(data.path()).unwrap();
+    let record = GitCheckpoint::new(root).capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    assert_eq!(record.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"unstaged\n");
+    assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
+    let staged = std::process::Command::new("git").current_dir(root)
+        .args(["show", ":tracked.txt"]).output().unwrap();
+    assert!(staged.status.success());
+    assert_eq!(staged.stdout, b"staged\n");
+}
+
 #[tokio::test]
 async fn reuses_unchanged_checkpoint_and_detects_external_dirty_edits() {
     let repository = repository();
@@ -475,7 +624,7 @@ fn capture_accepts_an_index_refresh_without_changing_staging() {
 }
 
 #[test]
-fn capture_reads_the_current_version_of_a_clean_file_changed_before_its_turn() {
+fn capture_defers_edits_outside_the_initial_status_inventory_to_the_next_checkpoint() {
     let repository = repository();
     let later = repository.path().join("z-later.txt");
     fs::write(&later, b"old\n").unwrap();
@@ -495,9 +644,11 @@ fn capture_reads_the_current_version_of_a_clean_file_changed_before_its_turn() {
         Ok(())
     }).unwrap();
     assert!(changed);
-    let captured = record.file.iter().find(|file| file.path == "z-later.txt").unwrap();
+    assert_eq!(record.read(&store.objects, "z-later.txt", 4096).unwrap().unwrap(), b"old\n");
+    let next = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
+    let captured = next.file.iter().find(|file| file.path == "z-later.txt").unwrap();
     assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"current version\n");
-    assert!(checkpoint.cache.lock().unwrap().is_none());
+    assert_eq!(record.changed_paths(&next).unwrap(), vec!["z-later.txt"]);
 }
 
 #[test]

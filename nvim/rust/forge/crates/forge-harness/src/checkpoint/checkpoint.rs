@@ -312,7 +312,7 @@ impl GitCheckpoint {
 }
 
 impl GitCheckpoint {
-    /// Captures each tracked or nonignored file as it is read under shared repository admission.
+    /// Capture changed non-LFS files from Git's status inventory under shared repository admission.
     /// Concurrent workspace edits do not require a globally consistent snapshot or a retry.
     ///
     /// Discovery resolves the canonical worktree before admitting its index, file, and shared-ref
@@ -402,22 +402,15 @@ impl GitCheckpoint {
             eprintln!("checkpoint.reuse duration_ms={}", started.elapsed().as_millis());
             return Ok(previous.record.clone());
         }
-        let inventory = forge_git::checkpoint::inventory(&self.workspace, &mut check)?;
+        let inventory = forge_git::checkpoint::inventory(&self.workspace, &signature, &mut check)?;
         let mut file = Vec::new();
-        let mut deleted = Vec::new();
+        let mut deleted = inventory.missing.into_iter().collect::<Vec<_>>();
         let mut hits = 0usize;
         let mut bytes = 0u64;
         let mut source = Vec::new();
         let mut reusable = true;
-        for relative in inventory.candidate.keys() {
+        for relative in &inventory.candidate {
             check()?;
-            if inventory.missing.contains(relative) {
-                deleted.push(relative.clone());
-                continue;
-            }
-            if inventory.unchanged(&self.workspace, relative)? {
-                continue;
-            }
             let path = self.file_path(relative)?;
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(metadata) => metadata,
@@ -523,7 +516,7 @@ impl GitCheckpoint {
             })
             .collect::<BTreeMap<_, _>>();
         let manifest =
-            serde_json::to_vec(&(session_id, &inventory.tree, &file, &deleted, &checkout))?;
+            serde_json::to_vec(&(session_id, &inventory.tree, &file, &deleted, &checkout, &inventory.excluded))?;
         eprintln!(
             "checkpoint.capture candidates={} overrides={} cache_hits={} bytes_read={} duration_ms={}",
             inventory.candidate.len(),
@@ -541,11 +534,11 @@ impl GitCheckpoint {
             file,
             deleted,
             checkout,
+            excluded: inventory.excluded,
             created_at_ms: now_ms,
         };
-        let verified_signature = forge_git::checkpoint::signature(&self.workspace, &mut check)?;
         let cached = CachedCheckpoint { signature, record: record.clone(), source };
-        let cached = (reusable && cached.signature == verified_signature && cached.unchanged())
+        let cached = (reusable && cached.unchanged())
             .then_some(cached);
         *self.cache.lock().map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))? = cached;
         Ok(record)
@@ -602,7 +595,7 @@ fn checkpoint_retained_bytes(record: &CheckpointRecord) -> Result<usize> {
             .file
             .iter()
             .flat_map(|file| [&file.path, &file.object_id]),
-    ) {
+    ).chain(record.excluded.iter()) {
         bytes = bytes
             .checked_add(value.capacity())
             .context("checkpoint input size overflow")?;
@@ -641,8 +634,7 @@ async fn checkpoint_diff_matching(
     after: &CheckpointRecord,
     selected_path_set: Option<&std::collections::BTreeSet<String>>,
 ) -> Result<String> {
-    let before_file = before.resolved()?;
-    let after_file = after.resolved()?;
+    let (before_file, after_file) = before.resolve_pair(after)?;
     let mut path_set = std::collections::BTreeSet::new();
     path_set.extend(before_file.keys().cloned());
     path_set.extend(after_file.keys().cloned());

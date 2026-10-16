@@ -48,6 +48,27 @@ pub fn read_command(
     progress_command(command, limits, None, None, check)
 }
 
+/// Collect two independent reads concurrently, retaining admission until both children exit.
+pub fn read_command_pair(
+    first: Command,
+    second: Command,
+    limits: CommandLimits,
+    mut check: impl FnMut() -> Result<()>,
+) -> Result<(Output, Output)> {
+    ensure!(!limits.timeout.is_zero(), "command timeout must be positive");
+    check()?;
+    let check = std::cell::RefCell::new(check);
+    command_runtime()?.block_on(async {
+        let mut first_check = || (check.borrow_mut())();
+        let mut second_check = || (check.borrow_mut())();
+        let (first, second) = tokio::join!(
+            collect_async(first, limits, None, None, false, None, &mut first_check),
+            collect_async(second, limits, None, None, false, None, &mut second_check),
+        );
+        Ok((first?, second?))
+    })
+}
+
 /// Writes input while collecting bounded output.
 pub fn write_command(
     command: &mut Command,
@@ -104,28 +125,10 @@ fn collect_command(
         "command timeout must be positive"
     );
     check()?;
-    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
-        OnceLock::new();
-    let current = tokio::runtime::Handle::try_current().ok();
-    let runtime = match current {
-        Some(handle) => handle,
-        None => RUNTIME
-            .get_or_init(|| {
-                tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(1)
-                    .enable_all()
-                    .build()
-                    .map_err(|error| error.to_string())
-            })
-            .as_ref()
-            .map_err(|error| anyhow::anyhow!("start native command runtime: {error}"))?
-            .handle()
-            .clone(),
-    };
     let command = std::mem::replace(command, Command::new(""));
     let input = input.map(ToOwned::to_owned);
     let progress = progress.cloned();
-    runtime.block_on(async move {
+    command_runtime()?.block_on(async move {
         collect_async(
             command,
             limits,
@@ -137,6 +140,23 @@ fn collect_command(
         )
         .await
     })
+}
+
+fn command_runtime() -> Result<tokio::runtime::Handle> {
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        OnceLock::new();
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        return Ok(handle);
+    }
+    Ok(RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .map_err(|error| error.to_string())
+    }).as_ref()
+        .map_err(|error| anyhow::anyhow!("start native command runtime: {error}"))?
+        .handle().clone())
 }
 
 async fn collect_async(

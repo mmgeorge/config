@@ -2,7 +2,9 @@ use crate::storage::objects::ObjectStore;
 use anyhow::{Context, Result};
 use forge_git::checkpoint::{BaseFile, CheckoutRule};
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeMap, path::Path};
+use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+
+type ResolvedFileMap = BTreeMap<String, ResolvedFile>;
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 /// Stores one override relative to the checkpoint's existing Git tree.
@@ -34,6 +36,9 @@ pub struct CheckpointRecord {
     pub deleted: Vec<String>,
     /// Non-default checkout conversion sampled for baseline paths.
     pub checkout: BTreeMap<String, CheckoutRule>,
+    /// LFS paths excluded from capture and restoration, including after attribute changes.
+    #[serde(default)]
+    pub excluded: BTreeSet<String>,
     /// Time at which capture completed.
     pub created_at_ms: i64,
 }
@@ -59,14 +64,34 @@ impl CheckpointRecord {
 
     /// Select changed paths using content identities without loading whole file contents.
     pub fn changed_paths(&self, other: &Self) -> Result<Vec<String>> {
-        let before = self.resolved()?;
-        let after = other.resolved()?;
+        let (before, after) = self.resolve_pair(other)?;
         Ok(before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>()
             .into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect())
     }
 
     /// Resolves metadata without loading any file contents.
     pub(super) fn resolved(&self) -> Result<BTreeMap<String, ResolvedFile>> {
+        let mut files = self.resolved_metadata()?;
+        let paths = files.keys().cloned().collect();
+        let current_lfs = forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &paths)?;
+        files.retain(|path, _| !current_lfs.contains(path));
+        Ok(files)
+    }
+
+    pub(super) fn resolve_pair(&self, other: &Self) -> Result<(ResolvedFileMap, ResolvedFileMap)> {
+        let mut before = self.resolved_metadata()?;
+        let mut after = other.resolved_metadata()?;
+        let paths = before.keys().chain(after.keys()).cloned().collect();
+        let mut excluded = forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &paths)?;
+        if self.workspace != other.workspace {
+            excluded.extend(forge_git::checkpoint::lfs_paths(Path::new(&other.workspace), &paths)?);
+        }
+        before.retain(|path, _| !other.excluded.contains(path) && !excluded.contains(path));
+        after.retain(|path, _| !self.excluded.contains(path) && !excluded.contains(path));
+        Ok((before, after))
+    }
+
+    fn resolved_metadata(&self) -> Result<ResolvedFileMap> {
         let mut files =
             forge_git::checkpoint::tree_files(Path::new(&self.workspace), self.tree.as_deref())?
                 .into_iter()
@@ -94,13 +119,13 @@ impl CheckpointRecord {
                 },
             );
         }
+        files.retain(|path, _| !self.excluded.contains(path));
         Ok(files)
     }
 
     /// Compares resolved content independently of session IDs, Git history, and staging.
     pub fn equivalent(&self, other: &Self, objects: &ObjectStore) -> Result<bool> {
-        let left = self.resolved()?;
-        let right = other.resolved()?;
+        let (left, right) = self.resolve_pair(other)?;
         if !left.keys().eq(right.keys()) {
             return Ok(false);
         }
@@ -127,6 +152,11 @@ impl CheckpointRecord {
 
     /// Retrieves one captured source, including clean files supplied by the Git baseline.
     pub fn read(&self, objects: &ObjectStore, path: &str, limit: usize) -> Result<Option<Vec<u8>>> {
+        if self.excluded.contains(path)
+            || forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &BTreeSet::from([path.to_owned()]))?.contains(path)
+        {
+            return Ok(None);
+        }
         if let Some(file) = self.file.iter().find(|file| file.path == path) {
             return Ok(Some(
                 objects

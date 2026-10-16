@@ -364,6 +364,7 @@ mod tests {
             file: Vec::new(),
             deleted: Vec::new(),
             checkout: BTreeMap::new(),
+            excluded: Default::default(),
             created_at_ms: 0,
         };
         for (path, source) in [

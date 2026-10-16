@@ -47,8 +47,7 @@ impl RestorePreview {
             fs::canonicalize(root)? == fs::canonicalize(&target.workspace)?,
             "checkpoint belongs to another worktree"
         );
-        let before = expected.resolved()?;
-        let after = target.resolved()?;
+        let (before, after) = expected.resolve_pair(target)?;
         let mut path = Vec::new();
         let mut warning = Vec::new();
         let head = current_head(root)?;
@@ -427,6 +426,10 @@ fn read_actual(
     relative: &str,
 ) -> Result<Option<CheckpointFile>> {
     let path = checked_path(root, relative)?;
+    ensure!(
+        !forge_git::checkpoint::lfs_paths(root, &std::collections::BTreeSet::from([relative.to_owned()]))?.contains(relative),
+        "restore path is now excluded by Git LFS: {relative}"
+    );
     let metadata = match fs::symlink_metadata(&path) {
         Ok(metadata) => metadata,
         Err(error)
