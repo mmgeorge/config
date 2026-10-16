@@ -12,7 +12,7 @@ use crate::{
     RepositoryPath,
     command::{CommandLimits, read_command},
     content::{
-        ContentLimits, ContentRequest, ContentResult, ContentSource, IndexStage,
+        ContentRequest, ContentResult, ContentSource, IndexStage,
         WorktreeConversion, acquire,
     },
     repository::RepositoryState,
@@ -199,7 +199,6 @@ impl WritePrecondition {
                     "@{upstream}",
                 ]),
                 CommandLimits {
-                    stdout_bytes: 65536,
                     stderr_bytes: 65536,
                     timeout: std::time::Duration::from_secs(10),
                 },
@@ -219,7 +218,6 @@ impl WritePrecondition {
         timing.insert("index", started.elapsed().as_micros());
         let started = Instant::now();
         let mut path = Vec::new();
-        let mut index_bytes = 0;
         let selected = action.paths();
         let actions = match action {
             GitWriteAction::Batch { action } => action.as_slice(),
@@ -255,11 +253,6 @@ impl WritePrecondition {
             } else {
                 selected_index.remove(target).unwrap_or_default()
             };
-            index_bytes += index.len();
-            ensure!(
-                index_bytes <= 2 * 1024 * 1024,
-                "write precondition index exceeds 2 MiB"
-            );
             let worktree = worktree_policy.capture(repository, target, check)?;
             path.push(PathPrecondition {
                 head_tracked: selected_head.contains(target),
@@ -479,7 +472,6 @@ fn bulk_index(
     let output = read_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 16 * 1024 * 1024,
             stderr_bytes: 4096,
             timeout: std::time::Duration::from_secs(30),
         },
@@ -491,7 +483,6 @@ fn bulk_index(
         String::from_utf8_lossy(&output.stderr)
     );
     let mut captured: HashMap<RepositoryPath, Vec<u8>> = HashMap::new();
-    let mut retained = 0;
     for record in output
         .stdout
         .split(|byte| *byte == 0)
@@ -511,8 +502,6 @@ fn bulk_index(
             );
         }
         if selected.contains(indexed) {
-            retained += record.len() + 1;
-            ensure!(retained <= 2 * 1024 * 1024, "selected index exceeds 2 MiB");
             let entry = captured
                 .entry(RepositoryPath::new(indexed.to_vec())?)
                 .or_default();
@@ -538,7 +527,6 @@ fn bulk_head(
     let output = read_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 16 * 1024 * 1024,
             stderr_bytes: 4096,
             timeout: std::time::Duration::from_secs(30),
         },
@@ -584,7 +572,6 @@ fn head_contains(
     let output = read_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 16 * 1024,
             stderr_bytes: 4096,
             timeout: std::time::Duration::from_secs(30),
         },
@@ -610,7 +597,6 @@ fn index_entries(
     let output = read_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 16 * 1024,
             stderr_bytes: 4096,
             timeout: std::time::Duration::from_secs(30),
         },
@@ -780,7 +766,6 @@ fn validate_patch_target(
             let output = read_command(
                 &mut command,
                 CommandLimits {
-                    stdout_bytes: 8 * 1024 * 1024,
                     stderr_bytes: 4096,
                     timeout: std::time::Duration::from_secs(30),
                 },
@@ -824,7 +809,6 @@ fn validate_content(
         repository,
         ContentRequest {
             source,
-            limits: ContentLimits::default(),
             expected: Some(expected),
         },
         check,

@@ -16,7 +16,6 @@ use crate::{
 
 use super::{ObservationTiming, PathRecord};
 
-const MAX_SHARED_INDEX_FILES: usize = 256;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeadState {
@@ -72,7 +71,7 @@ pub struct IndexFileStamp {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-/// Includes the main index and all bounded shared-index backing files in its directory.
+/// Include the main index and every shared-index backing file in its directory.
 pub struct IndexStamp {
     pub index: Option<IndexFileStamp>,
     pub shared: Vec<IndexFileStamp>,
@@ -334,10 +333,6 @@ pub(crate) fn read_index_stamp(
             && matches!(hash.len(), 40 | 64)
             && hash.iter().all(u8::is_ascii_hexdigit)
         {
-            ensure!(
-                shared_path.len() < MAX_SHARED_INDEX_FILES,
-                "shared index file limit exceeded"
-            );
             shared_path.push(entry.path());
         }
     }
@@ -722,19 +717,14 @@ mod tests {
         assert_eq!(file.checksum_tail.len(), 32);
         assert!(file.modified_without_checksum.is_some());
         fs::remove_file(&index).unwrap();
-        for number in 0..=MAX_SHARED_INDEX_FILES {
+        for number in 0..257 {
             fs::write(
                 fixture.path().join(format!("sharedindex.{number:040x}")),
                 b"",
             )
             .unwrap();
         }
-        assert!(
-            read_index_stamp(&index, &mut || Ok(()))
-                .unwrap_err()
-                .to_string()
-                .contains("file limit")
-        );
+        assert_eq!(read_index_stamp(&index, &mut || Ok(())).unwrap().shared.len(), 257);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 use super::*;
 
-/// Shares conversion preparation across bounded reads. Call `verify` before publishing results.
+/// Share conversion preparation across complete reads and verify before publishing results.
 pub(crate) struct ContentBatch {
     local: gix::Repository,
     repository: RepositoryIdentity,
@@ -30,7 +30,6 @@ impl ContentBatch {
             ContentSource::Object(object) => read_object(
                 &self.local,
                 object,
-                ContentLimits::default(),
                 None,
                 ContentOrigin::Object(object),
                 None,
@@ -52,7 +51,6 @@ impl ContentBatch {
                     WorktreeRead {
                         path: path.clone(),
                         conversion,
-                        limits: ContentLimits::default(),
                         expected: None,
                         session: self.session.as_mut(),
                     },

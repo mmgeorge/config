@@ -231,10 +231,9 @@ fn decode_rest(value: Value, collection: bool, page: u32) -> Result<ReviewPage, 
     } else {
         vec![value]
     };
-    if records.len() > 100 {
-        return Err(invalid("REST page exceeds 100 records"));
-    }
-    let next_cursor = (collection && records.len() == 100).then(|| (page + 1).to_string());
+    let next_cursor = if collection && records.len() >= 100 {
+        Some(page.checked_add(1).ok_or_else(|| invalid("REST page number overflow"))?.to_string())
+    } else { None };
     Ok(ReviewPage {
         records,
         complete: next_cursor.is_none(),
@@ -302,9 +301,6 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
         .and_then(Value::as_array)
         .cloned()
         .ok_or_else(|| invalid("GitHub connection nodes are missing"))?;
-    if records.len() > 100 {
-        return Err(invalid("GraphQL page exceeds 100 records"));
-    }
     let has_next = connection
         .pointer("/pageInfo/hasNextPage")
         .and_then(Value::as_bool)
@@ -314,7 +310,7 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
             connection
                 .pointer("/pageInfo/endCursor")
                 .and_then(Value::as_str)
-                .filter(|cursor| !cursor.is_empty() && cursor.len() <= 512)
+                .filter(|cursor| !cursor.is_empty())
                 .ok_or_else(|| invalid("GitHub incomplete page has no cursor"))?
                 .to_owned(),
         )

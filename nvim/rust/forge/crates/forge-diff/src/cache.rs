@@ -35,6 +35,7 @@ pub struct CacheUsage {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CacheError {
     Saturated,
+    AccountingOverflow,
     ForeignReservation,
     InsufficientReservation,
     WrongIdentity,
@@ -107,7 +108,7 @@ impl AnalysisStore {
     }
 }
 
-/// Reserves one entry plus independently bounded source and result capacities before work begins.
+/// Tracks one live analysis and its source and result allocations independently from cache retention.
 pub struct AnalysisReservation {
     accounting: Arc<Mutex<CacheUsage>>,
     bytes: AnalysisBytes,
@@ -155,7 +156,8 @@ impl AnalysisCache {
         usage
     }
 
-    /// Evicts least-recently-used cache references as needed. Live handles remain charged.
+    /// Evict least-recently-used cache references without rejecting an explicit analysis.
+    /// Keep live handles charged even when their allocations exceed cache retention budgets.
     pub fn reserve(&mut self, bytes: AnalysisBytes) -> Result<AnalysisReservation, CacheError> {
         self.reserve_with_eviction(bytes, true)
     }
@@ -165,43 +167,36 @@ impl AnalysisCache {
         bytes: AnalysisBytes,
         evict: bool,
     ) -> Result<AnalysisReservation, CacheError> {
-        if bytes.source > self.limits.source_bytes
-            || bytes.result > self.limits.result_bytes
-            || self.limits.entries == 0
-        {
-            return Err(CacheError::Saturated);
-        }
         loop {
             {
                 let mut usage = self
                     .accounting
                     .lock()
                     .expect("analysis accounting poisoned");
-                if usage.admitted_entries < self.limits.entries
-                    && bytes.source <= self.limits.source_bytes - usage.bytes.source
-                    && bytes.result <= self.limits.result_bytes - usage.bytes.result
+                if (evict && self.entry.is_empty()) || (usage.admitted_entries < self.limits.entries
+                    && bytes.source <= self.limits.source_bytes.saturating_sub(usage.bytes.source)
+                    && bytes.result <= self.limits.result_bytes.saturating_sub(usage.bytes.result))
                 {
-                    usage.admitted_entries += 1;
-                    usage.bytes.source += bytes.source;
-                    usage.bytes.result += bytes.result;
+                    let entries = usage.admitted_entries.checked_add(1).ok_or(CacheError::AccountingOverflow)?;
+                    let source = usage.bytes.source.checked_add(bytes.source).ok_or(CacheError::AccountingOverflow)?;
+                    let result = usage.bytes.result.checked_add(bytes.result).ok_or(CacheError::AccountingOverflow)?;
+                    usage.admitted_entries = entries;
+                    usage.bytes = AnalysisBytes { source, result };
                     return Ok(AnalysisReservation {
                         accounting: Arc::clone(&self.accounting),
                         bytes,
                     });
                 }
-            }
-            if !evict {
-                return Err(CacheError::Saturated);
+                if !evict {
+                    return Err(CacheError::Saturated);
+                }
             }
             let Some(key) = self
                 .entry
                 .iter()
-                .filter(|(_, entry)| Arc::strong_count(&entry.handle.0) == 1)
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(key, _)| *key)
-            else {
-                return Err(CacheError::Saturated);
-            };
+            else { unreachable!("nonempty cache has an eviction candidate"); };
             self.entry.remove(&key);
         }
     }
@@ -238,13 +233,19 @@ impl AnalysisCache {
             diff,
             _reservation: reservation,
         }));
-        self.entry.insert(
-            key,
-            CachedEntry {
-                handle: handle.clone(),
-                used: self.clock,
-            },
-        );
+        let usage = self.usage();
+        if usage.admitted_entries <= self.limits.entries
+            && usage.bytes.source <= self.limits.source_bytes
+            && usage.bytes.result <= self.limits.result_bytes
+        {
+            self.entry.insert(
+                key,
+                CachedEntry {
+                    handle: handle.clone(),
+                    used: self.clock,
+                },
+            );
+        }
         Ok(handle)
     }
 

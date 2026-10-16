@@ -207,12 +207,10 @@ pub fn project(
             .checked_add(heading.text.byte_count())
             .and_then(|bytes| bytes.checked_add(body.text.byte_count()))
             .context("issue projection size overflow")?;
-        ensure!(bytes <= 8 * 1024 * 1024, "issue projection exceeds 8 MiB");
         block.push(heading);
         block.push(body);
     }
     block.push(readonly("issue:comments-end", "")?);
-    ensure!(bytes <= 8 * 1024 * 1024, "issue projection exceeds 8 MiB");
     Ok(IssueProjection { block, target })
 }
 

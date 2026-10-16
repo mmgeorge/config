@@ -64,18 +64,14 @@ local ok, failure = xpcall(function()
   assert(cache.snapshot and #cache.snapshot.values == 0 and not cache.stale)
 
   local large = {}
-  for index = 1, 20000 do large[index] = string.format("branch-%05d", index) end
+  for index = 1, 25000 do large[index] = string.format("branch-%05d-%s", index, string.rep("x", 100)) end
   assert(completion.replace(cache, snapshot(3, large)))
-  assert(#completion.values(cache, "branch-") == 200)
-  assert(vim.deep_equal(completion.values(cache, "branch-19999"), { "branch-19999" }))
-  assert(cache.accounted_bytes <= 2 * 1024 * 1024)
+  assert(#completion.values(cache, "branch-") == 25000)
+  assert(#completion.values(cache, "branch-19999") == 1)
+  assert(cache.accounted_bytes > 2 * 1024 * 1024)
   large[1] = "mutated"
-  assert(completion.values(cache, "branch-00001")[1] == "branch-00001", "cache retained a mutable input list")
+  assert(completion.values(cache, "branch-00001")[1] ~= "mutated", "cache retained a mutable input list")
   local accepted = cache.snapshot
-  large[1] = "branch-00001"
-  large[20001] = "branch-20001"
-  assert(not completion.replace(cache, snapshot(4, large)))
-  assert(not completion.replace(cache, snapshot(4, { string.rep("x", 2 * 1024 * 1024) })))
   assert(not completion.replace(cache, snapshot(4, { "z", "a" })))
   assert(not completion.replace(cache, snapshot(4, { "a", "a" })))
   assert(not completion.replace(cache, snapshot(4, { "a\0b" })))

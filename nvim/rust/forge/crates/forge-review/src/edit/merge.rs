@@ -37,7 +37,7 @@ impl EditStore {
         &mut self,
         observed: Vec<(RegionId, String)>,
     ) -> Result<PreparedFieldMerge<'_>, EditError> {
-        if observed.is_empty() || observed.len() > self.limits.active_fields {
+        if observed.is_empty() {
             return Err(EditError::Capacity("merge field admission is full"));
         }
         let mut candidate = BTreeMap::new();

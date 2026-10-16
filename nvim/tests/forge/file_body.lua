@@ -1,11 +1,9 @@
 vim.loader.enable(false)
 
-local config = require("forge.infra.config")
 local file_body = require("forge.git.file_body")
 local git_backend = require("forge.git.git_backend")
 
 local original_backend = git_backend.current
-local original_options = config.options
 local command_list = {}
 local response_list = {}
 
@@ -76,7 +74,7 @@ local function assert_staged_addition_uses_index_blob()
   assert_true(result.hunks[1].diff:find("new file mode 100755", 1, true) ~= nil, "staged addition lost its index mode")
 end
 
-local function assert_large_addition_stops_before_diff_render()
+local function assert_large_addition_preserves_complete_diff()
   command_list = {}
   local content_line_list = {}
   for line_number = 1, 1001 do content_line_list[line_number] = ("line %d"):format(line_number) end
@@ -84,21 +82,27 @@ local function assert_large_addition_stops_before_diff_render()
   local file = staged_file("index_added", string.rep("2", 40))
   local result = load(file)
   assert_equal(#command_list, 1, "large staged addition issued more than its blob read")
-  assert_equal(result.state, "omitted", "large addition did not enter the omitted state")
+  assert_equal(result.state, "loaded", "large addition did not load")
   assert_equal(result.added, 1001, "large addition lost its exact line count")
-  assert_equal(result.hunks, {}, "large addition synthesized an oversized diff")
+  assert_equal(#result.hunks, 1, "large addition lost its canonical hunk")
+  assert_true(type(result.diff) == "string" and result.diff:find("+line 1001", 1, true) ~= nil, "large addition lost its final line")
 end
 
-local function assert_large_deletion_stops_before_blob_read()
+local function assert_large_deletion_preserves_complete_diff()
   command_list = {}
-  response_list = { success("0\t1001\texample.txt\0") }
+  response_list = {
+    success("0\t1001\texample.txt\0"),
+    success(string.rep("deleted line\n", 1000) .. "final deleted line\n"),
+  }
   local file = staged_file("head_deleted", string.rep("1", 40))
   local result = load(file)
-  assert_equal(#command_list, 1, "large deletion read a blob after crossing the preview limit")
+  assert_equal(#command_list, 2, "large deletion did not load its complete blob")
   assert_true(vim.tbl_contains(command_list[1], "--numstat"), "large deletion skipped its count query")
   assert_true(vim.tbl_contains(command_list[1], "--cached"), "staged deletion count did not target the index diff")
-  assert_equal(result.state, "omitted", "large deletion did not enter the omitted state")
+  assert_equal(result.state, "loaded", "large deletion did not load")
   assert_equal(result.removed, 1001, "large deletion lost its exact line count")
+  assert_equal(#result.hunks, 1, "large deletion lost its canonical hunk")
+  assert_true(type(result.diff) == "string" and result.diff:find("-final deleted line", 1, true) ~= nil, "large deletion lost its final line")
 end
 
 local function assert_small_deletion_uses_head_blob()
@@ -150,12 +154,9 @@ end
 
 local function run()
   git_backend.set_backend(backend)
-  config.options = vim.tbl_deep_extend("force", vim.deepcopy(config.defaults), {
-    status_file_preview_line_limit = 1000,
-  })
   assert_staged_addition_uses_index_blob()
-  assert_large_addition_stops_before_diff_render()
-  assert_large_deletion_stops_before_blob_read()
+  assert_large_addition_preserves_complete_diff()
+  assert_large_deletion_preserves_complete_diff()
   assert_small_deletion_uses_head_blob()
   assert_unstaged_deletion_uses_index_blob()
   assert_binary_addition_never_reads_content()
@@ -163,7 +164,6 @@ end
 
 local ok, error_message = xpcall(run, debug.traceback)
 git_backend.set_backend(original_backend)
-config.options = original_options
 if not ok then
   vim.api.nvim_err_writeln(error_message)
   vim.cmd("cquit")

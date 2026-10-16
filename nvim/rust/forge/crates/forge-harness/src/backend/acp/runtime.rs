@@ -8,8 +8,6 @@ use std::time::Duration;
 
 const CLAUDE_VERSION: &str = "0.89.1";
 const ANTIGRAVITY_VERSION: &str = "1.3.0";
-const ARCHIVE_LIMIT: u64 = 512 * 1024 * 1024;
-const EXTRACTED_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Serialize)]
 /// Reports installation independently of authentication and provider session state.
@@ -117,12 +115,8 @@ impl AcpRuntime {
             let url = format!("https://dl.google.com/agy-extensions/releases/{platform}/agy-acp-server-{ANTIGRAVITY_VERSION}-{architecture}.zip");
             let mut response = reqwest::Client::builder().connect_timeout(Duration::from_secs(10))
                 .timeout(Duration::from_secs(120)).build()?.get(url).send().await?.error_for_status()?;
-            ensure!(response.content_length().is_none_or(|size| size <= ARCHIVE_LIMIT), "ACP archive exceeds 512 MiB");
             let mut archive = tempfile::tempfile()?;
-            let mut downloaded = 0u64;
             while let Some(chunk) = response.chunk().await? {
-                downloaded = downloaded.checked_add(chunk.len() as u64).context("ACP archive size overflow")?;
-                ensure!(downloaded <= ARCHIVE_LIMIT, "ACP archive exceeds 512 MiB");
                 archive.write_all(&chunk)?;
             }
             let root = staging.path().to_owned();
@@ -148,21 +142,17 @@ async fn tool_output(program: &str, argument: &[String], root: &Path) -> Result<
 
 fn extract(archive: File, root: &Path) -> Result<()> {
     let mut archive = zip::ZipArchive::new(archive)?;
-    ensure!(archive.len() <= 4096, "ACP archive contains more than 4096 entries");
-    let mut total = 0u64;
     for index in 0..archive.len() {
         let mut entry = archive.by_index(index)?;
         let relative = entry.enclosed_name().context("ACP archive path escapes its installation directory")?;
         ensure!(relative.components().all(|component| matches!(component, Component::Normal(_))), "ACP archive path is not relative");
         ensure!(entry.unix_mode().is_none_or(|mode| mode & 0o170000 != 0o120000), "ACP archive contains a symbolic link");
-        total = total.checked_add(entry.size()).context("ACP extracted size overflow")?;
-        ensure!(total <= EXTRACTED_LIMIT, "ACP archive expands beyond 2 GiB");
         let destination = root.join(relative);
         if entry.is_dir() { std::fs::create_dir_all(destination)?; continue; }
         if let Some(parent) = destination.parent() { std::fs::create_dir_all(parent)?; }
         let mut output = File::create(&destination)?;
         let expected_size = entry.size();
-        let copied = std::io::copy(&mut std::io::Read::take(&mut entry, expected_size + 1), &mut output)?;
+        let copied = std::io::copy(&mut entry, &mut output)?;
         ensure!(copied == expected_size, "ACP archive entry differs from its declared size");
         #[cfg(unix)]
         if let Some(mode) = entry.unix_mode() {

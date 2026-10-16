@@ -12,7 +12,6 @@ use crate::{
     store::RepositoryStore,
 };
 
-const STATUS_RECORDS: usize = 65_536;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusBackend {
@@ -146,10 +145,6 @@ impl StatusReader {
         let mut records = HashMap::new();
         while let Some(item) = iterator.next() {
             check()?;
-            ensure!(
-                records.len() < STATUS_RECORDS,
-                "status record limit exceeded"
-            );
             match item? {
                 gix::status::Item::TreeIndex(change) => insert_tree_index(&mut records, change)?,
                 gix::status::Item::IndexWorktree(change) => {

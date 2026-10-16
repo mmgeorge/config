@@ -96,7 +96,7 @@ impl NotificationReadRequest {
     pub fn validate(&mut self) -> Result<()> {
         self.hostname = normalize_hostname(&self.hostname).map_err(anyhow::Error::msg)?;
         ensure!(
-            self.cursor.is_none_or(|page| (1..=100_001).contains(&page)),
+            self.cursor.is_none_or(|page| page > 0),
             "invalid notification page cursor"
         );
         Ok(())
@@ -133,17 +133,9 @@ pub struct NotificationPage {
     pub complete: bool,
 }
 
-/// Decodes at most 100 records without treating malformed records as missing results.
+/// Decode complete notification records without treating malformed records as missing results.
 pub fn decode_page(bytes: &[u8], request: &NotificationReadRequest) -> Result<NotificationPage> {
-    ensure!(
-        bytes.len() <= 8 * 1024 * 1024,
-        "notification page exceeds 8 MiB"
-    );
     let raw: Vec<Value> = serde_json::from_slice(bytes)?;
-    ensure!(
-        raw.len() <= NOTIFICATION_PAGE_SIZE,
-        "notification page exceeds 100 records"
-    );
     let mut identity = HashSet::new();
     let mut record = Vec::with_capacity(raw.len());
     for raw in raw {
@@ -154,7 +146,7 @@ pub fn decode_page(bytes: &[u8], request: &NotificationReadRequest) -> Result<No
         );
         record.push(notification);
     }
-    let next_cursor = if record.len() == NOTIFICATION_PAGE_SIZE {
+    let next_cursor = if record.len() >= NOTIFICATION_PAGE_SIZE {
         Some(
             request
                 .cursor
@@ -188,7 +180,7 @@ fn decode_record(raw: Value, hostname: &str) -> Result<NotificationRecord> {
         "notification identity is not canonical decimal"
     );
     let id = raw_id.to_owned();
-    let full_name = text(&raw, "/repository/full_name", 201)?;
+    let full_name = text(&raw, "/repository/full_name")?;
     let (owner, name) = full_name
         .split_once('/')
         .context("notification repository omits owner")?;
@@ -203,7 +195,7 @@ fn decode_record(raw: Value, hostname: &str) -> Result<NotificationRecord> {
         }
         number.parse::<u64>().ok().filter(|number| *number > 0)
     });
-    let kind = text(&raw, "/subject/type", 128)?.to_owned();
+    let kind = text(&raw, "/subject/type")?.to_owned();
     let browser_url = number
         .map(|number| {
             format!(
@@ -225,14 +217,14 @@ fn decode_record(raw: Value, hostname: &str) -> Result<NotificationRecord> {
     Ok(NotificationRecord {
         id,
         repository,
-        title: text(&raw, "/subject/title", 64 * 1024)?.to_owned(),
+        title: text(&raw, "/subject/title")?.to_owned(),
         kind,
         unread: raw
             .get("unread")
             .and_then(Value::as_bool)
             .context("notification unread state is missing")?,
-        reason: text(&raw, "/reason", 256)?.to_owned(),
-        updated_at: text(&raw, "/updated_at", 128)?.to_owned(),
+        reason: text(&raw, "/reason")?.to_owned(),
+        updated_at: text(&raw, "/updated_at")?.to_owned(),
         subject_endpoint,
         comment_endpoint,
         number,
@@ -240,13 +232,13 @@ fn decode_record(raw: Value, hostname: &str) -> Result<NotificationRecord> {
     })
 }
 
-fn text<'value>(value: &'value Value, path: &str, limit: usize) -> Result<&'value str> {
+fn text<'value>(value: &'value Value, path: &str) -> Result<&'value str> {
     let text = value
         .pointer(path)
         .and_then(Value::as_str)
         .with_context(|| format!("notification field {path} is missing"))?;
     ensure!(
-        text.len() <= limit && !text.contains('\0'),
+        !text.contains('\0'),
         "notification field {path} is invalid"
     );
     Ok(text)
@@ -414,10 +406,6 @@ pub fn decode_detail(
     bytes: &[u8],
     request: &NotificationDetailRequest,
 ) -> Result<NotificationDetail> {
-    ensure!(
-        bytes.len() <= 2 * 1024 * 1024,
-        "notification detail exceeds 2 MiB"
-    );
     request.endpoint()?;
     let raw: Value = serde_json::from_slice(bytes)?;
     ensure!(raw.is_object(), "notification detail is not an object");
@@ -427,8 +415,8 @@ pub fn decode_detail(
         _ => anyhow::bail!("notification body is not text"),
     };
     ensure!(
-        body.len() <= 1024 * 1024 && !body.contains('\0'),
-        "notification body exceeds bounds"
+        !body.contains('\0'),
+        "notification body contains NUL"
     );
     let author = raw
         .pointer("/user/login")
@@ -437,8 +425,8 @@ pub fn decode_detail(
     ensure!(
         author
             .as_ref()
-            .is_none_or(|author| author.len() <= 256 && !author.contains('\0')),
-        "notification author exceeds bounds"
+            .is_none_or(|author| !author.contains('\0')),
+        "notification author contains NUL"
     );
     let comments = match raw.get("comments") {
         None | Some(Value::Null) => None,

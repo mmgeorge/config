@@ -11,8 +11,6 @@ use crate::remote::{GithubRemote, RemoteFailure};
 use crate::service::GithubService;
 
 pub const REVIEW_PAGE_SIZE: usize = 100;
-pub const MAX_REVIEW_RECORDS: usize = 10_000;
-pub const MAX_REVIEW_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "section", rename_all = "snake_case", deny_unknown_fields)]
@@ -140,7 +138,6 @@ impl ReviewReadRequest {
         );
         ensure!(
             self.cursor.as_ref().is_none_or(|cursor| !cursor.is_empty()
-                && cursor.len() <= 512
                 && !cursor.contains(['\n', '\r', '\0'])),
             "invalid GitHub document cursor"
         );
@@ -174,7 +171,7 @@ impl GithubService {
         .await
     }
 
-    /// Collects metadata until complete or the explicit document limits require further demand.
+    /// Collect metadata through complete, nonrepeating remote pagination.
     pub async fn review_collection(
         &self,
         directory: std::path::PathBuf,
@@ -188,31 +185,15 @@ impl GithubService {
             complete: false,
             diagnostic: None,
         };
-        let mut bytes = 0usize;
         let mut visited = std::collections::HashSet::new();
         loop {
             let page = self
                 .review_page(directory.clone(), Arc::clone(&remote), request.clone())
                 .await?;
             ensure!(
-                page.records.len() <= REVIEW_PAGE_SIZE,
-                "remote page exceeds 100 records"
-            );
-            ensure!(
                 page.complete == page.next_cursor.is_none(),
                 "remote pagination omitted completion identity"
             );
-            let page_bytes = serde_json::to_vec(&page.records)?.len();
-            if collection.records.len() + page.records.len() > MAX_REVIEW_RECORDS
-                || bytes.saturating_add(page_bytes) > MAX_REVIEW_DOCUMENT_BYTES
-            {
-                collection.diagnostic = Some(
-                    "document collection limit reached, additional records require explicit demand"
-                        .into(),
-                );
-                return Ok(collection);
-            }
-            bytes += page_bytes;
             collection.records.extend(page.records);
             collection.next_cursor = page.next_cursor.clone();
             collection.complete = page.complete;
@@ -225,11 +206,6 @@ impl GithubService {
                 "remote document repeated its pagination cursor"
             );
             request.cursor = Some(cursor);
-            if collection.records.len() == MAX_REVIEW_RECORDS {
-                collection.diagnostic =
-                    Some("document metadata limit reached at 10000 records".into());
-                return Ok(collection);
-            }
         }
     }
 }

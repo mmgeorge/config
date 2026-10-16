@@ -1,4 +1,3 @@
-use forge_diff::body::{BodyKind, UnavailableReason};
 use forge_diff::intraline::FallbackReason;
 mod support;
 use support::retain;
@@ -8,7 +7,7 @@ use forge_diff::display::{
     ChunkLimits, DisplayCursor, DisplayRow, DisplayState, RowKind, group_hunks,
 };
 use forge_diff::raw::compute_hunks;
-use forge_diff::source::{Representation, SourcePair, SourceSide, SourceVersion};
+use forge_diff::source::{Representation, SourcePair, SourceVersion};
 
 fn diff(old: &str, new: &str) -> AnalysisHandle {
     retain(
@@ -25,7 +24,7 @@ fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
     for _ in 0..10000 {
         let chunk = cursor.next_rows(limits);
         assert!(chunk.rows.len() <= limits.rows.min(256).min(limits.decorations));
-        assert!(chunk.text_bytes <= limits.text_bytes.min(128 * 1024));
+        assert!(chunk.rows.len() == 1 || chunk.text_bytes <= limits.text_bytes.min(128 * 1024));
         assert!(chunk.decorations <= limits.decorations.min(8192));
         assert_eq!(
             chunk.decorations,
@@ -47,7 +46,6 @@ fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
         match chunk.state {
             DisplayState::Complete => return rows,
             DisplayState::More => {}
-            state => panic!("unexpected terminal state: {state:?}"),
         }
     }
     panic!("cursor did not terminate");
@@ -57,7 +55,7 @@ fn drain(cursor: &mut DisplayCursor, limits: ChunkLimits) -> Vec<DisplayRow> {
 fn first_giant_hunk_obeys_the_same_chunk_limit_as_later_hunks() {
     let source = diff(&"old\n".repeat(800), &"new\n".repeat(900));
     let identity = source.hunks()[0].id;
-    let mut cursor = DisplayCursor::new(source, 3, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(source, 3);
     let first = cursor.next_rows(ChunkLimits::default());
     assert_eq!(first.rows.len(), 256);
     assert_eq!(first.state, DisplayState::More);
@@ -85,7 +83,7 @@ fn display_context_merges_without_duplicate_source_lines() {
     assert_eq!(group.len(), 1);
     assert_eq!(group[0].raw_ids.len(), 2);
     let rows = drain(
-        &mut DisplayCursor::new(source, 2, BodyKind::Modified),
+        &mut DisplayCursor::new(source, 2),
         ChunkLimits {
             rows: 2,
             text_bytes: 10,
@@ -113,7 +111,7 @@ fn display_context_merges_without_duplicate_source_lines() {
 #[test]
 fn group_identity_survives_one_row_deliveries_and_context_gaps() {
     let source = diff("a\nb\nc\nd\ne\nf\ng\n", "A\nb\nc\nd\ne\nf\nG\n");
-    let mut cursor = DisplayCursor::new(source, 1, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(source, 1);
     assert_eq!(cursor.group(0).unwrap().old_lines, 0..2);
     assert_eq!(cursor.group(1).unwrap().old_lines, 5..7);
     let rows = drain(
@@ -139,7 +137,7 @@ fn group_identity_survives_one_row_deliveries_and_context_gaps() {
 #[test]
 fn byte_and_decoration_limits_preserve_unemitted_rows() {
     let source = diff("", "é🙂\r\nsecond\nlast\r");
-    let mut cursor = DisplayCursor::new(source, 0, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(source, 0);
     let paused = cursor.next_rows(ChunkLimits {
         rows: 0,
         ..ChunkLimits::default()
@@ -163,15 +161,14 @@ fn byte_and_decoration_limits_preserve_unemitted_rows() {
 }
 
 #[test]
-fn one_very_long_line_is_unavailable_before_allocating_a_display_row() {
+fn one_very_long_line_survives_the_batch_byte_target_intact() {
     let source = diff("", &"x".repeat(128 * 1024));
-    let mut cursor = DisplayCursor::new(source, 0, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(source, 0);
     let chunk = cursor.next_rows(ChunkLimits::default());
-    assert!(chunk.rows.is_empty());
-    assert_eq!(chunk.text_bytes, 0);
-    assert!(
-        matches!(chunk.state, DisplayState::Unavailable(UnavailableReason::LineBytes { coordinate, line_bytes: 131072, limit: 131072 }) if coordinate.side == SourceSide::New && coordinate.line == 0)
-    );
+    assert_eq!(chunk.rows.len(), 1);
+    assert_eq!(chunk.rows[0].text, "x".repeat(128 * 1024));
+    assert_eq!(chunk.text_bytes, 128 * 1024 + 1);
+    assert_eq!(chunk.state, DisplayState::Complete);
     assert_eq!(cursor.next_rows(ChunkLimits::default()).state, chunk.state);
 }
 
@@ -181,7 +178,7 @@ fn separate_context_windows_skip_unchanged_gaps_and_keep_raw_targets() {
     assert_eq!(group_hunks(&source, 1).len(), 2);
     let original = source.hunks().to_vec();
     let rows = drain(
-        &mut DisplayCursor::new(source.clone(), 1, BodyKind::Modified),
+        &mut DisplayCursor::new(source.clone(), 1),
         ChunkLimits::default(),
     );
     assert_eq!(
@@ -190,7 +187,7 @@ fn separate_context_windows_skip_unchanged_gaps_and_keep_raw_targets() {
     );
     assert_eq!(source.hunks(), original);
     let no_context = drain(
-        &mut DisplayCursor::new(source, 0, BodyKind::Modified),
+        &mut DisplayCursor::new(source, 0),
         ChunkLimits::default(),
     );
     assert_eq!(no_context.len(), 4);
@@ -215,7 +212,7 @@ fn full_context_preserves_both_source_coordinate_sequences_across_insertions_and
                 continue;
             }
             let rows = drain(
-                &mut DisplayCursor::new(source, usize::MAX, BodyKind::Modified),
+                &mut DisplayCursor::new(source, usize::MAX),
                 ChunkLimits {
                     rows: 1,
                     ..ChunkLimits::default()
@@ -254,7 +251,7 @@ fn full_context_preserves_both_source_coordinate_sequences_across_insertions_and
 #[test]
 fn emphasis_survives_batch_boundaries_with_exact_display_byte_ranges() {
     let source = diff("é🙂old終\r\n", "é🙂new終\r\n");
-    let mut cursor = DisplayCursor::new(source, 0, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(source, 0);
     let rows = drain(
         &mut cursor,
         ChunkLimits {
@@ -274,7 +271,7 @@ fn emphasis_survives_batch_boundaries_with_exact_display_byte_ranges() {
 
 #[test]
 fn a_decoration_budget_that_cannot_fit_one_emphasized_row_uses_base_styles() {
-    let mut cursor = DisplayCursor::new(diff("old\n", "new\n"), 0, BodyKind::Modified);
+    let mut cursor = DisplayCursor::new(diff("old\n", "new\n"), 0);
     let rows = drain(
         &mut cursor,
         ChunkLimits {
@@ -293,7 +290,7 @@ fn a_decoration_budget_that_cannot_fit_one_emphasized_row_uses_base_styles() {
 fn rejected_intraline_work_preserves_the_entire_large_replacement() {
     let source = diff(&"old\n".repeat(65), &"new\n".repeat(65));
     let rows = drain(
-        &mut DisplayCursor::new(source, 0, BodyKind::Modified),
+        &mut DisplayCursor::new(source, 0),
         ChunkLimits::default(),
     );
     assert_eq!(rows.len(), 130);

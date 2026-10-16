@@ -2295,16 +2295,14 @@ mod tests {
         let controller = registry.resolve(&session_id).await?;
         let broker = controller.broker.lock().await;
         let generator = service();
-        let error = tokio::time::timeout(Duration::from_secs(1), generator.generate_text(
+        let text = tokio::time::timeout(Duration::from_secs(1), generator.generate_text(
             TextGenerationConfig {
                 backend: crate::backend::BackendLaunch { kind: "mock".into(), command: vec![] },
                 model: "default".into(), data_root,
             },
             &before.workspace, TextGeneration::CommitMessage, "Staged diff:\n+change",
-        )).await?.unwrap_err();
-        let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("text_generation"), "{diagnostic}");
-        assert!(!diagnostic.contains("controlled by another"), "{diagnostic}");
+        )).await??;
+        assert_eq!(text, "feat: describe repository changes");
         assert!(generator.registry.lock().await.is_none());
         let after = store.load_session(&session_id)?.unwrap();
         assert_eq!(after.lease_owner, before.lease_owner);
@@ -2507,8 +2505,8 @@ mod tests {
         {
             let mut broker = controller.broker.lock().await;
             let rejected = broker.dispatch(Request { id: 99, method: "plan.request_changes".into(),
-                params: json!({"plan_id":plan.id,"comment":"x".repeat(65537)}) }).await;
-            assert!(rejected.response.error().is_some());
+                params: json!({"plan_id":plan.id,"digest":"stale-review-digest","comment":"x".repeat(65537)}) }).await;
+            assert!(rejected.response.error().unwrap().message.contains("plan review digest changed"));
             assert!(file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1).is_err());
         }
         service.dispatch(Some(session_id.clone()), Request { id:5, method:"plan.request_changes".into(),

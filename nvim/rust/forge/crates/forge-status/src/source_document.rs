@@ -26,7 +26,7 @@ use serde::Serialize;
 
 use crate::{
     BodyState,
-    document::{DOCUMENT_BYTES, DocumentAdmission},
+    document::DocumentAdmission,
     service::{optional_syntax, syntax_decorations},
     source::{SourceUnavailable, acquire, language},
 };
@@ -82,7 +82,7 @@ impl SourceDocumentService {
     }
 
     pub fn open_text(&self, id: DocumentId, title: String, text: Vec<u8>) -> Result<SourceOpen> {
-        self.open_literal(id, title, text, 1024 * 1024, "text")
+        self.open_literal(id, title, text, "text")
     }
 
     pub fn open_diff_text(
@@ -91,7 +91,7 @@ impl SourceDocumentService {
         title: String,
         text: Vec<u8>,
     ) -> Result<SourceOpen> {
-        self.open_literal(id, title, text, 8 * 1024 * 1024, "diff")
+        self.open_literal(id, title, text, "diff")
     }
 
     fn open_literal(
@@ -99,15 +99,13 @@ impl SourceDocumentService {
         id: DocumentId,
         title: String,
         text: Vec<u8>,
-        limit: usize,
         kind: &str,
     ) -> Result<SourceOpen> {
         id.validate()?;
         ensure!(
-            title.len() <= 4096 && !title.contains(['\0', '\n', '\r']),
+            !title.contains(['\0', '\n', '\r']),
             "invalid source title"
         );
-        ensure!(text.len() <= limit, "literal source exceeds its byte limit");
         ensure!(
             !self.closed.load(Ordering::Acquire),
             "source document service is closed"
@@ -426,28 +424,21 @@ impl SourceDocument {
             } else {
                 &remaining[..end]
             };
-            if bytes + text.len() > 128 * 1024 {
-                if rows.is_empty() {
-                    self.state =
-                        BodyState::Unavailable("source row exceeds 128 KiB delivery limit".into());
-                }
+            if !rows.is_empty() && bytes + text.len() > 128 * 1024 {
                 break;
             }
             let mut row_metadata = BlockMetadata::default();
             if let Some(syntax) = &self.syntax {
-                if !syntax_decorations(
+                syntax_decorations(
                     syntax,
                     self.row + rows.len(),
                     rows.len(),
                     text,
                     &mut row_metadata,
-                ) {
-                    self.state =
-                        BodyState::Unavailable("source row exceeds decoration admission".into());
-                    break;
-                }
+                )?;
             }
-            if metadata.visible_decoration.len() + row_metadata.visible_decoration.len() > 8192 {
+            if !rows.is_empty()
+                && metadata.visible_decoration.len() + row_metadata.visible_decoration.len() > 8192 {
                 break;
             }
             metadata
@@ -464,14 +455,6 @@ impl SourceDocument {
                 .iter()
                 .map(|decoration| 160 + decoration.capture.capacity())
                 .sum::<usize>();
-        if self.retained.saturating_add(retained) > DOCUMENT_BYTES {
-            self.state = BodyState::Unavailable("source document exceeds 16 MiB admission".into());
-            return Ok(SourceDelivery {
-                patch: None,
-                state: self.state.clone(),
-                more: false,
-            });
-        }
         let patch = if rows.is_empty() {
             None
         } else {
@@ -513,7 +496,7 @@ mod tests {
             store,
             SyntaxEngine::new(diff.analysis_pool()),
         );
-        let text = format!("+{}\n", "x".repeat(254)).repeat(8192).into_bytes();
+        let text = format!("+{}\n", "x".repeat(254)).repeat(70_000).into_bytes();
         assert!(
             service
                 .open_text(
@@ -521,7 +504,7 @@ mod tests {
                     "message".into(),
                     text.clone()
                 )
-                .is_err()
+                .is_ok()
         );
         let id = DocumentId("saved-diff".into());
         let opened = service.open_diff_text(id.clone(), "Tool changes".into(), text)?;
@@ -552,7 +535,7 @@ mod tests {
             }
             more = delivered.more;
         }
-        assert_eq!(rows, 8192);
+        assert_eq!(rows, 70_000);
         assert!(service.close(&id));
         assert!(
             service
@@ -561,7 +544,7 @@ mod tests {
                     "large".into(),
                     vec![b'x'; 8 * 1024 * 1024 + 1]
                 )
-                .is_err()
+                .is_ok()
         );
         Ok(())
     }

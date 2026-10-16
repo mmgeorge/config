@@ -11,6 +11,23 @@ globs:
 
 # Forge Plugin Rules
 
+## No Arbitrary Content-Size Limits
+
+Never reject, truncate, disable, or leave loading a valid file, document, plan,
+navigation index, declaration snapshot, diff, or editable text because it crosses
+a hardcoded byte, KB, KiB, MB, MiB, line-count, or occurrence-count threshold.
+Do not replace an existing cap with a larger cap or move it to another layer.
+Readers, parsers, renderers, persistence, transport, and editor adapters must
+preserve complete content across their shared boundaries.
+
+Use streaming, chunking, pagination, viewport rendering, cancellation, or cache
+eviction to control work without restricting accepted content. Chunk sizes,
+cache budgets, log rotation, and concurrency limits must not become total
+file-size admission limits. Surface actual I/O, decoding, allocation, or external
+service failures explicitly and leave the previous usable view intact.
+Any unavoidable external format or API limit needs concrete evidence and the
+user's explicit approval before introducing a rejection or truncation policy.
+
 ## Harness Check Ownership
 
 Inside Forge Harness, agents must perform automated validation through the checks

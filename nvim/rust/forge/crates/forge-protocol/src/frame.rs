@@ -2,34 +2,26 @@ use std::io;
 
 use tokio::io::{AsyncBufRead, AsyncBufReadExt};
 
-use crate::MAX_FRAME_BYTES;
-
 pub struct JsonLineReader<Input> {
     input: Input,
     frame: Vec<u8>,
-    limit: usize,
     failed: bool,
 }
 
 impl<Input: AsyncBufRead + Unpin> JsonLineReader<Input> {
     pub fn new(input: Input) -> Self {
-        Self::with_limit(input, MAX_FRAME_BYTES)
-    }
-
-    pub fn with_limit(input: Input, limit: usize) -> Self {
         Self {
             input,
             frame: Vec::new(),
-            limit,
             failed: false,
         }
     }
 
     /// Reads one frame without retaining bytes from subsequent frames.
     ///
-    /// The newline does not count toward the limit. A final frame at EOF is
+    /// A final frame at EOF is
     /// returned once even without a newline. Cancellation retains a partial
-    /// frame in this reader. An I/O or size error terminates its lifetime.
+    /// frame in this reader. An I/O error terminates its lifetime.
     pub async fn next_frame(&mut self) -> io::Result<Option<Vec<u8>>> {
         if self.failed {
             return Err(io::Error::new(
@@ -55,14 +47,6 @@ impl<Input: AsyncBufRead + Unpin> JsonLineReader<Input> {
             }
             let newline = available.iter().position(|byte| *byte == b'\n');
             let count = newline.unwrap_or(available.len());
-            if count > self.limit.saturating_sub(self.frame.len()) {
-                self.failed = true;
-                self.frame.clear();
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Forge JSONL frame exceeds its byte limit",
-                ));
-            }
             self.frame.extend_from_slice(&available[..count]);
             self.input.consume(count + usize::from(newline.is_some()));
             if newline.is_some() {
@@ -93,27 +77,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn accepts_exact_limit_without_counting_the_newline() {
-        let mut reader =
-            JsonLineReader::with_limit(BufReader::with_capacity(2, &b"1234\n\n"[..]), 4);
+    async fn preserves_newline_delimited_and_empty_records() {
+        let mut reader = JsonLineReader::new(BufReader::with_capacity(2, &b"1234\n\n"[..]));
         assert_eq!(reader.next_frame().await.unwrap().unwrap(), b"1234");
         assert!(reader.next_frame().await.unwrap().unwrap().is_empty());
         assert!(reader.next_frame().await.unwrap().is_none());
     }
 
     #[tokio::test]
-    async fn rejects_oversized_unterminated_input_and_poisoned_followup() {
-        let mut reader =
-            JsonLineReader::with_limit(BufReader::with_capacity(2, &b"12345\n{}\n"[..]), 4);
-        assert_eq!(
-            reader.next_frame().await.unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert!(reader.frame.is_empty());
-        assert_eq!(
-            reader.next_frame().await.unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
+    async fn preserves_complete_requests_beyond_output_frame_and_queue_budgets() {
+        let body = "λ".repeat(8 * 1024 * 1024 + 1);
+        let encoded = format!("{{\"text\":\"{body}\"}}\n{{}}\n");
+        let mut reader = JsonLineReader::new(BufReader::with_capacity(64 * 1024, encoded.as_bytes()));
+        let frame = reader.next_frame().await.unwrap().unwrap();
+        let decoded: serde_json::Value = serde_json::from_slice(&frame).unwrap();
+        assert_eq!(decoded["text"], body);
+        assert_eq!(reader.next_frame().await.unwrap().unwrap(), b"{}");
+        assert!(reader.next_frame().await.unwrap().is_none());
     }
 
     #[tokio::test]

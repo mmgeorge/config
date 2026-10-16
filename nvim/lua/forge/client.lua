@@ -142,7 +142,6 @@ local function write_request(id, method, params, session_id)
   if not client.pending[id] then return end
   local ok, failure = pcall(function()
     local encoded = protocol.encode_request(id, method, params, session_id)
-    assert(#encoded <= 512 * 1024, "Forge request exceeds frame limit")
     assert(client.process, "Forge host is not running")
     client.process:write(encoded)
   end)

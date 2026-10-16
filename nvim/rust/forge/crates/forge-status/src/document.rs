@@ -18,7 +18,6 @@ use forge_git::{
 use std::collections::HashMap;
 use std::sync::{Arc, atomic::AtomicBool};
 
-pub(crate) const DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 pub(crate) use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionStore};
 
 pub(crate) struct StatusDocument {
@@ -111,7 +110,6 @@ impl FileTarget {
         };
         let stats = match stats {
             forge_git::snapshot::LineStats::Unknown => StatusStatistics::Unknown,
-            forge_git::snapshot::LineStats::ExceedsLimit => StatusStatistics::ExceedsLimit,
             forge_git::snapshot::LineStats::Exact { added, deleted } => {
                 StatusStatistics::Exact { added, deleted }
             }
@@ -237,10 +235,6 @@ impl StatusDocument {
         let retained_bytes = retained_bytes
             + context_cost(context.as_ref())
             + local_path.as_ref().map_or(0, |path| path.retained_bytes());
-        ensure!(
-            retained_bytes <= DOCUMENT_BYTES,
-            "status inventory exceeds document budget"
-        );
         Ok(Self {
             id,
             revision: DocumentRevision(0),
@@ -432,10 +426,6 @@ pub(crate) fn inventory(
             retained_bytes += observed.analysis[usize::from(section == StatusSection::Staged)]
                 .as_ref()
                 .map_or(0, forge_git::snapshot::PreparedAnalysis::retained_bytes);
-            ensure!(
-                retained_bytes <= DOCUMENT_BYTES,
-                "status inventory exceeds 16 MiB document budget"
-            );
             let target = file_target(id);
             order.push(target.clone());
             file.insert(

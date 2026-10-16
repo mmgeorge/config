@@ -140,7 +140,6 @@ pub(super) fn parse(
     source: SourceVersion,
     language: SyntaxLanguage,
     budget: &WorkBudget,
-    line_limited: bool,
 ) -> Result<ParsedSyntax, SyntaxError> {
     budget.check().map_err(stop_error)?;
     let parsed = ParsedSyntax {
@@ -152,9 +151,6 @@ pub(super) fn parse(
         tree: Vec::new(),
         line: Vec::new(),
     };
-    if line_limited {
-        return Ok(parsed);
-    }
     let line = std::iter::once(0)
         .chain(
             parsed.source

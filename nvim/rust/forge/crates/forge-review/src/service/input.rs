@@ -509,7 +509,7 @@ impl ReviewDocument {
 
 fn workspace_file_path(workspace: &std::path::Path, relative: &str) -> Result<String> {
     ensure!(
-        !relative.is_empty() && relative.len() <= 65_536 && !relative.contains('\0'),
+        !relative.is_empty() && !relative.contains('\0'),
         "review working-file target has an invalid path"
     );
     let relative = std::path::Path::new(relative);
@@ -522,7 +522,7 @@ fn workspace_file_path(workspace: &std::path::Path, relative: &str) -> Result<St
     let path = workspace.join(relative);
     let bytes = path.as_os_str().as_encoded_bytes();
     ensure!(
-        path.is_absolute() && bytes.len() <= 65_536 && !bytes.contains(&0),
+        path.is_absolute() && !bytes.contains(&0),
         "review working-file path is invalid"
     );
     Ok(path.to_string_lossy().into_owned())
@@ -534,8 +534,7 @@ fn validate_browser_url(url: &str) -> Result<()> {
         .or_else(|| url.strip_prefix("http://"))
         .and_then(|remainder| remainder.split('/').next());
     ensure!(
-        url.len() <= 65_536
-            && !url.contains(char::is_control)
+        !url.contains(char::is_control)
             && authority.is_some_and(|authority| !authority.is_empty()),
         "review browser target has an invalid URL"
     );

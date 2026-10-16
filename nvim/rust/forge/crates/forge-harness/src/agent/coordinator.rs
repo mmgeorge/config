@@ -400,7 +400,6 @@ impl AgentCoordinator {
 
 fn validate_message(message: &str) -> Result<()> {
     ensure!(!message.trim().is_empty(), "child message must not be empty");
-    ensure!(message.len() <= 256 * 1024, "child message exceeds 256 KiB");
     Ok(())
 }
 

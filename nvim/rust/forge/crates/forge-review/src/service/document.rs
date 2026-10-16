@@ -667,22 +667,6 @@ impl ReviewService {
                     block.push(title_block("space:description".into(), "")?);
                     block.append(&mut description);
                 }
-                ensure!(
-                    block
-                        .iter()
-                        .map(|block| block.text.byte_count())
-                        .sum::<usize>()
-                        <= 16 * 1024 * 1024,
-                    "review presentation byte limit exceeded"
-                );
-                ensure!(
-                    block
-                        .iter()
-                        .map(|block| block.text.row_count())
-                        .sum::<usize>()
-                        <= 65_536,
-                    "review presentation row limit exceeded"
-                );
                 Ok::<_, anyhow::Error>((block, link, target))
             })();
             let _ = sender.send(result);

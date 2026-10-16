@@ -5,7 +5,6 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use forge_diff::source::MAX_SOURCE_BYTES;
 use gix::bstr::ByteSlice;
 use gix::{
     attrs::{State, StateRef},
@@ -28,8 +27,6 @@ const ATTRIBUTE_NAMES: [&str; 6] = [
 ];
 const FILTER_ATTRIBUTE: usize = 2;
 const ENCODING_ATTRIBUTE: usize = 5;
-const MAX_CONFIGURATION_BYTES: usize = 1024 * 1024;
-const MAX_ATTRIBUTE_BYTES: usize = 64 * 1024;
 
 /// Retains sampled conversion inputs for later verification of cached canonical content.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -45,14 +42,10 @@ pub(super) enum ConversionResult {
         identity: Arc<ConversionIdentity>,
     },
     Unavailable(ContentUnavailable),
-    TooLarge {
-        capacity: usize,
-    },
 }
 
 struct DigestWriter {
     hasher: gix::hash::Hasher,
-    remaining: usize,
 }
 
 pub(super) struct ConversionSession {
@@ -129,11 +122,10 @@ pub(super) fn convert(
     repository: &RepositoryIdentity,
     path: &RepositoryPath,
     bytes: Vec<u8>,
-    limit: usize,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<ConversionResult> {
     let mut session = ConversionSession::new(local, repository, check)?;
-    let result = session.convert(local, repository, path, bytes, limit, check)?;
+    let result = session.convert(local, repository, path, bytes, check)?;
     session.verify(local, repository, check)?;
     Ok(result)
 }
@@ -145,7 +137,6 @@ impl ConversionSession {
         repository: &RepositoryIdentity,
         path: &RepositoryPath,
         bytes: Vec<u8>,
-        limit: usize,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<ConversionResult> {
         let relative = PathBuf::from(resolve_argument(path)?);
@@ -183,13 +174,10 @@ impl ConversionSession {
                     "explicit UTF-16 endianness forbids a byte-order mark"
                 );
                 let encoding = gix::filter::plumbing::worktree::encoding::for_label(label)?;
-                let capacity = encoding
+                encoding
                     .new_decoder_without_bom_handling()
                     .max_utf8_buffer_length(bytes.len())
                     .context("conversion capacity overflow")?;
-                if capacity > limit {
-                    return Ok(ConversionResult::TooLarge { capacity });
-                }
             }
         }
         check()?;
@@ -215,15 +203,10 @@ impl ConversionSession {
                         if header.kind() != gix::objs::Kind::Blob {
                             return Ok(None);
                         }
-                        ensure!(
-                            header.size() <= MAX_SOURCE_BYTES as u64,
-                            "index source exceeds canonical conversion byte limit"
-                        );
                         let object = local.find_object(index_entry.id)?;
                         ensure!(
-                            object.data.len() as u64 == header.size()
-                                && object.data.capacity() <= MAX_SOURCE_BYTES,
-                            "index conversion source exceeds admitted capacity"
+                            object.data.len() as u64 == header.size(),
+                            "index conversion source differs from its header"
                         );
                         ensure!(
                             gix::objs::compute_hash(
@@ -242,10 +225,6 @@ impl ConversionSession {
             match outcome {
                 ToGitOutcome::Unchanged(_) => None,
                 ToGitOutcome::Buffer(converted) => {
-                    ensure!(
-                        converted.len() <= limit,
-                        "canonical conversion exceeded admitted output size"
-                    );
                     Some(converted.to_vec())
                 }
                 ToGitOutcome::Process(_) => {
@@ -294,10 +273,6 @@ pub(crate) fn resolve_attributes(
             serialized.push(b'=');
             serialized.extend_from_slice(value.as_ref().as_bstr());
         }
-        ensure!(
-            serialized.len() <= MAX_ATTRIBUTE_BYTES,
-            "resolved attributes exceed conversion limit"
-        );
     }
     serialized.push(b'\n');
     let mut collection = gix::attrs::search::MetadataCollection::default();
@@ -420,13 +395,12 @@ pub(crate) fn read_info(
         Ok(mut file) => {
             let metadata = file.metadata()?;
             ensure!(
-                metadata.is_file() && metadata.len() <= MAX_CONFIGURATION_BYTES as u64,
-                "info attributes exceed conversion input limit"
+                metadata.is_file(),
+                "info attributes must be a regular file"
             );
-            Ok(Some(super::read_bounded(
+            Ok(Some(super::read_exact_content(
                 &mut file,
-                metadata.len() as usize,
-                MAX_CONFIGURATION_BYTES,
+                usize::try_from(metadata.len()).context("attribute length overflow")?,
                 check,
             )?))
         }
@@ -464,7 +438,6 @@ fn reload(
 fn configuration_digest(local: &gix::Repository) -> Result<gix::ObjectId> {
     let mut writer = DigestWriter {
         hasher: gix::hash::hasher(gix::hash::Kind::Sha256),
-        remaining: MAX_CONFIGURATION_BYTES,
     };
     local.config_snapshot().plumbing().write_to(&mut writer)?;
     Ok(writer.hasher.try_finalize()?)
@@ -500,7 +473,6 @@ fn attribute_digest(attribute: &[State]) -> Result<gix::ObjectId> {
     );
     let mut writer = DigestWriter {
         hasher: gix::hash::hasher(gix::hash::Kind::Sha256),
-        remaining: MAX_ATTRIBUTE_BYTES,
     };
     for state in attribute {
         match state.as_ref() {
@@ -519,12 +491,6 @@ fn attribute_digest(attribute: &[State]) -> Result<gix::ObjectId> {
 
 impl Write for DigestWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        if bytes.len() > self.remaining {
-            return Err(io::Error::other(
-                "canonical configuration or attribute byte limit exceeded",
-            ));
-        }
-        self.remaining -= bytes.len();
         self.hasher.update(bytes);
         Ok(bytes.len())
     }
@@ -562,7 +528,6 @@ mod tests {
                         &repository,
                         &path,
                         b"one\r\n".to_vec(),
-                        MAX_SOURCE_BYTES,
                         &mut || Ok(()),
                     )
                     .unwrap();
@@ -612,7 +577,6 @@ mod tests {
                 &repository,
                 &path,
                 b"one\r\n".to_vec(),
-                MAX_SOURCE_BYTES,
                 &mut || Ok(()),
             )
             .unwrap();

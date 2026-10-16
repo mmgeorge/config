@@ -107,6 +107,7 @@ module.exports = grammar({
     [$.scoped_identifier, $.scoped_type_identifier],
     [$.parameters, $._pattern],
     [$.parameters, $.tuple_struct_pattern],
+    [$.foreign_mod_item, $.function_modifiers],
     [$.array_expression],
     [$.visibility_modifier],
     [$.visibility_modifier, $.scoped_identifier, $.scoped_type_identifier],
@@ -280,6 +281,7 @@ module.exports = grammar({
 
     foreign_mod_item: $ => seq(
       optional($.visibility_modifier),
+      optional('unsafe'),
       $.extern_modifier,
       choice(
         ';',

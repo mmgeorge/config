@@ -18,6 +18,11 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(
+        workspace.join(".forge.json"),
+        json!({"checks":{"version":2,"definitions":[]}}).to_string(),
+    )
+    .unwrap();
     assert!(
         Command::new("git")
             .arg("init")
@@ -168,16 +173,22 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         .await;
     assert!(retained.response.error().is_none());
     let after = broker.snapshot().unwrap();
-    assert_eq!(after.active_plan.unwrap().id, before.active_plan.unwrap().id);
+    let plan = after.active_plan.as_ref().unwrap();
+    assert_eq!(plan.id, before.active_plan.as_ref().unwrap().id);
+    assert_eq!(plan.state, forge_harness::plan::PlanState::AwaitingReview);
     assert_eq!(after.exchange.len(), before.exchange.len());
     let accepted = broker
         .dispatch(Request {
             id: 14,
             method: "plan.accept".into(),
-            params: json!({ "execution_mode": "write" }),
+            params: json!({
+                "plan_id": plan.id,
+                "digest": plan.review_digest.as_deref().unwrap(),
+                "execution_mode": "write"
+            }),
         })
         .await;
-    assert!(accepted.response.error().is_none());
+    assert!(accepted.response.error().is_none(), "{:?}", accepted.response.error());
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
         PermissionMode::Write

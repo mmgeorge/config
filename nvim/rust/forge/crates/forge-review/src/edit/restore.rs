@@ -49,11 +49,6 @@ impl EditStore {
                     "review region identity was already used",
                 ));
             }
-            if self.field.len() >= self.limits.active_fields
-                || self.used_region.len() >= self.limits.region_lifetimes
-            {
-                return Err(EditError::Capacity("review region admission is full"));
-            }
         }
         if self
             .pending
@@ -154,7 +149,7 @@ mod tests {
 
     #[test]
     fn restored_capture_keeps_exact_counters_and_new_owner_settlement() {
-        let budget = EditBudget::new(1024).unwrap();
+        let budget = EditBudget::default();
         let identity = DocumentId("restored".into());
         let region = RegionId("body".into());
         let mut store = EditStore::new(identity.clone(), EditLimits::default(), budget).unwrap();
@@ -175,7 +170,7 @@ mod tests {
         let mut foreign = EditStore::new(
             DocumentId("foreign".into()),
             EditLimits::default(),
-            EditBudget::new(1024).unwrap(),
+            EditBudget::default(),
         )
         .unwrap();
         assert_eq!(
@@ -204,7 +199,7 @@ mod tests {
 
     #[test]
     fn failed_restoration_preserves_allocation_and_region_admission() {
-        let budget = EditBudget::new(10).unwrap();
+        let budget = EditBudget::default();
         let mut store = EditStore::new(
             DocumentId("restored".into()),
             EditLimits::default(),
@@ -212,7 +207,9 @@ mod tests {
         )
         .unwrap();
         let region = RegionId("body".into());
-        assert!(store.restore_field(region.clone(), restoration()).is_err());
+        let mut invalid = restoration();
+        invalid.pending.as_mut().unwrap().sequence = EditSequence(101);
+        assert!(store.restore_field(region.clone(), invalid).is_err());
         assert_eq!(budget.retained_bytes(), 0);
         assert_eq!(store.next_save, 0);
         assert!(store.snapshot(&region).is_err());
@@ -228,7 +225,7 @@ mod tests {
 
     #[test]
     fn restoration_deduplicates_text_and_rejects_accepted_regions() {
-        let budget = EditBudget::new(4).unwrap();
+        let budget = EditBudget::default();
         let mut store = EditStore::new(
             DocumentId("restored".into()),
             EditLimits::default(),

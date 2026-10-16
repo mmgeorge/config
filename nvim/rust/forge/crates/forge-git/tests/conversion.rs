@@ -4,7 +4,7 @@ use forge_diff::source::Representation;
 use forge_git::{
     RepositoryPath,
     content::{
-        ContentLimits, ContentRequest, ContentResult, ContentSource, ContentUnavailable,
+        ContentRequest, ContentResult, ContentSource, ContentUnavailable,
         WorktreeConversion,
     },
     store::RepositoryStore,
@@ -139,7 +139,7 @@ async fn external_filters_and_unproven_encodings_remain_explicitly_unavailable()
 }
 
 #[tokio::test]
-async fn encoding_capacity_and_byte_order_marks_are_checked_before_conversion() {
+async fn encoding_preserves_complete_content_and_rejects_invalid_byte_order_marks() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     git(root, &["init", "--quiet"]);
@@ -148,18 +148,13 @@ async fn encoding_capacity_and_byte_order_marks_are_checked_before_conversion() 
         "file working-tree-encoding=UTF-16LE text\n",
     )
     .unwrap();
-    fs::write(root.join("file"), b"o\0n\0e\0\r\0\n\0").unwrap();
+    let input = b"o\0n\0e\0\r\0\n\0".repeat(900_000);
+    fs::write(root.join("file"), input).unwrap();
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let mut request = canonical_request();
-    request.limits = ContentLimits::new(10, 10).unwrap();
-    assert!(matches!(
-        repository.content(&store, request).await.unwrap().value,
-        ContentResult::TooLarge {
-            kind: forge_git::content::ContentLimit::ConversionCapacity,
-            ..
-        }
-    ));
+    let result = repository.content(&store, canonical_request()).await.unwrap().value;
+    let ContentResult::Ready(content) = result else { panic!("{result:?}") };
+    assert_eq!(content.source.bytes(), b"one\n".repeat(900_000));
     fs::write(root.join("file"), b"\xff\xfeo\0").unwrap();
     let result = repository
         .content(&store, canonical_request())
@@ -178,7 +173,6 @@ fn canonical_request() -> ContentRequest {
             path: RepositoryPath::new(b"file".to_vec()).unwrap(),
             conversion: WorktreeConversion::GitCanonical,
         },
-        limits: ContentLimits::default(),
         expected: None,
     }
 }

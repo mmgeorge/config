@@ -46,7 +46,7 @@ impl HarnessBroker {
                         if forge_diff::syntax::DeclarationOverview::supports(path)
                             && !accepted_paths.contains(path)
                         {
-                            let expected = initial.read(&self.store.objects, path, usize::MAX)?;
+                            let expected = initial.read(&self.store.objects, path)?;
                             let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
                             progress.source_digest.insert(path.to_string(), source.as_deref().map_or_else(|| "absent".into(), |text| crate::plan::digest(text.as_bytes())));
                             let expected = expected.map(String::from_utf8).transpose()?;
@@ -239,7 +239,7 @@ impl HarnessBroker {
                         .cloned()
                         .collect::<Vec<_>>();
                     for path in newly_captured {
-                        if let Some(source) = checkpoint.read(&self.store.objects, &path, 1024 * 1024)? {
+                        if let Some(source) = checkpoint.read(&self.store.objects, &path)? {
                             let source_digest = crate::plan::digest(&source);
                             let source = String::from_utf8(source)?;
                             let (text, calls) =

@@ -51,14 +51,14 @@ impl Target {
         ensure!(
             self.symbol
                 .as_ref()
-                .is_none_or(|name| !name.trim().is_empty() && name.len() <= 256),
-            "symbol must contain 1-256 bytes"
+                .is_none_or(|name| !name.trim().is_empty()),
+            "symbol must be nonempty"
         );
         ensure!(
             self.path
                 .as_ref()
-                .is_none_or(|path| !path.is_empty() && path.len() <= 4096),
-            "path must contain 1-4096 bytes"
+                .is_none_or(|path| !path.is_empty()),
+            "path must be nonempty"
         );
         ensure!(
             self.line.is_none_or(|line| line > 0) && self.column.is_none_or(|column| column > 0),
@@ -227,14 +227,14 @@ impl Arguments {
         ensure!(
             self.path
                 .as_ref()
-                .is_none_or(|value| !value.is_empty() && value.len() <= 4096),
-            "path must contain 1-4096 bytes"
+                .is_none_or(|value| !value.is_empty()),
+            "path must be nonempty"
         );
         ensure!(
             self.query
                 .as_ref()
-                .is_none_or(|value| !value.trim().is_empty() && value.len() <= 256),
-            "query must contain 1-256 bytes"
+                .is_none_or(|value| !value.trim().is_empty()),
+            "query must be nonempty"
         );
         ensure!(
             self.query.is_none() || self.operation == Operation::Symbols,
@@ -342,13 +342,13 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
     NAMES.iter().map(|&name| {
         let operation = name.trim_start_matches("lsp_");
         let position = matches!(operation, "definition" | "context" | "references" | "calls");
-        let mut properties = json!({"path":{"type":"string","minLength":1,"maxLength":4096,"description":"Workspace-relative or authorized absolute path."}});
+        let mut properties = json!({"path":{"type":"string","minLength":1,"description":"Workspace-relative or authorized absolute path."}});
         let fields = properties.as_object_mut().unwrap();
         let mut required = Vec::new();
         if position {
             fields.insert("line".into(), json!({"type":"integer","minimum":1,"description":"One-based source line from a tool result."}));
             fields.insert("column".into(), json!({"type":"integer","minimum":1,"description":"One-based Unicode code-point column of the symbol."}));
-            fields.insert("symbol".into(), json!({"type":"string","minLength":1,"maxLength":256,"description":"Exact short or qualified name. With line, locate its spelling on that line. Ambiguity returns candidates."}));
+            fields.insert("symbol".into(), json!({"type":"string","minLength":1,"description":"Exact short or qualified name. With line, locate its spelling on that line. Ambiguity returns candidates."}));
         }
         if operation != "status" { fields.insert("token_budget".into(), json!({"type":"integer","minimum":1,"maximum":8000,"default":2000,"description":"Estimated output tokens, not an exact model tokenizer count."})); }
         if !matches!(operation, "context" | "status" | "paths") {
@@ -362,15 +362,15 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
         if matches!(operation, "symbols" | "references" | "calls" | "paths") { fields.insert("scope".into(), json!({"type":"string","enum":["workspace","all"],"default":"workspace"})); }
         let description = match operation {
             "overview" => { fields.insert("declaration_depth".into(), json!({"type":"integer","minimum":1,"maximum":8,"default":2})); "Map public declarations, members, and methods under a directory. Tree-sitter supplies source structure. Reuse returned positions with context and semantic tools." },
-            "symbols" => { fields.insert("query".into(), json!({"type":"string","minLength":1,"maxLength":256,"description":"Optional workspace symbol name search. Omit to list declarations under path."})); "Find declarations by name or list a file/directory. Returns signatures, hierarchy, and reusable identifier positions, without bodies." },
+            "symbols" => { fields.insert("query".into(), json!({"type":"string","minLength":1,"description":"Optional workspace symbol name search. Omit to list declarations under path."})); "Find declarations by name or list a file/directory. Returns signatures, hierarchy, and reusable identifier positions, without bodies." },
             "definition" => { fields.insert("kind".into(), json!({"type":"string","enum":["definition","type","implementation"],"default":"definition"})); "Find a symbol's definition, its type declaration, or its implementations. Use a symbol name or source position. Name lookup selects a declaration, while a position resolves that occurrence." },
             "context" => { fields.insert("include".into(), json!({"type":"array","uniqueItems":true,"maxItems":4,"items":{"type":"string","enum":["references","callers","callees","implementations"]},"description":"Optional related signatures, at most five per relation, sharing the budget."})); fields.insert("start_line".into(), json!({"type":"integer","minimum":1,"description":"Continue at returned next_line, preserving the original target position."})); "Read the containing declaration, source docs, and full body within token_budget. Optional semantic relationships are signature summaries. Live unsaved source is included." },
             "references" => { fields.insert("include_declaration".into(), json!({"type":"boolean","default":false})); "Find semantic uses, grouped by file and enclosing signature, with one source line before and after each occurrence. Matching rows use >." },
             "calls" => { fields.insert("direction".into(), json!({"type":"string","enum":["incoming","outgoing"]})); required.push("direction"); "Find one level of incoming callers or outgoing callees. Returns a symbol tree with aligned definition locations. The root is the selected symbol. Incoming children call the root. The root calls outgoing children." },
             "paths" => {
                 let target = json!({"type":"object","additionalProperties":false,"properties":{
-                    "path":{"type":"string","minLength":1,"maxLength":4096},
-                    "symbol":{"type":"string","minLength":1,"maxLength":256},
+                    "path":{"type":"string","minLength":1},
+                    "symbol":{"type":"string","minLength":1},
                     "line":{"type":"integer","minimum":1},"column":{"type":"integer","minimum":1}
                 },"description":"Use a symbol, optionally scoped to a file, or a file/line/column occurrence. A file/line/symbol selects a unique spelling on that line."});
                 fields.remove("path");
@@ -391,6 +391,20 @@ pub(crate) fn definitions() -> Vec<super::super::ControlToolDefinition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_paths_and_symbol_queries_have_no_byte_ceiling() {
+        let path = format!("{}source.rs", "directory/".repeat(512));
+        let symbol = "qualified_symbol_".repeat(512);
+        let target = json!({"path":path,"symbol":symbol});
+        assert!(Arguments::parse("lsp_context", target.clone()).is_ok());
+        assert!(Arguments::parse("lsp_paths", json!({"from":target,"to":{"symbol":"finish"}})).is_ok());
+        assert!(Arguments::parse("lsp_symbols", json!({"path":path,"query":symbol})).is_ok());
+        for definition in definitions() {
+            let schema = serde_json::to_string(&definition.input_schema).unwrap();
+            assert!(!schema.contains("maxLength"));
+        }
+    }
 
     #[test]
     fn requested_result_count_has_no_arbitrary_upper_bound() {

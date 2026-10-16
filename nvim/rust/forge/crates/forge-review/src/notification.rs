@@ -31,8 +31,6 @@ use std::{
 
 pub trait NotificationRemote: GithubNotificationRemote + GithubReviewWriteRemote {}
 impl<Remote: GithubNotificationRemote + GithubReviewWriteRemote> NotificationRemote for Remote {}
-const MAX_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RECORDS: usize = 10_000;
 
 pub struct NotificationDocumentService {
     github: GithubService,
@@ -306,20 +304,6 @@ impl NotificationDocumentService {
                     records.push(record);
                 }
             }
-            ensure!(
-                records.len() <= MAX_RECORDS,
-                "notification record limit exceeded"
-            );
-            ensure!(
-                serde_json::to_vec(&records)?.len()
-                    + if input.action == "refresh" {
-                        0
-                    } else {
-                        serde_json::to_vec(&document.detail)?.len()
-                    }
-                    <= MAX_BYTES / 2,
-                "notification source admission exceeded"
-            );
             document.record = records;
             if input.action == "refresh" {
                 document.diagnostic.clear();
@@ -366,18 +350,6 @@ impl NotificationDocumentService {
                         }
                         _ => unreachable!(),
                     }
-                    ensure!(
-                        candidate.unread.len() <= MAX_RECORDS
-                            && candidate.saved.len() <= MAX_RECORDS,
-                        "notification local record limit exceeded"
-                    );
-                    let bytes = serde_json::to_vec(&candidate.saved)?.len()
-                        + serde_json::to_vec(&candidate.done)?.len()
-                        + serde_json::to_vec(&candidate.unread)?.len();
-                    ensure!(
-                        bytes <= 1024 * 1024,
-                        "notification local choices exceed 1 MiB"
-                    );
                     *local = candidate;
                 }
                 if input.action != "unread" {
@@ -464,20 +436,6 @@ impl NotificationDocumentService {
                                     .get(&record.id)
                                     .and_then(|previous| previous.comments);
                             }
-                            let previous_bytes = document
-                                .detail
-                                .get(&record.id)
-                                .map(serde_json::to_vec)
-                                .transpose()?
-                                .map_or(0, |bytes| bytes.len());
-                            let retained = serde_json::to_vec(&document.record)?.len()
-                                + serde_json::to_vec(&document.detail)?.len()
-                                - previous_bytes
-                                + serde_json::to_vec(&detail)?.len();
-                            ensure!(
-                                retained <= MAX_BYTES / 2,
-                                "notification detail admission exceeded"
-                            );
                             document.diagnostic.remove(&record.id);
                             document.detail.insert(record.id, detail);
                         }
@@ -591,16 +549,6 @@ fn reproject(document: &mut NotificationDocument) -> Result<Option<BufferPatch>>
             records.push(record.clone());
         }
     }
-    ensure!(
-        records.len() <= MAX_RECORDS,
-        "notification record admission exceeded"
-    );
-    let mut retained =
-        serde_json::to_vec(&records)?.len() + serde_json::to_vec(&document.detail)?.len();
-    ensure!(
-        retained <= MAX_BYTES / 2,
-        "notification sources exceed 8 MiB"
-    );
     for category in ["Unread", "Saved", "Done"] {
         let category_id = format!("notifications:{category}");
         block.push(plain(&category_id, [format!("{category}:")])?);
@@ -743,20 +691,10 @@ fn reproject(document: &mut NotificationDocument) -> Result<Option<BufferPatch>>
         });
         block.push(footer);
     }
-    let projection_bytes = serde_json::to_vec(&block)?.len();
-    ensure!(
-        projection_bytes <= MAX_BYTES / 2,
-        "notification projection exceeds 8 MiB"
-    );
-    retained += projection_bytes;
     document.identity.retain(|id, _| seen.contains(id));
     document.detail.retain(|id, _| seen.contains(id));
     document.diagnostic.retain(|id, _| seen.contains(id));
     document.expanded.retain(|id| seen.contains(id));
-    ensure!(
-        retained <= MAX_BYTES,
-        "notification document exceeds 16 MiB"
-    );
     let old: Vec<_> = document
         .buffer
         .blocks(document.buffer.revision(), 0..document.buffer.block_count())?

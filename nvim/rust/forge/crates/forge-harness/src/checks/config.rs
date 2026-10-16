@@ -112,15 +112,10 @@ impl CheckConfig {
             self.version == 2,
             "unsupported checks configuration version"
         );
-        ensure!(
-            self.definitions.len() <= 128,
-            "checks exceeds 128 definitions"
-        );
         let mut identities = BTreeSet::new();
         for definition in &self.definitions {
             ensure!(
                 !definition.area.trim().is_empty()
-                    && definition.area.len() <= 128
                     && !definition.area.contains(['\0', '\n', '\r']),
                 "invalid check area"
             );
@@ -142,7 +137,7 @@ impl CheckConfig {
                 definition.id
             );
             ensure!(
-                !definition.name.trim().is_empty() && definition.name.len() <= 256,
+                !definition.name.trim().is_empty(),
                 "invalid check name"
             );
             relative_path(&definition.directory)?;
@@ -152,7 +147,6 @@ impl CheckConfig {
             {
                 ensure!(
                     !operation.command.trim().is_empty()
-                        && operation.command.len() <= 16384
                         && !operation.command.contains(['\0', '\r', '\n']),
                     "invalid command for {}",
                     definition.id
@@ -236,9 +230,6 @@ impl ConfigSnapshot {
 pub(crate) fn read_document(workspace: &Path) -> Result<serde_json::Value> {
     let path = workspace.join(".forge.json");
     reject_links(workspace, &path)?;
-    if let Ok(metadata) = std::fs::metadata(&path) {
-        ensure!(metadata.len() <= 1024 * 1024, ".forge.json exceeds 1 MiB");
-    }
     let source = match std::fs::read(&path) {
         Ok(source) => source,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -246,7 +237,6 @@ pub(crate) fn read_document(workspace: &Path) -> Result<serde_json::Value> {
         }
         Err(error) => return Err(error).context("read .forge.json"),
     };
-    ensure!(source.len() <= 1024 * 1024, ".forge.json exceeds 1 MiB");
     let document: serde_json::Value =
         serde_json::from_slice(&source).context("invalid .forge.json")?;
     ensure!(document.is_object(), ".forge.json must contain an object");
@@ -256,7 +246,7 @@ pub(crate) fn read_document(workspace: &Path) -> Result<serde_json::Value> {
 /// Rejects absolute and parent-relative paths before joining a project directory.
 pub(crate) fn relative_path(path: &str) -> Result<PathBuf> {
     ensure!(
-        !path.is_empty() && path.len() <= 4096 && !path.contains(['\0', '\\', ':']),
+        !path.is_empty() && !path.contains(['\0', '\\', ':']),
         "path must use project-relative forward slashes"
     );
     let path = PathBuf::from(path);
@@ -292,15 +282,7 @@ fn collect_helpers(
         if kind.is_dir() {
             collect_helpers(workspace, &entry.path(), result)?;
         } else if kind.is_file() {
-            ensure!(
-                entry.metadata()?.len() <= 256 * 1024 && result.len() < 128,
-                "checks helper limits exceeded"
-            );
             let source = std::fs::read(entry.path())?;
-            ensure!(
-                source.len() <= 256 * 1024 && result.len() < 128,
-                "checks helper limits exceeded"
-            );
             result.insert(
                 entry
                     .path()

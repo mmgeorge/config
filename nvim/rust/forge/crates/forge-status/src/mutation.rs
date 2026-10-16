@@ -672,7 +672,7 @@ impl StatusService {
         let mut selected = HashMap::new();
         if let Some(selection) = selection {
             ensure!(
-                !selection.target.is_empty() && selection.target.len() <= 65536,
+                !selection.target.is_empty(),
                 "invalid status selection size"
             );
             for location in selection.target {
@@ -853,10 +853,6 @@ impl StatusService {
                 .worktree_root
                 .clone()
                 .context("ignored paths require worktree")?;
-            let retained = private_path
-                .iter()
-                .map(|path| path.retained_bytes() * 2 + 64)
-                .sum();
             intent.set_settlement_handler(
                 Arc::new(move |outcome| {
                     let completed: Vec<_> = private_path
@@ -873,7 +869,6 @@ impl StatusService {
                     crate::ignored::update(&directory, &root, &expected, &completed, false)
                         .map(|_| ())
                 }),
-                retained,
             )?;
         }
         let operation = intent.operation();
@@ -935,18 +930,6 @@ impl StatusService {
             }
             apply_prediction(&mut prediction, selected)?;
         }
-        ensure!(
-            prediction_cost(&prediction)
-                + state
-                    .pending
-                    .iter()
-                    .flat_map(|pending| &pending.target)
-                    .chain(&target)
-                    .map(target_cost)
-                    .sum::<usize>()
-                <= 64 * 1024 * 1024,
-            "status mutation journal exceeds 64 MiB"
-        );
         state.confirmed = prediction.confirmed;
         state.confirmed_source = prediction.confirmed_source;
         state.head_source = prediction.head_source;
@@ -1188,7 +1171,7 @@ impl StatusService {
                         file.record.unstaged_stats = stats;
                     }
                     file.cursor = Some(
-                        DisplayCursor::compact(analysis.clone(), 3, body_kind(&file))
+                        DisplayCursor::compact(analysis.clone(), 3)
                             .with_syntax_context(
                                 file.old_syntax.as_ref(),
                                 file.new_syntax.as_ref(),
@@ -1352,7 +1335,7 @@ impl StatusService {
             file.old_syntax = old;
             file.new_syntax = new;
             file.cursor = Some(
-                DisplayCursor::compact(analysis.clone(), 3, body_kind(&file))
+                DisplayCursor::compact(analysis.clone(), 3)
                     .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref()),
             );
             file.state = BodyState::Partial;
@@ -1699,55 +1682,6 @@ fn prediction_copy(state: &WorktreeJournal) -> WorktreeJournal {
     }
 }
 
-fn target_cost(target: &MutationTarget) -> usize {
-    512 + target.observed.change.path.retained_bytes()
-        + target
-            .edit
-            .as_ref()
-            .map_or(0, EditSelection::retained_bytes)
-        + target.source.as_ref().map_or(0, |source| {
-            source.old.bytes().len() + source.new.bytes().len()
-        })
-}
-
-fn prediction_cost(state: &WorktreeJournal) -> usize {
-    state
-        .confirmed_source
-        .values()
-        .map(|source| source.bytes().len())
-        .sum::<usize>()
-        + state
-            .head_source
-            .values()
-            .chain(state.worktree_source.values())
-            .map(|source| source.bytes().len())
-            .sum::<usize>()
-        + state
-            .projected
-            .values()
-            .map(|projection| {
-                512 + projection.original.change.path.retained_bytes()
-                    + projection
-                        .head
-                        .as_ref()
-                        .map_or(0, |source| source.bytes().len())
-                    + projection
-                        .worktree
-                        .as_ref()
-                        .map_or(0, |source| source.bytes().len())
-                    + match &projection.index {
-                        IndexSource::Captured(source) => source.bytes().len(),
-                        _ => 0,
-                    }
-            })
-            .sum::<usize>()
-        + state
-            .transition
-            .iter()
-            .map(|(path, edit)| path.retained_bytes() + edit.retained_bytes())
-            .sum::<usize>()
-}
-
 fn remember(document: &mut StatusDocument, before: SelectionVersion) {
     document.history.push_back(before);
     let mut retained: usize = document
@@ -1863,18 +1797,6 @@ fn reset_body(document: &mut StatusDocument, file: &mut FileTarget) -> Result<()
     Ok(())
 }
 
-fn body_kind(file: &FileTarget) -> BodyKind {
-    match if file.section == StatusSection::Staged {
-        file.record.staged
-    } else {
-        file.record.unstaged
-    } {
-        ChangeKind::Added => BodyKind::Added,
-        ChangeKind::Deleted => BodyKind::Deleted,
-        _ => BodyKind::Modified,
-    }
-}
-
 fn full_delivery(document: &StatusDocument, file: &FileTarget) -> BodyDelivery {
     BodyDelivery {
         document: document.id.clone(),
@@ -1988,10 +1910,6 @@ fn replay_pending(state: &mut WorktreeJournal, pending: &mut PendingMutation) ->
     if pending.target.is_empty() {
         return Ok(());
     }
-    ensure!(
-        prediction_cost(&prediction) <= 64 * 1024 * 1024,
-        "replayed status journal exceeds 64 MiB"
-    );
     let intent = pending
         .intent
         .as_mut()

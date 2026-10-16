@@ -4,7 +4,7 @@ use std::process::Output;
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Deserializer};
 
-use super::{BoundedVec, GhClient, append_diagnostic, classify_failure, diagnostic};
+use super::{GhClient, append_diagnostic, classify_failure, diagnostic};
 use crate::model::{ConversationComment, IssueDetail};
 use crate::remote::{IssueDetailRequest, RemoteFailure, RemoteFailureKind};
 
@@ -23,14 +23,14 @@ struct DetailResponse {
     created_at: String,
     updated_at: String,
     #[serde(deserialize_with = "nullable_collection")]
-    labels: BoundedVec<NamedValue, 100>,
+    labels: Vec<NamedValue>,
     #[serde(deserialize_with = "nullable_collection")]
-    assignees: BoundedVec<Login, 100>,
+    assignees: Vec<Login>,
     milestone: Option<TitledValue>,
     #[serde(deserialize_with = "nullable_collection")]
-    project_items: BoundedVec<ProjectItem, 100>,
+    project_items: Vec<ProjectItem>,
     #[serde(deserialize_with = "nullable_collection")]
-    comments: BoundedVec<CommentResponse, 1000>,
+    comments: Vec<CommentResponse>,
 }
 
 #[derive(Deserialize)]
@@ -128,8 +128,8 @@ fn decode_detail(
             "GitHub issue detail has invalid identity, state, title, or timestamps",
         ));
     }
-    let mut comments = Vec::with_capacity(response.comments.0.len());
-    for comment in response.comments.0 {
+    let mut comments = Vec::with_capacity(response.comments.len());
+    for comment in response.comments {
         let Some((source, anchor)) = comment.url.split_once("#issuecomment-") else {
             return Err(invalid_response(
                 "GitHub issue comment omits its source anchor",
@@ -155,7 +155,7 @@ fn decode_detail(
         });
     }
     let mut projects = Vec::new();
-    for project in response.project_items.0 {
+    for project in response.project_items {
         let status = project
             .status
             .map_or_else(String::new, |status| status.name);
@@ -187,14 +187,12 @@ fn decode_detail(
         updated_at: response.updated_at,
         labels: response
             .labels
-            .0
             .into_iter()
             .map(|label| label.name)
             .filter(|name| !name.is_empty())
             .collect(),
         assignees: response
             .assignees
-            .0
             .into_iter()
             .map(|assignee| assignee.login)
             .filter(|login| !login.is_empty())
@@ -221,11 +219,10 @@ fn nullable_collection<
     'input,
     Value: Deserialize<'input>,
     Decoder: Deserializer<'input>,
-    const LIMIT: usize,
 >(
     deserializer: Decoder,
-) -> std::result::Result<BoundedVec<Value, LIMIT>, Decoder::Error> {
-    Option::<BoundedVec<Value, LIMIT>>::deserialize(deserializer).map(Option::unwrap_or_default)
+) -> std::result::Result<Vec<Value>, Decoder::Error> {
+    Option::<Vec<Value>>::deserialize(deserializer).map(Option::unwrap_or_default)
 }
 
 #[cfg(test)]
@@ -340,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn collection_limits_fail_instead_of_returning_truncated_detail() {
+    fn detail_preserves_collections_beyond_previous_limits() {
         for (field, limit) in [
             ("comments", 1000),
             ("labels", 100),
@@ -352,9 +349,7 @@ mod tests {
             value[field] = json!(vec![record.clone(); limit]);
             assert!(decode(value.clone()).is_ok(), "{field} at limit");
             value[field] = json!(vec![record; limit + 1]);
-            let failure = decode(value).unwrap_err();
-            assert_eq!(failure.kind, RemoteFailureKind::InvalidResponse);
-            assert!(failure.message.contains(&format!("{limit} records")));
+            assert!(decode(value).is_ok(), "{field} beyond former limit");
         }
     }
 }

@@ -171,6 +171,10 @@ fn main() {
     }
     if argument.get(4).is_some_and(|argument| argument == "user") {
         assert_eq!(argument.len(), 5);
+        if let Ok(message) = fs::read_to_string("actor-error") {
+            eprintln!("{message}");
+            std::process::exit(1);
+        }
         std::io::stdout()
             .write_all(br#"{"login":"fixture","node_id":"ACTOR_fixture"}"#)
             .unwrap();

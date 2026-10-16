@@ -12,23 +12,12 @@ use crate::{
     store::RepositoryStore,
 };
 
-const MAX_CANDIDATES: usize = 20_000;
-const MAX_CANDIDATE_BYTES: usize = 2 * 1024 * 1024;
-const MAX_ENUMERATION_BYTES: usize = 16 * 1024 * 1024;
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct RevisionId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RevisionBackend {
     Gix,
-}
-
-/// Bounds candidate storage independently from reference enumeration output.
-#[derive(Clone, Copy, Debug)]
-pub struct CandidateLimits {
-    items: usize,
-    bytes: usize,
 }
 
 /// Immutable, sorted raw revision arguments accepted for one repository generation.
@@ -40,7 +29,6 @@ pub struct RevisionCandidates {
     pub backend: RevisionBackend,
     pub reference_digest: String,
     pub values: Vec<Vec<u8>>,
-    pub truncated: bool,
     pub retained_bytes: usize,
 }
 
@@ -58,40 +46,18 @@ struct RevisionRequest {
 
 struct CandidateValues {
     values: Vec<Vec<u8>>,
-    truncated: bool,
     retained_bytes: usize,
-}
-
-impl Default for CandidateLimits {
-    fn default() -> Self {
-        Self {
-            items: MAX_CANDIDATES,
-            bytes: MAX_CANDIDATE_BYTES,
-        }
-    }
-}
-
-impl CandidateLimits {
-    /// Accepts lower limits, including zero, without increasing the shared cache ceilings.
-    pub fn new(items: usize, bytes: usize) -> Result<Self> {
-        ensure!(
-            items <= MAX_CANDIDATES && bytes <= MAX_CANDIDATE_BYTES,
-            "revision candidate limits exceed supported ceilings"
-        );
-        Ok(Self { items, bytes })
-    }
 }
 
 impl RepositoryState {
     /// Refreshes local and remote branch arguments on the shared read pool.
     ///
-    /// Two equal bounded enumerations fence detected ref changes. A newer request or repository
+    /// Two equal complete enumerations fence detected ref changes. A newer request or repository
     /// invalidation rejects adoption. Failed refreshes preserve the previous accepted snapshot.
     /// Native filesystem waits can outlive the 30-second cooperative deadline.
     pub async fn refresh_revisions(
         self: &Arc<Self>,
         store: &RepositoryStore,
-        limits: CandidateLimits,
     ) -> Result<Arc<RevisionCandidates>> {
         let request = self.begin_revisions()?;
         let worker = Arc::clone(self);
@@ -99,7 +65,6 @@ impl RepositoryState {
             .read(
                 Arc::clone(self),
                 size_of::<RevisionRequest>()
-                    + size_of::<CandidateLimits>()
                     + size_of::<Arc<Self>>(),
                 move |local, cancellation| {
                     let started = Instant::now();
@@ -116,8 +81,8 @@ impl RepositoryState {
                         Ok(())
                     };
                     let candidates =
-                        collect_candidates(local.object_hash(), limits, &mut check, |check| {
-                            enumerate(&local, limits, check)
+                        collect_candidates(local.object_hash(), &mut check, |check| {
+                            enumerate(&local, check)
                         })?;
                     Ok(RevisionCandidates {
                         revision: request.revision,
@@ -126,7 +91,6 @@ impl RepositoryState {
                         backend: RevisionBackend::Gix,
                         reference_digest: format!("{:064x}", request.revision.0),
                         values: candidates.values,
-                        truncated: candidates.truncated,
                         retained_bytes: candidates.retained_bytes,
                     })
                 },
@@ -190,13 +154,12 @@ impl RepositoryState {
 
 fn collect_candidates(
     hash: gix::hash::Kind,
-    limits: CandidateLimits,
     check: &mut dyn FnMut() -> Result<()>,
     mut enumerate: impl FnMut(&mut dyn FnMut() -> Result<()>) -> Result<Vec<u8>>,
 ) -> Result<CandidateValues> {
     check()?;
     let first = enumerate(check)?;
-    let candidates = build_candidates(&first, hash, limits)?;
+    let candidates = build_candidates(&first, hash)?;
     check()?;
     let second = enumerate(check)?;
     ensure!(
@@ -209,7 +172,6 @@ fn collect_candidates(
 
 fn enumerate(
     repository: &gix::Repository,
-    limits: CandidateLimits,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
     use gix::bstr::ByteSlice;
@@ -218,25 +180,15 @@ fn enumerate(
     let references = platform.all()?;
     let mut names = Vec::new();
     let mut branches = Vec::new();
-    let mut name_bytes = 0usize;
     for reference in references {
         check()?;
         let reference =
             reference.map_err(|error| anyhow::anyhow!("enumerate revision reference: {error}"))?;
         let name = reference.name().as_bstr().as_bytes().to_vec();
-        name_bytes = name_bytes.saturating_add(name.capacity());
-        ensure!(
-            name_bytes <= MAX_ENUMERATION_BYTES,
-            "reference enumeration exceeds byte limit"
-        );
         if name.starts_with(b"refs/heads/") || name.starts_with(b"refs/remotes/") {
             branches.push(name.clone());
         }
         names.push(name);
-        ensure!(
-            names.len() <= MAX_CANDIDATES * 16,
-            "reference enumeration exceeds count limit"
-        );
     }
     branches.sort_unstable();
     branches.dedup();
@@ -245,7 +197,7 @@ fn enumerate(
         *short_counts.entry(abbreviated_name(name)).or_insert(0usize) += 1;
     }
     let mut output = Vec::new();
-    for name in branches.into_iter().take(limits.items + 1) {
+    for name in branches {
         check()?;
         let abbreviated = abbreviated_name(&name);
         let collisions = short_counts.get(&abbreviated).copied().unwrap_or(0);
@@ -266,10 +218,6 @@ fn enumerate(
         output.push(0);
         output.extend_from_slice(object.to_string().as_bytes());
         output.extend_from_slice(b"\0\n");
-        ensure!(
-            output.len() <= MAX_ENUMERATION_BYTES,
-            "revision enumeration exceeds byte limit"
-        );
     }
     Ok(output)
 }
@@ -289,34 +237,17 @@ fn abbreviated_name(name: &[u8]) -> Vec<u8> {
 fn build_candidates(
     bytes: &[u8],
     hash: gix::hash::Kind,
-    limits: CandidateLimits,
 ) -> Result<CandidateValues> {
-    ensure!(
-        bytes.len() <= MAX_ENUMERATION_BYTES,
-        "revision enumeration exceeds byte limit"
-    );
     ensure!(
         bytes.is_empty() || bytes.ends_with(b"\n"),
         "revision enumeration is truncated"
     );
     let record_count = bytes.iter().filter(|byte| **byte == b'\n').count();
-    ensure!(
-        record_count <= limits.items + 1,
-        "revision enumeration exceeds record limit"
-    );
-    let capacity = record_count
-        .min(limits.items)
-        .min(limits.bytes / size_of::<Vec<u8>>());
     let mut values = Vec::new();
     values
-        .try_reserve_exact(capacity)
+        .try_reserve_exact(record_count)
         .context("reserve revision candidate index")?;
     let mut retained_bytes = values.capacity() * size_of::<Vec<u8>>();
-    ensure!(
-        retained_bytes <= limits.bytes,
-        "revision candidate index exceeds byte limit"
-    );
-    let mut truncated = false;
     let mut previous: Option<&[u8]> = None;
     for record in bytes.split_inclusive(|byte| *byte == b'\n') {
         let mut field = record[..record.len() - 1].split(|byte| *byte == 0);
@@ -348,21 +279,10 @@ fn build_candidates(
             gix::ObjectId::from_hex(object)?.kind() == hash,
             "revision object hash format mismatch"
         );
-        if truncated
-            || values.len() == capacity
-            || short.len() > limits.bytes.saturating_sub(retained_bytes)
-        {
-            truncated = true;
-            continue;
-        }
         let mut value = Vec::new();
         value
             .try_reserve_exact(short.len())
             .context("reserve revision argument")?;
-        ensure!(
-            value.capacity() <= limits.bytes.saturating_sub(retained_bytes),
-            "revision allocation exceeds byte limit"
-        );
         value.extend_from_slice(short);
         retained_bytes += value.capacity();
         values.push(value);
@@ -374,7 +294,6 @@ fn build_candidates(
     );
     Ok(CandidateValues {
         values,
-        truncated,
         retained_bytes,
     })
 }
@@ -396,7 +315,7 @@ mod tests {
     }
 
     #[test]
-    fn candidates_preserve_raw_arguments_and_bound_index_and_value_capacity() {
+    fn candidates_preserve_complete_raw_arguments() {
         let bytes = [
             record(b"refs/heads/a", b"heads/a"),
             record(b"refs/heads/b", b"b"),
@@ -404,47 +323,28 @@ mod tests {
         ]
         .concat();
         let complete =
-            build_candidates(&bytes, gix::hash::Kind::Sha1, CandidateLimits::default()).unwrap();
+            build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
         assert_eq!(
             complete.values,
             [b"b".to_vec(), b"heads/a".to_vec(), b"origin/\xff".to_vec()]
         );
-        assert!(!complete.truncated);
         assert_eq!(
             complete.retained_bytes,
             complete.values.capacity() * size_of::<Vec<u8>>()
                 + complete.values.iter().map(Vec::capacity).sum::<usize>()
         );
-        let limited = build_candidates(
-            &bytes,
-            gix::hash::Kind::Sha1,
-            CandidateLimits::new(2, MAX_CANDIDATE_BYTES).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(limited.values.len(), 2);
-        assert!(limited.truncated);
-        let bytes_limit = 3 * size_of::<Vec<u8>>() + 7;
-        let limited = build_candidates(
-            &bytes,
-            gix::hash::Kind::Sha1,
-            CandidateLimits::new(3, bytes_limit).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(limited.values, [b"heads/a".to_vec()]);
-        assert!(limited.truncated);
-        assert!(limited.retained_bytes <= bytes_limit);
-        let zero = build_candidates(
-            &record(b"refs/heads/a", b"a"),
-            gix::hash::Kind::Sha1,
-            CandidateLimits::new(0, 0).unwrap(),
-        )
-        .unwrap();
-        assert!(zero.values.is_empty() && zero.truncated);
-        assert_eq!(zero.retained_bytes, 0);
+        let bytes = (0..20_001)
+            .map(|index| record(format!("refs/heads/branch-{index:05}").as_bytes(),
+                format!("branch-{index:05}").as_bytes()))
+            .flatten()
+            .collect::<Vec<_>>();
+        let complete = build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
+        assert_eq!(complete.values.len(), 20_001);
+        assert_eq!(complete.values.last().unwrap(), b"branch-20000");
     }
 
     #[test]
-    fn malformed_and_oversized_enumerations_do_not_publish_partial_candidates() {
+    fn malformed_enumerations_do_not_publish_partial_candidates() {
         for bytes in [
             b"refs/heads/a\0a\0".to_vec(),
             record(b"refs/tags/a", b"a"),
@@ -453,7 +353,7 @@ mod tests {
             [record(b"refs/heads/a", b"a"), record(b"refs/heads/b", b"a")].concat(),
         ] {
             assert!(
-                build_candidates(&bytes, gix::hash::Kind::Sha1, CandidateLimits::default())
+                build_candidates(&bytes, gix::hash::Kind::Sha1)
                     .is_err()
             );
         }
@@ -461,17 +361,6 @@ mod tests {
             build_candidates(
                 &record(b"refs/heads/a", b"a"),
                 gix::hash::Kind::Sha256,
-                CandidateLimits::default()
-            )
-            .is_err()
-        );
-        assert!(CandidateLimits::new(MAX_CANDIDATES + 1, 0).is_err());
-        assert!(CandidateLimits::new(0, MAX_CANDIDATE_BYTES + 1).is_err());
-        assert!(
-            build_candidates(
-                &[record(b"refs/heads/a", b"a"), record(b"refs/heads/b", b"b")].concat(),
-                gix::hash::Kind::Sha1,
-                CandidateLimits::new(0, 0).unwrap()
             )
             .is_err()
         );
@@ -482,7 +371,6 @@ mod tests {
         let mut enumeration = 0;
         let changed = collect_candidates(
             gix::hash::Kind::Sha1,
-            CandidateLimits::default(),
             &mut || Ok(()),
             |_| {
                 enumeration += 1;
@@ -508,7 +396,6 @@ mod tests {
         enumeration = 0;
         let cancelled = collect_candidates(
             gix::hash::Kind::Sha1,
-            CandidateLimits::default(),
             &mut || {
                 checks += 1;
                 ensure!(checks < 2, "cancelled between enumerations");
@@ -576,7 +463,6 @@ mod tests {
                 backend: RevisionBackend::Gix,
                 reference_digest: format!("{:064x}", request.revision.0),
                 values: Vec::new(),
-                truncated: false,
                 retained_bytes: 0,
             },
         }

@@ -4,6 +4,18 @@ A saved plan describes a proposed interface and its review evidence. Harness val
 
 Tree-sitter extraction and LSP setup are separate capabilities. See [Languages](languages.md) and [Adding a language](../adding-language.md).
 
+## Complete plan artifacts
+
+Plan readers retain complete documents, source snapshots, Markdown, navigation indexes, and
+annotations. A large navigation index follows the same integrity and regular-file checks as a
+small one, without inheriting a source-file byte ceiling. Current and historical review capture
+validate the saved artifacts before constructing the view.
+
+Rendering and editor delivery preserve every logical row. Pagination and transport chunks control
+individual deliveries rather than total plan size, and an oversized first record still makes
+progress. Patch confirmations retain the complete applied diff. Cache eviction controls retained
+reuse without rejecting explicit reads, declaration analysis, edits, or reviews.
+
 ## Local annotations and recovery
 
 `forge.draft_comments` owns local compact and full-width comment presentation. PlanReview
@@ -124,8 +136,8 @@ turn, and optional `source_digests` preserves read identities across turns. Prov
 first-capture digests for broker replay, so a source change after acknowledgement also rejects the patch.
 Invalid syntax, paths, bodies, stale versions, source identities, or unmatched context change nothing.
 Every patch that changes the design increments the version. Patch confirmation includes
-the applied declaration and overview deltas with three context lines, capped at 16 KiB with explicit
-truncation. The agent can confirm focused edits without a second read. The baseline remains immutable.
+the complete applied declaration and overview deltas with three context lines.
+The agent can confirm focused edits without a second read. The baseline remains immutable.
 Successful submission retains inconclusive reference warnings in the saved validation evidence and
 returns only acceptance and version to the provider. Proven-invalid references still return actionable errors.
 Reference validation reads relevant ancestor manifests, lockfiles, and untouched modules on demand

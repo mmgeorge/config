@@ -1,7 +1,7 @@
 //! Repository user metadata retains current cache paths and publishes through atomic replacement.
 
 use std::fs;
-use std::io::Read;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
@@ -10,9 +10,6 @@ use serde::{Deserialize, Serialize};
 use crate::lease::RepositoryLease;
 use crate::model::GithubRepositoryId;
 use crate::remote::RemoteFailure;
-
-pub const MAX_METADATA_BYTES: usize = crate::publication::MAX_CACHE_JSON_BYTES;
-pub const MAX_USERS: usize = 100_000;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct RepositoryUser {
@@ -118,15 +115,8 @@ impl MetadataStore {
             Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(failure) => return Err(failure).context("read repository metadata"),
         };
-        let mut encoded = Vec::new();
-        file.take((MAX_METADATA_BYTES + 1) as u64)
-            .read_to_end(&mut encoded)?;
-        ensure!(
-            encoded.len() <= MAX_METADATA_BYTES,
-            "repository metadata exceeds its byte limit"
-        );
         let metadata: RepositoryMetadata =
-            serde_json::from_slice(&encoded).context("decode repository metadata")?;
+            serde_json::from_reader(BufReader::new(file)).context("decode repository metadata")?;
         self.validate(&metadata)?;
         Ok(Some(metadata))
     }
@@ -148,10 +138,6 @@ impl MetadataStore {
                     .is_none_or(|host| host.eq_ignore_ascii_case(self.repository.hostname())),
             "repository metadata identity differs from its cache path"
         );
-        ensure!(
-            metadata.contributors.len() <= MAX_USERS && metadata.failure.len() <= 2,
-            "repository metadata exceeds its record limit"
-        );
         for user in &metadata.contributors {
             validate_user(user)?;
         }
@@ -162,16 +148,11 @@ impl MetadataStore {
 pub(crate) fn validate_user(user: &RepositoryUser) -> Result<()> {
     ensure!(
         !user.login.is_empty()
-            && user.login.len() <= 256
             && !user
                 .login
                 .chars()
                 .any(|character| character.is_whitespace() || character.is_control()),
         "repository user has an invalid login"
-    );
-    ensure!(
-        user.name.as_ref().is_none_or(|name| name.len() <= 1024),
-        "repository user name exceeds its byte limit"
     );
     Ok(())
 }
@@ -181,9 +162,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn oversized_publication_preserves_the_previous_file_and_removes_temporary_output() -> Result<()>
+    fn large_publication_roundtrips_complete_metadata_and_removes_intermediate_output() -> Result<()>
     {
-        let root = tempfile::tempdir()?;
+        let root = tempfile::Builder::new().prefix(".forge-metadata-").tempdir_in(std::env::current_dir()?)?;
         let directory = root.path().join("github.com/repos/owner/repo");
         let _lease = RepositoryLease::metadata(&directory)?;
         let store = MetadataStore::new(
@@ -198,16 +179,16 @@ mod tests {
             failure: Vec::new(),
         };
         store.publish(&metadata)?;
-        let previous = fs::read(directory.join("metadata.json"))?;
         metadata.contributors = (0..9000)
             .map(|number| RepositoryUser {
                 login: format!("user-{number}"),
                 name: Some("\"".repeat(1024)),
             })
             .collect();
-        let failure = store.publish(&metadata).unwrap_err();
-        assert!(failure.to_string().contains("byte limit"));
-        assert_eq!(fs::read(directory.join("metadata.json"))?, previous);
+        store.publish(&metadata)?;
+        assert!(fs::metadata(directory.join("metadata.json"))?.len() > 16 * 1024 * 1024);
+        let restored = store.read()?.unwrap();
+        assert_eq!(restored.contributors, metadata.contributors);
         assert_eq!(fs::read_dir(directory)?.count(), 1);
         Ok(())
     }

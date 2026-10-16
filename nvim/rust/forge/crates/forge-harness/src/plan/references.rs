@@ -50,7 +50,7 @@ impl PlanReferenceIndex {
             return Self::legacy(document, workspace);
         };
         let mut resolver = DeclarationResolver::planned(workspace, design, baseline)?;
-        resolver.bound_reference_files();
+        resolver.discard_snapshot_originals();
         Self::extract(design, baseline, resolver)
     }
 
@@ -292,10 +292,6 @@ impl PlanReferenceIndex {
             }
             output.declaration.insert(path.clone(), index);
         }
-        ensure!(
-            output.occurrence.len() <= 65536,
-            "plan reference index exceeds 65536 occurrences"
-        );
         let mut capture_by_path = BTreeMap::new();
         let mut capture_by_identity = BTreeMap::new();
         for (path, index) in &output.declaration {
@@ -794,7 +790,6 @@ impl PlanReferenceIndex {
             .version
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("plan version overflow"))?;
-        ensure!(serde_json::to_vec(&output)?.len() <= 8 * 1024 * 1024, "renamed plan exceeds 8 MiB");
         Ok(output)
     }
 

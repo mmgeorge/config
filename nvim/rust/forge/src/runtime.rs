@@ -68,7 +68,7 @@ impl ForgeRuntime {
             forge_review::notification::NotificationDocumentService::new(github.clone());
         let issues = forge_review::issue_service::IssueDocumentService::new(
             github.clone(),
-            forge_review::edit::EditBudget::new(32 * 1024 * 1024)?,
+            forge_review::edit::EditBudget::default(),
             diff.analysis_pool(),
         );
         let github_remote = Arc::new(GhClient::new("gh".into(), std::env::current_dir()?)?);

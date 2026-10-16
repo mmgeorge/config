@@ -53,6 +53,21 @@ requests[3].callback({ patch = {} })
 timer:stop()
 timer:close()
 assert(observations > 0)
+---@type string[]
+local prompt_rows = {}
+for index = 1, 5000 do prompt_rows[index] = string.rep("complete prompt ", 5) end
+local prompt = table.concat(prompt_rows, "\n")
+assert(#prompt > 65536)
+vim.api.nvim_buf_set_lines(composer, 0, -1, false, prompt_rows)
+local submitted = false
+owner.submit(function(result, failure)
+  assert(result and not failure, failure)
+  submitted = true
+end)
+local submission = requests[#requests]
+assert(submission.params.text == prompt, "large composer draft lost content")
+submission.callback({ accepted = true })
+assert(submitted, "large composer submission did not finish")
 owner.sync()
 assert(owner.close())
 local closed_count = #requests

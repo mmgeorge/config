@@ -442,11 +442,26 @@ impl ConnectionHost {
         let shutdown = timeout(SHUTDOWN_DEADLINE, self.runtime.shutdown());
         tokio::pin!(shutdown);
         let mut feature_done = false;
+        let mut subscription_done = false;
+        let mut subscription = None;
         let mut request_abort_started = false;
         loop {
             let pending = self.requests.pending();
+            if feature_done && pending.is_empty() && !subscription_done && subscription.is_none() {
+                match self.router.finish_status_subscription() {
+                    Ok(task) => {
+                        subscription = task;
+                        subscription_done = subscription.is_none();
+                    }
+                    Err(error) => {
+                        failure.push(format!("{error:#}"));
+                        subscription_done = true;
+                    }
+                }
+            }
             if feature_done
                 && pending.is_empty()
+                && subscription_done
                 && let Some(sink) = connection.sink.take()
                 && let Some(request_id) = request_id
                 && connection.writer.is_some()
@@ -460,7 +475,7 @@ impl ConnectionHost {
                     failure.push(error.to_string());
                 }
             }
-            if feature_done && pending.is_empty() && connection.writer.is_none() {
+            if feature_done && pending.is_empty() && subscription_done && connection.writer.is_none() {
                 break;
             }
             tokio::select! {
@@ -474,6 +489,15 @@ impl ConnectionHost {
                 }
                 joined = self.requests.join_next(), if !pending.is_empty() => {
                     if let Some(Err(error)) = joined { failure.push(format!("{error:#}")); }
+                }
+                result = async { subscription.as_mut().expect("pending Forge status subscription").await }, if subscription.is_some() => {
+                    subscription.take();
+                    subscription_done = true;
+                    match result {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => failure.push(format!("Forge status subscription failed: {error:#}")),
+                        Err(error) => failure.push(format!("Forge status subscription task failed: {error}")),
+                    }
                 }
                 result = async { connection.writer.as_mut().expect("pending Forge writer").await }, if connection.writer.is_some() => {
                     connection.writer.take();
@@ -510,6 +534,20 @@ impl ConnectionHost {
                         self.requests.abort_all();
                     }
                 }
+            }
+        }
+        match self.router.finish_status_subscription() {
+            Ok(Some(task)) => subscription = Some(task),
+            Ok(None) => {}
+            Err(error) => failure.push(format!("{error:#}")),
+        }
+        if let Some(task) = subscription {
+            task.abort();
+            match task.await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => failure.push(format!("Forge status subscription failed: {error:#}")),
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => failure.push(format!("Forge status subscription task failed: {error}")),
             }
         }
         connection.sink.take();
@@ -731,6 +769,46 @@ mod tests {
                 .contains("connection shutdown deadline expired")
         );
         assert!(runtime.requests.pending().is_empty());
+    }
+
+    #[tokio::test]
+    async fn eof_collects_status_subscription_while_runtime_update_source_remains_alive() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+
+        let runtime = Arc::new(ForgeRuntime::new().unwrap());
+        let mut updates = runtime.status.subscribe_updates();
+        let host = ConnectionHost::new(Arc::clone(&runtime));
+        let (client, server) = tokio::io::duplex(4096);
+        let (input, output) = tokio::io::split(server);
+        let running = tokio::spawn(async move { host.run(input, output).await });
+        let mut client = BufReader::new(client);
+        client.get_mut().write_all(format!(
+            "{{\"id\":1,\"method\":\"initialize\",\"params\":{{\"protocol_version\":{}}}}}\n{{\"id\":2,\"method\":\"state.get\",\"params\":{{}}}}\n",
+            forge_protocol::WIRE_VERSION,
+        ).as_bytes()).await.unwrap();
+        for expected in [1, 2] {
+            let mut response = Vec::new();
+            client.read_until(b'\n', &mut response).await.unwrap();
+            let response: Value = serde_json::from_slice(&response).unwrap();
+            assert_eq!(response["id"], expected);
+            if expected == 1 {
+                assert!(response.get("error").is_none(), "{response}");
+            } else {
+                assert_eq!(response["error"]["code"], "request_failed", "{response}");
+            }
+        }
+        client.get_mut().shutdown().await.unwrap();
+        timeout(Duration::from_secs(3), async {
+            let mut remaining = Vec::new();
+            client.read_to_end(&mut remaining).await.unwrap();
+            assert!(remaining.is_empty(), "{remaining:?}");
+            running.await.unwrap().unwrap();
+        }).await.expect("EOF did not collect the status subscription");
+        assert!(runtime.requests.pending().is_empty());
+        assert!(matches!(
+            updates.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]

@@ -1,7 +1,7 @@
 //! Shared wire records and bounded transport primitives for the Forge host.
 //!
-//! Framing bounds apply before JSON deserialization. A framing failure poisons
-//! the connection so a discarded prefix can never become a second request.
+//! Outbound frame limits govern individual deliveries, not complete request content.
+//! Bounded reads retain each complete JSONL request before decoding.
 
 pub mod contract;
 pub mod credit;

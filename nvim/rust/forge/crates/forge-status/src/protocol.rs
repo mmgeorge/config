@@ -66,7 +66,6 @@ pub struct StatusFile {
 pub enum StatusStatistics {
     Unknown,
     Exact { added: u64, deleted: u64 },
-    ExceedsLimit,
 }
 
 #[derive(Clone, Debug, Serialize)]

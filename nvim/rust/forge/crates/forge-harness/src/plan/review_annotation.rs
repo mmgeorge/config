@@ -1,10 +1,7 @@
 use super::{PlanAnnotationInput, digest, write_bytes_atomically};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::io::Read;
 use std::path::PathBuf;
-
-const MAX_ANNOTATION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ReviewAnnotation {
@@ -138,10 +135,6 @@ impl ReviewAnnotationStore {
             source_digest: self.source_digest.clone(),
             annotation: annotation.clone(),
         })?;
-        ensure!(
-            replacement.len() <= MAX_ANNOTATION_BYTES,
-            "plan annotations exceed 1 MiB"
-        );
         write_bytes_atomically(&self.path, &replacement)?;
         self.saved = Some(replacement);
         self.annotation = annotation;
@@ -188,19 +181,7 @@ fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
                 metadata.is_file() && !metadata.file_type().is_symlink(),
                 "plan annotation path is not a regular file"
             );
-            ensure!(
-                metadata.len() <= MAX_ANNOTATION_BYTES as u64,
-                "plan annotations exceed 1 MiB"
-            );
-            let mut bytes = Vec::new();
-            std::fs::File::open(path)?
-                .take(MAX_ANNOTATION_BYTES as u64 + 1)
-                .read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= MAX_ANNOTATION_BYTES,
-                "plan annotations exceed 1 MiB"
-            );
-            Ok(Some(bytes))
+            Ok(Some(std::fs::read(path)?))
         }
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(failure) => Err(failure.into()),
@@ -208,7 +189,6 @@ fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
-    ensure!(annotation.len() <= 64, "plan review exceeds 64 annotations");
     let mut identities = std::collections::HashSet::new();
     for annotation in annotation {
         ensure!(
@@ -223,8 +203,8 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
             "invalid plan annotation source range"
         );
         ensure!(
-            annotation.source.body.len() <= 65536 && !annotation.source.body.contains('\0'),
-            "plan annotation exceeds 64 KiB or contains NUL"
+            !annotation.source.body.contains('\0'),
+            "plan annotation contains NUL"
         );
         if let Some(parent_id) = &annotation.parent_id {
             ensure!(identities.contains(parent_id) && parent_id != &annotation.id,
@@ -233,7 +213,7 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
         if let Some(reply) = &annotation.reply {
             ensure!(annotation.kind == ReviewAnnotationKind::Question
                 && reply.question_body == annotation.source.body
-                && !reply.body.trim().is_empty() && reply.body.len() <= 8192
+                && !reply.body.trim().is_empty()
                 && !reply.body.contains('\0'), "invalid plan question reply");
         }
     }
@@ -351,6 +331,35 @@ mod tests {
         assert!(resumed.replace(Vec::new()).is_err());
         assert_eq!(resumed.annotation().len(), 1);
     }
+
+    #[test]
+    fn annotations_preserve_large_files_bodies_replies_and_collections() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = temporary.path().join("working.md");
+        std::fs::write(&source, b"canonical").unwrap();
+        let checksum = digest(b"canonical");
+        let body = "question".repeat(150_000);
+        let reply = "answer".repeat(4096);
+        let mut annotations = (0..65).map(|index| ReviewAnnotation {
+            id: format!("comment-{index}"),
+            parent_id: None,
+            source: PlanAnnotationInput { start_line: 1, end_line: 1, body: "comment".into() },
+            anchor: None,
+            kind: ReviewAnnotationKind::Comment,
+            reply: None,
+        }).collect::<Vec<_>>();
+        annotations[0].source.body = body.clone();
+        annotations[0].kind = ReviewAnnotationKind::Question;
+        annotations[0].reply = Some(ReviewQuestionReply {
+            question_body: body.clone(), body: reply.clone(), duration_ms: None,
+        });
+        let mut store = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
+        store.replace(annotations).unwrap();
+        let restored = ReviewAnnotationStore::open(source, checksum).unwrap();
+        assert_eq!(restored.annotation().len(), 65);
+        assert_eq!(restored.annotation()[0].source.body, body);
+        assert_eq!(restored.annotation()[0].reply.as_ref().unwrap().body, reply);
+    }
 }
 
 pub(crate) fn resolve_annotations(
@@ -364,16 +373,9 @@ pub(crate) fn resolve_annotations(
         .iter()
         .map(|anchor| (anchor.line, anchor))
         .collect();
-    let mut subject_bytes = 0usize;
-    let mut subject_count = 0usize;
     let annotation = annotation_input
         .into_iter()
-        .enumerate()
-        .map(|(index, input)| {
-            anyhow::ensure!(
-                index < 64 && input.body.len() <= 65536,
-                "plan annotation admission exceeds 64 comments or 64 KiB per body"
-            );
+        .map(|input| {
             anyhow::ensure!(
                 input.start_line > 0 && input.end_line as usize <= source_rows,
                 "plan annotation range is outside the reviewed source"
@@ -392,24 +394,14 @@ pub(crate) fn resolve_annotations(
                 .map(|(_, anchor)| *anchor)
                 .filter(|anchor| seen_path.insert(anchor.json_path.clone()))
                 .map(|anchor| {
-                    anyhow::ensure!(
-                        subject_count < 4096,
-                        "plan review exceeds 4096 annotation subjects"
-                    );
-                    let size = crate::limits::serialized_size(
-                        anchor,
-                        (1024 * 1024usize).saturating_sub(subject_bytes),
-                    )?;
-                    subject_count += 1;
-                    subject_bytes += size;
-                    Ok(crate::plan::PlanAnnotationSubject {
+                    crate::plan::PlanAnnotationSubject {
                         target: anchor.target.clone(),
                         json_path: anchor.json_path.clone(),
                         label: anchor.label.clone(),
                         path: anchor.path.clone(),
-                    })
+                    }
                 })
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Vec<_>>();
             anyhow::ensure!(
                 !subject.is_empty(),
                 "plan annotation lines {}-{} have no semantic render anchors",
@@ -440,7 +432,7 @@ mod subject_tests {
     use super::*;
 
     #[test]
-    fn subject_resolution_bounds_semantic_expansion_and_rejects_unmapped_ranges() {
+    fn subject_resolution_preserves_complete_content_and_rejects_unmapped_ranges() {
         let mut rendered = crate::plan::RenderedPlan {
             markdown: "x\n".repeat(4097),
             navigation: crate::plan::PlanNavigationIndex {
@@ -466,11 +458,11 @@ mod subject_tests {
                 body: "change".into(),
             }]
         };
-        let failure = resolve_annotations(&rendered, input(4097)).unwrap_err();
-        assert!(failure.to_string().contains("4096 annotation subjects"));
+        let resolved = resolve_annotations(&rendered, input(4097)).unwrap();
+        assert_eq!(resolved[0].subject.len(), 4097);
         rendered.navigation.anchor.truncate(1);
         rendered.navigation.anchor[0].label = "x".repeat(1024 * 1024);
-        assert!(resolve_annotations(&rendered, input(1)).is_err());
+        assert_eq!(resolve_annotations(&rendered, input(1)).unwrap()[0].subject[0].label.len(), 1024 * 1024);
         rendered.navigation.anchor.clear();
         assert!(
             resolve_annotations(&rendered, input(1))

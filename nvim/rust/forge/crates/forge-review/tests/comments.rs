@@ -18,11 +18,11 @@ fn target() -> PullRequestTarget {
 fn stores(mode: ReviewMode) -> (CommentStore, EditStore) {
     let document = DocumentId("review".into());
     (
-        CommentStore::new(document.clone(), target(), mode, CommentLimits::default()).unwrap(),
+        CommentStore::new(document.clone(), target(), mode).unwrap(),
         EditStore::new(
             document,
             EditLimits::default(),
-            EditBudget::new(4096).unwrap(),
+            EditBudget::default(),
         )
         .unwrap(),
     )
@@ -358,7 +358,7 @@ fn invalid_identity_anchor_and_cross_document_input_preserve_admission() {
     let mut other = EditStore::new(
         DocumentId("other".into()),
         EditLimits::default(),
-        EditBudget::new(1024).unwrap(),
+        EditBudget::default(),
     )
     .unwrap();
     assert!(comments.merge(&mut other, remote("old")).is_err());
@@ -371,47 +371,38 @@ fn invalid_identity_anchor_and_cross_document_input_preserve_admission() {
 }
 
 #[test]
-fn occurrence_lifetime_and_shared_text_bounds_do_not_lose_drafts() {
+fn complete_comment_text_and_occurrences_have_no_admission_cap() {
     let document = DocumentId("review".into());
-    let budget = EditBudget::new(3).unwrap();
+    let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
     let mut comments = CommentStore::new(
         document,
         target(),
         ReviewMode::Overview,
-        CommentLimits {
-            comments: 1,
-            occurrences: 1,
-            occurrence_lifetimes: 2,
-        },
     )
     .unwrap();
-    assert!(comments.merge(&mut edits, remote("oversized")).is_err());
-    let (comment, _) = comments.merge(&mut edits, remote("old")).unwrap();
+    let text = "x".repeat(9 * 1024 * 1024);
+    let (comment, _) = comments.merge(&mut edits, remote(&text)).unwrap();
     assert_eq!(comment, CommentId(1));
-    assert!(comments.draft(&mut edits, None).is_err());
+    for _ in 0..300 {
+        comments.draft(&mut edits, None).unwrap();
+    }
     let first = comments
         .add_occurrence(comment, OccurrenceKind::Inline)
         .unwrap();
-    assert!(
-        comments
-            .add_occurrence(comment, OccurrenceKind::Inline)
-            .is_err()
-    );
+    for _ in 0..5000 {
+        comments.add_occurrence(comment, OccurrenceKind::Inline).unwrap();
+    }
     comments.remove_occurrence(first).unwrap();
     let second = comments
         .add_occurrence(comment, OccurrenceKind::Inline)
         .unwrap();
     assert_ne!(first, second);
     comments.remove_occurrence(second).unwrap();
-    assert!(
-        comments
-            .add_occurrence(comment, OccurrenceKind::Inline)
-            .is_err()
-    );
-    assert_eq!(budget.retained_bytes(), 3);
-    assert_eq!(comments.body(&edits, comment).unwrap().text, "old");
+    comments.add_occurrence(comment, OccurrenceKind::Inline).unwrap();
+    assert_eq!(budget.retained_bytes(), text.len());
+    assert_eq!(comments.body(&edits, comment).unwrap().text, text);
 }
 
 #[test]
@@ -660,14 +651,13 @@ fn foreign_receipt_and_empty_draft_rejections_leave_owner_unchanged() {
 fn save_receipt_retains_its_shared_budget_after_document_drop() {
     use forge_review::comments::{CommentSaveAction, CommentSaveOutcome};
     let document = DocumentId("review".into());
-    let budget = EditBudget::new(16).unwrap();
+    let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
     let mut comments = CommentStore::new(
         document,
         target(),
         ReviewMode::Overview,
-        CommentLimits::default(),
     )
     .unwrap();
     let comment = comments.draft(&mut edits, Some(anchor())).unwrap();
@@ -688,17 +678,16 @@ fn save_receipt_retains_its_shared_budget_after_document_drop() {
 }
 
 #[test]
-fn failed_observation_allocation_keeps_uncertain_capture_and_identity() {
+fn invalid_observation_keeps_uncertain_capture_and_identity() {
     use forge_review::comments::{CommentSaveAction, CommentSaveOutcome};
     let document = DocumentId("review".into());
-    let budget = EditBudget::new(8).unwrap();
+    let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
     let mut comments = CommentStore::new(
         document,
         target(),
         ReviewMode::Overview,
-        CommentLimits::default(),
     )
     .unwrap();
     let (comment, _) = comments.merge(&mut edits, remote("old")).unwrap();
@@ -710,9 +699,11 @@ fn failed_observation_allocation_keeps_uncertain_capture_and_identity() {
     comments
         .complete_save(&mut edits, &save, CommentSaveOutcome::Uncertain)
         .unwrap();
+    let mut invalid = remote("remote");
+    invalid.identity.node_id = "different".into();
     assert!(
         comments
-            .reconcile_save(&mut edits, &save, Some(remote("remote")))
+            .reconcile_save(&mut edits, &save, Some(invalid))
             .is_err()
     );
     let body = comments.body(&edits, comment).unwrap();

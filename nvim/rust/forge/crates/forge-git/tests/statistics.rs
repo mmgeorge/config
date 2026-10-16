@@ -183,7 +183,7 @@ async fn saturated_cache_preserves_exact_counts_and_unavailable_classification()
     }
     std::fs::write(
         root.join("oversized"),
-        vec![b'x'; forge_diff::source::MAX_SOURCE_BYTES + 1],
+        vec![b'x'; 8 * 1024 * 1024 + 1],
     )
     .unwrap();
     let mut store = RepositoryStore::default();
@@ -199,6 +199,7 @@ async fn saturated_cache_preserves_exact_counts_and_unavailable_classification()
         ("unterminated", 1),
         ("crlf", 2),
         ("encoded", 1),
+        ("oversized", 1),
     ] {
         let path = observation
             .path
@@ -215,7 +216,7 @@ async fn saturated_cache_preserves_exact_counts_and_unavailable_classification()
         );
         assert!(path.analysis.iter().all(Option::is_none));
     }
-    for name in ["binary", "invalid", "filtered", "oversized"] {
+    for name in ["binary", "invalid", "filtered"] {
         let path = observation
             .path
             .iter()

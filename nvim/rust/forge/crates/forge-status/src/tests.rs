@@ -37,7 +37,6 @@ fn git(root: &Path, arguments: &[&str]) -> Vec<u8> {
                 read_command(
                     &mut command,
                     CommandLimits {
-                        stdout_bytes: 64 * 1024,
                         stderr_bytes: 4096,
                         timeout: Duration::from_secs(10),
                     },
@@ -104,10 +103,10 @@ fn literal_source_uses_shared_admission_and_bounded_first_delivery() {
         service
             .open_text(
                 DocumentId("large".into()),
-                "too large".into(),
+                "large source".into(),
                 vec![b'a'; 1024 * 1024 + 1]
             )
-            .is_err()
+            .is_ok()
     );
     assert!(service.close(&DocumentId("message".into())));
 }
@@ -966,7 +965,7 @@ async fn body_continuation_is_bounded_and_loaded_blocks_remain() {
 }
 
 #[tokio::test]
-async fn oversized_added_file_is_explicitly_unavailable() {
+async fn large_added_file_remains_available_through_chunked_delivery() {
     let (directory, service, _, _) = fixture().await;
     std::fs::write(directory.path().join("added.txt"), "line\n".repeat(1001)).unwrap();
     let snapshot = service
@@ -977,9 +976,9 @@ async fn oversized_added_file_is_explicitly_unavailable() {
         .demand(input(&snapshot, "added.txt", 1, "demand"))
         .await
         .unwrap();
-    assert!(matches!(delivery.state, BodyState::Unavailable(_)));
+    assert_eq!(delivery.state, BodyState::Partial);
     assert!(delivery.snapshot.is_some());
-    assert!(!delivery.more);
+    assert!(delivery.more);
 }
 
 #[tokio::test]
@@ -1206,6 +1205,33 @@ async fn local_document_filters_neighbors_and_stages_with_shared_writer() {
     assert_eq!(current.file.len(), 1);
     assert_eq!(current.file[0].section, StatusSection::Staged);
     assert_ne!(current.file[0].id, snapshot.file[0].id);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity() {
+    let (directory, service, _, _) = fixture().await;
+    let storage = tempfile::tempdir().unwrap();
+    let alias = storage.path().join("worktree-link");
+    std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
+    let selected = vec![forge_git::RepositoryPath::new(b"sample.txt".to_vec()).unwrap()];
+    crate::ignored::update(
+        storage.path(), directory.path(), &Default::default(), &selected, true,
+    ).unwrap();
+    assert_eq!(
+        crate::ignored::load(Some(storage.path()), &alias).unwrap(),
+        selected.into_iter().collect(),
+    );
+    for deleted in [false, true] {
+        if deleted {
+            std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
+        }
+        let snapshot = service.open_local(
+            DocumentId(format!("linked-local-{deleted}")), alias.join("sample.txt"),
+        ).await.unwrap();
+        assert_eq!(snapshot.file.len(), 1);
+        assert!(service.close(&snapshot.document));
+    }
 }
 
 #[tokio::test]

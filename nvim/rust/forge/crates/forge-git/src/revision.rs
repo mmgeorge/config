@@ -32,7 +32,6 @@ pub async fn resolve_file(
 ) -> Result<RepositoryRead<ResolvedFile>> {
     ensure!(
         !reference.is_empty()
-            && reference.len() <= 4096
             && !reference.chars().any(char::is_control),
         "invalid revision reference"
     );

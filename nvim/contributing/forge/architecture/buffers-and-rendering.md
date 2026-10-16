@@ -77,8 +77,13 @@ visible through the existing notification and recovery paths.
 
 Status retains file bodies independently of visible rows. Opening an unloaded file requests
 its body before expanding. The shared projector handles file, hunk, and section expansion,
-while the Git service remains responsible for paging and semantic actions. Review buffers
-retain canonical source rows and draft comments separately. A collapsed source row is
+while the Git service remains responsible for paging and semantic actions. If a generation
+change discards a body delivery, the Status renderer requests a complete body snapshot before
+accepting a patch whose base is missing or ahead of the retained body revision. Demand responses
+and context events can cross in transit, so deliveries already covered by a retained body do not
+replace it. Snapshot recovery retains the prior usable view and expansion intent, admits recovery
+from a desynchronized body, and reports request failures through the existing notification path.
+Review buffers retain canonical source rows and draft comments separately. A collapsed source row is
 omitted from presentation without deleting its comment or changing its source anchor.
 
 Updates validate source identities, ranges, and revisions before publication. The buffer
@@ -334,35 +339,33 @@ the leading and trailing edges of each group. A cursor tracks source line and by
 positions monotonically, skipping hidden gaps without constructing an all-file display-row array or
 another complete source-line index.
 
-Each delivery caps source rows at 256 and generated text at 128 KiB, counting one row separator byte
+Each delivery targets 256 source rows and 128 KiB of generated text, counting one row separator byte
 per emitted row. The decoration budget reserves one slot per row for its base diff style. Additional
 syntax or intraline spans are not yet emitted. Zero budgets preserve delivery state. A row that fits
-the total byte limit but not the remaining batch budget remains pending for the next call.
+the byte target but not the remaining batch budget remains pending for the next call.
 
-An oversized source line terminates delivery with its source coordinate and byte length before
-allocating a display string. Lines are never split into artificial source rows. Returned text omits
+The first complete source line always makes progress even when it exceeds the chunk's byte target.
+Lines are never split into artificial source rows. Returned text omits
 the diff gutter and LF/CRLF terminator. Bare CR content remains intact. Rows carry old/new source
 coordinates and the exact raw identity for added or removed content.
 
 Structural rows, full-file preview policy, syntax and intraline spans, document memory accounting,
-wire delivery, and live viewport demand integration remain incomplete. The row and text bounds here
+wire delivery, and live viewport demand integration remain incomplete. The row and text targets here
 do not establish a bound on group metadata, shared analysis memory, or serialized transport bytes.
 
 ## Full-file preview and speculative eligibility
 
-Display cursor construction now requires the caller's explicit `BodyKind`. Repository ownership
-supplies that classification, since empty bytes alone do not distinguish deletion from an emptied
-tracked file. Added/deleted previews count source lines and reject counts above 1,000 before group
-metadata or display rows are allocated. Modified-file expansion remains independent of this gate.
-An unavailable preview retains the raw analysis, source identities, and canonical patch bodies.
+Display cursor construction takes an immutable analysis and context setting. Added, deleted,
+and modified previews retain every source line and use successive
+display chunks to deliver the complete content. File size and line count do not disable expansion.
 
 `BodyPolicy::may_prewarm` requires a nondeleted kind, a known changed-line total below 100, known
-byte sizes within the source limit on both sides, and available speculative capacity. It does not
+byte sizes on both sides, and available speculative capacity. It does not
 acquire sources or compute missing counts. Policy overrides can lower the thresholds but cannot
 raise them above the migration limits. Eligibility does not reserve capacity, so the scheduler must
 still perform atomic admission before starting work.
 
-Typed unavailable reasons distinguish a full-file line limit from a single-line byte limit.
+Explicit display requests have no full-file line or single-line byte admission limit.
 The pure speculative eligibility function is not yet connected to the live feature scheduler.
 Editor delivery and runtime body-kind classification remain part of feature integration.
 
@@ -408,8 +411,9 @@ scheduling, cancellation, syntax spans, and retained-memory accounting remain in
 
 `ForgeRuntime` owns one `DiffEngine` with four active-job slots. Construction opens no repository
 and requires no executor. `compare` checks the cache and joins matching in-flight source identities
-before reserving another job. New work reserves source retention and a conservative maximum hunk
-capacity before reserving dedicated pool admission. Returned handles retain cache reservations.
+before reserving another job. New work accounts for source retention and a conservative maximum
+hunk capacity before reserving dedicated pool admission. Returned handles retain their accounting
+reservations even when cache budgets require an uncached result.
 
 Each waiting caller owns an interest token. Dropping one waiter leaves other consumers active.
 One analysis admits at most 64 waiting callers. The next caller receives `ConsumerLimit` without
@@ -419,12 +423,12 @@ requests wait until retirement releases the slot. A retiring job cannot gain new
 consumers after its worker has committed to cancellation.
 
 Diff and syntax callers register a capacity notification before attempting admission. Temporary
-job-slot pressure suspends both callers, while input-byte pressure applies only to diff work.
+job-slot pressure suspends both callers without imposing an input-byte admission ceiling.
 Completion wakes the caller to recheck cache coalescing and admission. Closing either analysis
 owner wakes its pending callers without closing the other owner's shared pool. Syntax deadlines
 also bound admission waits. Dropping a waiting future cancels that caller without starting native
-work. Disabled workers and closed owners remain explicit errors. Diff admission also rejects
-oversized input and retained-memory exhaustion. Caller-owned sources waiting for capacity remain
+work. Disabled workers and closed owners remain explicit errors. Content size and cache-budget
+exhaustion do not reject explicit diff analysis. Caller-owned sources waiting for capacity remain
 outside pool input accounting.
 
 After the final waiter drops, queued work is removed and its inputs are released. Running work
@@ -441,8 +445,8 @@ after the caller's Tokio executor has been destroyed.
 Host shutdown closes analysis admission and drains repository reads and analyses concurrently under
 the two-second shutdown deadline. Completion notifications wake drain waiters. Deadline expiry
 reports remaining jobs and unjoined worker threads without releasing native work or its reservations.
-The reservation uses a conservative hunk-capacity estimate based on source line counts, so it can
-reject a large source with few actual changes. Temporary algorithm allocations, caller-owned input
+The reservation uses a conservative hunk-capacity estimate based on source line counts for
+accounting, not source rejection. Temporary algorithm allocations, caller-owned input
 acquisition, independent clones, and per-consumer metadata need separate accounting. This is not a
 hard process-memory bound or preemptive cancellation of the native histogram algorithm.
 
@@ -454,7 +458,8 @@ completed-but-unconsumed responses remain incomplete.
 ## Dedicated analysis worker ownership
 
 `AnalysisPool` owns lazily started `forge-analysis-*` threads. Pool limits bound worker count, total
-reserved/queued/running jobs, and declared input bytes. `reserve` obtains admission before a caller
+reserved/queued/running jobs. Declared input bytes remain accounted without an admission ceiling.
+`reserve` obtains admission before a caller
 transfers its input closure. A dropped permit returns admission. An accepted permit can submit after
 admission closes, and shutdown retains workers while such reservations remain outstanding.
 

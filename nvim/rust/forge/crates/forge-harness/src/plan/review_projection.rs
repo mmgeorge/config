@@ -98,7 +98,6 @@ pub(crate) fn project(
         width,
     )?;
     let rows = rendered.block.text.row_count();
-    ensure!(rows <= 65536, "plan projection exceeds 65536 rows");
     let mut source_output = HashMap::new();
     for mapping in &rendered.source {
         for source_row in mapping.source.clone() {

@@ -1300,6 +1300,18 @@
           ]
         },
         {
+          "type": "CHOICE",
+          "members": [
+            {
+              "type": "STRING",
+              "value": "unsafe"
+            },
+            {
+              "type": "BLANK"
+            }
+          ]
+        },
+        {
           "type": "SYMBOL",
           "name": "extern_modifier"
         },
@@ -9638,6 +9650,10 @@
     [
       "parameters",
       "tuple_struct_pattern"
+    ],
+    [
+      "foreign_mod_item",
+      "function_modifiers"
     ],
     [
       "array_expression"

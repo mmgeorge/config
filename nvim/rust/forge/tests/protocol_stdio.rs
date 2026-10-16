@@ -86,6 +86,9 @@ impl HostProcess {
         let initialized = self.response(2).await;
         assert!(initialized.get("error").is_none(), "{initialized}");
         self.send(json!({"id":3,"method":"prompt.submit","params":{"text":"remain active until connection closes"}})).await;
+        let mut changed = false;
+        let mut pending_query = None;
+        let mut next_query = 4;
         loop {
             let message = self.read(true).await;
             assert_ne!(
@@ -93,10 +96,30 @@ impl HostProcess {
                 Some(3),
                 "turn ended before EOF: {message}"
             );
-            if message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_node_updated")
-            {
-                break;
+            if message["event"] == "document_changed" {
+                changed = true;
+            }
+            if pending_query.is_some() && message["id"].as_u64() == pending_query {
+                pending_query = None;
+                assert!(message.get("error").is_none(), "{message}");
+                let running_with_output = message["result"].as_array().unwrap().iter().any(|exchange| {
+                    exchange["state"] == "running"
+                        && exchange["turn"].as_array().is_some_and(|turns| turns.iter().any(|turn| {
+                            turn["message"].as_array().is_some_and(|messages| messages.iter().any(|message| {
+                                message["kind"] == "assistant"
+                                    && message["text"].as_str().is_some_and(|text| !text.is_empty())
+                            }))
+                        }))
+                });
+                if running_with_output {
+                    break;
+                }
+            }
+            if changed && pending_query.is_none() {
+                changed = false;
+                pending_query = Some(next_query);
+                self.send(json!({"id":next_query,"method":"exchange.list","params":{}})).await;
+                next_query += 1;
             }
         }
     }

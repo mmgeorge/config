@@ -17,7 +17,7 @@ use forge_github::review_mutation::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::comments::{CommentLimits, CommentStore, DraftComment};
+use crate::comments::{CommentStore, DraftComment};
 use crate::edit::{EditBudget, EditLimits, EditStore, RegionEdit, SaveOutcome, SaveSubmission};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
@@ -133,7 +133,6 @@ impl ReviewDocument {
             id.clone(),
             target.clone(),
             ReviewMode::Overview,
-            CommentLimits::default(),
         )?;
         edits.insert(RegionId("title".into()), RegionRevision(0), title)?;
         edits.insert(RegionId("body".into()), RegionRevision(0), body)?;
@@ -174,12 +173,6 @@ impl ReviewDocument {
         if self.comments.contains_region(&edit.region) {
             return self.comments.accept(&mut self.edits, edit);
         }
-        if matches!(edit.region.0.as_str(), "title" | "reviewers") {
-            ensure!(
-                edit.text.len() <= 4096,
-                "PR single-line field exceeds its local text limit"
-            );
-        }
         Ok(self.edits.accept(edit)?)
     }
 
@@ -195,7 +188,7 @@ impl ReviewDocument {
             }
             if matches!(edit.region.0.as_str(), "title" | "reviewers") {
                 ensure!(
-                    !edit.text.contains(['\n', '\r']) && edit.text.len() <= 4096,
+                    !edit.text.contains(['\n', '\r']),
                     "invalid PR single-line field"
                 );
             }

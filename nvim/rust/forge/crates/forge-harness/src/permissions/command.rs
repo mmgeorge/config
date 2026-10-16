@@ -746,7 +746,10 @@ mod test {
         );
         assert!(!nested.ambiguous);
         assert!(nested.invocation_list.len() >= 3);
-        assert!(normalize_command("ForEach-Object { Get-ChildItem; Write-Output 'done'").ambiguous);
-        assert!(normalize_command("tool (one]").ambiguous);
+        assert!(normalize_command_in(
+            "ForEach-Object { Get-ChildItem; Write-Output 'done'",
+            CommandShell::PowerShell,
+        ).ambiguous);
+        assert!(normalize_command_in("tool (one]", CommandShell::PowerShell).ambiguous);
     }
 }

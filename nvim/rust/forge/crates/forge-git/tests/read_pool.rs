@@ -4,7 +4,7 @@ use forge_git::read_pool::{BlockingReadPool, ReadAdmissionError};
 
 #[tokio::test]
 async fn dropped_waiter_retains_capacity_until_native_read_exits() {
-    let pool = BlockingReadPool::new(1, 8).unwrap();
+    let pool = BlockingReadPool::new(1).unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = mpsc::channel();
     let task = pool
@@ -42,7 +42,7 @@ async fn dropped_waiter_retains_capacity_until_native_read_exits() {
 
 #[tokio::test]
 async fn timed_out_finish_keeps_worker_accounted_and_requests_cancellation() {
-    let pool = BlockingReadPool::new(1, 8).unwrap();
+    let pool = BlockingReadPool::new(1).unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = mpsc::channel();
     let task = pool
@@ -71,8 +71,8 @@ async fn timed_out_finish_keeps_worker_accounted_and_requests_cancellation() {
 }
 
 #[tokio::test]
-async fn input_budget_and_job_count_are_independent_admission_limits() {
-    let pool = BlockingReadPool::new(3, 8).unwrap();
+async fn input_accounting_does_not_reject_jobs_based_on_content_size() {
+    let pool = BlockingReadPool::new(3).unwrap();
     let (release, wait) = mpsc::channel();
     let first = pool
         .submit(5, move |_| {
@@ -80,15 +80,13 @@ async fn input_budget_and_job_count_are_independent_admission_limits() {
             Ok(())
         })
         .unwrap();
-    assert_eq!(
-        pool.submit(9, |_| Ok(())).err().unwrap(),
-        ReadAdmissionError::InputTooLarge
-    );
+    let large = pool.submit(32 * 1024 * 1024 + 1, |_| Ok(())).unwrap();
+    let second = pool.submit(3, |_| Ok(42)).unwrap();
     assert_eq!(
         pool.submit(4, |_| Ok(())).err().unwrap(),
         ReadAdmissionError::Busy
     );
-    let second = pool.submit(3, |_| Ok(42)).unwrap();
+    large.finish().await.unwrap();
     assert_eq!(second.finish().await.unwrap(), 42);
     assert_eq!(pool.status().reserved_input_bytes, 5);
     release.send(()).unwrap();
@@ -99,7 +97,7 @@ async fn input_budget_and_job_count_are_independent_admission_limits() {
 
 #[tokio::test]
 async fn worker_panic_releases_capacity_and_is_reported_to_its_waiter() {
-    let pool = BlockingReadPool::new(1, 8).unwrap();
+    let pool = BlockingReadPool::new(1).unwrap();
     let task = pool
         .submit::<()>(8, |_| panic!("synthetic read panic"))
         .unwrap();
@@ -111,9 +109,8 @@ async fn worker_panic_releases_capacity_and_is_reported_to_its_waiter() {
 
 #[test]
 fn invalid_limits_and_missing_runtime_do_not_admit_work() {
-    assert!(BlockingReadPool::new(0, 8).is_err());
-    assert!(BlockingReadPool::new(1, 0).is_err());
-    let pool = BlockingReadPool::new(1, 8).unwrap();
+    assert!(BlockingReadPool::new(0).is_err());
+    let pool = BlockingReadPool::new(1).unwrap();
     assert_eq!(
         pool.submit(1, |_| Ok(())).err().unwrap(),
         ReadAdmissionError::NoRuntime
@@ -133,7 +130,7 @@ fn cancelled_queued_work_retains_admission_and_never_runs_its_operation() {
         .build()
         .unwrap();
     runtime.block_on(async {
-        let pool = BlockingReadPool::new(2, 8).unwrap();
+        let pool = BlockingReadPool::new(2).unwrap();
         let (started, ready) = tokio::sync::oneshot::channel();
         let (release, wait) = mpsc::channel();
         let first = pool
@@ -169,7 +166,7 @@ fn cancelled_queued_work_retains_admission_and_never_runs_its_operation() {
 
 #[tokio::test]
 async fn cancelled_native_result_cannot_be_returned_as_success() {
-    let pool = BlockingReadPool::new(1, 8).unwrap();
+    let pool = BlockingReadPool::new(1).unwrap();
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, wait) = mpsc::channel();
     let task = pool

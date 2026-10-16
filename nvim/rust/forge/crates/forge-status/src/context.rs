@@ -113,7 +113,6 @@ impl StatusContextService {
 
 impl StatusContext {
     pub fn issues_replacement(&self, text: &str) -> Result<Vec<u8>> {
-        ensure!(text.len() <= 65536, "issue edit exceeds 64 KiB");
         let mut numbers = Vec::new();
         for token in text
             .split(|character: char| !character.is_ascii_digit())
@@ -129,7 +128,6 @@ impl StatusContext {
             if number > 0 {
                 numbers.push(number);
             }
-            ensure!(numbers.len() <= 1024, "issue edit exceeds 1024 references");
         }
         numbers.sort_unstable();
         numbers.dedup();
@@ -145,10 +143,6 @@ impl StatusContext {
         object.insert("issues".into(), serde_json::to_value(numbers)?);
         let mut replacement = serde_json::to_vec_pretty(&config)?;
         replacement.push(b'\n');
-        ensure!(
-            replacement.len() <= 1024 * 1024,
-            "repository config replacement exceeds 1 MiB"
-        );
         Ok(replacement)
     }
 
@@ -238,7 +232,6 @@ fn collect_native(
     ensure!(config.is_object(), ".forge.json must contain an object");
     let mut issues = Vec::new();
     if let Some(values) = config.get("issues").and_then(serde_json::Value::as_array) {
-        ensure!(values.len() <= 1024, "issue list exceeds 1024 entries");
         for value in values {
             if let Some(number) = value
                 .as_u64()
@@ -353,10 +346,7 @@ fn read_config(workspace: &Path) -> Result<Option<Vec<u8>>> {
         ".forge.json must be a regular file"
     );
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(1024 * 1024 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= 1024 * 1024, ".forge.json exceeds 1 MiB");
+    File::open(path)?.read_to_end(&mut bytes)?;
     Ok(Some(bytes))
 }
 

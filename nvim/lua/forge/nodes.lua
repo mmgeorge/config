@@ -29,7 +29,7 @@ function M.validate(sequence, changed, retired, state, read_row)
     seen[fold.id] = true
     assert(type(fold.closed) == "boolean", "invalid fold closed state")
     assert(fold.collapsed_suffix == nil or (type(fold.collapsed_suffix) == "string"
-      and #fold.collapsed_suffix <= 1024 and not fold.collapsed_suffix:find("%c")), "invalid fold summary suffix")
+      and not fold.collapsed_suffix:find("%c")), "invalid fold summary suffix")
     assert(fold.collapse_children == nil or type(fold.collapse_children) == "boolean", "invalid fold child policy")
     assert(fold.expand_children == nil or type(fold.expand_children) == "boolean", "invalid fold expansion policy")
     assert(not (fold.collapse_children and fold.expand_children), "conflicting fold child policies")

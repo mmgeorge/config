@@ -1,5 +1,5 @@
 use forge_diff::source::{
-    MAX_SOURCE_BYTES, NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion,
+    NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion,
     validate_source_pair,
 };
 
@@ -48,7 +48,7 @@ fn identical_bytes_in_distinct_representations_have_distinct_analysis_identities
 }
 
 #[test]
-fn invalid_encoding_binary_and_size_are_distinct_admission_results() {
+fn invalid_encoding_and_binary_remain_distinct_admission_results() {
     assert_eq!(
         SourceVersion::new(vec![0xff], Representation::Raw).unwrap_err(),
         SourceError::UnsupportedEncoding
@@ -57,15 +57,9 @@ fn invalid_encoding_binary_and_size_are_distinct_admission_results() {
         SourceVersion::new(b"text\0data".to_vec(), Representation::Raw).unwrap_err(),
         SourceError::Binary
     );
-    assert_eq!(
-        SourceVersion::new(vec![0; MAX_SOURCE_BYTES + 1], Representation::Raw).unwrap_err(),
-        SourceError::TooLarge {
-            bytes: MAX_SOURCE_BYTES + 1,
-            limit: MAX_SOURCE_BYTES,
-        }
-    );
-    let accepted = SourceVersion::new(vec![b'x'; MAX_SOURCE_BYTES], Representation::Raw).unwrap();
-    assert_eq!(accepted.bytes().len(), MAX_SOURCE_BYTES);
+    let bytes = vec![b'x'; 8 * 1024 * 1024 + 1];
+    let accepted = SourceVersion::new(bytes.clone(), Representation::Raw).unwrap();
+    assert_eq!(accepted.bytes(), bytes);
     assert_eq!(accepted.newline().line_count, 1);
 }
 
@@ -91,15 +85,11 @@ fn acquisition_claims_must_match_exact_content_and_newline_state() {
 }
 
 #[test]
-fn spare_capacity_cannot_bypass_source_admission() {
-    let mut content = Vec::with_capacity(MAX_SOURCE_BYTES + 1);
+fn spare_capacity_does_not_restrict_source_admission() {
+    let mut content = Vec::with_capacity(8 * 1024 * 1024 + 1);
     content.push(b'x');
     let retained = content.capacity();
-    assert_eq!(
-        SourceVersion::new(content, Representation::Raw).unwrap_err(),
-        SourceError::TooLarge {
-            bytes: retained,
-            limit: MAX_SOURCE_BYTES
-        }
-    );
+    let source = SourceVersion::new(content, Representation::Raw).unwrap();
+    assert_eq!(source.retained_bytes(), retained);
+    assert_eq!(source.bytes(), b"x");
 }

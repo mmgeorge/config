@@ -164,13 +164,11 @@ pub struct ReviewerSelection {
 impl ReviewerSelection {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self.reviewer.len() + self.team.len() <= 100
-                && self
+            self
                     .reviewer
                     .iter()
                     .chain(&self.team)
                     .all(|name| !name.is_empty()
-                        && name.len() <= 100
                         && name
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
@@ -290,11 +288,6 @@ impl ReviewMutationRequest {
                 "invalid captured operation identity"
             );
         }
-        let encoded = serde_json::to_vec(self)?;
-        ensure!(
-            encoded.len() <= 8 * 1024 * 1024,
-            "remote mutation capture exceeds 8 MiB"
-        );
         if let ReviewMutation::ReviewSubmit {
             pending_review_id,
             commit_id,
@@ -311,22 +304,17 @@ impl ReviewMutationRequest {
                 .as_ref()
                 .context("review submission requires captured comment membership")?;
             ensure!(
-                member.len() <= 10_000 && (pending_review_id.is_some() || member.is_empty()),
+                pending_review_id.is_some() || member.is_empty(),
                 "invalid review submission membership"
             );
             ensure!(
                 member.windows(2).all(|pair| pair[0].id < pair[1].id),
                 "review submission membership is not unique and ordered"
             );
-            ensure!(
-                comment.len() <= 10_000,
-                "review submission comment count exceeds limit"
-            );
             for comment in comment {
                 ensure!(
                     !comment.body.trim().is_empty()
-                        && !comment.body.contains('\0')
-                        && comment.body.len() <= 4 * 1024 * 1024,
+                        && !comment.body.contains('\0'),
                     "invalid submitted review comment body"
                 );
                 validate_path(&comment.path)?;
@@ -344,8 +332,7 @@ impl ReviewMutationRequest {
                     member.id > 0
                         && !member.node_id.is_empty()
                         && member.node_id.len() <= 256
-                        && !member.body.contains('\0')
-                        && member.body.len() <= 4 * 1024 * 1024,
+                        && !member.body.contains('\0'),
                     "invalid captured review comment"
                 );
                 validate_commit(&member.commit_id)?;
@@ -374,7 +361,7 @@ impl ReviewMutationRequest {
             _ => None,
         };
         ensure!(
-            body.is_none_or(|body| body.len() <= 4 * 1024 * 1024 && !body.contains('\0')),
+            body.is_none_or(|body| !body.contains('\0')),
             "invalid remote body"
         );
         match &self.mutation {
@@ -408,7 +395,6 @@ impl ReviewMutationRequest {
                 for branch in [base, head] {
                     ensure!(
                         !branch.is_empty()
-                            && branch.len() <= 1024
                             && !branch.chars().any(char::is_control),
                         "invalid captured creation branch"
                     );
@@ -498,9 +484,7 @@ impl ReviewMutationRequest {
             }
             ReviewMutation::ReviewerAdd { reviewer, team }
             | ReviewMutation::ReviewerRemove { reviewer, team } => ensure!(
-                reviewer.len() + team.len() <= 100
-                    && reviewer.iter().chain(team).all(|name| !name.is_empty()
-                        && name.len() <= 100
+                reviewer.iter().chain(team).all(|name| !name.is_empty()
                         && name
                             .bytes()
                             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
@@ -508,7 +492,7 @@ impl ReviewMutationRequest {
             ),
             ReviewMutation::MilestoneCreate { title }
             | ReviewMutation::MilestoneCreateAndAssign { title } => ensure!(
-                !title.trim().is_empty() && title.len() <= 1024 && !title.contains('\0'),
+                !title.trim().is_empty() && !title.contains('\0'),
                 "invalid milestone title"
             ),
             ReviewMutation::IssueEdit {
@@ -531,7 +515,6 @@ impl ReviewMutationRequest {
                         || !add_assignees.is_empty()
                         || !remove_assignees.is_empty())
                         && title.as_ref().is_none_or(|title| !title.trim().is_empty()
-                            && title.len() <= 1024
                             && !title.contains('\0')),
                     "invalid issue edit"
                 );
@@ -821,15 +804,10 @@ impl GithubService {
 }
 
 fn validate_assignees(assignee: &[String]) -> Result<()> {
-    ensure!(
-        assignee.len() <= 100,
-        "issue assignee set exceeds 100 entries"
-    );
     let mut seen = std::collections::HashSet::new();
     for login in assignee {
         ensure!(
             !login.is_empty()
-                && login.len() <= 100
                 && login.bytes().all(|byte| byte.is_ascii_alphanumeric()
                     || matches!(byte, b'-' | b'_' | b'[' | b']'))
                 && seen.insert(login.to_ascii_lowercase()),
@@ -842,7 +820,6 @@ fn validate_assignees(assignee: &[String]) -> Result<()> {
 fn validate_path(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()
-            && path.len() <= 16 * 1024
             && !path.contains(['\n', '\r', '\0'])
             && !path.starts_with('/')
             && !path.split('/').any(|part| part == ".."),

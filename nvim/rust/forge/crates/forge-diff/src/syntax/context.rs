@@ -102,7 +102,7 @@ mod tests {
     use std::sync::Arc;
 
     async fn syntax(language: SyntaxLanguage, source: &str) -> SyntaxHandle {
-        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })));
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2 })));
         engine.analyze(SyntaxRequest {
             source: SourceVersion::new(source.as_bytes().to_vec(), Representation::GitCanonical).unwrap(),
             language, priority: WorkPriority::Foreground, deadline: None,

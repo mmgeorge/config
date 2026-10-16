@@ -4,7 +4,7 @@ use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use forge_buffer::identity::DocumentId;
 use forge_git::{
-    completion::{CandidateLimits, RevisionCandidates},
+    completion::RevisionCandidates,
     repository::RepositoryState,
 };
 use forge_github::{
@@ -36,9 +36,6 @@ mod notification_routes;
 mod walkthrough_routes;
 
 const PAGE_BYTES: usize = 128 * 1024;
-const CACHE_BYTES: usize = 2 * 1024 * 1024;
-const SNAPSHOT_BYTES: usize = 4096;
-const VALUE_BYTES: usize = 64;
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -490,17 +487,26 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
     }
 }
 
+enum StatusSubscription {
+    Idle,
+    Active {
+        stop: tokio::sync::oneshot::Sender<()>,
+        task: tokio::task::JoinHandle<Result<()>>,
+    },
+    Closed,
+}
+
 /// Routes repository requests without creating a provider or durable Harness session.
 pub(crate) struct HostRouter {
     host: Arc<ForgeRuntime>,
-    status_events: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
+    status_events: std::sync::Mutex<StatusSubscription>,
 }
 
 impl HostRouter {
     pub(crate) fn new(host: Arc<ForgeRuntime>) -> Self {
         Self {
             host,
-            status_events: std::sync::OnceLock::new(),
+            status_events: std::sync::Mutex::new(StatusSubscription::Idle),
         }
     }
 
@@ -524,25 +530,21 @@ impl HostRouter {
         method: RoutedMethod,
         sink: &MessageSender,
     ) -> Result<()> {
-        self.status_events.get_or_init(|| {
-            let mut updates = self.host.status.subscribe_updates();
-            let sink = sink.clone();
-            tokio::spawn(async move {
-                loop {
-                    match updates.recv().await {
-                        Ok(update) => {
-                            if let Err(error) = send_status_update(&sink, &update).await {
-                                if sink.send_wait(Message::DocumentEvent(DocumentEvent { document: update.document.0.clone(), event: "status.resync".into(), payload: json!({"diagnostic": [format!("Status update delivery requires recovery: {error:#}")]}) })).await.is_err() { break; }
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            if sink.send_wait(Message::DocumentEvent(DocumentEvent { document: String::new(), event: "status.resync".into(), payload: json!({}) })).await.is_err() { break; }
-                        }
-                    }
+        {
+            let mut subscription = self.status_events.lock()
+                .map_err(|_| anyhow::anyhow!("Forge status subscription owner poisoned"))?;
+            match &*subscription {
+                StatusSubscription::Idle => {
+                    let updates = self.host.status.subscribe_updates();
+                    let (stop, stopped) = tokio::sync::oneshot::channel();
+                    let sink = sink.clone();
+                    let task = tokio::spawn(forward_status_updates(sink, updates, stopped));
+                    *subscription = StatusSubscription::Active { stop, task };
                 }
-            })
-        });
+                StatusSubscription::Active { .. } => {}
+                StatusSubscription::Closed => anyhow::bail!("Forge status subscription is closed"),
+            }
+        }
         let _harness_admission = envelope.harness_admission;
         let request = envelope.request;
         match method {
@@ -587,10 +589,6 @@ impl HostRouter {
                         serde_json::to_value(self.host.status.context_action(input).await?)?
                     }
                     StatusContextRequest::Issues { input, text } => {
-                        ensure!(
-                            text.len() <= 1024 * 1024,
-                            "Status issues text exceeds request limit"
-                        );
                         let ticket = self.host.status.context_issues(input, &text).await?;
                         let outcome = ticket.finish().await?;
                         crate::runtime::repository_write::outcome_value(&outcome)
@@ -614,7 +612,6 @@ impl HostRouter {
                         )?)?
                     }
                     StatusContextRequest::AboutMessage { document, text } => {
-                        ensure!(text.len() <= 1024 * 1024, "About message exceeds 1 MiB");
                         serde_json::to_value(self.host.sources.open_text(
                             document,
                             "About".into(),
@@ -633,7 +630,6 @@ impl HostRouter {
                         revision,
                         path,
                     } => {
-                        ensure!(path.len() <= 65536, "source path exceeds request limit");
                         let path = STANDARD
                             .decode(path)
                             .context("source path is not valid base64")?;
@@ -704,10 +700,6 @@ impl HostRouter {
                     } => {
                         let path = path
                             .map(|path| {
-                                ensure!(
-                                    path.len() <= 65536,
-                                    "comparison path exceeds request limit"
-                                );
                                 forge_git::identity::RepositoryPath::new(
                                     STANDARD
                                         .decode(path)
@@ -1228,7 +1220,7 @@ impl HostRouter {
                         "initial revision request requires zero offset"
                     );
                     repository
-                        .refresh_revisions(&self.host.repositories, CandidateLimits::default())
+                        .refresh_revisions(&self.host.repositories)
                         .await?
                 };
                 let page = revision_page(&repository, &candidates, params.offset)?;
@@ -1246,6 +1238,22 @@ impl HostRouter {
         }
         Ok(())
     }
+
+    /// Resolve status subscription ownership after request and feature producers quiesce.
+    pub(crate) fn finish_status_subscription(
+        &self,
+    ) -> Result<Option<tokio::task::JoinHandle<Result<()>>>> {
+        let mut subscription = self.status_events.lock()
+            .map_err(|_| anyhow::anyhow!("Forge status subscription owner poisoned"))?;
+        match std::mem::replace(&mut *subscription, StatusSubscription::Closed) {
+            StatusSubscription::Active { stop, task } => {
+                // Preserve task collection when it completed before the stop signal.
+                let _ = stop.send(());
+                Ok(Some(task))
+            }
+            StatusSubscription::Idle | StatusSubscription::Closed => Ok(None),
+        }
+    }
 }
 
 pub(crate) fn validate_initialize(params: &Value) -> Result<()> {
@@ -1257,21 +1265,70 @@ pub(crate) fn validate_initialize(params: &Value) -> Result<()> {
     );
     if let Some(path) = initialize.git_config_cache_path {
         ensure!(
-            path.is_absolute() && path.as_os_str().len() <= 16 * 1024,
-            "Git configuration cache must be an absolute bounded path"
+            path.is_absolute(),
+            "Git configuration cache must be an absolute path"
         );
     }
     if let Some(directory) = initialize.recovery_directory {
         ensure!(
-            directory.is_absolute() && directory.as_os_str().len() <= 16 * 1024,
-            "GitHub recovery directory must be an absolute bounded path"
+            directory.is_absolute(),
+            "GitHub recovery directory must be an absolute path"
         );
     }
     if let Some(directory) = initialize.status_ignored_directory {
         ensure!(
-            directory.is_absolute() && directory.as_os_str().len() <= 16 * 1024,
-            "Status ignored directory must be an absolute bounded path"
+            directory.is_absolute(),
+            "Status ignored directory must be an absolute path"
         );
+    }
+    Ok(())
+}
+
+async fn forward_status_updates(
+    sink: MessageSender,
+    mut updates: tokio::sync::broadcast::Receiver<Arc<forge_status::StatusUpdate>>,
+    mut stopped: tokio::sync::oneshot::Receiver<()>,
+) -> Result<()> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+
+    let mut draining = false;
+    loop {
+        let update = if draining {
+            match updates.try_recv() {
+                Ok(update) => Ok(update),
+                Err(TryRecvError::Closed | TryRecvError::Empty) => break,
+                Err(TryRecvError::Lagged(count)) => Err(RecvError::Lagged(count)),
+            }
+        } else {
+            tokio::select! {
+                biased;
+                result = &mut stopped => {
+                    result.context("Forge status subscription stop owner disappeared")?;
+                    draining = true;
+                    continue;
+                }
+                update = updates.recv() => update,
+            }
+        };
+        match update {
+            Ok(update) => {
+                if let Err(error) = send_status_update(&sink, &update).await {
+                    sink.send_wait(Message::DocumentEvent(DocumentEvent {
+                        document: update.document.0.clone(),
+                        event: "status.resync".into(),
+                        payload: json!({"diagnostic": [format!("Status update delivery requires recovery: {error:#}")]}),
+                    })).await.with_context(|| format!("report status update delivery failure: {error:#}"))?;
+                }
+            }
+            Err(RecvError::Closed) => break,
+            Err(RecvError::Lagged(_)) => {
+                sink.send_wait(Message::DocumentEvent(DocumentEvent {
+                    document: String::new(),
+                    event: "status.resync".into(),
+                    payload: json!({}),
+                })).await.context("report lagged status subscription")?;
+            }
+        }
     }
     Ok(())
 }
@@ -1334,17 +1391,11 @@ fn revision_page(
         candidates.revision.0 <= 9_007_199_254_740_991,
         "revision candidate sequence exceeds wire range"
     );
-    let mut accounted = SNAPSHOT_BYTES;
-    let mut count = 0;
-    let mut total = 0;
-    for value in &candidates.values {
-        if value.len() + VALUE_BYTES > CACHE_BYTES.saturating_sub(accounted) {
-            break;
-        }
-        accounted += value.len() + VALUE_BYTES;
-        total += value.len() + 1;
-        count += 1;
-    }
+    let count = candidates.values.len();
+    let total = candidates.values.iter().try_fold(0usize, |total, value| {
+        total.checked_add(value.len()).and_then(|bytes| bytes.checked_add(1))
+            .context("revision candidate byte count overflow")
+    })?;
     ensure!(
         offset <= total,
         "revision page offset exceeds snapshot size"
@@ -1373,7 +1424,69 @@ fn revision_page(
         "next_offset": offset + payload.len(),
         "total_bytes": total,
         "count": count,
-        "truncated": candidates.truncated || count < candidates.values.len(),
         "data": STANDARD.encode(payload),
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_git::completion::{RevisionBackend, RevisionId};
+
+    #[tokio::test]
+    async fn revision_pages_preserve_candidates_beyond_previous_cache_budget() {
+        let directory = tempfile::Builder::new()
+            .prefix(".forge-revision-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let initialized = std::process::Command::new("git")
+            .arg("-C").arg(directory.path()).args(["init", "--quiet"])
+            .status().unwrap();
+        assert!(initialized.success());
+        let store = forge_git::store::RepositoryStore::default();
+        let repository = store.open(directory.path().to_path_buf()).await.unwrap().unwrap();
+        let values: Vec<Vec<u8>> = (0..20_001)
+            .map(|index| format!("branch-{index}-{}", "x".repeat(100)).into_bytes())
+            .collect();
+        let expected: Vec<u8> = values.iter().flat_map(|value| value.iter().copied().chain([0])).collect();
+        assert!(expected.len() > 2 * 1024 * 1024);
+        let candidates = RevisionCandidates {
+            revision: RevisionId(1),
+            generation: repository.generation(),
+            storage: repository.identity.storage.clone(),
+            backend: RevisionBackend::Gix,
+            reference_digest: "fixture".into(),
+            retained_bytes: expected.len(),
+            values,
+        };
+        let mut offset = 0;
+        let mut actual = Vec::new();
+        loop {
+            let page = revision_page(&repository, &candidates, offset).unwrap();
+            assert_eq!(page["count"], 20_001);
+            assert_eq!(page["total_bytes"], expected.len());
+            let data = STANDARD.decode(page["data"].as_str().unwrap()).unwrap();
+            assert!(data.len() <= PAGE_BYTES);
+            actual.extend(data);
+            offset = page["next_offset"].as_u64().unwrap() as usize;
+            if offset == expected.len() { break; }
+        }
+        assert_eq!(actual, expected);
+        assert!(revision_page(&repository, &candidates, expected.len() + 1).is_err());
+    }
+
+    #[test]
+    fn initialization_preserves_absolute_paths_without_byte_admission() {
+        let path = std::env::current_dir().unwrap().join("x".repeat(16 * 1024 + 1));
+        assert!(validate_initialize(&json!({
+            "protocol_version": forge_protocol::WIRE_VERSION,
+            "git_config_cache_path": path,
+            "recovery_directory": path,
+            "status_ignored_directory": path,
+        })).is_ok());
+        assert!(validate_initialize(&json!({
+            "protocol_version": forge_protocol::WIRE_VERSION,
+            "git_config_cache_path": "relative/path",
+        })).is_err());
+    }
 }

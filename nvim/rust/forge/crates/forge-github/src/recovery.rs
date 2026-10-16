@@ -1,7 +1,7 @@
 //! Durable remote outcomes remain separate from deletable repository caches and executable retries.
 
 use std::fs::{self, File, TryLockError};
-use std::io::Read;
+use std::io::BufReader;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail, ensure};
@@ -12,9 +12,6 @@ use crate::model::GithubRepositoryId;
 use crate::publication::publish_json;
 
 pub const MAX_RECOVERY_RECORDS: usize = 64;
-pub const MAX_RECOVERY_RECORD_BYTES: usize = 16 * 1024 * 1024;
-pub const MAX_RECOVERY_BYTES: usize = 64 * 1024 * 1024;
-const DIAGNOSTIC_RESERVATION: usize = 64 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -134,9 +131,7 @@ impl RecoveryStore {
 
     /// Persists a captured intent before write admission and retains resource ownership until drop.
     ///
-    /// Existing records reject new attempts regardless of host lifetime. Reservation covers the
-    /// captured submission, one equally bounded response, and terminal diagnostics. No unresolved
-    /// record is removed to recover admission capacity.
+    /// Preserve unsettled records independently of host lifetime and submitted text size.
     pub fn prepare(
         &self,
         resource: RecoveryResource,
@@ -166,23 +161,11 @@ impl RecoveryStore {
             state: RecoveryPhase::Prepared,
             confirmed_steps: Vec::new(),
         };
-        let encoded = serde_json::to_vec(&record)?.len();
-        record.reserved_bytes = encoded
-            .checked_mul(2)
-            .and_then(|bytes| bytes.checked_add(DIAGNOSTIC_RESERVATION))
-            .context("recovery reservation overflow")?;
-        ensure!(
-            record.reserved_bytes <= MAX_RECOVERY_RECORD_BYTES,
-            "recovery record exceeds 16 MiB reservation"
-        );
-        let (count, bytes) = self.usage()?;
+        record.reserved_bytes = serde_json::to_vec(&record)?.len();
+        let count = self.usage()?;
         ensure!(
             count < MAX_RECOVERY_RECORDS,
             "recovery admission has 64 unsettled resources"
-        );
-        ensure!(
-            bytes <= MAX_RECOVERY_BYTES - record.reserved_bytes,
-            "recovery admission exceeds 64 MiB"
         );
         self.create_parent(&path)?;
         publish_json(&path, &record)?;
@@ -281,19 +264,12 @@ impl RecoveryStore {
         Ok(())
     }
 
-    fn usage(&self) -> Result<(usize, usize)> {
+    fn usage(&self) -> Result<usize> {
         let mut pending = vec![(self.directory.clone(), 0)];
         let mut count = 0;
-        let mut bytes = 0usize;
-        let mut visited = 0usize;
         while let Some((directory, depth)) = pending.pop() {
             for entry in fs::read_dir(directory)? {
                 let entry = entry?;
-                visited += 1;
-                ensure!(
-                    visited <= 4096,
-                    "recovery directory inventory exceeds its bound"
-                );
                 let metadata = entry.file_type()?;
                 ensure!(
                     !metadata.is_symlink(),
@@ -312,16 +288,10 @@ impl RecoveryStore {
                         count <= MAX_RECOVERY_RECORDS,
                         "recovery inventory exceeds 64 records"
                     );
-                    let reservation = read_record(&entry.path())
-                        .map(|record| record.reserved_bytes)
-                        .unwrap_or(MAX_RECOVERY_RECORD_BYTES);
-                    bytes = bytes
-                        .checked_add(reservation)
-                        .context("recovery inventory size overflow")?;
                 }
             }
         }
-        Ok((count, bytes))
+        Ok(count)
     }
 }
 
@@ -334,10 +304,7 @@ impl RecoveryLease {
         );
         let mut record = self.record.clone();
         record.confirmed_steps.push(result);
-        ensure!(
-            serde_json::to_vec(&record)?.len() <= record.reserved_bytes,
-            "confirmed intermediate step exceeds recovery reservation"
-        );
+        record.reserved_bytes = serde_json::to_vec(&record)?.len();
         publish_json(&self.path, &record)?;
         self.record = record;
         Ok(())
@@ -441,10 +408,7 @@ impl RecoveryLease {
     fn publish(&mut self, phase: RecoveryPhase) -> Result<()> {
         let mut record = self.record.clone();
         record.state = phase;
-        ensure!(
-            serde_json::to_vec(&record)?.len() <= record.reserved_bytes,
-            "recovery settlement exceeds reserved durable bytes"
-        );
+        record.reserved_bytes = serde_json::to_vec(&record)?.len();
         publish_json(&self.path, &record)?;
         self.record = record;
         Ok(())
@@ -532,15 +496,7 @@ fn read_record(path: &Path) -> Result<RecoveryRecord> {
         !fs::symlink_metadata(path)?.file_type().is_symlink(),
         "recovery record cannot be a symlink"
     );
-    let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_RECOVERY_RECORD_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_RECOVERY_RECORD_BYTES,
-        "recovery record exceeds 16 MiB"
-    );
-    let record: RecoveryRecord = serde_json::from_slice(&bytes)
+    let record: RecoveryRecord = serde_json::from_reader(BufReader::new(File::open(path)?))
         .context("malformed recovery record, preserved without replay")?;
     ensure!(
         record.version == 1,
@@ -548,10 +504,6 @@ fn read_record(path: &Path) -> Result<RecoveryRecord> {
     );
     record.resource.validate()?;
     record.capture.validate()?;
-    ensure!(
-        record.reserved_bytes >= bytes.len() && record.reserved_bytes <= MAX_RECOVERY_RECORD_BYTES,
-        "invalid recovery reservation"
-    );
     Ok(record)
 }
 
@@ -559,6 +511,27 @@ fn read_record(path: &Path) -> Result<RecoveryRecord> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn complete_large_capture_and_growing_settlement_survive_reopening() {
+        let directory = tempfile::Builder::new().prefix(".forge-recovery-")
+            .tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let store = store(&directory);
+        let text = format!("{}capture tail", "x".repeat(16 * 1024 * 1024 + 1));
+        let mut captured = capture("large-operation");
+        captured.submitted = json!({"body": text});
+        let mut lease = store.prepare(resource(1), captured).unwrap();
+        lease.dispatch_possible().unwrap();
+        let result = format!("{}settlement tail", "λ".repeat(1024 * 1024));
+        lease.settle(RecoveryPhase::Confirmed { result: json!({"body":result}) }).unwrap();
+        drop(lease);
+        let record = store.inspect(&resource(1)).unwrap().unwrap();
+        assert_eq!(record.capture.submitted["body"], text);
+        match record.state {
+            RecoveryPhase::Confirmed { result: observed } => assert_eq!(observed["body"], result),
+            other => panic!("lost settlement: {other:?}"),
+        }
+    }
 
     #[test]
     #[ignore]
@@ -779,7 +752,7 @@ mod tests {
                 .is_err()
         );
         assert!(store.inspect(&resource(65)).unwrap().is_none());
-        assert_eq!(store.usage().unwrap().0, 64);
+        assert_eq!(store.usage().unwrap(), 64);
     }
 
     #[test]

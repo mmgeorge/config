@@ -8,7 +8,7 @@ Buffer publication is described in [Buffers and rendering](buffers-and-rendering
 
 On Windows, the initialize handshake loads a versioned Git system-prefix location
 cache from `stdpath("cache")/rust-sidecar/forge/git-config-location.json` before
-repository reads. `forge-git::config_location` validates the bounded record and
+repository reads. `forge-git::config_location` validates the complete record and
 existing absolute directory, then seeds gix through the local `gix-path` patch.
 A miss uses gix's default discovery and atomically persists the prefix. A hit avoids
 the `git --exec-path` subprocess. Configuration and attribute contents remain live.
@@ -120,7 +120,8 @@ NUL-delimited pathspecs through stdin. Selected untracked deletions form separat
 and do not spawn Git. Mixed action lists retain their original order and merge only
 adjacent groups with the same operation and source behavior.
 Patch stage, unstage, and worktree discard combine distinct-file patches with the same
-direction into one `git apply` input, bounded to 256 targets and 16 MiB. Staged-hunk
+direction into one `git apply` input per group of at most 256 targets. This grouping
+bounds each command's target count, not the complete selection or patch bytes. Staged-hunk
 discard and compound rollback retain their dependent preflight and mutation steps.
 Before each group, the writer verifies every selected source. A failed command marks
 every target in that group as uncertain, preserves completed earlier groups, and leaves
@@ -148,6 +149,9 @@ Renames include both endpoints. The working tree remains unchanged, and a failed
 unstage leaves the file staged and visible. Ignoring unstaged or untracked files
 only updates the private marker store. Ignored rows use the resulting worktree
 diff, and Unstage on an Ignored row removes its marker.
+The marker store keys worktrees by their canonical root, so symlinked directory
+names share the same state and errors. Local-file views resolve the parent
+directory without requiring the selected file to exist, preserving deleted-file views.
 
 Stage and unstage use a worktree-scoped native mutation journal. The journal holds one
 confirmed observation and an ordered predicted index projection shared by every open
@@ -280,8 +284,9 @@ execution before cross-platform acceptance.
 
 ## Blocking repository read ownership
 
-`forge_git::read_pool::BlockingReadPool` bounds admitted jobs and their declared retained input
-bytes. Admission counts queued jobs, running jobs, and completed results awaiting collection.
+`forge_git::read_pool::BlockingReadPool` bounds admitted jobs and tracks their declared retained
+input bytes without a byte admission ceiling. Admission counts queued jobs, running jobs, and
+completed results awaiting collection.
 Over-capacity requests return typed errors immediately, without accumulating capacity waiters.
 Each worker owns a reservation that survives caller cancellation, waiter drop, and timeout.
 Successful and failed results carry their reservation until collection or disposal. Abandoned
@@ -299,9 +304,9 @@ A later shutdown call can observe worker exit and result disposal. It does not t
 blocking threads or discard a result still owned by its waiter.
 
 The repository store and Harness checkpoint source reader use this pool. Input accounting relies
-on the caller's declared retained size. Source allocation and output byte limits remain the
-operation's responsibility. Result count remains bounded through collection, while unified source,
-cache, and output byte accounting remains acceptance work.
+on the caller's declared retained size. Operations preserve complete source and output content,
+report actual acquisition failures, and check cancellation between interruptible stages.
+Job-count admission bounds concurrent ownership through result collection, not total content size.
 
 ## Shared repository handle lifetime
 
@@ -324,16 +329,17 @@ invalidating unrelated storage. This does not yet detect external Git changes au
 
 Shutdown closes admission and delegates cancellation and unfinished-worker reporting to the read
 pool. Idle eviction never removes leased entries. The host uses the store for startup discovery,
-and Harness checkpoint reads share its read admission. Handle count and declared input budgets do
-not bound gix internal caches or source bytes. Operation-specific source limits remain necessary.
+and Harness checkpoint reads share its read admission. Handle count and declared input accounting
+do not bound gix internal caches or source bytes. Streaming, cancellation, and cache eviction
+control work without rejecting a source for its size.
 Observation caches and complete mutation integration remain incomplete.
 
 ## Host repository ownership
 
 `ForgeRuntime` constructs one shared repository store without opening a repository or provider.
-The current host defaults allow 32 retained repository handles, four admitted native reads, and
-32 MiB of declared retained read inputs, including supplied source allocations. These are admission settings, not measured cache
-or process-memory bounds.
+The current host defaults allow 32 retained repository handles and four admitted native reads.
+Declared retained read inputs, including supplied source allocations, remain accounted without a
+byte admission ceiling. Handle and job counts do not establish process-memory bounds.
 
 After wire-version validation, the Neovim host discovers its initial workspace through this store
 and retains the repository lease for the connection lifetime. Harness receives the resolved
@@ -356,7 +362,8 @@ repository and analysis services.
 Each `RepositoryStore` owns one `MutationCoordinator`. Index and worktree-file scopes use
 `WorktreeId`, while shared-reference scopes use `GitStorageId`. Admission reserves queue and
 receipt capacity before asynchronous preparation. The current store limit is 64 retained
-operations, each with at most 64 distinct scopes, and 16 MiB of declared retained preparation inputs.
+operations. Scope validation requires distinct, nonempty scopes, while retained preparation-input
+accounting imposes no byte admission ceiling.
 Completed receipts and their input reservations count toward capacity until their consumer
 acknowledges them with `take_receipt`.
 
@@ -504,21 +511,21 @@ sessions owning old complete-file checkpoint records through SQLite foreign-key 
 Preferences, prompt history, and provider-owned sessions remain intact. Immutable object
 cleanup is separate from format reset.
 
-## Checkpoint diff source admission
+## Complete checkpoint diff sources
 
-Checkpoint diff generation admits at most 8 MiB of content per source side, matching the migration
-source-input limit. `ObjectStore::get` requires an explicit byte limit and returns an unavailable
-result before reading or allocating content when the stored length exceeds it. Accepted reads
-reserve the initial length, use the bounded reader, verify the digest, and reject observed
-descriptor metadata changes. Empty objects are valid with a zero-byte limit.
+Checkpoint diff generation reads each complete source side. `ObjectStore::get` returns the exact
+stored bytes, verifies their digest, and rejects observed descriptor metadata changes. It checks
+addressability and allocation failures rather than imposing a content-size threshold. Empty
+objects remain valid.
 
-An oversized source produces a `Diff unavailable` entry for that file while other changed files
-continue to generate diffs. Capture and streamed restoration retain the complete object, so preview
-availability does not disable rollback. Oversized objects are not hash-verified by the preview read.
+Capture, diffing, and streamed restoration share complete object identities. Binary content and
+unsupported encodings retain distinct preview outcomes. A file's size does not turn an otherwise
+valid preview into `Diff unavailable`. Restoration verifies bytes before replacing a destination
+and preserves existing regular-file permissions.
 
-This bounds retained source bytes to 16 MiB per file pair. It does not bound the diff algorithm's
-line indexes, working memory, computation time, accumulated output, or concurrent callers. Shared
-diff-engine admission and typed availability delivery remain migration work.
+Concurrency, cache eviction, cancellation, and bounded I/O chunks control resource ownership.
+They do not impose a total file-size limit. Comparison still requires memory for line indexes,
+working state, and output, and actual allocation or I/O failures propagate to the requesting owner.
 
 ## Shared immutable diff sources
 
@@ -528,13 +535,13 @@ newline metadata. Raw, Git-canonical, and display-only representations produce d
 identities even when their byte hashes match. Clones share the original allocation and one
 thread-safe identity cell. The first identity request computes its hash once.
 
-Construction admits byte length and retained vector capacity against the 8 MiB limit without
-hashing. NUL-containing bytes and invalid UTF-8 produce distinct rejection results. Metadata counts
+Construction retains complete source bytes without an arbitrary byte or line-count limit.
+NUL-containing bytes and invalid UTF-8 produce distinct rejection results. Metadata counts
 LF and CRLF without normalizing bytes, treating bare CR as content. Empty files contain zero source
 lines, and a final newline does not create another line. `from_declared` verifies acquisition claims
 against both the content hash and derived newline metadata.
 
-Harness checkpoint diffs now consume these sources and use the shared source limit. Binary sources
+Harness checkpoint diffs consume these complete sources. Binary sources
 retain a binary-difference entry, while unsupported encodings receive an explicit unavailable entry.
 Source validation does not authorize writes or canonicalize checkpoint bytes.
 
@@ -564,7 +571,7 @@ end-to-end latency, peak memory, or cross-platform performance acceptance.
 
 Shared analysis admission, cancellation, retained-result accounting, lazy display, and live Harness
 comparison cutover remain incomplete. Temporary indexes, interning, and patch output require their
-own memory accounting beyond the source-byte limit.
+own memory accounting independently of source acceptance.
 
 ## Shared Harness checkpoint comparisons
 
@@ -575,7 +582,7 @@ They no longer run a separate `similar::TextDiff` comparison.
 
 Interaction finalization awaits shared comparison through checkpoint population and turn setup.
 Captured checkpoint records are saved before the analysis await, preserving durable checkpoint
-identity across cancellation or comparison failure. Expected binary, encoding, and source-size
+identity across cancellation or comparison failure. Expected binary and encoding
 unavailability remain distinct. Shared-engine admission and execution errors propagate to the
 existing broker failure path without a fallback comparison engine.
 
@@ -589,11 +596,11 @@ parser decodes quoted headings and source headers, including octal UTF-8 bytes, 
 separate file blocks and `/dev/null` identity. Mixed quoted/unquoted headings remain supported.
 
 Checkpoint source acquisition uses the host repository store's blocking read pool. Each job reads
-at most two 8 MiB objects, verifies stored digests, validates encoding, and computes source identity
-and newline metadata outside the async executor. Cancellation checks separate those stages. The
-default four read slots bound running and uncollected checkpoint source pairs to 64 MiB of source
-payload, excluding allocator overhead and separately retained analysis results. Object IDs consume
-the pool's declared input budget. Busy and closed admission propagate through the broker error path.
+the complete source pair, verifies stored digests, validates encoding, and computes source identity
+and newline metadata outside the async executor. Cancellation checks separate those stages.
+The default four read slots bound concurrent jobs, not the size of an individual source pair.
+Input-byte statistics describe retained work without rejecting large jobs. Busy and closed
+admission propagate through the broker error path.
 
 Preview serialization still executes synchronously in the broker future. Persisted previews
 still accumulate into strings. Unified source/cache byte accounting, output retention and
@@ -637,16 +644,15 @@ the complete capture. Ignored file edits do not invalidate reuse. Repository coo
 command cancellation apply to both paths. Capture diagnostics report reuse or candidate and override
 counts, cache hits, file bytes read, and elapsed milliseconds.
 
-## Bounded checkpoint command output
+## Complete checkpoint command output
 
 `forge_git::command::read_command` owns one direct child and two scoped output readers. The caller
-supplies job admission, independent stdout/stderr byte limits, a deadline, and cancellation checks.
+supplies job admission, a deadline, and cancellation checks.
 Readers drain both pipes concurrently, preserving binary bytes and nonzero exit status for caller
-classification. Each reader uses an 8 KiB scratch buffer and grows retained output geometrically
-within its stream capacity. An extra byte beyond the limit produces an error without publishing
-truncated output as success.
+classification. Each reader uses an 8 KiB scratch buffer and grows retained output as needed,
+preserving the complete stream. Allocation and I/O failures remain explicit errors.
 
-Cancellation, timeout, output overflow, and reader errors request direct-child termination. The
+Cancellation, timeout, and reader errors request direct-child termination. The
 owner waits for the child and joins both readers before returning. Callback unwind uses the same
 child cleanup ownership. The deadline is a termination deadline rather than a guaranteed return
 time. Operating-system waits and inherited pipes held by descendants can outlive it. Process-tree
@@ -654,8 +660,10 @@ containment remains incomplete.
 
 Checkpoint discovery reads Git metadata through gix rather than shell file lists.
 `file_command` sends large immutable blob output directly to an owned temporary file,
-retains at most 64 KiB of stderr, and applies a 30-second deadline. It shares process-group
-or Windows Job Object ownership and cancellation cleanup with the bounded command runner.
+retains complete stderr, and applies a 30-second deadline. It shares process-group
+or Windows Job Object ownership and cancellation cleanup with the command runner.
+Only explicit diagnostic-command calls retain bounded output tails. Those diagnostic budgets
+do not restrict acquired file content or ordinary command streams.
 
 ## Capture and rollback share repository scopes
 
@@ -689,7 +697,7 @@ read pool. The `Gix` backend combines HEAD-to-index and index-to-worktree events
 untracked path, evaluates configured submodule state, and enables staged rename tracking. Scoped
 reads disable staged rename tracking. It never writes gix's optional index-refresh suggestions.
 
-The reader caps the collected status map at 65,536 paths, restores byte-wise path ordering, and
+The reader retains the complete status map, restores byte-wise path ordering, and
 checks cancellation between emitted events. `gix` performs its own parallel directory, worktree,
 and tree-index traversal. The iterator must finish before Forge accepts its result.
 
@@ -723,7 +731,7 @@ Detected mismatches reject the result. HEAD preserves the symbolic reference and
 including unborn and detached states. Linked worktrees retain independent observations.
 
 Display collection performs no separate worktree-stamp passes. Paths start as `Unobserved`, which
-is distinct from `Missing`. Statistics reuse metadata already obtained during bounded content
+is distinct from `Missing`. Statistics reuse metadata already obtained during complete content
 acquisition. Counts describe the bytes encountered and may become stale during collection.
 Selected-path settlement retains its verified collection mode. The removed broad display scans
 have no worker pool. Expansion verifies cached source provenance. Writes use the action-specific
@@ -738,11 +746,11 @@ snapshot when skipped patches advanced the native revision. Native refresh advan
 generation and verifies the collected generation before reconciliation. Closing the document
 removes its autocmds and completes pending refresh callbacks with a closed-document error.
 
-Index stamps read at most the final 32 bytes of the index and each bounded
+Index stamps read at most the final 32 bytes of the index and each
 `sharedindex.<hash>` file, retaining Git's existing checksum and the file length.
 They do not hash or scan index contents. If Git omitted its checksum, the stamp uses
 modification time instead. A present checksum ignores timestamp-only shared-index
-refreshes. At most 256 shared-index files are admitted per directory.
+refreshes. Every matching shared-index file participates, without a directory-level count ceiling.
 
 Worktree stamps use file kind, size, modification time, available creation time, readonly state,
 and symlink target text. Unix builds also record device, inode, and change time. Symlink contents
@@ -754,16 +762,17 @@ preconditions remain separate work.
 Collection checks cancellation, generation invalidation, and a 30-second cooperative deadline.
 Full collection runs two native status enumerations and two index-stamp passes. It derives
 line counts from Forge raw hunks using the same canonical source pairs used for body rendering.
-Binary, filtered, unsupported, and oversized sources retain unknown counts. The count total can
-differ from Git's default numstat when the two diff algorithms choose different repeated-line hunks.
+Binary, filtered, and unsupported sources retain unknown counts. Source size alone does not
+disable statistics. The count total can differ from Git's default numstat when the two diff
+algorithms choose different repeated-line hunks.
 
-## Bounded repository content acquisition
+## Complete repository content acquisition
 
 `RepositoryState::content` admits object, index-stage, worktree, or supplied-source requests on the
 shared read pool. Request accounting includes retained path capacity and supplied source capacity.
-The default input budget is now 32 MiB so an 8 MiB supplied source can enter the pool. The four-job
-limit remains unchanged. Admission, cancellation, and generation invalidation fail the outer read.
-Native acquisition returns distinct ready, binary, oversized, missing, unavailable, and failed
+The read pool admits four jobs without a byte admission ceiling. Admission, cancellation, and
+generation invalidation fail the outer read.
+Native acquisition returns distinct ready, binary, missing, unavailable, and failed
 outcomes. Actual acquisition errors retain their error chains.
 
 `FileContent` reuses `forge_diff::source::SourceVersion` for immutable bytes, lazy SHA-256 content identity,
@@ -776,35 +785,32 @@ crate depends on the repository-independent source contract without invoking dif
 Native gix reads check object hash format, existence, blob kind, and advertised size before decoding.
 They disable replacement-ref substitution. Exact content requests verify decoded bytes against the
 requested Git object ID. Informational statistics use the existing object ID without rehashing the
-blob. Exact mutation acquisition retains checksum verification. A real packed-object fixture
-corrupts an oversized blob's compressed payload and still
-obtains a size rejection, proving that this path does not decode the payload before admission.
-Native gix delta bases, decoder scratch buffers, and aggregate result leases still need memory
-admission before the resource acceptance gates can pass.
+blob. Exact mutation acquisition retains checksum verification. Packed-blob and worktree fixtures
+verify complete bytes beyond the former source-size threshold. Native gix delta bases,
+decoder scratch buffers, and aggregate result leases still consume memory independently of
+the retained source accounting.
 
-Index-stage selection uses bounded `git ls-files --stage -z` output with literal pathspecs and
-64 KiB limits for each output stream. It validates exact path identity, unique stage records,
-mode, and object hash through the shared object-state parser. It checks the selected stage again
+Index-stage selection reads the requested stage from the native gix index. It retains exact
+path identity, stage, mode, and object hash. It checks the selected stage again
 after reading the object. Base, ours, and theirs remain separate sources. Gitlinks report an
 unavailable content kind rather than entering text analysis.
 
 Worktree acquisition checks metadata before opening, from the opened file, after streaming, and
 at the path after acquisition. It rejects growth and shrinkage without returning a partial source.
-Reads use an 8 KiB scratch buffer and reserve only the admitted file length. Leaf opens use Unix
-`O_NOFOLLOW` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. Symlink content is its target text, without
+Reads use an 8 KiB scratch buffer and reserve the observed file length without a size ceiling.
+Leaf opens use Unix `O_NOFOLLOW` or Windows `FILE_FLAG_OPEN_REPARSE_POINT`. Symlink content is its target text, without
 opening the target. Directory and special-file requests remain explicit unavailable outcomes.
 
-Callers can lower the 8 MiB byte ceiling and impose a line limit. Line counts preserve CRLF and
-terminal-newline behavior, stopping at a lower bound when a line limit is exceeded. An optional
-expected source identity rejects changed bytes or representation. Successful empty sources remain
-distinct from missing content. Complete canonical conversion, external filters, textconv, atomic write
-preconditions, aggregate memory admission, and the live feature cutovers remain incomplete. The
+Content requests carry no byte or line-count limits. Complete newline metadata preserves CRLF and
+terminal-newline behavior. An optional expected source identity rejects changed bytes or
+representation. Successful empty sources remain distinct from missing content. Complete canonical
+conversion, external filters, textconv, atomic write preconditions, and the live feature cutovers remain incomplete. The
 Unix symlink fixture is present but was not executed by the Windows validation run.
 
 ## Canonical worktree conversion
 
 Worktree content requests select `WorktreeConversion::Raw` or `GitCanonical`. Canonical regular-file
-reads use the pinned native gix conversion pipeline after bounded raw acquisition and before UTF-8
+reads use the pinned native gix conversion pipeline after complete raw acquisition and before UTF-8
 validation. This ordering permits UTF-16 input without admitting it as a UTF-8 source. Symlink target
 text is canonical without applying regular-file filters. Object and index content remain canonical.
 
@@ -816,7 +822,7 @@ fresh configuration, attributes, and index state after conversion. Invalid confi
 acquisition failure. These sampled checks do not establish atomic mutation preconditions.
 
 Status opens and refreshes share one conversion session across changed paths. The session
-prepares configuration, index, native pipeline, attribute stack, and bounded info-attribute
+prepares configuration, index, native pipeline, attribute stack, and complete info-attribute
 input once. A fresh verification session compares configuration and index, then resolves every
 used path's attributes before the batch can publish. Single-file content acquisition uses the
 same preparation and verification boundaries around one file. Existing HEAD, status, and
@@ -828,7 +834,7 @@ Statistics acquire only changed sides, retaining a path's index source across it
 unstaged comparisons. Source newline metadata uses `memchr` and preserves unterminated final
 lines. Added, deleted, and untracked text uses that metadata without tokenizing a comparison.
 Modified text uses the pinned `gix-imara-diff` Histogram implementation and line postprocessing.
-Counts and display hunks derive from the same comparison. Binary, oversized, conflicted,
+Counts and display hunks derive from the same comparison. Binary, conflicted,
 submodule, and unsupported sources retain unavailable counts.
 
 Each repository owns a count cache with at most 8,192 entries and 4 MiB of charged entry data.
@@ -843,8 +849,10 @@ New entries publish after conversion-batch verification. Pending entries have th
 charged-byte limits as the cache. Cache entries never authorize mutations or bypass lazy
 prepared-analysis validation when a file expands.
 
-`RepositoryStore` and the runtime's `DiffEngine` share one synchronized `AnalysisStore`, bounded
-to 512 entries, 128 MiB of retained sources, and 64 MiB of results. Statistics reserve retention
+`RepositoryStore` and the runtime's `DiffEngine` share one synchronized `AnalysisStore`, with cache
+retention budgets of 512 entries, 128 MiB of sources, and 64 MiB of results. Explicit analysis
+can exceed these budgets and returns a live handle without retaining a cache reference.
+Statistics reserve optional retention
 before constructing cached hunks, prioritize unstaged then staged path order, and
 never evict existing analyses. Saturation keeps exact counts but omits retention. Count-only
 comparisons omit hunk byte ranges and content hashes. Retained full analyses request lazy source
@@ -861,7 +869,7 @@ source preconditions independently of these display-cache associations.
 
 The native pipeline handles CRLF normalization, text attributes, ident contraction, and the admitted
 encoding subset. UTF-8, UTF-16LE, and UTF-16BE are admitted. Explicit UTF-16 endianness rejects byte
-order marks. Decoder capacity is checked against the caller's byte limit before conversion. Other
+order marks. Decoder capacity calculations retain overflow checks without imposing a byte ceiling. Other
 encoding labels return an explicit unsupported-encoding outcome until their Git parity is proven.
 Configured clean/process filters or required filters return an explicit external-filter unavailable
 outcome. All native external driver options are cleared before conversion, so no filter process can
@@ -870,16 +878,16 @@ start through this path. Textconv remains separate work.
 Attribute resolution corrects the pinned gix-worktree 0.56 precedence behavior by applying
 `$GIT_COMMON_DIR/info/attributes` after nested worktree rules. The override uses collected macro
 definitions and preserves explicit unspecified/unset states. A validated resolved selection drives
-both native conversion and final context verification. Each additional info-attribute read permits
-1 MiB. Selected-state digest input permits 64 KiB and serialized effective configuration permits
-1 MiB. Native configuration/attribute parsing, decoder scratch, and aggregate result memory still
-require complete admission accounting before resource acceptance gates can pass.
+both native conversion and final context verification. Info-attribute reads, selected-state digests,
+and serialized effective configuration preserve their complete input without byte ceilings.
+Native configuration/attribute parsing, decoder scratch, and aggregate results retain their
+actual memory costs.
 
-The CRLF history callback reads only an unconflicted index entry, checks blob kind and the 8 MiB
-header limit before decoding, then verifies retained capacity and object checksum. Tests compare
+The CRLF history callback reads only an unconflicted index entry, checks blob kind, decodes the
+complete object, and verifies advertised length and object checksum. Tests compare
 canonical bytes with real Git staging for an existing CRLF index entry. Other fixtures cover native
 Git object identity, configuration refresh and invalidation, attribute precedence/macros, explicit
-unset/unspecified states, index identity changes, external-filter exclusion, and encoding limits.
+unset/unspecified states, index identity changes, external-filter exclusion, and encoding validation.
 
 Enabling gix's attributes feature retains gix 0.87.1 and adds locked transitive packages
 `gix-submodule 0.34.0`, `dashmap 6.2.1`, and `hashbrown 0.14.5`. The stale local registry index needed
@@ -895,10 +903,8 @@ and preserves Git-compatible short names, including ambiguous local branches.
 The result retains raw argument bytes, a sorted candidate list, request revision, repository
 generation, shared-storage identity, and a digest of the enumerated full refs and object IDs.
 
-Each enumeration retains at most 20,001 candidate records and 16 MiB of encoded reference data.
-Accepted candidate storage permits 20,000 values and 2 MiB of actual vector capacities,
-including the candidate index. Callers can lower both limits. The extra record proves truncation
-when the count ceiling is reached. Byte saturation keeps an admitted prefix and marks truncation.
+Each enumeration retains the complete candidate collection and encoded reference data without a
+count or byte ceiling. Accepted snapshots preserve every argument rather than an admitted prefix.
 Malformed framing, unsorted full refs, duplicate short arguments, and wrong object hash formats
 reject the result. Invalid UTF-8 arguments retain their original bytes.
 
@@ -911,21 +917,19 @@ Previous snapshots are dropped outside the locks. Linked-worktree storage invali
 worktree's candidate cache. Readers retaining an old Arc keep an explicitly historical snapshot.
 
 `forge/completion.lua` owns one completion list independently from repository discovery and I/O.
-Its synchronous lookup uses binary search and returns at most 200 values. A cold or stale lookup
+Its synchronous lookup uses binary search and returns every prefix match. A cold or stale lookup
 schedules one refresh, and warm lookups schedule none. Callback delivery is accepted once. Failed
 requests notify, preserve valid candidates, clear pending state, and delay retry for one second.
 Repository invalidation rejects an in-flight result, while a host-generation change drops the list
 and rejects old-host responses. Successful empty lists remain distinct from failed requests.
 
-Lua publication validates identity, generation, revision, strict byte ordering, dense-list shape,
-20,000 values, and a 2 MiB accounting quota before copying the list. The accounting quota includes
-4 KiB per snapshot and 64 bytes per value in addition to string bytes. It is an admission policy,
-not a measured bound on Lua VM allocation or total host memory. Candidate snapshots expose their
-truncated state. The shared-host page encoder applies this same quota before wire delivery and
-uses base64 to preserve raw ref bytes. Section 62 describes the live command integration.
+Lua publication validates identity, generation, revision, strict byte ordering, and dense-list shape
+before copying the complete list. Accounting includes 4 KiB per snapshot and 64 bytes per value in
+addition to string bytes, without rejecting snapshots for their accounted size. The shared-host
+page encoder preserves every argument and uses base64 to preserve raw ref bytes.
 
 Peak-memory and cross-platform measurements remain required before the completion acceptance gate
-can pass. The accounting quota is not a measurement of total Lua VM memory.
+can pass. Snapshot accounting is not a measurement of total Lua VM memory.
 
 ## Shared-host revision completion cutover
 
@@ -947,17 +951,15 @@ Revision refresh publishes one accepted Rust snapshot, then returns a page of NU
 arguments encoded as base64. Pages contain at most 128 KiB of decoded payload. Subsequent requests
 carry the repository identity, ref digest, snapshot revision, and byte offset. They read the accepted
 snapshot without rerunning Git enumeration and reject a changed repository, invalidated snapshot,
-changed source digest, superseded revision, or out-of-range offset. The encoder applies Lua's
-4 KiB plus 64-bytes-per-value accounting quota before selecting the exposed prefix. Further
-omissions set the existing truncated flag. Individual arguments may span page boundaries.
+changed source digest, superseded revision, or out-of-range offset. Pagination covers the complete
+snapshot without selecting a size-limited prefix. Individual arguments may span page boundaries.
 
 `revisions.lua` captures working-directory context at setup and on command-line/directory events.
 The synchronous command callback reads that context and cached strings without repository discovery,
 Git execution, or JSON decoding. Cold calls return immediately and schedule one host start/refresh.
 The adapter assembles bounded pages asynchronously and publishes only after identity, offsets,
 length, count, framing, and cache validation succeed. Ten-second stale refreshes retain the previous
-list while running. Failures notify and preserve valid data. A truncated result produces a warning
-that manually entered revisions remain available.
+list while running. Failures notify and preserve valid data.
 
 `ForgeBranchDiff`, the revision argument of `ForgeBranchDiffFile`, and the revision argument of
 `ForgeFileRevision` now use that adapter. Native file completion for the first file argument remains

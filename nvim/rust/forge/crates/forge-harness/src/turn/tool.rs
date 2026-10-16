@@ -138,6 +138,9 @@ impl ToolStore {
                 tool.output.clone_from(output);
             }
         }
+        if activity.kind == crate::backend::ToolActivityKind::FileChange {
+            tool.kind = tool_kind(activity);
+        }
         if !activity.change.is_empty() {
             tool.change.clone_from(&activity.change);
         }

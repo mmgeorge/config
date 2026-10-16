@@ -129,9 +129,6 @@ impl DeclarationIndex {
         path: &str,
         source: &str,
     ) -> Result<(Self, DeclarationIndexTiming), SyntaxError> {
-        if source.len() > 8 * 1024 * 1024 {
-            return Err(SyntaxError::MemoryLimit);
-        }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         if !matches!(
@@ -161,7 +158,7 @@ impl DeclarationIndex {
         if language == SyntaxLanguage::Lua {
             let surrogate;
             let source = if tree.root_node().has_error() {
-                surrogate = super::declaration::declaration_surrogate(language, source);
+                surrogate = super::declaration::declaration_surrogate(language, source)?;
                 tree = parser.parse(&surrogate, None).ok_or(SyntaxError::Cancelled)?;
                 surrogate.as_str()
             } else { source };
@@ -256,7 +253,7 @@ fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope
 }
 
 fn lua_symbol_walk(node: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String], local: &std::collections::HashSet<String>, exported: &std::collections::HashSet<String>, depth: usize) -> Result<(), SyntaxError> {
-    if depth > 128 || index.symbol.len() > 65536 { return Err(SyntaxError::CaptureLimit); }
+    if depth > 128 { return Err(SyntaxError::CaptureLimit); }
     if node.kind() == "function_declaration" {
         if let Some(name) = node.child_by_field_name("name") {
             let parts = contents(name, source).replace(':', ".").split('.').map(str::to_owned).collect::<Vec<_>>();
@@ -527,7 +524,7 @@ fn walk(
     index: &mut DeclarationIndex,
     depth: usize,
 ) -> Result<(), SyntaxError> {
-    if depth > 128 || index.symbol.len() + index.reference.len() + index.import.len() > 65536 {
+    if depth > 128 {
         return Err(SyntaxError::CaptureLimit);
     }
     let rust = language == SyntaxLanguage::Rust;

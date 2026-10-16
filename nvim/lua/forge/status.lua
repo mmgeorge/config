@@ -333,7 +333,7 @@ function M.demand(state)
       local owner = history.owner(state.replica, result.document)
       result = history.delivery(state.replica, result)
       local applied = buffer.apply_body(state.replica, result)
-      if applied.kind == "Desynchronized" then return end
+      if applied.kind == "Desynchronized" or applied.kind == "Recovering" then return end
       if applied.kind == "Discarded" then
         state.done[result.file] = true
         if owner then recover_commit(state, owner) else recover(state) end
@@ -488,7 +488,13 @@ function M.navigate_step(state)
   if not captured then state.navigation = nil notice(failure or "Cannot capture hunk navigation") return end
   navigation.sequence = captured.sequence
   request(state, { input = captured, forward = navigation.forward }, function(result, request_failure)
-    if result and result.body and result.body ~= vim.NIL then buffer.apply_body(state.replica, result.body) end
+    if result and result.body and result.body ~= vim.NIL then
+      local applied = buffer.apply_body(state.replica, result.body)
+      if applied.kind == "Desynchronized" or applied.kind == "Recovering" then
+        state.navigation = nil
+        return
+      end
+    end
     if state.navigation ~= navigation then return end
     if request_failure or not result then
       state.navigation = nil
@@ -657,11 +663,25 @@ function M.open(options)
     local owner = model and model.owner
     request(state, { operation = "body_snapshot", document = owner and owner.document or document,
       file = model and model.record.id or file, generation = generation }, function(result, failure)
-      if failure or not result then notice(failure or "Missing status body snapshot") return end
+      if failure or not result then
+        local current = state.replica.file[file]
+        if current and current.record.generation == generation then
+          current.recovering = nil
+          state.done[file] = true
+        end
+        notice(failure or "Missing status body snapshot")
+        return
+      end
       local applied = buffer.apply_body(state.replica, result)
       if applied.kind ~= "Applied" then return end
       local model = state.replica.file[file]
-      if model and model.record.generation == generation then model.recovering = nil end
+      if model and model.record.generation == generation then
+        model.recovering = nil
+        if model.body and state.pending_expansion and state.pending_expansion[file] == generation then
+          state.pending_expansion[file] = nil
+          require("forge.buffer").set_expansion(state.replica, "file:" .. tostring(file), true)
+        end
+      end
       state.done[file] = result.more ~= true
       M.demand(state)
     end)

@@ -288,9 +288,9 @@ fn decode_path(text: &str) -> Result<String, PatchParseError> {
     if text.is_empty() {
         return Err(PatchParseError("empty saved patch path"));
     }
-    if text.len() > 16 * 1024 || text.contains('\0') {
+    if text.contains('\0') {
         return Err(PatchParseError(
-            "saved patch path is invalid or exceeds 16 KiB",
+            "saved patch path contains NUL",
         ));
     }
     if !text.starts_with('"') {

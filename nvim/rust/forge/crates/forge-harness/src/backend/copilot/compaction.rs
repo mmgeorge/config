@@ -83,7 +83,7 @@ impl CompactionMonitor {
         let correlation = Arc::clone(&manual);
         let thread_id = session.id().to_string();
         let task = tokio::spawn(async move {
-            let decoder = CopilotEventDecoder;
+            let decoder = CopilotEventDecoder::default();
             let sink = subscription_state.sink;
             subscription_state.output.lock().await.backend_session_id = Some(thread_id);
             loop {
@@ -186,10 +186,10 @@ mod tests {
             data: serde_json::json!({"success":true,"summaryContent":"Keep the task constraints."}),
             ..start.clone()
         };
-        CopilotEventDecoder
+        CopilotEventDecoder::default()
             .decode(&start, &mut *subscription.output.lock().await, None)
             .await;
-        CopilotEventDecoder
+        CopilotEventDecoder::default()
             .decode(&complete, &mut *rebound.output.lock().await, None)
             .await;
         let output = rebound.output.lock().await;

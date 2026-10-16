@@ -377,14 +377,36 @@ fn nushell_unresolved_execution_never_inherits_an_allow_rule() {
 }
 
 #[test]
-fn parser_resource_limits_fail_closed() {
+fn parser_preserves_complete_commands_beyond_former_byte_limit() {
+    let payload = "retained".repeat(9000);
+    let source = format!("probe '{payload}'; probe after");
+    assert!(source.len() > 65_536);
     for shell in [
         CommandShell::PowerShell,
         CommandShell::Bash,
         CommandShell::Zsh,
         CommandShell::Nushell,
     ] {
-        assert!(normalize_command_in(&"a".repeat(65_537), shell).ambiguous);
+        let parsed = normalize_command_in(&source, shell);
+        assert!(!parsed.ambiguous, "{shell:?}");
+        assert_eq!(parsed.invocation_list.len(), 2, "{shell:?}");
+        assert_eq!(parsed.invocation_list[0].token_list, ["probe", payload.as_str()], "{shell:?}");
+        assert_eq!(parsed.invocation_list[1].source, "probe after", "{shell:?}");
+        let final_command = source.rfind("probe").unwrap();
+        assert!(highlights(&source, shell).iter().any(|capture|
+            capture.group == "ForgeHarnessCommand" && capture.range.start >= final_command),
+            "{shell:?}");
+    }
+}
+
+#[test]
+fn parser_structural_guards_fail_closed() {
+    for shell in [
+        CommandShell::PowerShell,
+        CommandShell::Bash,
+        CommandShell::Zsh,
+        CommandShell::Nushell,
+    ] {
         assert!(
             normalize_command_in(
                 &format!("{}probe{}", "(".repeat(100), ")".repeat(100)),

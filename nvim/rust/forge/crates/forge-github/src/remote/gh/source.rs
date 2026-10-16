@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use super::{GhClient, classify_failure, diagnostic, remote_result};
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 use crate::review_source::{
-    MAX_SOURCE_BYTES, ReviewCommitDetail, ReviewCommitDetailRequest, ReviewCommitFile,
+    ReviewCommitDetail, ReviewCommitDetailRequest, ReviewCommitFile,
     ReviewComparison, ReviewComparisonRequest, ReviewSource, ReviewSourceRequest, valid_object_id,
 };
 
@@ -30,10 +30,12 @@ impl GhClient {
                 request.commit
             )
             .into(),
+            "--paginate".into(),
+            "--slurp".into(),
         ];
         remote_result(
             self.run_native(directory, argument, None, 1024 * 1024, move |output| {
-                decode_commit_detail(response(output)?, &request.commit)
+                decode_commit_pages(response(output)?, &request.commit)
             })
             .await,
         )
@@ -93,7 +95,7 @@ impl GhClient {
             .into(),
         ];
         let bytes = remote_result(
-            self.run_native(directory, argument, None, MAX_SOURCE_BYTES, move |output| {
+            self.run_native(directory, argument, None, 0, move |output| {
                 let bytes = response_bytes(output)?;
                 if bytes.len() != size {
                     return Err(invalid("Git blob size changed from immutable metadata"));
@@ -152,6 +154,23 @@ impl GhClient {
     }
 }
 
+fn decode_commit_pages(value: Value, requested_commit: &str) -> Result<ReviewCommitDetail, RemoteFailure> {
+    let pages = value.as_array().ok_or_else(|| invalid("commit detail pages are not a collection"))?;
+    let mut detail: Option<ReviewCommitDetail> = None;
+    for page in pages {
+        let mut next = decode_commit_detail(page.clone(), requested_commit)?;
+        if let Some(previous) = &mut detail {
+            if previous.parent != next.parent || previous.subject != next.subject {
+                return Err(invalid("commit detail metadata changed during pagination"));
+            }
+            previous.file.append(&mut next.file);
+        } else {
+            detail = Some(next);
+        }
+    }
+    detail.ok_or_else(|| invalid("commit detail pages are empty"))
+}
+
 fn decode_commit_detail(
     value: Value,
     requested_commit: &str,
@@ -185,18 +204,13 @@ fn decode_commit_detail(
         .next()
         .unwrap_or_default()
         .trim_end_matches('\r');
-    if subject.is_empty() || subject.len() > 4096 {
+    if subject.is_empty() {
         return Err(invalid("commit detail has an invalid subject"));
     }
     let file = value
         .get("files")
         .and_then(Value::as_array)
         .ok_or_else(|| invalid("commit detail omitted changed files"))?;
-    if file.len() > 300 {
-        return Err(invalid(
-            "commit detail exceeds the 300-file expansion bound",
-        ));
-    }
     let file = file
         .iter()
         .map(|file| {
@@ -231,12 +245,6 @@ fn decode_commit_detail(
                 })
                 .ok_or_else(|| invalid("commit detail contains an invalid file status"))?;
             let patch = file.get("patch").and_then(Value::as_str).map(str::to_owned);
-            if patch
-                .as_ref()
-                .is_some_and(|patch| patch.len() > 1024 * 1024)
-            {
-                return Err(invalid("commit file patch exceeds the 1 MiB bound"));
-            }
             Ok(ReviewCommitFile {
                 path: path.into(),
                 previous_path,
@@ -255,7 +263,6 @@ fn decode_commit_detail(
 
 fn valid_path(path: &str) -> bool {
     !path.is_empty()
-        && path.len() <= 4096
         && !path.contains('\0')
         && !path.starts_with('/')
         && path.split('/').all(|part| !matches!(part, "" | "." | ".."))
@@ -298,8 +305,8 @@ fn decode_identity(value: Value, commit: &str) -> Result<Option<(String, usize)>
     let size = source
         .get("byteSize")
         .and_then(Value::as_u64)
-        .filter(|size| *size <= MAX_SOURCE_BYTES as u64)
-        .ok_or_else(|| invalid("source exceeds the 8 MiB native bound"))? as usize;
+        .and_then(|size| usize::try_from(size).ok())
+        .ok_or_else(|| invalid("source byteSize is missing or exceeds this platform's addressable size"))?;
     Ok(Some((blob.into(), size)))
 }
 
@@ -331,6 +338,20 @@ fn invalid(message: impl Into<String>) -> RemoteFailure {
 mod tests {
     use super::*;
 
+    #[test]
+    fn commit_pages_preserve_all_files_and_large_patches() {
+        let commit = "a".repeat(40);
+        let patch = format!("{}patch tail", "+line\n".repeat(180_000));
+        let first = json!({"sha":commit,"commit":{"message":"subject"},"parents":[],
+            "files":[{"filename":"first.rs","status":"modified","patch":patch}]});
+        let second = json!({"sha":commit,"commit":{"message":"subject"},"parents":[],
+            "files":(0..301).map(|index| json!({"filename":format!("next-{index}.rs"),"status":"added"})).collect::<Vec<_>>()});
+        let detail = decode_commit_pages(json!([first,second]), &commit).unwrap();
+        assert_eq!(detail.file.len(), 302);
+        assert_eq!(detail.file[0].patch.as_ref().unwrap(), &patch);
+        assert_eq!(detail.file[301].path, "next-300.rs");
+    }
+
     fn source_value(source: Value) -> Value {
         json!({"data":{"repository":{"commit":{"__typename":"Commit","oid":"a".repeat(40)},"source":source}}})
     }
@@ -350,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn immutable_source_preserves_blob_identity_and_rejects_trees_or_oversize() {
+    fn immutable_source_preserves_large_blob_identity_and_rejects_trees() {
         let blob = "b".repeat(40);
         assert_eq!(
             decode_identity(
@@ -367,12 +388,13 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
+        assert_eq!(
             decode_identity(
-                source_value(json!({"__typename":"Blob","oid":blob,"byteSize":MAX_SOURCE_BYTES+1})),
+                source_value(json!({"__typename":"Blob","oid":blob,"byteSize":8 * 1024 * 1024 + 1})),
                 &"a".repeat(40)
             )
-            .is_err()
+            .unwrap(),
+            Some((blob, 8 * 1024 * 1024 + 1))
         );
     }
 

@@ -350,7 +350,6 @@ async fn initial_sections_start_together_and_failures_finish_loading() {
     let pool = Arc::new(AnalysisPool::new(PoolLimits {
         workers: 2,
         jobs: 16,
-        input_bytes: 64 * 1024 * 1024,
     }));
     let service = ReviewService::with_analysis(github(&remote), pool.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -451,7 +450,6 @@ async fn section_pages_retain_previous_records_after_duplicate_or_stale_delivery
     let pool = Arc::new(AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 2,
-        input_bytes: 32 * 1024 * 1024,
     }));
     let service = ReviewService::with_analysis(github(&remote), pool.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -612,7 +610,6 @@ async fn checks_and_submitted_reviews_preserve_the_lua_summary_rows() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -750,7 +747,6 @@ async fn checks_and_submitted_reviews_preserve_the_lua_summary_rows() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let empty = empty_service
@@ -841,7 +837,6 @@ async fn pull_request_head_row_preserves_commit_date_branch_and_subject() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -991,7 +986,6 @@ async fn pull_request_recent_commits_are_last_newest_first_and_closed() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let opened = service
@@ -1218,7 +1212,6 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -1695,7 +1688,6 @@ async fn materialized_edits_preserve_raw_text_and_advance_projection_once() {
     let pool = Arc::new(AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 1024 * 1024,
     }));
     let service = ReviewService::with_analysis(github(&remote), pool.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -1776,7 +1768,6 @@ async fn materialized_analysis_rejects_text_changed_while_queued() {
     let pool = Arc::new(AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 2,
-        input_bytes: 1024 * 1024,
     }));
     let service = ReviewService::with_analysis(github(&remote), pool.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
@@ -4779,7 +4770,6 @@ async fn status_snapshot_opens_header_without_remote_reads() {
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 32 * 1024 * 1024,
         })),
     );
     let body = "Paragraph\r\n\r\n```ts\r\nconst value = 1;\r\n```";
@@ -4897,7 +4887,6 @@ async fn repository_pr_discovery_runs_concurrently_and_reuses_header() {
     let pool = Arc::new(AnalysisPool::new(PoolLimits {
         workers: 2,
         jobs: 16,
-        input_bytes: 64 * 1024 * 1024,
     }));
     let service = ReviewService::with_analysis(github(&remote), pool);
     *remote.section_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(3)));
@@ -4988,7 +4977,6 @@ async fn reviewer_document(remote: &Arc<TestRemote>) -> (ReviewService, Document
         Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 8,
-            input_bytes: 64 * 1024 * 1024,
         })),
     );
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();

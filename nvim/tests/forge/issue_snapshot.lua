@@ -2,7 +2,7 @@ vim.loader.enable(false)
 local snapshot = require("github.issue_snapshot")
 local index = require("github.issue_index")
 local cache = require("github.repo_cache")
-local root = vim.fn.tempname()
+local root = vim.fs.joinpath(vim.fn.getcwd(), ".forge-issue-snapshot-test-" .. tostring(vim.uv.hrtime()))
 vim.fn.mkdir(root, "p")
 local owned_root = vim.uv.fs_realpath(root)
 local repo = "owner/repo"
@@ -16,10 +16,12 @@ cache.set_data_dir_for_test(root)
 
 ---@param path string
 ---@param title string
-local function publish(path, title)
+---@param repository? string
+local function publish(path, title, repository)
+  repository = repository or repo
   vim.fn.mkdir(vim.fs.dirname(path), "p")
-  local bytes = vim.json.encode({ repo = repo, state = "open", issue_count = 1, issues = {
-    { repo = repo, number = 7, title = title, state = "OPEN", url = "https://github.com/owner/repo/issues/7", labels = { { name = "original" } } },
+  local bytes = vim.json.encode({ repo = repository, state = "open", issue_count = 1, issues = {
+    { repo = repository, number = 7, title = title, state = "OPEN", url = "https://github.com/owner/repo/issues/7", labels = { { name = "original" } } },
   } })
   local temporary = path .. ".next"
   vim.fn.writefile({ bytes }, temporary)
@@ -31,7 +33,7 @@ end
 local function load(path)
   local done, failure = false, nil
   snapshot.load(repo, path, function(result) failure = result done = true end, true)
-  assert(vim.wait(2000, function() return done end, 5), "snapshot preload did not finish")
+  assert(vim.wait(10000, function() return done end, 5), "snapshot preload did not finish")
   return failure
 end
 
@@ -92,11 +94,42 @@ local ok, failure = xpcall(function()
   vim.uv.fs_read, vim.uv.fs_close = original_read, original_close
 
   local oversized = vim.fs.joinpath(root, "oversized.json")
-  local descriptor = assert(vim.uv.fs_open(oversized, "w", 438))
-  assert(vim.uv.fs_ftruncate(descriptor, 16 * 1024 * 1024 + 1))
-  assert(vim.uv.fs_close(descriptor))
-  local limit_failure = load(oversized)
-  assert(limit_failure and limit_failure:find("16 MiB", 1, true))
+  local full_title = string.rep("complete-", 4 * 1024 * 1024)
+  publish(oversized, full_title)
+  assert(load(oversized) == nil)
+  assert(snapshot.records(repo)[1].title == full_title, "large snapshot was rejected by cache admission")
+  publish(oversized, "small replacement")
+  assert(load(oversized) == nil)
+  assert(snapshot.records(repo)[1].title == "small replacement")
+
+  local cached_title = string.rep("cached-", 3 * 1024 * 1024)
+  publish(path, cached_title)
+  assert(load(path) == nil)
+  local held_refresh, refresh_done, refresh_failure
+  vim.uv.fs_read = function(descriptor, length, offset, callback)
+    return original_read(descriptor, length, offset, function(read_failure, bytes)
+      held_refresh = function() callback(read_failure, bytes) end
+    end)
+  end
+  snapshot.load(repo, path, function(result)
+    refresh_failure, refresh_done = result, true
+  end, true)
+  assert(vim.wait(2000, function() return held_refresh ~= nil end, 5))
+  vim.uv.fs_read = original_read
+  local other_repo, other_done, other_failure = "other/repo", false, nil
+  local other_path = vim.fs.joinpath(root, "other.json")
+  local other_title = string.rep("other-", 3 * 1024 * 1024)
+  publish(other_path, other_title, other_repo)
+  snapshot.load(other_repo, other_path, function(result)
+    other_failure, other_done = result, true
+  end, true)
+  assert(vim.wait(10000, function() return other_done end, 5))
+  assert(other_failure == nil, other_failure)
+  assert(snapshot.records(other_repo)[1].title == other_title, "pinned cache rejected complete content")
+  assert(snapshot.records(repo)[1].title == cached_title, "pending refresh lost its valid snapshot")
+  held_refresh()
+  assert(vim.wait(10000, function() return refresh_done end, 5))
+  assert(refresh_failure == nil, refresh_failure)
 
   snapshot.clear()
   local pending_open = {}

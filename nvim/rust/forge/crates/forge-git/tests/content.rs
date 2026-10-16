@@ -1,16 +1,15 @@
 mod support;
 
 use std::{
-    fs::{self, File, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    fs,
     path::Path,
 };
 
-use forge_diff::source::{MAX_SOURCE_BYTES, Representation, SourceVersion};
+use forge_diff::source::{Representation, SourceVersion};
 use forge_git::{
     RepositoryPath,
     content::{
-        ContentLimit, ContentLimits, ContentOrigin, ContentRequest, ContentResult, ContentSource,
+        ContentOrigin, ContentRequest, ContentResult, ContentSource,
         ContentUnavailable, FileContent, IndexStage,
     },
     store::RepositoryStore,
@@ -143,19 +142,6 @@ async fn missing_binary_encoding_size_and_source_identity_have_distinct_outcomes
             .unwrap()
             .value,
     );
-    let mut limited = request(ContentSource::Worktree {
-        path: path("text"),
-        conversion: forge_git::content::WorktreeConversion::Raw,
-    });
-    limited.limits = ContentLimits::new(3, usize::MAX).unwrap();
-    assert!(matches!(
-        repository.content(&store, limited).await.unwrap().value,
-        ContentResult::TooLarge {
-            kind: ContentLimit::Bytes,
-            observed: 8,
-            limit: 3
-        }
-    ));
     fs::write(root.join("text"), b"replaced").unwrap();
     let mut expected = request(ContentSource::Worktree {
         path: path("text"),
@@ -201,80 +187,33 @@ async fn object_reads_ignore_replacement_refs_and_support_sha256() {
 }
 
 #[tokio::test]
-async fn oversized_packed_blob_is_rejected_without_decoding_its_corrupt_payload() {
+async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_content() {
     let fixture = tempfile::tempdir().unwrap();
     let root = fixture.path();
     git(root, &["init", "--quiet"]);
-    File::create(root.join("large"))
-        .unwrap()
-        .set_len(MAX_SOURCE_BYTES as u64 + 1)
-        .unwrap();
+    let bytes = b"content\r\n".repeat(1_000_000);
+    fs::write(root.join("large"), &bytes).unwrap();
+    git(root, &["config", "core.autocrlf", "false"]);
     git(root, &["add", "large"]);
     commit(root);
     let large = object(&git(root, &["rev-parse", "HEAD:large"]));
     git(root, &["gc", "--prune=now"]);
-    let pack_directory = root.join(".git/objects/pack");
-    let index = fs::read_dir(&pack_directory)
-        .unwrap()
-        .map(|entry| entry.unwrap().path())
-        .find(|path| path.extension().is_some_and(|extension| extension == "idx"))
-        .unwrap();
-    let listing =
-        String::from_utf8(git(root, &["verify-pack", "-v", index.to_str().unwrap()])).unwrap();
-    let line = listing
-        .lines()
-        .find(|line| line.starts_with(&large.to_string()))
-        .unwrap();
-    let offset = line
-        .split_whitespace()
-        .nth(4)
-        .unwrap()
-        .parse::<u64>()
-        .unwrap();
-    let pack_path = index.with_extension("pack");
-    let mut permissions = fs::metadata(&pack_path).unwrap().permissions();
-    #[cfg(windows)]
-    #[expect(
-        clippy::permissions_set_readonly_false,
-        reason = "Windows clears a DOS attribute. Unix uses an explicit owner-only mode below."
-    )]
-    permissions.set_readonly(false);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        permissions.set_mode(0o600);
-    }
-    fs::set_permissions(&pack_path, permissions).unwrap();
-    let mut pack = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pack_path)
-        .unwrap();
-    pack.seek(SeekFrom::Start(offset)).unwrap();
-    let mut header = [0];
-    loop {
-        pack.read_exact(&mut header).unwrap();
-        if header[0] & 0x80 == 0 {
-            break;
-        }
-    }
-    pack.write_all(&[0]).unwrap();
-    drop(pack);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let result = repository
-        .content(&store, request(ContentSource::Object(large)))
-        .await
-        .unwrap()
-        .value;
-    assert!(
-        matches!(result, ContentResult::TooLarge { kind: ContentLimit::Bytes, observed, limit } if observed == MAX_SOURCE_BYTES as u64 + 1 && limit == MAX_SOURCE_BYTES as u64)
-    );
-    assert!(gix::open(root).unwrap().find_object(large).is_err());
+    for source in [
+        ContentSource::Object(large),
+        ContentSource::Worktree {
+            path: path("large"),
+            conversion: forge_git::content::WorktreeConversion::Raw,
+        },
+    ] {
+        let result = repository.content(&store, request(source)).await.unwrap().value;
+        assert_eq!(ready(result).source.bytes(), bytes);
+    }
 }
 
 #[tokio::test]
-async fn supplied_sources_keep_identity_and_respect_line_and_input_admission() {
+async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
     let fixture = tempfile::tempdir().unwrap();
     git(fixture.path(), &["init", "--quiet"]);
     let store = RepositoryStore::default();
@@ -284,7 +223,7 @@ async fn supplied_sources_keep_identity_and_respect_line_and_input_admission() {
         .unwrap()
         .unwrap();
     let source =
-        SourceVersion::new(vec![b'a'; MAX_SOURCE_BYTES], Representation::DisplayOnly).unwrap();
+        SourceVersion::new(vec![b'a'; 8 * 1024 * 1024 + 1], Representation::DisplayOnly).unwrap();
     let identity = source.identity();
     let loaded = ready(
         repository
@@ -294,20 +233,10 @@ async fn supplied_sources_keep_identity_and_respect_line_and_input_admission() {
             .value,
     );
     assert_eq!(loaded.source.identity(), identity);
-    let source = SourceVersion::new(b"one\r\ntwo\nthree".to_vec(), Representation::Raw).unwrap();
-    let mut limited = request(ContentSource::Supplied(source));
-    limited.limits = ContentLimits::new(100, 2).unwrap();
-    assert!(matches!(
-        repository.content(&store, limited).await.unwrap().value,
-        ContentResult::TooLarge {
-            kind: ContentLimit::Lines,
-            observed: 3,
-            limit: 2
-        }
-    ));
-    assert!(ContentLimits::new(MAX_SOURCE_BYTES + 1, 1).is_err());
-
-    let constrained = RepositoryStore::new(1, 1, 1024).unwrap();
+    let source = SourceVersion::new(b"one\r\ntwo\nthree".repeat(10_001), Representation::Raw).unwrap();
+    let result = repository.content(&store, request(ContentSource::Supplied(source.clone()))).await.unwrap().value;
+    assert_eq!(ready(result).source.bytes(), source.bytes());
+    let constrained = RepositoryStore::new(1, 1).unwrap();
     let repository = constrained
         .open(fixture.path().to_path_buf())
         .await
@@ -316,12 +245,11 @@ async fn supplied_sources_keep_identity_and_respect_line_and_input_admission() {
     let mut spare = Vec::with_capacity(4096);
     spare.push(b'x');
     let source = SourceVersion::new(spare, Representation::Raw).unwrap();
-    assert!(
-        repository
+    let result = repository
             .content(&constrained, request(ContentSource::Supplied(source)))
             .await
-            .is_err()
-    );
+            .unwrap().value;
+    assert_eq!(ready(result).source.bytes(), b"x");
 }
 
 #[tokio::test]
@@ -477,7 +405,6 @@ async fn symlink_worktree_content_is_the_target_text() {
 fn request(source: ContentSource) -> ContentRequest {
     ContentRequest {
         source,
-        limits: ContentLimits::default(),
         expected: None,
     }
 }

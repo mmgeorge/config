@@ -15,6 +15,44 @@ fn block(id: usize, rows: &[&str]) -> BufferBlock {
 }
 
 #[test]
+fn source_metadata_preserves_long_overlay_and_fold_summary_text() {
+    use forge_buffer::block::{BlockAnchor, FoldRange, SourceOverlay};
+    use forge_buffer::identity::FoldId;
+
+    let mut entry = block(1, &["source"]);
+    let overlay = "λ".repeat(8193);
+    let suffix = "summary ".repeat(1025);
+    entry.metadata.source_overlay.push(SourceOverlay {
+        range: TextRange {
+            start: TextPosition { row: 0, column: 0 },
+            end: TextPosition { row: 0, column: 6 },
+        },
+        text: overlay.clone(),
+        capture: "Normal".into(),
+        priority: 100,
+    });
+    entry.metadata.fold.push(FoldRange {
+        id: FoldId("fold".into()),
+        start: TextPosition { row: 0, column: 0 },
+        end: BlockAnchor {
+            block: entry.id.clone(),
+            position: TextPosition { row: 1, column: 0 },
+        },
+        closed: true,
+        collapsed_suffix: Some(suffix.clone()),
+        heading_start: None,
+        collapse_children: false,
+        expand_children: false,
+    });
+    let document = BufferDocument::new(DocumentId("long-source-metadata".into()), vec![entry]).unwrap();
+    let snapshot = document.snapshot();
+    let encoded = serde_json::to_vec(&snapshot).unwrap();
+    let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+    assert_eq!(decoded["block"][0]["metadata"]["source_overlay"][0]["text"], overlay);
+    assert_eq!(decoded["block"][0]["metadata"]["fold"][0]["collapsed_suffix"], suffix);
+}
+
+#[test]
 fn node_enum_spelling_matches_the_editor_contract() {
     use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
     let contract: serde_json::Value = serde_json::from_str(include_str!("../../../../../lua/forge/protocol_contract.json")).unwrap();

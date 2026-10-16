@@ -38,6 +38,8 @@ pub enum EditError {
     UnknownHunk,
     DifferentSource,
     Overlap,
+    SizeOverflow,
+    Allocation(String),
     Source(SourceError),
 }
 
@@ -47,6 +49,8 @@ impl fmt::Display for EditError {
             Self::UnknownHunk => formatter.write_str("selected edit belongs to another comparison"),
             Self::DifferentSource => formatter.write_str("selected edit source changed externally"),
             Self::Overlap => formatter.write_str("selected edit overlaps a newer local change"),
+            Self::SizeOverflow => formatter.write_str("selected edit size exceeds addressable memory"),
+            Self::Allocation(error) => write!(formatter, "allocate selected edit: {error}"),
             Self::Source(error) => error.fmt(formatter),
         }
     }
@@ -109,15 +113,13 @@ impl EditSelection {
         if self.is_empty() {
             return Ok(AppliedEdit { selection: self.clone(), after: self.before.clone() });
         }
-        let size = self.replacement.iter().fold(self.before.bytes().len(), |size, replacement| {
-            size - replacement.range.len() + replacement.replacement.len()
-        });
-        if size > crate::source::MAX_SOURCE_BYTES {
-            return Err(EditError::Source(SourceError::TooLarge {
-                bytes: size, limit: crate::source::MAX_SOURCE_BYTES,
-            }));
-        }
-        let mut content = Vec::with_capacity(size);
+        let size = self.replacement.iter().try_fold(self.before.bytes().len(), |size, replacement| {
+            size.checked_sub(replacement.range.len())
+                .and_then(|size| size.checked_add(replacement.replacement.len()))
+                .ok_or(EditError::SizeOverflow)
+        })?;
+        let mut content = Vec::new();
+        content.try_reserve_exact(size).map_err(|error| EditError::Allocation(error.to_string()))?;
         let mut position = 0;
         for replacement in &self.replacement {
             content.extend_from_slice(&self.before.bytes()[position..replacement.range.start]);

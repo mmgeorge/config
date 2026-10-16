@@ -6,7 +6,6 @@ use anyhow::{Context, Result, ensure};
 
 use crate::mutation::{MutationScope, OperationCompletion, OperationId};
 
-const MAX_OPERATION_SCOPES: usize = 64;
 const TRACE_CAPACITY: usize = 1024;
 const TRACE_PAGE: usize = 128;
 
@@ -102,7 +101,6 @@ impl CoordinatorState {
 pub struct MutationCoordinator {
     state: Arc<Mutex<CoordinatorState>>,
     capacity: usize,
-    input_capacity: usize,
     changed: tokio::sync::watch::Sender<()>,
 }
 
@@ -122,12 +120,8 @@ struct QueuedWait {
 }
 
 impl MutationCoordinator {
-    pub fn new(capacity: usize, input_capacity: usize) -> Result<Self> {
+    pub fn new(capacity: usize) -> Result<Self> {
         ensure!(capacity > 0, "mutation admission capacity must be positive");
-        ensure!(
-            input_capacity > 0,
-            "mutation input capacity must be positive"
-        );
         Ok(Self {
             state: Arc::new(Mutex::new(CoordinatorState {
                 operations: BTreeMap::new(),
@@ -138,7 +132,6 @@ impl MutationCoordinator {
                 trace_sequence: 0,
             })),
             capacity,
-            input_capacity,
             changed: tokio::sync::watch::channel(()).0,
         })
     }
@@ -147,8 +140,8 @@ impl MutationCoordinator {
     /// Callers must include retained patch, path, and precondition inputs in the declared byte bound.
     pub fn admit(&self, scopes: Vec<MutationScope>, input_bytes: usize) -> Result<OperationId> {
         ensure!(
-            !scopes.is_empty() && scopes.len() <= MAX_OPERATION_SCOPES,
-            "mutation scope count must be between 1 and {MAX_OPERATION_SCOPES}"
+            !scopes.is_empty(),
+            "mutation requires at least one scope"
         );
         for (index, scope) in scopes.iter().enumerate() {
             ensure!(!scopes[..index].contains(scope), "duplicate mutation scope");
@@ -160,10 +153,8 @@ impl MutationCoordinator {
             state.operations.len() < self.capacity,
             "mutation admission is full"
         );
-        ensure!(
-            input_bytes <= self.input_capacity - state.input_bytes,
-            "mutation retained input budget is full"
-        );
+        let retained = state.input_bytes.checked_add(input_bytes)
+            .context("mutation retained input accounting overflow")?;
         let id = OperationId::from_value(state.next_id)?;
         state.next_id = state
             .next_id
@@ -186,7 +177,7 @@ impl MutationCoordinator {
                 blocker: None,
             },
         );
-        state.input_bytes += input_bytes;
+        state.input_bytes = retained;
         Ok(id)
     }
 
@@ -239,9 +230,9 @@ impl MutationCoordinator {
         let operation = state.operations.get(&id).context("unknown queued mutation")?;
         ensure!(operation.state == OperationState::Queued, "running mutation cannot change its input reservation");
         let retained = state.input_bytes - operation.input_bytes;
-        ensure!(input_bytes <= self.input_capacity - retained, "mutation retained input budget is full");
+        let total = retained.checked_add(input_bytes).context("mutation input accounting overflow")?;
         state.operations.get_mut(&id).expect("validated mutation").input_bytes = input_bytes;
-        state.input_bytes = retained + input_bytes;
+        state.input_bytes = total;
         Ok(())
     }
 

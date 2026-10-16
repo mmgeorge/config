@@ -1030,13 +1030,8 @@ impl Backend for CodexBackend {
             terminal: Vec::new(),
         };
         let mut cursor: Option<String> = None;
-        let mut page_count = 0;
+        let mut seen_cursors = std::collections::HashSet::new();
         loop {
-            page_count += 1;
-            anyhow::ensure!(
-                page_count <= 16,
-                "background terminal pagination exceeds 16 pages"
-            );
             let result = process
                 .request(
                     "thread/backgroundTerminals/list",
@@ -1047,22 +1042,18 @@ impl Backend for CodexBackend {
             snapshot
                 .terminal
                 .extend(super::terminal::TerminalSnapshot::parse(&result, false)?.terminal);
-            anyhow::ensure!(
-                snapshot.terminal.len() <= 1024,
-                "background terminal inventory exceeds 1024 entries"
-            );
             let next = result
                 .get("nextCursor")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
-            if next.is_none() {
+            let Some(next) = next else {
                 break;
-            }
+            };
             anyhow::ensure!(
-                next != cursor,
+                seen_cursors.insert(next.clone()),
                 "background terminal pagination did not advance"
             );
-            cursor = next;
+            cursor = Some(next);
         }
         Ok(snapshot)
     }

@@ -4,7 +4,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    BoundedVec, GhClient, GhDirectory, GraphFailure, append_graph_failures, classify_failure,
+    GhClient, GhDirectory, GraphFailure, append_graph_failures, classify_failure,
     diagnostic, remote_result,
 };
 use crate::comment::ConversationCommentCreation;
@@ -20,7 +20,7 @@ const FIELDS: &str = "__typename id databaseId: fullDatabaseId body url viewerDi
 struct CommentResponse {
     data: Option<Value>,
     #[serde(default)]
-    errors: BoundedVec<GraphFailure, 32>,
+    errors: Vec<GraphFailure>,
 }
 
 impl GithubCommentRemote for GhClient {
@@ -296,14 +296,14 @@ fn decode_data(output: Output) -> Result<Value, RemoteFailure> {
             String::from_utf8_lossy(&output.stderr)
         ));
         if let Ok(response) = response {
-            append_graph_failures(&mut message, &response.errors.0);
+            append_graph_failures(&mut message, &response.errors);
         }
         return Err(classify_failure(message));
     }
     let response = response.map_err(invalid)?;
-    if !response.errors.0.is_empty() {
+    if !response.errors.is_empty() {
         let mut message = String::new();
-        append_graph_failures(&mut message, &response.errors.0);
+        append_graph_failures(&mut message, &response.errors);
         return Err(classify_failure(message));
     }
     response

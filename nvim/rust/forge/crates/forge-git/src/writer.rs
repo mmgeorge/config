@@ -28,9 +28,6 @@ mod config;
 mod precondition;
 use precondition::WritePrecondition;
 
-pub const MAX_TARGETS: usize = 10_000;
-pub const MAX_INPUT: usize = 16 * 1024 * 1024;
-pub const MAX_PATH_BYTES: usize = 1024 * 1024;
 const RECEIPT_RESERVATION: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Eq, PartialEq)]
@@ -411,10 +408,6 @@ impl GitWriteIntent {
         head: &crate::snapshot::HeadState,
         observed: &[crate::snapshot::ObservedPath],
     ) -> Result<()> {
-        ensure!(
-            observed.len() <= MAX_TARGETS,
-            "observed write sources exceed target limit"
-        );
         let selected: HashSet<_> = self.action.paths().into_iter().collect();
         ensure!(
             observed
@@ -447,12 +440,7 @@ impl GitWriteIntent {
     pub fn set_settlement_handler(
         &mut self,
         handler: SettlementHandler,
-        retained_bytes: usize,
     ) -> Result<()> {
-        ensure!(
-            retained_bytes <= 1024 * 1024,
-            "write settlement capture exceeds 1 MiB reservation"
-        );
         ensure!(
             self.settlement.is_none(),
             "write settlement handler is already attached"
@@ -630,24 +618,17 @@ impl GitWriteAction {
 
     fn validate(&self) -> Result<()> {
         if let Self::UpdateRepositoryConfig {
-            expected,
             replacement,
+            ..
         } = self
         {
-            ensure!(
-                expected
-                    .as_ref()
-                    .is_none_or(|bytes| bytes.len() <= 1024 * 1024)
-                    && replacement.len() <= 1024 * 1024,
-                "repository config exceeds 1 MiB"
-            );
             std::str::from_utf8(replacement).context("repository config is not UTF-8")?;
             ensure!(!replacement.contains(&0), "repository config contains NUL");
         }
         if let Self::Batch { action } = self {
             ensure!(
-                !action.is_empty() && action.len() <= MAX_TARGETS,
-                "batch requires 1 to 10000 path operations"
+                !action.is_empty(),
+                "batch requires at least one path operation"
             );
             for action in action {
                 ensure!(
@@ -665,7 +646,6 @@ impl GitWriteAction {
             }
         }
         let paths = self.paths();
-        ensure!(paths.len() <= MAX_TARGETS, "write exceeds 10000 targets");
         if matches!(
             self,
             Self::Stage { .. } | Self::Unstage { .. } | Self::Discard { .. }
@@ -677,10 +657,6 @@ impl GitWriteAction {
             resolve_argument(path)?;
             ensure!(unique.insert(path), "duplicate write target");
         }
-        ensure!(
-            paths.iter().map(|path| path.raw().len()).sum::<usize>() <= MAX_PATH_BYTES,
-            "write paths exceed 1 MiB"
-        );
         if let Self::CreateBranch { name } | Self::PublishBranch { name, .. } = self {
             ensure!(
                 !name.is_empty() && !name.starts_with('-') && !name.contains('\0'),
@@ -735,7 +711,6 @@ impl GitWriteAction {
             .and_then(|bytes| bytes.checked_add(path.len().saturating_mul(768)))
             .and_then(|bytes| bytes.checked_add(RECEIPT_RESERVATION + 3 * 1024 * 1024))
             .context("write input accounting overflow")?;
-        ensure!(retained <= MAX_INPUT, "write input exceeds 16 MiB");
         Ok(retained)
     }
 
@@ -1113,7 +1088,6 @@ fn run_path_chunk(
     progress_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 64 * 1024,
             stderr_bytes: 64 * 1024,
             timeout: Duration::from_secs(120),
         },
@@ -1138,10 +1112,6 @@ fn run_patch_group(
         };
         let (before_exists, after_exists) = intent.precondition().patch_presence(path, *direction);
         let patch = encode_patch(target, before_exists, after_exists)?;
-        ensure!(
-            input.len() + patch.len() <= MAX_INPUT,
-            "patch group exceeds 16 MiB"
-        );
         input.extend_from_slice(&patch);
     }
     let mut command = git_command(&intent.repository)?;
@@ -1165,7 +1135,6 @@ fn run_patch_group(
     progress_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 64 * 1024,
             stderr_bytes: 64 * 1024,
             timeout: Duration::from_secs(120),
         },
@@ -1250,7 +1219,6 @@ fn run_target(
         command.arg(resolve_argument(path)?);
     }
     let limits = CommandLimits {
-        stdout_bytes: 64 * 1024,
         stderr_bytes: 64 * 1024,
         timeout: if matches!(intent.action, GitWriteAction::CommitWithEditor { .. }) {
             Duration::MAX
@@ -1307,7 +1275,6 @@ fn discard_staged_patch(
         let output = progress_command(
             &mut command,
             CommandLimits {
-                stdout_bytes: 64 * 1024 - stdout.len(),
                 stderr_bytes: 64 * 1024 - stderr.len(),
                 timeout: Duration::from_secs(120),
             },
@@ -1373,10 +1340,6 @@ fn encode_patch(target: &PatchTarget, before_exists: bool, after_exists: bool) -
             hunk.new_lines.len()
         )?;
         output.extend_from_slice(&patch_body(&target.analysis, hunk.id)?.bytes);
-        ensure!(
-            output.len() <= 8 * 1024 * 1024,
-            "serialized patch exceeds 8 MiB"
-        );
     }
     Ok(output)
 }

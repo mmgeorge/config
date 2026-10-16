@@ -39,7 +39,7 @@ pub struct DesignDocument {
 impl DesignDocument {
     /// Applies plan-only choices, enabling prerequisites and disabling dependent checks together.
     pub(crate) fn set_checks(&mut self, config: &crate::checks::CheckConfig, changes: &std::collections::BTreeMap<String, bool>) -> Result<()> {
-        ensure!(!changes.is_empty() && changes.len() <= 128, "select 1 to 128 checks");
+        ensure!(!changes.is_empty(), "select at least one check");
         for (id, enabled) in changes {
             let check = config.definitions.iter().find(|check| &check.id == id)
                 .ok_or_else(|| anyhow::anyhow!("unknown planned check: {id}"))?;
@@ -147,25 +147,16 @@ impl DesignDocument {
         ]
     }
 
-    /// Rejects malformed or oversized metadata while allowing incomplete drafts.
+    /// Validate metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(self.checks.len() <= 128, "plan checks exceeds 128 entries");
         ensure!(self.checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid planned check id");
-        ensure!(self.disabled_checks.len() <= 128 && self.disabled_checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid disabled plan checks");
+        ensure!(self.disabled_checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid disabled plan checks");
         ensure!(self.checks.iter().all(|id| !self.disabled_checks.contains(id)), "plan check cannot be enabled and disabled");
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
         for action in &self.verification {
             ensure!(!action.trim().is_empty(), "manual verification actions cannot be empty");
         }
-        ensure!(
-            self.requirements.len() <= 256,
-            "plan requirements exceeds 256 entries"
-        );
-        ensure!(
-            self.decisions.len() <= 128,
-            "plan decisions exceeds 128 entries"
-        );
         for requirement in &self.requirements {
             ensure!(
                 !requirement.trim().is_empty(),
@@ -179,11 +170,6 @@ impl DesignDocument {
             );
         }
         for section in self.sections() {
-            ensure!(
-                section.text.len() <= 16 * 1024,
-                "plan {} exceeds 16 KiB",
-                section.path
-            );
             ensure!(
                 !section.text.contains('\0'),
                 "plan {} contains a NUL byte",
@@ -226,4 +212,27 @@ pub(crate) struct DesignSection {
     pub title: &'static str,
     pub section: PlanSection,
     pub text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_check_selection_preserves_every_configured_choice() {
+        let definitions = (0..129).map(|index| serde_json::json!({
+            "id": format!("check_{index}"), "name": format!("Check {index}"),
+            "category": "test", "enabled": true, "area": "Project",
+            "trigger": {"kind": "manual"}, "all": {"command": "test"},
+        })).collect::<Vec<_>>();
+        let config: crate::checks::CheckConfig = serde_json::from_value(
+            serde_json::json!({"version": 2, "definitions": definitions}),
+        ).unwrap();
+        let changes = config.definitions.iter()
+            .map(|check| (check.id.clone(), true)).collect();
+        let mut document = DesignDocument::default();
+        document.set_checks(&config, &changes).unwrap();
+        assert_eq!(document.checks, changes.keys().cloned().collect::<Vec<_>>());
+        assert_eq!(document.checks.len(), 129);
+    }
 }

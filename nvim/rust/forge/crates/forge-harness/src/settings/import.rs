@@ -4,10 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-
-const SOURCE_LIMIT: u64 = 1024 * 1024;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -75,7 +72,7 @@ pub(crate) struct ImportCandidate {
 }
 
 #[derive(Serialize)]
-/// Retains a bounded source revision and the entries the user can explicitly import.
+/// Retains a source revision and the entries the user can explicitly import.
 pub(crate) struct NativeImport {
     /// Identifies the canonical source directory or configuration file.
     pub(crate) source: PathBuf,
@@ -101,10 +98,9 @@ impl NativeImport {
             ImportKind::Skills => {
                 ensure!(source.is_dir(), "skill import requires a directory");
                 let resource = ResourceCatalog::native_skills(vec![source])?;
-                ensure!(resource.len() <= 128, "native import exceeds 128 skills");
                 for mut skill in resource {
                     digest.update(skill.source.as_bytes());
-                    digest.update(bounded_read(Path::new(&skill.source), 65536)?);
+                    digest.update(std::fs::read(&skill.source)?);
                     skill.id = identity(namespace, &skill.source, &skill.name);
                     imported.candidate.push(ImportCandidate { id:skill.id.clone(), name:skill.name.clone(), kind:"skill",
                         source:skill.source.clone(), transport:None, blocked:None, conflict:Vec::new() });
@@ -113,7 +109,7 @@ impl NativeImport {
             }
             ImportKind::Mcp => {
                 ensure!(source.is_file(), "MCP import requires a configuration file");
-                let content = bounded_read(&source, SOURCE_LIMIT)?;
+                let content = std::fs::read(&source)?;
                 digest.update(&content);
                 let document = document(&source, &content)?;
                 let mut server = BTreeMap::new();
@@ -131,7 +127,6 @@ impl NativeImport {
                             format!("/projects/{}/mcpServers/{}", pointer_key(path), pointer_key(name)))); }
                     }
                 }
-                ensure!(server.len() <= 128, "native import exceeds 128 MCP servers");
                 for (name, (definition, pointer)) in server {
                     let id = identity(namespace, source.to_string_lossy().as_ref(), name);
                     let sanitized = sanitize_server(name, definition, &source, &pointer);
@@ -149,7 +144,6 @@ impl NativeImport {
         }
         ensure!(!imported.candidate.is_empty(), "native source contains no importable resource entries");
         imported.fingerprint = hex::encode(digest.finalize());
-        ensure!(serde_json::to_vec(&imported)?.len() <= 256 * 1024, "native import preview exceeds 256 KiB");
         Ok(imported)
     }
 
@@ -169,7 +163,7 @@ impl NativeImport {
 }
 
 #[derive(Default)]
-/// Resolves native launch references from one bounded file snapshot per server.
+/// Resolves native launch references from one file snapshot per server.
 pub(super) struct NativeValues {
     source: BTreeMap<PathBuf, Value>,
 }
@@ -196,7 +190,7 @@ impl NativeValues {
 
     fn value(&mut self, source: &Path, pointer: &str) -> Result<&Value> {
         if !self.source.contains_key(source) {
-            let value = document(&source, &bounded_read(&source, SOURCE_LIMIT)?)?;
+            let value = document(&source, &std::fs::read(source)?)?;
             self.source.insert(source.to_owned(), value);
         }
         self.source[source].pointer(pointer).context("native MCP referenced value no longer exists")
@@ -212,14 +206,6 @@ fn path_identity(source: &str) -> String {
     let source = source.replace('\\', "/");
     let source = source.trim_end_matches('/');
     if cfg!(windows) { source.to_lowercase() } else { source.to_owned() }
-}
-
-fn bounded_read(source: &Path, limit: u64) -> Result<Vec<u8>> {
-    ensure!(source.metadata()?.len() <= limit, "native import source exceeds its size limit");
-    let mut content = Vec::new();
-    std::fs::File::open(source)?.take(limit + 1).read_to_end(&mut content)?;
-    ensure!(content.len() as u64 <= limit, "native import source exceeds its size limit");
-    Ok(content)
 }
 
 fn sanitize_server(name: &str, source: &Value, file: &Path, pointer: &str) -> Result<Value> {
@@ -379,12 +365,30 @@ mod test {
     }
 
     #[test]
+    fn native_import_preserves_large_source_and_preview() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let source = root.path().join("native.json");
+        let servers = (0..2049).map(|index|
+            (format!("fixture-{index}"), json!({"command":"node","args":["fixture.js"]})))
+            .collect::<serde_json::Map<_, _>>();
+        let document = json!({"mcpServers":servers,"unrelated":"λ".repeat(1024 * 1024)});
+        std::fs::write(&source, serde_json::to_vec(&document)?)?;
+        let preview = NativeImport::read(ImportKind::Mcp, &source, "global", root.path())?;
+        assert_eq!(preview.candidate.len(), 2049);
+        assert!(serde_json::to_vec(&preview)?.len() > 256 * 1024);
+        let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
+        assert_eq!(selected[0].server()?.unwrap().native()?["command"], "node");
+        Ok(())
+    }
+
+    #[test]
     fn native_skill_import_retains_source_and_scope_without_copying_prompt_body() -> Result<()> {
         use crate::settings::{SettingScope, SettingsStore};
         let root = tempfile::tempdir()?;
         let source = root.path().join("native-skill");
         std::fs::create_dir(&source)?;
-        std::fs::write(source.join("SKILL.md"), "---\nname: imported-skill\ndescription: Native skill\n---\nPROMPT_BODY_FIXTURE")?;
+        std::fs::write(source.join("SKILL.md"),
+            format!("---\nname: imported-skill\ndescription: Native skill\n---\nPROMPT_BODY_FIXTURE{}", "λ".repeat(65_537)))?;
         let mut store = SettingsStore::open(root.path())?;
         let preview = store.preview_import(ImportKind::Skills, &source, SettingScope::Global, "workspace", "session", "claude")?;
         let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;

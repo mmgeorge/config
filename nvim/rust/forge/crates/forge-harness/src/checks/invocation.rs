@@ -61,16 +61,12 @@ pub(super) fn validate(operation: &CheckOperation) -> Result<()> {
         return Ok(());
     };
     ensure!(
-        args.len() <= 256 && operation.command.len() <= 4096,
-        "direct invocation exceeds argument limits"
-    );
-    ensure!(
         !operation.command.contains(['{', '}']),
         "executable cannot contain bindings"
     );
     for argument in args {
         ensure!(
-            argument.len() <= 16384 && !argument.contains('\0'),
+            !argument.contains('\0'),
             "invalid direct argument"
         );
         let mut literal = argument.clone();
@@ -307,10 +303,6 @@ impl InvocationResolver {
                 unique.insert(key, invocation);
             }
         }
-        ensure!(
-            unique.len() <= 4096,
-            "check expansion exceeds 4096 invocations"
-        );
         Ok(unique.into_values().collect())
     }
 }
@@ -477,7 +469,7 @@ fn target_args(package: &Package, case: &CheckCase) -> Result<Vec<String>> {
     }
 }
 
-/// Captures bounded discovery output while retaining process-tree cancellation ownership.
+/// Capture discovery output while retaining process-tree cancellation ownership.
 pub(super) async fn capture(
     program: &str,
     args: &[String],
@@ -496,13 +488,11 @@ pub(super) async fn capture(
     let mut stdout = child
         .stdout()
         .take()
-        .context("discovery stdout missing")?
-        .take(8 * 1024 * 1024 + 1);
+        .context("discovery stdout missing")?;
     let mut stderr = child
         .stderr()
         .take()
-        .context("discovery stderr missing")?
-        .take(1024 * 1024 + 1);
+        .context("discovery stderr missing")?;
     let work = async {
         let mut output = Vec::new();
         let mut errors = Vec::new();
@@ -511,10 +501,6 @@ pub(super) async fn capture(
             stderr.read_to_end(&mut errors),
             child.wait()
         )?;
-        ensure!(
-            output.len() <= 8 * 1024 * 1024 && errors.len() <= 1024 * 1024,
-            "check discovery output exceeds its limit"
-        );
         ensure!(
             status.success(),
             "check discovery failed ({status}): {}",
@@ -532,5 +518,22 @@ pub(super) async fn capture(
             _ = &mut deadline => bail!("check discovery timed out after {seconds}s"),
             _ = ticker.tick() => ensure!(!cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) && !external.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)), "check discovery interrupted"),
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn discovery_preserves_output_and_drains_errors_beyond_previous_limits() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let output = capture("sh", &[
+            "-c".into(),
+            "printf '%08388609d' 0; printf '%01048577d' 0 >&2".into(),
+        ], directory.path(), None, None, 30).await?;
+        assert_eq!(output.len(), 8 * 1024 * 1024 + 1);
+        assert!(output.iter().all(|byte| *byte == b'0'));
+        Ok(())
     }
 }

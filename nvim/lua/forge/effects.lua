@@ -118,7 +118,7 @@ function M.apply(session, view, effect)
       local _, failure = vim.ui.open(effect.url)
       if failure then error(failure) end
     elseif effect.kind == "notify" then
-      assert(type(effect.message) == "string" and #effect.message <= 65536, "invalid notification text")
+      assert(type(effect.message) == "string", "invalid notification text")
       view.effect[effect.id] = true
       vim.notify(effect.message, effect.level or vim.log.levels.INFO)
     else

@@ -2,8 +2,6 @@ use anyhow::{Context, Result, ensure};
 use forge_git::RepositoryPath;
 use serde::Deserialize;
 
-pub const MAX_ARTIFACT_BYTES: usize = 2 * 1024 * 1024;
-const MAX_ITEMS: usize = 10_000;
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Artifact {
@@ -81,10 +79,6 @@ pub enum Kind {
 
 impl Artifact {
     pub fn parse(bytes: &[u8]) -> Result<Self> {
-        ensure!(
-            bytes.len() <= MAX_ARTIFACT_BYTES,
-            "walkthrough artifact exceeds 2 MiB"
-        );
         let artifact: Self = serde_json::from_slice(bytes).context("invalid walkthrough schema")?;
         artifact.validate()?;
         Ok(artifact)
@@ -105,12 +99,10 @@ impl Artifact {
             !self.flow.is_empty() && !self.tasks.is_empty(),
             "walkthrough flow and tasks must not be empty"
         );
-        let mut items = 0usize;
         for flow in &self.flow {
-            flow.validate(0, &mut items)?;
+            flow.validate()?;
         }
         for task in &self.tasks {
-            count(&mut items)?;
             text(&task.title, "task title")?;
             optional(&task.justification, "task justification")?;
             ensure!(
@@ -119,7 +111,6 @@ impl Artifact {
             );
             let mut annotations = 0usize;
             for subtask in &task.subtasks {
-                count(&mut items)?;
                 text(&subtask.title, "subtask title")?;
                 optional(&subtask.justification, "subtask justification")?;
                 ensure!(
@@ -127,7 +118,6 @@ impl Artifact {
                     "walkthrough subtask has no changes"
                 );
                 for change in &subtask.changes {
-                    count(&mut items)?;
                     change.validate()?;
                     annotations += usize::from(change.annotation.is_some());
                 }
@@ -139,12 +129,11 @@ impl Artifact {
 }
 
 impl Flow {
-    fn validate(&self, depth: usize, items: &mut usize) -> Result<()> {
-        ensure!(depth < 64, "walkthrough flow nesting exceeds 64 levels");
-        count(items)?;
-        text(&self.text, "flow text")?;
-        for child in &self.children {
-            child.validate(depth + 1, items)?;
+    fn validate(&self) -> Result<()> {
+        let mut pending = vec![self];
+        while let Some(flow) = pending.pop() {
+            text(&flow.text, "flow text")?;
+            pending.extend(&flow.children);
         }
         Ok(())
     }
@@ -208,20 +197,23 @@ fn optional(value: &Option<String>, role: &str) -> Result<()> {
     Ok(())
 }
 
-fn count(value: &mut usize) -> Result<()> {
-    *value += 1;
-    ensure!(
-        *value <= MAX_ITEMS,
-        "walkthrough exceeds 10000 flow/task/change records"
-    );
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     fn artifact() -> serde_json::Value {
         serde_json::json!({"version":12,"flow":[{"text":"flow"}],"overview":"overview","root":"Project description","commit":"1234567890123456789012345678901234567890","tasks":[{"title":"Task","subtasks":[{"title":"Subtask","changes":[{"action":"Modify","kind":"Function","target":"function","note":"note","file":"src/main.rs","line":3,"annotation":{"title":"Annotation","comment":"Comment"}}]}]}]})
+    }
+    #[test]
+    fn artifact_preserves_content_beyond_former_byte_and_record_caps() {
+        let mut value = artifact();
+        let overview = "complete ".repeat(300_000);
+        value["overview"] = overview.clone().into();
+        value["flow"] = serde_json::json!(vec![serde_json::json!({"text":"flow"}); 10_001]);
+        let encoded = serde_json::to_vec(&value).unwrap();
+        assert!(encoded.len() > 2 * 1024 * 1024);
+        let parsed = Artifact::parse(&encoded).unwrap();
+        assert_eq!(parsed.overview, overview);
+        assert_eq!(parsed.flow.len(), 10_001);
     }
     #[test]
     fn artifact_root_is_prose_and_annotation_coordinates_are_native() {

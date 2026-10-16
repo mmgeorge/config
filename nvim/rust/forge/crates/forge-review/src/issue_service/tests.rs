@@ -146,7 +146,7 @@ async fn durable_issue_save_retains_newer_typing_and_collected_close() {
     let pool = analysis();
     let service = IssueDocumentService::new(
         github.clone(),
-        EditBudget::new(32 * 1024 * 1024).unwrap(),
+        EditBudget::default(),
         pool.clone(),
     );
     let remote = Arc::new(Remote {
@@ -300,7 +300,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
         .unwrap();
     let service = IssueDocumentService::new(
         github,
-        EditBudget::new(32 * 1024 * 1024).unwrap(),
+        EditBudget::default(),
         analysis(),
     );
     let id = DocumentId("issue-restart-recovery".into());
@@ -346,7 +346,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
         .unwrap();
     let restarted = IssueDocumentService::new(
         restarted_github,
-        EditBudget::new(32 * 1024 * 1024).unwrap(),
+        EditBudget::default(),
         analysis(),
     );
     let reopened = restarted
@@ -389,7 +389,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
 async fn issue_shutdown_deadline_retains_owned_job_until_collection() {
     let service = IssueDocumentService::new(
         GithubService::default(),
-        EditBudget::new(1024).unwrap(),
+        EditBudget::default(),
         analysis(),
     );
     let release = Arc::new(tokio::sync::Notify::new());
@@ -414,7 +414,6 @@ fn analysis() -> Arc<forge_diff::workers::AnalysisPool> {
         forge_diff::workers::PoolLimits {
             workers: 1,
             jobs: 8,
-            input_bytes: 32 * 1024 * 1024,
         },
     ))
 }

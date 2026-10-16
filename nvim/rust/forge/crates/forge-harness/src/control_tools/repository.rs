@@ -10,7 +10,7 @@ use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::workers::WorkPriority;
 use forge_git::RepositoryPath;
 use forge_git::content::{
-    ContentLimits, ContentRequest, ContentResult, ContentSource, WorktreeConversion,
+    ContentRequest, ContentResult, ContentSource, WorktreeConversion,
 };
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, HeadState, PathRecord, PathState};
@@ -25,7 +25,6 @@ use crate::permissions::matcher::{
 use crate::session::PermissionMode;
 
 const MAX_REPLY_BYTES: usize = 256 * 1024;
-const MAX_FILE_BYTES: usize = 128 * 1024;
 
 /// Restricts repository inspection to one live broker interaction and its captured read policy.
 pub struct RepositoryToolScope {
@@ -191,15 +190,10 @@ impl RepositoryToolScope {
             "active policy does not authorize repository inspection"
         );
         let input: Inspection = serde_json::from_value(arguments)?;
-        ensure!(
-            input.offset <= 65536,
-            "repository inspection offset exceeds 65536"
-        );
         let selected_path = input
             .path_hex
             .as_deref()
             .map(|path| {
-                ensure!(path.len() <= 8192, "repository path exceeds 4096 bytes");
                 RepositoryPath::new(
                     hex::decode(path)
                         .context("path_hex must encode exact repository path bytes")?,
@@ -218,10 +212,6 @@ impl RepositoryToolScope {
             self.check()?;
             let snapshot = repository.snapshot(&self.repository).await?;
             self.check()?;
-            ensure!(
-                snapshot.path.len() <= 65536,
-                "repository inspection exceeds 65536 changed paths"
-            );
             let mut result = Vec::new();
             let mut retained = 0usize;
             let is_diff = matches!(
@@ -250,9 +240,9 @@ impl RepositoryToolScope {
                 }
             };
             let envelope = json!({ "session": self.session, "interaction": self.interaction, "head": head,
-                "items": [], "total": selected.len(), "next_offset": 65536, "fresh_observation": true });
+                "items": [], "total": selected.len(), "next_offset": selected.len(), "fresh_observation": true });
             let capacity = MAX_REPLY_BYTES
-                .saturating_sub(crate::limits::serialized_size(&envelope, MAX_REPLY_BYTES)? + 1);
+                .saturating_sub(serde_json::to_vec(&envelope)?.len() + 1);
             drop(envelope);
             for observed in selected.iter().skip(input.offset).take(limit) {
                 self.authorize(&repository, &observed.change.path).await?;
@@ -280,7 +270,6 @@ impl RepositoryToolScope {
             let value = json!({ "session": self.session, "interaction": self.interaction, "head": head,
                 "items": result, "total": selected.len(), "next_offset": (end < selected.len()).then_some(end),
                 "fresh_observation": true });
-            crate::limits::serialized_size(&value, MAX_REPLY_BYTES)?;
             Ok::<_, anyhow::Error>(serde_json::to_string(&value)?)
         };
         self.collect(operation).await
@@ -373,29 +362,14 @@ impl RepositoryToolScope {
             .map_err(|error| anyhow::anyhow!("repository diff unavailable: {error:?}"))?;
         self.check()?;
         let mut hunks = Vec::new();
-        let mut bytes = 0;
         for hunk in analysis.hunks() {
             let value = json!({ "old_lines": [hunk.old_lines.start, hunk.old_lines.end], "new_lines": [hunk.new_lines.start, hunk.new_lines.end],
                 "removed": std::str::from_utf8(&analysis.source().old.bytes()[hunk.old_bytes.clone()])?,
                 "added": std::str::from_utf8(&analysis.source().new.bytes()[hunk.new_bytes.clone()])? });
-            let Ok(size) = crate::limits::serialized_size(
-                &value,
-                MAX_REPLY_BYTES.saturating_sub(bytes + 4096),
-            ) else {
-                return Ok(
-                    json!({ "path": path_value(&path.path), "state": "reply_too_large", "partial": false }),
-                );
-            };
-            bytes += size + 1;
             hunks.push(value);
         }
         let record = json!({ "path": path_value(&path.path), "origin": relocation_value(path), "state": "ready", "hunks": hunks,
             "old_identity": hex::encode(analysis.source().old.identity().content_hash), "new_identity": hex::encode(analysis.source().new.identity().content_hash) });
-        if crate::limits::serialized_size(&record, MAX_REPLY_BYTES - 4096).is_err() {
-            return Ok(
-                json!({ "path": path_value(&path.path), "state": "reply_too_large", "partial": false }),
-            );
-        }
         Ok(record)
     }
 
@@ -410,7 +384,6 @@ impl RepositoryToolScope {
                 &self.repository,
                 ContentRequest {
                     source,
-                    limits: ContentLimits::new(MAX_FILE_BYTES, 4096)?,
                     expected: None,
                 },
             )
@@ -423,7 +396,6 @@ impl RepositoryToolScope {
                 Representation::GitCanonical,
             )?),
             ContentResult::Binary => Err("binary"),
-            ContentResult::TooLarge { .. } => Err("too_large"),
             ContentResult::Unavailable(_) => Err("unavailable"),
             ContentResult::Failed(error) => return Err(error),
         })
@@ -450,15 +422,13 @@ fn append_record(
     record: Value,
     capacity: usize,
 ) -> Result<bool> {
-    match crate::limits::serialized_size(&record, capacity.saturating_sub(*retained + 1)) {
-        Ok(bytes) => {
-            *retained += bytes + 1;
-            records.push(record);
-            Ok(true)
-        }
-        Err(_) if !records.is_empty() => Ok(false),
-        Err(error) => Err(error).context("one repository record exceeds the reply limit"),
+    let bytes = serde_json::to_vec(&record)?.len();
+    if !records.is_empty() && bytes > capacity.saturating_sub(*retained + 1) {
+        return Ok(false);
     }
+    *retained += bytes + 1;
+    records.push(record);
+    Ok(true)
 }
 fn change_name(change: ChangeKind) -> &'static str {
     match change {
@@ -493,7 +463,7 @@ mod tests {
     }
 
     #[test]
-    fn bounded_pages_preserve_unreturned_record_and_charge_json_escaping() {
+    fn pages_preserve_unreturned_records_and_accept_oversized_first_records() {
         let mut records = Vec::new();
         let mut retained = 0;
         let record = json!({ "text": "\\".repeat(100000) });
@@ -505,15 +475,12 @@ mod tests {
         assert_eq!(records.len(), 1);
         assert_eq!(retained, accepted);
         assert!(retained > 200000);
-        assert!(
-            append_record(
-                &mut Vec::new(),
-                &mut 0,
-                json!({ "text": "x".repeat(MAX_REPLY_BYTES) }),
-                MAX_REPLY_BYTES
-            )
-            .is_err()
-        );
+        let mut large = Vec::new();
+        assert!(append_record(
+            &mut large, &mut 0,
+            json!({ "text": "x".repeat(MAX_REPLY_BYTES) }), MAX_REPLY_BYTES,
+        ).unwrap());
+        assert_eq!(large[0]["text"].as_str().unwrap().len(), MAX_REPLY_BYTES);
     }
 
     #[tokio::test]
@@ -670,7 +637,6 @@ mod tests {
             forge_git::command::write_command(
                 &mut command,
                 forge_git::command::CommandLimits {
-                    stdout_bytes: 4 * 1024,
                     stderr_bytes: 4 * 1024,
                     timeout: std::time::Duration::from_secs(5),
                 },
@@ -725,7 +691,7 @@ mod tests {
         );
         std::fs::write(
             scope.workspace.join("quoted.txt"),
-            "\\".repeat(MAX_FILE_BYTES),
+            "\\".repeat(128 * 1024),
         )
         .unwrap();
         let bounded: Value = serde_json::from_str(
@@ -738,9 +704,8 @@ mod tests {
                 .unwrap(),
         )
         .unwrap();
-        assert_eq!(bounded["items"][0]["state"], "reply_too_large");
-        assert_eq!(bounded["items"][0]["partial"], false);
-        assert!(bounded["items"][0].get("hunks").is_none());
+        assert_eq!(bounded["items"][0]["state"], "ready");
+        assert_eq!(bounded["items"][0]["hunks"][0]["added"], "\\".repeat(128 * 1024));
         assert!(state.current_observation().is_none());
         drop(lease);
         assert!(scope.check().is_err());

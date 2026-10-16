@@ -61,7 +61,6 @@ impl GhDirectory {
                         let output = read_command(
                             &mut command,
                             CommandLimits {
-                                stdout_bytes: 4096,
                                 stderr_bytes: 8192,
                                 timeout: Duration::from_secs(30),
                             },
@@ -84,7 +83,6 @@ impl GhDirectory {
                     );
                     ensure!(
                         !branch.is_empty()
-                            && branch.len() <= 1024
                             && !branch.chars().any(char::is_control),
                         "invalid creation branch"
                     );

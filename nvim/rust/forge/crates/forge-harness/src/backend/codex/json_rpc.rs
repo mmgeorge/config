@@ -2012,11 +2012,13 @@ fn provider_change_path(path: &str, workspace: &str) -> String {
     if workspace.is_empty() {
         return path.to_owned();
     }
-    Path::new(path)
-        .strip_prefix(Path::new(workspace))
-        .unwrap_or_else(|_| Path::new(path))
+    let path = path.replace('\\', "/");
+    let workspace = workspace.replace('\\', "/");
+    Path::new(&path)
+        .strip_prefix(Path::new(&workspace))
+        .unwrap_or_else(|_| Path::new(&path))
         .to_string_lossy()
-        .replace('\\', "/")
+        .into_owned()
 }
 
 fn successful_file_change(activity: &ToolActivity) -> bool {
@@ -3727,33 +3729,40 @@ mod test {
 
     #[tokio::test]
     async fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
-        let mut output = BackendOutput::default();
-        normalize_event_in_workspace(
-            &json!({
-                "method": "item/completed",
-                "params": {
-                    "item": {
-                        "id": "patch-1",
-                        "type": "fileChange",
-                        "status": "completed",
-                        "changes": [{
-                            "path": "C:\\workspace\\src\\main.rs",
-                            "kind": { "type": "add" },
-                            "diff": "@@ -0,0 +1 @@\n+created"
-                        }]
+        for (path, workspace, expected) in [
+            ("C:\\workspace\\src\\main.rs", "C:\\workspace", "src/main.rs"),
+            ("/workspace/src/main.rs", "/workspace", "src/main.rs"),
+            ("src/main.rs", "/workspace", "src/main.rs"),
+            ("C:\\workspace-other\\src\\main.rs", "C:\\workspace", "C:/workspace-other/src/main.rs"),
+        ] {
+            let mut output = BackendOutput::default();
+            normalize_event_in_workspace(
+                &json!({
+                    "method": "item/completed",
+                    "params": {
+                        "item": {
+                            "id": "patch-1",
+                            "type": "fileChange",
+                            "status": "completed",
+                            "changes": [{
+                                "path": path,
+                                "kind": { "type": "add" },
+                                "diff": "@@ -0,0 +1 @@\n+created"
+                            }]
+                        }
                     }
-                }
-            }),
-            &mut output,
-            None,
-            "C:\\workspace",
-            true,
-        )
-        .await;
+                }),
+                &mut output,
+                None,
+                workspace,
+                true,
+            )
+            .await;
 
-        let change = &output.event[0].activity.as_ref().unwrap().change.file[0];
-        assert_eq!(change.path, "src/main.rs");
-        assert_eq!(change.kind, ProviderChangeKind::Add);
+            let change = &output.event[0].activity.as_ref().unwrap().change.file[0];
+            assert_eq!(change.path, expected);
+            assert_eq!(change.kind, ProviderChangeKind::Add);
+        }
     }
 
     #[tokio::test]

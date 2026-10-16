@@ -63,7 +63,7 @@ pub struct CommandHighlight {
 fn parse_tree(command: &str, shell: CommandShell) -> Option<Tree> {
     let language = shell.grammar()?;
     // The pinned Zsh grammar treats escaped newlines as command boundaries.
-    if command.trim().is_empty() || command.len() > 65_536
+    if command.trim().is_empty()
         || (shell == CommandShell::Zsh && command.contains("\\\n"))
     {
         return None;

@@ -20,7 +20,6 @@ async fn priority_queues_preserve_fifo_and_cancelled_inputs_drop_before_capacity
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 6,
-        input_bytes: 60,
     });
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
@@ -49,7 +48,6 @@ async fn priority_queues_preserve_fifo_and_cancelled_inputs_drop_before_capacity
     let foreign = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 10,
     });
     assert!(!foreign.cancel(&cancelled));
     assert!(pool.cancel(&cancelled));
@@ -93,7 +91,6 @@ async fn running_cancellation_and_shutdown_expiry_retain_native_admission() {
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 8,
     });
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
@@ -136,7 +133,6 @@ async fn promotion_preserves_admission_and_appends_after_existing_foreground_wor
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 5,
-        input_bytes: 50,
     });
     let (started, ready) = tokio::sync::oneshot::channel();
     let (release, blocked) = std::sync::mpsc::channel();
@@ -177,7 +173,6 @@ async fn promotion_preserves_admission_and_appends_after_existing_foreground_wor
     let foreign = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 10,
     });
     assert!(!foreign.promote(&promoted, WorkPriority::Foreground));
     assert!(!pool.promote(&running, WorkPriority::Foreground));
@@ -208,20 +203,17 @@ async fn reservations_bound_inputs_before_transfer_and_survive_admission_close()
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 2,
-        input_bytes: 8,
     });
     assert_eq!(pool.usage(), PoolUsage::default());
     let accepted = pool
         .reserve(WorkPriority::Visible, WorkBudget::new(8, None))
         .unwrap();
-    assert!(matches!(
-        pool.reserve(WorkPriority::Foreground, WorkBudget::new(1, None)),
-        Err(PoolError::Busy)
-    ));
+    let large = pool.reserve(WorkPriority::Foreground, WorkBudget::new(9, None)).unwrap();
     assert!(matches!(
         pool.reserve(WorkPriority::Foreground, WorkBudget::new(9, None)),
-        Err(PoolError::Oversized)
+        Err(PoolError::Busy)
     ));
+    drop(large);
     drop(accepted);
     assert_eq!(pool.usage().input_bytes, 0);
     let accepted = pool
@@ -248,7 +240,6 @@ async fn panicking_work_releases_its_slot_and_preserves_the_dedicated_worker() {
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 2,
-        input_bytes: 16,
     });
     pool.submit(WorkPriority::Foreground, WorkBudget::new(8, None), |_| {
         panic!("injected native analysis failure");
@@ -275,7 +266,6 @@ async fn a_deadline_that_expires_after_reservation_drops_input_without_execution
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 8,
     });
     let deadline = Instant::now() + Duration::from_millis(100);
     let permit = pool
@@ -303,7 +293,6 @@ fn expired_work_is_rejected_before_starting_a_worker() {
     let pool = AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 1,
-        input_bytes: 8,
     });
     assert!(matches!(
         pool.submit(

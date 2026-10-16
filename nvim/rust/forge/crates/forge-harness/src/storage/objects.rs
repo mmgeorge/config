@@ -243,16 +243,12 @@ impl ObjectStore {
         Ok(object_id)
     }
 
-    /// Returns verified bytes, or `None` when the stored length exceeds the caller's byte limit.
-    /// Oversized objects are not read or hash-verified. Accepted objects reject observed changes.
-    pub fn get(&self, object_id: &str, byte_limit: usize) -> Result<Option<Vec<u8>>> {
+    /// Load verified bytes from an immutable object, rejecting observed changes.
+    pub fn get(&self, object_id: &str) -> Result<Vec<u8>> {
         let path = self.path(object_id)?;
         let mut source = fs::File::open(&path)
             .with_context(|| format!("open Harness object {}", path.display()))?;
         let before = file_stamp(&source.metadata()?)?;
-        if before.length > byte_limit as u64 {
-            return Ok(None);
-        }
         let length =
             usize::try_from(before.length).context("object length exceeds address space")?;
         let mut content = Vec::new();
@@ -265,7 +261,7 @@ impl ObjectStore {
             before == file_stamp(&source.metadata()?)?,
             "Harness object changed during retrieval"
         );
-        Ok(Some(content))
+        Ok(content)
     }
 
     /// Verifies bytes before atomically replacing the destination from a same-directory temporary file.
@@ -294,6 +290,14 @@ impl ObjectStore {
             copy_exact(&mut verified, &mut output, before.length)?.eq_ignore_ascii_case(object_id),
             "verified rollback bytes changed during restoration"
         );
+        match fs::symlink_metadata(destination) {
+            Ok(metadata) if metadata.is_file() => {
+                output.as_file().set_permissions(metadata.permissions())?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read rollback destination permissions"),
+        }
         output.as_file().sync_all()?;
         output
             .persist(destination)
@@ -477,7 +481,7 @@ mod tests {
             }).unwrap();
             assert!(changed);
             assert!(captured.stamp.is_none());
-            assert_eq!(store.get(&captured.object_id.unwrap(), 4096).unwrap().unwrap(), content);
+            assert_eq!(store.get(&captured.object_id.unwrap()).unwrap(), content);
             let settled = store.capture_file(&source, directory.path(), None, &mut || Ok(())).unwrap();
             assert!(!settled.reused);
             assert!(settled.stamp.is_some());
@@ -510,7 +514,7 @@ mod tests {
         });
         assert!(identities.iter().all(|identity| identity == &identities[0]));
         assert_eq!(
-            objects.get(&identities[0], content.len()).unwrap().unwrap(),
+            objects.get(&identities[0]).unwrap(),
             content
         );
         let path = objects.path(&identities[0]).unwrap();
@@ -523,10 +527,10 @@ mod tests {
         let objects = ObjectStore::open(directory.path()).unwrap();
         let identity = objects.put(b"checkpoint").unwrap();
         fs::write(objects.path(&identity).unwrap(), b"corrupt").unwrap();
-        assert!(objects.get(&identity, 1024).is_err());
+        assert!(objects.get(&identity).is_err());
         assert!(objects.put(b"checkpoint").is_err());
-        assert!(objects.get("../outside", 1024).is_err());
-        assert!(objects.get(&"g".repeat(64), 1024).is_err());
+        assert!(objects.get("../outside").is_err());
+        assert!(objects.get(&"g".repeat(64)).is_err());
     }
 
     #[test]
@@ -539,7 +543,7 @@ mod tests {
             let streamed = objects.put_file(&source).unwrap();
             assert_eq!(streamed, objects.put(&content).unwrap());
             assert_eq!(
-                objects.get(&streamed, content.len()).unwrap().unwrap(),
+                objects.get(&streamed).unwrap(),
                 content
             );
             assert_eq!(objects.put_file(&source).unwrap(), streamed);
@@ -577,17 +581,18 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_enforces_the_byte_limit_before_reading_and_accepts_exact_limits() {
+    fn retrieval_preserves_complete_content_and_rejects_corruption() {
         let directory = tempfile::tempdir().unwrap();
         let objects = ObjectStore::open(directory.path()).unwrap();
         let identity = objects.put(b"exact").unwrap();
-        assert_eq!(objects.get(&identity, 5).unwrap().unwrap(), b"exact");
-        assert!(objects.get(&identity, 4).unwrap().is_none());
+        assert_eq!(objects.get(&identity).unwrap(), b"exact");
         fs::write(objects.path(&identity).unwrap(), b"wrong").unwrap();
-        assert!(objects.get(&identity, 4).unwrap().is_none());
-        assert!(objects.get(&identity, 5).is_err());
+        assert!(objects.get(&identity).is_err());
         let empty = objects.put(b"").unwrap();
-        assert!(objects.get(&empty, 0).unwrap().unwrap().is_empty());
+        assert!(objects.get(&empty).unwrap().is_empty());
+        let content = vec![b'x'; 9 * 1024 * 1024];
+        let identity = objects.put(&content).unwrap();
+        assert_eq!(objects.get(&identity).unwrap(), content);
     }
 
     #[test]

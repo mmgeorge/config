@@ -11,11 +11,7 @@ local function selected_rows(session)
   assert(not require("forge.editable").suspend_generated_text(session.editable), "local edits require acknowledgement before copying gutters")
   local anchor, cursor = vim.fn.getpos("v")[2], vim.api.nvim_win_get_cursor(0)[1]
   local first, last = math.min(anchor, cursor), math.max(anchor, cursor)
-  local source_bytes = vim.api.nvim_buf_get_offset(session.buffer, last)
-    - vim.api.nvim_buf_get_offset(session.buffer, first - 1)
-  assert(source_bytes >= 0 and source_bytes <= 16 * 1024 * 1024, "selected source exceeds 16 MiB")
   local rows = vim.api.nvim_buf_get_lines(session.buffer, first - 1, last, true)
-  local bytes = 0
   for index, text in ipairs(rows) do
     local layout = gutter.bounds(session, first + index - 1)
     if layout then
@@ -28,8 +24,6 @@ local function selected_rows(session)
       fragment[#fragment + 1] = text:sub(column + 1)
       rows[index] = table.concat(fragment)
     end
-    bytes = bytes + #rows[index] + 1
-    assert(bytes <= 16 * 1024 * 1024, "selected source and gutters exceed 16 MiB")
   end
   return rows
 end

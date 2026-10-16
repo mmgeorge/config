@@ -34,7 +34,7 @@ fn fixture() -> (tempfile::TempDir, RepositoryIdentity) {
 #[test]
 fn intersecting_scopes_keep_admission_order_without_blocking_unrelated_work() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(4, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(4).unwrap();
     let index = MutationScope::Index(identity.worktree.clone().unwrap());
     let files = MutationScope::WorktreeFiles(identity.worktree.unwrap());
     let first = coordinator.admit(vec![index.clone()], 0).unwrap();
@@ -71,7 +71,7 @@ fn intersecting_scopes_keep_admission_order_without_blocking_unrelated_work() {
 #[test]
 fn running_cancellation_retains_scopes_until_the_owner_records_termination() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
     let second = coordinator.admit(vec![scope], 0).unwrap();
@@ -96,7 +96,7 @@ fn running_cancellation_retains_scopes_until_the_owner_records_termination() {
 #[test]
 fn dropped_running_owner_quarantines_scopes_and_survives_shutdown() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
     let second = coordinator.admit(vec![scope.clone()], 0).unwrap();
@@ -115,7 +115,7 @@ fn dropped_running_owner_quarantines_scopes_and_survives_shutdown() {
 #[test]
 fn completed_receipts_consume_capacity_until_acknowledged() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(1, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(1).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
     coordinator.cancel(first).unwrap();
@@ -153,7 +153,7 @@ fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
     let linked = discover_identity(&root.path().join("linked"))
         .unwrap()
         .unwrap();
-    let coordinator = MutationCoordinator::new(4, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(4).unwrap();
     let main_index = coordinator
         .admit(vec![MutationScope::Index(identity.worktree.unwrap())], 0)
         .unwrap();
@@ -184,8 +184,8 @@ fn linked_worktrees_have_independent_indexes_and_one_shared_ref_queue() {
 #[test]
 fn invalid_scope_requests_do_not_consume_admission() {
     let (_root, identity) = fixture();
-    assert!(MutationCoordinator::new(0, 4096).is_err());
-    let coordinator = MutationCoordinator::new(1, 4096).unwrap();
+    assert!(MutationCoordinator::new(0).is_err());
+    let coordinator = MutationCoordinator::new(1).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     assert!(coordinator.admit(vec![], 0).is_err());
     assert!(
@@ -200,7 +200,7 @@ fn invalid_scope_requests_do_not_consume_admission() {
 #[tokio::test]
 async fn asynchronous_handoff_observes_completion_before_its_first_poll() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
     let second = coordinator.admit(vec![scope], 0).unwrap();
@@ -222,7 +222,7 @@ async fn cancelled_waiter_records_a_receipt_and_wakes_the_next_scope_owner() {
     use std::task::Poll;
 
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(3, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(3).unwrap();
     let index = MutationScope::Index(identity.worktree.clone().unwrap());
     let files = MutationScope::WorktreeFiles(identity.worktree.unwrap());
     let first = coordinator.admit(vec![index.clone()], 0).unwrap();
@@ -255,7 +255,7 @@ async fn shutdown_wakes_queued_and_running_owners_without_releasing_running_scop
     use std::task::Poll;
 
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2, 4096).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 0).unwrap();
     let second = coordinator.admit(vec![scope], 0).unwrap();
@@ -284,13 +284,11 @@ async fn shutdown_wakes_queued_and_running_owners_without_releasing_running_scop
 }
 
 #[test]
-fn input_budget_is_independent_from_count_and_releases_only_on_receipt_adoption() {
+fn input_accounting_preserves_full_content_until_receipt_adoption() {
     let (_root, identity) = fixture();
-    assert!(MutationCoordinator::new(1, 0).is_err());
-    let coordinator = MutationCoordinator::new(3, 10).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 6).unwrap();
-    assert!(coordinator.admit(vec![scope.clone()], 5).is_err());
     assert!(coordinator.admit(vec![scope.clone()], usize::MAX).is_err());
     assert_eq!(coordinator.usage().operations, 1);
     assert_eq!(coordinator.usage().input_bytes, 6);
@@ -317,7 +315,7 @@ fn input_budget_is_independent_from_count_and_releases_only_on_receipt_adoption(
 #[test]
 fn cancelled_waiter_and_abandoned_owner_retain_their_input_charges() {
     let (_root, identity) = fixture();
-    let coordinator = MutationCoordinator::new(2, 10).unwrap();
+    let coordinator = MutationCoordinator::new(2).unwrap();
     let scope = MutationScope::Index(identity.worktree.unwrap());
     let first = coordinator.admit(vec![scope.clone()], 6).unwrap();
     let second = coordinator.admit(vec![scope], 4).unwrap();

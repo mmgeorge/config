@@ -262,25 +262,10 @@ impl WriteAction {
 }
 
 fn decode_paths(paths: Vec<String>) -> Result<Vec<RepositoryPath>> {
-    ensure!(
-        paths.len() <= forge_git::writer::MAX_TARGETS,
-        "Git path target limit exceeded"
-    );
-    let encoded_limit = (forge_git::writer::MAX_PATH_BYTES.div_ceil(3) + paths.len()) * 4;
-    ensure!(
-        paths.iter().map(String::len).sum::<usize>() <= encoded_limit,
-        "encoded Git paths exceed input limit"
-    );
-    let mut decoded_bytes = 0;
     paths
         .into_iter()
         .map(|path| {
             let path = STANDARD.decode(path)?;
-            decoded_bytes += path.len();
-            ensure!(
-                decoded_bytes <= forge_git::writer::MAX_PATH_BYTES,
-                "Git path bytes exceed input limit"
-            );
             RepositoryPath::new(path)
         })
         .collect()
@@ -291,26 +276,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn path_admission_matches_native_writer_limits() {
-        let accepted = (0..400)
+    fn path_admission_preserves_complete_collections_and_validates_paths() {
+        let accepted = (0..10_001)
             .map(|index| STANDARD.encode(format!("source-{index}.rs")))
             .collect();
-        assert_eq!(decode_paths(accepted).unwrap().len(), 400);
-        assert!(
-            decode_paths(vec![
-                STANDARD.encode("source");
-                forge_git::writer::MAX_TARGETS + 1
-            ])
-            .is_err()
-        );
-        assert!(
-            decode_paths(vec![STANDARD.encode(vec![
-                b'x';
-                forge_git::writer::MAX_PATH_BYTES
-                    + 1
-            ])])
-            .is_err()
-        );
+        assert_eq!(decode_paths(accepted).unwrap().len(), 10_001);
+        let path = vec![b'x'; 1024 * 1024 + 1];
+        assert_eq!(decode_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(), path);
         assert!(decode_paths(vec![STANDARD.encode("../outside")]).is_err());
     }
 }

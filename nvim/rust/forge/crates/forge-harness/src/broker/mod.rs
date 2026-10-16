@@ -1270,7 +1270,6 @@ impl HarnessBroker {
                     && message.delivery() == crate::turn::MessageDelivery::Final)
                 .map(|message| message.text()).collect::<Vec<_>>().join("\n\n");
             anyhow::ensure!(!answer.trim().is_empty(), "plan question completed without an answer");
-            anyhow::ensure!(answer.len() <= 8_192, "plan question answer exceeds the display limit");
             self.plan_review.answer(&document, &question, answer.clone(), exchange.duration_ms)?;
             self.trace.record(&self.session.id, "plan.question.answered", json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms}));
         }
@@ -1759,7 +1758,7 @@ impl HarnessBroker {
                 return Ok(json!({"agents":entry}));
             }
             AgentOperation::Message { target, message } => {
-                anyhow::ensure!(!message.trim().is_empty() && message.len() <= 256 * 1024, "informational message must contain 1 to 262144 bytes");
+                anyhow::ensure!(!message.trim().is_empty(), "informational message must contain nonempty text");
                 let mut agent = self.agent_coordinator.resolve(target)?;
                 let id = request.operation_id.clone();
                 if let Some(existing) = agent.inbox.iter().find(|message|message.id == id) {
@@ -3634,11 +3633,7 @@ Planning continuation: turn {} of {}.",
                     self.session.backend_session_id = Some(backend_session_id);
                 }
                 if cancelled && self.turn_cancellation.restart.load(Ordering::Acquire) {
-                    interaction.pause_for_restart(self.clock.now_ms())?;
-                    self.store.save_exchange(&interaction)?;
-                    self.exchange_runtime = None;
-                    self.active_wait_projection = None;
-                    self.save_session()?;
+                    self.park_exchange_for_restart(&mut interaction).await?;
                     return Err(error);
                 }
                 let outcome = if cancelled {
@@ -4251,6 +4246,32 @@ Planning continuation: turn {} of {}.",
         let Some(task) = runtime.checkpoint.as_mut() else { return Ok(()); };
         let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
         self.finish_initial_checkpoint(runtime, interaction, result)
+    }
+
+    async fn park_exchange_for_restart(&mut self, interaction: &mut Exchange) -> Result<()> {
+        if let Err(error) = self.collect_active_initial_checkpoint(interaction).await {
+            interaction.begin_finalization(ExchangeState::Failed, self.clock.now_ms())?;
+            interaction.finalization_error = Some(format!("{error:#}"));
+            self.store.save_exchange(interaction)?;
+            return Err(error);
+        }
+        interaction.pause_for_restart(self.clock.now_ms())?;
+        self.store.save_exchange(interaction)?;
+        self.exchange_runtime = None;
+        self.active_wait_projection = None;
+        self.save_session()
+    }
+
+    async fn collect_active_initial_checkpoint(&mut self, interaction: &mut Exchange) -> Result<()> {
+        if !self.exchange_runtime.as_ref().is_some_and(|runtime|
+            runtime.exchange_id == interaction.id && runtime.checkpoint.is_some())
+        {
+            return Ok(());
+        }
+        let mut runtime = self.exchange_runtime.take().expect("checked runtime");
+        let result = self.collect_initial_checkpoint(&mut runtime, interaction).await;
+        self.exchange_runtime = Some(runtime);
+        result
     }
 
     fn resume_exchange_runtime(&mut self, interaction: &Exchange) -> Result<()> {
@@ -5048,12 +5069,7 @@ Planning continuation: turn {} of {}.",
                 interaction.finish(outcome, self.clock.now_ms())?;
                 return Ok(None);
             }
-            if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == interaction.id && runtime.checkpoint.is_some()) {
-                let mut runtime = self.exchange_runtime.take().expect("checked runtime");
-                let saved = self.collect_initial_checkpoint(&mut runtime, interaction).await;
-                self.exchange_runtime = Some(runtime);
-                saved?;
-            }
+            self.collect_active_initial_checkpoint(interaction).await?;
             let WorkspaceKind::Git(_) = &self.workspace_kind else {
                 let mut changes = crate::exchange::ProviderDiffBuilder::default();
                 self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
@@ -6474,12 +6490,6 @@ Planning continuation: turn {} of {}.",
             .map(str::trim)
             .filter(|comment| !comment.is_empty())
             .map(str::to_owned);
-        anyhow::ensure!(
-            overall_comment
-                .as_ref()
-                .is_none_or(|comment| comment.len() <= 65536),
-            "overall plan review comment exceeds 64 KiB"
-        );
         let feedback = crate::plan::render_review_feedback(document, &annotation)?;
         let document_json = document.model_json()?;
         self.finalize_review_draft(&mut plan, &reviewed)?;
@@ -10341,6 +10351,93 @@ mod test {
         assert_eq!(broker.session.name, "convert a rather long reposito");
         assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
             "convert a rather long reposito");
+    }
+
+    #[tokio::test]
+    async fn restart_collects_pending_initial_checkpoint_and_preserves_the_baseline_on_resume() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let (mut exchange, _, _) = broker.interaction_for_turn("retain this request", true, 100)
+            .await.unwrap();
+        let baseline = broker.checkpoint.as_ref().unwrap()
+            .capture(&broker.store.objects, &broker.repositories, &broker.session.id, 100)
+            .await.unwrap();
+        let baseline_id = baseline.id.clone();
+        let gate = crate::checkpoint::ToolGate::new().unwrap();
+        gate.complete(Err("provider turn ended before checkpoint admission completed".into())).unwrap();
+        let (complete, completed) = tokio::sync::oneshot::channel();
+        broker.exchange_runtime = Some(ExchangeRuntime {
+            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async move {
+                completed.await.context("initial checkpoint fixture owner disappeared")?
+            }))),
+            tool_gate: Some(gate.clone()),
+            exchange_id: exchange.id.clone(),
+            synthetic_turn: None,
+            task: TaskTracker::default(),
+            retraction_eligible: true,
+            active_wait: None,
+        });
+        {
+            let collecting = broker.park_exchange_for_restart(&mut exchange);
+            tokio::pin!(collecting);
+            assert!(futures_util::poll!(&mut collecting).is_pending());
+            assert!(!gate.ready());
+            complete.send(Ok(baseline)).unwrap();
+            collecting.await.unwrap();
+        }
+        assert!(!gate.ready());
+        assert!(gate.wait().await.unwrap_err().to_string().contains("provider turn ended"));
+        assert_eq!(exchange.checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+        assert_eq!(
+            broker.store.list_exchange(&broker.session.id).unwrap()[0].checkpoint_before,
+            Some(baseline_id.clone())
+        );
+        assert!(broker.exchange_runtime.is_none());
+        assert!(exchange.execution_started_at_ms.is_none());
+        std::fs::write(repository.path().join("seed.txt"), "changed after baseline\n").unwrap();
+        broker.resume_exchange_runtime(&exchange).unwrap();
+        broker.collect_active_initial_checkpoint(&mut exchange).await.unwrap();
+        exchange.resume(102).unwrap();
+        broker.capture_final_checkpoint(&mut exchange, ExchangeState::Complete).await.unwrap();
+        assert_eq!(exchange.checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+        assert_ne!(exchange.checkpoint_after, exchange.checkpoint_before);
+        let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(persisted.len(), 1);
+        assert_eq!(persisted[0].state, ExchangeState::Complete);
+        assert_eq!(persisted[0].checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+    }
+
+    #[tokio::test]
+    async fn restart_checkpoint_failure_propagates_without_releasing_tools() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let (mut exchange, _, _) = broker.interaction_for_turn("retain the failed barrier", true, 100)
+            .await.unwrap();
+        let gate = crate::checkpoint::ToolGate::new().unwrap();
+        broker.exchange_runtime = Some(ExchangeRuntime {
+            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async {
+                anyhow::bail!("initial checkpoint fixture failed")
+            }))),
+            tool_gate: Some(gate.clone()),
+            exchange_id: exchange.id.clone(),
+            synthetic_turn: None,
+            task: TaskTracker::default(),
+            retraction_eligible: true,
+            active_wait: None,
+        });
+        let failure = broker.park_exchange_for_restart(&mut exchange).await.unwrap_err();
+        assert!(failure.to_string().contains("initial checkpoint fixture failed"));
+        assert!(gate.wait().await.unwrap_err().to_string().contains("initial checkpoint fixture failed"));
+        assert!(!gate.ready());
+        assert!(exchange.checkpoint_before.is_none());
+        assert_eq!(exchange.state, ExchangeState::Finalizing);
+        assert!(exchange.finalization_error.as_deref().unwrap().contains("initial checkpoint fixture failed"));
+        let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(persisted[0].state, ExchangeState::Finalizing);
+        assert_eq!(persisted[0].finalization_error, exchange.finalization_error);
+        assert!(broker.exchange_runtime.as_ref().unwrap().checkpoint.is_none());
     }
 
     #[tokio::test]

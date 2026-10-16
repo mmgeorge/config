@@ -1,7 +1,6 @@
 use std::{collections::BTreeSet, sync::Arc};
 
 use forge_diff::{
-    body::BodyKind,
     cache::AnalysisHandle,
     display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState, RowKind, group_hunks},
     raw::compute_hunks,
@@ -24,7 +23,6 @@ async fn analysis(
     let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
         workers: 1,
         jobs: 2,
-        input_bytes: 8 * 1024 * 1024,
     })));
     let mut syntax = Vec::new();
     for source in [source.old.clone(), source.new.clone()] {
@@ -57,7 +55,6 @@ fn drain(cursor: &mut DisplayCursor, rows: usize) -> Vec<DisplayRow> {
         match chunk.state {
             DisplayState::Complete => return result,
             DisplayState::More => {}
-            state => panic!("unexpected display state: {state:?}"),
         }
     }
     panic!("display did not finish");
@@ -103,9 +100,9 @@ async fn semantic_windows_merge_and_shared_boundaries_render_once_in_typescript_
         for compact in [false, true] {
             let make_cursor = || {
                 let cursor = if compact {
-                    DisplayCursor::compact(diff.clone(), 3, BodyKind::Modified)
+                    DisplayCursor::compact(diff.clone(), 3)
                 } else {
-                    DisplayCursor::new(diff.clone(), 3, BodyKind::Modified)
+                    DisplayCursor::new(diff.clone(), 3)
                 };
                 cursor.with_syntax_context(Some(&old), Some(&new))
             };
@@ -172,7 +169,7 @@ async fn semantic_bridge_accepts_six_hidden_lines_but_rejects_seven() {
             &modified.join("\n"),
         )
         .await;
-        let cursor = DisplayCursor::compact(diff, 3, BodyKind::Modified)
+        let cursor = DisplayCursor::compact(diff, 3)
             .with_syntax_context(Some(&old), Some(&new));
         assert!(cursor.group(groups - 1).is_some());
         assert!(
@@ -198,7 +195,7 @@ async fn semantic_bridge_does_not_join_unrelated_functions() {
         &modified.join("\n"),
     )
     .await;
-    let mut cursor = DisplayCursor::compact(diff, 3, BodyKind::Modified)
+    let mut cursor = DisplayCursor::compact(diff, 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert!(cursor.group(1).is_some());
     assert!(cursor.group(2).is_none());
@@ -236,7 +233,7 @@ async fn nested_rust_methods_share_ancestor_boundaries_without_merging_sibling_s
         &modified.join("\n"),
     )
     .await;
-    let mut cursor = DisplayCursor::compact(diff, 3, BodyKind::Modified)
+    let mut cursor = DisplayCursor::compact(diff, 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert_eq!(cursor.context_label(0), Some("fn first() {"));
     assert_eq!(cursor.context_label(1), Some("fn second() {"));
@@ -275,7 +272,7 @@ async fn deletion_only_context_uses_the_old_declaration_and_preserves_line_mappi
     )
     .await;
     let raw = diff.hunks().to_vec();
-    let mut cursor = DisplayCursor::compact(diff.clone(), 3, BodyKind::Modified)
+    let mut cursor = DisplayCursor::compact(diff.clone(), 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert_eq!(cursor.group(0).unwrap().raw_ids.len(), 2);
     assert!(cursor.group(1).is_none());

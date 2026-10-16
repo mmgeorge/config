@@ -113,7 +113,6 @@ impl DiffEngine {
                     .map_or(1, |count| count.get().saturating_sub(1).clamp(1, 4)),
             ),
             jobs: max_jobs,
-            input_bytes: cache.limits().source_bytes,
         }));
         Arc::new(Self {
             state: Mutex::new(EngineState {
@@ -568,7 +567,6 @@ mod tests {
         owner.pool = Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 1024,
         }));
         let first_engine = Arc::clone(&engine);
         let first = tokio::spawn(async move { first_engine.compare(request("first\n")).await });
@@ -642,7 +640,6 @@ mod tests {
         owner.pool = Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 4,
-            input_bytes: 1024,
         }));
         let started = Arc::new(Notify::new());
         let notification = Arc::clone(&started);
@@ -892,21 +889,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exhausted_retention_budget_rejects_before_starting_native_work() {
-        let mut engine = DiffEngine::new(
+    async fn exhausted_cache_budget_keeps_analysis_available_without_caching() {
+        let engine = DiffEngine::new(
             CacheLimits {
                 result_bytes: 0,
                 ..CacheLimits::default()
             },
             1,
         );
-        Arc::get_mut(&mut engine).unwrap().compute =
-            Arc::new(|_| panic!("rejected work must not run"));
-        assert!(matches!(
-            engine.compare(request("new\n")).await,
-            Err(EngineError::Cache(CacheError::Saturated))
-        ));
+        let analysis = engine.compare(request("new\n")).await.unwrap();
+        assert_eq!(analysis.source().new.bytes(), b"new\n");
         assert_eq!(engine.usage().active_jobs, 0);
+        assert_eq!(engine.usage().cache.cached_entries, 0);
+        drop(analysis);
         assert_eq!(engine.usage().cache.admitted_entries, 0);
     }
 }

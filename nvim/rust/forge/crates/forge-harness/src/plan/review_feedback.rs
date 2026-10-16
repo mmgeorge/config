@@ -93,10 +93,6 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
             for index in file.comment.keys() {
                 output.push_str(&format!("{}\n\n", annotation[*index].body));
             }
-            ensure!(
-                output.len() <= 8 * 1024 * 1024,
-                "review feedback exceeds 8 MiB"
-            );
             continue;
         }
         let mut ranges = Vec::<(usize, usize)>::new();
@@ -198,19 +194,11 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                     output.push_str(&format!("{label}: {}\n\n", annotation[*index].body));
                 }
             }
-            ensure!(
-                output.len() <= 8 * 1024 * 1024,
-                "review feedback exceeds 8 MiB"
-            );
         }
     }
     for index in general {
         let comment = &annotation[index];
         output.push_str(&format!("{}:\n{}\n\n", comment.label, comment.body));
-        ensure!(
-            output.len() <= 8 * 1024 * 1024,
-            "review feedback exceeds 8 MiB"
-        );
     }
     if output.is_empty() {
         output.push_str("None");

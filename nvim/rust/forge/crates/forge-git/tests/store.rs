@@ -35,7 +35,7 @@ async fn concurrent_discovery_reuses_one_worktree_handle() {
     let root = fixture();
     let nested = root.path().join("nested");
     std::fs::create_dir(&nested).unwrap();
-    let store = RepositoryStore::new(1, 2, 4096).unwrap();
+    let store = RepositoryStore::new(1, 2).unwrap();
     let (first, second) = tokio::join!(store.open(root.path().to_owned()), store.open(nested));
     let first = first.unwrap().unwrap();
     let second = second.unwrap().unwrap();
@@ -62,7 +62,7 @@ async fn capacity_rejects_active_leases_and_evicts_least_recent_idle_handle() {
     let first_root = fixture();
     let second_root = fixture();
     let third_root = fixture();
-    let store = RepositoryStore::new(2, 2, 4096).unwrap();
+    let store = RepositoryStore::new(2, 2).unwrap();
     let first = store
         .open(first_root.path().to_owned())
         .await
@@ -93,7 +93,7 @@ async fn capacity_rejects_active_leases_and_evicts_least_recent_idle_handle() {
 #[tokio::test]
 async fn invalidation_rejects_a_native_result_started_before_the_change() {
     let root = fixture();
-    let store = Arc::new(RepositoryStore::new(1, 1, 4096).unwrap());
+    let store = Arc::new(RepositoryStore::new(1, 1).unwrap());
     let repository = store.open(root.path().to_owned()).await.unwrap().unwrap();
     let generation = repository.generation();
     let (started, started_receiver) = tokio::sync::oneshot::channel();
@@ -125,7 +125,7 @@ async fn invalidation_rejects_a_native_result_started_before_the_change() {
 #[tokio::test]
 async fn cancelled_waiter_cannot_evict_an_active_native_worker() {
     let root = fixture();
-    let store = Arc::new(RepositoryStore::new(1, 1, 4096).unwrap());
+    let store = Arc::new(RepositoryStore::new(1, 1).unwrap());
     let repository = store.open(root.path().to_owned()).await.unwrap().unwrap();
     let (started, started_receiver) = tokio::sync::oneshot::channel();
     let (release, release_receiver) = std::sync::mpsc::channel();
@@ -159,8 +159,8 @@ async fn cancelled_waiter_cannot_evict_an_active_native_worker() {
 #[tokio::test]
 async fn foreign_store_leases_are_rejected() {
     let root = fixture();
-    let owner = RepositoryStore::new(1, 1, 4096).unwrap();
-    let other = RepositoryStore::new(1, 1, 4096).unwrap();
+    let owner = RepositoryStore::new(1, 1).unwrap();
+    let other = RepositoryStore::new(1, 1).unwrap();
     let repository = owner.open(root.path().to_owned()).await.unwrap().unwrap();
     let _other_repository = other.open(root.path().to_owned()).await.unwrap().unwrap();
     assert!(other.read(repository, 0, |_, _| Ok(())).await.is_err());
@@ -195,7 +195,7 @@ async fn linked_worktrees_share_invalidation_but_keep_separate_handles() {
         ],
     );
     let unrelated_root = fixture();
-    let store = RepositoryStore::new(3, 2, 4096).unwrap();
+    let store = RepositoryStore::new(3, 2).unwrap();
     let main = store.open(root.path().to_owned()).await.unwrap().unwrap();
     let linked = store.open(linked).await.unwrap().unwrap();
     let unrelated = store
@@ -215,7 +215,7 @@ async fn linked_worktrees_share_invalidation_but_keep_separate_handles() {
 #[tokio::test]
 async fn bare_repository_and_missing_repository_remain_distinct() {
     let root = tempfile::tempdir().unwrap();
-    let store = RepositoryStore::new(1, 1, 4096).unwrap();
+    let store = RepositoryStore::new(1, 1).unwrap();
     assert!(store.open(root.path().to_owned()).await.unwrap().is_none());
     git(root.path(), &["init", "--bare", "--quiet"]);
     let repository = store.open(root.path().to_owned()).await.unwrap().unwrap();

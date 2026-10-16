@@ -61,10 +61,7 @@ impl DraftStore {
             return Ok(None);
         }
         let mut bytes = Vec::new();
-        File::open(&self.path)?
-            .take(8 * 1024 * 1024 + 1)
-            .read_to_end(&mut bytes)?;
-        ensure!(bytes.len() <= 8 * 1024 * 1024, "review draft exceeds 8 MiB");
+        File::open(&self.path)?.read_to_end(&mut bytes)?;
         let value = serde_json::from_slice(&bytes)
             .context("review draft is malformed and was preserved")?;
         Ok(Some(value))
@@ -135,19 +132,11 @@ impl DraftStore {
             }
             fields.insert(key.clone(), value.clone());
         }
-        ensure!(
-            serde_json::to_vec(&current)?.len() <= 8 * 1024 * 1024,
-            "combined review draft exceeds 8 MiB"
-        );
         crate::publication::publish_json(&self.path, &current)
     }
 }
 
 pub(crate) fn validate_patch(resource: &RecoveryResource, draft: &Value) -> Result<()> {
-    ensure!(
-        serde_json::to_vec(draft)?.len() <= 8 * 1024 * 1024,
-        "review draft exceeds 8 MiB"
-    );
     ensure!(
         draft.get("repo").and_then(Value::as_str)
             == Some(resource.repository.repository_name().as_str())

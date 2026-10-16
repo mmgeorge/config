@@ -1342,7 +1342,6 @@ async fn consumer_settlement_failure_preserves_confirmed_git_completion() {
                 assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
                 anyhow::bail!("private metadata unavailable")
             }),
-            0,
         )
         .unwrap();
     let outcome = service.submit(intent).unwrap().finish().await.unwrap();
@@ -1540,7 +1539,6 @@ async fn whole_file_stage_accepts_large_sources_and_changes_after_preparation() 
         crate::command::read_command(
             &mut command,
             CommandLimits {
-                stdout_bytes: 10 * 1024 * 1024,
                 stderr_bytes: 4096,
                 timeout: Duration::from_secs(30),
             },

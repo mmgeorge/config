@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::Output};
 use serde::Deserialize;
 
 use super::{
-    BoundedVec, GhClient, GraphFailure, append_diagnostic, append_graph_failures, classify_failure,
+    GhClient, GraphFailure, append_diagnostic, append_graph_failures, classify_failure,
     diagnostic, remote_result,
 };
 use crate::pull_request::{
@@ -17,7 +17,7 @@ const STATE_QUERY: &str = "query($owner:String!, $name:String!, $number:Int!, $i
 struct StateResponse {
     data: Option<StateData>,
     #[serde(default)]
-    errors: BoundedVec<GraphFailure, 32>,
+    errors: Vec<GraphFailure>,
 }
 
 #[derive(Deserialize)]
@@ -162,7 +162,7 @@ fn decode_state(
             String::from_utf8_lossy(&output.stderr)
         ));
         if let Ok(response) = decoded {
-            append_graph_failures(&mut message, &response.errors.0);
+            append_graph_failures(&mut message, &response.errors);
         } else {
             append_diagnostic(&mut message, &String::from_utf8_lossy(&output.stdout));
         }
@@ -172,9 +172,9 @@ fn decode_state(
         kind: RemoteFailureKind::InvalidResponse,
         message: diagnostic(&format!("gh returned invalid PR state JSON: {failure}")),
     })?;
-    if !response.errors.0.is_empty() {
+    if !response.errors.is_empty() {
         let mut message = String::new();
-        append_graph_failures(&mut message, &response.errors.0);
+        append_graph_failures(&mut message, &response.errors);
         return Err(classify_failure(message));
     }
     let observed = response

@@ -611,7 +611,6 @@ fn rows(
     navigation.anchor.extend(section_anchor);
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
-    ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden, contextual_block))
 }
 
@@ -1284,7 +1283,7 @@ mod tests {
         design.proposed_calls.insert("arena.rs".into(), proposed);
         document.design = Some(design);
         let original = document.clone();
-        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })));
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2 })));
         let mut syntax = HashMap::new();
         for (side, text) in [("baseline", before), ("proposed", after.as_str())] {
             let plain = forge_diff::syntax::DeclarationOverview::present("arena.rs", text).unwrap().text;

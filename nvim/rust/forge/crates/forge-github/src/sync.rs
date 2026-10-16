@@ -11,8 +11,6 @@ use crate::model::{GithubRepositoryId, PageInput, RepoSyncState, SnapshotState, 
 use crate::remote::{GithubRemote, IssuePage, IssuePageRequest, RemoteFailureKind};
 use crate::service::{GithubService, IssueOperation};
 
-const MAX_PAGES: usize = 10_000;
-const MAX_CURSOR_BYTES: usize = 512;
 const MAX_RATE_RETRIES: usize = 3;
 const REMOTE_DEADLINE: Duration = Duration::from_secs(120);
 const RATE_DELAY: Duration = Duration::from_secs(60);
@@ -124,10 +122,6 @@ pub(crate) async fn run(
         pages: 0,
     };
     loop {
-        ensure!(
-            outcome.pages < MAX_PAGES,
-            "issue sync exceeds its page limit"
-        );
         let mut rate_retries = 0;
         let page = loop {
             progress.publish(SyncPhase::Reading, None);
@@ -259,7 +253,7 @@ fn unix_seconds() -> Result<i64> {
 
 fn validate_cursor(cursor: &str) -> Result<()> {
     ensure!(
-        !cursor.is_empty() && cursor.len() <= MAX_CURSOR_BYTES,
+        !cursor.is_empty(),
         "GitHub issue cursor has invalid length"
     );
     Ok(())

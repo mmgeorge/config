@@ -178,7 +178,6 @@ pub(crate) struct DeclarationResolver {
     pending_module: HashMap<(String, Vec<String>), (PathBuf, bool)>,
     warning: Vec<String>,
     bytes: usize,
-    file_limit: Option<usize>,
     /// Correlates navigation work with the currently admitted review input.
     pub(crate) trace: Option<trace::DeclarationTrace>,
     work: ResolutionWork,
@@ -219,7 +218,7 @@ impl DeclarationResolver {
     pub(crate) fn planned(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
         let mut resolver = Self::snapshot(workspace, design, baseline)?;
         sources::project(&mut resolver)?;
-        resolver.bound_reference_files();
+        resolver.discard_snapshot_originals();
         Ok(resolver)
     }
 
@@ -254,7 +253,6 @@ impl DeclarationResolver {
             pending_module: HashMap::new(),
             warning: Vec::new(),
             bytes: 0,
-            file_limit: None,
             trace: None,
             work: Default::default(),
         };
@@ -312,7 +310,6 @@ impl DeclarationResolver {
         if self.file.contains_key(&path) {
             return Ok(true);
         }
-        anyhow::ensure!(self.file_limit.is_none_or(|limit| self.file.len() < limit), "declaration resolution reached its 64 additional file budget");
         let stage = self.trace.as_ref().map(|trace| trace.stage("index_file", Some(self.baseline)));
         let started = Instant::now();
         let read_started = Instant::now();
@@ -324,10 +321,6 @@ impl DeclarationResolver {
         };
         let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
         self.bytes += text.len();
-        anyhow::ensure!(
-            self.bytes <= 128 * 1024 * 1024 && self.file.len() < 16384,
-            "declaration index exceeded 128 MiB or 16384 files"
-        );
         let key = format!(
             "{}:{}",
             path.extension()
@@ -720,9 +713,8 @@ impl DeclarationResolver {
         }
         result
     }
-    /// Limit one reference index to 64 additional dependency files.
-    pub(crate) fn bound_reference_files(&mut self) {
-        self.file_limit = Some(self.file.len() + 64);
+    /// Release redundant original text from indexed declaration snapshots.
+    pub(crate) fn discard_snapshot_originals(&mut self) {
         for file in self.file.values_mut() {
             if file.path.strip_prefix(&self.workspace).ok().is_some_and(|path| self.snapshot.contains_key(&path.to_string_lossy().replace('\\', "/"))) { file.original = None; }
         }
@@ -832,9 +824,6 @@ impl DeclarationResolver {
             return resolution
                 .clone()
                 .unwrap_or_else(|| unverified("cyclic member ownership"));
-        }
-        if owner_resolution.len() >= 128 {
-            return unverified("member ownership exceeds its 128 type budget");
         }
         owner_resolution.insert(key.clone(), None);
         let result = (|| {

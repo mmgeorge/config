@@ -73,7 +73,6 @@ async fn read_request(socket: tokio::net::TcpStream, path: &str) -> Result<(BufR
         return Ok((reader, None));
     }
     let length = length.context("control request requires content length")?;
-    ensure!(length <= 1024 * 1024, "control payload exceeds 1 MiB");
     let mut body = vec![0; length];
     reader.read_exact(&mut body).await?;
     let request: Value = serde_json::from_slice(&body)?;
@@ -114,4 +113,29 @@ async fn respond(reader: &mut BufReader<tokio::net::TcpStream>, request: Value, 
     reader.get_mut().write_all(header.as_bytes()).await?;
     reader.get_mut().write_all(&body).await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn control_request_preserves_json_larger_than_one_mib() -> Result<()> {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let address = listener.local_addr()?;
+        let content = "λ".repeat(1024 * 1024);
+        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{"content":content}}))?;
+        let sender = tokio::spawn(async move {
+            let mut socket = tokio::net::TcpStream::connect(address).await?;
+            let header = format!("POST /control HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            socket.write_all(header.as_bytes()).await?;
+            socket.write_all(&body).await?;
+            Ok::<_, anyhow::Error>(())
+        });
+        let (socket, _) = listener.accept().await?;
+        let (_, request) = read_request(socket, "/control").await?;
+        sender.await??;
+        assert_eq!(request.unwrap()["params"]["content"], content);
+        Ok(())
+    }
 }

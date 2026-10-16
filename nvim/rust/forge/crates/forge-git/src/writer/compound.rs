@@ -66,7 +66,6 @@ fn apply(
     progress_command(
         &mut command,
         CommandLimits {
-            stdout_bytes: 64 * 1024,
             stderr_bytes: 64 * 1024,
             timeout: Duration::from_secs(120),
         },

@@ -1,16 +1,14 @@
 use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::{Result, bail, ensure};
 use tokio::sync::oneshot;
-use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::model::GithubRepositoryId;
 
 pub(crate) const MAX_REMOTE_OPERATIONS: usize = 64;
 const MAX_RESOURCE: usize = 64;
-const MAX_INPUT_BYTES: usize = 16 * 1024 * 1024;
 
 /// Remote issue or PR identity. Both use GitHub's shared repository number namespace.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -82,21 +80,21 @@ pub enum RemoteCompletion {
     Reconciled,
 }
 
-/// Process-local FIFO ownership for at most 64 operations, 64 remote resources, and 16 MiB of input.
+/// Owns process-local FIFO admission for at most 64 operations and 64 remote resources.
 ///
 /// Clones share admission and uncertainty state. Uncertain resources retain a slot until a
 /// successful reconciliation. This queue does not exclude other processes or external writers.
 #[derive(Clone)]
 pub struct RemoteQueue {
     state: Arc<Mutex<QueueState>>,
-    input: Arc<Semaphore>,
+    input_bytes: Arc<AtomicUsize>,
 }
 
 impl Default for RemoteQueue {
     fn default() -> Self {
         Self {
             state: Arc::default(),
-            input: Arc::new(Semaphore::new(MAX_INPUT_BYTES)),
+            input_bytes: Arc::default(),
         }
     }
 }
@@ -128,7 +126,7 @@ struct PendingOperation {
 /// uncertain. The service must retain this owner independently of a request receiver.
 pub struct RemoteOperation {
     pub(crate) mutation_started: Arc<AtomicBool>,
-    _input: OwnedSemaphorePermit,
+    retained_bytes: usize,
     queue: RemoteQueue,
     resource: RemoteResource,
     scope: RemoteScope,
@@ -166,13 +164,6 @@ impl RemoteQueue {
         let retained_bytes = retained_bytes
             .checked_add(scope.retained_bytes()?)
             .ok_or_else(|| anyhow::anyhow!("GitHub mutation input size overflow"))?;
-        ensure!(
-            retained_bytes <= MAX_INPUT_BYTES,
-            "GitHub mutation input exceeds its byte limit"
-        );
-        let input = Arc::clone(&self.input)
-            .try_acquire_many_owned(retained_bytes as u32)
-            .map_err(|_| anyhow::anyhow!("GitHub mutation input admission is full"))?;
         let mut state = self.state.lock().expect("GitHub remote queue poisoned");
         ensure!(!state.closed, "GitHub mutation admission is closed");
         ensure!(
@@ -194,6 +185,9 @@ impl RemoteQueue {
             .next
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GitHub operation identity exhausted"))?;
+        self.input_bytes
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| bytes.checked_add(retained_bytes))
+            .map_err(|_| anyhow::anyhow!("GitHub mutation input accounting overflow"))?;
         state.next = id;
         state.admitted += 1;
         let entry = state.resource.entry(resource.clone()).or_default();
@@ -208,7 +202,7 @@ impl RemoteQueue {
         }
         Ok(RemoteOperation {
             mutation_started: Arc::new(AtomicBool::new(false)),
-            _input: input,
+            retained_bytes,
             queue: self.clone(),
             resource,
             scope,
@@ -218,6 +212,10 @@ impl RemoteQueue {
             ready: false,
             completion: RemoteCompletion::Unchanged,
         })
+    }
+
+    pub fn retained_bytes(&self) -> usize {
+        self.input_bytes.load(Ordering::Acquire)
     }
 
     /// Rejects new operations and queued work without releasing an active resource owner.
@@ -327,6 +325,7 @@ impl RemoteOperation {
 
 impl Drop for RemoteOperation {
     fn drop(&mut self) {
+        self.queue.input_bytes.fetch_sub(self.retained_bytes, Ordering::AcqRel);
         self.queue
             .complete(&self.resource, &self.scope, self.id, self.completion);
     }

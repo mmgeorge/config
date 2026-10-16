@@ -87,11 +87,6 @@ impl ReviewService {
                 !document.file_loading.contains(&path),
                 "review file acquisition is already running"
             );
-            let bytes: usize = document.file.values().map(retained_bytes).sum();
-            ensure!(
-                bytes + 1536 * 1024 <= 16 * 1024 * 1024,
-                "review document has no remaining diff row admission"
-            );
             let file = document
                 .file
                 .get_mut(&path)
@@ -252,11 +247,6 @@ impl ReviewService {
             ensure!(
                 !document.file_loading.contains(&path),
                 "review file acquisition is already running"
-            );
-            ensure!(
-                document.file.contains_key(&path)
-                    || document.file.len() + document.file_loading.len() < 64,
-                "review file retention limit reached"
             );
             let identity = document
                 .section
@@ -440,16 +430,6 @@ impl ReviewService {
                     current == Some(&identity),
                     "PR comparison changed during file acquisition"
                 );
-                let retained = document
-                    .file
-                    .iter()
-                    .filter(|(existing, _)| **existing != path)
-                    .map(|(_, file)| retained_bytes(file))
-                    .sum::<usize>();
-                ensure!(
-                    retained + retained_bytes(&observed) <= 16 * 1024 * 1024,
-                    "review document diff row budget is full"
-                );
                 let previous = document
                     .file
                     .get(&path)
@@ -528,35 +508,13 @@ pub(crate) fn continuation_block(path: &str) -> Result<BufferBlock> {
     })
 }
 
-fn retained_bytes(file: &RetainedFile) -> usize {
-    file.block
-        .iter()
-        .map(|block| {
-            block.text.byte_count()
-                + (block.metadata.decoration.len()
-                    + block.metadata.visible_decoration.len()
-                    + block.metadata.target.len())
-                    * 160
-                + block.metadata.gutter.len() * 128
-        })
-        .sum()
-}
-
 fn project_next(file: &mut RetainedFile) -> Result<()> {
     use forge_diff::{
-        body::BodyKind,
         display::{ChunkLimits, DisplayCursor, DisplayState},
     };
     use std::hash::{Hash, Hasher};
     if file.cursor.is_none() {
-        let kind = if file.summary.old_blob.is_none() {
-            BodyKind::Added
-        } else if file.summary.new_blob.is_none() {
-            BodyKind::Deleted
-        } else {
-            BodyKind::Modified
-        };
-        file.cursor = Some(DisplayCursor::new(file.diff.clone(), 3, kind));
+        file.cursor = Some(DisplayCursor::new(file.diff.clone(), 3));
     }
     let revision = file.identity.head_commit.clone();
     let path = file.summary.path.clone();
@@ -569,7 +527,6 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
     file.summary.path.hash(&mut hash);
     let prefix = format!("file:{:016x}", hash.finish());
     let mut candidate = Vec::new();
-    let mut decorations = 0;
     for display in &chunk.rows {
         if file.group != Some(display.group_index) {
             let group = cursor
@@ -601,11 +558,6 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
             file.new_syntax.as_ref(),
             0,
         )?;
-        decorations += metadata.decoration.len() + metadata.visible_decoration.len();
-        ensure!(
-            decorations <= 8192,
-            "PR display batch exceeds decoration admission"
-        );
         if let Some(anchor) = inline_anchor(&revision, &path, display) {
             let target = TargetId(format!(
                 "{prefix}:inline:{}",
@@ -635,13 +587,6 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
             )),
             text: BufferText::from_rows(vec![display.text.clone()])?,
             metadata,
-        });
-    }
-    if let DisplayState::Unavailable(reason) = &chunk.state {
-        candidate.push(BufferBlock {
-            id: BlockId(format!("{prefix}:unavailable")),
-            text: BufferText::from_rows(vec![format!("Diff unavailable: {reason:?}")])?,
-            metadata: BlockMetadata::default(),
         });
     }
     file.summary.more = chunk.state == DisplayState::More;

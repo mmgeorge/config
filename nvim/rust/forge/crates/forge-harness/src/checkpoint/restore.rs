@@ -497,9 +497,7 @@ fn write_file(
             fs::remove_dir(&path)?;
         }
         if file.mode == 0o120000 {
-            let bytes = objects
-                .get(&file.object_id, 1024 * 1024)?
-                .context("symlink target exceeds limit")?;
+            let bytes = objects.get(&file.object_id)?;
             #[cfg(windows)]
             let target = Path::new(std::str::from_utf8(&bytes)?);
             #[cfg(unix)]

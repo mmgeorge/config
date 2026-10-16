@@ -205,7 +205,7 @@ async fn writer_waits_for_native_consumption_after_the_frame_window_fills() {
 }
 
 #[tokio::test]
-async fn rejects_oversized_unterminated_request_before_initializing_a_provider() {
+async fn large_invalid_unterminated_request_fails_json_decoding_after_eof() {
     use tokio::io::AsyncWriteExt;
 
     let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_forge"))
@@ -220,18 +220,18 @@ async fn rejects_oversized_unterminated_request_before_initializing_a_provider()
     let payload = vec![b'x'; forge_protocol::MAX_FRAME_BYTES + 1];
     tokio::time::timeout(Duration::from_secs(5), input.write_all(&payload))
         .await
-        .expect("host stopped reading before the frame limit")
+        .expect("host stopped reading the complete input")
         .unwrap();
     drop(input);
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
-        .expect("host waited for a newline after exceeding its limit")
+        .expect("host did not finish decoding after EOF")
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
     assert!(
         String::from_utf8_lossy(&output.stderr)
-            .contains("Forge JSONL frame exceeds its byte limit")
+            .contains("decode Forge initialize request")
     );
 }
 
@@ -934,17 +934,21 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
 
     broker.request(json!({
         "id": 3,
-        "method": "turn.restart",
-        "params": { "mode": "write" }
+        "method": "task.transition",
+        "params": {
+            "operation_id": "restart-in-write-mode",
+            "action": "permission",
+            "mode": "write"
+        }
     }));
     let restart = broker.read_response(3);
     assert_eq!(
         restart
             .last()
             .unwrap()
-            .pointer("/result/restart_requested")
-            .and_then(Value::as_bool),
-        Some(true)
+            .pointer("/result/state")
+            .and_then(Value::as_str),
+        Some("accepted")
     );
     let cancelled = broker.read_response(2);
     assert_eq!(
@@ -956,32 +960,17 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
         Some("turn_cancelled")
     );
 
-    broker.request(json!({
-        "id": 4,
-        "method": "session.execution_mode",
-        "params": { "mode": "write" }
-    }));
-    assert!(
-        broker
-            .read_response(4)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
-    );
-    broker.request(json!({
-        "id": 5,
-        "method": "exchange.resume",
-        "params": { "text": "continue in write mode" }
-    }));
-    assert!(
-        broker
-            .read_response(5)
-            .last()
-            .unwrap()
-            .get("error")
-            .is_none()
-    );
+    loop {
+        let message = broker.read_message();
+        if message["event"] == "task_operation"
+            && message["payload"]["id"] == "restart-in-write-mode"
+            && message["payload"]["state"] != "running"
+        {
+            assert_eq!(message["payload"]["state"], "completed", "{message}");
+            assert!(message["payload"]["error"].is_null(), "{message}");
+            break;
+        }
+    }
 
     broker.request(json!({ "id": 6, "method": "state.get", "params": {} }));
     let snapshot = broker.read_response(6);

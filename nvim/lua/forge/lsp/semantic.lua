@@ -63,13 +63,6 @@ local function hover_text(value)
   return table.concat(parts, "\n")
 end
 
-local function bounded_hover(text)
-  if #text <= 4096 then return text end
-  local last = 4080
-  while text:byte(last + 1) >= 128 and text:byte(last + 1) < 192 do last = last - 1 end
-  return text:sub(1, last) .. "\n[truncated]\n"
-end
-
 ---@param workspace string
 ---@param arguments ForgeLspSemanticArguments
 ---@param authorize fun(paths: string[], receive: fun(allowed: table<string, boolean>?, failure: string?))
@@ -226,7 +219,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
         end
         local target = source.loaded(row.path)
         if target then versions[target] = vim.api.nvim_buf_get_changedtick(target) accept(vim.api.nvim_buf_get_lines(target, 0, -1, false))
-        else source.read(row.path, nil, function(contents, read_error)
+        else source.read(row.path, function(contents, read_error)
           if not valid() then return end
           if read_error then warnings[#warnings + 1] = read_error enrich(index + 1)
           else accept(source.rows(contents)) end
@@ -296,7 +289,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
       collect() return
     end
     send(client, methods[arguments.operation], params, buffer, function(value)
-      if arguments.operation == "hover" then result.hover = bounded_hover(hover_text(value and value.contents))
+      if arguments.operation == "hover" then result.hover = hover_text(value and value.contents)
       elseif arguments.operation == "document_symbols" then symbols(value, client, arguments.path)
       elseif arguments.operation == "diagnostics" then
         result.freshness = "current"
@@ -380,7 +373,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
       collect() return
     end
     if buffer then run(buffer, client)
-    else source.read(path, nil, function(contents, read_error)
+    else source.read(path, function(contents, read_error)
       if not valid() then return end
       if read_error then finish(read_error) return end
       local opened, owned, open_error = source.open(path, contents, filetype)

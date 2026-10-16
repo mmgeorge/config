@@ -210,20 +210,26 @@ async fn detail_admission_keeps_blocking_storage_capacity_available() -> Result<
     let store = store(root.path())?;
     let service = GithubService::default();
     let mut caller = Vec::new();
-    for _ in 0..2 {
+    for _ in 0..16 {
         let remote = Arc::new(DetailRemote::default());
         caller.push(fetch(service.clone(), remote.clone(), store.clone()));
         tokio::time::timeout(Duration::from_secs(1), remote.started.notified()).await?;
     }
     assert!(
-        service
-            .fetch_detail(Arc::new(DetailRemote::default()), store.clone(), request())
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("full")
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            service.fetch_detail(Arc::new(DetailRemote::default()), store.clone(), request()),
+        )
+        .await?
+        .unwrap_err()
+        .to_string()
+        .contains("full")
     );
-    service.execute(store, IssueOperation::State {}).await?;
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        service.execute(store, IssueOperation::State {}),
+    )
+    .await??;
     assert_eq!(
         service
             .shutdown(Duration::from_secs(1))

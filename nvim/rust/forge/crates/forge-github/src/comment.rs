@@ -147,8 +147,8 @@ impl CommentState {
             "comment observation belongs to another PR"
         );
         ensure!(
-            self.body.len() <= 256 * 1024 && !self.body.contains('\0'),
-            "comment body exceeds its text contract"
+            !self.body.contains('\0'),
+            "comment body contains NUL"
         );
         Ok(())
     }
@@ -351,7 +351,7 @@ fn validate_identity(identity: &str) -> Result<()> {
 
 fn validate_body(body: &str) -> Result<()> {
     ensure!(
-        !body.trim().is_empty() && body.len() <= 256 * 1024 && !body.contains('\0'),
+        !body.trim().is_empty() && !body.contains('\0'),
         "invalid submitted comment body"
     );
     Ok(())

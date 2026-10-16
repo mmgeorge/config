@@ -32,9 +32,7 @@ pub struct DesignFlowNode {
 
 /// Bounds recursive rendering and rejects empty or ambiguous flow labels before persistence.
 pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
-    ensure!(flows.len() <= 32, "plan flows exceeds 32 entries");
     let mut titles = HashSet::new();
-    let mut count = 0;
     for flow in flows {
         validate_label(&flow.title)?;
         ensure!(
@@ -52,8 +50,6 @@ pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
         );
         let mut pending = vec![(&flow.root, 1)];
         while let Some((node, depth)) = pending.pop() {
-            count += 1;
-            ensure!(count <= 512, "plan flows exceeds 512 nodes");
             ensure!(depth <= 32, "plan flow exceeds 32 node levels");
             validate_label(&node.text)?;
             if let Some(via) = &node.via {
@@ -141,6 +137,21 @@ fn append_node(node: &DesignFlowNode, prefix: &str, marker: &str, rows: &mut Vec
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_flow_collections_preserve_all_nodes() {
+        let flows = (0..33).map(|index| DesignFlow {
+            title: format!("Flow {index}"),
+            description: "Preserve every downstream consumer.".into(),
+            root: DesignFlowNode {
+                text: "Source".into(), via: None,
+                children: (0..513).map(|child| DesignFlowNode {
+                    text: format!("Consumer {child}"), via: None, children: Vec::new(),
+                }).collect(),
+            },
+        }).collect::<Vec<_>>();
+        validate(&flows).unwrap();
+    }
 
     #[test]
     fn flow_diagrams_preserve_transfer_labels_branches_and_long_paths() {

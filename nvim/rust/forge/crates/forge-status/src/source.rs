@@ -7,7 +7,7 @@ use forge_diff::{
     syntax::SyntaxLanguage,
 };
 use forge_git::{
-    content::{ContentLimits, ContentRequest, ContentResult, ContentSource, WorktreeConversion},
+    content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion},
     repository::RepositoryState,
     snapshot::{ChangeKind, ObjectState, PathRecord, PathState},
     store::RepositoryStore,
@@ -84,11 +84,9 @@ pub(crate) async fn analysis(
         && let Some(analysis) = prepared.load(repository, store).await?
     {
         let kind = selection(record, section)?.kind;
-        validate_preview(analysis.source(), kind)?;
         return Ok((analysis, kind));
     }
     let (source, kind) = sources(store, repository, record, section).await?;
-    validate_preview(&source, kind)?;
     let analysis = diff
         .compare(forge_diff::engine::DiffRequest {
             source,
@@ -109,19 +107,6 @@ pub(crate) async fn sources(
     let old = acquire(store, repository, selected.old).await?;
     let new = acquire(store, repository, selected.new).await?;
     Ok((SourcePair { old, new }, selected.kind))
-}
-
-fn validate_preview(source: &SourcePair, kind: BodyKind) -> Result<()> {
-    forge_diff::body::BodyPolicy::default()
-        .may_preview_full_file(
-            kind,
-            match kind {
-                BodyKind::Deleted => source.old.newline().line_count,
-                _ => source.new.newline().line_count,
-            },
-        )
-        .map_err(|reason| SourceUnavailable(format!("{reason:?}")))?;
-    Ok(())
 }
 
 fn object(state: &ObjectState) -> Option<ContentSource> {
@@ -152,7 +137,6 @@ pub(crate) async fn acquire(
             store,
             ContentRequest {
                 source,
-                limits: ContentLimits::default(),
                 expected: None,
             },
         )

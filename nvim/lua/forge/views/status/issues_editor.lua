@@ -76,7 +76,7 @@ function M.attach(replica, save)
     local target = row()
     local text = first == target and last == target + 1 and next_last == last
       and vim.api.nvim_buf_get_lines(buffer, first, next_last, false)[1]
-    if not text or #text > 65536 or text:find("%z") then reject_edit() return end
+    if not text or text:find("%z") then reject_edit() return end
     local value = vim.tbl_extend("force", replica.source_entry[key], {
       text = { text }, chunk = { { { text, "ForgeStatusPR" } } },
     })

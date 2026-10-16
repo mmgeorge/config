@@ -112,7 +112,7 @@ impl WalkthroughService {
         let artifact = self
             .store
             .reads
-            .submit(schema::MAX_ARTIFACT_BYTES, move |cancellation| {
+            .submit(0, move |cancellation| {
                 cancellation.check()?;
                 let path = root.join(".walkthrough.json");
                 let metadata = std::fs::symlink_metadata(&path)
@@ -121,14 +121,8 @@ impl WalkthroughService {
                     metadata.is_file() && !metadata.file_type().is_symlink(),
                     "Walkthrough artifact must be a regular file"
                 );
-                ensure!(
-                    metadata.len() <= schema::MAX_ARTIFACT_BYTES as u64,
-                    "Walkthrough artifact exceeds 2 MiB"
-                );
                 let mut bytes = Vec::new();
-                std::fs::File::open(path)?
-                    .take(schema::MAX_ARTIFACT_BYTES as u64 + 1)
-                    .read_to_end(&mut bytes)?;
+                std::fs::File::open(path)?.read_to_end(&mut bytes)?;
                 cancellation.check()?;
                 Artifact::parse(&bytes)
             })?
@@ -323,7 +317,6 @@ impl WalkthroughService {
                 &self.store,
                 forge_git::content::ContentRequest {
                     source,
-                    limits: Default::default(),
                     expected: None,
                 },
             )
@@ -819,15 +812,6 @@ fn project(
         }
         fold(&mut block, task_header, &task_id, false);
     }
-    let retained = schema::MAX_ARTIFACT_BYTES * 3
-        + block
-            .iter()
-            .map(|block| block.text.byte_count() * 2 + 4096 + block.metadata.decoration.len() * 256)
-            .sum::<usize>();
-    ensure!(
-        retained <= 16 * 1024 * 1024,
-        "Walkthrough generated document exceeds 16 MiB"
-    );
     Ok((block, target))
 }
 fn push(block: &mut Vec<BufferBlock>, id: &str, source: &str, width: &WidthProfile) -> Result<()> {

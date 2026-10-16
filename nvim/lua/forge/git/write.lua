@@ -170,7 +170,6 @@ function M.execute(workspace, action, callback, progress, trace_id)
         state.sequence = state.sequence + 1
         local bytes = vim.base64.decode(chunk.bytes)
         if state.sequence == 1 then record("progress.first", { source = chunk.stream, bytes = #bytes }) end
-        if #state.text + #bytes > 64 * 1024 then error("Git progress exceeds retained stream limit") end
         state.text = state.text .. bytes
         local visible = bytes
         if state.last_carriage and visible:sub(1, 1) == "\n" then visible = visible:sub(2) end

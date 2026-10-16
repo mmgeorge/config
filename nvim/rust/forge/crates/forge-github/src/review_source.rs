@@ -7,8 +7,6 @@ use crate::model::GithubRepositoryId;
 use crate::review_api::GithubReviewRemote;
 use crate::service::GithubService;
 
-pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
-
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReviewCommitDetailRequest {
@@ -70,7 +68,6 @@ impl ReviewSourceRequest {
         );
         ensure!(
             !self.path.is_empty()
-                && self.path.len() <= 4096
                 && !self.path.contains('\0')
                 && !self.path.starts_with('/')
                 && self

@@ -109,6 +109,21 @@ mod tests {
     use super::super::tool::ToolOutputView;
 
     #[test]
+    fn demand_preserves_a_line_larger_than_its_page_byte_budget() -> Result<()> {
+        let line = "λ".repeat(128 * 1024);
+        let output = ToolOutputView::new("call".into(), &format!("{line}\nlast\n"))?;
+        let mut document = OutputDocument::new(DocumentId("tool:large".into()), output.snapshot()?)?;
+        let first = document.demand(DocumentRevision(0))?;
+        assert!(first.more);
+        let snapshot = document.snapshot();
+        assert_eq!(snapshot.block[0].text.row(0), Some(line.as_str()));
+        let next = document.demand(snapshot.revision)?;
+        assert!(!next.more);
+        assert_eq!(document.snapshot().block[1].text.row(0), Some("last"));
+        Ok(())
+    }
+
+    #[test]
     fn rejected_demand_preserves_complete_source_and_export_lifetime() -> Result<()> {
         let source = (0..1001)
             .map(|line| format!("line {line}\n"))

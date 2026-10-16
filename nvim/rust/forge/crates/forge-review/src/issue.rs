@@ -124,10 +124,7 @@ impl IssueDocument {
         let mut edits = EditStore::new(
             id.clone(),
             EditLimits {
-                active_fields: 3,
-                region_lifetimes: 3,
                 pending_saves: 3,
-                field_bytes: 4 * 1024 * 1024,
             },
             budget.clone(),
         )?;
@@ -311,10 +308,7 @@ impl IssueDocument {
         let mut edits = EditStore::new(
             id.clone(),
             EditLimits {
-                active_fields: 3,
-                region_lifetimes: 3,
                 pending_saves: 3,
-                field_bytes: 4 * 1024 * 1024,
             },
             self.budget.clone(),
         )?;
@@ -324,7 +318,7 @@ impl IssueDocument {
             ensure!(
                 field.sequence <= forge_buffer::MAX_COUNTER
                     && (name == "body"
-                        || (!field.text.contains(['\n', '\r']) && field.text.len() <= 16 * 1024)),
+                        || !field.text.contains(['\n', '\r'])),
                 "invalid issue draft field"
             );
             let region = RegionId(name.into());
@@ -431,7 +425,7 @@ impl IssueDocument {
             );
             if edit.region.0 != "body" {
                 ensure!(
-                    !edit.text.contains(['\n', '\r']) && edit.text.len() <= 16 * 1024,
+                    !edit.text.contains(['\n', '\r']),
                     "invalid issue scalar field"
                 );
             }
@@ -439,7 +433,7 @@ impl IssueDocument {
         let captured = self.edits.prepare_capture(capture, &[])?;
         let title = captured.snapshot(&RegionId("title".into()))?;
         ensure!(
-            !title.text.trim().is_empty() && title.text.len() <= 1024,
+            !title.text.trim().is_empty(),
             "invalid issue title"
         );
         assignee_logins(captured.snapshot(&RegionId("assignees".into()))?.text)?;
@@ -474,7 +468,7 @@ impl IssueDocument {
         );
         if edit.region.0 != "body" {
             ensure!(
-                !edit.text.contains(['\n', '\r']) && edit.text.len() <= 16 * 1024,
+                !edit.text.contains(['\n', '\r']),
                 "issue scalar field exceeds its single-row bound"
             );
         }
@@ -504,10 +498,6 @@ impl IssueDocument {
         updated.remote = snapshot.remote.map(str::to_owned);
         updated.uncertain = snapshot.uncertain;
         let payload = serde_json::json!({"repo":self.repository.repository_name(), "number":self.number, "issue_document":draft});
-        ensure!(
-            serde_json::to_vec(&payload)?.len() <= 8 * 1024 * 1024,
-            "issue draft exceeds 8 MiB"
-        );
         Ok(PreparedIssueEdit {
             field,
             buffer: prepared,
@@ -532,7 +522,7 @@ impl IssueDocument {
             return Ok(None);
         }
         ensure!(
-            !title.text.trim().is_empty() && title.text.len() <= 1024,
+            !title.text.trim().is_empty(),
             "invalid issue title"
         );
         let current = assignee_logins(assignees.text)?;
@@ -620,45 +610,8 @@ fn validate_detail(
         "invalid issue node identity"
     );
     ensure!(
-        !detail.title.contains(['\n', '\r']) && detail.title.len() <= 1024,
+        !detail.title.contains(['\n', '\r']),
         "invalid issue title"
-    );
-    ensure!(
-        detail.assignees.len() <= 100,
-        "issue assignees exceed 100 entries"
-    );
-    ensure!(
-        detail.comments.len() <= 10_000,
-        "issue comments exceed document admission"
-    );
-    let source_bytes = [
-        &detail.title,
-        &detail.body,
-        &detail.url,
-        &detail.state,
-        &detail.author,
-        &detail.created_at,
-        &detail.updated_at,
-        &detail.milestone,
-    ]
-    .into_iter()
-    .chain(detail.labels.iter())
-    .chain(detail.projects.iter())
-    .chain(detail.assignees.iter())
-    .chain(detail.comments.iter().flat_map(|comment| {
-        [
-            &comment.body,
-            &comment.author,
-            &comment.created_at,
-            &comment.updated_at,
-            &comment.url,
-        ]
-    }))
-    .try_fold(0usize, |total, value| total.checked_add(value.len()))
-    .context("issue source size overflow")?;
-    ensure!(
-        source_bytes <= 8 * 1024 * 1024,
-        "issue source exceeds 8 MiB"
     );
     Ok(())
 }
@@ -719,7 +672,6 @@ fn assignee_logins(text: &str) -> Result<Vec<String>> {
         {
             login.push(token.to_owned());
         }
-        ensure!(login.len() <= 100, "issue assignees exceed 100 entries");
     }
     Ok(login)
 }
@@ -755,7 +707,7 @@ mod tests {
                 subscription: "subscribed".into(),
                 is_draft: false,
             },
-            EditBudget::new(16 * 1024 * 1024).unwrap(),
+            EditBudget::default(),
         )
         .unwrap()
     }
@@ -776,6 +728,20 @@ mod tests {
                 text: text.into(),
             })
             .unwrap()
+    }
+
+    #[test]
+    fn issue_preserves_complete_large_body_through_capture_and_reopen() {
+        let mut document = issue_document();
+        let body = "full body ".repeat(950_000);
+        edit(&mut document, "body", 0, 1, &body);
+        let draft = document.draft_payload().unwrap();
+        assert!(serde_json::to_vec(&draft).unwrap().len() > 8 * 1024 * 1024);
+        let mut reopened = issue_document();
+        reopened.restore_draft(&draft).unwrap();
+        assert_eq!(reopened.edits.snapshot(&RegionId("body".into())).unwrap().text, body);
+        let mutation = reopened.begin_save().unwrap().unwrap();
+        assert!(matches!(mutation, ReviewMutation::IssueEdit { body: Some(captured), .. } if captured == body));
     }
 
     #[test]

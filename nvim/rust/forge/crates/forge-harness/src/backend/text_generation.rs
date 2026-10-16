@@ -44,10 +44,9 @@ impl TextGeneration {
         }
     }
 
-    /// Reject output that does not fit the requested presentation surface.
+    /// Validate generated output for its requested presentation surface.
     pub fn validate(self, text: &str) -> Result<String> {
         if self == Self::CommitMessage {
-            ensure!(text.len() <= 16 * 1024, "generated commit message exceeds 16 KiB");
             let mut text = text.trim();
             if text.starts_with("```") {
                 text = text.split_once('\n').map(|(_, body)| body).unwrap_or(text);
@@ -69,10 +68,6 @@ impl TextGeneration {
             "Session name must be a single line"
         );
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        ensure!(
-            text.chars().count() <= 30 && text.split_whitespace().count() <= 6,
-            "Generated session name is too long"
-        );
         Ok(text)
     }
 }
@@ -97,7 +92,6 @@ pub(crate) fn lowest_effort(model: &super::BackendModel) -> Result<Option<String
 /// Capture recent visible conversation content without reasoning, diffs, or workflow status.
 pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
     let mut parts = Vec::new();
-    let mut remaining = 60_000;
     for entry in entries.iter().rev() {
         let TimelineEntry::Exchange { exchange, .. } = entry else {
             continue;
@@ -128,15 +122,7 @@ pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
             }
         }
         for (role, text) in messages.into_iter().rev() {
-            if remaining == 0 {
-                break;
-            }
-            let text: String = text.chars().take(remaining.min(8_000)).collect();
-            remaining = remaining.saturating_sub(text.chars().count() + role.len() + 3);
             parts.push(format!("{role}: {text}"));
-        }
-        if remaining == 0 {
-            break;
         }
     }
     parts.reverse();
@@ -147,11 +133,10 @@ pub(crate) fn history(entries: &[TimelineEntry]) -> Result<String> {
     Ok(parts.join("\n\n"))
 }
 
-/// Reject missing or oversized output before it reaches transient status rendering.
+/// Validate nonempty recap text before transient status rendering.
 pub(crate) fn validate(text: &str) -> Result<String> {
     let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
     ensure!(!text.is_empty(), "Recap completed without text");
-    ensure!(text.len() <= 8_192, "Recap exceeded the display limit");
     Ok(text)
 }
 
@@ -161,14 +146,15 @@ mod tests {
     use crate::backend::{Backend, BackendCatalogRequest};
 
     #[test]
-    fn commit_message_preserves_body_and_rejects_empty_or_oversized_output() {
+    fn commit_message_preserves_body_and_large_output_and_rejects_empty_output() {
         let purpose = TextGeneration::CommitMessage;
         let message = "fix: preserve commit drafts\n\nKeep user edits while generation runs.";
         assert_eq!(purpose.validate(&format!("  ```text\n{message}\n```  ")).unwrap(), message);
         assert_eq!(purpose.input("Staged diff:\n+change"), "Staged diff:\n+change");
         assert!(purpose.validate(" \n ").is_err());
         assert!(purpose.validate("```text\n```").is_err());
-        assert!(purpose.validate(&"x".repeat(16 * 1024 + 1)).is_err());
+        assert_eq!(purpose.validate(&"x".repeat(16 * 1024 + 1)).unwrap().len(), 16 * 1024 + 1);
+        assert_eq!(TextGeneration::Recap.validate(&"x".repeat(8193)).unwrap().len(), 8193);
         assert_eq!(purpose.validate(&"x".repeat(16 * 1024)).unwrap().len(), 16 * 1024);
         assert_eq!(TextGeneration::Recap.input("User: question"), "Conversation:\nUser: question");
         assert_eq!(TextGeneration::Recap.validate("first\n\nsecond").unwrap(), "first second");
@@ -208,14 +194,10 @@ mod tests {
             "Fix terminal status"
         );
         assert!(purpose.validate(&"a".repeat(30)).is_ok());
-        for invalid in [
-            "",
-            "A title\nwith explanation",
-            "one two three four five six seven",
-            &"a".repeat(31),
-        ] {
+        for invalid in ["", "A title\nwith explanation"] {
             assert!(purpose.validate(invalid).is_err(), "accepted {invalid:?}");
         }
+        assert_eq!(purpose.validate(&"a".repeat(31)).unwrap(), "a".repeat(31));
         assert!(
             TextGeneration::Recap
                 .validate("one two three four five six seven")
@@ -311,6 +293,11 @@ mod tests {
         }];
         let captured = history(&entries).unwrap();
         assert_eq!(captured, "User: Fix this\n\nAssistant: Visible progress");
+        let large_prompt = "λ".repeat(60_001);
+        if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
+            exchange.prompt = large_prompt.clone();
+        }
+        assert_eq!(history(&entries).unwrap(), format!("User: {large_prompt}\n\nAssistant: Visible progress"));
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
             exchange.disposition = HistoryDisposition::Superseded;
         }
@@ -318,9 +305,9 @@ mod tests {
     }
 
     #[test]
-    fn rejects_empty_and_oversized_recaps_and_normalizes_lines() {
+    fn rejects_empty_recaps_preserves_large_text_and_normalizes_lines() {
         assert!(super::validate("  \n").is_err());
-        assert!(super::validate(&"x".repeat(8193)).is_err());
+        assert_eq!(super::validate(&"x".repeat(8193)).unwrap(), "x".repeat(8193));
         assert_eq!(
             super::validate("Recent work.\nNext step.").unwrap(),
             "Recent work. Next step."

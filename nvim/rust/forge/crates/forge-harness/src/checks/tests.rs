@@ -29,6 +29,42 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
     std::fs::write(workspace.join(".forge.json"),serde_json::to_vec(&serde_json::json!({"branch_prefix":"feature","checks":{"version":2,"definitions":definitions}})).unwrap()).unwrap();
 }
 
+#[test]
+fn relative_check_paths_validate_structure_without_a_byte_ceiling() -> Result<()> {
+    let path = format!("{}helper.nu", "directory/".repeat(512));
+    assert_eq!(super::config::relative_path(&path)?, std::path::PathBuf::from(&path));
+    for invalid in ["../outside", "/absolute", "invalid\0path"] {
+        assert!(super::config::relative_path(invalid).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn large_check_configuration_and_helpers_preserve_complete_content() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let definitions = (0..129).map(|index| definition(&format!("check-{index}"), "print ok"))
+        .collect::<Vec<_>>();
+    let document = serde_json::json!({
+        "checks":{"version":2,"definitions":definitions},
+        "unrelated":"λ".repeat(1024 * 1024)
+    });
+    std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&document)?)?;
+    let helpers = workspace.path().join(".forge/checks");
+    std::fs::create_dir_all(&helpers)?;
+    let source = "# retained helper\n".repeat(32_769);
+    assert!(source.len() > 256 * 1024);
+    for index in 0..129 {
+        std::fs::write(helpers.join(format!("helper-{index}.nu")),
+            if index == 0 { source.as_str() } else { "print ok" })?;
+    }
+    let snapshot = ConfigSnapshot::load(workspace.path())?;
+    assert_eq!(snapshot.config.definitions.len(), 129);
+    assert_eq!(snapshot.helper_digest.len(), 129);
+    assert_eq!(snapshot.helper_digest[".forge/checks/helper-0.nu"], crate::plan::digest(source.as_bytes()));
+    assert_eq!(super::config::read_document(workspace.path())?, document);
+    Ok(())
+}
+
 fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<CheckRunner> {
     let mut presentation = crate::buffer::session::SessionPresentation::new("checks-test".into());
     presentation.initialize(Vec::new()).unwrap();
@@ -858,8 +894,12 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/name $var; [case].rs".to_owned();
+    let mut files = (0..5000).map(|index|
+        format!("src/{}-{index:05}.rs", "retained".repeat(40))).collect::<Vec<_>>();
+    files.push(path);
+    files.sort();
     let selection = CheckSelection::Files {
-        files: vec![path.clone()],
+        files: files.clone(),
     };
     let prepared = runner.prepare_request(
         RunRequest { include: Vec::new(),
@@ -882,11 +922,12 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
         run.commands[0].context.as_ref().unwrap().resolved,
         Some(selection)
     );
+    assert!(std::fs::metadata(&run.commands[0].context.as_ref().unwrap().receipt)?.len() > 1024 * 1024);
     assert_eq!(
         serde_json::from_slice::<Vec<String>>(&std::fs::read(
             workspace.path().join("received.json")
         )?)?,
-        vec![path]
+        files
     );
     Ok(())
 }
@@ -904,9 +945,11 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
         version: 2,
         definitions: Vec::new(),
     };
+    let helper_source = format!("{}let selected = $in | from json\nprint $selected\n",
+        "# retained helper\n".repeat(32_769));
     let helper = super::tools::CheckHelper {
         path: ".forge/checks/select.nu".into(),
-        source: "let selected = $in | from json\nprint $selected\n".into(),
+        source: helper_source.clone(),
         expected_digest: None,
     };
     runner
@@ -919,7 +962,7 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
             None,
         )
         .await?;
-    assert!(workspace.path().join(".forge/checks/select.nu").is_file());
+    assert_eq!(std::fs::read_to_string(workspace.path().join(".forge/checks/select.nu"))?, helper_source);
     let revision = runner.catalog(None)?["revision"]
         .as_str()
         .unwrap()
@@ -951,6 +994,10 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     save(workspace.path(), vec![definition("unit", "exit 0")]);
+    let mut original = super::config::read_document(workspace.path())?;
+    let unrelated = "λ".repeat(1024 * 1024);
+    original["unrelated"] = serde_json::json!(unrelated);
+    std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&original)?)?;
     let runner = make_runner(workspace.path(), data.path());
     let catalog = runner.catalog(None)?;
     runner
@@ -970,6 +1017,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
         super::config::read_document(workspace.path())?["branch_prefix"],
         "feature"
     );
+    assert_eq!(super::config::read_document(workspace.path())?["unrelated"], unrelated);
     save(workspace.path(), vec![definition("unit", "exit 0")]);
     runner.set_overrides(
         Some("task-one"),

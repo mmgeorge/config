@@ -746,15 +746,10 @@ function M.open(options, callback)
     if not alive() or not owner.ready then callback(nil, "Harness documents are not ready") return end
     if owner.failure then callback(nil, owner.failure) return end
     if owner.submission then callback(nil, "Composer submission is already active") return end
-    local row_count = vim.api.nvim_buf_line_count(options.composer_buffer)
-    if row_count > 4096 or vim.api.nvim_buf_get_offset(options.composer_buffer, row_count) - 1 > 65536 then
-      callback(nil, "Prompt exceeds 64 KiB or 4096 rows")
-      return
-    end
     local source = vim.api.nvim_buf_get_lines(options.composer_buffer, 0, -1, false)
     local text = table.concat(source, "\n")
     if not text:find("%S") then
-      callback(nil, "Prompt requires nonempty text within 64 KiB and 4096 rows")
+      callback(nil, "Prompt requires nonempty text")
       return
     end
     owner.submission_sequence = owner.submission_sequence + 1

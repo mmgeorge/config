@@ -1,4 +1,5 @@
 mod event_decoder;
+mod file_change;
 mod event_stream;
 mod compaction;
 mod text_generation;
@@ -649,7 +650,7 @@ impl Backend for CopilotBackend {
             },
             ..BackendOutput::default()
         };
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder { workspace: request.workspace.clone() };
         let initial_task_snapshot = session
             .rpc()
             .plan()
@@ -1428,8 +1429,6 @@ impl ControlToolRouter {
             let admission = sender
                 .try_reserve_owned()
                 .context("Copilot control-tool admission is full or closed")?;
-            forge_protocol::outbound::encode(&invocation, 256 * 1024)
-                .context("Copilot control-tool invocation exceeds 256 KiB")?;
             let runtime = self
                 .runtime
                 .lock()
@@ -1849,37 +1848,25 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oversized_control_invocation_preserves_runtime_and_capacity() {
+    async fn large_control_invocation_preserves_runtime_and_content() {
         let router = Arc::new(ControlToolRouter::default());
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.has_active_goal = true;
         let mut stream = router.activate(context).unwrap();
-        assert!(
-            router
-                .route(ControlToolInvocation {
-                    name: "goal_complete".into(),
-                    arguments: Value::String("x".repeat(256 * 1024)),
-                })
-                .await
-                .unwrap_err()
-                .to_string()
-                .contains("256 KiB")
-        );
-        assert!(stream.try_receive().is_err());
+        let summary = "λ".repeat(256 * 1024 + 1);
         assert_eq!(
             router
                 .route(ControlToolInvocation {
                     name: "goal_complete".into(),
-                    arguments: serde_json::json!({ "summary": "finished" }),
+                    arguments: serde_json::json!({"summary":summary}),
                 })
                 .await
                 .unwrap(),
             "Goal control accepted"
         );
-        assert_eq!(
-            stream.receive().await.unwrap().name,
-            "goal_complete"
-        );
+        let invocation = stream.receive().await.unwrap();
+        assert_eq!(invocation.name, "goal_complete");
+        assert_eq!(invocation.arguments["summary"], summary);
     }
 
     #[test]

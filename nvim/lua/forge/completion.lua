@@ -1,8 +1,5 @@
 local M = {}
 
-local MAX_VALUES = 20000
-local MAX_BYTES = 2 * 1024 * 1024
-local MAX_RESULTS = 200
 local VALUE_INDEX_BYTES = 64
 local SNAPSHOT_ACCOUNTING_BYTES = 4096
 local RETRY_DELAY_MS = 1000
@@ -47,8 +44,8 @@ local function validate(snapshot, cache)
   if cache.snapshot and snapshot.revision <= cache.snapshot.revision then
     return nil, "snapshot revision was superseded"
   end
-  if type(snapshot.values) ~= "table" or #snapshot.values > MAX_VALUES or type(snapshot.truncated) ~= "boolean" then
-    return nil, "snapshot candidate shape or count is invalid"
+  if type(snapshot.values) ~= "table" or type(snapshot.truncated) ~= "boolean" then
+    return nil, "snapshot candidate shape is invalid"
   end
   local count = #snapshot.values
   local total = 0
@@ -59,7 +56,6 @@ local function validate(snapshot, cache)
     total = total + 1
   end
   if total ~= count then return nil, "snapshot candidates must be a dense list" end
-  local bytes = SNAPSHOT_ACCOUNTING_BYTES + count * VALUE_INDEX_BYTES
   for index = 1, count do
     local value = snapshot.values[index]
     if type(value) ~= "string" or value == "" or value:find("[%z\1-\32\127]") then
@@ -68,8 +64,6 @@ local function validate(snapshot, cache)
     if index > 1 and snapshot.values[index - 1] >= value then
       return nil, "snapshot candidates must be strictly sorted"
     end
-    bytes = bytes + #value
-    if bytes > MAX_BYTES then return nil, "snapshot candidate byte limit exceeded" end
   end
   local values = {}
   for index = 1, count do values[index] = snapshot.values[index] end
@@ -160,7 +154,7 @@ function M.refresh(cache)
   return true
 end
 
----Returns at most 200 prefix matches without repository I/O or synchronous request dispatch.
+---Return all prefix matches without repository I/O or synchronous request dispatch.
 ---@param cache CompletionCache
 ---@param prefix string
 ---@return string[]
@@ -175,7 +169,7 @@ function M.values(cache, prefix)
     if values[middle] < prefix then first = middle + 1 else last = middle end
   end
   local result = {}
-  for index = first, math.min(#values, first + MAX_RESULTS - 1) do
+  for index = first, #values do
     local value = values[index]
     if value:sub(1, #prefix) ~= prefix then break end
     result[#result + 1] = value

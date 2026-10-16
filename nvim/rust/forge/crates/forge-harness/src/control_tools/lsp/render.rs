@@ -54,9 +54,7 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
             && reply.source.len() <= 256,
         "invalid LSP result size"
     );
-    let maximum = (arguments.token_budget.unwrap_or(2000) as usize * 4)
-        .min(64 * 1024)
-        .max(128);
+    let maximum = (arguments.token_budget.unwrap_or(2000) as usize * 4).max(128);
     if arguments.operation == Operation::Paths {
         return render_paths(reply, workspace, maximum);
     }
@@ -258,10 +256,6 @@ pub(super) fn render(reply: Reply, arguments: &Arguments, workspace: &Path) -> R
         output.push_str(&format!("more: next_offset={offset}\n"));
     }
     append_notes(&mut output, &reply, workspace, maximum);
-    ensure!(
-        output.len() <= 64 * 1024,
-        "LSP output exceeded transport limit"
-    );
     Ok(output)
 }
 
@@ -322,10 +316,6 @@ fn render_paths(reply: Reply, workspace: &Path, maximum: usize) -> Result<String
         }
     }
     append_notes(&mut output, &reply, workspace, maximum);
-    ensure!(
-        output.len() <= 64 * 1024,
-        "LSP output exceeded transport limit"
-    );
     Ok(output)
 }
 

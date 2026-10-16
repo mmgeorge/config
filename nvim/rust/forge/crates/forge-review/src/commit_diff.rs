@@ -138,17 +138,8 @@ impl CommitDiffStore {
                 },
             );
         }
-        let retained_bytes = candidate.values().map(retained_bytes).sum::<usize>();
-        ensure!(
-            candidate.len() <= self.limits.records,
-            "commit diff record limit reached"
-        );
-        ensure!(
-            retained_bytes <= self.limits.bytes,
-            "commit diff byte limit reached"
-        );
         self.records = candidate;
-        self.retained_bytes = retained_bytes;
+        self.evict();
         Ok(())
     }
 
@@ -182,19 +173,19 @@ impl CommitDiffStore {
             availability,
             diff,
         };
-        let bytes = retained_bytes(&record);
-        let previous = self.records.get(&key).map(retained_bytes).unwrap_or(0);
-        ensure!(
-            self.records.contains_key(&key) || self.records.len() < self.limits.records,
-            "commit diff record limit reached"
-        );
-        ensure!(
-            self.retained_bytes - previous + bytes <= self.limits.bytes,
-            "commit diff byte limit reached"
-        );
-        self.retained_bytes = self.retained_bytes - previous + bytes;
         self.records.insert(key, record);
+        self.evict();
         Ok(())
+    }
+
+    fn evict(&mut self) {
+        self.retained_bytes = self.records.values().map(retained_bytes).sum();
+        while self.records.len() > self.limits.records || self.retained_bytes > self.limits.bytes {
+            let Some((_, record)) = self.records.pop_first() else {
+                break;
+            };
+            self.retained_bytes -= retained_bytes(&record);
+        }
     }
 }
 
@@ -273,7 +264,7 @@ mod tests {
     }
 
     #[test]
-    fn subject_target_survives_expansion_and_limits_reject_without_eviction() {
+    fn subject_target_survives_expansion_and_cache_evicts_without_rejecting_content() {
         let commit = detail('b', Some('a'));
         let mut store = CommitDiffStore::new(CommitDiffLimits {
             records: 1,
@@ -296,21 +287,19 @@ mod tests {
         assert!(
             store
                 .retain_subject(&commit, "src/other.rs".into())
-                .is_err()
+                .is_ok()
         );
         assert!(
             store
                 .retain_expanded(&commit, "src/lib.rs".into(), vec![0; 256])
-                .is_err()
+                .is_ok()
         );
-        assert_eq!(
-            store.get(&commit.commit, "src/lib.rs").unwrap().diff,
-            b"diff"
-        );
+        assert!(store.get(&commit.commit, "src/lib.rs").is_none());
+        assert!(store.retained_bytes() <= 256);
     }
 
     #[test]
-    fn batch_admission_is_atomic_when_commit_exceeds_remaining_records() {
+    fn batch_cache_evicts_when_commit_exceeds_remaining_records() {
         let commit = detail('b', Some('a'));
         let mut store = CommitDiffStore::new(CommitDiffLimits {
             records: 1,
@@ -326,9 +315,10 @@ mod tests {
                         ("src/two.rs".into(), b"two".to_vec()),
                     ],
                 )
-                .is_err()
+                .is_ok()
         );
         assert!(store.get(&commit.commit, "src/one.rs").is_none());
-        assert_eq!(store.retained_bytes(), 0);
+        assert!(store.get(&commit.commit, "src/two.rs").is_some());
+        assert!(store.retained_bytes() <= 1024);
     }
 }

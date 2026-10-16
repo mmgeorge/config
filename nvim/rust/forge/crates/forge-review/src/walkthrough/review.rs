@@ -33,19 +33,6 @@ impl ReviewExcerpt {
             });
         }
         blocks.splice(0..0, self.block.clone());
-        let retained = blocks
-            .iter()
-            .map(|block| {
-                block.text.byte_count() * 2
-                    + 4096
-                    + (block.metadata.decoration.len() + block.metadata.visible_decoration.len())
-                        * 256
-            })
-            .sum::<usize>();
-        ensure!(
-            retained <= 16 * 1024 * 1024,
-            "Walkthrough review exceeds 16 MiB"
-        );
         Ok(())
     }
 }
@@ -115,7 +102,6 @@ impl WalkthroughService {
                                         path: change.path.clone(),
                                         conversion: WorktreeConversion::Raw,
                                     },
-                                    limits: Default::default(),
                                     expected: None,
                                 },
                             )
@@ -184,7 +170,6 @@ impl WalkthroughService {
                 }
             }
             let mut cursor = DisplayCursor::at_source_line(analysis, 3, side, change.row);
-            let chunk = cursor.next_rows(ChunkLimits::default());
             if let Some(group) = cursor.group(0) {
                 push(
                     &mut excerpt.block,
@@ -200,46 +185,48 @@ impl WalkthroughService {
                 )?;
                 color_block(excerpt.block.last_mut().unwrap(), "ForgeHunkHeader");
             }
-            let anchor_visible = chunk.rows.iter().any(|row| {
-                (if old_side { row.old } else { row.new })
-                    .is_some_and(|coordinate| coordinate.line == change.row)
+            let anchor_visible = cursor.group(0).is_some_and(|group| {
+                (if old_side { &group.old_lines } else { &group.new_lines })
+                    .contains(&change.row)
             });
             if anchor_visible {
-                for (index, display) in chunk.rows.iter().enumerate() {
-                    let mut block = BufferBlock {
-                        id: BlockId(format!("walkthrough:review:row:{index}")),
-                        text: BufferText::from_rows([display.text.as_str()])?,
-                        metadata: BlockMetadata::default(),
-                    };
-                    forge_diff::projection::append_display_row(
-                        &mut block.metadata,
-                        0,
-                        display,
-                        cursor
-                            .group(display.group_index)
-                            .context("missing review hunk")?,
-                        old_syntax.as_ref(),
-                        new_syntax.as_ref(),
-                        0,
-                    )?;
-                    if let Some(coordinate) = if old_side { display.old } else { display.new } {
-                        source_target(&mut excerpt, &mut block, coordinate.line);
+                let mut row_index = 0;
+                loop {
+                    owner.lock().expect("walkthrough document").admission.check()?;
+                    let chunk = cursor.next_rows(ChunkLimits::default());
+                    for display in &chunk.rows {
+                        let mut block = BufferBlock {
+                            id: BlockId(format!("walkthrough:review:row:{row_index}")),
+                            text: BufferText::from_rows([display.text.as_str()])?,
+                            metadata: BlockMetadata::default(),
+                        };
+                        forge_diff::projection::append_display_row(
+                            &mut block.metadata,
+                            0,
+                            display,
+                            cursor
+                                .group(display.group_index)
+                                .context("missing review hunk")?,
+                            old_syntax.as_ref(),
+                            new_syntax.as_ref(),
+                            0,
+                        )?;
+                        if let Some(coordinate) = if old_side { display.old } else { display.new } {
+                            source_target(&mut excerpt, &mut block, coordinate.line);
+                        }
+                        excerpt.block.push(block);
+                        row_index += 1;
                     }
-                    excerpt.block.push(block);
-                }
-                if chunk.state != DisplayState::Complete {
-                    push(
-                        &mut excerpt.block,
-                        "review:bounded",
-                        "Diff excerpt is limited to 256 rows and 128 KiB. Open source for the full captured file.",
-                        &width,
-                    )?;
+                    if chunk.state == DisplayState::Complete {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
                 }
             } else {
                 push(
                     &mut excerpt.block,
                     "review:context",
-                    "Captured source at the annotation. The changed hunk is outside this bounded excerpt.",
+                    "Captured source at the annotation. The nearest changed hunk does not contain this source line.",
                     &width,
                 )?;
                 source_excerpt(&mut excerpt, &change.source, change.row)?;
@@ -355,7 +342,6 @@ async fn acquired_source(
             store,
             ContentRequest {
                 source,
-                limits: Default::default(),
                 expected: None,
             },
         )

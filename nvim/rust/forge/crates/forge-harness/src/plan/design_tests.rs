@@ -61,7 +61,7 @@ pub(crate) struct DesignTestSelection {
 
 /// Remove exactly the reviewed entries, rejecting stale or ambiguous selections before mutation.
 pub(crate) fn remove(files: &mut Vec<DesignTestFile>, selected: &[DesignTestSelection]) -> Result<()> {
-    ensure!(!selected.is_empty() && selected.len() <= 1024, "select between 1 and 1024 planned tests");
+    ensure!(!selected.is_empty(), "select at least one planned test");
     let selection: BTreeSet<_> = selected.iter().collect();
     ensure!(selection.len() == selected.len(), "duplicate selected test");
     for test in &selection {
@@ -75,11 +75,8 @@ pub(crate) fn remove(files: &mut Vec<DesignTestFile>, selected: &[DesignTestSele
     Ok(())
 }
 
-/// Rejects ambiguous identities and unbounded inventories before a plan edit is committed.
+/// Validate unique file and test identities before committing a plan edit.
 pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
-    ensure!(files.len() <= 256, "plan tests exceeds 256 files");
-    ensure!(files.iter().map(|file| file.cases.len()).sum::<usize>() <= 1024,
-        "plan tests exceeds 1024 cases");
     let mut paths = BTreeSet::new();
     for file in files {
         super::design::validate_relative_path(&file.file)?;
@@ -123,4 +120,27 @@ pub(super) fn text(files: &[DesignTestFile]) -> String {
             .collect::<Vec<_>>().join("\n");
         format!("{}\n{cases}", file.file)
     }).collect::<Vec<_>>().join("\n\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_inventories_and_selections_preserve_every_file_and_case() {
+        let mut files = (0..257).map(|index| DesignTestFile {
+            file: format!("tests/source_{index}.rs"),
+            cases: (0..5).map(|case| DesignTestCase {
+                name: format!("case_{case}"), target: None,
+                change: DesignTestChange::New, description: "Preserve complete coverage.".into(),
+            }).collect(),
+        }).collect::<Vec<_>>();
+        validate(&files).unwrap();
+        let selected = files.iter().flat_map(|file| file.cases.iter().map(|case| DesignTestSelection {
+            file: file.file.clone(), name: case.name.clone(),
+        })).collect::<Vec<_>>();
+        assert_eq!(selected.len(), 1285);
+        remove(&mut files, &selected).unwrap();
+        assert!(files.is_empty());
+    }
 }

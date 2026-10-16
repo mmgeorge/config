@@ -210,34 +210,12 @@ impl crate::review::ReviewDocument {
             ensure!(start <= end, "thread presentation anchors are reversed");
             start..end + 1
         };
-        let mut removed_bytes = 0;
-        let mut removed_rows = 0;
         let mut removed_block = Vec::new();
         let mut removed_target = std::collections::BTreeSet::new();
         for block in projection.blocks(projection.revision(), range.clone())? {
-            removed_bytes += block.text.byte_count();
-            removed_rows += block.text.row_count();
             removed_block.push(block.id.clone());
             removed_target.extend(block.metadata.target.iter().map(|target| target.id.clone()));
         }
-        let added_bytes: usize = projected
-            .block
-            .iter()
-            .map(|block| block.text.byte_count())
-            .sum();
-        let added_rows: usize = projected
-            .block
-            .iter()
-            .map(|block| block.text.row_count())
-            .sum();
-        ensure!(
-            projection.text_bytes() - removed_bytes + added_bytes <= 16 * 1024 * 1024,
-            "review presentation byte limit exceeded"
-        );
-        ensure!(
-            projection.row_count() - removed_rows + added_rows <= 65_536,
-            "review presentation row limit exceeded"
-        );
         ensure!(
             projected
                 .target

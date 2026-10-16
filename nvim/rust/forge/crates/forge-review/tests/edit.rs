@@ -11,7 +11,7 @@ fn layout_change_does_not_invalidate_region_edit() {
     use forge_buffer::identity::BlockId;
     use forge_buffer::text::BufferText;
 
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     let body = BufferBlock {
         id: BlockId("body".into()),
         text: BufferText::from_rows(["old"]).unwrap(),
@@ -104,7 +104,7 @@ fn change(store: &mut EditStore, text: &str) {
 
 #[test]
 fn older_save_preserves_newer_local_text() {
-    let budget = EditBudget::new(1024).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     change(&mut store, "submitted");
     let save = store.begin_save(&region()).unwrap().unwrap();
@@ -126,7 +126,7 @@ fn older_save_preserves_newer_local_text() {
 
 #[test]
 fn out_of_order_confirmation_cannot_roll_back_baseline() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     change(&mut store, "first");
     let first = store.begin_save(&region()).unwrap().unwrap();
     change(&mut store, "second");
@@ -148,7 +148,7 @@ fn out_of_order_confirmation_cannot_roll_back_baseline() {
 
 #[test]
 fn local_revert_still_saves_after_pending_write() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     change(&mut store, "first");
     let first = store.begin_save(&region()).unwrap().unwrap();
     change(&mut store, "old");
@@ -171,7 +171,7 @@ fn local_revert_still_saves_after_pending_write() {
 
 #[test]
 fn uncertainty_requires_observation_and_preserves_local_edits() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     change(&mut store, "submitted");
     let save = store.begin_save(&region()).unwrap().unwrap();
     assert!(
@@ -200,7 +200,7 @@ fn uncertainty_requires_observation_and_preserves_local_edits() {
 
 #[test]
 fn late_uncertainty_reconciliation_cannot_replace_newer_confirmation() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     change(&mut store, "first");
     let first = store.begin_save(&region()).unwrap().unwrap();
     change(&mut store, "second");
@@ -220,7 +220,7 @@ fn late_uncertainty_reconciliation_cannot_replace_newer_confirmation() {
 
 #[test]
 fn rejected_save_keeps_baseline_and_releases_admission() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     change(&mut store, "submitted");
     let save = store.begin_save(&region()).unwrap().unwrap();
     assert!(matches!(
@@ -240,7 +240,7 @@ fn rejected_save_keeps_baseline_and_releases_admission() {
 
 #[test]
 fn submissions_keep_budget_after_store_drop_and_reject_foreign_owner() {
-    let budget = EditBudget::new(9).unwrap();
+    let budget = EditBudget::default();
     let mut owner = store(&budget);
     change(&mut owner, "new");
     let save = owner.begin_save(&region()).unwrap().unwrap();
@@ -259,8 +259,8 @@ fn submissions_keep_budget_after_store_drop_and_reject_foreign_owner() {
 }
 
 #[test]
-fn invalid_or_over_budget_edit_is_atomic() {
-    let budget = EditBudget::new(3).unwrap();
+fn invalid_edit_is_atomic() {
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     let make = |base, sequence, text: &str| RegionEdit {
         document: DocumentId("review".into()),
@@ -269,10 +269,6 @@ fn invalid_or_over_budget_edit_is_atomic() {
         sequence: EditSequence(sequence),
         text: text.into(),
     };
-    assert!(matches!(
-        store.accept(make(0, 1, "new")),
-        Err(EditError::Capacity(_))
-    ));
     assert!(matches!(
         store.accept(make(1, 1, "old")),
         Err(EditError::Conflict { .. })
@@ -300,7 +296,7 @@ fn invalid_or_over_budget_edit_is_atomic() {
 
 #[test]
 fn refresh_invalidates_old_region_revision_and_refuses_dirty_text() {
-    let mut store = store(&EditBudget::new(1024).unwrap());
+    let mut store = store(&EditBudget::default());
     assert_eq!(
         store
             .refresh(&region(), RegionRevision(0), "remote".into())
@@ -327,27 +323,20 @@ fn refresh_invalidates_old_region_revision_and_refuses_dirty_text() {
 }
 
 #[test]
-fn cardinality_and_retired_identity_limits_preserve_fields() {
+fn save_admission_and_retired_identity_preserve_fields() {
     let limits = EditLimits {
-        active_fields: 1,
-        region_lifetimes: 2,
         pending_saves: 1,
-        field_bytes: 3,
     };
     let mut store = EditStore::new(
         DocumentId("review".into()),
         limits,
-        EditBudget::new(32).unwrap(),
+        EditBudget::default(),
     )
     .unwrap();
     store
         .insert(region(), RegionRevision(0), "old".into())
         .unwrap();
     let other = RegionId("other".into());
-    assert!(matches!(
-        store.insert(other.clone(), RegionRevision(0), "".into()),
-        Err(EditError::Capacity(_))
-    ));
     change(&mut store, "one");
     let first = store.begin_save(&region()).unwrap().unwrap();
     change(&mut store, "two");
@@ -366,10 +355,7 @@ fn cardinality_and_retired_identity_limits_preserve_fields() {
         .insert(other.clone(), RegionRevision(0), "".into())
         .unwrap();
     store.remove(&other).unwrap();
-    assert!(matches!(
-        store.insert(RegionId("third".into()), RegionRevision(0), "".into()),
-        Err(EditError::Capacity(_))
-    ));
+    store.insert(RegionId("third".into()), RegionRevision(0), "".into()).unwrap();
 }
 
 #[test]
@@ -377,7 +363,7 @@ fn region_counter_exhaustion_leaves_text_unchanged() {
     let mut store = EditStore::new(
         DocumentId("review".into()),
         EditLimits::default(),
-        EditBudget::new(32).unwrap(),
+        EditBudget::default(),
     )
     .unwrap();
     store
@@ -413,7 +399,7 @@ fn wire_edit_rejects_layout_revision_and_unknown_fields() {
 
 #[test]
 fn explicit_capture_validates_all_fields_before_adopting_any() {
-    let budget = EditBudget::new(1024).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     let title = RegionId("title".into());
     store
@@ -485,8 +471,8 @@ fn explicit_capture_validates_all_fields_before_adopting_any() {
 }
 
 #[test]
-fn explicit_capture_capacity_failure_rolls_back_all_reservations() {
-    let budget = EditBudget::new(12).unwrap();
+fn explicit_capture_preserves_complete_large_fields() {
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     let title = RegionId("title".into());
     store
@@ -505,21 +491,22 @@ fn explicit_capture_capacity_failure_rolls_back_all_reservations() {
             region: title.clone(),
             base: RegionRevision(0),
             sequence: EditSequence(2),
-            text: "replacement".into(),
+            text: "replacement".repeat(2 * 1024 * 1024),
         },
     ];
-    assert!(store.prepare_capture(capture, &[]).is_err());
+    store.prepare_capture(capture, &[]).unwrap().commit();
     assert_eq!(
         store.snapshot(&region()).unwrap().revision,
-        RegionRevision(0)
+        RegionRevision(1)
     );
-    assert_eq!(store.snapshot(&title).unwrap().revision, RegionRevision(0));
-    assert_eq!(budget.retained_bytes(), 8);
+    assert_eq!(store.snapshot(&title).unwrap().revision, RegionRevision(1));
+    assert_eq!(store.snapshot(&title).unwrap().text, "replacement".repeat(2 * 1024 * 1024));
+    assert_eq!(budget.retained_bytes(), 8 + 4 + "replacement".len() * 2 * 1024 * 1024);
 }
 
 #[test]
 fn prepared_capture_abort_preserves_fields_and_releases_reserved_text() {
-    let budget = EditBudget::new(128).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     let retained = budget.retained_bytes();
     let captured = store.prepare_capture(vec![RegionEdit {
@@ -541,9 +528,9 @@ fn prepared_capture_abort_preserves_fields_and_releases_reserved_text() {
 }
 
 #[test]
-fn merge_conflict_retains_all_versions_and_rejects_over_budget_replacement() {
+fn merge_conflict_retains_replacement_versions() {
     use forge_review::edit::{ConflictResolution, MergeOutcome};
-    let budget = EditBudget::new(14).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     change(&mut store, "local");
     assert_eq!(
@@ -551,14 +538,11 @@ fn merge_conflict_retains_all_versions_and_rejects_over_budget_replacement() {
         MergeOutcome::Conflict
     );
     assert_eq!(budget.retained_bytes(), 14);
-    assert!(matches!(
-        store.merge(&region(), "replacement".into()),
-        Err(EditError::Capacity(_))
-    ));
+    assert_eq!(store.merge(&region(), "replacement".into()).unwrap(), MergeOutcome::Conflict);
     let snapshot = store.snapshot(&region()).unwrap();
     assert_eq!(
         (snapshot.text, snapshot.baseline, snapshot.remote),
-        ("local", "old", Some("remote"))
+        ("local", "old", Some("replacement"))
     );
     let revision = snapshot.revision;
     assert!(matches!(
@@ -571,11 +555,11 @@ fn merge_conflict_retains_all_versions_and_rejects_over_budget_replacement() {
             .unwrap(),
         RegionRevision(2)
     );
-    assert_eq!(budget.retained_bytes(), 6);
+    assert_eq!(budget.retained_bytes(), "replacement".len());
     let snapshot = store.snapshot(&region()).unwrap();
     assert_eq!(
         (snapshot.text, snapshot.baseline, snapshot.remote),
-        ("remote", "remote", None)
+        ("replacement", "replacement", None)
     );
     assert!(!snapshot.dirty);
     drop(store);
@@ -585,7 +569,7 @@ fn merge_conflict_retains_all_versions_and_rejects_over_budget_replacement() {
 #[test]
 fn matching_local_edit_resolves_remote_conflict_without_duplicate_retention() {
     use forge_review::edit::MergeOutcome;
-    let budget = EditBudget::new(14).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     change(&mut store, "local");
     assert_eq!(
@@ -607,7 +591,7 @@ fn matching_local_edit_resolves_remote_conflict_without_duplicate_retention() {
 #[test]
 fn remote_reversion_clears_conflict_and_preserves_local_draft() {
     use forge_review::edit::MergeOutcome;
-    let budget = EditBudget::new(14).unwrap();
+    let budget = EditBudget::default();
     let mut store = store(&budget);
     change(&mut store, "local");
     store.merge(&region(), "remote".into()).unwrap();
@@ -627,7 +611,7 @@ fn remote_reversion_clears_conflict_and_preserves_local_draft() {
 #[test]
 fn merge_and_resolution_counter_exhaustion_preserve_retained_state() {
     use forge_review::edit::ConflictResolution;
-    let budget = EditBudget::new(14).unwrap();
+    let budget = EditBudget::default();
     let mut store = EditStore::new(
         DocumentId("review".into()),
         EditLimits::default(),

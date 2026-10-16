@@ -94,7 +94,6 @@ pub enum ChangeKind {
 pub enum LineStats {
     Unknown,
     Exact { added: u64, deleted: u64 },
-    ExceedsLimit,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -165,16 +164,13 @@ impl PathRecord {
 
 /// Parses NUL-delimited status metadata without decoding repository path bytes as text.
 ///
-/// Rejects malformed or truncated records and caller-specified byte or record limits.
+/// Reject malformed or truncated records without restricting complete inventory size.
 /// Unknown headers are ignored. No partial result escapes after a parse failure.
 /// Returned statistics and content classifications remain unknown until content analysis.
 pub fn parse_porcelain_v2(
     input: &[u8],
     hash: gix::hash::Kind,
-    max_bytes: usize,
-    max_records: usize,
 ) -> Result<Vec<PathRecord>> {
-    ensure!(input.len() <= max_bytes, "status byte limit exceeded");
     if input.is_empty() {
         return Ok(Vec::new());
     }
@@ -186,7 +182,6 @@ pub fn parse_porcelain_v2(
         if entry.starts_with(b"# ") {
             continue;
         }
-        ensure!(record.len() < max_records, "status record limit exceeded");
         ensure!(
             entry.len() >= 3 && entry[1] == b' ',
             "invalid status record"

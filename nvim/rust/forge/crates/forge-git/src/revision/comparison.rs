@@ -40,7 +40,6 @@ pub async fn observe(
 ) -> Result<RepositoryRead<ComparisonObservation>> {
     ensure!(
         !request.reference.is_empty()
-            && request.reference.len() <= 4096
             && !request.reference.chars().any(char::is_control),
         "invalid comparison reference"
     );
@@ -117,7 +116,6 @@ pub async fn observe(
             let output = read_command(
                 &mut command,
                 CommandLimits {
-                    stdout_bytes: 16 * 1024 * 1024,
                     stderr_bytes: 4096,
                     timeout: Duration::from_secs(30),
                 },
@@ -176,10 +174,6 @@ pub async fn observe(
 }
 
 fn parse(bytes: &[u8], worktree: bool) -> Result<Vec<PathRecord>> {
-    ensure!(
-        bytes.len() <= 16 * 1024 * 1024,
-        "comparison metadata exceeds 16 MiB"
-    );
     if bytes.is_empty() {
         return Ok(Vec::new());
     }
@@ -191,7 +185,6 @@ fn parse(bytes: &[u8], worktree: bool) -> Result<Vec<PathRecord>> {
     let mut records = Vec::new();
     let mut seen = HashSet::new();
     while let Some(header) = segment.next() {
-        ensure!(records.len() < 10_000, "comparison exceeds 10000 paths");
         let field: Vec<_> = header.split(|byte| *byte == b' ').collect();
         ensure!(
             field.len() == 5 && field[0].first() == Some(&b':'),

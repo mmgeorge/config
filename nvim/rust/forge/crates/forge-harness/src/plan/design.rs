@@ -217,32 +217,23 @@ impl DeclarationDesign {
             "declaration line width must be between 40 and 240"
         );
         self.document.validate()?;
-        let mut bytes = 0usize;
         for (path, text) in &self.cargo_lock {
             validate_relative_path(path)?;
             ensure!(Path::new(path).file_name().is_some_and(|name| name == "Cargo.lock"), "invalid Cargo lockfile path: {path}");
             toml::from_str::<toml::Value>(text).with_context(|| format!("parse {path}"))?;
-            bytes += text.len();
         }
         for (path, file) in &self.baseline {
             validate_path(path)?;
             DeclarationOverview::parse(path, &file.text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate baseline {path}"))?;
-            bytes += file.text.len();
         }
         for (path, text) in &self.proposed {
             validate_path(path)?;
             DeclarationOverview::parse(path, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate {path}"))?;
-            bytes += text.len();
-            ensure!(
-                bytes <= 8 * 1024 * 1024,
-                "baseline and proposed declaration snapshot exceeds 8 MiB"
-            );
         }
-        ensure!(bytes <= 8 * 1024 * 1024, "declaration snapshot exceeds 8 MiB");
         for (files, baseline) in [(&self.baseline_calls, true), (&self.proposed_calls, false)] {
             for (path, calls) in files {
                 let text = if baseline { self.baseline.get(path).map(|file| &file.text) } else { self.proposed.get(path) }
@@ -250,10 +241,8 @@ impl DeclarationDesign {
                 let combined = super::calls::combined(path, text, calls)?;
                 let (_, parsed) = super::calls::parse(path, &combined, calls)?;
                 ensure!(parsed.len() == calls.len(), "call metadata has an absent or ambiguous callable: {path}");
-                bytes += serde_json::to_vec(calls)?.len();
             }
         }
-        ensure!(bytes <= 8 * 1024 * 1024, "declaration and call snapshot exceeds 8 MiB");
         for (from, to) in &self.moved {
             ensure!(
                 self.baseline.contains_key(from)
@@ -355,7 +344,6 @@ impl DeclarationDesign {
 
     /// Apply a familiar multi-file patch atomically to virtual proposed files.
     pub fn patch(&self, workspace: &Path, source_digests: &BTreeMap<String, String>, patch: &str) -> Result<Self> {
-        ensure!(patch.len() <= 1024 * 1024, "design patch exceeds 1 MiB");
         let lines = patch.lines().collect::<Vec<_>>();
         ensure!(
             lines.first() == Some(&"*** Begin Patch") && lines.last() == Some(&"*** End Patch"),
@@ -545,9 +533,8 @@ fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-/// Read one bounded workspace source after validating its path and regular-file identity.
+/// Read workspace source after validating its path and regular-file identity.
 pub(crate) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
-    use std::io::Read;
     validate_relative_path(path)?;
     let target = workspace.join(path);
     let metadata = match std::fs::symlink_metadata(&target) {
@@ -557,10 +544,8 @@ pub(crate) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<St
     };
     ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "{path}: source is not a regular file");
     ensure!(std::fs::canonicalize(&target)?.starts_with(std::fs::canonicalize(workspace)?), "{path}: source escapes workspace");
-    ensure!(metadata.len() <= 1024 * 1024, "{path}: source exceeds 1 MiB");
-    let mut source = String::new();
-    std::fs::File::open(&target)?.take(1024 * 1024 + 1).read_to_string(&mut source)?;
-    ensure!(source.len() <= 1024 * 1024, "{path}: source exceeds 1 MiB");
+    let source = std::fs::read_to_string(&target)
+        .with_context(|| format!("read {path}"))?;
     Ok(Some(source))
 }
 
@@ -665,6 +650,13 @@ mod tests {
         assert_eq!(design.proposed.len(), 1);
     }
     use super::*;
+    #[test]
+    fn workspace_source_preserves_complete_text_above_the_former_file_limit() {
+        let workspace = tempfile::tempdir().unwrap();
+        let text = format!("// {}\nexport interface Item {{ value: string }}\n", "x".repeat(2 * 1024 * 1024));
+        std::fs::write(workspace.path().join("item.ts"), &text).unwrap();
+        assert_eq!(workspace_source(workspace.path(), "item.ts").unwrap(), Some(text));
+    }
 
     #[test]
     fn first_edit_captures_only_its_source_and_failed_patches_publish_nothing() {
@@ -802,7 +794,7 @@ mod tests {
         document.design.as_mut().unwrap().document.objective.clear();
         assert!(document.validate_for_submission().is_err());
         let oversized = changed.patch(workspace.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": \"Add cancellable requests.\",\n+  \"design\": \"{}\",\n*** End Patch", "x".repeat(16 * 1024 + 1)));
-        assert!(oversized.is_err());
+        assert_eq!(oversized.unwrap().document.design.len(), 16 * 1024 + 1);
     }
 
     #[test]
@@ -950,6 +942,72 @@ mod tests {
         assert!(rendered.markdown.contains("Tests · 1 reused"));
         assert!(!rendered.markdown.contains("= tests::cancellation"));
         assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
+    }
+
+    #[test]
+    fn declaration_boundary_source_capture_patch_and_storage_preserve_reference_evidence() {
+        let fixtures = [
+            (
+                "boundary.ts",
+                "export type Handler = (\nvalue: string\n) =>\nstring;\nexport type Label = `first =>\nsecond`;\nexport function run(input: Writer | Reader) { input.send(); }\n",
+            ),
+            (
+                "boundary.ts",
+                "export class BufferStore {\ncurrent: { writer: Writer; metric: Metric | null };\npending: Writer[];\nrun(input: unknown) {\ninput\n .writer\n .send();\nthis.current.writer.send();\nthis.pending.push(this.current.writer);\n}\n}\n",
+            ),
+            (
+                "boundary.lua",
+                "local M = {}\nfunction M.run(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nwriter.send()\nend\nreturn M\n",
+            ),
+            (
+                "boundary.rs",
+                "pub struct BufferStore(\n/// Caller-owned writer.\npub Writer,\n);\nimpl BufferStore { pub fn run(&self) { self.send(); self.send(); } }\n",
+            ),
+        ];
+        for (path, source) in fixtures {
+            for newline in ["\n", "\r\n"] {
+                for width in [40, 80] {
+                    let workspace = tempfile::tempdir().unwrap();
+                    let storage = tempfile::tempdir().unwrap();
+                    let source = source.replace('\n', newline);
+                    std::fs::write(workspace.path().join(path), &source).unwrap();
+                    let initial = DeclarationDesign { line_width: width, ..Default::default() };
+                    let (_, expected) = initial.source(workspace.path(), path).unwrap();
+                    assert!(expected.iter().flat_map(|function| function.call.iter().flatten())
+                        .next().is_some());
+                    let inspected = initial.inspect(workspace.path(), Some(path), false).unwrap();
+                    assert!(initial.baseline.is_empty());
+                    let first_line = inspected["text"].as_str().unwrap().lines().next().unwrap();
+                    let comment = if path.ends_with(".lua") { "--" } else { "//" };
+                    let patch = format!(
+                        "*** Begin Patch\n*** Update File: {path}\n@@\n+{comment} Reviewed boundary.\n {first_line}\n*** End Patch"
+                    );
+                    let changed = initial.patch(workspace.path(), &Default::default(), &patch)
+                        .unwrap_or_else(|error| panic!("{path}, width {width}: {error:#}"));
+                    assert_eq!(changed.baseline_calls[path], expected);
+                    assert_eq!(changed.proposed_calls[path], expected);
+                    let mut document = crate::plan::document::test_fixture("boundary", "Boundary");
+                    document.design = Some(changed.clone());
+                    let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+                    store.write_working_document("session", "boundary", &document).unwrap();
+                    let reopened = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+                    let saved = reopened.read_working_document("session", "boundary").unwrap();
+                    assert_eq!(saved, document);
+                    let saved_design = saved.design.unwrap();
+                    let follow_up = format!(
+                        "*** Begin Patch\n*** Update File: {path}\n@@\n-{comment} Reviewed boundary.\n+{comment} Confirmed boundary.\n*** End Patch"
+                    );
+                    let revised = saved_design.patch(workspace.path(), &Default::default(), &follow_up).unwrap();
+                    assert_eq!(revised.baseline, changed.baseline);
+                    assert_eq!(revised.proposed_calls[path], expected);
+                    document.version += 1;
+                    document.design = Some(revised.formatted().unwrap());
+                    reopened.write_working_document("session", "boundary", &document).unwrap();
+                    assert_eq!(reopened.read_working_document("session", "boundary").unwrap(), document);
+                    assert_eq!(std::fs::read_to_string(workspace.path().join(path)).unwrap(), source);
+                }
+            }
+        }
     }
 
     #[test]

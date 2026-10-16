@@ -8,8 +8,6 @@ use anyhow::{Context, Result, ensure};
 use crate::mutation::OperationId;
 use crate::repository::RepositoryState;
 
-const MAX_CONFIG_BYTES: usize = 1024 * 1024;
-
 struct ConfigTemporary {
     path: PathBuf,
     file: Option<File>,
@@ -22,7 +20,7 @@ impl Drop for ConfigTemporary {
         if !self.published {
             if let Err(error) = std::fs::remove_file(&self.path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
-                    eprintln!("Forge repository config temporary cleanup failed: {error}");
+                    let _ = writeln!(std::io::stderr(), "Forge repository config temporary cleanup failed: {error}");
                 }
             }
         }
@@ -35,12 +33,6 @@ pub(super) fn validate(
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<()> {
     check()?;
-    ensure!(
-        expected
-            .as_ref()
-            .is_none_or(|bytes| bytes.len() <= MAX_CONFIG_BYTES),
-        "repository config exceeds 1 MiB"
-    );
     let root = repository
         .identity
         .worktree_root
@@ -60,10 +52,6 @@ pub(super) fn replace(
     operation: OperationId,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Output> {
-    ensure!(
-        replacement.len() <= MAX_CONFIG_BYTES,
-        "repository config replacement exceeds 1 MiB"
-    );
     validate(repository, expected, check)?;
     let root = repository
         .identity
@@ -142,11 +130,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
         metadata.is_file() && !metadata.file_type().is_symlink(),
         "repository config must be a regular file"
     );
-    ensure!(
-        metadata.len() <= MAX_CONFIG_BYTES as u64,
-        "repository config exceeds 1 MiB"
-    );
-    let file = File::open(path).context("open repository config")?;
+    let mut file = File::open(path).context("open repository config")?;
     let opened = file.metadata()?;
     ensure!(
         opened.is_file()
@@ -155,12 +139,7 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
         "repository config changed while opening"
     );
     let mut bytes = Vec::new();
-    file.take((MAX_CONFIG_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() <= MAX_CONFIG_BYTES,
-        "repository config exceeds 1 MiB"
-    );
+    file.read_to_end(&mut bytes)?;
     let after = std::fs::symlink_metadata(path)?;
     ensure!(
         after.is_file()

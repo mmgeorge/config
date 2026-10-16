@@ -37,12 +37,6 @@ impl GhDirectory {
         if number == 0
             || number > i32::MAX as u64
             || pending_review_id == Some(0)
-            || expected.len() > 10_000
-            || expected
-                .iter()
-                .map(|member| member.body.len())
-                .sum::<usize>()
-                > 4 * 1024 * 1024
         {
             return Err(invalid("invalid review submission capture"));
         }
@@ -144,8 +138,9 @@ impl GhClient {
         review: u64,
     ) -> Result<Vec<PendingReviewMember>, RemoteFailure> {
         let mut result = Vec::new();
-        let mut bytes = 0;
-        for page in 1..=101 {
+        let mut seen = std::collections::HashSet::new();
+        let mut page = 1u64;
+        loop {
             let argument = vec![
                 "api".into(),
                 "--hostname".into(),
@@ -167,9 +162,6 @@ impl GhClient {
                         let record = value.as_array().ok_or_else(|| {
                             invalid("pending review comments are not a collection")
                         })?;
-                        if record.len() > 100 {
-                            return Err(invalid("pending review page exceeds 100 records"));
-                        }
                         record
                             .iter()
                             .map(decode_member)
@@ -179,12 +171,10 @@ impl GhClient {
                 .await,
             )?;
             let complete = members.len() < 100;
-            bytes += members
-                .iter()
-                .map(|member| member.body.len() + member.path.len() + member.node_id.len() + 256)
-                .sum::<usize>();
-            if bytes > 8 * 1024 * 1024 || result.len() + members.len() > 10_000 {
-                return Err(invalid("pending review membership exceeds capture limits"));
+            for member in &members {
+                if !seen.insert(member.id) {
+                    return Err(invalid("pending review membership repeats an identity"));
+                }
             }
             result.extend(members);
             if complete {
@@ -194,8 +184,8 @@ impl GhClient {
                 }
                 return Ok(result);
             }
+            page = page.checked_add(1).ok_or_else(|| invalid("pending review page number overflow"))?;
         }
-        Err(invalid("pending review membership is incomplete"))
     }
 }
 

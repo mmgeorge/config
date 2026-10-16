@@ -1,4 +1,4 @@
-//! Bounded native commands own their process group until output collection completes.
+//! Native commands own their process group until complete output collection finishes.
 
 use std::io;
 use std::process::{Command, ExitStatus, Output, Stdio};
@@ -10,10 +10,9 @@ use anyhow::{Context, Result, ensure};
 use process_wrap::tokio::{CommandWrap, KillOnDrop};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-/// Independent stream capacities and the command deadline.
+/// Defines diagnostic tail retention and the command deadline for native commands.
 #[derive(Clone, Copy, Debug)]
 pub struct CommandLimits {
-    pub stdout_bytes: usize,
     pub stderr_bytes: usize,
     pub timeout: Duration,
 }
@@ -69,7 +68,7 @@ pub fn read_command_pair(
     })
 }
 
-/// Writes input while collecting bounded output.
+/// Write complete input while collecting complete output.
 pub fn write_command(
     command: &mut Command,
     limits: CommandLimits,
@@ -197,7 +196,7 @@ async fn collect_async(
     let stdout_reader = match stdout {
         Some(stdout) => spawn_reader(
             stdout,
-            limits.stdout_bytes,
+            limits.stderr_bytes,
             CommandStream::Stdout,
             progress.clone(),
             diagnostic,
@@ -317,11 +316,7 @@ async fn read_stream(
 ) -> Result<Vec<u8>> {
     let notice = b"\n[Command output truncated]\n";
     let notice = &notice[..notice.len().min(limit)];
-    let capacity = if diagnostic {
-        limit - notice.len()
-    } else {
-        limit
-    };
+    let capacity = limit - notice.len();
     let mut output = if diagnostic {
         Vec::with_capacity(capacity)
     } else {
@@ -332,12 +327,7 @@ async fn read_stream(
     let mut sequence = 0;
     let mut truncated = false;
     loop {
-        let available = capacity.saturating_sub(output.len());
-        let requested = if diagnostic {
-            chunk.len()
-        } else {
-            chunk.len().min(available.saturating_add(1)).max(1)
-        };
+        let requested = chunk.len();
         let received = match source.read(&mut chunk[..requested]).await {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             result => result.context("read command output")?,
@@ -352,25 +342,7 @@ async fn read_stream(
             return Ok(output);
         }
         if !diagnostic {
-            let name = match stream {
-                CommandStream::Stdout => "stdout",
-                CommandStream::Stderr => "stderr",
-            };
-            ensure!(
-                received <= available,
-                "command {name} exceeds {limit} bytes"
-            );
-            let required = output.len() + received;
-            if required > output.capacity() {
-                let reserved = output.capacity().saturating_mul(2).max(required).min(limit);
-                output
-                    .try_reserve_exact(reserved - output.len())
-                    .context("reserve command output")?;
-                ensure!(
-                    output.capacity() <= limit,
-                    "command {name} allocation exceeds {limit} bytes"
-                );
-            }
+            output.try_reserve(received).context("reserve command output")?;
             output.extend_from_slice(&chunk[..received]);
         } else {
             let retained = received.min(capacity);

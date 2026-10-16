@@ -119,7 +119,6 @@ impl ConfigurationFormat {
                     text,
                     roxmltree::ParsingOptions {
                         allow_dtd: true,
-                        nodes_limit: 1024 * 1024,
                         ..Default::default()
                     },
                 )

@@ -202,7 +202,6 @@ mod tests {
             Arc::new(AnalysisPool::new(PoolLimits {
                 workers: 1,
                 jobs: 2,
-                input_bytes: 1024 * 1024,
             })),
         );
         let job = MarkdownSyntax {
@@ -272,7 +271,6 @@ mod tests {
             Arc::new(AnalysisPool::new(PoolLimits {
                 workers: 1,
                 jobs: 2,
-                input_bytes: 1024 * 1024,
             })),
         );
         let job = SavedDiffSyntax {

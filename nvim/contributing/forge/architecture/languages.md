@@ -122,13 +122,12 @@ An LSP result describes the current project source. It cannot establish that a
 changed virtual signature or a new dependency in a plan typechecks. Saving and
 submission retain their independent structural and internal-reference checks.
 
-## Native syntax analysis bounds
+## Native syntax analysis and cache retention
 
-Native rendering analysis applies the 10,000-line cutoff independently to each source
-version. Explicit agent structural queries bypass that cutoff. Analysis has no source-byte reservation, retained-memory rejection, capture-count
-limit, injection-count limit, or decoration-count limit. The shared worker pool still
-queues work and propagates cancellation. Its byte admission excludes syntax sources,
-which are already retained by their owners. The cache retains up to 256 results and
+Native rendering and explicit structural queries analyze complete source versions without
+byte, line-count, capture-count, injection-count, or decoration-count admission ceilings.
+The shared worker pool bounds concurrent jobs and propagates cancellation and deadlines.
+Syntax sources remain retained by their existing owners. The cache retains up to 256 results and
 evicts old entries without invalidating document handles or rejecting new analysis.
 
 ## Bundled tree-sitter queries (`queries/`)
@@ -152,11 +151,13 @@ which is why `query_runtime` must run before any consumer.
 
 ## Analysis cache ownership and reservations
 
-`AnalysisCache` reserves source capacity, result capacity, and one entry before work is admitted.
-Defaults are 128 MiB of sources, 64 MiB of results, and 512 admitted entries. Reservations cover
-pending work and remain attached to published consumer handles. Cache eviction does not release a
-charge until the last such handle drops. Admission evicts least-recently-used entries only when
-the cache is their sole owner, preserving reuse of results with live consumers.
+`AnalysisCache` tracks source capacity, result capacity, and one entry for each live analysis.
+Cache retention budgets default to 128 MiB of sources, 64 MiB of results, and 512 entries.
+Reservations cover pending work and remain attached to published consumer handles. Explicit work
+evicts least-recently-used cache references as needed and still returns an uncached handle when
+live allocations exceed those budgets. Eviction does not release a charge until the last consumer
+handle drops. Optional speculative retention can decline a cache reservation without disabling
+explicit analysis or losing its source content.
 
 Publication rejects reservations from another cache, mismatched source identities, and retained
 capacities above the reservation. Raw result accounting includes the result structure and hunk

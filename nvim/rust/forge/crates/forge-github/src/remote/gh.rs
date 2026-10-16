@@ -1,8 +1,6 @@
 use std::ffi::OsString;
-use std::fmt;
 use std::future::Future;
 use std::io::Write;
-use std::marker::PhantomData;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::process::{Command, Output};
@@ -12,8 +10,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use forge_git::command::{CommandLimits, read_command};
 use forge_git::read_pool::{BlockingReadPool, ReadAdmissionError};
-use serde::de::{SeqAccess, Visitor};
-use serde::{Deserialize, Deserializer};
+use serde::Deserialize;
 
 use super::{
     GithubRemote, IssueDetailRequest, IssuePage, IssuePageRequest, RemoteFailure, RemoteFailureKind,
@@ -37,8 +34,6 @@ mod submission;
 pub use submission::{PendingReviewExpected, ReviewSubmissionContext};
 mod users;
 
-const MAX_REQUEST_BYTES: usize = 16 * 1024 * 1024;
-const MAX_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES: usize = 64 * 1024;
 const ISSUE_QUERY: &str = "query($owner:String!, $name:String!, $states:[IssueState!], $cursor:String) { rateLimit { remaining } repository(owner:$owner, name:$name) { issues(first:100, after:$cursor, states:$states, orderBy:{field:UPDATED_AT, direction:DESC}) { totalCount pageInfo { hasNextPage endCursor } nodes { number title state url createdAt updatedAt labels(first:50) { nodes { name color description } } } } } }";
 
@@ -63,7 +58,7 @@ pub struct GhDirectory {
 struct GraphResponse {
     data: Option<GraphData>,
     #[serde(default)]
-    errors: BoundedVec<GraphFailure, 32>,
+    errors: Vec<GraphFailure>,
 }
 
 #[derive(Deserialize)]
@@ -88,7 +83,7 @@ struct GraphRepository {
 struct GraphConnection {
     total_count: u64,
     page_info: GraphPageInfo,
-    nodes: BoundedVec<GraphIssue, 100>,
+    nodes: Vec<GraphIssue>,
 }
 
 #[derive(Deserialize)]
@@ -112,7 +107,7 @@ struct GraphIssue {
 
 #[derive(Deserialize)]
 struct GraphLabels {
-    nodes: BoundedVec<LabelRecord, 50>,
+    nodes: Vec<LabelRecord>,
 }
 
 #[derive(Deserialize)]
@@ -122,15 +117,9 @@ struct GraphFailure {
     kind: Option<String>,
 }
 
-struct BoundedVec<Value, const LIMIT: usize>(Vec<Value>);
-
 impl GhClient {
     /// Binds a checkout context while sharing this owner's global native request admission.
     pub fn for_directory(self: &Arc<Self>, directory: PathBuf) -> Result<Arc<GhDirectory>> {
-        ensure!(
-            directory.as_os_str().len() <= 16 * 1024,
-            "gh checkout path exceeds its input limit"
-        );
         Ok(Arc::new(GhDirectory {
             client: Arc::clone(self),
             directory: std::path::absolute(directory)?,
@@ -143,14 +132,10 @@ impl GhClient {
             !executable.as_os_str().is_empty(),
             "gh executable must not be empty"
         );
-        ensure!(
-            executable.as_os_str().len() <= 16 * 1024 && directory.as_os_str().len() <= 16 * 1024,
-            "gh launch path exceeds its input limit"
-        );
         Ok(Self {
             executable,
             directory: std::path::absolute(directory)?,
-            requests: BlockingReadPool::new(4, MAX_REQUEST_BYTES)?,
+            requests: BlockingReadPool::new(4)?,
         })
     }
 
@@ -317,8 +302,8 @@ impl GhClient {
             request
                 .cursor
                 .as_ref()
-                .is_none_or(|cursor| !cursor.is_empty() && cursor.len() <= 512),
-            "GitHub cursor exceeds its request limit"
+                .is_none_or(|cursor| !cursor.is_empty()),
+            "GitHub cursor must not be empty"
         );
         let name = request.repository.repository_name();
         let (owner, repository) = name
@@ -388,7 +373,6 @@ impl GhClient {
                 let output = read_command(
                     &mut command,
                     CommandLimits {
-                        stdout_bytes: MAX_RESPONSE_BYTES,
                         stderr_bytes: MAX_DIAGNOSTIC_BYTES,
                         timeout: Duration::from_secs(120),
                     },
@@ -427,7 +411,7 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
         let stderr = String::from_utf8_lossy(&output.stderr);
         let mut message = diagnostic(&format!("gh exited {}: {stderr}", output.status));
         if let Ok(response) = decoded {
-            append_graph_failures(&mut message, &response.errors.0);
+            append_graph_failures(&mut message, &response.errors);
         } else {
             append_diagnostic(&mut message, &String::from_utf8_lossy(&output.stdout));
         }
@@ -440,9 +424,9 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
             String::from_utf8_lossy(&output.stderr)
         )),
     })?;
-    if !response.errors.0.is_empty() {
+    if !response.errors.is_empty() {
         let mut message = String::new();
-        append_graph_failures(&mut message, &response.errors.0);
+        append_graph_failures(&mut message, &response.errors);
         return Err(classify_failure(message));
     }
     let data = response.data.ok_or_else(|| RemoteFailure {
@@ -459,7 +443,7 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
     let next_cursor = if connection.page_info.has_next_page {
         match connection.page_info.end_cursor {
             Some(cursor)
-                if !cursor.is_empty() && cursor.len() <= 512 && !connection.nodes.0.is_empty() =>
+                if !cursor.is_empty() && !connection.nodes.is_empty() =>
             {
                 Some(cursor)
             }
@@ -475,7 +459,6 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
     };
     let issues = connection
         .nodes
-        .0
         .into_iter()
         .map(|issue| IssueRecord {
             repo: repository.into(),
@@ -486,7 +469,7 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
             created_at: Some(issue.created_at),
             updated_at: Some(issue.updated_at),
             body: None,
-            labels: issue.labels.nodes.0,
+            labels: issue.labels.nodes,
         })
         .collect();
     Ok(IssuePage {
@@ -567,49 +550,6 @@ fn diagnostic(message: &str) -> String {
     format!("{}{suffix}", &message[..boundary])
 }
 
-impl<Value, const LIMIT: usize> Default for BoundedVec<Value, LIMIT> {
-    fn default() -> Self {
-        Self(Vec::new())
-    }
-}
-
-impl<'input, Value: Deserialize<'input>, const LIMIT: usize> Deserialize<'input>
-    for BoundedVec<Value, LIMIT>
-{
-    fn deserialize<Decoder: Deserializer<'input>>(
-        decoder: Decoder,
-    ) -> std::result::Result<Self, Decoder::Error> {
-        struct BoundedVisitor<Value, const LIMIT: usize>(PhantomData<Value>);
-        impl<'input, Value: Deserialize<'input>, const LIMIT: usize> Visitor<'input>
-            for BoundedVisitor<Value, LIMIT>
-        {
-            type Value = BoundedVec<Value, LIMIT>;
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                write!(formatter, "at most {LIMIT} records")
-            }
-            fn visit_seq<Sequence: SeqAccess<'input>>(
-                self,
-                mut sequence: Sequence,
-            ) -> std::result::Result<Self::Value, Sequence::Error> {
-                let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0).min(LIMIT));
-                for _ in 0..LIMIT {
-                    match sequence.next_element()? {
-                        Some(value) => values.push(value),
-                        None => return Ok(BoundedVec(values)),
-                    }
-                }
-                if sequence.next_element::<serde::de::IgnoredAny>()?.is_some() {
-                    return Err(serde::de::Error::custom(format!(
-                        "response exceeds {LIMIT} records"
-                    )));
-                }
-                Ok(BoundedVec(values))
-            }
-        }
-        decoder.deserialize_seq(BoundedVisitor::<Value, LIMIT>(PhantomData))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,7 +600,7 @@ mod tests {
     }
 
     #[test]
-    fn decoded_collections_stop_at_their_record_limit() {
+    fn decoded_collections_preserve_every_record() {
         let record = serde_json::json!({"number":1,"title":"title","state":"OPEN","url":"https://github.com/owner/repo/issues/1",
             "createdAt":"2026-09-01T00:00:00Z","updatedAt":"2026-09-07T00:00:00Z","labels":{"nodes":[]}});
         let response = |records| {
@@ -674,17 +614,15 @@ mod tests {
                 .len(),
             100
         );
-        let failure = decode_page(output(response(101)), "owner/repo").unwrap_err();
-        assert_eq!(failure.kind, RemoteFailureKind::InvalidResponse);
-        assert!(failure.message.contains("100 records"));
+        assert_eq!(decode_page(output(response(101)), "owner/repo").unwrap().issues.len(), 101);
         let labels = serde_json::json!({"nodes":vec![serde_json::json!({"name":"label"});51]});
-        assert!(serde_json::from_value::<GraphLabels>(labels).is_err());
-        assert!(
-            serde_json::from_value::<BoundedVec<GraphFailure, 32>>(serde_json::json!(vec![
+        assert_eq!(serde_json::from_value::<GraphLabels>(labels).unwrap().nodes.len(), 51);
+        assert_eq!(
+            serde_json::from_value::<Vec<GraphFailure>>(serde_json::json!(vec![
                 serde_json::json!({"message":"failure"});
                 33
             ]))
-            .is_err()
+            .unwrap().len(), 33
         );
     }
 

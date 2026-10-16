@@ -14,22 +14,16 @@ use budget::StoredText;
 pub use merge::PreparedFieldMerge;
 pub use restore::{FieldRestoration, SaveRestoration};
 
-/// Per-document cardinality and per-field text bounds. A shared EditBudget bounds allocated text.
+/// Defines field ownership and concurrent save admission for one document.
 #[derive(Clone, Copy, Debug)]
 pub struct EditLimits {
-    pub active_fields: usize,
-    pub region_lifetimes: usize,
     pub pending_saves: usize,
-    pub field_bytes: usize,
 }
 
 impl Default for EditLimits {
     fn default() -> Self {
         Self {
-            active_fields: 256,
-            region_lifetimes: 4096,
             pending_saves: 64,
-            field_bytes: 256 * 1024,
         }
     }
 }
@@ -304,11 +298,6 @@ impl EditStore {
                 ));
             }
         }
-        if self.field.len().saturating_add(declared.len()) > self.limits.active_fields
-            || self.used_region.len().saturating_add(declared.len()) > self.limits.region_lifetimes
-        {
-            return Err(EditError::Capacity("review region admission is full"));
-        }
         let mut region = BTreeSet::new();
         let mut prepared = Vec::new();
         let mut inserted = Vec::new();
@@ -375,11 +364,7 @@ impl EditStore {
         budget: EditBudget,
     ) -> Result<Self, EditError> {
         document.validate()?;
-        if limits.active_fields == 0
-            || limits.region_lifetimes < limits.active_fields
-            || limits.pending_saves == 0
-            || limits.field_bytes == 0
-        {
+        if limits.pending_saves == 0 {
             return Err(EditError::Invalid("invalid review edit limits"));
         }
         Ok(Self {
@@ -408,11 +393,6 @@ impl EditStore {
             return Err(EditError::Invalid(
                 "review region identity was already used",
             ));
-        }
-        if self.field.len() >= self.limits.active_fields
-            || self.used_region.len() >= self.limits.region_lifetimes
-        {
-            return Err(EditError::Capacity("review region admission is full"));
         }
         let text = self.budget.retain(text)?;
         self.used_region.insert(region.clone());
@@ -756,8 +736,8 @@ impl EditStore {
     }
 
     fn validate_text(&self, text: &str) -> Result<(), EditError> {
-        if text.len() > self.limits.field_bytes || text.contains('\0') {
-            return Err(EditError::Invalid("review field exceeds its text contract"));
+        if text.contains('\0') {
+            return Err(EditError::Invalid("review field contains NUL"));
         }
         Ok(())
     }

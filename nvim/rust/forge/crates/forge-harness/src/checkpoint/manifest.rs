@@ -151,7 +151,7 @@ impl CheckpointRecord {
     }
 
     /// Retrieves one captured source, including clean files supplied by the Git baseline.
-    pub fn read(&self, objects: &ObjectStore, path: &str, limit: usize) -> Result<Option<Vec<u8>>> {
+    pub fn read(&self, objects: &ObjectStore, path: &str) -> Result<Option<Vec<u8>>> {
         if self.excluded.contains(path)
             || forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &BTreeSet::from([path.to_owned()]))?.contains(path)
         {
@@ -159,9 +159,7 @@ impl CheckpointRecord {
         }
         if let Some(file) = self.file.iter().find(|file| file.path == path) {
             return Ok(Some(
-                objects
-                    .get(&file.object_id, limit)?
-                    .context("checkpoint source exceeds the requested byte limit")?,
+                objects.get(&file.object_id)?,
             ));
         }
         if self.deleted.iter().any(|deleted| deleted == path) {
@@ -177,8 +175,7 @@ impl CheckpointRecord {
         };
         file.checkout = self.checkout.get(path).cloned().unwrap_or_default();
         Ok(Some(
-            forge_git::checkpoint::read_blob(Path::new(&self.workspace), &file, limit)?
-                .context("checkpoint source exceeds the requested byte limit")?,
+            forge_git::checkpoint::read_blob(Path::new(&self.workspace), &file)?,
         ))
     }
 }
@@ -188,11 +185,10 @@ impl ResolvedFile {
         &self,
         objects: &ObjectStore,
         root: &Path,
-        limit: usize,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Vec<u8>> {
         match &self.source {
-            Content::Stored(identity) => objects.get(identity, limit),
-            Content::Git(file) => forge_git::checkpoint::read_blob(root, file, limit)
+            Content::Stored(identity) => objects.get(identity),
+            Content::Git(file) => forge_git::checkpoint::read_blob(root, file)
                 .context("checkpoint baseline content is unavailable"),
         }
     }

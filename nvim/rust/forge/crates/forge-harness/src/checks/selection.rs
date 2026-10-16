@@ -35,7 +35,6 @@ impl CheckSelection {
         match self {
             Self::All => {}
             Self::Files { files } => {
-                ensure!(files.len() <= 4096, "selection exceeds 4096 files");
                 for file in files.iter() {
                     super::config::relative_path(file)?;
                 }
@@ -43,7 +42,6 @@ impl CheckSelection {
                 files.dedup();
             }
             Self::Cases { cases } => {
-                ensure!(cases.len() <= 4096, "selection exceeds 4096 cases");
                 for case in cases.iter() {
                     super::config::relative_path(&case.file)?;
                     ensure!(

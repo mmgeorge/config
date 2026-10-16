@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{
-    MAX_SOURCE_BYTES, Representation, SourceError, SourcePair, SourceVersion,
+    Representation, SourceError, SourcePair, SourceVersion,
 };
 use forge_diff::unified::{write_file_header, write_unified};
 use forge_diff::workers::WorkPriority;
@@ -399,7 +399,7 @@ impl GitCheckpoint {
             && previous.signature == signature && previous.record.session_id == session_id && previous.unchanged()
         {
             check()?;
-            eprintln!("checkpoint.reuse duration_ms={}", started.elapsed().as_millis());
+            let _ = writeln!(std::io::stderr(), "checkpoint.reuse duration_ms={}", started.elapsed().as_millis());
             return Ok(previous.record.clone());
         }
         let inventory = forge_git::checkpoint::inventory(&self.workspace, &signature, &mut check)?;
@@ -517,7 +517,8 @@ impl GitCheckpoint {
             .collect::<BTreeMap<_, _>>();
         let manifest =
             serde_json::to_vec(&(session_id, &inventory.tree, &file, &deleted, &checkout, &inventory.excluded))?;
-        eprintln!(
+        let _ = writeln!(
+            std::io::stderr(),
             "checkpoint.capture candidates={} overrides={} cache_hits={} bytes_read={} duration_ms={}",
             inventory.candidate.len(),
             file.len(),
@@ -655,13 +656,6 @@ async fn checkpoint_diff_matching(
             .await?
         {
             CheckpointSource::Text(pair) => pair,
-            CheckpointSource::TooLarge => {
-                writeln!(
-                    output,
-                    "Diff unavailable: checkpoint source exceeds {MAX_SOURCE_BYTES} bytes"
-                )?;
-                continue;
-            }
             CheckpointSource::Binary => {
                 writeln!(output, "Binary files a/{path} and b/{path} differ")?;
                 continue;
@@ -696,7 +690,6 @@ async fn checkpoint_diff_matching(
 #[derive(Debug)]
 enum CheckpointSource {
     Text(SourcePair),
-    TooLarge,
     Binary,
     UnsupportedEncoding,
 }
@@ -716,19 +709,15 @@ async fn checkpoint_source(
     reads
         .submit(input_bytes, move |cancellation| {
             let before_content = match before_id.as_ref() {
-                Some(identity) => identity.read(&objects, &workspace, MAX_SOURCE_BYTES)?,
-                None => Some(Vec::new()),
+                Some(identity) => identity.read(&objects, &workspace)?,
+                None => Vec::new(),
             };
             cancellation.check()?;
             let after_content = match after_id.as_ref() {
-                Some(identity) => identity.read(&objects, &workspace, MAX_SOURCE_BYTES)?,
-                None => Some(Vec::new()),
+                Some(identity) => identity.read(&objects, &workspace)?,
+                None => Vec::new(),
             };
             cancellation.check()?;
-            let (Some(before_content), Some(after_content)) = (before_content, after_content)
-            else {
-                return Ok(CheckpointSource::TooLarge);
-            };
             let old = SourceVersion::new(before_content, Representation::Raw);
             cancellation.check()?;
             let new = SourceVersion::new(after_content, Representation::Raw);

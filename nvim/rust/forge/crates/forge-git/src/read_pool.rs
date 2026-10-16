@@ -15,7 +15,6 @@ pub struct ReadId(u64);
 pub enum ReadAdmissionError {
     Closed,
     Busy,
-    InputTooLarge,
     NoRuntime,
     IdExhausted,
 }
@@ -25,7 +24,6 @@ impl fmt::Display for ReadAdmissionError {
         formatter.write_str(match self {
             Self::Closed => "repository read pool is closed",
             Self::Busy => "repository read capacity is full",
-            Self::InputTooLarge => "repository read input exceeds the pool budget",
             Self::NoRuntime => "repository reads require an active Tokio runtime",
             Self::IdExhausted => "repository read identities are exhausted",
         })
@@ -71,7 +69,6 @@ pub struct BlockingReadPool {
 
 struct PoolShared {
     max_jobs: usize,
-    max_input_bytes: usize,
     state: Mutex<PoolState>,
     changed: watch::Sender<usize>,
 }
@@ -104,16 +101,15 @@ struct ReadCompletion<Output> {
 }
 
 impl BlockingReadPool {
-    pub fn new(max_jobs: usize, max_input_bytes: usize) -> Result<Self> {
+    pub fn new(max_jobs: usize) -> Result<Self> {
         ensure!(
-            max_jobs > 0 && max_input_bytes > 0,
+            max_jobs > 0,
             "repository read limits must be positive"
         );
         let (changed, _) = watch::channel(0);
         Ok(Self {
             shared: Arc::new(PoolShared {
                 max_jobs,
-                max_input_bytes,
                 state: Mutex::new(PoolState::default()),
                 changed,
             }),
@@ -122,8 +118,8 @@ impl BlockingReadPool {
 
     /// Admits one job immediately or returns a capacity error without spawning it.
     ///
-    /// `input_bytes` accounts for retained caller input. The worker must separately bound source
-    /// allocation and result size, and check cancellation between interruptible stages.
+    /// `input_bytes` accounts for retained caller input without imposing content admission limits.
+    /// Check cancellation between interruptible worker stages.
     /// Admission remains charged until `finish` collects the result or the abandoned result drops.
     pub fn submit<Output: Send + 'static>(
         &self,
@@ -133,8 +129,8 @@ impl BlockingReadPool {
         self.submit_retained(input_bytes, &mut Some(work))
     }
 
-    /// Waits for native job and byte capacity without blocking the executor.
-    /// Callers bound queued inputs. Dropping this future before admission discards its work.
+    /// Wait for native job capacity without blocking the executor.
+    /// Discard queued work when its waiting future drops before admission.
     pub async fn submit_wait<Output: Send + 'static>(
         &self,
         input_bytes: usize,
@@ -176,20 +172,17 @@ impl BlockingReadPool {
             if state.closed {
                 return Err(ReadAdmissionError::Closed);
             }
-            if input_bytes > self.shared.max_input_bytes {
-                return Err(ReadAdmissionError::InputTooLarge);
-            }
-            if state.active.len() == self.shared.max_jobs
-                || input_bytes > self.shared.max_input_bytes - state.input_bytes
-            {
+            if state.active.len() == self.shared.max_jobs {
                 return Err(ReadAdmissionError::Busy);
             }
+            let retained = state.input_bytes.checked_add(input_bytes)
+                .ok_or(ReadAdmissionError::IdExhausted)?;
             state.next_id = state
                 .next_id
                 .checked_add(1)
                 .ok_or(ReadAdmissionError::IdExhausted)?;
             let id = ReadId(state.next_id);
-            state.input_bytes += input_bytes;
+            state.input_bytes = retained;
             state.active.insert(id, cancellation.clone());
             self.shared.changed.send_replace(state.active.len());
             id
@@ -335,7 +328,7 @@ mod tests {
 
     #[tokio::test]
     async fn waiting_reads_resume_after_collection_and_shutdown_wakes_waiters() {
-        let pool = BlockingReadPool::new(1, 8).unwrap();
+        let pool = BlockingReadPool::new(1).unwrap();
         let first = pool.submit(8, |_| Ok(())).unwrap();
         wait_for_native_completion(&first).await;
         let waiting = pool.submit_wait(8, |_| Ok("second"));
@@ -372,7 +365,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_read_bursts_wait_without_exceeding_native_capacity() {
-        let pool = Arc::new(BlockingReadPool::new(4, 32).unwrap());
+        let pool = Arc::new(BlockingReadPool::new(4).unwrap());
         let mut jobs = tokio::task::JoinSet::new();
         for index in 0..16 {
             let pool = pool.clone();
@@ -404,7 +397,7 @@ mod tests {
 
     #[tokio::test]
     async fn completed_result_retains_admission_until_collected() {
-        let pool = BlockingReadPool::new(1, 8).unwrap();
+        let pool = BlockingReadPool::new(1).unwrap();
         let owner = std::thread::current().id();
         let task = pool.submit(8, |_| Ok(std::thread::current().id())).unwrap();
         wait_for_native_completion(&task).await;
@@ -422,7 +415,7 @@ mod tests {
 
     #[tokio::test]
     async fn shutdown_reports_uncollected_results_and_cancellation_rejects_them() {
-        let pool = BlockingReadPool::new(1, 8).unwrap();
+        let pool = BlockingReadPool::new(1).unwrap();
         let task = pool.submit(4, |_| Ok("completed result")).unwrap();
         let id = task.id();
         wait_for_native_completion(&task).await;
@@ -453,7 +446,7 @@ mod tests {
             }
         }
 
-        let pool = Arc::new(BlockingReadPool::new(1, 8).unwrap());
+        let pool = Arc::new(BlockingReadPool::new(1).unwrap());
         let disposed = Arc::new(AtomicBool::new(false));
         let output = ObservedOutput {
             pool: Arc::clone(&pool),

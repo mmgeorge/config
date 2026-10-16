@@ -41,12 +41,12 @@ pub struct RepositoryStore {
 
 impl Default for RepositoryStore {
     fn default() -> Self {
-        Self::new(32, 4, 32 * 1024 * 1024).expect("positive repository admission defaults")
+        Self::new(32, 4).expect("positive repository admission defaults")
     }
 }
 
 impl RepositoryStore {
-    pub fn new(max_repositories: usize, read_jobs: usize, read_input_bytes: usize) -> Result<Self> {
+    pub fn new(max_repositories: usize, read_jobs: usize) -> Result<Self> {
         ensure!(
             max_repositories > 0,
             "repository handle limit must be positive"
@@ -54,9 +54,9 @@ impl RepositoryStore {
         Ok(Self {
             diagnostic_skip_line_stats: AtomicBool::new(false),
             analysis: Arc::new(forge_diff::cache::AnalysisStore::new(Default::default())),
-            writes: crate::coordinator::MutationCoordinator::new(64, 16 * 1024 * 1024)?,
+            writes: crate::coordinator::MutationCoordinator::new(64)?,
             state: Mutex::new(StoreState::default()),
-            reads: BlockingReadPool::new(read_jobs, read_input_bytes)?,
+            reads: BlockingReadPool::new(read_jobs)?,
             max_repositories,
         })
     }
@@ -212,7 +212,7 @@ mod tests {
                 .output()
                 .unwrap();
             assert!(output.status.success());
-            let store = RepositoryStore::new(1, 1, 4096).unwrap();
+            let store = RepositoryStore::new(1, 1).unwrap();
             let (release, release_receiver) = std::sync::mpsc::channel();
             let blocker = tokio::task::spawn_blocking(move || {
                 release_receiver

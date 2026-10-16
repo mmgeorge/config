@@ -8,9 +8,7 @@ use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::workers::WorkPriority;
 use forge_git::command::{CommandLimits, read_command};
-use forge_git::content::{
-    ContentLimits, ContentRequest, ContentResult, ContentSource, WorktreeConversion,
-};
+use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion};
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, PathState};
 use forge_git::store::RepositoryStore;
@@ -32,15 +30,6 @@ pub async fn collect(
     diff: &Arc<DiffEngine>,
     request: &GenerationRequest,
 ) -> Result<CommitContext> {
-    ensure!(
-        request.workspace.len() <= 32_768,
-        "generation workspace exceeds path limit"
-    );
-    ensure!(
-        request.ignored_paths.len() <= 10_000
-            && request.ignored_paths.iter().all(|path| path.len() <= 4096),
-        "generation ignore set exceeds limit"
-    );
     let repository = store
         .open(PathBuf::from(&request.workspace))
         .await?
@@ -54,16 +43,11 @@ pub async fn collect(
         })
         .await?
         .value;
-    ensure!(
-        observation.path.len() <= 10_000,
-        "generation comparison exceeds 10,000 paths"
-    );
     let mut summary = String::new();
     let mut body = String::new();
     let mut changed = 0;
     let mut source_requests = 0;
     let mut diff_pairs = 0;
-    let mut truncated = false;
     for record in &observation.path {
         if request
             .ignored_paths
@@ -144,21 +128,6 @@ pub async fn collect(
             continue;
         }
         changed += 1;
-        if body.len() >= 180_000 {
-            truncated = true;
-            append(
-                &mut summary,
-                &format!(
-                    "{}: changed, mode {:o} -> {:o}\n",
-                    String::from_utf8_lossy(record.path.raw()),
-                    old_mode,
-                    new_mode
-                ),
-                12_000,
-                &mut truncated,
-            );
-            continue;
-        }
         source_requests += usize::from(old_object.is_some()) + usize::from(!missing);
         let old = if let Some(head) = head.filter(|head| !head.object.is_null()) {
             source(store, &repository, ContentSource::Object(head.object)).await?
@@ -202,17 +171,12 @@ pub async fn collect(
             }
         };
         let (Some(old), Some(new)) = (old.text, new.text) else {
-            append(
-                &mut summary,
-                &format!(
-                    "{}: binary, oversized, or unsupported text content changed, mode {:o} -> {:o}\n",
-                    String::from_utf8_lossy(record.path.raw()),
-                    old_mode,
-                    new_mode
-                ),
-                12_000,
-                &mut truncated,
-            );
+            summary.push_str(&format!(
+                "{}: binary or unsupported text content changed, mode {:o} -> {:o}\n",
+                String::from_utf8_lossy(record.path.raw()),
+                old_mode,
+                new_mode
+            ));
             continue;
         };
         diff_pairs += 1;
@@ -229,66 +193,40 @@ pub async fn collect(
         }
         let label = String::from_utf8_lossy(record.path.raw());
         if let Some(relocation) = relocation {
-            append(
-                &mut summary,
-                &format!(
-                    "{label}: {:?} from {}\n",
-                    relocation.kind,
-                    String::from_utf8_lossy(relocation.origin.raw())
-                ),
-                12_000,
-                &mut truncated,
-            );
+            summary.push_str(&format!(
+                "{label}: {:?} from {}\n",
+                relocation.kind,
+                String::from_utf8_lossy(relocation.origin.raw())
+            ));
         }
-        append(
-            &mut summary,
-            &format!(
-                "{label}: {} changed hunks, mode {:o} -> {:o}\n",
-                analysis.hunks().len(),
-                old_mode,
-                new_mode
-            ),
-            12_000,
-            &mut truncated,
-        );
-        append(
-            &mut body,
-            &format!("diff --git a/{label} b/{label}\n"),
-            180_000,
-            &mut truncated,
-        );
+        summary.push_str(&format!(
+            "{label}: {} changed hunks, mode {:o} -> {:o}\n",
+            analysis.hunks().len(),
+            old_mode,
+            new_mode
+        ));
+        body.push_str(&format!("diff --git a/{label} b/{label}\n"));
         for hunk in analysis.hunks() {
-            if body.len() >= 180_000 {
-                truncated = true;
-                break;
-            }
-            append(
-                &mut body,
-                &format!(
-                    "@@ -{},{} +{},{} @@\n",
-                    hunk.old_lines.start + 1,
-                    hunk.old_lines.len(),
-                    hunk.new_lines.start + 1,
-                    hunk.new_lines.len()
-                ),
-                180_000,
-                &mut truncated,
-            );
+            body.push_str(&format!(
+                "@@ -{},{} +{},{} @@\n",
+                hunk.old_lines.start + 1,
+                hunk.old_lines.len(),
+                hunk.new_lines.start + 1,
+                hunk.new_lines.len()
+            ));
             append_lines(
                 &mut body,
                 &analysis.source().old.bytes()[hunk.old_bytes.clone()],
                 '-',
-                &mut truncated,
             );
             append_lines(
                 &mut body,
                 &analysis.source().new.bytes()[hunk.new_bytes.clone()],
                 '+',
-                &mut truncated,
             );
         }
     }
-    let prompt = (changed != 0).then(|| format!("Generate a conventional commit message for these changes.{}\n\nDiff summary:\n{summary}\nDiff:\n{body}", if truncated { " Context is truncated. Use the complete summary where available and visible changes for details." } else { "" }));
+    let prompt = (changed != 0).then(|| format!("Generate a conventional commit message for these changes.\n\nDiff summary:\n{summary}\nDiff:\n{body}"));
     Ok(CommitContext {
         prompt,
         source_requests,
@@ -318,7 +256,6 @@ async fn collect_latest_commit(
             read_command(
                 &mut command,
                 CommandLimits {
-                    stdout_bytes: 256 * 1024,
                     stderr_bytes: 4096,
                     timeout: Duration::from_secs(30),
                 },
@@ -344,19 +281,8 @@ async fn collect_latest_commit(
         .lines()
         .filter(|line| line.starts_with("diff --git "))
         .count();
-    let mut end = diff.len().min(180_000);
-    while !diff.is_char_boundary(end) {
-        end -= 1;
-    }
-    let truncated = end < diff.len();
     let prompt = format!(
-        "Generate a conventional commit message for the latest commit.{}\n\nDiff:\n{}",
-        if truncated {
-            " Context is truncated."
-        } else {
-            ""
-        },
-        &diff[..end]
+        "Generate a conventional commit message for the latest commit.\n\nDiff:\n{diff}"
     );
     Ok(CommitContext {
         prompt: Some(prompt),
@@ -383,7 +309,6 @@ async fn source(
             store,
             ContentRequest {
                 source,
-                limits: ContentLimits::default(),
                 expected: None,
             },
         )
@@ -399,7 +324,6 @@ async fn source(
         | ContentResult::Unavailable(forge_git::content::ContentUnavailable::UnsupportedEncoding) => {
             Ok(ComparisonSource { text: None })
         }
-        ContentResult::TooLarge { .. } => Ok(ComparisonSource { text: None }),
         unavailable => bail!("commit comparison source unavailable: {unavailable:?}"),
     }
 }
@@ -409,31 +333,12 @@ fn empty() -> Result<ComparisonSource> {
     Ok(ComparisonSource { text: Some(text) })
 }
 
-fn append(destination: &mut String, text: &str, limit: usize, truncated: &mut bool) {
-    let available = limit.saturating_sub(destination.len());
-    let mut end = available.min(text.len());
-    while !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    destination.push_str(&text[..end]);
-    *truncated |= end != text.len();
-}
-
-fn append_lines(destination: &mut String, source: &[u8], prefix: char, truncated: &mut bool) {
+fn append_lines(destination: &mut String, source: &[u8], prefix: char) {
     for line in String::from_utf8_lossy(source).split_inclusive('\n') {
-        if destination.len() >= 180_000 {
-            *truncated = true;
-            break;
-        }
-        append(destination, &prefix.to_string(), 180_000, truncated);
-        append(destination, line, 180_000, truncated);
+        destination.push(prefix);
+        destination.push_str(line);
         if !line.ends_with('\n') {
-            append(
-                destination,
-                "\n\\ No newline at end of file\n",
-                180_000,
-                truncated,
-            );
+            destination.push_str("\n\\ No newline at end of file\n");
         }
     }
 }
@@ -454,6 +359,63 @@ mod tests {
             "{}",
             String::from_utf8_lossy(&output.stderr)
         );
+    }
+
+    #[test]
+    fn diff_lines_preserve_complete_multibyte_content_and_terminal_marker() {
+        let source = format!("{}\nlast λ", "α".repeat(180_001));
+        let mut body = String::new();
+        append_lines(&mut body, source.as_bytes(), '+');
+        assert_eq!(
+            body,
+            format!("+{}\n+last λ\n\\ No newline at end of file\n", "α".repeat(180_001))
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_context_preserves_large_files_later_files_and_latest_commit() {
+        let directory = tempfile::Builder::new()
+            .prefix(".forge-commit-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        git(root, &["config", "user.name", "Forge Test"]);
+        git(root, &["config", "user.email", "forge@example.invalid"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("first.txt"), "before\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "initial"]);
+        let large = format!("{}\nlarge tail λ\n", "complete ".repeat(40_000));
+        std::fs::write(root.join("first.txt"), &large).unwrap();
+        std::fs::write(root.join("second.txt"), "later file remains present\n").unwrap();
+        let store = RepositoryStore::default();
+        let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let mut request = GenerationRequest {
+            operation: "generate".into(),
+            workspace: root.to_string_lossy().into_owned(),
+            comparison: Comparison::Head,
+            ignored_paths: vec![],
+            model: None,
+            generation: None,
+        };
+        let context = collect(&store, &diff, &request).await.unwrap();
+        let prompt = context.prompt.unwrap();
+        assert!(prompt.contains(&large[..large.len() - 1].replace('\n', "\n+")));
+        assert!(prompt.contains("+later file remains present"));
+        assert!(!prompt.contains("truncated"));
+        assert_eq!(context.diff_pairs, 2);
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "complete"]);
+        request.comparison = Comparison::LatestCommit;
+        let prompt = collect(&store, &diff, &request)
+            .await
+            .unwrap()
+            .prompt
+            .unwrap();
+        assert!(prompt.contains("+large tail λ") && prompt.contains("+later file remains present"));
+        assert!(prompt.len() > 256 * 1024);
+        assert!(!prompt.contains("truncated"));
     }
 
     #[tokio::test]

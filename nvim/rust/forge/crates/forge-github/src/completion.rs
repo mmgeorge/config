@@ -1,5 +1,5 @@
 use std::fs::File;
-use std::io::{BufReader, Read};
+use std::io::BufReader;
 use std::path::Path;
 
 use anyhow::{Context, Result};
@@ -7,7 +7,6 @@ use serde::de::{IgnoredAny, SeqAccess, Visitor};
 use serde::{Deserialize, Deserializer};
 
 use crate::model::SnapshotState;
-use crate::publication::MAX_CACHE_JSON_BYTES;
 
 #[derive(Deserialize)]
 struct SnapshotIdentity {
@@ -31,8 +30,7 @@ pub(crate) fn snapshot_matches(
         Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(failure) => return Err(failure).context("open completion snapshot for reconciliation"),
     };
-    let mut reader =
-        BufReader::with_capacity(64 * 1024, file.take((MAX_CACHE_JSON_BYTES + 1) as u64));
+    let mut reader = BufReader::with_capacity(64 * 1024, file);
     let identity: SnapshotIdentity = match serde_json::from_reader(&mut reader) {
         Ok(identity) => identity,
         Err(failure) if failure.is_io() => {
@@ -40,8 +38,7 @@ pub(crate) fn snapshot_matches(
         }
         Err(_) => return Ok(false),
     };
-    Ok(reader.get_ref().limit() > 0
-        && identity.repo == repo
+    Ok(identity.repo == repo
         && identity.revision == Some(revision)
         && identity.issue_count == identity.issues.0
         && identity.state

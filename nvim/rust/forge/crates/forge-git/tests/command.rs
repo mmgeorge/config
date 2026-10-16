@@ -12,7 +12,6 @@ fn fixture(name: &str) -> Command {
 
 fn limits() -> CommandLimits {
     CommandLimits {
-        stdout_bytes: 4096,
         stderr_bytes: 4096,
         timeout: Duration::from_secs(5),
     }
@@ -23,7 +22,6 @@ fn preserves_both_streams_and_nonzero_exit_status() {
     let output = read_command(
         &mut fixture("command_child_failure"),
         CommandLimits {
-            stdout_bytes: 128 * 1024,
             stderr_bytes: 128 * 1024,
             ..limits()
         },
@@ -43,7 +41,6 @@ fn paired_reads_preserve_both_failures_and_streams() {
         fixture("command_child_failure"),
         fixture("command_child_failure"),
         CommandLimits {
-            stdout_bytes: 128 * 1024,
             stderr_bytes: 128 * 1024,
             ..limits()
         },
@@ -73,19 +70,16 @@ fn paired_reads_cancel_both_children_before_returning() {
 }
 
 #[test]
-fn stdout_and_stderr_overflow_stop_without_returning_partial_success() {
+fn complete_stdout_and_stderr_cross_former_stream_caps_without_truncation() {
     for (child, stream) in [
         ("command_child_stdout", "stdout"),
         ("command_child_stderr", "stderr"),
     ] {
         let started = Instant::now();
-        let error = read_command(&mut fixture(child), limits(), || Ok(())).unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains(&format!("{stream} exceeds 4096 bytes")),
-            "{error:#}"
-        );
+        let output = read_command(&mut fixture(child), limits(), || Ok(())).unwrap();
+        assert!(output.status.success());
+        let bytes = if stream == "stdout" { &output.stdout } else { &output.stderr };
+        assert!(bytes.iter().filter(|byte| **byte == b'x').count() >= 512 * 1024);
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 }
@@ -268,7 +262,6 @@ fn command_child_stdout() {
     for _ in 0..16 {
         let _ = std::io::stdout().write_all(&[b'x'; 32768]);
     }
-    std::thread::sleep(Duration::from_secs(10));
 }
 
 #[test]
@@ -277,7 +270,6 @@ fn command_child_stderr() {
     for _ in 0..16 {
         let _ = std::io::stderr().write_all(&[b'x'; 32768]);
     }
-    std::thread::sleep(Duration::from_secs(10));
 }
 
 #[test]

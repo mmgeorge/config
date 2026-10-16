@@ -29,7 +29,7 @@ impl DeclarationVisibility {
         }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
-        let surrogate = declaration_surrogate(language, text);
+        let surrogate = declaration_surrogate(language, text)?;
         let mut parser = Parser::new();
         parser
             .set_language(&language.grammar())

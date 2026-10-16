@@ -806,10 +806,6 @@ impl CheckRunner {
         if scoped && !killed {
             let source = std::fs::read(&context.receipt)
                 .context("scoped check did not produce a selection receipt; fix its definition")?;
-            ensure!(
-                source.len() <= 1024 * 1024,
-                "selection receipt exceeds 1 MiB"
-            );
             let mut receipt: CheckReceipt =
                 serde_json::from_slice(&source).context("invalid selection receipt")?;
             receipt.validate_request(&context.selection)?;

@@ -10,7 +10,7 @@ use crate::plan::DeclarationDesign;
 type Scope = (String, Vec<String>);
 type Position = (String, u32, u32);
 
-/// Determine external contracts through saved exports and bounded owning-module metadata.
+/// Determine external contracts through saved exports and owning-module metadata.
 pub(crate) fn symbols(workspace: &Path, design: &DeclarationDesign) -> Result<BTreeSet<Position>> {
     let mut metadata = design.clone();
     let mut inspected = BTreeSet::new();
@@ -249,15 +249,7 @@ fn read(
     if design.baseline.contains_key(path) || !inspected.insert(path.into()) {
         return Ok(false);
     }
-    anyhow::ensure!(
-        inspected.len() <= 256,
-        "public API exposure exceeds 256 owning metadata probes"
-    );
     if let Some(text) = crate::plan::workspace_source(workspace, path)? {
-        anyhow::ensure!(
-            design.proposed.len() <= 16384,
-            "public API exposure exceeds 16384 files"
-        );
         design.proposed.insert(path.into(), text);
         Ok(true)
     } else {
@@ -275,6 +267,26 @@ fn location(workspace: &Path, file: &IndexedFile, line: u32, column: u32) -> Pos
         line,
         column,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_exposure_inventory_keeps_loading_owning_metadata() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "[package]\nname = 'example'\nversion = '0.1.0'\n";
+        std::fs::write(workspace.path().join("Cargo.toml"), source).unwrap();
+        let mut design = DeclarationDesign::default();
+        design.proposed = (0..16385).map(|index| {
+            (format!("src/file_{index}.rs"), String::new())
+        }).collect();
+        let mut inspected = (0..257).map(|index| format!("metadata_{index}")).collect();
+        assert!(read(workspace.path(), "Cargo.toml", &mut design, &mut inspected).unwrap());
+        assert_eq!(design.proposed.len(), 16386);
+        assert_eq!(design.proposed["Cargo.toml"], source);
+    }
 }
 
 fn library_root(resolver: &DeclarationResolver, file: &IndexedFile) -> bool {

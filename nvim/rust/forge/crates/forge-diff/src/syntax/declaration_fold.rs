@@ -40,7 +40,7 @@ impl DeclarationFolding {
         parser
             .set_language(&language.grammar())
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
-        let source = declaration_surrogate(language, text);
+        let source = declaration_surrogate(language, text)?;
         let tree = parser
             .parse(&source, None)
             .ok_or_else(|| SyntaxError::Query("declaration fold parsing was cancelled".into()))?;

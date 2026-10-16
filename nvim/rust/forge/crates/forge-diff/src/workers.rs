@@ -26,7 +26,6 @@ pub enum WorkStop {
 pub enum PoolError {
     Closed,
     Busy,
-    Oversized,
     WorkerUnavailable,
     Stopped(WorkStop),
 }
@@ -35,7 +34,6 @@ pub enum PoolError {
 pub struct PoolLimits {
     pub workers: usize,
     pub jobs: usize,
-    pub input_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -181,19 +179,16 @@ impl AnalysisPool {
         if state.closed {
             return Err(PoolError::Closed);
         }
-        if budget.input_bytes > self.shared.limits.input_bytes {
-            return Err(PoolError::Oversized);
-        }
         if self.shared.limits.workers == 0 || self.shared.limits.jobs == 0 {
             return Err(PoolError::WorkerUnavailable);
         }
-        if state.usage.admitted_jobs >= self.shared.limits.jobs
-            || budget.input_bytes > self.shared.limits.input_bytes - state.usage.input_bytes
-        {
+        if state.usage.admitted_jobs >= self.shared.limits.jobs {
             return Err(PoolError::Busy);
         }
         let sequence = state.next_sequence;
         let next_sequence = sequence.checked_add(1).ok_or(PoolError::WorkerUnavailable)?;
+        let input_bytes = state.usage.input_bytes.checked_add(budget.input_bytes)
+            .ok_or(PoolError::WorkerUnavailable)?;
 
         // Start capacity before retaining a queued closure, with workers blocked on the state lock.
         if state.usage.live_workers < self.shared.limits.workers
@@ -212,7 +207,7 @@ impl AnalysisPool {
         }
         state.next_sequence = next_sequence;
         state.usage.admitted_jobs += 1;
-        state.usage.input_bytes += budget.input_bytes;
+        state.usage.input_bytes = input_bytes;
         state.job.insert(
             sequence,
             WorkRecord {

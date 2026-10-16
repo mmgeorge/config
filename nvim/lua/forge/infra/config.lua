@@ -15,7 +15,6 @@
 ---@field status_diff_viewport_enabled boolean
 ---@field status_diff_viewport_threshold integer
 ---@field status_diff_viewport_overscan integer
----@field status_file_preview_line_limit integer
 ---@field about_auto_generate boolean
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .forge.json may override it
@@ -183,7 +182,6 @@ M.defaults = {
   status_diff_viewport_enabled = false,
   status_diff_viewport_threshold = 1200,
   status_diff_viewport_overscan = 80,
-  status_file_preview_line_limit = 1000,
   about_auto_generate = true,
   walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",

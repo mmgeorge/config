@@ -410,42 +410,38 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
         )
         .await;
     assert!(materialized.get("error").is_none(), "{materialized}");
-    let projection_revision = materialized["result"]["snapshot"]["revision"].clone();
     std::fs::write(
         root.path().join("submitted-body.json"),
         serde_json::to_vec(text).unwrap(),
     )
     .unwrap();
-    let accepted = host
+    let saved = host
         .request(
-            3,
-            "review.region_edit",
-            json!({"document":document,"region":"body","base":0,"sequence":1,"text":text}),
+            4,
+            "review.save",
+            json!({"document":document,"capture":[{
+                "document":document,"region":"body","base":0,"sequence":1,"text":text
+            }]}),
         )
         .await;
-    assert_eq!(accepted["result"]["revision"], 1, "{accepted}");
     assert_eq!(
-        accepted["result"]["patch"]["base"], projection_revision,
-        "{accepted}"
+        saved["result"]["snapshot"]["field"][1]["revision"], 1,
+        "{saved}"
     );
     assert_eq!(
-        accepted["result"]["patch"]["metadata_edit"]
-            .as_array()
-            .unwrap()
-            .len(),
-        1
+        saved["result"]["snapshot"]["field"][1]["sequence"], 1,
+        "{saved}"
     );
-    let saved = host
-        .request(4, "review.save", json!({"document":document}))
-        .await;
     assert_eq!(saved["result"]["remote"]["outcome"], "confirmed", "{saved}");
     assert_eq!(saved["result"]["snapshot"]["field"][1]["baseline"], text);
     assert_eq!(saved["result"]["snapshot"]["field"][1]["dirty"], false);
     let stale = host
         .request(
             5,
-            "review.region_edit",
-            json!({"document":document,"region":"body","base":0,"sequence":2,"text":"stale"}),
+            "review.save",
+            json!({"document":document,"capture":[{
+                "document":document,"region":"body","base":0,"sequence":2,"text":"stale"
+            }]}),
         )
         .await;
     assert!(stale.get("error").is_some());
@@ -455,11 +451,12 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
         "\"Uncertain title\"",
     )
     .unwrap();
-    let accepted = host.request(6, "review.region_edit", json!({"document":document,"region":"title","base":0,"sequence":2,"text":"Uncertain title"})).await;
-    assert_eq!(accepted["result"]["revision"], 1);
     let saved = host
-        .request(7, "review.save", json!({"document":document}))
+        .request(7, "review.save", json!({"document":document,"capture":[{
+            "document":document,"region":"title","base":0,"sequence":2,"text":"Uncertain title"
+        }]}))
         .await;
+    assert_eq!(saved["result"]["snapshot"]["field"][0]["revision"], 1, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["uncertain"], true, "{saved}");
     let reconciled = host
         .request(8, "review.reconcile", json!({"document":document}))
@@ -651,22 +648,42 @@ async fn issue_document_persists_edits_across_close_and_confirms_native_save() {
             .count(),
         3
     );
-    let edited = host
+    std::fs::write(
+        directory.path().join("actor-error"),
+        "fixture actor temporarily unavailable",
+    )
+    .unwrap();
+    let deferred = host
         .request(
             3,
             "issue.document",
-            json!({"operation":"edit","edit":{
-        "document":"native-issue-1","region":"title","base":0,"sequence":1,"text":saved_title}}),
+            json!({"operation":"save","document":"native-issue-1","capture":[{
+                "document":"native-issue-1","region":"title","base":0,"sequence":1,"text":saved_title
+            }]}),
         )
         .await;
-    assert_eq!(edited["result"]["revision"], 1, "{edited}");
-    assert_eq!(
-        edited["result"]["patch"]["metadata_edit"]
+    assert!(deferred.get("error").is_none(), "{deferred}");
+    assert!(
+        deferred["result"]["fields"]
             .as_array()
             .unwrap()
-            .len(),
-        1
+            .iter()
+            .any(|field| field["region"] == "title"
+                && field["revision"] == 1
+                && field["sequence"] == 1
+                && field["dirty"] == true
+                && field["uncertain"] == false),
+        "{deferred}"
     );
+    assert!(
+        deferred["result"]["diagnostic"]
+            .as_str()
+            .unwrap()
+            .contains("fixture actor temporarily unavailable"),
+        "{deferred}"
+    );
+    assert!(!directory.path().join("issue-edit-log").exists());
+    std::fs::remove_file(directory.path().join("actor-error")).unwrap();
     let closed = host
         .request(
             4,
@@ -762,22 +779,25 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
         )
         .await;
     assert!(opened.get("error").is_none(), "{opened}");
-    let edited = first
-        .request(
-            3,
-            "issue.document",
-            json!({"operation":"edit","edit":{"document":"restart-issue-first",
-                "region":"title","base":0,"sequence":1,"text":saved_title}}),
-        )
-        .await;
-    assert_eq!(edited["result"]["revision"], 1, "{edited}");
     let uncertain = first
         .request(
             4,
             "issue.document",
-            json!({"operation":"save","document":"restart-issue-first"}),
+            json!({"operation":"save","document":"restart-issue-first","capture":[{
+                "document":"restart-issue-first","region":"title","base":0,"sequence":1,"text":saved_title
+            }]}),
         )
         .await;
+    assert!(
+        uncertain["result"]["fields"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field["region"] == "title"
+                && field["revision"] == 1
+                && field["sequence"] == 1),
+        "{uncertain}"
+    );
     let operation_id = uncertain["result"]["recovery"]["capture"]["operation_id"]
         .as_str()
         .unwrap()
@@ -931,17 +951,12 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
         .await;
     assert!(opened.get("error").is_none(), "{opened}");
     let document = opened["result"]["document"].clone();
-    let edited = pr_host
-        .request(
-            14,
-            "review.region_edit",
-            json!({"document":document,"region":"title","base":0,"sequence":1,"text":saved_title}),
-        )
-        .await;
-    assert_eq!(edited["result"]["revision"], 1, "{edited}");
     let uncertain = pr_host
-        .request(15, "review.save", json!({"document":document}))
+        .request(15, "review.save", json!({"document":document,"capture":[{
+            "document":document,"region":"title","base":0,"sequence":1,"text":saved_title
+        }]}))
         .await;
+    assert_eq!(uncertain["result"]["snapshot"]["field"][0]["revision"], 1, "{uncertain}");
     assert_eq!(
         uncertain["result"]["snapshot"]["uncertain"], true,
         "{uncertain}"
@@ -1692,15 +1707,16 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         .await;
     assert!(opened["result"].get("composer").is_none(), "{opened}");
     let transcript_revision = opened["result"]["transcript"]["revision"].clone();
-    let oversized = host
+    let complete_text = format!("{}complete tail", "complete λ\n".repeat(6000));
+    let submitted_large = host
         .request(
             5,
             "prompt.submit",
-            json!({"text":format!("x{}", "\n".repeat(4096)),
+            json!({"text":complete_text,
                 "submission":{"document":"transcript","token":1}}),
         )
         .await;
-    assert!(oversized.get("error").is_some(), "{oversized}");
+    assert!(submitted_large.get("error").is_none(), "{submitted_large}");
     let synchronized = host
         .request(
             7,
@@ -1710,13 +1726,14 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             }),
         )
         .await;
-    assert_eq!(synchronized["result"]["patch"], json!([]), "{synchronized}");
+    assert!(synchronized["result"]["patch"].as_array()
+        .is_some_and(|patch| !patch.is_empty()), "{synchronized}");
     let submitted = host
         .request(
             21,
             "prompt.submit",
             json!({
-                "mode":"chat", "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":1}
+                "mode":"chat", "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":2}
             }),
         )
         .await;
@@ -1727,7 +1744,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             .any(|event| event["event"] == "backend_event"
                 && event["payload"]["kind"] == "prompt_submission"
                 && event["payload"]["data"]
-                    == json!({"document":"transcript","token":1,"state":"accepted"})),
+                    == json!({"document":"transcript","token":2,"state":"accepted"})),
         "missing prompt admission event"
     );
     let duplicate = host
@@ -1735,7 +1752,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             22,
             "prompt.submit",
             json!({"text":"duplicate",
-        "submission":{"document":"transcript","token":1}}),
+        "submission":{"document":"transcript","token":2}}),
         )
         .await;
     assert!(duplicate.get("error").is_some(), "{duplicate}");
@@ -1754,7 +1771,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             9,
             "prompt.submit",
             json!({"text":"late prompt",
-        "submission":{"document":"transcript","token":2}}),
+        "submission":{"document":"transcript","token":3}}),
         )
         .await;
     assert!(
@@ -1765,6 +1782,8 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
         "{stale}"
     );
     let state = host.request(10, "state.get", json!({})).await;
+    let exchanges = host.request(11, "exchange.list", json!({})).await;
+    assert_eq!(exchanges["result"][0]["prompt"], complete_text);
     assert_eq!(
         state["result"]["session"]["id"],
         initialized["result"]["session"]["id"]
@@ -2049,28 +2068,17 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
     assert_eq!(snapshot["baseline"], "remote old", "{loaded}");
     let comment = snapshot["comment"].clone();
     let region = snapshot["region"].clone();
-    let changed = host
-        .request(
-            4,
-            "review.region_edit",
-            json!({"document":document,"region":region,"base":0,"sequence":1,"text":"submitted"}),
-        )
-        .await;
-    assert!(changed.get("error").is_none(), "{changed}");
-    let saved = host.request(5,"review.comment",json!({"document":document,"command":{"operation":"save","comment":comment,"action":"save"}})).await;
+    let saved = host.request(5,"review.comment",json!({
+        "document":document,
+        "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":"submitted"}],
+        "command":{"operation":"save","comment":comment,"action":"save"}
+    })).await;
+    assert_eq!(saved["result"]["snapshot"]["revision"], 1, "{saved}");
     assert_eq!(
         saved["result"]["snapshot"]["baseline"], "submitted",
         "{saved}"
     );
     assert_eq!(saved["result"]["snapshot"]["dirty"], false);
-    let changed = host
-        .request(
-            6,
-            "review.region_edit",
-            json!({"document":document,"region":region,"base":1,"sequence":2,"text":"uncertain"}),
-        )
-        .await;
-    assert!(changed.get("error").is_none());
     std::fs::write(root.path().join("mode"), "comment_uncertain").unwrap();
     std::fs::write(
         root.path().join("rest-after.json"),
@@ -2082,22 +2090,23 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
         serde_json::to_vec(&json!({"data":{"node":hosted_comment("uncertain")}})).unwrap(),
     )
     .unwrap();
-    let saved = host.request(7,"review.comment",json!({"document":document,"command":{"operation":"save","comment":comment,"action":"save"}})).await;
+    let saved = host.request(7,"review.comment",json!({
+        "document":document,
+        "capture":[{"document":document,"region":region,"base":1,"sequence":2,"text":"uncertain"}],
+        "command":{"operation":"save","comment":comment,"action":"save"}
+    })).await;
+    assert_eq!(saved["result"]["snapshot"]["revision"], 2, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["uncertain"], true, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["baseline"], "submitted");
-    let changed = host
-        .request(
-            8,
-            "review.region_edit",
-            json!({"document":document,"region":region,"base":2,"sequence":3,"text":"newer"}),
-        )
-        .await;
-    assert!(changed.get("error").is_none());
     let reconciled = host
         .request(
             9,
             "review.comment",
-            json!({"document":document,"command":{"operation":"reconcile","comment":comment}}),
+            json!({
+                "document":document,
+                "capture":[{"document":document,"region":region,"base":2,"sequence":3,"text":"newer"}],
+                "command":{"operation":"reconcile","comment":comment}
+            }),
         )
         .await;
     assert_eq!(
@@ -2105,6 +2114,8 @@ async fn review_comment_route_owns_native_baseline_and_retains_unknown_submissio
         "{reconciled}"
     );
     assert_eq!(reconciled["result"]["snapshot"]["text"], "newer");
+    assert_eq!(reconciled["result"]["snapshot"]["revision"], 3);
+    assert_eq!(reconciled["result"]["snapshot"]["sequence"], 3);
     assert_eq!(reconciled["result"]["snapshot"]["dirty"], true);
     assert_eq!(reconciled["result"]["snapshot"]["uncertain"], false);
     assert_eq!(
@@ -2148,14 +2159,6 @@ async fn review_conversation_draft_creates_through_native_host() {
         serde_json::to_vec(&hosted_rest_comment(body)).unwrap(),
     )
     .unwrap();
-    let edited = host
-        .request(
-            4,
-            "review.region_edit",
-            json!({"document":document,"region":region,"base":0,"sequence":1,"text":body}),
-        )
-        .await;
-    assert!(edited.get("error").is_none(), "{edited}");
     std::fs::write(root.path().join("mode"), "creation_ok").unwrap();
     std::fs::write(root.path().join("creation-echo-receipt"), "yes").unwrap();
     for (field, value) in [("subjectId", "PR_fixture"), ("body", body)] {
@@ -2169,7 +2172,12 @@ async fn review_conversation_draft_creates_through_native_host() {
     let mut state = hosted_comment(body);
     state["__typename"] = json!("IssueComment");
     std::fs::write(root.path().join("creation-result.json"),serde_json::to_vec(&json!({"data":{"mutation":{"clientMutationId":"__receipt__","subject":{"id":"PR_fixture"},"commentEdge":{"node":state}}}})).unwrap()).unwrap();
-    let saved = host.request(5,"review.comment",json!({"document":document,"command":{"operation":"save","comment":comment,"action":"save"}})).await;
+    let saved = host.request(5,"review.comment",json!({
+        "document":document,
+        "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":body}],
+        "command":{"operation":"save","comment":comment,"action":"save"}
+    })).await;
+    assert_eq!(saved["result"]["snapshot"]["revision"], 1, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["baseline"], body, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["dirty"], false);
     assert_eq!(saved["result"]["snapshot"]["comment"], comment);

@@ -1,6 +1,5 @@
 local M = {}
 
-local MAX_FILE_BYTES = 16 * 1024 * 1024
 local MAX_CACHE_BYTES = 32 * 1024 * 1024
 local MAX_REPOSITORIES = 16
 local MAX_READS = 4
@@ -31,6 +30,8 @@ local entry_by_repo = {}
 ---@type table<string, GithubIssueSnapshotLoad>
 local request_by_repo = {}
 local cache_bytes = 0
+---@type { entry: GithubIssueSnapshotEntry, issues: table[] }?
+local active_snapshot
 local active_reads = 0
 local access = 0
 ---@type GithubIssueSnapshotLoad[]
@@ -48,6 +49,7 @@ end
 ---@param entry GithubIssueSnapshotEntry
 local function dispose(entry)
   cache_bytes = cache_bytes - entry.bytes
+  if active_snapshot and active_snapshot.entry == entry then active_snapshot = nil end
   if entry.watcher then
     entry.watcher:stop()
     entry.watcher:close()
@@ -157,12 +159,17 @@ local function read(request)
       end
       if not failure and issues then
         local entry = request.entry
-        if make_room(request.repo, size - entry.bytes, false) then
+        if size > MAX_CACHE_BYTES or not make_room(request.repo, size - entry.bytes, false) then
+          if active_snapshot then active_snapshot.entry.signature = nil end
+          cache_bytes = cache_bytes - entry.bytes
+          entry.issues, entry.bytes, entry.signature = {}, 0, source_signature
+          entry.revision = loaded_revision
+          active_snapshot = { entry = entry, issues = issues }
+        else
+          if active_snapshot and active_snapshot.entry == entry then active_snapshot = nil end
           cache_bytes = cache_bytes + size - entry.bytes
           entry.issues, entry.bytes, entry.signature = issues, size, source_signature
           entry.revision = loaded_revision
-        else
-          failure = "Completion snapshot cache exceeds its 32 MiB byte budget"
         end
       end
       if request_by_repo[request.repo] == request then request_by_repo[request.repo] = nil end
@@ -230,7 +237,6 @@ local function read(request)
         if stat_failure then finish(tostring(stat_failure)) return end
         size = stat.size
         source_signature = signature(stat)
-        if size > MAX_FILE_BYTES then finish("Completion snapshot exceeds its 16 MiB file limit") return end
         if stat.type ~= "file" then finish("Completion snapshot is not a regular file") return end
         if not request.force and request.entry.signature == source_signature
           and (expected_revision == nil or request.entry.revision == expected_revision) then finish(nil) return end
@@ -314,6 +320,7 @@ function M.records(repo)
   if not entry then return {} end
   access = access + 1
   entry.touched = access
+  if active_snapshot and active_snapshot.entry == entry then return active_snapshot.issues end
   return entry.issues
 end
 

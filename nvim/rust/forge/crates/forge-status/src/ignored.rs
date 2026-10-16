@@ -10,8 +10,6 @@ use std::{
 };
 
 pub(crate) type IgnoredPathSet = HashSet<RepositoryPath>;
-const MAX_BYTES: usize = 1024 * 1024;
-const MAX_PATHS: usize = 10_000;
 
 #[derive(Deserialize, Serialize)]
 struct Payload {
@@ -21,6 +19,7 @@ struct Payload {
 }
 
 fn identity(root: &Path) -> Result<String> {
+    let root = root.canonicalize().context("resolve ignored-path worktree root")?;
     let mut key = root
         .to_str()
         .context("Forge ignored paths require a UTF-8 worktree root")?
@@ -59,15 +58,8 @@ fn read(path: &Path, key: &str) -> Result<IgnoredPathSet> {
         metadata.is_file() && !metadata.file_type().is_symlink(),
         "ignored store is not a regular file"
     );
-    ensure!(
-        metadata.len() <= MAX_BYTES as u64,
-        "ignored store exceeds 1 MiB"
-    );
     let mut bytes = Vec::new();
-    File::open(path)?
-        .take(MAX_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    ensure!(bytes.len() <= MAX_BYTES, "ignored store grew beyond 1 MiB");
+    File::open(path)?.read_to_end(&mut bytes)?;
     if bytes.is_empty() {
         return Ok(HashSet::new());
     }
@@ -78,10 +70,6 @@ fn read(path: &Path, key: &str) -> Result<IgnoredPathSet> {
         "unsupported Forge ignored-path version"
     );
     ensure!(payload.root == key, "ignored-path worktree root differs");
-    ensure!(
-        payload.ignored_paths.len() <= MAX_PATHS,
-        "ignored store exceeds 10000 paths"
-    );
     let mut result = HashSet::new();
     for path in payload.ignored_paths {
         let path = path.replace('\\', "/");
@@ -103,8 +91,8 @@ pub(crate) fn update(
     ignored: bool,
 ) -> Result<IgnoredPathSet> {
     ensure!(
-        !selected.is_empty() && selected.len() <= MAX_PATHS,
-        "ignored change requires 1 to 10000 paths"
+        !selected.is_empty(),
+        "ignored change requires paths"
     );
     let (destination, key) = path(directory, root)?;
     std::fs::create_dir_all(directory)?;
@@ -129,10 +117,6 @@ pub(crate) fn update(
             current.remove(path);
         }
     }
-    ensure!(
-        current.len() <= MAX_PATHS,
-        "ignored store exceeds 10000 paths"
-    );
     let mut paths: Vec<_> = current
         .iter()
         .map(|path| std::str::from_utf8(path.raw()).map(str::to_owned))
@@ -144,7 +128,6 @@ pub(crate) fn update(
         root: key,
         ignored_paths: paths,
     })?;
-    ensure!(bytes.len() <= MAX_BYTES, "ignored store exceeds 1 MiB");
     let temporary = destination.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let mut temporary = Temporary {
         path: temporary,

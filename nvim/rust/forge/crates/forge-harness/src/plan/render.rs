@@ -1,6 +1,5 @@
 use super::document::*;
 use super::{PlanGraph, validate_plan_render};
-use crate::limits::serialized_size;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -195,8 +194,6 @@ pub struct RenderedPlan {
 struct PlanRenderer {
     line: Vec<String>,
     navigation: PlanNavigationIndex,
-    bytes: usize,
-    metadata_bytes: usize,
     exhausted: bool,
 }
 
@@ -220,7 +217,6 @@ struct DiagramCell {
 
 struct RenderRows<Row> {
     row: Vec<Row>,
-    bytes: usize,
     exhausted: bool,
 }
 
@@ -228,24 +224,16 @@ impl<Row> Default for RenderRows<Row> {
     fn default() -> Self {
         Self {
             row: Vec::new(),
-            bytes: 0,
             exhausted: false,
         }
     }
 }
 
-impl<Row: Serialize> RenderRows<Row> {
+impl<Row> RenderRows<Row> {
     fn push(&mut self, row: Row) {
         if self.exhausted {
             return;
         }
-        let remaining = (32 * 1024 * 1024usize).saturating_sub(self.bytes);
-        let size = serialized_size(&row, remaining);
-        if self.row.len() >= 65536 || size.is_err() {
-            self.exhausted = true;
-            return;
-        }
-        self.bytes += size.expect("bounded render row");
         self.row.push(row);
     }
     fn extend(&mut self, rows: impl IntoIterator<Item = Row>) {
@@ -262,8 +250,6 @@ impl PlanRenderer {
     fn new(document: &PlanDocument) -> Self {
         Self {
             line: Vec::new(),
-            bytes: 0,
-            metadata_bytes: 0,
             exhausted: false,
             navigation: PlanNavigationIndex {
                 plan_id: document.plan_id.clone(),
@@ -285,14 +271,6 @@ impl PlanRenderer {
             return;
         }
         let value = value.into();
-        let row_count = value.bytes().filter(|byte| *byte == b'\n').count() + 1;
-        if row_count > 65536usize.saturating_sub(self.line.len())
-            || value.len() + 1 > (8 * 1024 * 1024usize).saturating_sub(self.bytes)
-        {
-            self.exhausted = true;
-            return;
-        }
-        self.bytes += value.len() + 1;
         let mut anchor = PlanNavigationAnchor {
             line: 0,
             target,
@@ -303,14 +281,6 @@ impl PlanRenderer {
         for row in value.split('\n') {
             if !row.is_empty() {
                 anchor.line = self.line.len() as u32 + 1;
-                let Ok(size) = serialized_size(
-                    &anchor,
-                    (32 * 1024 * 1024usize).saturating_sub(self.metadata_bytes),
-                ) else {
-                    self.exhausted = true;
-                    return;
-                };
-                self.metadata_bytes += size;
                 self.navigation.anchor.push(anchor.clone());
             }
             self.line.push(row.to_owned());
@@ -321,11 +291,6 @@ impl PlanRenderer {
         if self.exhausted {
             return;
         }
-        if self.line.len() >= 65536 || self.bytes >= 8 * 1024 * 1024 {
-            self.exhausted = true;
-            return;
-        }
-        self.bytes += 1;
         self.line.push(String::new());
     }
 
@@ -365,7 +330,7 @@ impl PlanRenderer {
     fn finish(self) -> Result<RenderedPlan> {
         anyhow::ensure!(
             !self.exhausted,
-            "plan rendering exceeds 8 MiB text, 65536 rows, 32 MiB navigation/diagram metadata, or 128 diagram levels"
+            "plan rendering exceeds 128 diagram levels"
         );
         debug_assert_eq!(
             self.line.iter().filter(|line| !line.is_empty()).count(),
@@ -424,7 +389,6 @@ pub fn render_plan(document: &PlanDocument) -> Result<RenderedPlan> {
 /// Render one plan against its repository root so file status reflects the worktree.
 pub fn render_plan_at(document: &PlanDocument, workspace: &Path) -> Result<RenderedPlan> {
     if document.design.is_some() { document.validate()?; return super::design_review::render(document); }
-    serialized_size(document, 8 * 1024 * 1024)?;
     validate_plan_render(document)?;
     let graph = PlanGraph::new(document);
     let mut renderer = PlanRenderer::new(document);
@@ -1955,27 +1919,24 @@ fn entity_json_path(document: &PlanDocument, entity_name: &str) -> String {
 #[cfg(test)]
 mod test {
     #[test]
-    fn renderer_rejects_row_and_text_limits_without_publishing_partial_markdown() {
+    fn renderer_preserves_content_beyond_former_row_and_text_limits() {
         let document = crate::plan::document::test_fixture("plan", "overview");
         let mut renderer = PlanRenderer::new(&document);
         for _ in 0..65537 {
             renderer.blank();
         }
-        assert_eq!(renderer.line.len(), 65536);
-        assert!(renderer.finish().is_err());
+        assert_eq!(renderer.line.len(), 65537);
+        assert_eq!(renderer.finish().unwrap().markdown.len(), 65537);
         let mut renderer = PlanRenderer::new(&document);
         renderer.section("x".repeat(8 * 1024 * 1024), PlanSection::Title, "/title");
-        assert!(renderer.line.is_empty());
-        assert!(renderer.finish().is_err());
-        assert!(serialized_size(&"escaped\\text", 4).is_err());
+        assert_eq!(renderer.finish().unwrap().markdown.len(), 8 * 1024 * 1024 + 1);
         let mut renderer = PlanRenderer::new(&document);
         renderer.section("\n".repeat(65536), PlanSection::Overview, "/overview");
-        assert!(renderer.line.is_empty());
-        assert!(renderer.finish().is_err());
+        assert_eq!(renderer.finish().unwrap().markdown.lines().count(), 65537);
     }
 
     #[test]
-    fn wrapping_streams_rows_and_diagram_admission_stops_before_retaining_overflow() {
+    fn wrapping_streams_rows_and_diagrams_preserve_large_cells() {
         assert_eq!(
             wrap_prefixed("one two three", "- ", "  ", 9).collect::<Vec<_>>(),
             ["- one two", "  three"]
@@ -1985,12 +1946,12 @@ mod test {
             ["prefix"]
         );
         let mut cells = RenderRows::default();
-        cells.bytes = 32 * 1024 * 1024;
         cells.push(DiagramCell {
-            text: "new".into(),
+            text: "x".repeat(32 * 1024 * 1024 + 1),
             anchor: object_model_anchor(),
         });
-        assert!(cells.exhausted && cells.row.is_empty());
+        assert!(!cells.exhausted);
+        assert_eq!(cells.row[0].text.len(), 32 * 1024 * 1024 + 1);
     }
     use super::*;
     use crate::plan::{attach_integration_test_fixture, attach_test_fixture, test_fixture};

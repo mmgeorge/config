@@ -35,8 +35,8 @@ impl CheckTrigger {
     pub(crate) fn validate(&self) -> Result<()> {
         if let Self::Paths { include, exclude } | Self::FilesChanged { include, exclude } = self {
             ensure!(
-                !include.is_empty() && include.len() + exclude.len() <= 128,
-                "path triggers require 1 to 128 patterns"
+                !include.is_empty(),
+                "path triggers require include patterns"
             );
             for pattern in include.iter().chain(exclude) {
                 super::config::relative_path(pattern)?;

@@ -65,7 +65,7 @@ local function launch(state, config, path, filetype, accept_root, on_settled)
   local job = { path = path, filetype = filetype, name = config.name, started = vim.uv.now(), on_settled = on_settled }
   state.jobs[key] = job
   state.timer:again()
-  source.read(path, nil, function(contents, failure)
+  source.read(path, function(contents, failure)
     if state.closed then return end
     if failure then settle(job, "startup_failed: " .. config.name .. " — " .. failure) return end
     local buffer, owned, open_error = source.open(path, contents, filetype)

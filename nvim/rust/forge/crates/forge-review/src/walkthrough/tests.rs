@@ -22,10 +22,8 @@ async fn composite_review_preserves_diff_source_coordinates_and_annotation_reflo
             forge_diff::workers::PoolLimits {
                 workers: 1,
                 jobs: 2,
-                input_bytes: 8 * 1024 * 1024,
             },
         )),
-        Default::default(),
     );
     service
         .project_review(&input, &annotation, &mut change, &diff, &syntax)
@@ -104,6 +102,54 @@ async fn composite_review_preserves_diff_source_coordinates_and_annotation_reflo
     assert_eq!(change.source.text(), "fn current() {}\n");
     service.close_collected(&document).await;
 }
+
+#[tokio::test]
+async fn composite_review_drains_all_chunks_with_an_anchor_after_the_first_chunk() {
+    let (directory, service, document) = fixture(false).await;
+    service.close_collected(&document).await;
+    let source_rows = (0..600)
+        .map(|row| format!("// row {row} {}", "x".repeat(512)))
+        .collect::<Vec<_>>();
+    let source = format!("{}\n", source_rows.join("\n"));
+    assert!(source.len() > 128 * 1024);
+    std::fs::write(directory.path().join("source.rs"), source).unwrap();
+    let artifact_path = directory.path().join(".walkthrough.json");
+    let mut artifact: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&artifact_path).unwrap()).unwrap();
+    artifact["tasks"][0]["subtasks"][0]["changes"][0]["line"] = serde_json::json!(500);
+    std::fs::write(artifact_path, serde_json::to_vec(&artifact).unwrap()).unwrap();
+    service
+        .open(document.clone(), directory.path().to_owned(), false)
+        .await
+        .unwrap();
+    let input = source_input(&service, &document);
+    let annotation = DocumentId("review:complete".into());
+    let mut change = service
+        .resolve_change(input.clone(), annotation.clone())
+        .await
+        .unwrap();
+    let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
+    let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(forge_diff::workers::AnalysisPool::new(
+        forge_diff::workers::PoolLimits { workers: 1, jobs: 2 },
+    )));
+    service
+        .project_review(&input, &annotation, &mut change, &diff, &syntax)
+        .await
+        .unwrap();
+    let rows = change
+        .annotation
+        .block
+        .iter()
+        .flat_map(|block| (0..block.text.row_count()).map(|row| block.text.row(row).unwrap()))
+        .collect::<Vec<_>>();
+    for source_row in &source_rows {
+        assert!(rows.contains(&source_row.as_str()));
+    }
+    assert!(!rows.iter().any(|row| row.contains("excerpt is limited")));
+    assert_eq!(change.row, 499);
+    service.close_collected(&document).await;
+}
+
 fn git(root: &std::path::Path, arguments: &[&str]) -> String {
     let output = read_command(
         std::process::Command::new("git")
@@ -111,7 +157,6 @@ fn git(root: &std::path::Path, arguments: &[&str]) -> String {
             .arg(root)
             .args(arguments),
         CommandLimits {
-            stdout_bytes: 8192,
             stderr_bytes: 8192,
             timeout: std::time::Duration::from_secs(10),
         },
@@ -127,7 +172,10 @@ fn git(root: &std::path::Path, arguments: &[&str]) -> String {
 }
 async fn fixture(stale: bool) -> (tempfile::TempDir, WalkthroughService, DocumentId) {
     let (directory, head) = tokio::task::spawn_blocking(|| {
-        let directory = tempfile::tempdir().unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(".forge-walkthrough-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         git(directory.path(), &["init", "--initial-branch=main"]);
         git(directory.path(), &["config", "user.name", "Forge Test"]);
         git(

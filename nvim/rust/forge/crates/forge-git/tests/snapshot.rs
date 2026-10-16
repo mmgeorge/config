@@ -7,7 +7,7 @@ use forge_git::{
 };
 
 fn parse(input: &[u8]) -> anyhow::Result<Vec<forge_git::snapshot::PathRecord>> {
-    parse_porcelain_v2(input, gix::hash::Kind::Sha1, 4096, 32)
+    parse_porcelain_v2(input, gix::hash::Kind::Sha1)
 }
 
 fn tracked(kind: &str, pair: &str, suffix: &str) -> Vec<u8> {
@@ -89,9 +89,8 @@ fn rejects_truncation_invalid_metadata_and_limits() {
     assert!(parse(b"? ../escape\0").is_err());
     assert!(parse(b"\0").is_err());
     assert!(parse(b"? repeated\0? repeated\0").is_err());
-    assert!(parse_porcelain_v2(&valid, gix::hash::Kind::Sha256, 4096, 32).is_err());
-    assert!(parse_porcelain_v2(&valid, gix::hash::Kind::Sha1, valid.len() - 1, 32).is_err());
-    assert!(parse_porcelain_v2(&valid, gix::hash::Kind::Sha1, 4096, 0).is_err());
+    assert!(parse_porcelain_v2(&valid, gix::hash::Kind::Sha256).is_err());
+    assert!(parse_porcelain_v2(&valid, gix::hash::Kind::Sha1).is_ok());
 }
 
 #[test]
@@ -104,7 +103,7 @@ fn permits_empty_status_unknown_headers_and_sha256() {
         "a".repeat(64)
     );
     assert_eq!(
-        parse_porcelain_v2(input.as_bytes(), gix::hash::Kind::Sha256, 4096, 1)
+        parse_porcelain_v2(input.as_bytes(), gix::hash::Kind::Sha256)
             .unwrap()
             .len(),
         1
@@ -187,7 +186,7 @@ async fn process_reader_uses_store_admission_and_reports_backend() {
     let directory = tempfile::tempdir().unwrap();
     git(directory.path(), &["init", "--quiet"]);
     std::fs::write(directory.path().join("new file"), "content\n").unwrap();
-    let store = forge_git::store::RepositoryStore::new(4, 1, 1024 * 1024).unwrap();
+    let store = forge_git::store::RepositoryStore::new(4, 1).unwrap();
     let repository = store
         .open(directory.path().to_path_buf())
         .await
@@ -220,7 +219,7 @@ async fn process_reader_supports_sha256_and_rejects_bare_repositories() {
     );
     std::fs::write(directory.path().join("staged"), "content\n").unwrap();
     git(directory.path(), &["add", "staged"]);
-    let store = forge_git::store::RepositoryStore::new(4, 1, 1024 * 1024).unwrap();
+    let store = forge_git::store::RepositoryStore::new(4, 1).unwrap();
     let repository = store
         .open(directory.path().to_path_buf())
         .await

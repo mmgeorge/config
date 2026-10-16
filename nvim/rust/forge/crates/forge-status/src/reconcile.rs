@@ -1,5 +1,5 @@
 use crate::StatusSection;
-use crate::document::{DOCUMENT_BYTES, FileTarget, StatusDocument, context_cost, inventory};
+use crate::document::{FileTarget, StatusDocument, context_cost, inventory};
 use crate::protocol::*;
 use anyhow::{Result, ensure};
 use forge_git::snapshot::PathState;
@@ -37,10 +37,6 @@ pub(crate) fn reconcile(
             }
         }
     }
-    ensure!(
-        retained_bytes <= DOCUMENT_BYTES,
-        "status refresh exceeds 16 MiB document budget"
-    );
     let next_revision = document.revision.next()?;
     for target in &unchanged {
         let mut previous = document.file.remove(target).expect("retained file");

@@ -5,7 +5,6 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
-const MAX_CACHE_BYTES: u64 = 16 * 1024;
 const DISCOVERY_OVERRIDE: &[&str] = &[
     "EXEPATH",
     "GIT_EXEC_PATH",
@@ -60,13 +59,11 @@ fn resolve(
     discover: impl FnOnce() -> Option<PathBuf>,
 ) -> Result<(Option<PathBuf>, bool)> {
     match File::open(cache_path) {
-        Ok(file) => {
+        Ok(mut file) => {
             let mut bytes = Vec::new();
-            file.take(MAX_CACHE_BYTES + 1)
-                .read_to_end(&mut bytes)
+            file.read_to_end(&mut bytes)
                 .context("read Git configuration location cache")?;
-            if bytes.len() <= MAX_CACHE_BYTES as usize
-                && let Ok(location) = serde_json::from_slice::<ConfigLocation>(&bytes)
+            if let Ok(location) = serde_json::from_slice::<ConfigLocation>(&bytes)
                 && location.version == 1
                 && location.system_prefix.is_absolute()
                 && location.system_prefix.is_dir()
@@ -92,10 +89,6 @@ fn resolve(
         version: 1,
         system_prefix: prefix.clone(),
     })?;
-    ensure!(
-        encoded.len() <= MAX_CACHE_BYTES as usize,
-        "Git configuration cache exceeds 16 KiB"
-    );
     let mut temporary = tempfile::NamedTempFile::new_in(parent)
         .context("create Git configuration cache temporary file")?;
     temporary
@@ -145,7 +138,7 @@ mod tests {
         let cache = directory.path().join("location.json");
         for bytes in [
             b"broken".to_vec(),
-            vec![b' '; MAX_CACHE_BYTES as usize + 1],
+            vec![b' '; 16 * 1024 + 1],
             serde_json::to_vec(&ConfigLocation {
                 version: 9,
                 system_prefix: prefix.clone(),

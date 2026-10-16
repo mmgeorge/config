@@ -44,8 +44,9 @@ open completion snapshot. A failed later page preserves earlier committed progre
 cursor fails before committing that page. A non-manual refresh skips remote reads only when its
 scope history is complete, its snapshot exists, and its last check is less than ten minutes old.
 
-The loop admits at most 100 records per page and 10,000 pages, with nonempty cursors limited to
-512 bytes. Rate-limit read failures receive at most three retries with sixty-second timers. Normal
+The loop accepts at most 100 records per API page and follows nonempty, advancing cursors until
+history completes or reaches the high-water mark. It imposes no total page or cursor-byte cap.
+Rate-limit read failures receive at most three retries with sixty-second timers. Normal
 page spacing is 150 milliseconds. Exhausted page rate budgets wait sixty seconds. Each remote read
 has a 120-second deadline. Close notification takes priority over read or timer progression.
 
@@ -61,7 +62,7 @@ validation. `GithubRemote` is currently an injectable issue-read contract. The c
 client, host sync route, Lua consumer cutover, progress events, and coordinated deletion command
 remain pending. Production remote sync still uses the Lua implementation until those paths switch.
 
-## Bounded gh issue reads
+## Owned gh issue reads
 
 `GhClient` supplies the concrete `GithubRemote` issue-page implementation. It invokes gh directly
 with explicit hostname routing, inherited authentication, and JSON request variables stored in an
@@ -69,26 +70,27 @@ owned temporary input file. Initial open scope requests open issues. All scope a
 refresh request open and closed issues. The query preserves the existing hundred-issue page and
 fifty-label limits and excludes issue bodies.
 
-The client reuses forge-git's retained blocking read pool and bounded command runner. Four admitted
-native requests share a 64 KiB input budget. Each process accepts at most 8 MiB stdout and 64 KiB
-stderr, with a 120-second execution deadline. A blocking worker drives Tokio process I/O through
-the existing runtime. `process-wrap` contains each command in a Windows Job Object or Unix process
+The client reuses forge-git's retained blocking read pool and command runner. At most four native
+requests execute concurrently, and each retains complete request input, stdout, and stderr through
+a 120-second execution deadline. Total content bytes do not control admission.
+A blocking worker drives Tokio process I/O through the existing runtime. `process-wrap` contains
+each command in a Windows Job Object or Unix process
 group. Cancellation and deadlines terminate that job or group, await its exit, and collect both
-bounded streams before releasing admission. Windows `KillOnDrop` also terminates the job if the
+streams before releasing admission. Windows `KillOnDrop` also terminates the job if the
 Rust host exits unexpectedly. Unix process groups need a surviving owner to receive cancellation,
 so forced host death has no equivalent guarantee. Git can leave a repository lock after forced
 termination, which requires separate recovery.
 
-GraphQL decoding bounds issue, label, and error collections while consuming the response. An empty
+GraphQL decoding preserves complete returned issue, label, and error collections. An empty
 issue connection succeeds. Missing fields, malformed JSON, invalid pagination, GraphQL errors, and
 command failures remain errors. Error categories preserve rate limits, missing repositories,
 authentication failures, and local Busy admission. Diagnostics preserve UTF-8 within a 64 KiB limit
-and mark truncation. Decoded collection limits do not establish global allocation accounting.
+and mark truncation. This diagnostic retention budget does not reject or truncate successful content.
 
 Native tests compile a local Rust gh fixture and execute the real client against it. They verify
 arguments, request-file cleanup, Unicode records, cancellation and child reaping, admission overflow,
-oversized output, stderr classification, and retained descendant pipes. The fixture performs no
-network requests. Unit tests verify empty results, missing fields, API failures, collection limits,
+large output, stderr classification, and retained descendant pipes. The fixture performs no
+network requests. Unit tests verify empty results, missing fields, API failures, complete collections,
 and diagnostic truncation. The client is not yet registered with host runtime ownership or exposed
 through a sync route, so production Lua consumers have not switched.
 
@@ -193,12 +195,13 @@ and reopening the same issue restores that buffer with its current unsaved text.
 
 GithubRemote now exposes typed IssueDetailRequest and IssueDetail results. GhClient routes issue
 detail reads through `gh issue view` with an explicit hostname-qualified repository. Detail and page
-requests share one native command runner and the same four-request admission pool. Process output
-limits remain 8 MiB stdout and 64 KiB stderr, with a 120-second execution deadline. Cancellation
+requests share one native command runner and the same four-request admission pool. Processes retain
+complete output with a 120-second execution deadline. Failure diagnostics retain up to 64 KiB and
+mark truncation independently of successful content. Cancellation
 retains admission until child exit, pipe drainage, decoding, and result collection finish.
 
-The detail decoder consumes the CLI's current exported schema. It bounds returned comments to 1000
-and labels, assignees, and project items to 100 each. Exceeding a bound fails the read. Missing
+The detail decoder consumes the CLI's current exported schema and preserves every returned comment,
+label, assignee, and project item without collection-count admission limits. Missing
 required fields, mismatched repository or issue URLs, unsupported states, and invalid comment
 anchors fail decoding. Empty or null CLI collections remain valid empty collections. Normalization
 preserves bodies, metadata, project status, and comment source URLs. CLI issue comments do not
@@ -223,7 +226,7 @@ responses notify and fail their waiters. A throwing waiter does not prevent othe
 completing. Successful repository deletion invalidates both snapshot and detail memory and retires
 local pending detail callbacks without claiming cancellation of already-owned native work.
 
-Tests cover normalized fields, empty collections, collection overflow, source anchors, native
+Tests cover normalized fields, empty and large collections, source anchors, native
 argument routing, shared page/detail admission, cancellation and child reaping, retained service
 ownership after caller drop, shutdown, persistence, and oversized host responses. The Lua native
 fixture proves remote fetch, persisted reload after memory eviction, and detail invalidation after
@@ -238,13 +241,13 @@ detail fetches. Native commands share the existing four-request pool. Explicit h
 select the API host independently of the checkout's default repository.
 
 GhClient requests contributors and collaborators with per_page=100, --paginate, and --slurp. The
-typed decoder accepts at most 1000 pages of 100 users per source. The existing native output limit
-remains 8 MiB. User logins are nonempty, at most 256 bytes, and contain no whitespace or controls.
-Optional names are at most 1024 bytes. A sorted, case-insensitive map merges duplicate logins and
-fills a missing name from the other source, retaining at most 100,000 unique users. Empty pages are
-successful empty results. Malformed records and exceeded bounds are failures. A successful source
-can supply metadata when the other fails, with the failed source's diagnostic retained in the
-metadata failure list. Failure of both sources returns an error and preserves previous metadata.
+typed decoder preserves all returned pages and users. User logins must be nonempty and contain no
+whitespace or controls. Logins and optional names have no byte-admission cap.
+A sorted, case-insensitive map merges duplicate logins and fills a missing name from the other
+source, retaining every unique user. Empty pages are successful empty results. Malformed records
+remain failures. A successful source can supply metadata when the other fails, with the failed
+source's diagnostic retained in the metadata failure list. Failure of both sources returns an error
+and preserves previous metadata.
 Serialization omits absent names so cached Lua completion retains its repository-text fallback.
 
 MetadataStore validates the existing hostname/repos/owner/name path suffix and the record identity.
@@ -259,11 +262,11 @@ their own leases. Deletion cannot proceed until remote work and publication rele
 Dropping a request receiver leaves admitted work owned. Shutdown cancels remote waits and drains
 retained blocking publication. No database handle spans the remote wait.
 
-Publication validates the result, streams JSON through a 64 KiB buffer with a 16 MiB output limit,
-flushes and syncs the temporary file, and atomically replaces metadata.json. Serialization, byte
-limit, or flush failure leaves the prior file unchanged and removes temporary output. The file and
-record limits do not establish global process allocation bounds. The host uses segmented result
-delivery if the completed response exceeds one transport frame.
+Publication validates the result, streams complete JSON through a reusable 64 KiB buffer,
+flushes and syncs the temporary file, and atomically replaces metadata.json. Serialization or flush
+failure leaves the prior file unchanged and removes temporary output. The buffer controls write
+batching, not total file size. The host uses segmented result delivery if the completed response
+exceeds one transport frame.
 
 Lua repo_users now adapts requests to the host. The two former gh contributor methods and Lua user
 pagination, merge, and metadata-write implementations are removed. Status, issue, and notification
@@ -273,10 +276,10 @@ changed cache context or foreign identity, and repository deletion retires pendi
 context. Error paths release local admission and report refresh failure. Lua does not write the
 host's metadata result back to disk.
 
-Tests cover source merging, partial and total failures, invalid and oversized pages, retained
+Tests cover source merging, partial and total failures, invalid and large pages, retained
 ownership after caller drop, shutdown, old-format cache reuse, identity rejection, publication
-overflow, and temporary-file cleanup. The native Neovim fixture fetches merged users through the
-actual host, observes persisted metadata before callback completion, and removes metadata through
+of complete large metadata, and temporary-file cleanup. The native Neovim fixture fetches merged
+users through the actual host, observes persisted metadata before callback completion, and removes metadata through
 coordinated repository deletion. Remote mutations, other feature services, process-tree cleanup,
 global memory accounting, and the remaining migration gates are still open.
 
@@ -291,7 +294,7 @@ IssueStore.reconcile_snapshot retains the repository operation lease and databas
 checking the published repository, filter, revision, and row count. A missing or mismatched file
 is rebuilt from committed records. A database without a committed page reports ready=false and
 does not publish an empty success. Fresh automatic sync repairs the file before freshness can
-skip remote work. The shared publisher streams JSON through a 64 KiB buffer, enforces 16 MiB,
+skip remote work. The shared publisher streams complete JSON through a reusable 64 KiB buffer,
 flushes and syncs the temporary file, and replaces the destination atomically.
 
 Production Lua preload and watcher reload reconcile inside the existing four-active-request
@@ -299,6 +302,11 @@ admission bound. Concurrent callers coalesce, and callback identity checks rejec
 contexts. Lua verifies the decoded revision before adopting records. Concurrent file replacement
 uses the existing three-attempt bound. Failures preserve prior records and report failure to the
 caller. Synchronous completion performs no storage request or disk read.
+
+Lua retains reusable snapshots within a 32 MiB cache and a sixteen-repository cache budget.
+A snapshot larger than that byte budget, or blocked from cache admission by pending readers,
+remains available through one separately retained active snapshot. Eviction controls reuse,
+not which complete issue content completion can consume.
 
 The two-process fixture kills the writer after its database commit and observes repair by the
 surviving host. A second reconciliation leaves the repaired file unchanged. The native Neovim
@@ -328,9 +336,9 @@ still reconcile when all 64 resource slots are occupied.
 
 GithubService retains mutation jobs independently of request receivers. Closure rejects waiting
 work and drains active work without dropping a possible native write. Native reads and writes
-share the four-job gh process pool. Each command retains the existing 120-second deadline,
-8 MiB stdout bound, and 64 KiB diagnostic bound. The worker collects process termination and pipe
-drainage before the mutation future completes. Native admission rejection proves no write began.
+share the four-job gh process pool. Each command retains the existing 120-second deadline and complete
+process output. Formatted failure diagnostics retain at most 64 KiB. The worker collects process
+termination and pipe drainage before the mutation future completes. Native admission rejection proves no write began.
 Other native failures conservatively report OutcomeUnknown, including malformed successful output.
 No state mutation retries automatically. A proven second-step rejection returns the last confirmed
 remote state, while unknown results expose no claimed current state.
@@ -362,9 +370,9 @@ complete descendant termination, and global allocation acceptance remain open.
 PR title and description writes share the Rust resource owner used by lifecycle transitions.
 The github.pull_request edit operation captures optional title and body fields. Omitted fields
 remain unchanged, and an empty body clears the description. PullRequestEdit rejects an empty
-submission, blank or multiline titles, NUL bytes, titles above 4 KiB, and bodies above 256 KiB.
-The existing transport frame limit also applies to the encoded request. These are Forge admission
-limits, not claims about GitHub's full API limits.
+submission, blank or multiline titles, and NUL bytes. Valid title and body content has no total-byte
+admission cap. Logical requests preserve their complete encoded content, while completed responses
+can span multiple transport frames.
 
 Rust reads PR identity and editable text before choosing whether a write is needed. Matching
 submitted fields return a confirmed no-op. A changed field uses one updatePullRequest mutation,
@@ -373,11 +381,11 @@ response is uncertain and never triggers another write. ReconcileEdit reads curr
 returns matches_submission without returning or reposting the body. General PR reconciliation
 also reads editable text so it cannot release an uncertain text edit using lifecycle data alone.
 
-RemoteQueue retains at most 16 MiB of request allocation through queue waiting and completion,
-in addition to its 64-operation and 64-resource bounds. The service charges submitted string
-capacity before spawning a job. The native four-process pool has a separate 16 MiB input budget
-for encoded queries and launch context. Temporary encoding, decoded observations, Lua copies,
-and other services remain outside a complete global allocation proof.
+RemoteQueue retains at most 64 concurrent operations and 64 resource identities. It accounts for
+submitted string capacity through queue waiting and completion without rejecting requests by total
+input bytes. The native pool independently limits execution to four processes and preserves complete
+encoded queries and launch context. These concurrency bounds do not cap total field content or
+establish a complete global allocation proof.
 
 Lua github.pull_request.request_async copies the submitted request before dispatch and adapts
 both lifecycle and edit operations. Uncertain edits request one read-only comparison against that
@@ -423,13 +431,14 @@ Rejected writes preserve the baseline. Uncertain writes retain their capture and
 save admission until an explicit remote observation reconciles the field. Reconciliation preserves
 local text, and a superseded observation cannot replace a newer confirmed baseline.
 
-The default per-document bounds are 256 active fields, 4,096 region lifetimes, 64 pending saves,
-and 256 KiB per field. Retired region identities cannot be reused during the document lifetime.
-A caller-supplied shared EditBudget charges retained UTF-8 text bytes across stores and submissions.
+The default per-document save admission allows 64 pending saves. Fields and region lifetimes have
+no arbitrary count limit, and field text has no byte-admission cap. Retired region identities cannot
+be reused during the document lifetime. A shared EditBudget accounts for retained UTF-8 text bytes
+across stores and submissions without enforcing a total-content budget.
 Current text, baseline text, and captures share allocations when their content matches an existing
 current or baseline value. A retained submission keeps its charge after its store closes. Admission
-reserves new text before changing field state, including the transient overlap with replaced text.
-This bound excludes allocator overhead and metadata and does not establish global memory acceptance.
+accounts for new text before changing field state, including the transient overlap with replaced text.
+The accounting excludes allocator overhead and metadata and does not establish global memory acceptance.
 
 Production ReviewDocument uses EditStore to retain explicitly captured text and confirmed baselines.
 Neovim owns unsaved typing. Save, comment publication, and batched submission carry immutable captures
@@ -439,8 +448,9 @@ operations leave the document unchanged. No per-keystroke acknowledgment partici
 ## Host-owned review field lifecycle
 
 ForgeRuntime owns ReviewService alongside GithubService. The review service holds a registry of
-at most 64 PR documents, admits at most 32 asynchronous jobs, and shares a 16 MiB EditBudget across
-retained field text. Open, save, and reconciliation use the existing GithubService resource queue.
+at most 64 PR documents, admits at most 32 asynchronous jobs, and shares retained-text accounting
+across fields without a total-byte admission limit. Open, save, and reconciliation use the existing
+GithubService resource queue.
 They do not create another GitHub process pool or mutation queue. Completed job handles remain
 owned until collection. Runtime shutdown closes review admission and joins its jobs with the
 remaining shared owners.
@@ -460,15 +470,17 @@ explicit uncertainty rather than implicitly replaying the mutation.
 
 review.reconcile reads current remote text through the same resource owner and updates unresolved
 baselines without replacing local text or reposting the write. A failed observation retains the
-unresolved capture. If text admission fails partway through a multi-field reconciliation, settled
-fields retain the observed baseline and remaining captures stay unresolved for a later observation.
+unresolved capture. If field validation or accounting fails partway through a multi-field
+reconciliation, settled fields retain the observed baseline and remaining captures stay unresolved
+for a later observation.
 review.snapshot reports current text, baseline, revision, sequence, dirty flags, and operation state.
 review.close removes the view's registry entry. An admitted job retains its document and permit
 until it settles, so closing a buffer or dropping a request receiver cannot cancel an active write.
 
 GitHub reconciliation receipts now include observed title and body. Completed review and GitHub
-responses use the same bounded, request-correlated result transfer when encoded output exceeds a
-single frame. The host integration fixture transfers a 200 KiB body of quote characters with exact
+responses use the same chunked, request-correlated result transfer when encoded output exceeds a
+single frame. Frame sizes control each delivery chunk, not the total completed content.
+The host integration fixture transfers a 200 KiB body of quote characters with exact
 current and baseline text. Review failures reach their Lua request callbacks without invalidating
 Harness state. The existing PR editor still uses its previous rendering and baseline adapter until
 the native review consumer adopts these host documents. No review UI parity or migration gate is
@@ -480,7 +492,7 @@ The PR view binds title and description regions through forge.review to one Revi
 The initial host observation supplies saved baselines. If native text still matches the initial
 rendered field, the view adopts current remote text. If the user typed while the read was pending,
 the view preserves that text as a local draft. The adapter validates document identity,
-field revisions, edit sequences, field bounds, and dirty-state consistency before adopting results.
+field revisions, edit sequences, field structure, and dirty-state consistency before adopting results.
 
 Text-change events retain native values and capture sequences locally. An explicit save captures
 title, description, and reviewer text before dispatching review.save. A queued save retains that
@@ -531,17 +543,17 @@ while an explicit open can expand a read-only or conversation occurrence. Overvi
 one inline reply draft per remote parent. Batched review mode rejects that editor.
 
 ReviewDocument contains the comment index alongside its existing shared EditStore. Comment bodies
-use the same retained-text budget as title and description. The index validates document identity,
+use the same retained-text accounting as title and description. The index validates document identity,
 remote node and database identity, PR-scoped browser URLs, and revision-bound source anchors before
-admitting text. Default comment admission permits 256 owners, 1,024 simultaneous occurrences, and
-4,096 occurrence lifetimes. The shared 256-field default also includes title and description.
-Occurrence identities are never reused. Failed admission does not consume a comment identity.
+admitting text. Comment owners, simultaneous occurrences, and occurrence lifetimes have no arbitrary
+count cap. Exact cross-language identity counters still enforce representability and never reuse
+occurrence identities. Failed admission does not consume a comment identity.
 
 A clean remote update advances the region revision. A remote value matching current local text
 advances the baseline without changing the local revision or sequence. A divergent remote value
 retains a conflict candidate alongside local text and the previous baseline. All three values share
-the existing byte budget. Allocation failure preserves the previous candidate and body. Pending
-saves reject refreshes before metadata changes, and unresolved conflicts reject new saves.
+the existing retained-text accounting. Accounting overflow preserves the previous candidate and body.
+Pending saves reject refreshes before metadata changes, and unresolved conflicts reject new saves.
 
 Conflict resolution validates the current region revision. KeepLocal adopts the observed remote
 baseline and preserves the local draft. TakeRemote replaces current text, advances the revision,
@@ -565,7 +577,7 @@ a clean body. Save rejects empty bodies, read-only owners, deleted owners, and u
 Settlement checks receipt identity against the pending operation. Rejection releases admission without
 advancing the baseline. Other outcomes first retain an uncertain capture. A matching confirmation
 then reconciles the baseline while preserving newer native text. Invalid text, identity, anchor, or
-resource evidence leaves the operation uncertain. Observation allocation failure also preserves its
+resource evidence leaves the operation uncertain. Observation accounting failure also preserves its
 capture, body, baseline, and retry prohibition. Edit and delete observations require the exact existing
 remote node and database identity. Creation observations must refer to a new identity with the expected
 source anchor and viewer ownership. The native caller must supply evidence correlated with the actual
@@ -601,9 +613,10 @@ Confirmed recovery still requires exact equality with every captured field. A fa
 publication and remote dispatch releases its in-memory save capture without retrying closed storage,
 and preserves `MutationNotStarted` evidence for the caller.
 
-Scope identities contain at most 256 ASCII graphic bytes. Admission charges their text alongside the
-existing 16 MiB retained input bound and rejects overflow before acquiring an operation slot. At most
-64 uncertain resources retain one bounded scope each after request completion. A read-only owner
+Scope identities contain at most 256 ASCII graphic bytes. Admission accounts for their text alongside
+retained request input without a total-byte budget and rejects accounting overflow before acquiring
+an operation slot. At most 64 uncertain resources retain one bounded scope each after request
+completion. A read-only owner
 cannot create or replace mutation uncertainty. Creation scopes identify individual operations, so an
 observation for a different creation cannot enable reposting of the unresolved operation.
 
@@ -614,8 +627,8 @@ them during shutdown. Native comment adapters must use this same executor with t
 scope. This change adds no alternate process pool and does not yet execute native comment requests.
 
 Queue regressions verify cross-scope FIFO ordering, queued-write rejection after an unknown result,
-unrelated observation isolation, exact-scope recovery, identity limits, and byte overflow. Service
-regressions verify the same uncertainty boundary and retention of an active comment-scoped operation
+unrelated observation isolation, exact-scope recovery, identity limits, and retained-byte accounting.
+Service regressions verify the same uncertainty boundary and retention of an active comment-scoped operation
 after caller cancellation through a shutdown deadline. Native comment request construction, correlated
 creation receipts, host routing, and Lua consumer adoption remain open migration boundaries.
 
@@ -664,7 +677,7 @@ centralized in the original client.
 The github.comment host route accepts strict directory, target, and operation parameters and dispatches
 through GithubService.comment. It runs independently of Harness initialization. Confirmed, rejected,
 uncertain, and reconciled results retain their typed outcomes. Completed responses use the existing
-bounded result-transfer mechanism when JSON exceeds one frame. Invalid requests and uncertain-resource
+chunked result-transfer mechanism when JSON exceeds one frame. Invalid requests and uncertain-resource
 errors return through the caller's response channel. Lua does not invalidate Harness state for these
 host comment failures.
 
@@ -790,7 +803,7 @@ Uncertain comment snapshots hold later publication without replacing its queued 
 
 Reviewer completion excludes the authenticated user only in the reviewer input. Ordinary `@` mentions still include that user. Lua validates manually entered reviewer names case-insensitively before dispatch. Rust repeats validation before any field write and again before the reviewer phase, so a self-review request cannot produce a partial title/body save or bypass validation by changing during an earlier write. The buffer enables the shared `@` username and `#` issue completion sources, with metadata refreshed at open and issue queries served from the local index.
 
-After the first presentation, `review.load` starts file, check, conversation, and commit reads concurrently in Rust. Lua requests one presentation refresh after the batch settles. Successful sections survive failures in other sections, and failed sections display diagnostics. The shared GitHub service admits at most sixteen remote jobs, independently of storage-worker admission. Native `gh` execution runs at most four subprocesses concurrently. Additional admitted requests wait asynchronously for native job and input-byte capacity, and shutdown wakes waiting requests with a closed-pool error. Section updates serialize against presentation capture without blocking editable-field acceptance during analysis.
+After the first presentation, `review.load` starts file, check, conversation, and commit reads concurrently in Rust. Lua requests one presentation refresh after the batch settles. Successful sections survive failures in other sections, and failed sections display diagnostics. The shared GitHub service admits at most sixteen remote jobs, independently of storage-worker admission. Native `gh` execution runs at most four subprocesses concurrently. Additional admitted requests wait asynchronously for native job capacity, and shutdown wakes waiting requests with a closed-pool error. Section updates serialize against presentation capture without blocking editable-field acceptance during analysis.
 
 ## Native batched-review ownership
 
@@ -804,4 +817,4 @@ Lua obtains mode, viewed state, and submission outcomes only through `review.beg
 
 Commit detail reads resolve one immutable full commit identity to its first parent and subject through `GithubReviewRemote`. Expansion compares that parent SHA to the selected commit SHA. A commit with no parents produces an explicit root-commit unavailable state because no comparison base exists.
 
-`forge-review::commit_diff::CommitDiffStore` owns expanded commit rows separately from pull-request file state. Each record uses the full commit SHA and repository-relative path as its key, retains the subject target across expansion, and admits at most 64 records and 16 MiB. Failed admission preserves every existing record. Path-only pull-request `RetainedFile` entries never satisfy or replace a commit-scoped lookup.
+`forge-review::commit_diff::CommitDiffStore` owns expanded commit rows separately from pull-request file state. Each record uses the full commit SHA and repository-relative path as its key and retains the subject target across expansion. The cache evicts records to retain at most 64 records and 16 MiB. A diff larger than the cache budget still renders completely from the response even when its record is not retained for reuse. Path-only pull-request `RetainedFile` entries never satisfy or replace a commit-scoped lookup.

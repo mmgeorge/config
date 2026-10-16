@@ -272,7 +272,7 @@ impl LspService {
             priority: forge_diff::workers::WorkPriority::Foreground,
             deadline: Some(std::time::Instant::now() + Duration::from_secs(10)),
         };
-        let analysis = syntax.analyze_full(request);
+        let analysis = syntax.analyze(request);
         tokio::pin!(analysis);
         let mut tick = tokio::time::interval(Duration::from_millis(25));
         let handle = loop {
@@ -303,10 +303,6 @@ impl LspService {
         result: Value,
         failure: Option<String>,
     ) -> Result<()> {
-        ensure!(
-            serde_json::to_vec(&result)?.len() <= 64 * 1024,
-            "LSP response exceeded transport limit"
-        );
         let mut pending = self.pending.lock().unwrap();
         let request = pending.get(id).context("LSP request is no longer active")?;
         ensure!(
@@ -459,7 +455,6 @@ impl LspScope {
         self.check()?;
         let reply = received?;
         for row in reply.rows.iter().chain(&reply.omitted_visibility) {
-            ensure!(row.path.len() <= 4096, "LSP result path exceeds 4096 bytes");
             self.authorize(&row.path).await?;
             if let Some(path) = &row.excerpt_path {
                 self.authorize(path).await?;
@@ -637,7 +632,7 @@ mod tests {
         let id = event["payload"]["id"].as_str().unwrap();
         let path = directory.path().join("source.rs").to_string_lossy().into_owned();
         let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(forge_diff::workers::AnalysisPool::new(
-            forge_diff::workers::PoolLimits { workers: 1, jobs: 2, input_bytes: 1024 * 1024 },
+            forge_diff::workers::PoolLimits { workers: 1, jobs: 2 },
         )));
         let source = format!("{}pub fn beyond_previous_limits() {{}}\n", "// Unicode α and source padding for a large file\n".repeat(11000));
         assert!(source.len() > 512 * 1024);
@@ -647,7 +642,7 @@ mod tests {
             priority: forge_diff::workers::WorkPriority::Foreground,
             deadline: None,
         }).await.unwrap();
-        assert_eq!(rendering.tree_count(), 0, "rendering cutoff changed");
+        assert_eq!(rendering.tree_count(), 1, "large source was not parsed completely");
         let mut offset = 0;
         let mut result = json!(null);
         while offset < source.len() {

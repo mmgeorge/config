@@ -11,9 +11,6 @@ use crate::workers::{AnalysisPool, WorkBudget, WorkPriority, WorkStop, WorkTicke
 use super::tree::{ParsedSyntax, parse};
 use super::{SyntaxError, SyntaxHandle, SyntaxLanguage};
 
-/// Files above this line count retain source text without syntax analysis.
-pub const SYNTAX_LINE_LIMIT: usize = 10_000;
-
 const CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone)]
@@ -39,7 +36,6 @@ pub struct SyntaxEngine {
 struct SyntaxKey {
     source: SourceIdentity,
     language: SyntaxLanguage,
-    line_limited: bool,
 }
 
 struct SyntaxState {
@@ -84,35 +80,17 @@ impl SyntaxEngine {
 
     /// Coalesces one source/language identity and retains native ownership through cancellation.
     ///
-    /// Files exceeding `SYNTAX_LINE_LIMIT` return their source without trees or captures.
     /// Cache eviction never rejects analysis or invalidates handles held by documents.
     /// Unavailable injected languages remain explicit metadata on the parent result.
     pub async fn analyze(
         self: &Arc<Self>,
         request: SyntaxRequest,
     ) -> Result<SyntaxHandle, SyntaxError> {
-        self.analyze_with_policy(request, true).await
-    }
-
-    /// Parses source for explicit structural queries without the rendering line cutoff.
-    /// Worker admission, request deadlines, and cancellation still apply.
-    pub async fn analyze_full(
-        self: &Arc<Self>,
-        request: SyntaxRequest,
-    ) -> Result<SyntaxHandle, SyntaxError> {
-        self.analyze_with_policy(request, false).await
-    }
-
-    async fn analyze_with_policy(
-        self: &Arc<Self>,
-        request: SyntaxRequest,
-        line_limited: bool,
-    ) -> Result<SyntaxHandle, SyntaxError> {
         loop {
             let changed = self.pool.admission_changed();
             tokio::pin!(changed);
             changed.as_mut().enable();
-            match self.analyze_admitted(request.clone(), line_limited).await {
+            match self.analyze_admitted(request.clone()).await {
                 Err(SyntaxError::Busy | SyntaxError::Pool(crate::workers::PoolError::Busy)) => {
                     if let Some(deadline) = request.deadline {
                         tokio::time::timeout_at(deadline.into(), changed)
@@ -130,12 +108,10 @@ impl SyntaxEngine {
     async fn analyze_admitted(
         self: &Arc<Self>,
         request: SyntaxRequest,
-        line_limited: bool,
     ) -> Result<SyntaxHandle, SyntaxError> {
         let key = SyntaxKey {
             source: request.source.identity(),
             language: request.language,
-            line_limited: line_limited && request.source.text().lines().take(SYNTAX_LINE_LIMIT + 1).count() > SYNTAX_LINE_LIMIT,
         };
         let (interest, mut receiver, work) = {
             let mut state = self.state.lock().expect("syntax state poisoned");
@@ -163,7 +139,7 @@ impl SyntaxEngine {
                     None,
                 )
             } else {
-                // The source is already retained. Syntax eligibility depends only on its line count.
+                // Keep retained source ownership separate from worker concurrency admission.
                 let budget = WorkBudget::new(0, request.deadline);
                 let permit = self
                     .pool
@@ -195,7 +171,7 @@ impl SyntaxEngine {
         };
         if let Some((permit, mut completion)) = work {
             permit.submit(move |budget| {
-                let result = parse(request.source, request.language, &budget, key.line_limited);
+                let result = parse(request.source, request.language, &budget);
                 completion.publish(result);
             });
         }

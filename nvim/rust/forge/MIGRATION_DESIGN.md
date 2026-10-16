@@ -56,8 +56,8 @@ These rules are deliberate behavior changes or preserved requirements, not measu
 - Deleted files never trigger speculative body or syntax work from cursor movement.
 - A collapsed file qualifies for speculative work only with an already known delta below 100 lines.
   Unknown counts do not authorize speculative computation to discover eligibility.
-- Full added or deleted previews above 1,000 source lines show an unavailable row. Whole-file actions
-  remain available where they are valid, even when a preview is unavailable.
+- Explicit added or deleted previews retain the complete source and continue across delivery chunks.
+  Preview size does not disable a valid whole-file action.
 - The base status buffer publishes all section and file headers together, without pagination.
 - Expanded diff content follows visible demand plus lookahead. Each internal delivery batch admits
   at most 256 body rows, further limited by bytes and decorations. A batch is not a user-visible page
@@ -756,11 +756,11 @@ file nvim/rust/forge/crates/forge-git/src/store.rs
    └─ Add fn RepositoryStore::invalidate_storage to refresh linked-worktree ref consumers
 
 file nvim/rust/forge/crates/forge-git/src/completion.rs
-└─ Centralize bounded repository revision candidates without buffer-crate dependencies.
+└─ Centralize complete repository revision candidates without buffer-crate dependencies.
    ├─ Add struct RevisionCandidates with revision, sorted values, and truncated state
    ├─ Add fn build_candidates to preserve current local and remote branch completion
    ├─ Add fn invalidate_candidates to reject stale ref and repository generations
-   └─ Add fn limit_candidates to enforce both item and byte limits
+   └─ Add fn page_candidates to deliver complete inventories through successive pages
 
 file nvim/rust/forge/crates/forge-git/src/read_pool.rs
 └─ Configure blocking repository reads independently of CPU analysis.
@@ -777,7 +777,7 @@ file nvim/rust/forge/crates/forge-git/tests/reader.rs
    ├─ Add test rename_scope_includes_origin_but_copy_scope_does_not
    ├─ Add test invalid_utf8_paths_keep_identity_separate_from_display
    ├─ Add test worktree_change_during_read_rejects_the_result
-   ├─ Add test oversized_packed_blob_does_not_enter_diff_or_syntax
+   ├─ Add test large_packed_blob_reaches_diff_and_syntax_without_truncation
    └─ Add test unborn_detached_sparse_and_partial_repository_capabilities_are_explicit
 
 7. Compute canonical changes and lazy display rows in forge-diff. File display limits do not
@@ -818,8 +818,7 @@ file nvim/rust/forge/crates/forge-diff/src/body.rs
 └─ Centralize user-requested preview and speculative-work limits.
    ├─ Add struct BodyPolicy with explicit expansion, prewarm, row, byte, and span bounds
    ├─ Add fn may_prewarm to require nondeleted kind and an already known delta below 100
-   ├─ Add fn may_preview_full_file to permit 1000 lines and reject 1001
-   ├─ Add fn unavailable_reason to distinguish binary, size, encoding, missing, and actual errors
+   ├─ Add fn unavailable_reason to distinguish binary, encoding, missing, and actual errors
    └─ Add fn limit_display_chunk to bound rows, text bytes, metadata, and one progress sentinel
 
 file nvim/rust/forge/crates/forge-diff/src/intraline.rs
@@ -1804,8 +1803,8 @@ repositories or operations produce a precise capability result. Unexpected read 
 instead of selecting another implementation without explanation.
 
 The first status response enumerates changes and available metadata. It does not compute every
-modified file's hunks merely to show exact line counts. Counts have explicit Unknown, Exact, and
-ExceedsLimit states. Background counts are lower priority than explicit file expansion, and their
+modified file's hunks merely to show exact line counts. Counts have explicit Unknown and Exact
+states. Background counts are lower priority than explicit file expansion, and their
 work is bounded and cancelled when no view needs them.
 
 A count request for a modified file can require a diff. That cost belongs to optional enrichment,
@@ -1834,10 +1833,9 @@ Only canonical, untruncated content can generate write patches. Display-only tra
 navigation metadata where it is known and explicitly disable ambiguous hunk writes. Whole-path
 staging delegates to Git so filters, modes, symlinks, and empty files keep Git semantics.
 
-A 1,001-line probe can stop scanning a decoded buffer early, but it cannot promise that a packed
-Git blob was only partially decoded. Before object decode, inspect available size metadata and
-reject oversized objects. Packed delta bases, decoder caches, and library allocations remain part
-of measured memory consumption. Do not describe the line gate as a streaming-object guarantee.
+Decode complete Git objects without an arbitrary byte or line-count admission gate.
+Packed delta bases, decoder caches, and library allocations remain part of measured memory
+consumption. Bound reusable cache retention and delivery chunks without rejecting object content.
 
 ## Lazy content and bounded progress
 
@@ -1864,12 +1862,13 @@ The file-body state machine is independent from the window's native fold state:
    physical rows.
 7. A source change invalidates the body cursor and replaces the obsolete body under one new revision.
 
-A body chunk admits at most 256 source display rows, 128 KiB of generated text, and 8,192 decoration
+A body chunk targets 256 source display rows, 128 KiB of generated text, and 8,192 decoration
 records as initial engineering limits. The chunk also permits at most 16 structural rows for hunk
-headers, loading state, or a sentinel. Limits apply to the first hunk as well as later hunks.
+headers, loading state, or a sentinel. An empty batch admits its first complete source row even
+when that row exceeds the byte target.
 One hunk can span multiple batches and one batch can contain multiple hunks. A viewport can display
 any number of loaded batches. Loading indicators describe pending work, not a required load-more
-action. Failed reads expose explicit retry, while unavailable previews retain their stated limits.
+action. Failed reads expose explicit retry, while unsupported content retains its explicit reason.
 
 Lua reports ViewDemand after scroll, resize, fold changes, and applied text changes, outside redraw
 callbacks. Reports carry ViewId, DocumentRevision, generic visible block ranges, expanded fold IDs,
@@ -1888,18 +1887,18 @@ at most one pending delivery per file occurrence and fair rotation among ready r
 credit and the shared worker limits bound concurrent work. One window's collapse removes only its
 demand. Stop unneeded work when no consumer remains, reject stale source results, and retain loaded
 rows. Never expand a collapsed file merely because its header enters the viewport. A loading marker
-entering view continues its already expanded region without another keypress. Source limits and
-document memory limits still stop delivery with an explicit reason rather than retrying indefinitely.
+entering view continues its already expanded region without another keypress. Actual I/O, decoding,
+and allocation failures propagate explicitly. Arbitrary content-size thresholds never stop delivery.
 
-One source line above the chunk byte limit is not split into fake source rows. Forge reports that
-the inline preview is unavailable and retains exact whole-file and source-open actions. Binary,
-invalid text encoding, unsupported filters, and large source results remain distinct from errors.
+One source line above the chunk byte target is delivered intact rather than split into fake source
+rows. Binary content, invalid text encoding, and unsupported filters retain distinct availability
+outcomes. A valid text source's size does not disable its preview.
 
-The 1,000-line added/deleted gate counts source lines, excluding display headers. Empty content has
+Added and deleted previews retain all source lines, excluding display headers. Empty content has
 zero source lines. A final newline does not add a synthetic extra source line. Preserve final-newline
 metadata separately for Git patches.
 
-Prewarm requires a known changed-line total below 100, nondeleted kind, source-size admission, and
+Prewarm requires a known changed-line total below 100, nondeleted kind, known source sizes, and
 available speculative capacity. Modified-file delta means added plus removed source lines. Added
 file eligibility uses its known new-line count. A 99-line delta in a huge file still fails the
 source-byte gate. Deleted files never qualify.
@@ -1974,19 +1973,19 @@ Initial transport limits are proposals to validate, not benchmark results:
 
 | Resource | Initial limit | Saturation behavior |
 |---|---:|---|
-| Encoded frame | 512 KiB | Split a supported transfer or reject an oversized request |
+| Outbound encoded frame | 512 KiB | Split transfers while preserving complete logical content |
 | Active requests per client | 64 | Return Busy before retaining the payload |
 | Host queued encoded bytes | 8 MiB | Stop producing optional output and apply receive credit |
 | Lua pending received bytes | 8 MiB | Pause consumption credit and retain one scheduled drain |
 | Pending frame count | 128 | Reject further admission or suspend the affected stream |
 | Control records reserved | 32 | Preserve cancellation, failure, and shutdown progress |
 | Snapshot part | 256 KiB | Validate sequence and total size before applying |
-| Complete snapshot transfer | 16 MiB per document | Use a deliberate bounded document-load policy |
+| Complete snapshot transfer | No content-size ceiling | Reconstruct all ordered parts |
 | Incomplete snapshot transfers | 1 per document | Cancel obsolete transfer before accepting another |
 
-A bytes-only limit does not bound a JSON document containing millions of tiny arrays. Validation
-also caps rows, spans, nesting, strings, and edit counts before allocating feature objects.
-These are transport safety limits, not header pagination. A base snapshot that needs wire framing
+Validate identity, sequence, ranges, shape, and representability before applying feature objects.
+Transport queue and frame budgets govern delivery, not total rows, spans, strings, or edits.
+Inbound JSONL requests retain complete content through bounded reads. A base snapshot that needs wire framing
 is assembled and validated before its single initial buffer application. Do not apply expanded-body
 row budgets to base snapshots or introduce incremental header presentation.
 
@@ -2202,23 +2201,24 @@ Initial accounting targets are:
 
 | Owner | Initial target | Required accounting |
 |---|---:|---|
-| Source inputs | 8 MiB per source side | Raw and converted bytes, before and after decompression where measurable |
+| Source inputs | No content-size ceiling | Raw and converted bytes, before and after decompression where measurable |
 | Source cache | 128 MiB | Referenced buffers and unreferenced cache entries reported separately |
 | Diff result cache | 64 MiB and 512 entries | Hunk arrays, line indexes, and retained patch data |
 | Tree and capture cache | 64 MiB accounted target | Tree estimates, capture arrays, query and injection overhead |
-| Generated document | 16 MiB serialized snapshot limit | Text, metadata, loaded body ranges, and retained edit state |
+| Generated document | No content-size ceiling | Text, metadata, loaded body ranges, and retained edit state |
 | Idle repository handles | 16 | Active handles remain separately counted |
-| Revision completion | 2 MiB or 20,000 values | Loaded candidate strings and lookup index |
+| Revision completion | Complete inventory | Loaded candidate strings and lookup index |
 | Visible completion results | 200 | Returned string values only |
 | Logs per public scope | 30 MiB total | Active and rotated files across Lua and Rust writers |
 
-These are admission and retention limits for owned representations, not a hard bound on operating
+Cache targets control reusable retention, not admission of files, documents, or explicit analysis.
+They do not establish a hard bound on operating
 system resident memory. Native parser allocation, gix object caches, SQLite/redb mappings, allocator
 overhead, and the provider SDK can exceed estimated charges. Measure process memory during the soak
-and reject new optional work when the configured high-water target is reached.
+and defer new speculative work when the configured high-water target is reached.
 
 Do not silently remove loaded physical rows to satisfy a cache budget. Prefer releasing redundant
-analysis, stopping speculation, or refusing additional expansion with a visible resource limit.
+analysis, stopping speculation, or consuming oversized results without retaining them in the cache.
 Closing a document releases its pinned data. A full-file open or explicit export remains available
 where existing source access supports it.
 
@@ -2416,9 +2416,9 @@ A cold callback returns immediately and schedules one asynchronous refresh. A st
 return its last known candidates with a stale generation while refresh runs. A failed refresh
 notifies and does not replace a valid cache with an empty successful result.
 
-The 20,000-item and 2 MiB cache limits can omit candidates. The snapshot carries a truncated flag,
-and completion must expose that limitation without rejecting a manually typed valid revision.
-The first implementation does not promise exhaustive completion in repositories above those limits.
+Candidate inventories retain every discovered value. Transfer pages and visible match counts
+control individual deliveries without omitting the rest of the inventory. A manually typed valid
+revision remains independent from cached completion.
 
 Native file completion for the first argument of ForgeBranchDiffFile and ForgeFileRevision retains the
 current Neovim path completion behavior. Its native filesystem cost is measured separately and is
@@ -2511,7 +2511,8 @@ Completion requires all of these observable outcomes:
 - One Forge host serves ForgeStatus and Harness in a Neovim instance, with lazy provider startup.
 - Harness repository tools call shared Rust services without opening a status buffer.
 - The first ForgeStatus response omits collapsed body text and eager modified-file hunk computation.
-- Added/deleted preview, prewarm, first-hunk, byte, span, and source-size bounds are enforced.
+- Explicit previews preserve complete content. Prewarm, delivery-chunk, cache, and optional emphasis
+  budgets control work without rejecting files or losing source rows.
 - Rust owns expensive diff, syntax, Markdown, row, and domain-state work for migrated surfaces.
 - Lua stores generic structural metadata and performs native resource, editing, and effect work.
 - Stale inputs cannot silently target a newer file, hunk, comment, or window.
@@ -2782,5 +2783,3 @@ Every execution report records command, configured timeout, elapsed time, exit s
 assertion or diagnostic artifact, and skipped prerequisites. Windows and macOS require independent
 evidence. Tests must remove only their own verified temporary files and must never delete the user's
 existing diagnostic logs as routine cleanup.
-
-

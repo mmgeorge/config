@@ -123,7 +123,7 @@ local function validate_metadata(entry, read_row, region_seen)
     validate_range(overlay.range)
     assert(overlay.range.start.row == overlay.range["end"].row
       and overlay.range.start.row < entry.row_count, "invalid source overlay range")
-    assert(type(overlay.text) == "string" and #overlay.text > 0 and #overlay.text <= 8192
+    assert(type(overlay.text) == "string" and #overlay.text > 0
       and not overlay.text:find("%c"), "invalid source overlay text")
     identity(overlay.capture)
     assert(counter(overlay.priority) <= 65535, "invalid source overlay priority")

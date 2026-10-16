@@ -76,8 +76,7 @@ pub struct PullRequestEdit {
 }
 
 impl PullRequestEdit {
-    /// Rejects missing fields, invalid titles, NUL bytes, and text above the admission limits.
-    /// Titles accept at most 4 KiB without line breaks. Bodies accept at most 256 KiB and may be empty.
+    /// Validate submitted PR fields without changing their text.
     pub fn validate(&self) -> Result<()> {
         ensure!(
             self.title.is_some() || self.body.is_some(),
@@ -86,15 +85,14 @@ impl PullRequestEdit {
         if let Some(title) = &self.title {
             ensure!(
                 !title.trim().is_empty()
-                    && title.len() <= 4096
                     && !title.contains(['\r', '\n', '\0']),
                 "invalid GitHub PR title"
             );
         }
         if let Some(body) = &self.body {
             ensure!(
-                body.len() <= 256 * 1024 && !body.contains('\0'),
-                "GitHub PR body exceeds its text limit"
+                !body.contains('\0'),
+                "GitHub PR body contains NUL"
             );
         }
         Ok(())
@@ -121,14 +119,6 @@ impl PullRequestState {
         ensure!(
             self.node_id == target.node_id && self.number == target.number,
             "GitHub returned a different pull request identity"
-        );
-        ensure!(
-            self.title.as_ref().is_none_or(|title| title.len() <= 4096)
-                && self
-                    .body
-                    .as_ref()
-                    .is_none_or(|body| body.len() <= 256 * 1024),
-            "GitHub returned oversized PR text"
         );
         Ok(())
     }

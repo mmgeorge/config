@@ -12,7 +12,7 @@ fn resource(hostname: &str, number: u64) -> RemoteResource {
 }
 
 #[tokio::test]
-async fn retained_input_bytes_bound_waiting_work_and_release_after_completion() {
+async fn retained_input_bytes_account_for_large_waiting_work_until_completion() {
     let queue = RemoteQueue::default();
     let key = resource("github.com", 1);
     let first = queue
@@ -24,11 +24,8 @@ async fn retained_input_bytes_bound_waiting_work_and_release_after_completion() 
     let second = queue
         .enqueue(key.clone(), RemoteIntent::Mutation, 8 * 1024 * 1024)
         .unwrap();
-    assert!(
-        queue
-            .enqueue(resource("github.com", 2), RemoteIntent::Mutation, 1)
-            .is_err()
-    );
+    let independent = queue.enqueue(resource("github.com", 2), RemoteIntent::Mutation, 16 * 1024 * 1024 + 1).unwrap();
+    assert_eq!(queue.retained_bytes(), 32 * 1024 * 1024 + 1);
     assert!(
         queue
             .enqueue(key.clone(), RemoteIntent::Mutation, usize::MAX)
@@ -45,6 +42,8 @@ async fn retained_input_bytes_bound_waiting_work_and_release_after_completion() 
         .complete(RemoteCompletion::Confirmed)
         .unwrap();
     drop(third);
+    drop(independent);
+    assert_eq!(queue.retained_bytes(), 0);
     assert!(
         queue
             .enqueue(
@@ -442,7 +441,7 @@ async fn invalid_scope_and_byte_overflow_do_not_consume_admission() {
                 RemoteIntent::Mutation,
                 16 * 1024 * 1024
             )
-            .is_err()
+            .is_ok()
     );
     let read = queue
         .enqueue(target.clone(), RemoteIntent::Reconcile, 0)

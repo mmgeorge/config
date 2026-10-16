@@ -10,7 +10,7 @@ struct Meaning {
 }
 
 fn meaning(language: SyntaxLanguage, text: &str) -> Meaning {
-    let source = declaration_surrogate(language, text);
+    let source = declaration_surrogate(language, text).unwrap();
     let mut parser = Parser::new();
     parser.set_language(&language.grammar()).unwrap();
     let tree = parser.parse(&source, None).unwrap();
@@ -155,7 +155,7 @@ fn check(path: &str, source: &str) {
 
 fn check_corpus(path: &str, source: &str) {
     let language = DeclarationOverview::language(path).unwrap();
-    let surrogate = declaration_surrogate(language, source);
+    let surrogate = declaration_surrogate(language, source).unwrap();
     let mut parser = Parser::new();
     parser.set_language(&language.grammar()).unwrap();
     let tree = parser.parse(&surrogate, None).unwrap();
@@ -177,6 +177,70 @@ fn check_corpus(path: &str, source: &str) {
         start = end;
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn declaration_boundary_arrow_types_and_literals_remain_unchanged() {
+    for path in ["boundary.ts", "boundary.tsx"] {
+        for source in [
+            "export type Handler = (\nvalue: string\n) =>\nstring;\n",
+            "export type Label = `first =>\nsecond`;\n",
+            "// Documentation ending in =>\nexport type Label = string;\n",
+            "/* Documentation ending in =>\n*/\nexport type Label = string;\n",
+        ] {
+            assert_eq!(
+                declaration_surrogate(DeclarationOverview::language(path).unwrap(), source).unwrap(),
+                source,
+            );
+            check(path, source);
+        }
+    }
+}
+
+#[test]
+fn declaration_boundary_callable_arrows_complete_only_expression_bodies() {
+    for path in ["boundary.ts", "boundary.tsx"] {
+        for source in [
+            "export const run = (value: string): string =>;\n",
+            "export const run = value =>;\n",
+            "export const run = value =>\n",
+            "export const run = async value =>;\n",
+            "export class Store { run = value =>; }\n",
+            "export default (value: string) =>;\n",
+            "export default value =>;\n",
+            "export default value =>\n",
+            "export const run = (): () => void =>;\n",
+        ] {
+            check(path, source);
+        }
+        for source in [
+            "export type Invalid = (value: string) =>;\n",
+            "export const run = (value: string) => { return value; };\n",
+        ] {
+            assert!(DeclarationOverview::parse(path, source).is_err(), "{source}");
+        }
+    }
+}
+
+#[test]
+fn declaration_boundary_lua_parameter_comments_survive_extraction() {
+    for source in [
+        "function run(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend\n",
+        "local run = function(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend\n",
+        "local M = {\nrun = function(\n-- Caller-owned writer.\nwriter\n)\nwriter.send()\nend,\n}\nreturn M\n",
+    ] {
+        for comment in [
+            "-- Caller-owned writer.",
+            "-- Caller-owned writer. )",
+            "--[[Caller-owned writer.\n)\n]]",
+        ] {
+            let source = source.replace("-- Caller-owned writer.", comment);
+            let declaration = DeclarationOverview::extract("boundary.lua", &source).unwrap();
+            assert!(declaration.contains(comment));
+            assert!(!declaration.contains("writer.send"));
+            check("boundary.lua", &declaration);
+        }
+    }
 }
 
 #[test]
@@ -314,14 +378,27 @@ fn rust_unsafe_extern_blocks_are_admitted_before_formatting() {
         "ffi.rs",
         "unsafe extern \"C\" { pub fn send(buffer: *const u8, length: usize); }\n",
     );
+    check(
+        "ffi_function.rs",
+        "pub unsafe extern \"C\" fn send(buffer: *const u8, length: usize);\n",
+    );
 }
 
 #[test]
 fn tsx_function_expression_return_type_is_admitted_before_formatting() {
-    check(
-        "expression.tsx",
+    for source in [
         "export const Component = function(properties: Props): ReactNode;\n",
-    );
+        "export const Component = function(\nproperties: Props\n): ReactNode;\n",
+        "export const Component = function(\nproperties: Props\n): ReactNode\n",
+        "export const Component = function named<Value>(properties: Props<Value>): ReactNode;\n",
+        "export type Label = '= function';\n",
+    ] {
+        check("expression.tsx", source);
+    }
+    assert!(DeclarationOverview::parse(
+        "expression.tsx",
+        "export const Component = function(properties: Props): ReactNode { return render(properties); };",
+    ).is_err());
 }
 
 #[test]
@@ -330,6 +407,7 @@ fn lua_literal_require_without_parentheses_is_admitted_before_formatting() {
         "module.lua",
         "local module = require 'platform.module'\nreturn module\n",
     );
+    assert!(DeclarationOverview::parse("module.lua", "local module = require(module_name)\n").is_err());
 }
 
 #[test]

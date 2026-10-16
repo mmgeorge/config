@@ -94,7 +94,6 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
         status,
         names,
         crate::command::CommandLimits {
-            stdout_bytes: 32 * 1024 * 1024,
             stderr_bytes: 64 * 1024,
             timeout: std::time::Duration::from_secs(20),
         },
@@ -102,7 +101,7 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
     )?;
     ensure!(output.status.success(), "checkpoint status failed: {}", String::from_utf8_lossy(&output.stderr));
     ensure!(names.status.success(), "checkpoint path inventory failed: {}", String::from_utf8_lossy(&names.stderr));
-    let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash(), 32 * 1024 * 1024, 250_000)?;
+    let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash())?;
     let mut observation = Vec::with_capacity(paths.len());
     for path in &paths {
         check()?;
@@ -124,7 +123,7 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
     let refreshed = gix::index::File::at_or_default(&temporary_index, repository.object_hash(), false, Default::default())?;
     let checkout_size = refreshed.entries().iter()
         .map(|entry| (path_key(entry.path(&refreshed)), entry.stat.size)).collect();
-    eprintln!("checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}", command_elapsed.as_millis(), (started.elapsed()-command_elapsed).as_millis(), names.stdout.len(), checkout.len());
+    let _ = writeln!(std::io::stderr(), "checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}", command_elapsed.as_millis(), (started.elapsed()-command_elapsed).as_millis(), names.stdout.len(), checkout.len());
     Ok(CheckpointSignature { status: output.stdout, index, observation, paths, names: names.stdout, attributes, config, checkout, checkout_size })
 }
 
@@ -265,7 +264,7 @@ pub fn tree_files(root: &Path, tree: Option<&str>) -> Result<BTreeMap<String, Ba
 }
 
 /// Resolves an existing blob with the captured conversion, without invoking external filters.
-pub fn read_blob(root: &Path, file: &BaseFile, limit: usize) -> Result<Option<Vec<u8>>> {
+pub fn read_blob(root: &Path, file: &BaseFile) -> Result<Vec<u8>> {
     ensure!(
         file.mode != 0o160000,
         "submodule checkpoint restoration is unavailable"
@@ -277,9 +276,6 @@ pub fn read_blob(root: &Path, file: &BaseFile, limit: usize) -> Result<Option<Ve
     );
     let repository = gix::open(root)?;
     let id = gix::ObjectId::from_hex(file.object_id.as_bytes())?;
-    if repository.find_header(id)?.size() > limit as u64 {
-        return Ok(None);
-    }
     let mut blob = repository.find_blob(id)?;
     ensure!(
         gix::objs::compute_hash(id.kind(), gix::objs::Kind::Blob, &blob.data)? == id,
@@ -294,13 +290,10 @@ pub fn read_blob(root: &Path, file: &BaseFile, limit: usize) -> Result<Option<Ve
             AttributesDigest::TextCrlf
         };
         if eol::convert_to_worktree(&blob.data, digest, &mut converted, Configuration::default())? {
-            if converted.len() > limit {
-                return Ok(None);
-            }
-            return Ok(Some(converted));
+            return Ok(converted);
         }
     }
-    Ok(Some(std::mem::take(&mut blob.data)))
+    Ok(std::mem::take(&mut blob.data))
 }
 
 /// Copies an immutable Git source with bounded memory, including large packed objects.
@@ -309,10 +302,7 @@ pub fn write_blob(root: &Path, file: &BaseFile, output: &mut impl Write) -> Resu
     let object = gix::ObjectId::from_hex(file.object_id.as_bytes())?;
     let size = repository.find_header(object)?.size();
     if size <= 8 * 1024 * 1024 {
-        output.write_all(
-            &read_blob(root, file, usize::MAX)?
-                .ok_or_else(|| anyhow::anyhow!("missing baseline"))?,
-        )?;
+        output.write_all(&read_blob(root, file)?)?;
         return Ok(());
     }
     ensure!(
@@ -328,7 +318,6 @@ pub fn write_blob(root: &Path, file: &BaseFile, output: &mut impl Write) -> Resu
         &mut command,
         spool.try_clone()?,
         crate::command::CommandLimits {
-            stdout_bytes: 0,
             stderr_bytes: 64 * 1024,
             timeout: std::time::Duration::from_secs(30),
         },

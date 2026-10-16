@@ -378,7 +378,6 @@ mod tests {
         let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
             workers: 1,
             jobs: 2,
-            input_bytes: 1024 * 1024,
         })));
         for (language, source, expected) in [
             (

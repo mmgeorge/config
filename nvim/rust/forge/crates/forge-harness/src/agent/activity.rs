@@ -25,14 +25,11 @@ impl AgentToolReference {
     fn encode(exchange: &Exchange, turn_id: &str, tool_id: &str) -> Result<String> {
         let reference = Self { session_id: exchange.session_id.clone(), agent_id: exchange.agent_id.clone(),
             exchange_id: exchange.id.clone(), turn_id: turn_id.into(), tool_id: tool_id.into() };
-        let encoded = format!("agent-tool:{}", hex::encode(serde_json::to_vec(&reference)?));
-        ensure!(encoded.len() <= 16384, "tool reference exceeds 16384 bytes");
-        Ok(encoded)
+        Ok(format!("agent-tool:{}", hex::encode(serde_json::to_vec(&reference)?)))
     }
 
-    /// Decodes a bounded reference without granting authority over its identities.
+    /// Decode a complete reference without granting authority over its identities.
     pub(crate) fn decode(reference: &str) -> Result<Self> {
-        ensure!(reference.len() <= 16384, "tool reference exceeds 16384 bytes");
         let encoded = reference.strip_prefix("agent-tool:").context("invalid agent tool reference")?;
         serde_json::from_slice(&hex::decode(encoded).context("invalid agent tool reference")?)
             .context("invalid agent tool reference")
@@ -122,4 +119,20 @@ fn preview(text: &str, limit: usize) -> (String, bool) {
     let mut characters = text.chars();
     let preview = characters.by_ref().take(limit).collect();
     (preview, characters.next().is_some())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn complete_tool_identity_roundtrips_beyond_the_former_reference_limit() {
+        let exchange = Exchange::agent_admission("session-1", 1, "Inspect source".into(), 0);
+        let tool_id = "provider-tool-".repeat(2048);
+        let encoded = AgentToolReference::encode(&exchange, "turn-1", &tool_id).unwrap();
+        assert!(encoded.len() > 16384);
+        let decoded = AgentToolReference::decode(&encoded).unwrap();
+        assert_eq!(decoded.tool_id, tool_id);
+        assert_eq!(decoded.session_id, exchange.session_id);
+    }
 }

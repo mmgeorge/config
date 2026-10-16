@@ -55,11 +55,8 @@ impl<'profile> TranscriptRenderer<'profile> {
     /// Changes hidden output counts without replacing the heading or its preview.
     pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
         let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
-        let mut rows = if hidden == 0 { Vec::new() }
+        let rows = if hidden == 0 { Vec::new() }
             else { tool_body_rows(self.profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)? };
-        if output.truncated()? {
-            rows.extend(tool_body_rows(self.profile,"Display truncated; export output for the complete response.",false)?);
-        }
         self.output_block(BlockId(format!("{call_id}:hidden")),rows)
     }
 

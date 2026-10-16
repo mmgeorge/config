@@ -1017,7 +1017,6 @@ impl PlanFileStore {
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         anyhow::ensure!(document.plan_id == plan_id && rendered.navigation.plan_id == plan_id
             && rendered.navigation.plan_version == document.version, "rendered plan identity changed");
-        anyhow::ensure!(serde_json::to_vec(&document)?.len() <= 8 * 1024 * 1024, "plan exceeds 8 MiB");
         let plan_directory = self.plan_dir(session_id, plan_id);
         measure(trace, "persist.working_directory", || Ok(fs::create_dir_all(&plan_directory)?))?;
         measure(trace, "persist.working_json", || write_json_atomically(&plan_directory.join("working.json"), &document))?;

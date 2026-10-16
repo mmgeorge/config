@@ -274,7 +274,7 @@ impl GithubService {
 
     /// Retains one queued PR operation through remote completion, independently of its caller.
     ///
-    /// At most 64 mutation jobs and 16 MiB of request input are admitted. Same-resource jobs execute in FIFO order, including
+    /// At most 64 mutation jobs are admitted. Same-resource jobs execute in FIFO order, including
     /// reopen-then-draft or ready steps. Closing rejects queued work and drains running requests
     /// without dropping a possibly active native write. Unknown results require explicit reconcile.
     pub async fn pull_request(
@@ -560,8 +560,7 @@ impl GithubService {
 
     /// Executes a typed operation on a retained blocking worker.
     ///
-    /// Requires a Tokio executor. Pages and detail batches accept at most 100 issues. Closed,
-    /// saturated, or oversized admission fails before spawning work. Store
+    /// Requires a Tokio executor. Closed or saturated admission fails before spawning work. Store
     /// errors and panic payloads reach the caller. Cancellation of this future leaves admitted work
     /// owned until it completes, so callers must reload after an unobserved write result.
     pub async fn execute(
@@ -569,17 +568,6 @@ impl GithubService {
         store: IssueStore,
         operation: IssueOperation,
     ) -> Result<IssueResult> {
-        match &operation {
-            IssueOperation::UpsertPage { page, .. } => ensure!(
-                page.issues.len() <= 100,
-                "GitHub storage page exceeds 100 issues"
-            ),
-            IssueOperation::Details { number } => ensure!(
-                number.len() <= 100,
-                "GitHub storage detail batch exceeds 100 issues"
-            ),
-            _ => {}
-        }
         let directory = store.repository_directory()?;
         let admission = self.admit_repository(
             directory,
@@ -957,18 +945,18 @@ mod tests {
         )
         .unwrap();
         let service = GithubService::default();
-        assert!(
-            service
-                .execute(
-                    store.clone(),
-                    IssueOperation::Details {
-                        number: vec![7; 101]
-                    }
-                )
-                .await
-                .is_err()
-        );
-        assert!(!directory.path().join("issues.redb").exists());
+        let IssueResult::Details(details) = service
+            .execute(
+                store.clone(),
+                IssueOperation::Details { number: vec![7; 101] },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("wrong storage result")
+        };
+        assert_eq!(details.details.len(), 101);
+        assert!(details.details.iter().all(|detail| !detail.found));
         service
             .execute(
                 store.clone(),

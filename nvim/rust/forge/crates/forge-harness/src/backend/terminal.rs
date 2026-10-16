@@ -25,10 +25,6 @@ impl TerminalSnapshot {
             .get(if copilot { "tasks" } else { "data" })
             .and_then(Value::as_array)
             .context("background terminal inventory is missing")?;
-        ensure!(
-            rows.len() <= 1024,
-            "background terminal inventory exceeds 1024 entries"
-        );
         let mut terminal = Vec::new();
         for row in rows {
             if copilot
@@ -52,8 +48,8 @@ impl TerminalSnapshot {
                 .and_then(Value::as_str)
                 .context("background terminal command is missing")?;
             ensure!(
-                id.len() <= 256 && command.len() <= 16384,
-                "background terminal exceeds display limits"
+                id.len() <= 256,
+                "background terminal identity exceeds its limit"
             );
             if !terminal
                 .iter()
@@ -81,6 +77,25 @@ impl TerminalSnapshot {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn terminal_inventory_preserves_every_provider_record() {
+        let rows = (0..1025).map(|index| json!({
+            "processId": format!("process-{index}"), "command": "printf complete",
+        })).collect::<Vec<_>>();
+        let snapshot = TerminalSnapshot::parse(&json!({"data":rows}), false).unwrap();
+        assert_eq!(snapshot.terminal.len(), 1025);
+        assert_eq!(snapshot.terminal[1024].id, "process-1024");
+    }
+
+    #[test]
+    fn terminal_inventory_preserves_large_commands() {
+        let command = "retained-command ".repeat(2049).trim_end().to_owned();
+        let snapshot = TerminalSnapshot::parse(
+            &json!({"data":[{"processId":"1","command":command}]}), false,
+        ).unwrap();
+        assert_eq!(snapshot.terminal[0].command, command);
+    }
 
     #[test]
     fn terminal_inventory_displays_script_payloads_for_each_shell() {

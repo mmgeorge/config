@@ -97,6 +97,17 @@ local success, failure = xpcall(function()
   await = request()
   local ambiguous, ambiguous_error, ambiguous_notice = await()
   assert(not ambiguous and not ambiguous_error and ambiguous_notice == "ambiguous_server: first, second")
+  vim.lsp.get_clients = function() return { client } end
+  contents = contents .. string.rep("// complete source padding\r\n", 50000)
+  descriptor.digest = vim.fn.sha256(contents)
+  write(source_path, contents)
+  write(target_path, "export interface Value { count: number }\r\n/*"
+    .. string.rep("complete target ", 1200000) .. "*/\r\n")
+  handler = function(callback) callback(nil, { uri = vim.uri_from_fname(target_path), range = range }) end
+  await = request()
+  local large, large_error = await()
+  assert(large and not large_error and large.column == 25,
+    large_error or "large source or target rejected during definition lookup")
 end, debug.traceback)
 vim.lsp.get_clients, vim.lsp.buf_is_attached, vim.lsp.buf_attach_client = original_clients, original_attached, original_attach
 vim.api.nvim_del_augroup_by_id(group)

@@ -87,10 +87,6 @@ impl IssueDocument {
             saved.pending = None;
         }
         let payload = serde_json::json!({"repo":self.repository.repository_name(),"number":self.number,"issue_document":draft});
-        ensure!(
-            serde_json::to_vec(&payload)?.len() <= 8 * 1024 * 1024,
-            "issue draft exceeds 8 MiB"
-        );
         let edits = refresh_edits(&self.buffer, projection.block)?;
         let replacement = self.buffer.prepare_edits(edits)?;
         Ok(PreparedIssueRefresh {

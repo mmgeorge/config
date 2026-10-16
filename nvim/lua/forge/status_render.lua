@@ -117,7 +117,7 @@ local function context_entry(role, label, values)
   local parts = {}
   for index, value in ipairs(chunk) do parts[index] = value[1] end
   local text = table.concat(parts)
-  assert(#text <= 65536 and not text:find("[%z\r\n]"), "status context text exceeds capacity")
+  assert(not text:find("[%z\r\n]"), "invalid status context text")
   return entry({ text }, { chunk }, { kind = "context", role = role }, "context")
 end
 
@@ -229,7 +229,8 @@ local function prepare(session, snapshot, checkpoint)
     local previous = session.file[value.id]
     local body = previous and previous.record.generation == value.generation and previous.body or nil
     local header = previous and previous.record == value and previous.header or file_header(value, body)
-    file[value.id] = { record = value, header = header, body = body }
+    file[value.id] = { record = value, header = header, body = body,
+      recovering = previous and previous.record.generation == value.generation and previous.recovering or nil }
     if checkpoint and index % 64 == 0 then checkpoint() end
   end
   local seen = {}
@@ -277,7 +278,8 @@ local function prepare(session, snapshot, checkpoint)
           local key = history.file_key(owner, record_value.id)
           local previous = session.file[key]
           local body = previous and previous.record.generation == record_value.generation and previous.body or nil
-          local model = { record = record_value, body = body, owner = owner, header = file_header(record_value, body, key) }
+          local model = { record = record_value, body = body, owner = owner, header = file_header(record_value, body, key),
+            recovering = previous and previous.record.generation == record_value.generation and previous.recovering or nil }
           file[key] = model
           endpoint = push_file(key, model)
         end
@@ -507,7 +509,11 @@ function M.apply_update(session, update)
       local value = assert(record[delivery.file], "status update body has no file")
       assert(delivery.generation == value.generation, "status update body generation differs")
       assert(delivery.snapshot and delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status update body identity differs")
-      file[delivery.file] = { record = value, body = buffer.fragment(delivery.snapshot) }
+      local previous = file[delivery.file]
+      local body = previous and previous.record.generation == value.generation and previous.body
+      file[delivery.file] = { record = value,
+        body = body and body.revision >= delivery.snapshot.revision and body or buffer.fragment(delivery.snapshot),
+        recovering = previous and previous.record.generation == value.generation and previous.recovering or nil }
     end
     session.file = file
     local prepared = prepare(session, owner and session.inventory or snapshot)
@@ -530,34 +536,49 @@ end
 ---@return table
 function M.apply_body(session, delivery)
   delivery = history.delivery(session, delivery)
-  if delivery.document ~= session.document or session.status ~= "Applied" then return { kind = "Discarded" } end
+  if delivery.document ~= session.document or session.status ~= "Applied"
+    and not (session.status == "Desynchronized" and optional(delivery.snapshot)) then return { kind = "Discarded" } end
   local model = session.file[delivery.file]
   if not model or model.record.generation ~= delivery.generation then return { kind = "Discarded" } end
-  local ok, failure = pcall(function()
+  local ok, result = pcall(function()
     assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
     local body = model.body
     if optional(delivery.snapshot) then
       assert(delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status body identity differs")
+      counter(delivery.snapshot.revision)
+      if session.status == "Applied" and body and body.revision >= delivery.snapshot.revision then return { kind = "Applied" } end
       body = buffer.fragment(delivery.snapshot)
     elseif optional(delivery.patch) then
-      assert(body, "status body requires a snapshot")
+      local patch = delivery.patch
+      assert(patch.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status body identity differs")
+      assert(counter(patch.next) == counter(patch.base) + 1, "patch revision advance differs")
+      if body and patch.next <= body.revision then return { kind = "Applied" } end
+      if not body or patch.base ~= body.revision then
+        assert(session.recover_body, "status body requires snapshot recovery")
+        if not model.recovering then
+          model.recovering = true
+          session.recover_body(delivery.file, delivery.generation)
+        end
+        return { kind = "Recovering" }
+      end
       local prepared = buffer.prepare_fragment_patch(body, delivery.patch)
       buffer.apply_fragment_patch(body, delivery.patch, prepared)
-    else return end
+    else return { kind = "Applied" } end
     model.body = body
     model.header = file_header(model.record, body, delivery.file)
     adopt(session, prepare(session, session.inventory))
+    return { kind = "Applied" }
   end)
   if not ok then
     session.status = "Desynchronized"
-    session.notice(tostring(failure))
+    session.notice(tostring(result))
     if session.recover_body and not model.recovering then
       model.recovering = true
       session.recover_body(delivery.file, delivery.generation)
     end
-    return { kind = "Desynchronized", diagnostic = tostring(failure) }
+    return { kind = "Desynchronized", diagnostic = tostring(result) }
   end
-  return { kind = "Applied" }
+  return result
 end
 
 ---@param session ForgeStatusReplica
@@ -649,7 +670,7 @@ function M.selection(session, first, last)
       selected[#selected + 1], seen[candidate.target] = location, true
     end
   end
-  assert(#selected > 0 and #selected <= 65536, "invalid status selection size")
+  assert(#selected > 0, "invalid status selection size")
   return { target = selected }
 end
 

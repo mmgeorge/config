@@ -5,7 +5,6 @@ use std::{
     ops::Range,
 };
 
-use crate::body::{BodyKind, BodyPolicy, UnavailableReason};
 use crate::cache::AnalysisHandle;
 use crate::intraline::{FallbackReason, IntralinePolicy, IntralineResult, compare_replacement};
 use crate::raw::{RawDiff, RawHunkId};
@@ -51,7 +50,6 @@ pub struct ChunkLimits {
 pub enum DisplayState {
     More,
     Complete,
-    Unavailable(UnavailableReason),
 }
 
 #[derive(Debug)]
@@ -325,35 +323,22 @@ impl DisplayCursor {
     pub fn group(&self, index: usize) -> Option<&DisplayHunk> {
         self.group.get(index)
     }
-    pub fn new(diff: AnalysisHandle, context: usize, kind: BodyKind) -> Self {
-        Self::with_group_edges(diff, context, kind, false)
+    pub fn new(diff: AnalysisHandle, context: usize) -> Self {
+        Self::with_group_edges(diff, context, false)
     }
 
     /// Groups nearby changes with the requested context radius while omitting
     /// unchanged rows before the first and after the last raw hunk in each group.
-    pub fn compact(diff: AnalysisHandle, context: usize, kind: BodyKind) -> Self {
-        Self::with_group_edges(diff, context, kind, true)
+    pub fn compact(diff: AnalysisHandle, context: usize) -> Self {
+        Self::with_group_edges(diff, context, true)
     }
 
     fn with_group_edges(
         diff: AnalysisHandle,
         context: usize,
-        kind: BodyKind,
         compact_group_edges: bool,
     ) -> Self {
-        let lines = match kind {
-            BodyKind::Added | BodyKind::Modified => diff.source().new.newline().line_count,
-            BodyKind::Deleted => diff.source().old.newline().line_count,
-        };
-        let terminal = BodyPolicy::default()
-            .may_preview_full_file(kind, lines)
-            .err()
-            .map(DisplayState::Unavailable);
-        let group = if terminal.is_none() {
-            group_hunks(&diff, context)
-        } else {
-            Vec::new()
-        };
+        let group = group_hunks(&diff, context);
         Self {
             diff,
             group,
@@ -362,7 +347,7 @@ impl DisplayCursor {
             old: SourcePosition::default(),
             new: SourcePosition::default(),
             initialized: false,
-            terminal,
+            terminal: None,
             emphasis: None,
             compact_group_edges,
             context,
@@ -380,7 +365,7 @@ impl DisplayCursor {
         side: SourceSide,
         line: usize,
     ) -> Self {
-        let mut cursor = Self::new(diff, context, BodyKind::Modified);
+        let mut cursor = Self::new(diff, context);
         let selected = cursor
             .group
             .iter()
@@ -400,8 +385,8 @@ impl DisplayCursor {
         cursor
     }
 
-    /// Emits at most the requested limits, capped by the protocol's initial engineering limits.
-    /// A zero budget preserves the cursor. An oversized line terminates without splitting it.
+    /// Emit bounded batches while allowing one complete source line beyond the byte target.
+    /// Preserve the cursor for a zero budget without splitting source text.
     pub fn next_rows(&mut self, limits: ChunkLimits) -> DisplayChunk {
         let row_limit = limits.rows.min(256).min(limits.decorations.min(8192));
         let byte_limit = limits.text_bytes.min(128 * 1024);
@@ -428,20 +413,7 @@ impl DisplayCursor {
             };
             let text = &source[candidate.bytes.clone()];
             let charge = text.len() + 1;
-            if charge > byte_limit {
-                let state = DisplayState::Unavailable(UnavailableReason::LineBytes {
-                    coordinate: candidate
-                        .old
-                        .or(candidate.new)
-                        .expect("every row has a source coordinate"),
-                    line_bytes: text.len(),
-                    limit: byte_limit,
-                });
-                self.terminal = Some(state.clone());
-                chunk.state = state;
-                return chunk;
-            }
-            if charge > byte_limit - chunk.text_bytes {
+            if !chunk.rows.is_empty() && charge > byte_limit.saturating_sub(chunk.text_bytes) {
                 break;
             }
             let (mut emphasis, mut emphasis_fallback) = self.row_emphasis(&candidate);
@@ -730,7 +702,7 @@ mod selected_group_tests {
             })
             .await
             .unwrap();
-        let mut cursor = DisplayCursor::compact(analysis, 3, BodyKind::Modified);
+        let mut cursor = DisplayCursor::compact(analysis, 3);
         let chunk = cursor.next_rows(ChunkLimits::default());
         let rows: Vec<_> = chunk.rows.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(

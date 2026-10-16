@@ -213,13 +213,7 @@ impl ControlToolRuntime {
                 invocation.arguments["source_digests"] = serde_json::to_value(&request.source_digests)?;
                 let delta = crate::plan::revision::DeclarationDelta::between(Some(document), &updated)?;
                 let mut confirmation = format!("{}{}", delta.document, delta.files);
-                const MAX_CONFIRMATION_BYTES: usize = 16 * 1024;
-                if confirmation.len() > MAX_CONFIRMATION_BYTES {
-                    let mut boundary = MAX_CONFIRMATION_BYTES;
-                    while !confirmation.is_char_boundary(boundary) { boundary -= 1; }
-                    confirmation.truncate(boundary);
-                    confirmation.push_str("\n[Applied diff truncated. Read affected ranges for additional context.]\n");
-                } else if confirmation.is_empty() {
+                if confirmation.is_empty() {
                     confirmation.push_str("No declaration changes.\n");
                 }
                 if let Some(execution) = &self.context.execution {
@@ -646,7 +640,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn large_patch_confirmation_is_bounded_without_losing_the_applied_design() {
+    async fn large_patch_confirmation_preserves_the_complete_applied_design() {
         let mut context = planning_context();
         context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
         let mut declaration = "/// Describes the public response.\npub struct Response {\n".to_owned();
@@ -657,7 +651,9 @@ mod test {
         let added = declaration.lines().map(|line| format!("+{line}\n")).collect::<String>();
         let mut runtime = ControlToolRuntime::new(context);
         let confirmed = runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
-        assert!(confirmed.message.contains("Applied diff truncated") && confirmed.message.len() < 17 * 1024);
+        assert!(!confirmed.message.contains("Applied diff truncated"));
+        assert!(confirmed.message.len() > 17 * 1024);
+        assert!(confirmed.message.contains("response_499"));
         assert_eq!(runtime.plan_document().unwrap().design.as_ref().unwrap().proposed["src/response.rs"], declaration);
     }
 

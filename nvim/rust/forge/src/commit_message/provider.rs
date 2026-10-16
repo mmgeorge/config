@@ -1,4 +1,3 @@
-use std::io::Read;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -91,16 +90,12 @@ async fn read_json(request: RequestBuilder) -> Result<Value> {
     let status = response.status();
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await? {
-        ensure!(
-            bytes.len() + chunk.len() <= 256 * 1024,
-            "model response exceeds 256 KiB"
-        );
         bytes.extend_from_slice(&chunk);
     }
     if !status.is_success() {
         bail!(
             "model request failed with HTTP {status}: {}",
-            String::from_utf8_lossy(&bytes[..bytes.len().min(2048)])
+            String::from_utf8_lossy(&bytes)
         );
     }
     serde_json::from_slice(&bytes).context("model returned invalid JSON")
@@ -108,20 +103,12 @@ async fn read_json(request: RequestBuilder) -> Result<Value> {
 
 fn extract(provider: &str, response: &Value) -> Result<String> {
     let mut text = String::new();
-    let mut append = |part: &str| -> Result<()> {
-        ensure!(
-            text.len() + part.len() <= 16 * 1024,
-            "generated commit message exceeds 16 KiB"
-        );
-        text.push_str(part);
-        Ok(())
-    };
     match provider {
-        "copilot" => append(
+        "copilot" => text.push_str(
             response["choices"][0]["message"]["content"]
                 .as_str()
                 .context("Copilot returned no message")?,
-        )?,
+        ),
         "gemini" => {
             for part in response["candidates"][0]["content"]["parts"]
                 .as_array()
@@ -129,7 +116,7 @@ fn extract(provider: &str, response: &Value) -> Result<String> {
             {
                 if part["thought"] != true {
                     if let Some(part) = part["text"].as_str() {
-                        append(part)?;
+                        text.push_str(part);
                     }
                 }
             }
@@ -143,7 +130,7 @@ fn extract(provider: &str, response: &Value) -> Result<String> {
                     for part in item["content"].as_array().into_iter().flatten() {
                         if part["type"] == "output_text" {
                             if let Some(part) = part["text"].as_str() {
-                                append(part)?;
+                                text.push_str(part);
                             }
                         }
                     }
@@ -168,25 +155,17 @@ fn oauth_token() -> Result<String> {
     for directory in directory {
         for name in ["hosts.json", "apps.json"] {
             let path = directory.join("github-copilot").join(name);
-            let Ok(file) = std::fs::File::open(path) else {
-                continue;
+            let bytes = match std::fs::read(&path) {
+                Ok(bytes) => bytes,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error).with_context(|| format!("cannot read {}", path.display())),
             };
-            let mut bytes = Vec::new();
-            file.take(256 * 1024 + 1).read_to_end(&mut bytes)?;
-            ensure!(
-                bytes.len() <= 256 * 1024,
-                "Copilot credential file exceeds bound"
-            );
             let Ok(Value::Object(record)) = serde_json::from_slice(&bytes) else {
                 continue;
             };
             for (host, record) in record {
                 if host.contains("github.com") {
                     if let Some(token) = record["oauth_token"].as_str() {
-                        ensure!(
-                            token.len() <= 16 * 1024,
-                            "Copilot OAuth token exceeds bound"
-                        );
                         return Ok(token.to_owned());
                     }
                 }
@@ -199,6 +178,37 @@ fn oauth_token() -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn model_response_retains_complete_large_json() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let expected = format!("{}final response bytes", "λ".repeat(256 * 1024));
+        let body = serde_json::to_vec(&json!({ "text": expected })).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.windows(4).any(|bytes| bytes == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let count = stream.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&chunk[..count]);
+            }
+            let headers = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream.write_all(headers.as_bytes()).await.unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        let client = Client::builder().no_proxy().build().unwrap();
+        let response = read_json(client.get(format!("http://{address}/"))).await.unwrap();
+        assert_eq!(response["text"], expected);
+        server.await.unwrap();
+    }
+
     #[test]
     fn extracts_provider_text_without_thinking_or_tool_output() {
         assert_eq!(extract("gemini", &json!({"candidates":[{"content":{"parts":[{"thought":true,"text":"private reasoning"},{"text":"fix: preserve edits"}]}}]})).unwrap(), "fix: preserve edits");
@@ -211,12 +221,10 @@ mod tests {
             "fix: preserve edits"
         );
         assert_eq!(extract("openai", &json!({"output":[{"type":"reasoning"},{"type":"message","content":[{"type":"output_text","text":"fix: preserve edits"}]}]})).unwrap(), "fix: preserve edits");
-        assert!(
-            extract(
-                "copilot",
-                &json!({"choices":[{"message":{"content":"x".repeat(16385)}}]})
-            )
-            .is_err()
+        let text = format!("fix: preserve complete response\n\n{}", "x".repeat(256 * 1024 + 1));
+        assert_eq!(
+            extract("copilot", &json!({"choices":[{"message":{"content":text}}]})).unwrap(),
+            text
         );
     }
 }

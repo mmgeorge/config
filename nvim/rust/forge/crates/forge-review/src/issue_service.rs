@@ -37,7 +37,6 @@ pub struct IssueShutdown {
 }
 
 const MAX_JOBS: usize = 32;
-const MAX_INPUT: usize = 16 * 1024 * 1024;
 #[derive(Clone)]
 pub struct IssueDocumentService {
     github: GithubService,
@@ -46,7 +45,6 @@ pub struct IssueDocumentService {
     admission: Arc<DocumentAdmissionStore>,
     state: Arc<Mutex<IssueServiceState>>,
     jobs: Arc<Semaphore>,
-    bytes: Arc<Semaphore>,
 }
 #[derive(Default)]
 struct IssueServiceState {
@@ -124,7 +122,6 @@ impl IssueDocumentService {
             admission: Arc::default(),
             state: Arc::default(),
             jobs: Arc::new(Semaphore::new(MAX_JOBS)),
-            bytes: Arc::new(Semaphore::new(MAX_INPUT)),
         }
     }
     pub async fn open(
@@ -601,7 +598,6 @@ impl IssueDocumentService {
     pub fn close(&self) {
         self.admission.cancel_all();
         self.jobs.close();
-        self.bytes.close();
         let document = {
             let mut state = self.state.lock().expect("issue registry");
             state.closed = true;
@@ -681,21 +677,11 @@ impl IssueDocumentService {
             .cloned()
             .context("unknown issue document")
     }
-    fn admit_job(&self, bytes: usize) -> Result<(OwnedSemaphorePermit, OwnedSemaphorePermit)> {
-        ensure!(
-            bytes > 0 && bytes <= MAX_INPUT,
-            "issue input exceeds 16 MiB"
-        );
-        Ok((
-            self.jobs
+    fn admit_job(&self, _bytes: usize) -> Result<OwnedSemaphorePermit> {
+        self.jobs
                 .clone()
                 .try_acquire_owned()
-                .context("issue job admission is full")?,
-            self.bytes
-                .clone()
-                .try_acquire_many_owned(bytes as u32)
-                .context("issue input admission is full")?,
-        ))
+                .context("issue job admission is full")
     }
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> Result<()> {
         let mut state = self.state.lock().expect("issue registry");

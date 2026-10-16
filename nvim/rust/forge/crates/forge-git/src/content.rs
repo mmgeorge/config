@@ -6,9 +6,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, ensure};
-use forge_diff::source::{
-    MAX_SOURCE_BYTES, Representation, SourceError, SourceIdentity, SourceVersion,
-};
+use forge_diff::source::{Representation, SourceError, SourceIdentity, SourceVersion};
 
 use crate::{
     RepositoryIdentity, RepositoryPath, WorktreeId,
@@ -75,17 +73,9 @@ pub enum ContentSource {
     Supplied(SourceVersion),
 }
 
-#[derive(Clone, Copy, Debug)]
-/// Applies a caller-lowered byte and line bound within the shared 8 MiB source ceiling.
-pub struct ContentLimits {
-    bytes: usize,
-    lines: usize,
-}
-
 #[derive(Clone, Debug)]
 pub struct ContentRequest {
     pub source: ContentSource,
-    pub limits: ContentLimits,
     /// Rejects a ready source whose bytes or representation differ from this identity.
     pub expected: Option<SourceIdentity>,
 }
@@ -93,7 +83,6 @@ pub struct ContentRequest {
 struct WorktreeRead<'session> {
     path: RepositoryPath,
     conversion: WorktreeConversion,
-    limits: ContentLimits,
     expected: Option<SourceIdentity>,
     session: Option<&'session mut conversion::ConversionSession>,
 }
@@ -124,14 +113,6 @@ pub struct FileContent {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ContentLimit {
-    Bytes,
-    Lines,
-    RetainedCapacity,
-    ConversionCapacity,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ContentUnavailable {
     UnsupportedEncoding,
     NotBlob(gix::objs::Kind),
@@ -146,11 +127,6 @@ pub enum ContentUnavailable {
 pub enum ContentResult {
     Ready(FileContent),
     Binary,
-    TooLarge {
-        kind: ContentLimit,
-        observed: u64,
-        limit: u64,
-    },
     Missing,
     Unavailable(ContentUnavailable),
     Failed(anyhow::Error),
@@ -162,39 +138,13 @@ pub struct ContentAcquisition {
     pub identity: Option<SourceIdentity>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum BoundedLineCount {
-    Exact(usize),
-    ExceedsLimit { at_least: usize },
-}
-
-impl Default for ContentLimits {
-    fn default() -> Self {
-        Self {
-            bytes: MAX_SOURCE_BYTES,
-            lines: usize::MAX,
-        }
-    }
-}
-
-impl ContentLimits {
-    /// Allows zero bytes or lines for an empty-only request and rejects a byte bound above 8 MiB.
-    pub fn new(bytes: usize, lines: usize) -> Result<Self> {
-        ensure!(
-            bytes <= MAX_SOURCE_BYTES,
-            "content byte limit exceeds 8 MiB"
-        );
-        Ok(Self { bytes, lines })
-    }
-}
-
 impl RepositoryState {
-    /// Acquires exact bounded source bytes on the shared read pool and rejects invalidation.
+    /// Acquire complete source bytes on the shared read pool and reject invalidation.
     ///
     /// Object bytes use immutable object identity, index reads verify the selected stage before
     /// and after acquisition, and worktree reads verify metadata without following leaf symlinks.
     /// Worktree requests select raw bytes or canonical built-in conversion. Failures remain distinct from missing,
-    /// binary, unsupported, and oversized content. Admission and cancellation fail the outer read.
+    /// binary, and unsupported content. Admission and cancellation fail the outer read.
     pub async fn content(
         self: &Arc<Self>,
         store: &RepositoryStore,
@@ -208,7 +158,7 @@ impl RepositoryState {
     }
 
     /// Retains the canonical byte identity before text classification, including binary sources.
-    /// Sources rejected before bounded acquisition have no identity.
+    /// Sources unavailable before acquisition have no identity.
     pub async fn content_with_identity(
         self: &Arc<Self>,
         store: &RepositoryStore,
@@ -298,7 +248,6 @@ fn acquire_with_identity(
         ContentSource::Object(object) => read_object(
             local,
             object,
-            request.limits,
             request.expected,
             ContentOrigin::Object(object),
             identity,
@@ -311,7 +260,6 @@ fn acquire_with_identity(
             finish_source(
                 source,
                 ContentOrigin::Supplied,
-                request.limits,
                 request.expected,
             )
         }
@@ -321,7 +269,6 @@ fn acquire_with_identity(
             WorktreeRead {
                 path,
                 conversion,
-                limits: request.limits,
                 expected: request.expected,
                 session: None,
             },
@@ -353,7 +300,6 @@ fn acquire_with_identity(
             let result = read_object(
                 local,
                 state.object,
-                request.limits,
                 request.expected,
                 origin,
                 identity,
@@ -371,7 +317,6 @@ fn acquire_with_identity(
 fn read_object(
     repository: &gix::Repository,
     object: gix::ObjectId,
-    limits: ContentLimits,
     expected: Option<SourceIdentity>,
     origin: ContentOrigin,
     identity: Option<&mut Option<SourceIdentity>>,
@@ -393,13 +338,6 @@ fn read_object(
             header.kind(),
         )));
     }
-    if header.size() > limits.bytes as u64 {
-        return Ok(ContentResult::TooLarge {
-            kind: ContentLimit::Bytes,
-            observed: header.size(),
-            limit: limits.bytes as u64,
-        });
-    }
     check()?;
     let loaded = repository
         .find_object(object)
@@ -413,7 +351,6 @@ fn read_object(
         loaded.detach().data,
         Representation::GitCanonical,
         origin,
-        limits,
         expected,
         identity,
     )
@@ -429,7 +366,6 @@ fn read_worktree(
     let WorktreeRead {
         path,
         conversion,
-        limits,
         expected,
         session,
     } = request;
@@ -454,23 +390,9 @@ fn read_worktree(
         }
         WorktreeStamp::Symlink { target, .. } => {
             let bytes = target.as_os_str().as_encoded_bytes();
-            if bytes.len() > limits.bytes {
-                return Ok(ContentResult::TooLarge {
-                    kind: ContentLimit::Bytes,
-                    observed: bytes.len() as u64,
-                    limit: limits.bytes as u64,
-                });
-            }
             bytes.to_vec()
         }
         WorktreeStamp::File(metadata) => {
-            if metadata.length > limits.bytes as u64 {
-                return Ok(ContentResult::TooLarge {
-                    kind: ContentLimit::Bytes,
-                    observed: metadata.length,
-                    limit: limits.bytes as u64,
-                });
-            }
             let mut options = OpenOptions::new();
             options.read(true);
             #[cfg(unix)]
@@ -492,7 +414,8 @@ fn read_worktree(
                 opened.is_file() && !opened.is_symlink() && *metadata == metadata_stamp(&opened)?,
                 "worktree changed before content acquisition"
             );
-            let bytes = read_bounded(&mut file, metadata.length as usize, limits.bytes, check)?;
+            let expected = usize::try_from(metadata.length).context("worktree length overflow")?;
+            let bytes = read_exact_content(&mut file, expected, check)?;
             ensure!(
                 *metadata == metadata_stamp(&file.metadata()?)?,
                 "worktree changed during content acquisition"
@@ -511,22 +434,15 @@ fn read_worktree(
             (bytes, Representation::GitCanonical, None)
         }
         WorktreeConversion::GitCanonical => match if let Some(session) = session {
-            session.convert(local, repository, &path, bytes, limits.bytes, check)
+            session.convert(local, repository, &path, bytes, check)
         } else {
-            conversion::convert(local, repository, &path, bytes, limits.bytes, check)
+            conversion::convert(local, repository, &path, bytes, check)
         }? {
             conversion::ConversionResult::Ready { bytes, identity } => {
                 (bytes, Representation::GitCanonical, Some(identity))
             }
             conversion::ConversionResult::Unavailable(reason) => {
                 return Ok(ContentResult::Unavailable(reason));
-            }
-            conversion::ConversionResult::TooLarge { capacity } => {
-                return Ok(ContentResult::TooLarge {
-                    kind: ContentLimit::ConversionCapacity,
-                    observed: capacity as u64,
-                    limit: limits.bytes as u64,
-                });
             }
         },
     };
@@ -544,26 +460,20 @@ fn read_worktree(
             stamp,
             conversion,
         },
-        limits,
         expected,
         identity,
     )
 }
 
-fn read_bounded(
+fn read_exact_content(
     file: &mut impl Read,
     expected: usize,
-    limit: usize,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     bytes
         .try_reserve_exact(expected)
-        .context("reserve admitted worktree content")?;
-    ensure!(
-        bytes.capacity() <= limit,
-        "worktree allocation exceeds content limit"
-    );
+        .context("reserve worktree content")?;
     let mut scratch = [0; 8192];
     loop {
         check()?;
@@ -572,7 +482,7 @@ fn read_bounded(
             .min(expected.saturating_sub(bytes.len()).saturating_add(1));
         let count = match file.read(&mut scratch[..requested]) {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result.context("read bounded worktree content")?,
+            result => result.context("read worktree content")?,
         };
         if count == 0 {
             break;
@@ -621,17 +531,9 @@ fn finish_bytes(
     bytes: Vec<u8>,
     representation: Representation,
     origin: ContentOrigin,
-    limits: ContentLimits,
     expected: Option<SourceIdentity>,
     identity: Option<&mut Option<SourceIdentity>>,
 ) -> Result<ContentResult> {
-    if bytes.capacity() > limits.bytes {
-        return Ok(ContentResult::TooLarge {
-            kind: ContentLimit::RetainedCapacity,
-            observed: bytes.capacity() as u64,
-            limit: limits.bytes as u64,
-        });
-    }
     let bytes = Arc::new(bytes);
     let source = SourceVersion::from_shared(Arc::clone(&bytes), representation);
     if let Some(identity) = identity {
@@ -644,16 +546,6 @@ fn finish_bytes(
             "content identity differs from the requested source"
         );
     }
-    if limits.lines < bytes.len()
-        && let BoundedLineCount::ExceedsLimit { at_least } =
-            count_bounded_lines(&bytes, limits.lines)
-    {
-        return Ok(ContentResult::TooLarge {
-            kind: ContentLimit::Lines,
-            observed: at_least as u64,
-            limit: limits.lines as u64,
-        });
-    }
     let source = match source {
         Ok(source) => source,
         Err(SourceError::Binary) => return Ok(ContentResult::Binary),
@@ -664,53 +556,19 @@ fn finish_bytes(
         }
         Err(error) => return Err(error.into()),
     };
-    finish_source(source, origin, limits, expected)
+    finish_source(source, origin, expected)
 }
 
 fn finish_source(
     source: SourceVersion,
     origin: ContentOrigin,
-    limits: ContentLimits,
     expected: Option<SourceIdentity>,
 ) -> Result<ContentResult> {
-    if source.retained_bytes() > limits.bytes {
-        return Ok(ContentResult::TooLarge {
-            kind: ContentLimit::RetainedCapacity,
-            observed: source.retained_bytes() as u64,
-            limit: limits.bytes as u64,
-        });
-    }
-    if source.newline().line_count > limits.lines {
-        return Ok(ContentResult::TooLarge {
-            kind: ContentLimit::Lines,
-            observed: source.newline().line_count as u64,
-            limit: limits.lines as u64,
-        });
-    }
     ensure!(
         expected.is_none_or(|expected| expected == source.identity()),
         "content identity differs from the requested source"
     );
     Ok(ContentResult::Ready(FileContent { source, origin }))
-}
-
-/// Counts LF-delimited lines without adding a line for a terminal LF, stopping at the first excess.
-pub fn count_bounded_lines(bytes: &[u8], limit: usize) -> BoundedLineCount {
-    let mut count = 0;
-    for byte in bytes {
-        if *byte == b'\n' {
-            count += 1;
-            if count > limit {
-                return BoundedLineCount::ExceedsLimit { at_least: count };
-            }
-        }
-    }
-    count += usize::from(!bytes.is_empty() && bytes.last() != Some(&b'\n'));
-    if count > limit {
-        BoundedLineCount::ExceedsLimit { at_least: count }
-    } else {
-        BoundedLineCount::Exact(count)
-    }
 }
 
 #[cfg(test)]
@@ -719,50 +577,34 @@ mod tests {
     use crate::test_support::git;
 
     #[test]
-    fn bounded_lines_preserve_empty_final_newline_and_lower_bound_semantics() {
-        for (bytes, count) in [
-            (b"".as_slice(), 0),
-            (b"\n", 1),
-            (b"one", 1),
-            (b"one\r\n", 1),
-            (b"one\ntwo", 2),
-            (b"one\rtwo", 1),
-        ] {
-            assert_eq!(
-                count_bounded_lines(bytes, count),
-                BoundedLineCount::Exact(count)
-            );
-        }
+    fn complete_stream_preserves_content_beyond_former_limit() {
+        let bytes = b"line\r\n".repeat(1_500_000);
         assert_eq!(
-            count_bounded_lines(b"one\ntwo\nthree\nfour", 2),
-            BoundedLineCount::ExceedsLimit { at_least: 3 }
-        );
-        assert_eq!(
-            count_bounded_lines(b"one", 0),
-            BoundedLineCount::ExceedsLimit { at_least: 1 }
+            read_exact_content(&mut bytes.as_slice(), bytes.len(), &mut || Ok(())).unwrap(),
+            bytes
         );
     }
 
     #[test]
     fn bounded_stream_rejects_growth_shrinkage_and_cancellation() {
         assert!(
-            read_bounded(&mut b"longer".as_slice(), 3, 3, &mut || Ok(()))
+            read_exact_content(&mut b"longer".as_slice(), 3, &mut || Ok(()))
                 .unwrap_err()
                 .to_string()
                 .contains("grew")
         );
         assert!(
-            read_bounded(&mut b"short".as_slice(), 8, 8, &mut || Ok(()))
+            read_exact_content(&mut b"short".as_slice(), 8, &mut || Ok(()))
                 .unwrap_err()
                 .to_string()
                 .contains("shrank")
         );
         assert_eq!(
-            read_bounded(&mut b"exact".as_slice(), 5, 5, &mut || Ok(())).unwrap(),
+            read_exact_content(&mut b"exact".as_slice(), 5, &mut || Ok(())).unwrap(),
             b"exact"
         );
         assert_eq!(
-            read_bounded(&mut b"bytes".as_slice(), 5, 5, &mut || anyhow::bail!(
+            read_exact_content(&mut b"bytes".as_slice(), 5, &mut || anyhow::bail!(
                 "cancelled"
             ))
             .unwrap_err()
@@ -787,7 +629,6 @@ mod tests {
             WorktreeRead {
                 path: RepositoryPath::new(b"file".to_vec()).unwrap(),
                 conversion: WorktreeConversion::Raw,
-                limits: ContentLimits::default(),
                 expected: None,
                 session: None,
             },
@@ -810,7 +651,6 @@ mod tests {
             b"binary\0one".to_vec(),
             Representation::GitCanonical,
             ContentOrigin::Supplied,
-            ContentLimits::default(),
             None,
             Some(&mut identity),
         )
@@ -827,7 +667,6 @@ mod tests {
             b"binary\0two".to_vec(),
             Representation::GitCanonical,
             ContentOrigin::Supplied,
-            ContentLimits::default(),
             identity,
             Some(&mut None),
         );

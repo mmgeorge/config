@@ -24,7 +24,7 @@ fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
     assert!(before.file.is_empty());
     assert_eq!(before.excluded.len(), 3);
-    assert!(before.read(&objects, "edited.asset", 1024).unwrap().is_none());
+    assert!(before.read(&objects, "edited.asset").unwrap().is_none());
 
     fs::write(root.join("edited.asset"), "new asset bytes\n").unwrap();
     fs::remove_file(root.join("deleted.asset")).unwrap();
@@ -48,7 +48,7 @@ fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     assert!(root.join("untracked.asset").exists());
 
     fs::write(root.join(".gitattributes"), "*.asset -filter\n").unwrap();
-    assert!(before.read(&objects, "edited.asset", 1024).unwrap().is_none());
+    assert!(before.read(&objects, "edited.asset").unwrap().is_none());
     let after_rules = checkpoint.capture_native(&objects, "session", 3, || Ok(())).unwrap();
     let preview = RestorePreview::prepare(&objects, root, &after_rules, &lfs_only).unwrap();
     assert!(!preview.path.iter().any(|entry| lfs_only.excluded.contains(&entry.path)));
@@ -70,7 +70,7 @@ fn older_checkpoint_overrides_do_not_restore_current_lfs_assets() {
     let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
     assert!(after.file.iter().any(|file| file.path == "legacy.asset"));
     fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
-    assert!(after.read(&objects, "legacy.asset", 1024).unwrap().is_none());
+    assert!(after.read(&objects, "legacy.asset").unwrap().is_none());
     assert!(before.changed_paths(&after).unwrap().is_empty());
     assert!(RestorePreview::prepare(&objects, root, &after, &before).unwrap().path.is_empty());
 }
@@ -84,10 +84,10 @@ fn clean_checkout_preserves_physical_line_endings_and_invalidates_reuse() {
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
     let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
-    assert_eq!(before.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"before\n");
+    assert_eq!(before.read(&objects, "tracked.txt").unwrap().unwrap(), b"before\n");
     fs::write(root.join("tracked.txt"), b"before\r\n").unwrap();
     let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
-    assert_eq!(after.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"before\r\n");
+    assert_eq!(after.read(&objects, "tracked.txt").unwrap().unwrap(), b"before\r\n");
     assert_ne!(before.id, after.id);
     assert_eq!(before.changed_paths(&after).unwrap(), vec!["tracked.txt"]);
 }
@@ -143,7 +143,7 @@ fn private_checkpoint_index_preserves_a_split_index_and_staged_content() {
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let record = GitCheckpoint::new(root).capture_native(&objects, "session", 0, || Ok(())).unwrap();
-    assert_eq!(record.read(&objects, "tracked.txt", 1024).unwrap().unwrap(), b"unstaged\n");
+    assert_eq!(record.read(&objects, "tracked.txt").unwrap().unwrap(), b"unstaged\n");
     assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
     let staged = std::process::Command::new("git").current_dir(root)
         .args(["show", ":tracked.txt"]).output().unwrap();
@@ -174,7 +174,7 @@ async fn reuses_unchanged_checkpoint_and_detects_external_dirty_edits() {
     let edited = checkpoint.capture(&store.objects, &repositories, "reuse", 4).await.unwrap();
     assert_ne!(edited.id, dirty.id, "same-length edits with restored mtime must invalidate reuse");
     let captured = edited.file.iter().find(|file|file.path == "tracked.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id, 100).unwrap().unwrap(), b"second\n");
+    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"second\n");
 
     fs::write(repository.path().join("new.txt"), "external").unwrap();
     let added = checkpoint.capture(&store.objects, &repositories, "reuse", 5).await.unwrap();
@@ -235,8 +235,7 @@ async fn capture_waits_for_each_repository_scope_before_reading() {
         assert_eq!(
             store
                 .objects
-                .get(&tracked.object_id, 4096)
-                .unwrap()
+                .get(&tracked.object_id)
                 .unwrap(),
             content.as_bytes()
         );
@@ -285,7 +284,7 @@ async fn dropping_capture_queued_on_a_scope_removes_its_admission() {
     assert!(
         store
             .objects
-            .get(&crate::plan::digest(b"before\n"), 4096)
+            .get(&crate::plan::digest(b"before\n"))
             .is_err()
     );
     running.finish(OperationCompletion::Completed).unwrap();
@@ -347,7 +346,7 @@ async fn cancelled_capture_worker_retains_scopes_until_native_exit() {
     assert!(
         store
             .objects
-            .get(&crate::plan::digest(b"before\n"), 4096)
+            .get(&crate::plan::digest(b"before\n"))
             .is_err()
     );
 }
@@ -422,7 +421,7 @@ async fn admitted_capture_honors_cancellation_but_accepts_repository_invalidatio
             assert!(result.is_ok(), "repository invalidation must not fail capture: {result:?}");
         } else {
             assert!(result.unwrap_err().to_string().contains("cancelled"));
-            assert!(store.objects.get(&crate::plan::digest(b"before\n"), 4096).is_err());
+            assert!(store.objects.get(&crate::plan::digest(b"before\n")).is_err());
         }
         assert_eq!(repositories.writes.usage().operations, 0);
         assert_eq!(repositories.writes.usage().input_bytes, 0);
@@ -478,7 +477,7 @@ async fn capture_uses_shared_admission_before_acquisition() {
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
-    let repositories = Arc::new(RepositoryStore::new(1, 1, 4096).unwrap());
+    let repositories = Arc::new(RepositoryStore::new(1, 1).unwrap());
     let reads = &repositories.reads;
     let checkpoint = GitCheckpoint::new(repository.path());
     let occupied = reads.submit(0, |_| Ok(())).unwrap();
@@ -496,7 +495,7 @@ async fn capture_uses_shared_admission_before_acquisition() {
     assert!(captured.file.is_empty());
     assert_eq!(
         captured
-            .read(&store.objects, "tracked.txt", 4096)
+            .read(&store.objects, "tracked.txt")
             .unwrap()
             .unwrap(),
         b"before\n"
@@ -529,7 +528,7 @@ fn cancelled_queued_capture_keeps_admission_and_does_not_acquire_objects() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(data.path()).unwrap();
-        let repositories = Arc::new(RepositoryStore::new(1, 1, 4096).unwrap());
+        let repositories = Arc::new(RepositoryStore::new(1, 1).unwrap());
         let reads = &repositories.reads;
         let checkpoint = GitCheckpoint::new(repository.path());
         let (started, ready) = tokio::sync::oneshot::channel();
@@ -561,7 +560,7 @@ fn cancelled_queued_capture_keeps_admission_and_does_not_acquire_objects() {
         assert!(
             store
                 .objects
-                .get(&crate::plan::digest(b"before\n"), 4096)
+                .get(&crate::plan::digest(b"before\n"))
                 .is_err()
         );
     });
@@ -578,7 +577,7 @@ fn capture_keeps_read_content_without_retrying_after_a_later_edit() {
     let identity = crate::plan::digest(b"first capture\n");
     let mut changed = false;
     let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !changed && store.objects.get(&identity, 4096).is_ok() {
+        if !changed && store.objects.get(&identity).is_ok() {
             fs::write(&path, b"settled capture\n")?;
             changed = true;
         }
@@ -586,12 +585,12 @@ fn capture_keeps_read_content_without_retrying_after_a_later_edit() {
     }).unwrap();
     assert!(changed);
     let captured = record.file.iter().find(|file| file.path == "tracked.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"first capture\n");
+    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"first capture\n");
     assert!(checkpoint.cache.lock().unwrap().is_none());
     let current = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
     assert_ne!(current.id, record.id);
     let captured = current.file.iter().find(|file| file.path == "tracked.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"settled capture\n");
+    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"settled capture\n");
     let reused = checkpoint.capture_native(&store.objects, "session", 3, || Ok(())).unwrap();
     assert_eq!(reused.id, current.id);
     assert_eq!(reused.created_at_ms, 2);
@@ -610,7 +609,7 @@ fn capture_accepts_an_index_refresh_without_changing_staging() {
     let modified = fs::metadata(&index).unwrap().modified().unwrap();
     let mut refreshed = false;
     let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !refreshed && store.objects.get(&identity, 4096).is_ok() {
+        if !refreshed && store.objects.get(&identity).is_ok() {
             fs::File::options().write(true).open(&index)?.set_times(
                 fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
             )?;
@@ -637,17 +636,17 @@ fn capture_defers_edits_outside_the_initial_status_inventory_to_the_next_checkpo
     let identity = crate::plan::digest(b"first\n");
     let mut changed = false;
     let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !changed && store.objects.get(&identity, 4096).is_ok() {
+        if !changed && store.objects.get(&identity).is_ok() {
             fs::write(&later, b"current version\n")?;
             changed = true;
         }
         Ok(())
     }).unwrap();
     assert!(changed);
-    assert_eq!(record.read(&store.objects, "z-later.txt", 4096).unwrap().unwrap(), b"old\n");
+    assert_eq!(record.read(&store.objects, "z-later.txt").unwrap().unwrap(), b"old\n");
     let next = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
     let captured = next.file.iter().find(|file| file.path == "z-later.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"current version\n");
+    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"current version\n");
     assert_eq!(record.changed_paths(&next).unwrap(), vec!["z-later.txt"]);
 }
 
@@ -661,7 +660,7 @@ fn capture_cancellation_after_object_publication_returns_no_record() {
     let identity = crate::plan::digest(b"changed\n");
     let result = checkpoint.capture_native(&store.objects, "session", 1, || {
         anyhow::ensure!(
-            store.objects.get(&identity, 4096).is_err(),
+            store.objects.get(&identity).is_err(),
             "capture cancelled"
         );
         Ok(())
@@ -677,7 +676,7 @@ fn capture_cancellation_after_object_publication_returns_no_record() {
         b"changed\n"
     );
     assert_eq!(
-        store.objects.get(&identity, 4096).unwrap().unwrap(),
+        store.objects.get(&identity).unwrap(),
         b"changed\n"
     );
     assert!(
@@ -752,7 +751,7 @@ fn locked_checkpoint_source_reports_path_and_can_be_retried() {
 #[tokio::test]
 async fn diffs_and_restores_tracked_and_nonignored_untracked_files() {
     let engine = DiffEngine::new(forge_diff::cache::CacheLimits::default(), 4);
-    let reads = BlockingReadPool::new(4, 1024 * 1024).unwrap();
+    let reads = BlockingReadPool::new(4).unwrap();
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
@@ -1175,7 +1174,7 @@ fn uncollected_completed_restore_keeps_its_receipt_for_reconciliation() {
 #[tokio::test]
 async fn diffs_only_selected_checkpoint_paths() {
     let engine = DiffEngine::new(forge_diff::cache::CacheLimits::default(), 4);
-    let reads = BlockingReadPool::new(4, 1024 * 1024).unwrap();
+    let reads = BlockingReadPool::new(4).unwrap();
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
@@ -1241,7 +1240,7 @@ async fn diffs_only_selected_checkpoint_paths() {
 #[tokio::test]
 async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_changes() {
     let engine = DiffEngine::new(forge_diff::cache::CacheLimits::default(), 4);
-    let reads = BlockingReadPool::new(4, 1024 * 1024).unwrap();
+    let reads = BlockingReadPool::new(4).unwrap();
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
@@ -1267,7 +1266,7 @@ async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_ch
         .unwrap();
     let large = store
         .objects
-        .put(&vec![b'x'; MAX_SOURCE_BYTES + 1])
+        .put(&vec![b'x'; 8 * 1024 * 1024 + 1])
         .unwrap();
     after.file.push(CheckpointFile {
         mode: 0o100644,
@@ -1278,8 +1277,9 @@ async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_ch
         let diff = checkpoint_diff(&store.objects, &reads, &engine, source, target)
             .await
             .unwrap();
-        assert!(diff.contains("diff --git a/large.txt b/large.txt\nDiff unavailable:"));
-        assert!(diff.contains("8388608 bytes"));
+        assert!(diff.contains("diff --git a/large.txt b/large.txt"));
+        assert!(!diff.contains("Diff unavailable:"));
+        assert!(diff.contains(&"x".repeat(8 * 1024 * 1024 + 1)));
         assert!(diff.contains("diff --git a/tracked.txt b/tracked.txt"));
         assert!(diff.contains("after"));
     }
@@ -1287,14 +1287,14 @@ async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_ch
     store.objects.restore_file(&large, &destination).unwrap();
     assert_eq!(
         fs::metadata(destination).unwrap().len(),
-        (MAX_SOURCE_BYTES + 1) as u64
+        (8 * 1024 * 1024 + 1) as u64
     );
 }
 
 #[tokio::test]
 async fn checkpoint_diff_distinguishes_binary_content_from_unsupported_encoding() {
     let engine = DiffEngine::new(forge_diff::cache::CacheLimits::default(), 4);
-    let reads = BlockingReadPool::new(4, 1024 * 1024).unwrap();
+    let reads = BlockingReadPool::new(4).unwrap();
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
@@ -1331,7 +1331,7 @@ async fn checkpoint_diff_distinguishes_binary_content_from_unsupported_encoding(
 async fn checkpoint_source_uses_shared_read_admission_and_preserves_exact_bytes() {
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
-    let reads = BlockingReadPool::new(1, 4096).unwrap();
+    let reads = BlockingReadPool::new(1).unwrap();
     let old = store.objects.put(b"old\r\n").unwrap();
     let new = store.objects.put(b"new without newline").unwrap();
     let occupied = reads.submit(0, |_| Ok(())).unwrap();
@@ -1475,7 +1475,7 @@ fn clean_checkpoint_keeps_git_baseline_without_duplicate_objects() {
     );
     assert_eq!(
         checkpoint
-            .read(&objects, "tracked.txt", 4096)
+            .read(&objects, "tracked.txt")
             .unwrap()
             .unwrap(),
         b"before\n"
@@ -1833,7 +1833,7 @@ fn info_attributes_override_nested_checkout_rules_without_external_filters() {
         .unwrap();
     assert!(captured.file.iter().any(|file| file.path == "tracked.txt"));
     assert_eq!(
-        captured.read(&objects, "tracked.txt", 64).unwrap().unwrap(),
+        captured.read(&objects, "tracked.txt").unwrap().unwrap(),
         b"before\r\n"
     );
 }
@@ -1844,6 +1844,9 @@ fn raw_path_and_symlink_checkpoint_does_not_follow_external_content() {
     use std::os::unix::{ffi::OsStrExt, fs::symlink};
     let repository = repository();
     let root = repository.path();
+    #[cfg(target_os = "macos")]
+    let name = std::ffi::OsStr::from_bytes(b"raw-\xce\xbb");
+    #[cfg(not(target_os = "macos"))]
     let name = std::ffi::OsStr::from_bytes(b"raw-\xff");
     fs::write(root.join(name), b"exact").unwrap();
     symlink("/outside/never-read", root.join("link")).unwrap();
@@ -1854,11 +1857,11 @@ fn raw_path_and_symlink_checkpoint_does_not_follow_external_content() {
         .unwrap();
     let key = forge_git::checkpoint::path_key(name.as_bytes());
     assert_eq!(
-        captured.read(&objects, &key, 64).unwrap().unwrap(),
+        captured.read(&objects, &key).unwrap().unwrap(),
         b"exact"
     );
     assert_eq!(
-        captured.read(&objects, "link", 64).unwrap().unwrap(),
+        captured.read(&objects, "link").unwrap().unwrap(),
         b"/outside/never-read"
     );
 }
@@ -1886,7 +1889,7 @@ fn sparse_checkout_does_not_record_omitted_files_as_deletions() {
         .unwrap();
     assert!(captured.deleted.is_empty());
     assert_eq!(
-        captured.read(&objects, "omit/b", 64).unwrap().unwrap(),
+        captured.read(&objects, "omit/b").unwrap().unwrap(),
         b"omit"
     );
 }

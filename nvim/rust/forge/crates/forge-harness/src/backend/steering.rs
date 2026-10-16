@@ -3,8 +3,6 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc, oneshot};
 
 const MAX_STEERING_REQUESTS: usize = 32;
-const MAX_STEERING_BYTES: usize = 64 * 1024;
-const MAX_TARGET_BYTES: usize = 4096;
 
 use super::{BackendEvent, BackendEventSink};
 
@@ -157,17 +155,6 @@ impl SteeringLane {
                 "backend has no active turn to steer");
             return Ok(());
         };
-        anyhow::ensure!(
-            text.len() <= MAX_STEERING_BYTES,
-            "steering input exceeds 64 KiB"
-        );
-        anyhow::ensure!(
-            target
-                .as_ref()
-                .is_none_or(|target| target.thread_id.len() <= MAX_TARGET_BYTES
-                    && target.turn_id.len() <= MAX_TARGET_BYTES),
-            "steering target exceeds 4 KiB per identifier"
-        );
         let admission = match operation {
             ActiveTurnOperation::Steer
             | ActiveTurnOperation::PauseGoal
@@ -314,31 +301,25 @@ mod test {
     }
 
     #[tokio::test]
-    async fn oversized_steering_does_not_consume_admission() {
+    async fn large_steering_preserves_complete_content() {
         let lane = SteeringLane::default();
         let mut active = lane.activate(None).unwrap();
-        assert!(
-            lane.steer("x".repeat(super::MAX_STEERING_BYTES + 1).into())
-                .await
-                .is_err()
-        );
-        assert!(
-            lane.submit(
+        let text = "λ".repeat(65_537);
+        let target = "target".repeat(4097);
+        let mut request = Box::pin(lane.submit(
                 super::ActiveTurnOperation::Steer,
-                "text".into(),
+                text.clone(),
                 Some(super::SteerTarget {
-                    thread_id: "x".repeat(super::MAX_TARGET_BYTES + 1),
+                    thread_id: target.clone(),
                     turn_id: "turn".into(),
                 }),
                 true,
-            )
-            .await
-            .is_err()
-        );
-        assert!(active.receiver.try_recv().is_err());
-        let mut request = Box::pin(lane.steer("valid".into()));
+            ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
-        active.receive().await.unwrap().complete(Ok(())).await;
+        let command = active.receive().await.unwrap();
+        assert_eq!(command.text, text);
+        assert_eq!(command.target.as_ref().unwrap().thread_id, target);
+        command.complete(Ok(())).await;
         request.await.unwrap();
     }
 

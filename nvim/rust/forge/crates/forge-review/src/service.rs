@@ -58,7 +58,6 @@ use crate::review::{ReviewDocument, ReviewMode, ReviewSnapshot, ReviewVerdict};
 
 const MAX_DOCUMENTS: usize = 64;
 const MAX_JOBS: usize = 32;
-const MAX_TEXT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct ReviewSaveResult {
@@ -495,7 +494,7 @@ impl ReviewService {
             epoch: uuid::Uuid::new_v4(),
             state: Arc::new(Mutex::new(ServiceState::default())),
             github,
-            budget: EditBudget::new(MAX_TEXT_BYTES).expect("positive review text budget"),
+            budget: EditBudget::default(),
             document_admission: Arc::new(Semaphore::new(MAX_DOCUMENTS)),
             job_admission: Arc::new(Semaphore::new(MAX_JOBS)),
         }

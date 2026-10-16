@@ -632,7 +632,7 @@ impl PlanDocument {
         let mut candidate = self.clone();
         candidate.design = Some(self.design.as_ref().context("obsolete plan format. Create a new declaration design.")?.patch(workspace, &request.source_digests, &request.patch)?);
         if let Some(title) = request.title {
-            anyhow::ensure!(!title.trim().is_empty() && title.len() <= 1024, "design title must contain 1 to 1024 bytes");
+            anyhow::ensure!(!title.trim().is_empty(), "design title must not be empty");
             candidate.title = title.trim().into();
         }
         if candidate.design == self.design && candidate.title == self.title { return Ok(self.clone()); }
@@ -711,7 +711,6 @@ impl PlanDocument {
         if let Some(design) = &self.design {
             anyhow::ensure!(self.schema_version == PLAN_SCHEMA_VERSION, "obsolete plan format. Create a new declaration design.");
             anyhow::ensure!(self.version > 0 && !self.plan_id.is_empty() && !self.title.trim().is_empty(),"design identity, title, and version are required");
-            anyhow::ensure!(serde_json::to_vec(self)?.len() <= 8 * 1024 * 1024,"declaration design exceeds 8 MiB");
             return design.validate();
         }
         validate_plan_edit(self)

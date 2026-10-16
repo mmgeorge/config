@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use forge_diff::syntax::{DeclarationCalls, DeclarationContract, DeclarationOverview};
 use serde::{Deserialize, Serialize};
 
@@ -107,7 +107,7 @@ impl ImplementationReport {
             }
             let source = if let Some(current) = current {
                 current
-                    .read(objects, &path, usize::MAX)
+                    .read(objects, &path)
                     .and_then(|bytes| bytes.map(String::from_utf8).transpose().map_err(Into::into))
             } else {
                 super::workspace_source(workspace, &path)
@@ -138,7 +138,7 @@ impl ImplementationReport {
                 } else if !original.baseline.contains_key(&path)
                     && initial.is_some_and(|initial| {
                         initial
-                            .read(objects, &path, usize::MAX)
+                            .read(objects, &path)
                             .ok()
                             .flatten()
                             .is_some()
@@ -183,7 +183,7 @@ impl ImplementationReport {
                 // Existing unplanned declarations are not additions made by this execution.
                 if expected.is_empty()
                     && let Some(initial) = initial
-                    && let Some(bytes) = initial.read(objects, &path, usize::MAX)?
+                    && let Some(bytes) = initial.read(objects, &path)?
                 {
                     let baseline = String::from_utf8(bytes)?;
                     let baseline = DeclarationOverview::extract(&path, &baseline)
@@ -286,9 +286,7 @@ impl ImplementationReport {
 
     pub fn load(objects: &ObjectStore, reference: &ImplementationReportRef) -> Result<Self> {
         serde_json::from_slice(
-            &objects
-                .get(&reference.object_id, usize::MAX)?
-                .context("implementation report is unavailable")?,
+            &objects.get(&reference.object_id)?,
         )
         .map_err(Into::into)
     }

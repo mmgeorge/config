@@ -4,7 +4,6 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
-use std::io::Read;
 use crate::backend::ResourceScope;
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -144,34 +143,29 @@ impl ResourceCatalog {
         targets.is_empty() || targets.iter().any(|candidate| candidate == "*" || candidate == target)
     }
 
-    /// Parse bounded global and workspace skill sources without importing generated files.
+    /// Parse global and workspace skill sources without importing generated files.
     pub(crate) fn skills(config_dir: Option<&Path>, workspace: &Path) -> Result<Vec<SkillResource>> {
         let mut pending = Vec::new();
-        if let Some(config_dir) = config_dir { pending.push((config_dir.join("rulesync-global/.rulesync/skills"), 0, Some(ResourceScope::Global))); }
-        pending.push((workspace.join(".rulesync/skills"), 0, Some(ResourceScope::Workspace)));
+        if let Some(config_dir) = config_dir { pending.push((config_dir.join("rulesync-global/.rulesync/skills"), Some(ResourceScope::Global))); }
+        pending.push((workspace.join(".rulesync/skills"), Some(ResourceScope::Workspace)));
         Self::skill_sources(pending, "rulesync")
     }
 
     /// Inspect native skill metadata without importing it into shared configuration.
     pub(crate) fn native_skills(directory: Vec<std::path::PathBuf>) -> Result<Vec<SkillResource>> {
-        Self::skill_sources(directory.into_iter().map(|path|(path,0,None)).collect(), "native")
+        Self::skill_sources(directory.into_iter().map(|path|(path,None)).collect(), "native")
     }
 
-    fn skill_sources(mut pending: Vec<(std::path::PathBuf, usize, Option<ResourceScope>)>, namespace: &str) -> Result<Vec<SkillResource>> {
+    fn skill_sources(mut pending: Vec<(std::path::PathBuf, Option<ResourceScope>)>, namespace: &str) -> Result<Vec<SkillResource>> {
         let mut visited = std::collections::HashSet::new();
         let mut resource = Vec::new();
-        while let Some((directory, depth, scope)) = pending.pop() {
+        while let Some((directory, scope)) = pending.pop() {
             if !directory.is_dir() { continue; }
-            ensure!(depth <= 8, "skill catalog nesting exceeds 8 directories");
             let directory = dunce::canonicalize(directory)?;
             if !visited.insert(directory.clone()) { continue; }
-            ensure!(visited.len() <= 4096, "skill catalog exceeds 4096 directories");
             let source = directory.join("SKILL.md");
             if source.is_file() {
-                ensure!(source.metadata()?.len() <= 65536, "skill definition exceeds 64 KiB: {}", source.display());
-                let mut text = String::new();
-                std::fs::File::open(&source)?.take(65537).read_to_string(&mut text)?;
-                ensure!(text.len() <= 65536, "skill definition exceeds 64 KiB: {}", source.display());
+                let text = std::fs::read_to_string(&source)?;
                 let text = text.replace("\r\n", "\n");
                 let body = text.strip_prefix("---\n").with_context(||format!("skill frontmatter missing: {}", source.display()))?;
                 let (header, _) = body.split_once("\n---").context("skill frontmatter closing delimiter missing")?;
@@ -188,8 +182,7 @@ impl ResourceCatalog {
                 for entry in std::fs::read_dir(directory)? {
                     let path = entry?.path();
                     if path.is_dir() {
-                        ensure!(pending.len() + visited.len() < 4096, "skill catalog exceeds 4096 directories");
-                        pending.push((path, depth + 1, scope));
+                        pending.push((path, scope));
                     }
                 }
             }

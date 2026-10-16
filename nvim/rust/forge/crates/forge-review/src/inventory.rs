@@ -83,14 +83,6 @@ impl SemInventory {
                 untracked.push(forge_git::validate_path(&root, &record.path)?);
             }
         }
-        ensure!(
-            untracked
-                .iter()
-                .map(|path| path.as_os_str().as_encoded_bytes().len() + 1)
-                .sum::<usize>()
-                <= 24 * 1024,
-            "Sem batched untracked request exceeds command admission"
-        );
         let generation = repository.generation();
         let result = store
             .reads
@@ -141,10 +133,6 @@ impl SemInventory {
         added: Vec<Entity>,
         status: BTreeMap<Vec<u8>, String>,
     ) -> Result<Self> {
-        ensure!(
-            tracked.len() + added.len() <= 10_000,
-            "Sem inventory exceeds 10000 entities"
-        );
         let mut entry = Vec::new();
         let mut seen = HashSet::new();
         let mut touched = BTreeMap::new();
@@ -226,10 +214,6 @@ impl SemInventory {
                 });
             }
         }
-        ensure!(
-            entry.len() <= 30_000,
-            "Sem normalized inventory exceeds admission"
-        );
         Ok(Self { entry })
     }
 }
@@ -285,7 +269,6 @@ fn run(
     let output = read_command(
         command,
         CommandLimits {
-            stdout_bytes: 8 * 1024 * 1024,
             stderr_bytes: 64 * 1024,
             timeout: Duration::from_secs(30),
         },

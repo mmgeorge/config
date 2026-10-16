@@ -362,7 +362,6 @@ impl BufferBlock {
             if overlay.range.start.row != overlay.range.end.row
                 || overlay.range.start.row >= self.text.row_count()
                 || overlay.text.is_empty()
-                || overlay.text.len() > 8192
                 || overlay.text.chars().any(char::is_control)
                 || overlay.capture.is_empty()
                 || overlay.capture.len() > 256
@@ -388,8 +387,8 @@ impl BufferBlock {
         }
         for fold in &self.metadata.fold {
             fold.id.validate()?;
-            if fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.len() > 1024 || suffix.chars().any(char::is_control)) {
-                return Err(ContractError("fold summary suffix requires at most 1024 printable bytes"));
+            if fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.chars().any(char::is_control)) {
+                return Err(ContractError("fold summary suffix requires printable text"));
             }
             fold.end.block.validate()?;
             TextRange {

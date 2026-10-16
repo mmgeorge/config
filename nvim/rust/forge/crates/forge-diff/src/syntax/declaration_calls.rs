@@ -96,13 +96,10 @@ impl DeclarationCalls {
         if super::ConfigurationFormat::for_path(path).is_some() {
             return Ok(Vec::new());
         }
-        if source.len() > 1024 * 1024 {
-            return Err(SyntaxError::MemoryLimit);
-        }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         let parsed = if declarations {
-            super::declaration::declaration_surrogate(language, source)
+            super::declaration::declaration_surrogate(language, source)?
         } else {
             source.to_owned()
         };
@@ -155,14 +152,6 @@ impl DeclarationCalls {
             if *ordinal > 1 {
                 function.owner.push_str(&format!("#{ordinal}"));
             }
-        }
-        if callable
-            .iter()
-            .map(|function| function.call.len())
-            .sum::<usize>()
-            > 65536
-        {
-            return Err(SyntaxError::CaptureLimit);
         }
         Ok(callable)
     }
@@ -236,7 +225,7 @@ fn container(node: Node<'_>, source: &str) -> Option<String> {
     if node.kind() == "impl_item" {
         return node
             .child_by_field_name("type")
-            .map(|value| base_type(contents(value, source)));
+            .and_then(|value| base_type(contents(value, source)));
     }
     if matches!(
         node.kind(),
@@ -276,7 +265,7 @@ fn collect(
     output: &mut Vec<DeclarationCallable>,
     depth: usize,
 ) -> Result<(), SyntaxError> {
-    if depth > 128 || output.len() > 65536 {
+    if depth > 128 {
         return Err(SyntaxError::CaptureLimit);
     }
     let mut nested = scope.to_vec();
@@ -383,7 +372,7 @@ fn collect_returns(
         ) {
             output.insert(
                 format!("field:{owner}.{}", contents(name, source)),
-                Some(base_type(contents(value, source))),
+                base_type(contents(value, source)),
             );
         }
     }
@@ -519,7 +508,7 @@ fn parameter_types(node: Node<'_>, source: &str, binding: &mut HashMap<String, O
             let name = contents(name, source).trim_start_matches("mut ").to_owned();
             let value = child
                 .child_by_field_name("type")
-                .map(|value| base_type(contents(value, source)));
+                .and_then(|value| base_type(contents(value, source)));
             binding.insert(name, value);
         }
     }
@@ -541,7 +530,7 @@ fn lua_annotations(node: Node<'_>, source: &str, binding: &mut HashMap<String, O
     }
 }
 
-fn base_type(value: &str) -> String {
+fn base_type(value: &str) -> Option<String> {
     let value = value
         .trim()
         .trim_start_matches(':')
@@ -554,13 +543,49 @@ fn base_type(value: &str) -> String {
     } else {
         value
     };
-    value
-        .trim_start_matches("mut ")
-        .split(['<', '[', '|'])
-        .next()
-        .unwrap_or_default()
-        .trim()
-        .to_owned()
+    let value = value.trim_start_matches("mut ");
+    let end = value
+        .find(|character: char| {
+            !character.is_alphanumeric() && !matches!(character, '_' | '$' | ':' | '.')
+        })
+        .unwrap_or(value.len());
+    let name = &value[..end];
+    let mut suffix = value[end..].trim();
+    if suffix.starts_with('<') {
+        let mut depth = 0;
+        let mut previous = '\0';
+        let end = suffix.char_indices().find_map(|(offset, character)| {
+            match character {
+                '<' => depth += 1,
+                '>' if !matches!(previous, '=' | '-') => depth -= 1,
+                _ => {}
+            }
+            previous = character;
+            (depth == 0).then_some(offset + character.len_utf8())
+        })?;
+        suffix = suffix[end..].trim();
+    }
+    if !suffix.is_empty()
+        && !suffix.strip_prefix('|').is_some_and(|variants| {
+            variants
+                .split('|')
+                .all(|variant| matches!(variant.trim(), "null" | "undefined"))
+        })
+    {
+        return None;
+    }
+    let qualified = name
+        .split("::")
+        .flat_map(|part| part.split('.'))
+        .all(|part| {
+            let mut characters = part.chars();
+            characters.next().is_some_and(|character| {
+                character.is_alphabetic() || matches!(character, '_' | '$')
+            }) && characters.all(|character| {
+                character.is_alphanumeric() || matches!(character, '_' | '$')
+            })
+        });
+    qualified.then(|| name.to_owned())
 }
 
 fn expression_type(
@@ -574,7 +599,7 @@ fn expression_type(
         "struct_expression" | "new_expression" | "table_constructor" => node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("constructor"))
-            .map(|value| base_type(contents(value, source))),
+            .and_then(|value| base_type(contents(value, source))),
         "call_expression" | "function_call" => {
             let function = node
                 .child_by_field_name("function")
@@ -584,7 +609,7 @@ fn expression_type(
                 .get(&name)
                 .cloned()
                 .flatten()
-                .map(|value| base_type(&value))
+                .and_then(|value| base_type(&value))
         }
         "reference_expression" | "parenthesized_expression" | "await_expression" => {
             let mut cursor = node.walk();
@@ -606,7 +631,7 @@ fn expression_type(
                 .split(',')
                 .next()?
                 .trim_end_matches('>');
-            Some(base_type(inner))
+            base_type(inner)
         }
         "field_expression"
         | "member_expression"
@@ -694,14 +719,7 @@ fn call_name(
                 }
             );
         }
-        let receiver = if matches!(
-            receiver.kind(),
-            "identifier" | "field_expression" | "member_expression" | "dot_index_expression"
-        ) {
-            contents(receiver, source)
-        } else {
-            "<unresolved>"
-        };
+        let receiver = receiver_name(receiver, source);
         return format!("{receiver}.{member}");
     }
     let name = contents(function, source)
@@ -718,6 +736,18 @@ fn call_name(
     }
 }
 
+fn receiver_name(node: Node<'_>, source: &str) -> String {
+    if matches!(node.kind(), "identifier" | "self" | "this" | "super") {
+        contents(node, source).into()
+    } else if let Some((receiver, member)) = member_access(node, source) {
+        format!("{}.{member}", receiver_name(receiver, source))
+    } else if !contents(node, source).contains(['\r', '\n']) {
+        contents(node, source).into()
+    } else {
+        "<unresolved>".into()
+    }
+}
+
 fn calls(
     node: Node<'_>,
     source: &str,
@@ -728,7 +758,7 @@ fn calls(
     output: &mut Vec<DeclarationCall>,
     depth: usize,
 ) -> Result<(), SyntaxError> {
-    if depth > 128 || output.len() > 65536 {
+    if depth > 128 {
         return Err(SyntaxError::CaptureLimit);
     }
     if callable_name(node, source).is_some() {
@@ -758,7 +788,7 @@ fn calls(
         {
             let value = node
                 .child_by_field_name("type")
-                .map(|value| base_type(contents(value, source)))
+                .and_then(|value| base_type(contents(value, source)))
                 .or_else(|| {
                     node.child_by_field_name("value")
                         .and_then(|value| expression_type(value, source, returns, binding))
@@ -817,13 +847,14 @@ fn calls(
                     field,
                     container
                         .child_by_field_name("name")
-                        .or_else(|| container.child_by_field_name("type")),
+                        .or_else(|| container.child_by_field_name("type"))
+                        .and_then(|owner| base_type(contents(owner, source))),
                 ) {
                     output.push(DeclarationCall {
                         kind: DeclarationCallKind::Property,
                         name: format!(
                             "{}::{}",
-                            base_type(contents(owner, source)),
+                            owner,
                             contents(field, source)
                         ),
                         expression: contents(field, source).into(),
@@ -950,7 +981,80 @@ fn shadowed_target(
 
 #[cfg(test)]
 mod tests {
-    use super::{DeclarationCallKind, DeclarationCalls};
+    use super::{DeclarationCallKind, DeclarationCalls, base_type};
+
+    #[test]
+    fn receiver_type_inference_requires_a_named_type() {
+        for (annotation, expected) in [
+            (": Writer", "Writer"),
+            ("&'scope mut crate::Writer<Value>", "crate::Writer"),
+            ("api.Writer<Value>", "api.Writer"),
+            ("Writer | null", "Writer"),
+            ("Writer | null | undefined", "Writer"),
+            ("Container<Writer | Reader> | undefined", "Container"),
+            ("Container<(input: Writer) => Reader> | undefined", "Container"),
+            ("Container<fn() -> Reader>", "Container"),
+        ] {
+            assert_eq!(base_type(annotation).as_deref(), Some(expected));
+        }
+        for annotation in [
+            "{\n writer: Writer;\n metric: Metric | null;\n}",
+            "{ writer: Writer; metric: Metric }[]",
+            "[Writer, Metric]",
+            "(input: Writer) => Metric",
+            "typeof factory",
+            "{ [Key in keyof Writer]: Writer[Key] }",
+            "Writer[]",
+            "api.Writer<Value>[]",
+            "Writer | Reader",
+            "Container<Writer> | Container<Reader>",
+            "Store['writer']",
+            "Store[\"writer\"]",
+            "Writer & Reader",
+        ] {
+            assert_eq!(base_type(annotation), None, "{annotation}");
+        }
+    }
+
+    #[test]
+    fn declaration_boundary_ambiguous_receiver_types_stay_unresolved() {
+        for annotation in [
+            "Writer[]",
+            "Writer | Reader",
+            "Store['writer']",
+            "Writer & Reader",
+        ] {
+            let source = format!("function run(input: {annotation}) {{ input.send(); }}");
+            let functions = DeclarationCalls::extract("boundary.ts", &source, false).unwrap();
+            let calls = &functions[0].call;
+            assert_eq!(calls.len(), 1, "{annotation}");
+            assert_eq!(calls[0].name, "input.send", "{annotation}");
+            assert!(calls[0].unresolved, "{annotation}");
+            assert_eq!(calls[0].expression, "input.send");
+        }
+        let functions = DeclarationCalls::extract(
+            "boundary.ts",
+            "class Store { writers: Writer[]; run() { this.writers.push(); } }",
+            false,
+        ).unwrap();
+        let call = functions[0].call.iter()
+            .find(|reference| reference.kind == DeclarationCallKind::Call).unwrap();
+        assert_eq!(call.name, "this.writers.push");
+        assert!(call.unresolved);
+    }
+
+    #[test]
+    fn declaration_boundary_multiline_receivers_keep_single_line_reference_names() {
+        let source = "function run(input: unknown) { input\n .writer\n .send(); }";
+        let functions = DeclarationCalls::extract("boundary.ts", source, false).unwrap();
+        let calls = &functions[0].call;
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].name, "input.writer.send");
+        assert!(calls[0].unresolved);
+        assert_eq!(calls[0].expression, "input\n .writer\n .send");
+        assert_eq!((calls[0].line, calls[0].column), (3, 2));
+        assert!(calls.iter().all(|reference| !reference.name.contains(['\r', '\n'])));
+    }
 
     #[test]
     fn properties_capture_reads_writes_nested_receivers_and_opaque_bindings() {

@@ -256,7 +256,7 @@ impl TraceStore {
             return;
         }
         if let Err(error) = self.record_detail(session_id, event, payload) {
-            eprintln!("Forge Harness detailed trace write failed: {error}");
+            let _ = writeln!(std::io::stderr(), "Forge Harness detailed trace write failed: {error}");
         }
         let record = json!({
             "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
@@ -268,7 +268,7 @@ impl TraceStore {
             return;
         };
         if line.len() > 16 * 1024 {
-            eprintln!("Forge Harness trace record exceeded its 16 KiB encoding limit");
+            let _ = writeln!(std::io::stderr(), "Forge Harness trace record exceeded its 16 KiB encoding limit");
             return;
         }
         let Ok(mut file) = self.file.lock() else {
@@ -290,7 +290,7 @@ impl TraceStore {
             appended.and(unlocked)
         })();
         if let Err(error) = written {
-            eprintln!("Forge Harness trace write failed: {error}");
+            let _ = writeln!(std::io::stderr(), "Forge Harness trace write failed: {error}");
         }
     }
 

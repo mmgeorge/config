@@ -39,12 +39,8 @@ pub struct DeclarationPresentation {
 
 impl DeclarationOverview {
     /// Extract native comments without interpreting markers inside string values.
-    /// Files are limited to 1 MiB, 65,536 comments, and 128 grammar nesting levels.
     /// Body-free signatures tolerate grammar errors. Unsupported paths yield no comments.
     pub fn comments(path: &str, text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
-        if text.len() > 1024 * 1024 {
-            return Err(SyntaxError::MemoryLimit);
-        }
         if ConfigurationFormat::for_path(path) == Some(ConfigurationFormat::Xml) {
             return xml_comments(text);
         }
@@ -63,9 +59,6 @@ impl DeclarationOverview {
                 return Err(SyntaxError::CaptureLimit);
             }
             if node.kind().contains("comment") {
-                if comment.len() >= 65536 {
-                    return Err(SyntaxError::CaptureLimit);
-                }
                 comment.push(DeclarationComment {
                     position: DeclarationPosition {
                         line: node.start_position().row as u32 + 1,
@@ -142,9 +135,8 @@ impl DeclarationOverview {
         Self::project(path, source, false)
     }
 
-    /// Project declarations and call evidence from one bounded source parse.
+    /// Extract declarations and call evidence from one complete source parse.
     pub fn extract_with_calls(path: &str, source: &str) -> Result<(String, Vec<super::DeclarationCallable>), SyntaxError> {
-        if source.len() > 1024 * 1024 { return Err(SyntaxError::MemoryLimit); }
         if ConfigurationFormat::for_path(path).is_some() { return Ok((Self::extract(path, source)?, Vec::new())); }
         let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
         let mut parser = Parser::new();
@@ -222,9 +214,9 @@ impl DeclarationOverview {
 
     /// Admit signature-only text without changing its persisted layout.
     pub fn parse(path: &str, overview: &str) -> Result<String, SyntaxError> {
-        if overview.len() > 1024 * 1024 || overview.contains('\0') {
+        if overview.contains('\0') {
             return Err(SyntaxError::Query(
-                "declaration overview exceeds 1 MiB or contains NUL".into(),
+                "declaration overview contains NUL".into(),
             ));
         }
         if let Some(config) = ConfigurationFormat::for_path(path) {
@@ -235,7 +227,7 @@ impl DeclarationOverview {
             SyntaxError::Query(format!("unsupported declaration language: {path}"))
         })?;
         let canonical = normalize(overview);
-        let surrogate = declaration_surrogate(language, &canonical);
+        let surrogate = declaration_surrogate(language, &canonical)?;
         let projected = Self::project(path, &surrogate, false)?;
         if projected
             .chars()
@@ -323,7 +315,7 @@ impl DeclarationOverview {
 
     fn format(path: &str, overview: &str) -> Result<String, SyntaxError> {
         let language = Self::language(path).unwrap();
-        let text = Self::project(path, &declaration_surrogate(language, overview), true)?;
+        let text = Self::project(path, &declaration_surrogate(language, overview)?, true)?;
         format_indentation(language, &text)
     }
 }
@@ -333,7 +325,6 @@ fn xml_comments(text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
         text,
         roxmltree::ParsingOptions {
             allow_dtd: true,
-            nodes_limit: 1024 * 1024,
             ..Default::default()
         },
     ).map_err(|error| SyntaxError::Query(error.to_string()))?;
@@ -343,9 +334,6 @@ fn xml_comments(text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
         .collect::<Vec<_>>();
     let mut comment = Vec::new();
     for node in document.descendants().filter(|node| node.is_comment()) {
-        if comment.len() >= 65536 {
-            return Err(SyntaxError::CaptureLimit);
-        }
         let range = node.range();
         let line = line_start.partition_point(|offset| *offset <= range.start) - 1;
         comment.push(DeclarationComment {
@@ -365,7 +353,7 @@ fn formatting_tree(language: SyntaxLanguage, text: &str) -> Result<tree_sitter::
         .set_language(&language.grammar())
         .map_err(|error| SyntaxError::Query(error.to_string()))?;
     let tree = parser
-        .parse(declaration_surrogate(language, text), None)
+        .parse(declaration_surrogate(language, text)?, None)
         .ok_or_else(|| SyntaxError::Query("declaration formatting was cancelled".into()))?;
     if tree.root_node().has_error() {
         return Err(SyntaxError::Query(
@@ -589,7 +577,7 @@ fn layout_tokens(
     text: &str,
 ) -> Result<std::collections::BTreeMap<Vec<(u16, usize)>, (DeclarationPosition, String)>, SyntaxError>
 {
-    let surrogate = declaration_surrogate(language, text);
+    let surrogate = declaration_surrogate(language, text)?;
     let mut parser = Parser::new();
     parser
         .set_language(&language.grammar())
@@ -657,26 +645,42 @@ fn collect_tokens(
     }
 }
 
-pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) -> String {
+pub(super) fn declaration_surrogate(
+    language: SyntaxLanguage,
+    overview: &str,
+) -> Result<String, SyntaxError> {
+    let mut lua_parameter_end = std::collections::HashSet::new();
+    if language == SyntaxLanguage::Lua {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language.grammar())
+            .map_err(|error| SyntaxError::Query(error.to_string()))?;
+        let tree = parser.parse(overview, None).ok_or(SyntaxError::Cancelled)?;
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
+            if node.kind() == ")" && !node.is_missing() {
+                let end = node.end_position();
+                lua_parameter_end.insert((end.row, end.column));
+            }
+            let mut cursor = node.walk();
+            pending.extend(node.children(&mut cursor));
+        }
+    }
     let mut lua_header = false;
-    overview
+    let mut source = overview
         .lines()
-        .map(|line| {
+        .enumerate()
+        .map(|(row, line)| {
             let text = line.trim();
-            if language == SyntaxLanguage::Lua
-                && (text.starts_with("function ") || text.starts_with("local function "))
+            if lua_header
+                || (language == SyntaxLanguage::Lua
+                    && (text.starts_with("function ") || text.starts_with("local function ")))
             {
-                lua_header = !text.ends_with(')');
-                if lua_header {
-                    format!("{line}\n")
-                } else {
-                    format!("{line} end\n")
-                }
-            } else if lua_header {
-                if text.ends_with(')') {
+                if lua_parameter_end.contains(&(row, line.trim_end().len())) {
                     lua_header = false;
                     format!("{line} end\n")
                 } else {
+                    lua_header = true;
                     format!("{line}\n")
                 }
             } else if language == SyntaxLanguage::Lua
@@ -692,20 +696,75 @@ pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) ->
                     .all(|character| character.is_alphanumeric() || matches!(character, '_' | '.'))
             {
                 format!("{line} = nil\n")
-            } else if matches!(language, SyntaxLanguage::Typescript | SyntaxLanguage::Tsx)
-                && (text.trim_end_matches(';').ends_with("=>")
-                    || text.contains("= function") && text.trim_end_matches(';').ends_with(')'))
-            {
-                format!(
-                    "{} {{}}{}\n",
-                    line.trim_end_matches(';'),
-                    if text.ends_with(';') { ";" } else { "" }
-                )
             } else {
                 format!("{line}\n")
             }
         })
-        .collect::<String>()
+        .collect::<String>();
+    if matches!(language, SyntaxLanguage::Typescript | SyntaxLanguage::Tsx) {
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language.grammar())
+            .map_err(|error| SyntaxError::Query(error.to_string()))?;
+        let tree = parser.parse(&source, None).ok_or(SyntaxError::Cancelled)?;
+        let mut pending = vec![tree.root_node()];
+        let mut insertions = Vec::new();
+        while let Some(node) = pending.pop() {
+            let mut cursor = node.walk();
+            if node.kind() == "arrow_function"
+                && node
+                    .child_by_field_name("body")
+                    .is_some_and(|body| body.is_missing())
+                && let Some(arrow) = node
+                    .children(&mut cursor)
+                    .find(|child| child.kind() == "=>")
+            {
+                insertions.push(arrow.end_byte());
+            }
+            if node.is_error() {
+                let children = node.children(&mut cursor).collect::<Vec<_>>();
+                let expression_context = node.parent().is_some_and(|parent| {
+                    matches!(
+                        parent.kind(),
+                        "lexical_declaration" | "class_body" | "export_statement"
+                    )
+                }) || children
+                    .iter()
+                    .any(|child| matches!(child.kind(), "const" | "let" | "var"))
+                    || (children.iter().any(|child| child.kind() == "export")
+                        && children.iter().any(|child| child.kind() == "default"));
+                if expression_context {
+                    insertions.extend(
+                        children
+                            .iter()
+                            .filter(|child| child.kind() == "=>")
+                            .map(|child| child.end_byte()),
+                    );
+                }
+                if children.iter().any(|child| child.kind() == "function")
+                    && let Some(parameters) = children
+                        .iter()
+                        .find(|child| child.kind() == "formal_parameters")
+                {
+                    let signature = children
+                        .iter()
+                        .find(|child| {
+                            child.kind() == "type_annotation"
+                                && child.start_byte() >= parameters.end_byte()
+                        })
+                        .unwrap_or(parameters);
+                    insertions.push(signature.end_byte());
+                }
+            }
+            pending.extend(node.named_children(&mut cursor).filter(|child| child.has_error()));
+        }
+        insertions.sort_unstable();
+        insertions.dedup();
+        for offset in insertions.into_iter().rev() {
+            source.insert_str(offset, " {}");
+        }
+    }
+    Ok(source)
 }
 
 fn format_group(
@@ -786,7 +845,7 @@ fn format_group(
 }
 
 fn format_indentation(language: SyntaxLanguage, text: &str) -> Result<String, SyntaxError> {
-    let surrogate = declaration_surrogate(language, text);
+    let surrogate = declaration_surrogate(language, text)?;
     let mut parser = Parser::new();
     parser
         .set_language(&language.grammar())
@@ -866,6 +925,7 @@ fn retained(kind: &str, language: SyntaxLanguage) -> bool {
             "function_item"
                 | "function_signature_item"
                 | "struct_item"
+                | "union_item"
                 | "enum_item"
                 | "trait_item"
                 | "impl_item"
@@ -925,7 +985,11 @@ fn project_node(
         && matches!(value.kind(), "arrow_function" | "function_expression")
         && let Some(body) = value.child_by_field_name("body")
     {
-        return format!("{};", source[node.start_byte()..body.start_byte()].trim());
+        return format!(
+            "{}{}",
+            source[node.start_byte()..body.start_byte()].trim(),
+            if text.trim_end().ends_with(';') { ";" } else { "" },
+        );
     }
     if node.kind() == "export_statement"
         && node.child_by_field_name("value").is_some_and(|value| {
@@ -993,7 +1057,7 @@ fn project_node(
                                     } else {
                                         ""
                                     },
-                                    flatten(&source[parameters.byte_range()])
+                                    &source[parameters.byte_range()]
                                 );
                             }
                         }
@@ -1017,11 +1081,7 @@ fn project_node(
                 .child_by_field_name("parameters")
                 .map(|parameters| {
                     let header = &source[node.start_byte()..parameters.end_byte()];
-                    if formatted {
-                        header.to_owned()
-                    } else {
-                        flatten(header)
-                    }
+                    header.to_owned()
                 })
                 .unwrap_or_default();
         }
@@ -1066,11 +1126,13 @@ fn project_node(
         for child in node.children(&mut cursor) {
             if child.kind() == "," || child.kind() == ")" {
                 let field = source[position..child.start_byte()].trim();
-                if !field.is_empty() { fields.push(flatten(field)); }
+                if !field.is_empty() {
+                    fields.push(format!("{field}{}", if child.kind() == "," { "," } else { "" }));
+                }
                 position = child.end_byte();
             }
         }
-        return format!("(\n{}\n)", fields.iter().map(|field| format!("{field},")).collect::<Vec<_>>().join("\n"));
+        return format!("(\n{}\n)", fields.join("\n"));
     }
     if formatted
         && matches!(
@@ -1134,7 +1196,7 @@ fn project_lua_table(table: Node<'_>, owner: &str, source: &str, output: &mut St
                 if let Some(parameters) = value.child_by_field_name("parameters") {
                     output.push_str(&format!(
                         "function {binding}{}",
-                        flatten(&source[parameters.byte_range()])
+                        &source[parameters.byte_range()]
                     ));
                 }
             }
@@ -1148,15 +1210,16 @@ fn project_lua_table(table: Node<'_>, owner: &str, source: &str, output: &mut St
 }
 
 fn lua_literal_require(source: &str) -> Option<&str> {
-    let argument = source.trim().strip_prefix("require")?.trim_start().strip_prefix('(')?.trim_start();
+    let argument = source.trim().strip_prefix("require")?.trim_start();
+    let (argument, parenthesized) = match argument.strip_prefix('(') {
+        Some(argument) => (argument.trim_start(), true),
+        None => (argument, false),
+    };
     let quote = argument.chars().next()?;
     if !matches!(quote, '\'' | '"') { return None; }
     let (module, rest) = argument[1..].split_once(quote)?;
-    rest.trim_start().starts_with(')').then_some(module)
-}
-
-fn flatten(text: &str) -> String {
-    text.lines().map(str::trim).collect::<Vec<_>>().join(" ")
+    let rest = rest.trim();
+    (if parenthesized { rest == ")" } else { rest.is_empty() }).then_some(module)
 }
 
 fn normalize(text: &str) -> String {

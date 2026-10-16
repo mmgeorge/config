@@ -48,10 +48,6 @@ impl CommentAnchor {
                 && self.revision.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "comment anchor requires a full commit identity"
         );
-        ensure!(
-            self.path.len() <= 4096,
-            "comment source path exceeds its byte limit"
-        );
         RepositoryPath::new(self.path.as_bytes().to_vec())?;
         ensure!(
             self.first_line > 0
@@ -128,30 +124,12 @@ pub struct DraftComment {
     pub reply_to: Option<CommentId>,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct CommentLimits {
-    pub comments: usize,
-    pub occurrences: usize,
-    pub occurrence_lifetimes: u64,
-}
-
-impl Default for CommentLimits {
-    fn default() -> Self {
-        Self {
-            comments: 256,
-            occurrences: 1024,
-            occurrence_lifetimes: 4096,
-        }
-    }
-}
-
 /// Owns comment identity and occurrence focus. Bodies live in the document's shared EditStore.
 /// One reply draft per parent survives occurrence changes and remote refreshes.
 pub struct CommentStore {
     document: DocumentId,
     target: PullRequestTarget,
     mode: ReviewMode,
-    limits: CommentLimits,
     next_comment: u64,
     next_occurrence: u64,
     comment: BTreeMap<CommentId, CommentRecord>,
@@ -232,9 +210,8 @@ impl CommentStore {
                 continue;
             }
             ensure!(
-                self.comment.len().saturating_add(prepared.len()) < self.limits.comments
-                    && next_comment < MAX_COUNTER,
-                "comment admission is full"
+                next_comment < MAX_COUNTER,
+                "comment identity exhausted"
             );
             next_comment += 1;
             prepared.push((
@@ -292,22 +269,13 @@ impl CommentStore {
         document: DocumentId,
         target: PullRequestTarget,
         mode: ReviewMode,
-        limits: CommentLimits,
     ) -> Result<Self> {
         document.validate()?;
         target.validate()?;
-        ensure!(
-            limits.comments > 0
-                && limits.occurrences > 0
-                && limits.occurrence_lifetimes >= limits.occurrences as u64
-                && limits.occurrence_lifetimes <= MAX_COUNTER,
-            "invalid comment limits"
-        );
         Ok(Self {
             document,
             target,
             mode,
-            limits,
             next_comment: 0,
             next_occurrence: 0,
             comment: BTreeMap::new(),
@@ -493,9 +461,8 @@ impl CommentStore {
     ) -> Result<CommentOccurrenceId> {
         self.record(comment)?;
         ensure!(
-            self.occurrence.len() < self.limits.occurrences
-                && self.next_occurrence < self.limits.occurrence_lifetimes,
-            "comment occurrence admission is full"
+            self.next_occurrence < MAX_COUNTER,
+            "comment occurrence identity exhausted"
         );
         self.next_occurrence += 1;
         let id = CommentOccurrenceId(self.next_occurrence);
@@ -672,8 +639,8 @@ impl CommentStore {
         mut record: CommentRecord,
     ) -> Result<CommentId> {
         ensure!(
-            self.comment.len() < self.limits.comments && self.next_comment < MAX_COUNTER,
-            "comment admission is full"
+            self.next_comment < MAX_COUNTER,
+            "comment identity exhausted"
         );
         let id = CommentId(self.next_comment + 1);
         if record.region.0.is_empty() {

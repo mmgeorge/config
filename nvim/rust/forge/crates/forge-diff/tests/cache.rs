@@ -20,7 +20,7 @@ fn fixture(text: &str) -> (AnalysisKey, AnalysisBytes, RawDiff) {
 }
 
 #[test]
-fn reservations_enforce_independent_budgets_and_release_on_drop() {
+fn reservations_track_live_inputs_beyond_cache_budgets_and_release_on_drop() {
     let mut cache = AnalysisCache::new(CacheLimits {
         entries: 2,
         source_bytes: 10,
@@ -32,30 +32,23 @@ fn reservations_enforce_independent_budgets_and_release_on_drop() {
             result: 0,
         })
         .unwrap();
-    assert!(matches!(
-        cache.reserve(AnalysisBytes {
+    let additional = cache.reserve(AnalysisBytes {
             source: 1,
             result: 0
-        }),
-        Err(CacheError::Saturated)
-    ));
-    assert!(matches!(
-        cache.reserve(AnalysisBytes {
+        }).unwrap();
+    let large = cache.reserve(AnalysisBytes {
             source: 0,
             result: 21
-        }),
-        Err(CacheError::Saturated)
-    ));
+        }).unwrap();
+    drop(additional);
+    drop(large);
     let second = cache
         .reserve(AnalysisBytes {
             source: 0,
             result: 20,
         })
         .unwrap();
-    assert!(matches!(
-        cache.reserve(AnalysisBytes::default()),
-        Err(CacheError::Saturated)
-    ));
+    drop(cache.reserve(AnalysisBytes::default()).unwrap());
     drop(reservation);
     assert_eq!(
         cache.usage().bytes,
@@ -82,7 +75,7 @@ fn eviction_cannot_release_capacity_retained_by_consumers() {
     assert!(cache.evict(key));
     assert_eq!(cache.usage().cached_entries, 0);
     assert_eq!(cache.usage().admitted_entries, 1);
-    assert!(matches!(cache.reserve(bytes), Err(CacheError::Saturated)));
+    drop(cache.reserve(bytes).unwrap());
     drop(handle);
     assert_eq!(consumer.source().new.bytes(), b"new\n");
     assert_eq!(cache.usage().bytes, bytes);
@@ -155,7 +148,7 @@ fn shared_source_allocation_is_charged_once_within_one_result() {
 }
 
 #[test]
-fn saturated_admission_preserves_cached_results_with_live_consumers() {
+fn saturated_cache_evicts_only_cache_references_without_rejecting_analysis() {
     let (key, bytes, diff) = fixture("new\n");
     let mut cache = AnalysisCache::new(CacheLimits {
         entries: 1,
@@ -163,9 +156,10 @@ fn saturated_admission_preserves_cached_results_with_live_consumers() {
     });
     let reservation = cache.reserve(bytes).unwrap();
     let consumer = cache.insert(key, reservation, diff).unwrap();
-    assert!(matches!(cache.reserve(bytes), Err(CacheError::Saturated)));
-    assert_eq!(cache.usage().cached_entries, 1);
-    assert!(cache.get(key).is_some());
+    drop(cache.reserve(bytes).unwrap());
+    assert_eq!(cache.usage().cached_entries, 0);
+    assert!(cache.get(key).is_none());
+    assert_eq!(consumer.source().new.bytes(), b"new\n");
     drop(consumer);
     assert!(cache.reserve(bytes).is_ok());
     assert_eq!(cache.usage().cached_entries, 0);
@@ -173,7 +167,6 @@ fn saturated_admission_preserves_cached_results_with_live_consumers() {
 
 #[test]
 fn display_cursors_retain_evicted_analysis_until_the_final_cursor_drops() {
-    use forge_diff::body::BodyKind;
     use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayState};
 
     let (key, bytes, diff) = fixture("new\n");
@@ -183,11 +176,11 @@ fn display_cursors_retain_evicted_analysis_until_the_final_cursor_drops() {
     });
     let reservation = cache.reserve(bytes).unwrap();
     let handle = cache.insert(key, reservation, diff).unwrap();
-    let mut first = DisplayCursor::new(handle.clone(), 0, BodyKind::Modified);
-    let mut second = DisplayCursor::new(handle, 0, BodyKind::Modified);
+    let mut first = DisplayCursor::new(handle.clone(), 0);
+    let mut second = DisplayCursor::new(handle, 0);
     assert!(cache.evict(key));
     assert_eq!(cache.usage().bytes, bytes);
-    assert!(matches!(cache.reserve(bytes), Err(CacheError::Saturated)));
+    drop(cache.reserve(bytes).unwrap());
     let chunk = first.next_rows(ChunkLimits::default());
     assert_eq!(chunk.state, DisplayState::Complete);
     assert_eq!(chunk.rows.len(), 2);

@@ -4,8 +4,8 @@ use std::process::Output;
 
 use serde::Deserialize;
 
-use super::{BoundedVec, GhClient, append_diagnostic, classify_failure, diagnostic, remote_result};
-use crate::metadata::{MAX_USERS, RepositoryUser, RepositoryUsers, validate_user};
+use super::{GhClient, append_diagnostic, classify_failure, diagnostic, remote_result};
+use crate::metadata::{RepositoryUser, RepositoryUsers, validate_user};
 use crate::model::GithubRepositoryId;
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 
@@ -50,9 +50,6 @@ impl GhClient {
                                 existing.name = user.name;
                             }
                         } else {
-                            if user_map.len() == MAX_USERS {
-                                return Err(invalid("repository users exceed their record limit"));
-                            }
                             user_map.insert(key, user);
                         }
                     }
@@ -87,15 +84,15 @@ fn decode_users(output: Output) -> Result<Vec<RepositoryUser>, RemoteFailure> {
         append_diagnostic(&mut message, &String::from_utf8_lossy(&output.stdout));
         return Err(classify_failure(message));
     }
-    let pages: BoundedVec<BoundedVec<UserResponse, 100>, 1000> =
+    let pages: Vec<Vec<UserResponse>> =
         serde_json::from_slice(&output.stdout).map_err(|failure| {
             invalid(&format!(
                 "gh returned invalid repository user JSON: {failure}"
             ))
         })?;
     let mut users = Vec::new();
-    for page in pages.0 {
-        for user in page.0 {
+    for page in pages {
+        for user in page {
             let user = RepositoryUser {
                 login: user.login,
                 name: user.name,

@@ -7,7 +7,6 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-const DISPLAY_ROW_LIMIT: usize = 262_144;
 const INLINE_CHUNK_BYTES: usize = 16 * 1024;
 pub(super) const INITIAL_INLINE_BYTES: usize = 64 * 1024;
 
@@ -44,7 +43,6 @@ struct ParsedOutput {
     parser: strip_ansi_escapes::Writer<OutputCollector>,
     collected: Arc<Mutex<Vec<u8>>>,
     total_rows: usize,
-    truncated: bool,
 }
 
 impl ParsedOutput {
@@ -53,14 +51,13 @@ impl ParsedOutput {
         let mut output = Self {
             display: Arc::new(String::new()), row: Arc::new(Vec::new()),
             parser: strip_ansi_escapes::Writer::new(OutputCollector(collected.clone())),
-            collected, total_rows: 0, truncated: false,
+            collected, total_rows: 0,
         };
         output.append(saved)?;
         Ok(output)
     }
 
     fn append(&mut self, delta: &str) -> Result<()> {
-        if self.truncated { return Ok(()); }
         self.parser.write_all(delta.as_bytes())?;
         self.parser.flush()?;
         let normalized = String::from_utf8(std::mem::take(&mut *self.collected.lock()
@@ -77,23 +74,11 @@ impl ParsedOutput {
                 row.push(start..end);
                 if end > start { self.total_rows = row.len(); }
                 start = end + 1;
-                if row.len() > DISPLAY_ROW_LIMIT { break; }
             }
         }
-        if row.len() <= DISPLAY_ROW_LIMIT && start < display.len() {
+        if start < display.len() {
             row.push(start..display.len());
             self.total_rows = row.len();
-        }
-        if row.len() > DISPLAY_ROW_LIMIT {
-            display.truncate(row[DISPLAY_ROW_LIMIT - 1].end);
-            row.truncate(DISPLAY_ROW_LIMIT);
-            display.push('\n');
-            let start = display.len();
-            display.push_str("… Display truncated; export output for the complete response.");
-            row.push(start..display.len());
-            display.push('\n');
-            self.total_rows = row.len();
-            self.truncated = true;
         }
         Ok(())
     }
@@ -213,10 +198,6 @@ impl ToolOutputView {
         Ok(self.parsed()?.inline_bytes() / INLINE_CHUNK_BYTES)
     }
 
-    pub(super) fn truncated(&self) -> Result<bool> {
-        Ok(self.parsed()?.truncated)
-    }
-
     /// Borrows at most one byte window with UTF-8 boundaries retained across appends.
     pub(super) fn inline_chunk(&self, index: usize) -> Result<Vec<&str>> {
         let parsed = self.parsed()?;
@@ -295,13 +276,7 @@ impl ToolOutputSnapshot {
         let mut bytes = 0;
         for range in self.row[self.loaded_rows..self.total_rows].iter().take(row_limit) {
             let text = &self.display[range.clone()];
-            if bytes + text.len() + 1 > byte_limit {
-                if row.is_empty() {
-                    let notice = "… [line truncated; export for full output]";
-                    let mut end = byte_limit - notice.len() - 1;
-                    while !text.is_char_boundary(end) { end -= 1; }
-                    row.push(format!("{}{notice}", &text[..end]));
-                }
+            if !row.is_empty() && bytes + text.len() + 1 > byte_limit {
                 break;
             }
             bytes += text.len() + 1;
@@ -386,7 +361,7 @@ impl OwnedToolExport {
 impl Drop for OwnedToolExport {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            eprintln!("Forge tool export cleanup failed: {error:#}");
+            let _ = writeln!(std::io::stderr(), "Forge tool export cleanup failed: {error:#}");
         }
     }
 }
@@ -417,14 +392,13 @@ mod tests {
     }
 
     #[test]
-    fn oversized_line_is_abbreviated_in_a_batch_without_losing_saved_output() -> Result<()> {
+    fn large_line_is_preserved_in_a_batch_and_saved_output() -> Result<()> {
         let saved = format!("{}\nlast\n", "λ".repeat(80_000));
         let source = ToolOutputView::new("call".into(), &saved)?;
         let mut output = source.snapshot()?;
         output.expand();
         let batch = output.next_batch(256, 65536)?.unwrap();
-        assert!(batch.row[0].ends_with("[line truncated; export for full output]"));
-        assert!(batch.row.iter().map(|row| row.len() + 1).sum::<usize>() <= 65536);
+        assert_eq!(batch.row, ["λ".repeat(80_000)]);
         output.accept_batch(&batch)?;
         let last = output.next_batch(256, 65536)?.unwrap();
         assert_eq!(last.row, ["last"]);
@@ -437,21 +411,21 @@ mod tests {
     }
 
     #[test]
-    fn large_output_truncates_display_rows_and_preserves_complete_export() -> Result<()> {
-        let saved = format!("{}\n", "x".repeat(128)).repeat(DISPLAY_ROW_LIMIT + 1);
+    fn large_output_preserves_all_display_rows_and_complete_export() -> Result<()> {
+        let row_count = 262_145;
+        let saved = format!("{}\n", "x".repeat(128)).repeat(row_count);
         assert!(saved.len() > 32 * 1024 * 1024);
         let mut source = ToolOutputView::new("call".into(), &saved)?;
-        assert!(source.truncated()?);
-        source.append("last output after truncation\n")?;
+        source.append("last output after previous threshold\n")?;
         let preview = source.preview(true)?;
-        assert_eq!(preview.total_rows, DISPLAY_ROW_LIMIT + 1);
-        assert!(preview.row.last().unwrap().contains("Display truncated"));
+        assert_eq!(preview.total_rows, row_count + 1);
+        assert_eq!(preview.row.last().copied(), Some("last output after previous threshold"));
         let directory = tempfile::tempdir()?;
         let snapshot = source.snapshot()?;
         let export = snapshot.export_saved_output(directory.path())?;
         let complete = std::fs::read_to_string(export.path().unwrap())?;
         assert!(complete.starts_with(&saved));
-        assert!(complete.ends_with("last output after truncation\n"));
+        assert!(complete.ends_with("last output after previous threshold\n"));
         Ok(())
     }
 

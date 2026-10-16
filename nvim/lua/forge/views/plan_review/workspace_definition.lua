@@ -44,7 +44,7 @@ function M.request(source, current, receive)
   guard:start(50, 50, vim.schedule_wrap(function()
     if not valid() then finish(nil, nil, "cancelled") end
   end))
-  read(source.path, nil, function(contents, failure)
+  read(source.path, function(contents, failure)
     if finished then return end
     if not valid() then finish(nil, nil, "cancelled") return end
     if failure then finish(nil, failure) return end
@@ -114,7 +114,7 @@ function M.request(source, current, receive)
           if not target_line then finish(nil, "Definition position is outside the target file") return end
           local converted, byte_column = pcall(vim.str_byteindex, target_line, encoding, choice.position.character, false)
           if not converted then finish(nil, tostring(byte_column)) return end
-          read(source.path, 1024 * 1024, function(latest, source_error)
+          read(source.path, function(latest, source_error)
             if not valid() then finish(nil, nil, "cancelled") return end
             if source_error then finish(nil, source_error) return end
             if vim.fn.sha256(latest) ~= source.digest then finish(nil, nil, "Source changed during definition lookup") return end
@@ -125,7 +125,7 @@ function M.request(source, current, receive)
         end
         local target_buffer = loaded(canonical(choice.path))
         if target_buffer then target_rows(table.concat(vim.api.nvim_buf_get_lines(target_buffer, 0, -1, false), "\n"))
-        else read(choice.path, 16 * 1024 * 1024, target_rows) end
+        else read(choice.path, target_rows) end
       end
       if #choices == 0 then finish(nil, nil, "No definition returned by the project language server")
       elseif #choices == 1 then selected(choices[1])

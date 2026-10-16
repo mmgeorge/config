@@ -752,8 +752,8 @@ impl SessionPresentation {
     ) -> Result<()> {
         self.document(document)?;
         ensure!(
-            text.len() <= 65536 && text.split('\n').count() <= 4096 && !text.trim().is_empty(),
-            "prompt requires nonempty text within 64 KiB and 4096 rows"
+            !text.trim().is_empty(),
+            "prompt requires nonempty text"
         );
         let open = self.open.as_mut().expect("validated presentation");
         ensure!(
@@ -1296,7 +1296,7 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
         }
     };
     for patch in patches {
-        let bytes = crate::limits::serialized_size(&patch, usize::MAX)?;
+        let bytes = crate::limits::serialized_size(&patch)?;
         while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
             let Some((_, removed)) = open.pending.pop_front() else {
                 break;
@@ -1406,7 +1406,7 @@ mod tests {
         assert!(snapshots.iter().map(|output| output.retained_bytes()).sum::<usize>() > 128 * 1024 * 1024);
 
         let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1, jobs: 2, input_bytes: 1024 * 1024,
+            workers: 1, jobs: 2,
         })));
         let job = owner.capture_syntax(&document)?.expect("saved diff syntax");
         owner.apply_syntax(&document, &job, job.analyze(&engine).await?)?;
@@ -1680,7 +1680,6 @@ mod tests {
             Arc::new(AnalysisPool::new(PoolLimits {
                 workers: 1,
                 jobs: 2,
-                input_bytes: 1024 * 1024,
             })),
         );
         let mut entry = interaction_entry("syntax");
@@ -2500,15 +2499,10 @@ mod tests {
         assert!(owner.begin_submission(&document, 1, " ").is_err());
         assert!(
             owner
-                .begin_submission(&document, 1, &"x".repeat(65537))
-                .is_err()
-        );
-        assert!(
-            owner
                 .begin_submission(&document, 1, &"\n".repeat(4096))
                 .is_err()
         );
-        owner.begin_submission(&document, 1, "complete λ\n\ndraft")?;
+        owner.begin_submission(&document, 1, &"complete λ\n\ndraft\n".repeat(8193))?;
         assert!(
             owner
                 .begin_submission(&document, 2, "duplicate pending")

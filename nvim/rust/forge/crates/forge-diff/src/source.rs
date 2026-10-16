@@ -5,8 +5,6 @@ use std::sync::{Arc, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-pub const MAX_SOURCE_BYTES: usize = 8 * 1024 * 1024;
-
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum Representation {
     Raw,
@@ -62,7 +60,6 @@ pub struct SourcePair {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SourceError {
-    TooLarge { bytes: usize, limit: usize },
     Binary,
     UnsupportedEncoding,
     InconsistentMetadata,
@@ -72,10 +69,6 @@ pub enum SourceError {
 impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::TooLarge { bytes, limit } => write!(
-                formatter,
-                "source has {bytes} bytes, exceeding the {limit}-byte limit"
-            ),
             Self::Binary => formatter.write_str("source contains binary NUL bytes"),
             Self::UnsupportedEncoding => formatter.write_str("source is not valid UTF-8"),
             Self::InconsistentMetadata => {
@@ -111,12 +104,6 @@ impl SourceVersion {
         content: Arc<Vec<u8>>,
         representation: Representation,
     ) -> Result<Self, SourceError> {
-        if content.capacity() > MAX_SOURCE_BYTES {
-            return Err(SourceError::TooLarge {
-                bytes: content.capacity(),
-                limit: MAX_SOURCE_BYTES,
-            });
-        }
         validate_text(&content)?;
         let newline = newline_metadata(&content);
         Ok(Self {
@@ -179,12 +166,6 @@ pub fn validate_source_pair(pair: &SourcePair) -> Result<(), SourceError> {
 }
 
 fn validate_text(content: &[u8]) -> Result<(), SourceError> {
-    if content.len() > MAX_SOURCE_BYTES {
-        return Err(SourceError::TooLarge {
-            bytes: content.len(),
-            limit: MAX_SOURCE_BYTES,
-        });
-    }
     if content.contains(&0) {
         return Err(SourceError::Binary);
     }
@@ -208,6 +189,17 @@ fn newline_metadata(content: &[u8]) -> NewlineMetadata {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preserves_sources_and_spare_capacity_beyond_former_byte_limit() {
+        let mut bytes = Vec::with_capacity(10 * 1024 * 1024);
+        bytes.extend_from_slice(&vec![b'x'; 8 * 1024 * 1024 + 1]);
+        bytes.extend_from_slice(b"\r\nlast");
+        let source = SourceVersion::new(bytes.clone(), Representation::Raw).unwrap();
+        assert_eq!(source.bytes(), bytes);
+        assert_eq!(source.newline().line_count, 2);
+        assert!(!source.newline().has_final_newline);
+    }
 
     #[test]
     fn counts_do_not_hash_sources_and_clones_share_lazy_identity() {

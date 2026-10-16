@@ -47,25 +47,45 @@ function M.inside(path, root)
 end
 
 ---@param path string
----@param limit integer?
 ---@param receive fun(contents: string?, failure: string?)
-function M.read(path, limit, receive)
+function M.read(path, receive)
   vim.uv.fs_open(path, "r", 438, function(open_error, descriptor)
     if open_error then vim.schedule(function() receive(nil, M.read_failure(path, open_error)) end) return end
     vim.uv.fs_fstat(descriptor, function(stat_error, stat)
-      if stat_error or not stat or stat.type ~= "file" or limit and stat.size > limit then
+      if stat_error or not stat or stat.type ~= "file" then
         vim.uv.fs_close(descriptor)
         local failure = stat_error and M.read_failure(path, stat_error)
           or (stat and stat.type ~= "file" and "invalid_path: " .. path .. " is not a regular file.")
-          or (limit and "source_limit: " .. path .. " exceeds the " .. math.floor(limit / 1024) .. " KiB read limit.")
           or ("read_failed: No file metadata for " .. path)
         vim.schedule(function() receive(nil, failure) end)
         return
       end
-      vim.uv.fs_read(descriptor, stat.size, 0, function(read_error, contents)
-        vim.uv.fs_close(descriptor)
-        vim.schedule(function() receive(contents, read_error and M.read_failure(path, read_error)) end)
-      end)
+      ---@type string[]
+      local chunks = {}
+      local offset = 0
+      ---@param contents string?
+      ---@param failure string?
+      local function finish(contents, failure)
+        vim.uv.fs_close(descriptor, function(close_error)
+          vim.schedule(function()
+            failure = failure or (close_error and M.read_failure(path, close_error))
+            receive(not failure and contents or nil, failure)
+          end)
+        end)
+      end
+      ---@type fun()
+      local read_next
+      read_next = function()
+        vim.uv.fs_read(descriptor, 64 * 1024, offset, function(read_error, contents)
+          if read_error then finish(nil, M.read_failure(path, read_error)) return end
+          if not contents then finish(nil, "read_failed: No file contents for " .. path) return end
+          if contents == "" then finish(table.concat(chunks), nil) return end
+          chunks[#chunks + 1] = contents
+          offset = offset + #contents
+          read_next()
+        end)
+      end
+      read_next()
     end)
   end)
 end

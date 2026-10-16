@@ -169,7 +169,6 @@ impl super::ReviewService {
                 permit.submit(move |_| {
                     let result = (|| {
                         let bytes = serde_json::to_vec(&page.records)?.len();
-                        ensure!(bytes <= 8 * 1024 * 1024, "thread page exceeds byte limit");
                         let mut candidate = (*previous).clone();
                         if cursor.is_none() {
                             candidate.comment.clear();
@@ -201,10 +200,6 @@ impl super::ReviewService {
                             .additional_bytes
                             .checked_add(bytes)
                             .context("thread byte count overflow")?;
-                        ensure!(
-                            candidate.additional_bytes <= 8 * 1024 * 1024,
-                            "thread collection exceeds byte limit"
-                        );
                         candidate.next_cursor = page.next_cursor;
                         let projected = projection_width
                             .as_ref()
@@ -258,20 +253,6 @@ impl super::ReviewService {
                     .checked_sub(captured.additional_bytes)
                     .and_then(|bytes| bytes.checked_add(thread.additional_bytes))
                     .context("thread section byte count overflow")?;
-                ensure!(
-                    bytes <= 8 * 1024 * 1024,
-                    "thread section exceeds byte limit"
-                );
-                let other_bytes: usize = document
-                    .section
-                    .iter()
-                    .filter(|(kind, _)| **kind != ReviewSectionKind::Threads)
-                    .map(|(_, state)| state.bytes)
-                    .sum();
-                ensure!(
-                    other_bytes + bytes <= 16 * 1024 * 1024,
-                    "review document section limit reached"
-                );
                 let charge =
                     super::section::SectionCharge::reserve(service.section_bytes.clone(), bytes)?;
                 let mut section = previous.clone();
@@ -342,7 +323,6 @@ pub(super) fn decode(record: &Value) -> Result<ReviewThread> {
         .context("thread comment count is missing")?;
     ensure!(
         total_comments > 0
-            && total_comments <= 10_000
             && nodes.len() <= 100
             && nodes.len() as u64 <= total_comments,
         "thread comment count exceeds limits"
@@ -412,12 +392,12 @@ fn decode_comment(record: &Value) -> Result<ReviewThreadComment> {
         .and_then(Value::as_str)
         .context("thread comment body is missing")?;
     ensure!(
-        body.len() <= 256 * 1024 && !body.contains('\0'),
+        !body.contains('\0'),
         "thread comment body exceeds limits"
     );
     let diff_hunk = record.get("diffHunk").and_then(Value::as_str).unwrap_or("");
     ensure!(
-        diff_hunk.len() <= 4 * 1024 * 1024 && !diff_hunk.contains('\0'),
+        !diff_hunk.contains('\0'),
         "thread diff context exceeds limits"
     );
     let created_at = optional_timestamp(record, "createdAt")?;
@@ -491,8 +471,8 @@ fn line(record: &Value, key: &str) -> Result<Option<u64>> {
         Some(value) => {
             let line = value.as_u64().context("thread source line is invalid")?;
             ensure!(
-                line > 0 && line <= u32::MAX as u64,
-                "thread source line exceeds limits"
+                line > 0 && line <= forge_buffer::MAX_COUNTER,
+                "thread source line exceeds exact editor integer range"
             );
             Ok(Some(line))
         }

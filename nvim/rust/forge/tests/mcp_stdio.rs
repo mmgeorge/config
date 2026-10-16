@@ -70,7 +70,7 @@ async fn fragmented_requests_preserve_order_and_notification_silence() {
 }
 
 #[tokio::test]
-async fn oversized_unterminated_input_exits_while_stdin_remains_open() {
+async fn large_invalid_unterminated_input_reports_decode_failure_after_eof() {
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();
     tokio::time::timeout(
@@ -80,14 +80,14 @@ async fn oversized_unterminated_input_exits_while_stdin_remains_open() {
     .await
     .unwrap()
     .unwrap();
+    drop(input);
     let output = tokio::time::timeout(Duration::from_secs(5), child.wait_with_output())
         .await
         .unwrap()
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(String::from_utf8_lossy(&output.stderr).contains("frame exceeds its byte limit"));
-    drop(input);
+    assert!(String::from_utf8_lossy(&output.stderr).contains("decode Harness control MCP request"));
 }
 
 #[tokio::test]
@@ -109,14 +109,14 @@ async fn truncated_json_fails_without_a_partial_response() {
 }
 
 #[tokio::test]
-async fn oversized_result_returns_one_bounded_error_and_keeps_request_order() {
+async fn large_requests_and_results_preserve_complete_content_and_request_order() {
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"x".repeat(300 * 1024)}}});
+    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"x".repeat(1024 * 1024)}}});
     let mut encoded = serde_json::to_vec(&request).unwrap();
     encoded.push(b'\n');
-    assert!(encoded.len() < forge_protocol::MAX_FRAME_BYTES);
+    assert!(encoded.len() > forge_protocol::MAX_FRAME_BYTES);
     tokio::time::timeout(Duration::from_secs(5), input.write_all(&encoded))
         .await
         .unwrap()
@@ -132,11 +132,14 @@ async fn oversized_result_returns_one_bounded_error_and_keeps_request_order() {
             .await
             .unwrap()
             .unwrap();
-        assert!(line.len() <= forge_protocol::MAX_FRAME_BYTES);
         let response: Value = serde_json::from_slice(&line).unwrap();
         assert_eq!(response["id"], request_id);
         if request_id == 11 {
-            assert_eq!(response["error"]["code"], -32000);
+            assert!(line.len() > forge_protocol::MAX_FRAME_BYTES);
+            assert_eq!(
+                response["result"]["structuredContent"]["arguments"],
+                request["params"]["arguments"],
+            );
         } else {
             assert!(response.get("result").is_some());
         }

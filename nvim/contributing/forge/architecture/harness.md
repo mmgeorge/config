@@ -196,8 +196,8 @@ independent turns without treating one session as globally active.
 buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab.
 
 Lua owns the complete unsent Harness draft. Opening a transcript and typing in HarnessInput never
-transmit draft text or local edit revisions to Rust. Ctrl-s captures at most 64 KiB and 4096 rows,
-then sends one `prompt.submit` request with complete text and a monotonically increasing token
+transmit draft text or local edit revisions to Rust. Ctrl-s captures the complete draft,
+then sends one `prompt.submit` request with its text and a monotonically increasing token
 bound to the transcript document lifetime. Rust tracks submission admission without retaining a
 composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
 Retraction restores its exact rows only while the cleared buffer retains its changedtick.
@@ -262,11 +262,11 @@ lock. Completion must match the open document and retained source before adding 
 Replacement, reflow, and close invalidate obsolete work. Unknown fence languages retain plain text.
 The timeline has no aggregate byte, row, or block-count limit. Retained tool parsers and syntax
 metadata do not consume a session-wide admission budget. Each syntax job has a 10-second deadline
-and uses the shared 10,000-line source cutoff. Syntax results have no separate byte or span-count
+and analyzes the complete source without a file-size or line-count cutoff. Syntax results have no separate byte or span-count
 rejection. Content loading has no total byte-size admission limit. Pages and transport parts stay
-bounded, and their consumers request subsequent batches. Tool display stops after 262,144 source
-rows with an explicit truncation notice, while export retains the complete original response.
-A tool row longer than one output-page budget is abbreviated in that page with an export hint.
+bounded, and their consumers request subsequent batches. Tool display and export retain every
+source row. An output page admits its first complete row even when that row exceeds the page's
+byte target.
 Shared Markdown projection and literal wrapping also accept content without byte, row, or
 decoration-count admission limits. They retain source and navigation metadata for later paging.
 
@@ -495,7 +495,12 @@ together, before provider start evidence activates the child. A Delegation alway
 child Exchange, so later reuse of the Agent cannot change historical status.
 
 Mode restart interrupts provider Turns and pauses the existing Exchange. Resumption preserves its
-request, plan and goal associations, and initial checkpoint. Cancellation retains provider delivery
+request, plan and goal associations, and initial checkpoint. If baseline acquisition remains pending,
+the broker collects its existing worker and durably stores the baseline before parking the exchange
+and releasing its runtime. A failed capture retains a retryable finalizing exchange and propagates
+without releasing the tool barrier. Resumption
+reuses the stored baseline rather than capturing the changed workspace as a new starting point.
+Cancellation retains provider delivery
 while cleanup awaits terminal evidence. Copilot fences submission before attempting an abort.
 A turn still preparing its session has no provider execution to collect, so cleanup returns
 immediately and the broker drops preparation. A submitted turn retains its event reader until
@@ -886,7 +891,7 @@ continued word into another executable. These limitations never produce partial 
 The PowerShell parser accepts the pinned grammar's
 missing-space recovery only between adjacent literal comma-separated arguments, preserving the
 original command spans and checking each executable independently. Every other missing or error
-node rejects the call. Analysis stops at 64 KiB, 8,192 visited nodes, 64 tree
+node rejects the call. Analysis retains complete command text and stops at 8,192 visited nodes, 64 tree
 levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and returns the same error.
 The picker stages each decision locally and advances to the next unanswered item. Confirming the
 last unanswered item submits all decisions immediately, without a separate review page. Submission
@@ -1234,7 +1239,7 @@ The exchange stays open while provider generation is suspended. After all childr
 that exchange settle, Harness starts one continuation with their pending reports. New user
 input resumes the same exchange immediately and leaves children running, including when the
 provider lacks native steering. The root input lane persists across provider-turn boundaries,
-admits at most 32 ordered inputs, and limits each input to 64 KiB. Active native steering
+admits at most 32 ordered inputs, and retains each input's complete text. Active native steering
 retains its existing behavior. Unsupported or rejected delivery waits for the next turn boundary.
 Explicit pause, cancellation, and unresolved user decisions prevent automatic continuation.
 
@@ -1277,13 +1282,13 @@ automatically. Root forking does not transfer live child execution ownership.
 interrupt. A command retains its permit after dequeue until provider acknowledgement or command
 drop. Both operation classes share one FIFO receiver. Ordinary saturation cannot consume the
 interrupt permit. Excess requests fail immediately, without creating queue-capacity waiters.
-Steering text is limited to 64 KiB and each target identifier to 4 KiB. Closing the active receiver
+Steering retains complete text and validates target identity. Closing the active receiver
 fails queued acknowledgements and releases its generation's admission state. A dequeued command
 retains its acknowledgement owner until completion or drop.
 
 The Copilot control router uses a 32-slot bounded channel. It reserves a slot before validating
-the invocation's encoded size or invoking `ControlToolRuntime`. The invocation must encode within
-256 KiB. Reservation failure therefore precedes any plan or terminal-state mutation. Validation
+the invocation or invoking `ControlToolRuntime`. Each invocation retains its complete arguments.
+Reservation failure therefore precedes any plan or terminal-state mutation. Validation
 failures and calls without a routed result release their reservations. Accepted invocations retain
 their order in the receiver. These limits count queued and reserved invocations. A dequeued
 invocation and the runtime's retained plan state have separate lifetimes.

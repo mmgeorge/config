@@ -2,7 +2,6 @@ local M = {}
 
 local client = require("forge.client")
 local completion = require("forge.completion")
-local MAX_BYTES = 2 * 1024 * 1024
 local REFRESH_MS = 10000
 
 ---@type CompletionCache?
@@ -40,16 +39,16 @@ local function request_candidates(identity, generation, done)
     client.request_host("repository.revisions", { workspace = identity, revision = revision, offset = offset, repository = repository, reference_digest = reference_digest }, function(page, failure)
       if failure then done(nil, failure) return end
       if type(page) ~= "table" or not counter(page.revision, 9007199254740991) or page.revision == 0
-          or not counter(page.total_bytes, MAX_BYTES) or not counter(page.count, 20000)
-          or page.offset ~= offset or not counter(page.next_offset, MAX_BYTES)
+          or not counter(page.total_bytes, 9007199254740991) or not counter(page.count, 9007199254740991)
+          or page.offset ~= offset or not counter(page.next_offset, 9007199254740991)
           or page.next_offset < offset or page.next_offset > page.total_bytes
           or type(page.repository) ~= "string" or #page.repository > 65536
           or type(page.reference_digest) ~= "string" or not page.reference_digest:match("^[0-9a-f]+$") or #page.reference_digest ~= 64
-          or type(page.truncated) ~= "boolean" or type(page.data) ~= "string" or #page.data > 174764 then
+          or type(page.data) ~= "string" or #page.data > 174764 then
         done(nil, "invalid revision page metadata")
         return
       end
-      if revision and (page.revision ~= revision or page.total_bytes ~= total_bytes or page.count ~= count or page.truncated ~= truncated or page.repository ~= repository or page.reference_digest ~= reference_digest) then
+      if revision and (page.revision ~= revision or page.total_bytes ~= total_bytes or page.count ~= count or page.repository ~= repository or page.reference_digest ~= reference_digest) then
         done(nil, "revision snapshot changed between pages")
         return
       end
@@ -59,7 +58,7 @@ local function request_candidates(identity, generation, done)
         return
       end
       repository, reference_digest = page.repository, page.reference_digest
-      revision, total_bytes, count, truncated = page.revision, page.total_bytes, page.count, page.truncated
+      revision, total_bytes, count, truncated = page.revision, page.total_bytes, page.count, false
       chunks[#chunks + 1] = decoded
       offset = page.next_offset
       if offset < total_bytes then request_page() return end

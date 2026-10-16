@@ -12,7 +12,7 @@ use forge_diff::source::{SourceCoordinate, SourceSide};
 
 use crate::{
     StatusSection,
-    document::{DOCUMENT_BYTES, DisplayGroupTarget, FileTarget, HunkTarget, StatusDocument},
+    document::{DisplayGroupTarget, FileTarget, HunkTarget, StatusDocument},
 };
 
 pub(crate) struct HunkProjection {
@@ -29,7 +29,6 @@ pub(crate) fn project(
     body: BufferBlock,
     source: Vec<SourceCoordinate>,
     group: &[usize],
-    body_retained: usize,
 ) -> Result<HunkProjection> {
     ensure!(
         group.len() == body.text.row_count() && source.len() == group.len(),
@@ -60,14 +59,6 @@ pub(crate) fn project(
                 .context("hunk accounting overflow")?;
         }
     }
-    ensure!(
-        document
-            .retained_bytes
-            .saturating_add(body_retained)
-            .saturating_add(retained)
-            <= DOCUMENT_BYTES,
-        "hunk projection exceeds document budget"
-    );
     let mut projection = HunkProjection {
         block: Vec::new(),
         edit: Vec::new(),

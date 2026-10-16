@@ -67,7 +67,7 @@ function M.new(authorize, analyze)
         accept(table.concat(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), "\n") .. (vim.bo[buffer].endofline and "\n" or ""))
       else
         snapshot.stamp = stamp(path)
-        source.read(path, nil, function(contents, read_error)
+        source.read(path, function(contents, read_error)
           if read_error then receive(nil, read_error) return end
           if stamp(path) ~= snapshot.stamp then receive(nil, "source_changed: " .. path .. " changed during the request.") return end
           accept(contents)

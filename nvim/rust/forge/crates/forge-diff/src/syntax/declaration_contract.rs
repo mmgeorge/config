@@ -33,7 +33,7 @@ impl DeclarationContract {
     pub fn parse(path: &str, overview: &str) -> Result<Self, SyntaxError> {
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
-        let source = super::declaration::declaration_surrogate(language, overview);
+        let source = super::declaration::declaration_surrogate(language, overview)?;
         let mut parser = Parser::new();
         parser
             .set_language(&language.grammar())

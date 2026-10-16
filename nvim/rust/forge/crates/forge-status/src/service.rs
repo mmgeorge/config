@@ -34,7 +34,7 @@ use tokio::time::timeout;
 
 use crate::{
     StatusSection,
-    document::{DOCUMENT_BYTES, FileTarget, HunkTarget, StatusDocument, label},
+    document::{FileTarget, HunkTarget, StatusDocument, label},
     protocol::{
         StatusDelta, StatusInput, StatusLocation, StatusSelection, StatusSnapshot, file_target,
     },
@@ -380,14 +380,19 @@ impl StatusService {
             "status service is closed"
         );
         let admission = self.admitted.admit(id.clone())?;
+        let (parent, filename) = self.store.reads
+            .submit(filename.as_os_str().as_encoded_bytes().len(), move |cancellation| {
+                cancellation.check()?;
+                let parent = filename.parent().context("local file has no parent")?
+                    .canonicalize().context("resolve local file parent")?;
+                let filename = parent.join(filename.file_name().context("local file has no name")?);
+                cancellation.check()?;
+                Ok((parent, filename))
+            })?
+            .finish().await?;
         let repository = self
             .store
-            .open(
-                filename
-                    .parent()
-                    .context("local file has no parent")?
-                    .to_owned(),
-            )
+            .open(parent)
             .await?
             .context("local file has no repository")?;
         let root = repository
@@ -855,7 +860,6 @@ impl StatusService {
         if !missing.is_empty() {
             let repository = Arc::clone(&document.repository);
             drop(document);
-            let mut retained = 0usize;
             for (id, record, section, _) in &missing {
                 let (source, _) = sources(&self.store, &repository, record, *section).await?;
                 let analysis = self
@@ -866,11 +870,6 @@ impl StatusService {
                     })
                     .await
                     .map_err(|error| anyhow::anyhow!("discard analysis unavailable: {error:?}"))?;
-                retained += analysis.retained_source_bytes() + analysis.retained_result_bytes();
-                ensure!(
-                    retained <= forge_git::writer::MAX_INPUT,
-                    "discard sources exceed input budget"
-                );
                 captured.insert(id.clone(), analysis);
             }
             document = owner.lock().await;
@@ -1017,7 +1016,6 @@ impl StatusService {
                 .iter()
                 .map(|path| path.retained_bytes() * 2 + 64)
                 .sum::<usize>();
-            ensure!(retained <= 1024 * 1024, "ignore input exceeds 1 MiB");
             self.store
                 .reads
                 .submit(retained, move |cancellation| {
@@ -1041,12 +1039,6 @@ impl StatusService {
             let directory = directory.context("ignored persistence unavailable")?;
             let stage = input.action == "stage";
             let ignore = input.action == "ignore";
-            let retained = private_path
-                .iter()
-                .map(|path| path.retained_bytes() * 2 + 64)
-                .sum::<usize>()
-                + directory.as_os_str().as_encoded_bytes().len()
-                + root.as_os_str().as_encoded_bytes().len();
             intent.set_settlement_handler(
                 Arc::new(move |outcome| {
                     let completed: Vec<_> = private_path
@@ -1066,7 +1058,6 @@ impl StatusService {
                     }
                     Ok(())
                 }),
-                retained,
             )?;
         }
         Ok(StatusAction::Write(self.writer.submit(intent)?))
@@ -1267,11 +1258,6 @@ impl StatusService {
             };
             return Ok(body_delivery(document, file, patch));
         }
-        if document.retained_bytes.saturating_add(1536 * 1024) > DOCUMENT_BYTES {
-            file.state =
-                BodyState::Unavailable("status document has no remaining body admission".into());
-            return self.deliver(document, target, file);
-        }
         let chunk = file
             .cursor
             .as_mut()
@@ -1340,17 +1326,12 @@ impl StatusService {
         file.state = match &chunk.state {
             DisplayState::More => BodyState::Partial,
             DisplayState::Complete => BodyState::Ready,
-            DisplayState::Unavailable(reason) => BodyState::Unavailable(format!("{reason:?}")),
         };
         let retained = chunk.text_bytes
             + (metadata.decoration.len() + metadata.visible_decoration.len()) * 160
             + metadata.target.len() * 160
             + metadata.gutter.len() * 128
             + source_rows.capacity() * std::mem::size_of::<forge_diff::source::SourceCoordinate>();
-        ensure!(
-            document.retained_bytes.saturating_add(retained) <= DOCUMENT_BYTES,
-            "status body exceeds 16 MiB document budget"
-        );
         let block = BufferBlock {
             id: BlockId(document.next_id("body")?),
             text: BufferText::from_rows(rows)?,
@@ -1367,7 +1348,6 @@ impl StatusService {
                 .iter()
                 .map(|row| row.group_index)
                 .collect::<Vec<_>>(),
-            retained,
         )?;
         let retained = retained + projection.retained;
         let patch = if projection.block.is_empty() {
@@ -1404,7 +1384,7 @@ impl StatusService {
         Option<String>,
     )> {
         let generation = repository.generation();
-        let (analysis, kind) = if let Some(projected) = projected {
+        let (analysis, _kind) = if let Some(projected) = projected {
             let (source, kind) = projected.sources(self, repository, section).await?;
             let analysis = self
                 .diff
@@ -1430,7 +1410,7 @@ impl StatusService {
             projected.is_some() || generation == repository.generation(),
             "status body source generation changed"
         );
-        let cursor = DisplayCursor::compact(analysis.clone(), 3, kind);
+        let cursor = DisplayCursor::compact(analysis.clone(), 3);
         Ok((analysis, cursor, None, None, None))
     }
 }
@@ -1623,8 +1603,8 @@ pub(crate) fn syntax_decorations(
     row: usize,
     text: &str,
     metadata: &mut BlockMetadata,
-) -> bool {
-    forge_diff::projection::append_syntax_row(metadata, syntax, source_row, row, text).is_ok()
+) -> Result<()> {
+    Ok(forge_diff::projection::append_syntax_row(metadata, syntax, source_row, row, text)?)
 }
 
 #[derive(Serialize)]
@@ -1654,7 +1634,7 @@ fn selected_files(
     let mut selected = HashMap::new();
     if let Some(selection) = selection {
         ensure!(
-            !selection.target.is_empty() && selection.target.len() <= 65536,
+            !selection.target.is_empty(),
             "invalid status selection size"
         );
         for location in &selection.target {

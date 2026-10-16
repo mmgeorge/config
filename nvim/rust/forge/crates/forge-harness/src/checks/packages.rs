@@ -51,7 +51,7 @@ pub(super) struct Package {
 }
 
 #[derive(Clone, Debug)]
-/// Owns one bounded workspace package inventory for invocation resolution.
+/// Owns one workspace package inventory for invocation resolution.
 pub(super) struct PackageCatalog {
     root: PathBuf,
     manifest_name: &'static str,
@@ -207,7 +207,7 @@ impl PackageCatalog {
                 let mut manifests = vec![root_manifest];
                 if !patterns.is_empty() {
                     let mut candidates = Vec::new();
-                    scan(&directory, 0, &mut 0, &mut candidates)?;
+                    scan(&directory, &mut candidates)?;
                     for manifest in candidates {
                         let path = relative(&directory, manifest.parent().unwrap())?;
                         let included = patterns
@@ -255,8 +255,8 @@ impl PackageCatalog {
             }
         };
         ensure!(
-            !packages.is_empty() && packages.len() <= 512,
-            "package inventory must contain 1 to 512 workspace packages"
+            !packages.is_empty(),
+            "package inventory must contain workspace packages"
         );
         for package in &packages {
             ensure!(
@@ -350,8 +350,8 @@ fn read(path: &Path) -> Result<Vec<u8>> {
     let metadata =
         std::fs::symlink_metadata(path).with_context(|| format!("read {}", path.display()))?;
     ensure!(
-        metadata.is_file() && !metadata.file_type().is_symlink() && metadata.len() <= 1024 * 1024,
-        "manifest must be a regular file no larger than 1 MiB: {}",
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "manifest must be a regular file: {}",
         path.display()
     );
     Ok(std::fs::read(path)?)
@@ -373,19 +373,8 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
 
 fn scan(
     directory: &Path,
-    depth: usize,
-    count: &mut usize,
     manifests: &mut Vec<PathBuf>,
 ) -> Result<()> {
-    ensure!(
-        depth <= 32,
-        "workspace discovery exceeds 32 directory levels"
-    );
-    *count += 1;
-    ensure!(
-        *count <= 8192,
-        "workspace discovery exceeds 8192 directories"
-    );
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_type()?.is_dir()
@@ -394,14 +383,28 @@ fn scan(
                 Some("node_modules" | ".git" | "target" | ".forge")
             )
         {
-            scan(&entry.path(), depth + 1, count, manifests)?;
+            scan(&entry.path(), manifests)?;
         } else if entry.file_name() == "package.json" && entry.file_type()?.is_file() {
             manifests.push(entry.path());
-            ensure!(
-                manifests.len() <= 1024,
-                "workspace discovery exceeds 1024 manifests"
-            );
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn manifest_reads_preserve_complete_large_content() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("package.json");
+        let source = serde_json::to_vec(&serde_json::json!({
+            "name":"fixture","description":"λ".repeat(1024 * 1024)
+        }))?;
+        std::fs::write(&path, &source)?;
+        assert_eq!(read(&path)?, source);
+        assert!(read(directory.path()).is_err());
+        Ok(())
+    }
 }

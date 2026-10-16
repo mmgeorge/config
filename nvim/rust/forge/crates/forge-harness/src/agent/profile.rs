@@ -61,7 +61,6 @@ impl Default for AgentProfileDocument {
 
 impl AgentProfileDocument {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.profiles.len() <= 64, "at most 64 subagent profiles are supported");
         ensure!(self.profiles.get(&self.default_profile).is_some_and(|profile| profile.enabled),
             "default_profile must name an enabled profile");
         for (name, profile) in &self.profiles {
@@ -77,8 +76,6 @@ impl AgentProfileDocument {
                 "profile {name} has an unsupported service_tier");
             ensure!(matches!(profile.permission_mode.as_str(), "inherit" | "read" | "write" | "yolo"),
                 "profile {name} has an unsupported permission_mode");
-            ensure!(profile.instructions.len() <= 64 * 1024 && profile.description.len() <= 4096,
-                "profile {name} exceeds instruction or description limits");
         }
         Ok(())
     }
@@ -103,10 +100,9 @@ impl AgentProfileStore {
 
     fn bytes(&self) -> Result<Option<Vec<u8>>> {
         match std::fs::File::open(&self.path) {
-            Ok(file) => {
+            Ok(mut file) => {
                 let mut bytes = Vec::new();
-                file.take(1024 * 1024 + 1).read_to_end(&mut bytes)?;
-                ensure!(bytes.len() <= 1024 * 1024, "subagent profile file exceeds 1 MiB");
+                file.read_to_end(&mut bytes)?;
                 Ok(Some(bytes))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -148,7 +144,6 @@ impl AgentProfileStore {
     pub fn save(&self, expected_revision: &str, document: AgentProfileDocument) -> Result<AgentProfileSnapshot> {
         document.validate()?;
         let encoded = serde_json::to_vec_pretty(&document)?;
-        ensure!(encoded.len() < 1024 * 1024, "subagent profile file exceeds 1 MiB");
         let parent = self.path.parent().context("subagent profiles require a parent directory")?;
         std::fs::create_dir_all(parent)?;
         let lock_path = self.path.with_extension("json.lock");
@@ -178,6 +173,26 @@ fn revision(bytes: Option<&[u8]>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn large_profile_documents_round_trip_complete_instructions() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("subagents.json");
+        let store = AgentProfileStore::new(path.clone());
+        let mut document = AgentProfileDocument::default();
+        let instructions = "λ".repeat(1024 * 1024);
+        let description = "d".repeat(4097);
+        let worker = document.profiles.get_mut("worker").unwrap();
+        worker.instructions = instructions.clone();
+        worker.description = description.clone();
+        let saved = store.save("missing", document)?;
+        assert!(saved.error.is_none());
+        assert!(std::fs::metadata(&path)?.len() > 1024 * 1024);
+        let reloaded = AgentProfileStore::new(path).resolve(None)?.1;
+        assert_eq!(reloaded.instructions, instructions);
+        assert_eq!(reloaded.description, description);
+        Ok(())
+    }
 
     #[test]
     fn profile_file_reloads_external_edits_and_rejects_stale_saves() -> Result<()> {

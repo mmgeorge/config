@@ -82,10 +82,11 @@ The statusline resolves the source type from physical native-buffer paths withou
 the buffer's parser-admission filetype. Generated URI buffers retain their declared type.
 Collapsed fold labels use the same syntax and conceal metadata as expanded source rows.
 Markdown inline regions retain independent parse trees so delimiters cannot cross paragraph
-boundaries. Syntax analysis accepts at most 10,000 source lines, counting a trailing
-newline as the end of the last line rather than an extra line. Longer files retain
-their source and diff content without trees, captures, or an error notification.
-Injected languages use the same source and stop repeated language/range cycles.
+boundaries. Syntax analysis processes complete source without a byte or line-count
+admission cutoff. Cache eviction controls retained analysis references without
+disabling parsing for larger files. Cancellation, deadlines, and parser failures
+remain explicit outcomes. Injected languages use the same source and stop repeated
+language/range cycles.
 
 ## Startup measurement
 
@@ -213,8 +214,10 @@ writer can finish. Outstanding work beyond that explicit shutdown boundary is no
 Process stdin uses a dedicated blocking reader thread feeding a two-slot channel of at most 64 KiB
 per chunk. Unlike Tokio's stdin blocking-pool task, this thread cannot keep runtime teardown waiting
 on an idle pipe. The thread remains blocked until input or process exit if the OS read cannot be
-cancelled. Queue, current-read, and consumer chunks remain bounded. Existing JSONL frame limits
-still apply above this input adapter.
+cancelled. Queue and read chunks remain bounded. `JsonLineReader` accumulates one complete
+JSONL request above this adapter without an aggregate byte cap, preserving request content
+regardless of the number of read chunks. Lua likewise sends the complete encoded request
+without applying the host's outbound frame limit.
 
 Producer-side output admission remains a separate hard bound. A producer can still exhaust its
 encoded queue while the credit-gated writer waits. Pausing optional generation and replacing the
@@ -283,18 +286,17 @@ display `Loading Forge status…` until their initial request settles.
 
 ## MCP process framing
 
-`forge mcp` reads through `ThreadInput` and `JsonLineReader`, matching the root host's 512 KiB
-input frame limit before JSON decoding. Fragmented input remains in one reader until complete.
-Oversized input terminates the process even when its parent keeps stdin open. Truncated JSON at
-EOF fails decoding without writing a response fragment. A complete final JSON value at EOF keeps
-the shared reader's existing behavior.
+`forge mcp` shares the root host's `ThreadInput` and `JsonLineReader`. The input adapter
+reads bounded chunks, and the JSONL reader retains fragments until a complete request arrives,
+without a total request-size admission limit. Truncated JSON at EOF fails decoding without
+writing a response fragment. A complete final JSON value at EOF receives normal processing.
 
-The stateless MCP loop processes one request at a time and encodes each complete response through
-the bounded output encoder before writing. If a result exceeds 512 KiB including its newline, the
-loop emits an error with the original request ID and remains available for subsequent requests.
-If that error cannot fit, including an oversized request ID, the process fails without writing a
-partial frame. Response construction still materializes JSON values before encoding. The input
-bound limits the echoed arguments but does not eliminate those intermediate copies.
+The stateless MCP loop processes one request at a time and serializes its complete response,
+including the original request ID, before writing the newline-terminated record. Response
+size does not replace a result with an error or terminate the process. JSON serialization
+and I/O failures propagate normally. Response values and encoded bytes remain in memory
+during delivery. This MCP endpoint does not use Neovim's chunked response or receive-credit
+protocol, whose per-frame and queue bounds remain separate.
 
 This entry point remains the existing stateless control-tool transport. It does not create a
 Harness session or launch a provider. Notification handling and normal tool response shapes remain
@@ -403,9 +405,15 @@ credit. The host joins pending requests and waits for feature shutdown before en
 response. Successful shutdown uses the same `shutdown: true` result for a cold or initialized host.
 Response order remains the existing outbound FIFO order.
 
+`HostRouter` retains the status-update subscription and its output sender. After request and feature
+producers quiesce, `ConnectionHost` signals that subscription to drain already-published updates and
+joins its task before closing output admission. The subscription does not wait for the runtime-owned
+broadcast source to disappear. Delivery and task failures participate in the connection failure result.
+
 Connection drainage uses a two-second cooperative deadline. A deadline failure reports unfinished
 request IDs and whether feature shutdown finished. The output task receives a stop signal and has a
-further 100 ms cancellation deadline. Only the writer can be aborted at that boundary. Request tasks
+further 100 ms cancellation deadline. The status forwarder can also be aborted after that connection
+deadline because it owns no native work. Request tasks
 remain retained. Main's existing runtime teardown still runs after the connection returns, so the
 connection deadline is not a hard bound on total process exit time or native system calls.
 

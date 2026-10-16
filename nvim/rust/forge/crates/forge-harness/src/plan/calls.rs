@@ -535,8 +535,8 @@ pub(crate) fn parse(
         ));
     }
     ensure!(
-        text.len() <= 1024 * 1024 && !text.contains('\0'),
-        "combined declaration exceeds 1 MiB or contains NUL"
+        !text.contains('\0'),
+        "combined declaration contains NUL"
     );
     let lines = text.lines().collect::<Vec<_>>();
     let protected = protected_declaration_lines(path, text, &lines)?;
@@ -544,7 +544,6 @@ pub(crate) fn parse(
     let mut block = Vec::new();
     let mut original_line = Vec::new();
     let mut index = 0;
-    let mut occurrence_count = 0;
     while index < lines.len() {
         let line = lines[index];
         if matches!(line.trim(), "Change" | "Calls" | "Accesses") && !protected.contains(&index) {
@@ -588,11 +587,6 @@ pub(crate) fn parse(
                 }
                 let name = value.trim();
                 names.push((name.to_owned(), kind));
-                occurrence_count += 1;
-                ensure!(
-                    occurrence_count <= 65536,
-                    "Function uses exceed 65536 occurrences"
-                );
                 index += 1;
             }
             block.push((original_line.len(), preceding, BodySection::References(kind, names)));
@@ -719,6 +713,39 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_receiver_types_round_trip_without_becoming_reference_names() {
+        let source = r#"export class BufferStore {
+  private current: {
+    writer: Writer;
+    metric: Metric | null;
+  };
+  private pending: { writer: Writer; metric: Metric }[];
+  read(options: { writer: Writer; metric: Metric | null }): number {
+    options.writer.read();
+    this.current.writer.read();
+    this.pending.push(this.current);
+    return this.current.writer.count;
+  }
+  create(): { writer: Writer; metric: Metric | null } {
+    return this.current;
+  }
+  run(): void {
+    this.create().writer.read();
+  }
+}"#;
+        let path = "buffer.ts";
+        let (declaration, extracted) = DeclarationOverview::extract_with_calls(path, source).unwrap();
+        let declaration = DeclarationOverview::format_with_width(path, &declaration, 80).unwrap();
+        let captured = from_extracted(extracted);
+        let combined = combined(path, &declaration, &captured).unwrap();
+        let (_, parsed) = parse(path, &combined, &captured).unwrap();
+        assert_eq!(parsed, captured);
+        for reference in captured.iter().flat_map(|function| function.call.iter().flatten()) {
+            assert!(!reference.name.contains(['{', '}', ';', '\n']), "{}", reference.name);
+        }
+    }
 
     #[test]
     fn captured_receiver_expressions_round_trip_without_an_lsp() {

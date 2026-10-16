@@ -9,9 +9,6 @@ use serde_json::Value;
 
 use super::ReviewService;
 
-const MAX_SECTION_BYTES: usize = 8 * 1024 * 1024;
-const MAX_DOCUMENT_SECTION_BYTES: usize = 16 * 1024 * 1024;
-const MAX_SECTION_RECORDS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
@@ -109,9 +106,8 @@ impl SectionCharge {
         budget
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
                 used.checked_add(bytes)
-                    .filter(|next| *next <= 64 * 1024 * 1024)
             })
-            .map_err(|_| anyhow::anyhow!("shared review section budget is full"))?;
+            .map_err(|_| anyhow::anyhow!("review section retained-byte accounting overflow"))?;
         Ok(Arc::new(Self { budget, bytes }))
     }
 }
@@ -355,7 +351,7 @@ impl ReviewService {
                 let permit = analysis
                     .reserve(
                         forge_diff::workers::WorkPriority::Foreground,
-                        forge_diff::workers::WorkBudget::new(MAX_SECTION_BYTES, None),
+                        forge_diff::workers::WorkBudget::new(0, None),
                     )
                     .map_err(|failure| {
                         anyhow::anyhow!("review section analysis admission failed: {failure:?}")
@@ -365,10 +361,6 @@ impl ReviewService {
                 permit.submit(move |_| {
                     let result = (|| {
                         let bytes = serde_json::to_vec(&page.records)?.len();
-                        ensure!(
-                            bytes <= MAX_SECTION_BYTES,
-                            "review section page exceeds its byte limit"
-                        );
                         let fields = if refresh_fields {
                             page.records
                                 .first()
@@ -445,21 +437,6 @@ impl ReviewService {
                         .bytes
                         .checked_add(page_bytes)
                         .context("section byte count overflow")?;
-                    ensure!(
-                        candidate.bytes <= MAX_SECTION_BYTES
-                            && candidate.item.len() <= MAX_SECTION_RECORDS,
-                        "review section collection limit reached"
-                    );
-                    let total: usize = document
-                        .section
-                        .iter()
-                        .filter(|(kind, _)| **kind != section)
-                        .map(|(_, state)| state.bytes)
-                        .sum();
-                    ensure!(
-                        total + candidate.bytes <= MAX_DOCUMENT_SECTION_BYTES,
-                        "review document section limit reached"
-                    );
                     let mut identities = std::collections::HashSet::new();
                     ensure!(
                         candidate

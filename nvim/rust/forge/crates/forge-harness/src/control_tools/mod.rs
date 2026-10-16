@@ -100,7 +100,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "repository_diff",
-                description: "Inspect staged or unstaged changes in the active interaction repository. At most 8 files per fresh page. Sources above 128 KiB or 4096 lines return an explicit limit state. Read-only exact hunks include source hashes.",
+                description: "Inspect staged or unstaged changes in the active interaction repository. At most 8 files per fresh page. Each file retains its complete source and hunks regardless of size. Read-only exact hunks include source hashes.",
                 input_schema: repository_input_schema(true, false),
             },
             ControlToolDefinition {
@@ -110,7 +110,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "design_patch",
-                description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Change summaries, Calls, and Accesses, never executable bodies. Configuration retains complete values. Read affected text through plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and an applied diff capped at 16 KiB. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is a separate array of {title, description, root} objects, or [] when none apply. Each flow follows a value, request, event, record, or artifact through producers, transformations, stores, and consumers. Each recursive node has a compact single-line text label for one semantic role, optional incoming via (transfer or condition), and optional children for downstream transformations or consumers. Use nouns for objects and values, active verb phrases for operations, and no file paths in labels. A single child continues the path. Branch where paths split and repeat a shared downstream stage where they converge. Each arrow means the next node consumes an output of the preceding node. Keep scheduling rules, guards, and lifecycle guarantees in the description. Add a condition only to distinguish alternative data paths. Omit via on roots. Free functions are valid nodes. Harness generates the flow diagrams after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
+                description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Change summaries, Calls, and Accesses, never executable bodies. Configuration retains complete values. Read affected text through plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and the complete applied diff. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is a separate array of {title, description, root} objects, or [] when none apply. Each flow follows a value, request, event, record, or artifact through producers, transformations, stores, and consumers. Each recursive node has a compact single-line text label for one semantic role, optional incoming via (transfer or condition), and optional children for downstream transformations or consumers. Use nouns for objects and values, active verb phrases for operations, and no file paths in labels. A single child continues the path. Branch where paths split and repeat a shared downstream stage where they converge. Each arrow means the next node consumes an output of the preceding node. Keep scheduling rules, guards, and lifecycle guarantees in the description. Add a condition only to distinguish alternative data paths. Omit via on roots. Free functions are valid nodes. Harness generates the flow diagrams after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
                 input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema()),("source_digests",json!({"type":"object","additionalProperties":{"type":"string"}}))], &["plan_id","expected_version","patch"]),
             },
             ControlToolDefinition {
@@ -428,7 +428,7 @@ where
 fn repository_input_schema(diff: bool, file: bool) -> Value {
     let mut properties = vec![(
         "offset",
-        json!({ "type": "integer", "minimum": 0, "maximum": 65536 }),
+        json!({ "type": "integer", "minimum": 0 }),
     )];
     if diff {
         properties.push((
@@ -439,7 +439,7 @@ fn repository_input_schema(diff: bool, file: bool) -> Value {
     if file {
         properties.push((
             "path_hex",
-            json!({ "type": "string", "pattern": "^([0-9a-fA-F]{2})+$", "maxLength": 8192 }),
+            json!({ "type": "string", "pattern": "^([0-9a-fA-F]{2})+$" }),
         ));
     }
     strict_object_input_schema(properties, if file { &["path_hex"] } else { &[] })
@@ -587,21 +587,9 @@ pub async fn run_stdio() -> Result<()> {
             "notifications/initialized" => continue,
             _ => json!({}),
         };
-        let mut response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
-        let encoded = match forge_protocol::outbound::encode(
-            &response,
-            forge_protocol::MAX_FRAME_BYTES,
-        ) {
-            Ok(encoded) => encoded,
-            Err(_) => forge_protocol::outbound::encode(
-                &json!({
-                    "jsonrpc": "2.0",
-                    "id": response["id"].take(),
-                    "error": { "code": -32000, "message": "Forge MCP response exceeds its frame limit" },
-                }),
-                forge_protocol::MAX_FRAME_BYTES,
-            )?,
-        };
+        let response = json!({ "jsonrpc": "2.0", "id": id, "result": result });
+        let mut encoded = serde_json::to_vec(&response)?;
+        encoded.push(b'\n');
         output.write_all(&encoded).await?;
         output.flush().await?;
     }
@@ -610,6 +598,14 @@ pub async fn run_stdio() -> Result<()> {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn repository_schema_preserves_complete_offsets_and_path_identities() {
+        assert!(validate_arguments(&ControlToolInvocation {
+            name: "repository_file_diff".into(),
+            arguments: json!({"offset":65537,"path_hex":"61".repeat(4097)}),
+        }).is_ok());
+    }
+
     #[test]
     fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() {
         for name in [

@@ -18,7 +18,8 @@ Copilot SDK implementation. Consumer-owned traits stay beside the feature that c
 Claude Code uses the published Claude ACP adapter. Antigravity uses its standalone ACP server.
 The official Rust ACP SDK frames transport requests and dispatches permission callbacks independently
 of pending prompts. Harness control tools use a required, private loopback MCP endpoint. Its connection
-tasks share the endpoint lifetime and admit at most 16 connections, with 8 KiB headers and 1 MiB bodies.
+tasks share the endpoint lifetime and admit at most 16 connections. Headers and bodies retain
+complete requests without hardcoded byte-size admission limits.
 Provider restart retains the native conversation identity and reloads that conversation. Failure to
 load it fails configuration rather than creating replacement history.
 
@@ -58,7 +59,7 @@ Provider setup for Claude and Antigravity. Installation writes into a temporary 
 `provider-runtime`, validates the expected executable, then publishes the version directory atomically.
 An OS file lock excludes concurrent installers. Failed installation preserves existing versions.
 Claude uses its pinned npm package and requires Node.js 22 or newer. Antigravity uses Google's
-platform-specific archive with bounded download and extraction, rejecting escaping paths and symlinks.
+platform-specific archive with complete download and extraction, rejecting escaping paths and symlinks.
 Neither installer changes global CLI installations or shell configuration.
 Setup and authentication hold session execution and cleanup admission, so they reject active work.
 The setup handshake advertises terminal authentication support. Claude OAuth runs the advertised
@@ -126,11 +127,11 @@ Application uses the existing task transition coordinator and durable configurat
 
 Imported skills retain their source file and metadata. Imported MCP arguments, URL, environment,
 and headers retain references into the original native file, so Forge does not copy literal
-credentials into its database. Launch reads one bounded snapshot per source, preserves literal
+credentials into its database. Launch reads one complete snapshot per source, preserves literal
 values, and validates the imported structure before resolving references. Credential rotation
 preserves the binding. Added policy fields or changed launch structure require another explicit
-import. MCP files are limited to 1 MiB, skill definitions to 64 KiB, previews to 256 KiB, and
-each import to 128 resources. Nonportable native options are blocked in the preview, including
+import. MCP files, skill definitions, previews, and resource inventories retain their complete
+content. Nonportable native options are blocked in the preview, including
 tool restrictions, timeouts, and working directories that ACP cannot preserve. Imports never
 write native configuration, authentication, or Rulesync-generated files.
 

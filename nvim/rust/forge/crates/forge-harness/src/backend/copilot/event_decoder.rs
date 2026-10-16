@@ -10,7 +10,9 @@ use serde_json::{Value, json};
 
 /// Normalizes stable Copilot SDK session events into the Harness interaction protocol.
 #[derive(Default)]
-pub struct CopilotEventDecoder;
+pub struct CopilotEventDecoder {
+    pub(super) workspace: String,
+}
 
 impl CopilotEventDecoder {
     /// Decode one SDK event and publish its normalized Harness update.
@@ -188,7 +190,22 @@ impl CopilotEventDecoder {
             | "tool.execution_progress"
             | "tool.execution_complete" => {
                 output.evidence.tool_called = true;
-                let activity = tool_activity(provider_event);
+                let mut activity = tool_activity(provider_event, output);
+                if let Some(activity) = activity.as_mut()
+                    && activity.kind == ToolActivityKind::FileChange
+                    && activity.change.is_empty()
+                    && provider_event.event_type == "tool.execution_complete"
+                {
+                    match super::file_change::from_output(
+                        activity.output.as_deref().unwrap_or_default(), &self.workspace,
+                    ) {
+                        Ok(change) => activity.change = change,
+                        Err(error) => {
+                            self.publish_text("error", Some(format!("Invalid Copilot file changes: {error:#}")),
+                                provider_event, output, event_sink).await;
+                        }
+                    }
+                }
                 if activity.as_ref().is_some_and(successful_file_change) {
                     output.evidence.workspace_changed = true;
                 }
@@ -499,7 +516,12 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
         existing.title = update.title;
     }
     existing.status = update.status;
-    existing.change = update.change;
+    if update.kind == ToolActivityKind::FileChange {
+        existing.kind = ToolActivityKind::FileChange;
+    }
+    if !update.change.is_empty() {
+        existing.change = update.change;
+    }
     if let Some(text) = update.output {
         if update.output_delta {
             existing
@@ -514,9 +536,23 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
     previous.data = incoming.data;
 }
 
-fn tool_activity(provider_event: &SessionEvent) -> Option<ToolActivity> {
+fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Option<ToolActivity> {
     let data = &provider_event.data;
     let id = string_field(data, &["toolCallId", "id"])?;
+    let previous = output.event.iter().rev().find_map(|event| {
+        let agent_id = event.data.get("agentId").or_else(|| event.data.get("agent_id")).and_then(Value::as_str);
+        event.activity.as_ref().filter(|activity| activity.id == id
+            && agent_id == provider_event.agent_id.as_deref())
+    });
+    let file_tool = previous.is_some_and(|activity| activity.kind == ToolActivityKind::FileChange)
+        || match data.get("toolName").and_then(Value::as_str) {
+            Some("apply_patch" | "edit" | "create") => true,
+            Some("str_replace_editor") => matches!(
+                data.pointer("/arguments/command").and_then(Value::as_str),
+                Some("str_replace" | "create" | "insert" | "undo_edit"),
+            ),
+            _ => false,
+        };
     let title = string_field(data, &["toolName", "name", "toolDescription"])
         .unwrap_or_else(|| "Copilot tool".into());
     let title = data.get("arguments").filter(|arguments| !arguments.is_null())
@@ -553,13 +589,18 @@ fn tool_activity(provider_event: &SessionEvent) -> Option<ToolActivity> {
         }
         _ => return None,
     };
-    let change = provider_change_set(data);
+    let mut change = provider_change_set(data);
+    if change.is_empty()
+        && let Some(previous) = previous
+    {
+        change = previous.change.clone();
+    }
     Some(ToolActivity {
         id,
-        kind: if change.is_empty() {
-            ToolActivityKind::ToolCall
-        } else {
+        kind: if file_tool || !change.is_empty() {
             ToolActivityKind::FileChange
+        } else {
+            ToolActivityKind::ToolCall
         },
         title,
         output,
@@ -695,13 +736,13 @@ mod test {
         let mut address = Vec::new();
         for interaction in ["first-prompt", "second-prompt"] {
             let mut output = BackendOutput { backend_session_id:Some("same-session".into()), ..Default::default() };
-            CopilotEventDecoder.decode(&event("assistant.turn_start", serde_json::json!({
+            CopilotEventDecoder::default().decode(&event("assistant.turn_start", serde_json::json!({
                 "turnId":"0", "interactionId":interaction
             })), &mut output, None).await;
-            CopilotEventDecoder.decode(&event("assistant.message_delta", serde_json::json!({
+            CopilotEventDecoder::default().decode(&event("assistant.message_delta", serde_json::json!({
                 "messageId":interaction, "deltaContent":"visible answer"
             })), &mut output, None).await;
-            CopilotEventDecoder.decode(&event("assistant.turn_end", serde_json::json!({"turnId":"0"})), &mut output, None).await;
+            CopilotEventDecoder::default().decode(&event("assistant.turn_end", serde_json::json!({"turnId":"0"})), &mut output, None).await;
             let started = output.event.iter().find(|event|event.kind == "turn_started").unwrap().address.clone().unwrap();
             assert!(output.event.iter().all(|event|event.address.as_ref() == Some(&started)));
             address.push(started);
@@ -714,8 +755,124 @@ mod test {
     use serde_json::json;
 
     #[tokio::test]
+    async fn native_patch_results_render_as_changed_files_after_streaming_and_reload() -> anyhow::Result<()> {
+        use crate::buffer::projection::{ProjectionSource, project};
+        let decoder = CopilotEventDecoder { workspace: "/Users/me/project".into() };
+        let mut output = BackendOutput { backend_session_id: Some("root".into()), ..Default::default() };
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"patches", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Fix the file", "kind":"plan_execution", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let diff = "\ndiff --git a/Users/me/project/src/lib.rs b/Users/me/project/src/lib.rs\n\
+            index 0000000..0000000 100644\n\
+            --- a/Users/me/project/src/lib.rs\n+++ b/Users/me/project/src/lib.rs\n\
+            @@ -40 +40 @@\n-old\n+new\n";
+        for (index, (kind, data)) in [
+            ("assistant.turn_start", json!({"turnId":"one"})),
+            ("tool.execution_start", json!({"toolCallId":"patch", "toolName":"apply_patch",
+                "arguments":"*** Begin Patch\n*** Update File: /Users/me/project/src/lib.rs\n@@\n-old\n+new\n*** End Patch"})),
+            ("tool.execution_progress", json!({"toolCallId":"patch", "progressMessage":"Applying"})),
+            ("tool.execution_complete", json!({"toolCallId":"patch", "success":true,
+                "result":{"content":"Modified 1 file(s): src/lib.rs", "detailedContent":diff}})),
+            ("assistant.turn_end", json!({"turnId":"one"})),
+        ].into_iter().enumerate() {
+            decoder.decode(&event(kind, data), &mut output, None).await;
+            exchange.observe_turn(output.event.last().unwrap(), index as i64 + 1)?;
+            if kind == "tool.execution_start" {
+                let rendered = project(ProjectionSource::Exchange(&exchange), &Default::default(),
+                    false, &Default::default(), &Default::default())?;
+                let text = rendered.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+                assert!(text.contains("Changing files"));
+                assert!(!text.contains("Ran 1 tool"));
+            }
+        }
+        assert!(output.evidence.workspace_changed);
+        let activity = output.event.iter().find_map(|event| event.activity.as_ref()).unwrap();
+        assert_eq!(activity.kind, ToolActivityKind::FileChange);
+        assert_eq!(activity.change.file[0].path, "src/lib.rs");
+        assert_eq!(activity.change.file[0].diff, "@@ -40 +40 @@\n-old\n+new\n");
+        exchange.finish(crate::exchange::ExchangeState::Complete, 10)?;
+        let restored: crate::exchange::Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        let rendered = project(ProjectionSource::Exchange(&restored), &Default::default(),
+            false, &Default::default(), &Default::default())?;
+        let text = rendered.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Changed 1 file"));
+        assert!(text.contains("lib.rs"));
+        assert!(!text.contains("Ran 1 tool"));
+        assert!(rendered.tool.is_empty());
+        assert!(rendered.action.values().any(|action| matches!(action,
+            crate::buffer::projection::TranscriptAction::Diff { text } if text.contains("@@ -40 +40 @@\n-old\n+new"))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn file_tool_failures_and_read_only_diffs_never_claim_workspace_changes() {
+        let decoder = CopilotEventDecoder::default();
+        let diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
+        for (name, arguments, success, expected) in [
+            ("apply_patch", Value::Null, false, ToolActivityKind::FileChange),
+            ("bash", json!({"command":"git diff"}), true, ToolActivityKind::ToolCall),
+            ("str_replace_editor", json!({"command":"view", "path":"file"}), true, ToolActivityKind::ToolCall),
+        ] {
+            let mut output = BackendOutput::default();
+            decoder.decode(&event("tool.execution_start", json!({
+                "toolCallId":"tool", "toolName":name, "arguments":arguments,
+            })), &mut output, None).await;
+            decoder.decode(&event("tool.execution_complete", json!({
+                "toolCallId":"tool", "success":success, "result":{"detailedContent":diff},
+            })), &mut output, None).await;
+            let activity = output.event[0].activity.as_ref().unwrap();
+            assert_eq!(activity.kind, expected);
+            assert!(!output.evidence.workspace_changed);
+            if expected == ToolActivityKind::FileChange {
+                assert_eq!(activity.status.as_deref(), Some("failed"));
+            } else {
+                assert!(activity.change.is_empty());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_file_diffs_report_errors_without_losing_tool_completion() {
+        let decoder = CopilotEventDecoder::default();
+        let mut output = BackendOutput::default();
+        decoder.decode(&event("tool.execution_start", json!({"toolCallId":"patch", "toolName":"apply_patch"})),
+            &mut output, None).await;
+        decoder.decode(&event("tool.execution_complete", json!({"toolCallId":"patch", "success":true,
+            "result":{"detailedContent":"diff --git a/file b/file\n@@ -1 +1 @@\n-old\n"}})),
+            &mut output, None).await;
+        assert!(output.event.iter().any(|event| event.kind == "error"
+            && event.text.as_deref().unwrap().contains("truncated saved patch hunk")));
+        assert_eq!(output.event[0].activity.as_ref().unwrap().status.as_deref(), Some("completed"));
+        assert!(!output.evidence.workspace_changed);
+    }
+
+    #[tokio::test]
+    async fn structured_changes_upgrade_generic_tools_and_survive_nameless_completion() {
+        let decoder = CopilotEventDecoder::default();
+        let mut output = BackendOutput::default();
+        let mut tools = crate::turn::ToolStore::default();
+        for data in [
+            json!({"toolCallId":"tool", "toolName":"custom_edit"}),
+            json!({"toolCallId":"tool", "changes":[{"path":"file", "diff":"@@ -1 +1 @@\n-old\n+new\n"}]}),
+        ] {
+            decoder.decode(&event("tool.execution_start", data), &mut output, None).await;
+            tools.merge(output.event[0].activity.as_ref().unwrap(), 1);
+        }
+        decoder.decode(&event("tool.execution_complete", json!({"toolCallId":"tool", "success":true,
+            "result":{"content":"done"}})), &mut output, None).await;
+        tools.merge(output.event[0].activity.as_ref().unwrap(), 2);
+        assert!(output.evidence.workspace_changed);
+        assert_eq!(output.event[0].activity.as_ref().unwrap().kind, ToolActivityKind::FileChange);
+        assert_eq!(tools.get("tool").unwrap().kind, "file_change");
+        assert_eq!(tools.get("tool").unwrap().change.file.len(), 1);
+    }
+
+    #[tokio::test]
     async fn compaction_retains_summary_failure_and_identity_across_replays() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput { backend_session_id: Some("root".into()), ..Default::default() };
         let start = event("session.compaction_start", json!({"model":"summary-model", "conversationTokens":100}));
         let complete = event("session.compaction_complete", json!({
@@ -763,7 +920,7 @@ mod test {
 
     #[tokio::test]
     async fn publishes_root_model_before_turn_and_ignores_child_model() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
             runtime: crate::backend::BackendRuntime {
                 provider: "Copilot CLI".into(),
@@ -787,7 +944,7 @@ mod test {
 
     #[tokio::test]
     async fn reports_every_model_call_and_addresses_late_child_usage() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
             backend_session_id: Some("parent".into()),
             ..BackendOutput::default()
@@ -835,7 +992,7 @@ mod test {
 
     #[tokio::test]
     async fn retains_tool_identity_across_turns_and_ignores_late_background_output() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
             backend_session_id: Some("session".into()),
             ..BackendOutput::default()
@@ -862,7 +1019,7 @@ mod test {
 
     #[tokio::test]
     async fn coalesces_streamed_message_and_tool_lifecycle_updates() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput::default();
         decoder
             .decode(
@@ -913,7 +1070,7 @@ mod test {
 
     #[tokio::test]
     async fn normalizes_provider_turn_boundaries_without_counting_context_as_usage() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput {
             backend_session_id: Some("session".into()),
             ..BackendOutput::default()
@@ -969,7 +1126,7 @@ mod test {
 
     #[tokio::test]
     async fn maps_usage_tasks_and_subagent_events() {
-        let decoder = CopilotEventDecoder;
+        let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput::default();
         decoder
             .decode(

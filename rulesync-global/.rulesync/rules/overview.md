@@ -59,6 +59,19 @@ globs:
 
 # Programming
 
+- **No arbitrary content-size caps.** Never reject, truncate, disable, or crash
+  on valid files, documents, plans, metadata, diffs, or editable content because
+  of hardcoded byte, KB, KiB, MB, MiB, line-count, or occurrence-count thresholds.
+  Do not raise a cap, make it configurable, or move rejection to another layer.
+  Use streaming, chunking, pagination, viewport work, cancellation, backpressure,
+  and cache eviction while preserving complete content. Per-chunk, cache,
+  log-rotation, and concurrency budgets must not become total-content limits.
+  Audit readers, parsers, renderers, persistence, transport, and UI together.
+  Report real I/O, decoding, allocation, and external-service failures explicitly
+  and preserve the previous usable view rather than a loading placeholder.
+  Unavoidable external format or API limits require evidence and the user's
+  explicit approval before introducing rejection or truncation. Test content
+  beyond former thresholds through the complete affected workflow.
 - **Semantic Naming:** Name entities by role, ownership, and scope without
   single-letter names or comments. Abbreviate only `url`, `id`, `config`. Name
   collections with singular roles (`TaskStore`, `TaskMap`). Rename types at

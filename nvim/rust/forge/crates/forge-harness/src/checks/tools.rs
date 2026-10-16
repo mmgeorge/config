@@ -514,7 +514,6 @@ impl CheckRunner {
             "check setup cannot change an active run"
         );
         request.config.validate()?;
-        ensure!(request.helpers.len() <= 64, "setup exceeds 64 helpers");
         let original = super::config::read_document(&self.workspace)?;
         ensure!(
             crate::plan::digest(&serde_json::to_vec(&original)?) == request.expected_revision,
@@ -531,7 +530,6 @@ impl CheckRunner {
                         .is_some_and(|extension| extension == "nu"),
                 "helpers must be Nushell files under .forge/checks/"
             );
-            ensure!(helper.source.len() <= 256 * 1024, "helper exceeds 256 KiB");
             let destination = self.workspace.join(relative);
             ensure!(
                 helper_path.insert(destination.clone()),
@@ -606,10 +604,6 @@ impl CheckRunner {
         let mut document = original.clone();
         document["checks"] = serde_json::to_value(&request.config)?;
         let replacement = serde_json::to_vec_pretty(&document)?;
-        ensure!(
-            replacement.len() <= 1024 * 1024,
-            ".forge.json exceeds 1 MiB"
-        );
         ensure!(
             super::config::read_document(&self.workspace)? == original,
             ".forge.json changed during validation"

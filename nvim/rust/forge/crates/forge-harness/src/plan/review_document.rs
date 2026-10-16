@@ -128,7 +128,6 @@ impl PlanReviewStore {
             let excerpt = super::render_review_feedback(&document.source.document, &resolved)?;
             let thread = super::review_annotation::thread_context(document.annotation.annotation(), annotation);
             let prompt = format!("Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}", annotation.source.body);
-            ensure!(prompt.len() <= 8 * 1024 * 1024, "plan question context exceeds 8 MiB");
             question.push(PlanReviewQuestion { plan_id:document.source.document.plan_id.clone(), id:annotation.id.clone(), body:annotation.source.body.clone(), prompt });
         }
         Ok(question)
@@ -303,9 +302,7 @@ impl PlanReviewStore {
         if action == "schema" {
             document.validate_input(input)?;
             let text = serde_json::to_string_pretty(&document.source.document)?;
-            ensure!(text.len() <= 8 * 1024 * 1024, "plan schema exceeds 8 MiB");
             let text = forge_buffer::text::BufferText::from_rows(text.lines())?;
-            ensure!(text.row_count() <= 65536, "plan schema exceeds 65536 rows");
             let snapshot = BufferDocument::new(
                 DocumentId(format!("plan:schema:{}", uuid::Uuid::new_v4())),
                 vec![forge_buffer::block::BufferBlock {
@@ -533,7 +530,7 @@ impl PlanReviewDocument {
         let mut preview = Vec::new();
         let mut resolver =
             crate::declaration::DeclarationResolver::planned(&self.source.workspace, design, false)?;
-        resolver.bound_reference_files();
+        resolver.discard_snapshot_originals();
         for block in self.document.snapshot().block {
             for target in &block.metadata.target {
                 let Some(anchor) = self.target.get(&target.id) else {
@@ -851,10 +848,6 @@ impl PlanReviewDocument {
                 entity.name,
                 entity.description,
                 serde_json::to_string_pretty(entity)?
-            );
-            ensure!(
-                description.len() <= 65536,
-                "plan entity information exceeds 64 KiB"
             );
             let id = format!("plan:info:{}", uuid::Uuid::new_v4());
             let rendered = forge_buffer::markdown::MarkdownRenderer::render(
