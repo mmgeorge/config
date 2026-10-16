@@ -34,7 +34,7 @@ use github_copilot_sdk::rpc::{
     SlashCommandInvocationResult,
 };
 use github_copilot_sdk::tool::ToolHandler;
-use github_copilot_sdk::types::ContextTier;
+use github_copilot_sdk::types::{ContextTier, ToolSearchConfig};
 use github_copilot_sdk::{
     CliProgram, Client, ClientOptions, DeliveryMode, MessageOptions, Model, PermissionRequestData,
     PermissionRequestKind, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
@@ -289,6 +289,7 @@ impl CopilotBackend {
             config.streaming = Some(true);
             config.system_message = Some(system_message);
             config.tools = Some(tool_list);
+            config.tool_search = Some(ToolSearchConfig::new().with_enabled(false));
             config.working_directory = Some(PathBuf::from(&request.workspace));
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(resources.is_none());
@@ -314,6 +315,7 @@ impl CopilotBackend {
             config.streaming = Some(true);
             config.system_message = Some(system_message);
             config.tools = Some(tool_list);
+            config.tool_search = Some(ToolSearchConfig::new().with_enabled(false));
             config.working_directory = Some(PathBuf::from(&request.workspace));
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(resources.is_none());
@@ -613,6 +615,7 @@ impl Backend for CopilotBackend {
     ) -> Result<BackendOutput> {
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Copilot)?;
+        let _directories = self.permission_coordinator.directories(self.settings_root.as_deref(), &request)?;
         let event_sink = skills.sink(event_sink);
         let _turn_event_guard = turn_event.activate(event_sink.clone(),
             request.control_context.as_ref().and_then(|context| context.submission_cancelled.clone()))?;

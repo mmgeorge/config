@@ -2,12 +2,16 @@ use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-/// Controls provider isolation independently of approval mode.
+/// Controls file authorization and provider isolation independently of approval mode.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AccessPolicy {
     pub sandbox: bool,
-    pub write_access: WriteAccess,
+    #[serde(default)]
+    pub read_access: DirectoryScope,
+    pub write_access: DirectoryScope,
+    #[serde(default)]
+    pub readable_directory: Vec<String>,
     pub writable_directory: Vec<String>,
     pub windows_sandbox: WindowsSandbox,
 }
@@ -16,7 +20,9 @@ impl Default for AccessPolicy {
     fn default() -> Self {
         Self {
             sandbox: true,
-            write_access: WriteAccess::Workspace,
+            read_access: DirectoryScope::Full,
+            write_access: DirectoryScope::Workspace,
+            readable_directory: Vec::new(),
             writable_directory: Vec::new(),
             windows_sandbox: WindowsSandbox::Elevated,
         }
@@ -25,9 +31,9 @@ impl Default for AccessPolicy {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum WriteAccess {
-    #[default]
+pub enum DirectoryScope {
     Workspace,
+    #[default]
     Full,
 }
 
@@ -43,28 +49,33 @@ pub enum WindowsSandbox {
 impl AccessPolicy {
     /// Resolve existing directories before admitting a configuration change.
     pub fn validate(mut self) -> Result<Self> {
-        let mut normalized = Vec::new();
-        for directory in &self.writable_directory {
-            let path = Path::new(directory.trim());
-            ensure!(path.is_absolute(), "writable directory must be absolute: {directory}");
-            ensure!(path.is_dir(), "writable directory does not exist: {directory}");
-            let canonical = path.canonicalize()
-                .with_context(|| format!("resolve writable directory: {directory}"))?;
-            let canonical = canonical.to_string_lossy().replace('\\', "/");
-            let canonical = canonical.strip_prefix("//?/UNC/").map(|value| format!("//{value}"))
-                .unwrap_or_else(|| canonical.strip_prefix("//?/").unwrap_or(&canonical).to_owned());
-            ensure!(!normalized.iter().any(|existing: &String| if cfg!(windows) {
-                existing.eq_ignore_ascii_case(&canonical)
-            } else { existing == &canonical }), "duplicate writable directory: {directory}");
-            normalized.push(canonical);
+        for (label, directories) in [
+            ("readable", &mut self.readable_directory),
+            ("writable", &mut self.writable_directory),
+        ] {
+            let mut normalized = Vec::new();
+            for directory in directories.iter() {
+                let path = Path::new(directory.trim());
+                ensure!(path.is_absolute(), "{label} directory must be absolute: {directory}");
+                ensure!(path.is_dir(), "{label} directory does not exist: {directory}");
+                let canonical = path.canonicalize()
+                    .with_context(|| format!("resolve {label} directory: {directory}"))?;
+                let canonical = canonical.to_string_lossy().replace('\\', "/");
+                let canonical = canonical.strip_prefix("//?/UNC/").map(|value| format!("//{value}"))
+                    .unwrap_or_else(|| canonical.strip_prefix("//?/").unwrap_or(&canonical).to_owned());
+                ensure!(!normalized.iter().any(|existing: &String| if cfg!(windows) {
+                    existing.eq_ignore_ascii_case(&canonical)
+                } else { existing == &canonical }), "duplicate {label} directory: {directory}");
+                normalized.push(canonical);
+            }
+            *directories = normalized;
         }
-        self.writable_directory = normalized;
         Ok(self)
     }
 
     /// Include every mounted drive when sandboxed writes have full scope.
     pub fn writable_roots(&self, workspace: &str) -> Vec<String> {
-        if self.write_access == WriteAccess::Workspace {
+        if self.write_access == DirectoryScope::Workspace {
             let mut roots = vec![workspace.to_owned()];
             roots.extend(self.writable_directory.clone());
             return roots;

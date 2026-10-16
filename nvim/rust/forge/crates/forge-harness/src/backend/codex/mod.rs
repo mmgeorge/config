@@ -1093,6 +1093,7 @@ impl Backend for CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Codex)?;
+        let _directories = self.permission_coordinator.directories(self.settings_root.as_deref(), &request)?;
         let event_sink = skills.sink(event_sink);
         let mut active_steering = self
             .activate_turn_control(&request.runtime_key()?, event_sink.clone())

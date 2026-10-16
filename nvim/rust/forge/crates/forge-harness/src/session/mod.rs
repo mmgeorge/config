@@ -6,7 +6,7 @@ mod shell;
 mod timeout;
 pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
 pub use shell::CheckShell;
-pub use access::{AccessPolicy, WindowsSandbox, WriteAccess};
+pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox};
 pub mod continuation;
 pub mod state_machine;
 use std::collections::BTreeMap;

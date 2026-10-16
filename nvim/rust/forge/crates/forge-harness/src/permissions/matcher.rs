@@ -23,6 +23,9 @@ pub enum PermissionTarget {
     Write {
         path: String,
     },
+    UnknownFile {
+        operation: super::directory::DirectoryOperation,
+    },
     Network {
         target: String,
     },
@@ -117,7 +120,7 @@ fn normalized_path(path: &Path) -> Option<PathBuf> {
 }
 
 #[cfg(windows)]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
+pub(crate) fn path_starts_with(path: &Path, root: &Path) -> bool {
     let path = path
         .to_string_lossy()
         .replace('\\', "/")
@@ -130,7 +133,7 @@ fn path_starts_with(path: &Path, root: &Path) -> bool {
 }
 
 #[cfg(not(windows))]
-fn path_starts_with(path: &Path, root: &Path) -> bool {
+pub(crate) fn path_starts_with(path: &Path, root: &Path) -> bool {
     path.starts_with(root)
 }
 
@@ -183,7 +186,11 @@ fn path_pattern_score(pattern: &str, target: &str, workspace: &Path) -> Option<u
     };
     let root = normalized_path(&root)?;
     let target = normalized_path(Path::new(target))?;
-    path_starts_with(&target, &root).then_some(root.components().count())
+    let score = root.components().count();
+    if path_starts_with(&target, &root) { return Some(score); }
+    let root = super::directory::resolve_path(&root, workspace).ok()?;
+    let target = super::directory::resolve_path(&target, workspace).ok()?;
+    path_starts_with(&target, &root).then_some(score)
 }
 
 fn combine_decision(result_list: &[TargetEvaluation]) -> PermissionDecision {
@@ -313,6 +320,11 @@ impl CompiledPermissionDocument {
                 result_list.extend(self.evaluate_command(command, *shell, mode)?);
                 continue;
             }
+            if matches!(target, PermissionTarget::UnknownFile { .. }) {
+                result_list.push(TargetEvaluation { target: target.clone(), decision: PermissionDecision::Ask,
+                    matched_pattern: None, command: None });
+                continue;
+            }
             if mode == PermissionMode::Yolo {
                 result_list.push(TargetEvaluation {
                     target: target.clone(),
@@ -323,6 +335,7 @@ impl CompiledPermissionDocument {
                 continue;
             }
             let (decision, matched_pattern) = match target {
+                PermissionTarget::UnknownFile { .. } => unreachable!("unknown file targets require explicit approval"),
                 PermissionTarget::Command { .. } => {
                     unreachable!("commands are parsed before policy evaluation")
                 }

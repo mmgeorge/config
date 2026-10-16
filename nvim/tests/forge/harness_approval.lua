@@ -158,6 +158,27 @@ local ok, failure = pcall(function()
   invoke("<C-c>")
   assert(interrupted == 1 and closed == previous_closed + 1 and not approval.is_open())
 
+  for _, operation in ipairs({ "readable", "writable" }) do
+    local directory_request = { id = "directory-" .. operation, item_list = { {
+      id = "file", title = "File access", detail = "/external/project/file",
+      choice_list = {
+        { id = "allow_once", label = "Allow once" },
+        { id = "allow_global_directory", label = "Allow and add to global " .. operation .. " directories: /external/project" },
+        { id = "cancel", label = "Reject all" },
+      },
+    } } }
+    host.resolve = function(id, answers, callback)
+      assert(id == directory_request.id)
+      assert(#answers == 1 and answers[1].item_id == "file" and answers[1].choice_id == "allow_global_directory")
+      callback(true)
+    end
+    approval.open(directory_request, host)
+    local rendered = table.concat(vim.api.nvim_buf_get_lines(picker._state_for_test().buf, 0, -1, false), "\n")
+    assert(rendered:find("global " .. operation .. " directories", 1, true), rendered)
+    choose("allow_global_directory")
+    assert(not approval.is_open())
+  end
+
   local command = [[ForEach-Object { Get-ChildItem "$_.FullName" -Directory -Filter "bevy*0.19.1"; Write-Output 'done; a|b' }]]
   assert(command_detail.format(context(command, command)).text == table.concat({
     "ForEach-Object {",

@@ -342,6 +342,7 @@ impl Backend for AcpBackend {
 
     async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<BackendOutput> {
         let skills = self.permission.skills(Some(&self.settings_root), &request, self.kind)?;
+        let _directories = self.permission.directories(Some(&self.settings_root), &request)?;
         let sink = skills.sink(sink);
         if self.kind == BackendKind::Claude {
             let existing = self.session.lock().await.get(&request.runtime_key()?).cloned();

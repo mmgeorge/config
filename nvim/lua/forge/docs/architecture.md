@@ -2464,6 +2464,16 @@ can prove the turn never gained workspace mutation access without comparing work
 An otherwise output-free native rewind then cancels pending baseline acquisition and removes the
 provisional exchange immediately. It does not wait for the repository scan or capture a final
 checkpoint. Once the barrier releases tools, normal checkpoint comparison remains required.
+Native abort may complete the provider reader successfully before the coordinator publishes
+its cancellation request. The broker resolves a pending cleanup intent to cancellation before
+collecting the initial checkpoint, rather than interpreting the native success as ordinary
+completion. If cancellation arrives during that collection, a still-closed tool barrier also
+allows cancellation to interrupt the wait. This admission proof remains separate from conversation
+retraction eligibility. If an assistant has already spoken or a tool has appeared while waiting at
+the barrier, cancellation preserves that partial conversation but still cancels baseline acquisition.
+The exchange settles without workspace snapshots because its tools never received mutation access.
+It does not invent a rollback snapshot or restore files. Once tool admission succeeds, cancellation
+retains the usual before/after checkpoint requirements.
 Each broker invocation clears stale native rewind identity before preparation. The broker's
 submission-cancellation flag also fences turns that have not activated their provider reader yet.
 Copilot serializes both initial and steering sends against stop admission, so an in-flight native
@@ -3159,6 +3169,11 @@ startup to the SDK. A nonempty command selects an explicit Copilot CLI executabl
 arguments. Persisted provider session IDs resume through the same backend, and backend mismatches
 remain invalid session transitions.
 
+Copilot sessions explicitly disable tool search on creation and resume. The runtime preloads
+all enabled tool definitions, keeping Harness controls and MCP tools directly available instead
+of routing them through deferred discovery. This increases schema context usage but prevents
+an empty discovery result for an already-active tool from blocking planning.
+
 The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/forge/permissions.json`, compiles command and resource matchers once, and
 gives every surfaced provider request to one `PermissionCoordinator`. `allow` proceeds immediately,
@@ -3265,16 +3280,26 @@ this binding. Shared picker actions explicitly opt into freeform input, override
 editor commands, and supply the corresponding footer.
 
 Read, Write, and YOLO select approval handling. Read asks before edits and untrusted
-commands, Write applies saved permission rules, and YOLO skips approval prompts. These
+commands, Write applies saved permission rules, and YOLO skips ordinary approval prompts. These
 settings do not select a filesystem scope or disable the sandbox. `/mode` and its direct
 commands change only approvals through the durable task transition coordinator.
 
-`session.access` stores sandbox enablement, workspace/full write scope, additional writable
-directories, and the Windows sandbox backend. `/config` saves these settings per workspace
-and provider. The directory picker adds or edits existing directories using completion,
-confirms deletion, and marks covered paths. Full scope and disabled sandbox retain the list
-but make it inactive. Disabling the sandbox removes OS write restrictions, so the write-scope
-selector remains stored but inactive. Copilot does not expose these isolation controls.
+`session.access` stores independent workspace/full read and write scopes, separate additional
+readable and writable directories, sandbox enablement, and the Windows sandbox backend.
+Read scope defaults to Full. Write scope defaults to Workspace. Workspace scope authorizes
+the execution workspace and its corresponding additional directories. Full scope removes
+that directory ceiling, but does not override explicit file denials or protected targets.
+Read approval mode still asks before writes, including writes inside an authorized directory.
+Out-of-scope reported file requests ask for approval even in YOLO mode. Specific saved file
+permission grants remain effective outside the scope, while wildcard allow rules do not
+override a Workspace ceiling.
+
+`/config` exposes both scopes and directory lists for Copilot, Codex, and ACP, independently
+of sandbox support. Configuration saves global defaults through the existing settings store,
+which also supports workspace and session overrides. The shared directory editor adds or
+edits existing directories using completion, confirms deletion, and marks canonical overlaps.
+Full scope retains its list for later use. Disabling the sandbox does not disable either
+authorization scope. Only OS-isolation controls depend on native provider support.
 The shared provider access validator rejects sandbox-enabled Copilot and ACP sessions before
 creating or reusing a provider session. Root configuration and child admission use the same
 validator. The user must explicitly disable sandbox before connecting these providers.
@@ -3298,6 +3323,38 @@ requests are evaluated by `PermissionCoordinator`, which no longer imposes an im
 workspace ceiling based on approval mode. Copilot routes SDK approval callbacks through
 the same coordinator. Provider-private operations without callbacks remain outside that
 approval boundary. MCP servers retain their own process permissions.
+
+`PermissionCoordinator` binds a `DirectoryPolicy` to each provider execution through an
+execution-owned guard. All three adapters register before starting provider work and release
+the registration when that work settles or is cancelled. File authorization resolves relative
+paths from the execution workspace, follows existing symlinks before processing later `..`
+components, and resolves existing ancestors for new files. Containment compares path
+components, not string prefixes. Both the supplied and canonical path participate in explicit
+denial checks. Selected-skill read grants retain their existing execution lifetime and cannot
+override those denials.
+Permission-evaluation failures publish an error event before rejecting the provider callback,
+so unresolved paths and malformed commands reach the editor's notification boundary.
+
+The existing permission popup includes “Allow and add to global readable directories” or
+the writable equivalent for reported file targets. The server mints the canonical directory
+in each choice. A file grants its existing parent, and a new nested path grants its nearest
+existing directory, with that exact directory displayed before approval. Directory choices
+carry no client-selected path. `SettingsStore::grant_directories` merges accepted choices
+into global settings in one immediate SQLite transaction, retaining unrelated preferences
+and concurrent grants. Persistence completes before the provider receives approval. A
+successful grant refreshes the active session's displayed access lists through the existing
+execution-state event, without interrupting the execution waiting for that approval.
+Subsequent authorization reads current stored lists, including global grants alongside
+workspace/session lists, so grants survive restarts and configured removals take effect.
+Exact and broad permission-file choices remain available. Outside the workspace, broad
+choices name the displayed canonical directory instead of granting an unrelated workspace rule.
+
+These scopes authorize reported file operations, not every filesystem access performed by
+a provider, shell command, or MCP server. Copilot and ACP do not acquire an OS filesystem
+sandbox from these controls. Codex's native sandbox separately constrains writes, but Forge
+does not translate Read scope into native read isolation. A file callback without a path
+always asks for a one-request decision and explains that directory limits and protected paths
+cannot be verified. It never substitutes the workspace or offers a persistent directory grant.
 
 The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
 cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI

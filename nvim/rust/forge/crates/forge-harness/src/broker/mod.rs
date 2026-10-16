@@ -219,7 +219,11 @@ struct ExchangeRuntime {
 
 impl ExchangeRuntime {
     fn retractable_before_tools(&self) -> bool {
-        self.retraction_eligible && self.tool_gate.as_ref().is_some_and(|gate| !gate.ready())
+        self.retraction_eligible && self.tools_blocked()
+    }
+
+    fn tools_blocked(&self) -> bool {
+        self.tool_gate.as_ref().is_some_and(|gate| !gate.ready())
     }
 }
 
@@ -4874,18 +4878,36 @@ Planning continuation: turn {} of {}.",
                 }
             }
         };
+        let outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
+            Err(anyhow::Error::new(TurnCancelled))
+        } else {
+            outcome
+        };
         if outcome.is_err() && let Some(gate) = &runtime.tool_gate {
             gate.complete(Err("provider turn ended before checkpoint admission completed".into()))?;
         }
-        let retract_before_tools = outcome.as_ref().is_err_and(|error| error.is::<TurnCancelled>())
-            && cancellation.restores_prompt()
-            && self.capability.native_turn_rollback
-            && runtime.retractable_before_tools();
-        let outcome = if !retract_before_tools && let Some(task) = runtime.checkpoint.as_mut() {
-            let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
-            let saved = self.finish_initial_checkpoint(&mut runtime, interaction, result);
-            checkpoint_failed |= saved.is_err();
-            saved.and(outcome)
+        let tools_blocked = runtime.tools_blocked();
+        let cancelled_before_tools = outcome.as_ref().is_err_and(|error| error.is::<TurnCancelled>())
+            && tools_blocked;
+        let outcome = if !cancelled_before_tools && let Some(task) = runtime.checkpoint.as_mut() {
+            let cancelled = async {
+                cancellation.cancelled().await;
+                if tools_blocked { return; }
+                std::future::pending::<()>().await;
+            };
+            let result = tokio::select! {
+                biased;
+                () = cancelled => None,
+                result = &mut task.0 => Some(result.context("checkpoint worker failed").and_then(|result|result)),
+            };
+            match result {
+                Some(result) => {
+                    let saved = self.finish_initial_checkpoint(&mut runtime, interaction, result);
+                    checkpoint_failed |= saved.is_err();
+                    saved.and(outcome)
+                }
+                None => Err(anyhow::Error::new(TurnCancelled)),
+            }
         } else { outcome };
         while !result_delivery.is_empty() {
             tokio::select! {
@@ -4909,9 +4931,7 @@ Planning continuation: turn {} of {}.",
         drop(pending_revision.take());
         let mut outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
             Err(anyhow::Error::new(TurnCancelled))
-        } else {
-            outcome
-        };
+        } else { outcome };
         while let Ok(backend_event) = backend_event_stream.try_recv() {
             if let Err(error) = self
                 .process_backend_event(&mut runtime, interaction, backend_event, event)
@@ -5049,19 +5069,29 @@ Planning continuation: turn {} of {}.",
         interaction.begin_finalization(outcome, self.clock.now_ms())?;
         self.store.save_exchange(interaction)?;
         let result: Result<Option<String>> = async {
-            if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == interaction.id && runtime.checkpoint.is_some()) {
-                let mut runtime = self.exchange_runtime.take().expect("checked runtime");
-                let saved = self.collect_initial_checkpoint(&mut runtime, interaction).await;
-                self.exchange_runtime = Some(runtime);
-                saved?;
-            }
             let descendants: Vec<_> = referenced_child_exchange_list(interaction)
                 .into_iter()
                 .map(|(_, id)| id)
                 .collect();
             self.store
                 .require_settled_exchange_tree(&self.session.id, &descendants)?;
-
+            if outcome == ExchangeState::Cancelled
+                && let Some(runtime) = self.exchange_runtime.as_mut()
+                    .filter(|runtime| runtime.exchange_id == interaction.id && runtime.tools_blocked())
+            {
+                runtime.tool_gate.as_ref().expect("blocked tool gate")
+                    .complete(Err("turn cancelled before checkpoint admission completed".into()))?;
+                runtime.checkpoint.take();
+                interaction.finalization_error = None;
+                interaction.finish(outcome, self.clock.now_ms())?;
+                return Ok(None);
+            }
+            if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == interaction.id && runtime.checkpoint.is_some()) {
+                let mut runtime = self.exchange_runtime.take().expect("checked runtime");
+                let saved = self.collect_initial_checkpoint(&mut runtime, interaction).await;
+                self.exchange_runtime = Some(runtime);
+                saved?;
+            }
             let WorkspaceKind::Git(_) = &self.workspace_kind else {
                 let mut changes = crate::exchange::ProviderDiffBuilder::default();
                 self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
@@ -5182,6 +5212,27 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if backend_event.kind == "directory_access_granted" {
+            let grants: Vec<crate::permissions::directory::DirectoryGrant> =
+                serde_json::from_value(backend_event.data)?;
+            for grant in grants {
+                let directories = match grant.operation {
+                    crate::permissions::directory::DirectoryOperation::Read => &mut self.session.access.readable_directory,
+                    crate::permissions::directory::DirectoryOperation::Write => &mut self.session.access.writable_directory,
+                };
+                if !directories.contains(&grant.path) { directories.push(grant.path); }
+            }
+            self.save_session()?;
+            let goal = self.session.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten();
+            let goal_execution = self.store.list_plan_execution(&self.session.id)?
+                .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
+            self.emit_backend_event(BackendEvent { address: None, turn_boundary: None,
+                received_at_ms: None, kind: "execution_state".into(), text: None,
+                activity: None, summary: None, task_update: None,
+                data: json!({ "session": self.session, "task": self.store.list_task(&self.session.id)?, "goal": goal,
+                    "goal_execution": goal_execution }) }, event).await?;
+            return Ok(());
+        }
         if backend_event.address.as_ref().and_then(|address| address.owner.as_ref())
             .is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id)) {
             self.trace.record(&self.session.id,"provider.event.rejected",json!({
@@ -8203,6 +8254,75 @@ mod test {
     }
 
     #[tokio::test]
+    async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization() -> Result<()> {
+        for (cleanup_before_completion, visible_output, restore_prompt) in [
+            (true, false, true), (false, false, true),
+            (true, true, true), (false, true, true),
+            (true, false, false), (false, false, false),
+        ] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            let backend = Arc::new(CleanupRetryBackend {
+                started: Notify::new(), complete: Notify::new(), settled: Notify::new(),
+                attempt: std::sync::atomic::AtomicUsize::new(1), visible_output,
+            });
+            broker.backend = backend.clone();
+            broker.capability.native_turn_rollback = true;
+            let repositories = Arc::clone(&broker.repositories);
+            let handle = repositories.open(repository.path().to_owned()).await?.context("fixture repository")?;
+            let operation = repositories.writes.admit(vec![forge_git::mutation::MutationScope::WorktreeFiles(
+                handle.identity.worktree.clone().context("fixture worktree")?)], 0)?;
+            let held = repositories.writes.start(operation)?.context("fixture mutation admission")?;
+            let cancellation = broker.turn_cancellation();
+            cancellation.arm(true);
+            let session_id = broker.session.id.clone();
+            let cancel = async {
+                backend.started.notified().await;
+                if cleanup_before_completion {
+                    cancellation.begin_cleanup(false, restore_prompt)?;
+                    backend.cleanup_execution(&session_id).await?;
+                } else {
+                    backend.complete.notify_one();
+                    backend.settled.notified().await;
+                    tokio::task::yield_now().await;
+                    cancellation.begin_cleanup(false, restore_prompt)?;
+                }
+                cancellation.request(restore_prompt);
+                Ok::<_, anyhow::Error>(())
+            };
+            let execution = broker.run_interaction("Cancel after native dispatch".into(), PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Cancel after native dispatch".into())));
+            let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+                tokio::join!(execution, cancel)
+            }).await;
+            held.finish(forge_git::mutation::OperationCompletion::Completed)?;
+            repositories.writes.take_receipt(operation);
+            let (result, cancelled) = result.context("native abort completion waited for checkpoint finalization")?;
+            cancelled?;
+            let error = result.unwrap_err();
+            let exchange = broker.store.list_exchange(&broker.session.id)?;
+            if restore_prompt && !visible_output {
+                assert!(error.is::<TurnRetracted>(), "{error:#}");
+                assert!(exchange.is_empty());
+            } else {
+                assert!(error.is::<TurnCancelled>(), "{error:#}");
+                assert_eq!(exchange.len(), 1);
+                assert_eq!(exchange[0].state, ExchangeState::Cancelled);
+                assert!(exchange[0].checkpoint_before.is_none());
+                assert!(exchange[0].checkpoint_after.is_none());
+                assert!(exchange[0].finalization_error.is_none());
+                if visible_output {
+                    assert!(exchange[0].turn.iter().any(|turn| turn.messages().iter()
+                        .any(|message| message.text() == "Partial response")));
+                }
+            }
+            assert!(broker.exchange_runtime.is_none());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
@@ -9899,10 +10019,12 @@ mod test {
         complete: Notify,
         settled: Notify,
         attempt: std::sync::atomic::AtomicUsize,
+        visible_output: bool,
     }
 
     #[async_trait::async_trait]
     impl Backend for CleanupRetryBackend {
+        fn checkpoint_tool_gate(&self) -> bool { true }
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
             crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
                 capability: crate::backend::mock_capability() }
@@ -9915,6 +10037,8 @@ mod test {
         async fn has_active_turn(&self, _session_id: &str) -> bool { false }
 
         async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> { Ok(true) }
 
         async fn prompt_stream(
             &self,
@@ -9929,6 +10053,12 @@ mod test {
             }))?;
             event.turn_boundary = Some(crate::backend::TurnBoundary::Started);
             sink.send(event.clone())?;
+            if self.visible_output {
+                sink.send(serde_json::from_value(json!({
+                    "kind":"assistant_message", "text":"Partial response", "data":null,
+                    "address":{"thread_id":"cleanup-thread", "turn_id":"cleanup-turn"},
+                }))?)?;
+            }
             self.started.notify_one();
             self.complete.notified().await;
             event.kind = "turn_completed".into();
@@ -10028,6 +10158,7 @@ mod test {
             complete: Notify::new(),
             settled: Notify::new(),
             attempt: std::sync::atomic::AtomicUsize::new(0),
+            visible_output: false,
         });
         broker.backend = backend.clone();
         let cancellation = broker.turn_cancellation();

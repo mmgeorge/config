@@ -127,6 +127,13 @@ local success, failure = xpcall(function()
   instance.spec.action_list[2].callback({ option = sandbox })
   require("forge.infra.notifications").error = original_error
   assert(sandbox_failure and not configured_session.access.sandbox, "unsupported provider enabled sandbox")
+  local copilot_options = {}
+  for _, option in ipairs(instance.spec.page_list[1].option_list) do copilot_options[option.id] = option end
+  assert(copilot_options["readable-directories"] and copilot_options["writable-directories"])
+  instance.spec.action_list[2].callback({ option = copilot_options["read-access"] })
+  assert(configured_session.access.read_access == "workspace" and not configured_session.access.sandbox)
+  instance.spec.action_list[2].callback({ option = copilot_options["write-access"] })
+  assert(configured_session.access.write_access == "workspace" and not configured_session.access.sandbox)
   picker.close()
   settings.log("settings-session", "on")
   assert(enabled)

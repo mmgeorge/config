@@ -210,14 +210,15 @@ function M.open(state, host)
         configure({ [id] = duration.change(duration.value(active[id]), timeout_focus[id], direction or 1) })
         return
       end
-      if id == "sandbox" or id == "write-access" or id == "windows-sandbox" then
+      if id == "sandbox" or id == "read-access" or id == "write-access" or id == "windows-sandbox" then
         local policy = access.policy(active)
         local supported = state.capability and state.capability.os_sandbox == true
-        if not supported then
+        if not supported and (id == "sandbox" or id == "windows-sandbox") then
           notifications.error("This provider does not expose sandbox configuration", "Harness access")
           return
         end
         if id == "sandbox" then policy.sandbox = not policy.sandbox
+        elseif id == "read-access" then policy.read_access = policy.read_access == "workspace" and "full" or "workspace"
         elseif id == "write-access" then policy.write_access = policy.write_access == "workspace" and "full" or "workspace"
         else
           local values = { "elevated", "unelevated", "mxc" }
@@ -227,13 +228,10 @@ function M.open(state, host)
         end
         apply_access(policy)
         return
-      elseif id == "writable-directories" then
-        if not (state.capability and state.capability.os_sandbox) then
-          notifications.error("This provider does not expose sandbox configuration", "Harness access")
-          return
-        end
+      elseif id == "readable-directories" or id == "writable-directories" then
         picker.close(false)
-        access.directories(state, host, apply_access, function() M.open(state, host) end)
+        access.directories(state, host, apply_access, function() M.open(state, host) end,
+          id == "readable-directories" and "read" or "write")
         return
       end
       if id == "default-write-permission" or id == "plan-permission" then
@@ -288,7 +286,9 @@ function M.open(state, host)
             { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
               or "Disabled (unsupported)", "OS isolation, independent of approval mode" } },
-            { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },
+            { id = "read-access", label = "Read access", columns = { "Read access", picker_field.render(policy.read_access, true), "Approval scope for reported file reads · not OS confinement" } },
+            { id = "readable-directories", label = "Additional readable directories", columns = { "Additional readable directories", tostring(#policy.readable_directory), "Enter to add, edit, or remove" } },
+            { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), "Approval scope for reported file writes · independent of sandbox" } },
             { id = "writable-directories", label = "Additional writable directories", columns = { "Additional writable directories", tostring(#policy.writable_directory), "Enter to add, edit, or remove" } },
             { id = "windows-sandbox", label = "Windows sandbox", columns = { "Windows sandbox", picker_field.render(policy.windows_sandbox, true), "Windows only · MXC requires host support" } },
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },

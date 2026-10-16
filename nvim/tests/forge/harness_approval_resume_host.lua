@@ -3,7 +3,7 @@ local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
-local binary = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
+local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
@@ -42,7 +42,8 @@ local succeeded, failure = xpcall(function()
   require("forge").setup({ diff_logging = false, harness_logging = false,
     harness = { backend = "mock", backends = { mock = { command = { "approval-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
-  assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
+  assert(vim.wait(10000, function() return state.session ~= nil end, 10),
+    "startup timeout: " .. vim.inspect(errors))
   for iteration = 1, 2 do
     local settled, result, problem
     client.request("prompt.submit", { text = "Resume after approval " .. iteration }, function(value, error)
@@ -70,6 +71,8 @@ local succeeded, failure = xpcall(function()
   end
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
+require("forge.views.harness.workspace").release(state)
+if state.presentation then state.presentation.close() end
 client.stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.api.nvim_set_current_dir(root)

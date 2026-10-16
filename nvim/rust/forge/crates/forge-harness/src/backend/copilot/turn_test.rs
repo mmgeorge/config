@@ -11,6 +11,83 @@ enum NativeUserDelivery {
 }
 
 #[tokio::test]
+async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
+    for resumed in [false, true] {
+        let (_fixture, backend, mut request) = fixture()?;
+        request.backend_session_id = resumed.then(|| "retained-session".into());
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        *backend.client.lock().await = Some(Client::from_streams(
+            client_read, client_write, PathBuf::from(&request.workspace),
+        )?);
+        let server = async {
+            let message = read_request(&mut server_read).await?;
+            assert_eq!(message["method"], if resumed { "session.resume" } else { "session.create" });
+            assert_eq!(message["params"]["toolSearch"], json!({"enabled":false}));
+            assert!(message["params"]["tools"].as_array().context("missing control tools")?
+                .iter().any(|tool| tool["name"] == "harness_plan_read"));
+            let session_id = message["params"]["sessionId"].as_str()
+                .context("SDK omitted session identity")?;
+            respond(&mut server_write, &message,
+                json!({"result":{"sessionId":session_id,"workspacePath":"."}})).await?;
+            if resumed {
+                let reload = read_request(&mut server_read).await?;
+                assert_eq!(reload["method"], "session.skills.reload");
+                respond(&mut server_write, &reload, json!({"result":{}})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(backend.session(&request), server)
+        }).await??;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_file_callbacks_apply_directory_scopes_without_sandbox() -> Result<()> {
+    let (root, backend, mut request) = fixture()?;
+    let external = tempfile::tempdir()?;
+    request.access.read_access = crate::session::DirectoryScope::Workspace;
+    request.execution_mode = PermissionMode::Write;
+    assert!(!request.access.sandbox);
+    let coordinator = backend.permission_coordinator.clone();
+    let _directories = coordinator.directories(Some(&root.path().join("settings")), &request)?;
+    let (sink, mut events) = crate::backend::events::channel();
+    let context = Arc::new(CopilotPermissionContext::new(coordinator.clone()));
+    context.configure(request.owner()?, PermissionMode::Write, request.workspace.clone(), Some(sink))?;
+    let handler = Arc::new(CopilotPermissionHandler { context });
+    let PermissionResult::Decision(expected) = PermissionResult::approve_once() else { unreachable!() };
+    let expected = serde_json::to_value(expected)?;
+    for kind in ["read", "write"] {
+        let data = json!({"kind":kind,"path":external.path().join("file.txt")});
+        let waiting_handler = handler.clone();
+        let waiting_data = data.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_handler.handle(serde_json::from_value(json!("native")).unwrap(),
+                serde_json::from_value(json!("file")).unwrap(),
+                serde_json::from_value(waiting_data).unwrap()).await
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv()).await?.unwrap().unwrap();
+        assert_eq!(event.kind, "approval_requested");
+        let approval: crate::backend::approval::ApprovalRequestView = serde_json::from_value(event.data)?;
+        coordinator.resolve(&approval.id, &[crate::backend::approval::ApprovalAnswer {
+            item_id: approval.item_list[0].id.clone(), choice_id: "allow_global_directory".into(),
+        }], None).await?;
+        let PermissionResult::Decision(decision) = waiter.await? else { panic!("approval returned no decision") };
+        assert_eq!(serde_json::to_value(decision)?, expected);
+        assert_eq!(events.recv().await.unwrap().unwrap().kind, "directory_access_granted");
+        assert_eq!(events.recv().await.unwrap().unwrap().kind, "approval_resolved");
+        let repeat = tokio::time::timeout(std::time::Duration::from_secs(1), handler.handle(
+            serde_json::from_value(json!("native"))?, serde_json::from_value(json!("repeat"))?,
+            serde_json::from_value(data)?)).await?;
+        let PermissionResult::Decision(decision) = repeat else { panic!("repeat returned no decision") };
+        assert_eq!(serde_json::to_value(decision)?, expected);
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn cancellation_during_copilot_startup_does_not_wait_or_send() -> Result<()> {
     let (_fixture, backend, request) = fixture()?;
     let session_id = request.runtime_key()?;

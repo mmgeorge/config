@@ -21,7 +21,7 @@ pub enum SettingScope {
 #[serde(deny_unknown_fields)]
 /// Retains portable choices without copying provider authentication or native files.
 pub struct PortableSettings {
-    /// Controls requested OS isolation independently of approval handling.
+    /// Controls reported file authorization and requested OS isolation independently of approval mode.
     pub access: Option<crate::session::AccessPolicy>,
     /// Selects the check shell used by Harness execution.
     pub shell: Option<crate::session::CheckShell>,
@@ -288,6 +288,29 @@ impl SettingsStore {
     pub fn update(&mut self, expected_revision: u64, scope: SettingScope, workspace: &str, session: &str,
         setting: &PortableSettings) -> Result<u64> {
         Ok(self.write_layer(expected_revision, scope, workspace, session, setting, None, &[])?.revision)
+    }
+
+    /// Merge explicit directory grants into global settings without replacing concurrent preferences.
+    pub(crate) fn grant_directories(&mut self, grants: &[crate::permissions::directory::DirectoryGrant]) -> Result<()> {
+        use crate::permissions::directory::DirectoryOperation;
+        let transaction = self.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let payload = transaction.query_row("SELECT payload FROM setting_layer WHERE scope='global' AND identity=''",
+            [], |row| row.get::<_, String>(0)).optional()?;
+        let mut settings: PortableSettings = payload.map(|payload| serde_json::from_str(&payload)).transpose()?.unwrap_or_default();
+        let access = settings.access.get_or_insert_with(Default::default);
+        for grant in grants {
+            let directories = match grant.operation {
+                DirectoryOperation::Read => &mut access.readable_directory,
+                DirectoryOperation::Write => &mut access.writable_directory,
+            };
+            if !directories.contains(&grant.path) { directories.push(grant.path.clone()); }
+        }
+        *access = access.clone().validate()?;
+        transaction.execute("INSERT INTO setting_layer VALUES ('global','',?1)
+            ON CONFLICT(scope,identity) DO UPDATE SET payload=excluded.payload", [serde_json::to_string(&settings)?])?;
+        transaction.execute("UPDATE setting_revision SET revision=revision+1 WHERE id=1", [])?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Recover an accepted mutation before validating a retry against the newer revision.

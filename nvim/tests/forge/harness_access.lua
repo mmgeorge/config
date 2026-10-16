@@ -21,7 +21,7 @@ local function selected(index)
   local instance = picker._state_for_test()
   instance.spec.on_confirm({ option = instance.spec.page_list[1].option_list[index] })
 end
-access.directories(state, host, apply, function() returned = returned + 1 end)
+access.directories(state, host, apply, function() returned = returned + 1 end, "write")
 selected(1)
 assert(input_spec.completion == "dir")
 input_reply(root .. "/missing")
@@ -42,12 +42,24 @@ assert(applied == 2 and #state.session.access.writable_directory == 0)
 state.session.access.write_access = "full"
 picker.close()
 assert(returned == 1)
-access.directories(state, host, apply, function() end)
-assert(picker._state_for_test().spec.page_list[1].subtitle:find("Inactive", 1, true))
+access.directories(state, host, apply, function() end, "write")
+assert(picker._state_for_test().spec.page_list[1].subtitle:find("Already covered", 1, true))
 selected(1)
 state.session = { id = "other" }
 input_reply(nested)
 assert(applied == 2 and not picker.is_open(), "stale input changed another session")
+state.session = { id = "read-access", workspace = root, access = {
+  sandbox = false, read_access = "workspace", write_access = "full",
+  readable_directory = {}, writable_directory = {}, windows_sandbox = "elevated",
+} }
+access.directories(state, host, apply, function() end, "read")
+selected(1)
+assert(input_spec.prompt == "Readable directory: ")
+input_reply(nested)
+assert(applied == 3 and state.session.access.readable_directory[1] == vim.uv.fs_realpath(nested))
+assert(#state.session.access.writable_directory == 0)
+assert(picker.is_open("harness-readable-directories"))
+picker.close(false)
 vim.fn.delete(root, "rf")
 print("harness_access: passed")
 vim.cmd("qa!")

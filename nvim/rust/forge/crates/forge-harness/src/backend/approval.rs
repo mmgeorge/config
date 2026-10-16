@@ -11,6 +11,7 @@ use crate::permissions::matcher::{
 };
 use crate::permissions::shell::{self, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
+use crate::permissions::directory::{DirectoryGrant, DirectoryOperation, DirectoryPolicy};
 use crate::session::{InputDeadline, InputTimeout, PermissionMode, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -43,6 +44,8 @@ pub struct ApprovalChoice {
     pub resolution: ApprovalResolution,
     #[serde(default)]
     pub rule_list: Vec<(String, String)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub directory: Option<DirectoryGrant>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -99,6 +102,7 @@ struct PendingApproval {
     view: ApprovalRequestView,
     response: oneshot::Sender<ApprovalResolution>,
     resolution_sink: Option<BackendEventSink>,
+    directory_policy: Option<Arc<DirectoryPolicy>>,
 }
 
 struct PendingRegistration<'registry> {
@@ -123,6 +127,7 @@ pub struct PermissionCoordinator {
     timeout_by_session: Mutex<BTreeMap<String, (InputTimeout, InputTimeout)>>,
     feedback_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, String>>,
     skill_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, Arc<crate::skill::SkillAccess>>>,
+    directory_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, Arc<DirectoryPolicy>>>,
 }
 
 impl PermissionCoordinator {
@@ -133,7 +138,19 @@ impl PermissionCoordinator {
             timeout_by_session: Mutex::new(BTreeMap::new()),
             feedback_by_owner: Mutex::new(HashMap::new()),
             skill_by_owner: Mutex::new(HashMap::new()),
+            directory_by_owner: Mutex::new(HashMap::new()),
         }
+    }
+
+    pub(crate) fn directories(self: &Arc<Self>, root: Option<&Path>, request: &crate::backend::BackendRequest) -> Result<DirectoryExecution> {
+        let owner = request.owner()?;
+        let policy = Arc::new(DirectoryPolicy { access: request.access.clone(),
+            workspace: request.workspace.clone().into(), session_id: request.harness_session_id.clone(),
+            settings_root: root.map(Path::to_owned) });
+        let mut directory = self.directory_by_owner.lock().map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
+        anyhow::ensure!(!directory.contains_key(&owner), "directory access already belongs to an active execution");
+        directory.insert(owner.clone(), policy.clone());
+        Ok(DirectoryExecution { owner, policy, coordinator: self.clone() })
     }
 
     /// Bind selected bundle access to one provider execution and revoke it when the guard drops.
@@ -231,12 +248,32 @@ impl PermissionCoordinator {
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        let mut evaluation = self
-            .store
-            .read()
-            .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-            .compiled()
-            .evaluate(execution_mode, &request)?;
+        let directory_policy = address.as_ref().and_then(|address| address.owner.as_ref())
+            .map(|owner| self.directory_by_owner.lock()
+                .map(|directory| directory.get(owner).cloned())
+                .map_err(|_| anyhow::anyhow!("directory permission lock poisoned")))
+            .transpose()?.flatten();
+        let evaluated = (|| -> Result<PermissionEvaluation> {
+            let store = self.store.read().map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
+            if let Some(policy) = &directory_policy {
+                let mut evaluation = policy.evaluate(&store.compiled(), execution_mode, &mut request)?;
+                if protected_target(&request, &store) { evaluation.decision = PermissionDecision::Deny; }
+                Ok(evaluation)
+            } else {
+                Ok(store.compiled().evaluate(execution_mode, &request)?)
+            }
+        })();
+        let mut evaluation = match evaluated {
+            Ok(evaluation) => evaluation,
+            Err(error) => {
+                if let Some(sink) = event_sink {
+                    sink.send_wait(BackendEvent { received_at_ms: None, address: address.clone(), turn_boundary: None,
+                        kind: "error".into(), text: Some(format!("Permission evaluation failed: {error:#}")),
+                        data: json!({"error":format!("{error:#}")}), activity: None, summary: None, task_update: None }).await?;
+                }
+                return Err(error);
+            }
+        };
         if !forced && evaluation.decision != PermissionDecision::Deny {
             let scopes = self.skill_by_owner.lock().map_err(|_|anyhow::anyhow!("skill permission lock poisoned"))?;
             let access = address.as_ref().and_then(|address|address.owner.as_ref())
@@ -250,10 +287,15 @@ impl PermissionCoordinator {
                     if matches!(target,PermissionTarget::Command {..}) && evaluation.pending_command_list.iter()
                         .any(|command| &command.target == target && command.source.contains(['>', '<'])) { continue; }
                     let canonical = access.permission_paths(target);
-                    let canonical = PermissionRequest { id:request.id.clone(),provider:request.provider.clone(),reason:None,
+                    let mut canonical = PermissionRequest { id:request.id.clone(),provider:request.provider.clone(),reason:None,
                         target_list:canonical.into_iter().map(|path|PermissionTarget::Read {path:path.display().to_string()}).collect() };
-                    if self.store.read().map_err(|_|anyhow::anyhow!("permission store lock poisoned"))?
-                        .compiled().evaluate(execution_mode,&canonical)?.decision == PermissionDecision::Deny {
+                    let compiled = self.store.read().map_err(|_|anyhow::anyhow!("permission store lock poisoned"))?.compiled();
+                    let canonical = if let Some(policy) = &directory_policy {
+                        policy.evaluate(&compiled, execution_mode, &mut canonical)?
+                    } else {
+                        compiled.evaluate(PermissionMode::Write, &canonical)?
+                    };
+                    if canonical.decision == PermissionDecision::Deny {
                         return Ok(ApprovalResolution::DenyOnce);
                     }
                     granted.push(target.clone());
@@ -277,6 +319,26 @@ impl PermissionCoordinator {
         }
         let id = request.id.clone();
         let mut view = approval_view(&request, &evaluation);
+        if let Some(policy) = &directory_policy {
+            for (item, target) in view.item_list.iter_mut().zip(&evaluation.pending_target_list) {
+                if let Some(grant) = policy.grant(target)? {
+                    if !crate::permissions::matcher::path_starts_with(Path::new(&grant.path), &dunce::canonicalize(&policy.workspace)?) {
+                        for choice in &mut item.choice_list {
+                            if matches!(choice.resolution, ApprovalResolution::AllowBroad | ApprovalResolution::DenyBroad) {
+                                for (_, pattern) in &mut choice.rule_list { *pattern = grant.path.clone(); }
+                                let action = if choice.resolution == ApprovalResolution::AllowBroad { "allow" } else { "deny" };
+                                choice.label = format!("Always {action} directory: {}", grant.path);
+                            }
+                        }
+                    }
+                    if policy.settings_root.is_none() { continue; }
+                    let label = match grant.operation { DirectoryOperation::Read => "readable", DirectoryOperation::Write => "writable" };
+                    item.choice_list.insert(1, ApprovalChoice { id: "allow_global_directory".into(),
+                        label: format!("Allow and add to global {label} directories: {}", grant.path),
+                        resolution: ApprovalResolution::AllowOnce, rule_list: Vec::new(), directory: Some(grant) });
+                }
+            }
+        }
         view.execution_owner = execution_owner;
         let timeout = self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
             .get(view.execution_owner.as_ref().map(|owner| owner.session_id.as_str()).unwrap_or_default())
@@ -296,6 +358,7 @@ impl PermissionCoordinator {
                     view: view.clone(),
                     response: sender,
                     resolution_sink: event_sink.cloned(),
+                    directory_policy,
                 },
             );
         }
@@ -380,7 +443,7 @@ impl PermissionCoordinator {
         answer_list: &[ApprovalAnswer],
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalRequestView> {
-        let (pending, resolution, rule_list) = {
+        let (pending, resolution, rule_list, directory_list) = {
             let mut pending_map = self
                 .pending_map
                 .lock()
@@ -406,6 +469,7 @@ impl PermissionCoordinator {
             }
             let mut resolution = ApprovalResolution::AllowOnce;
             let mut rule_map = BTreeMap::new();
+            let mut directory_list = Vec::new();
             for item in &pending.view.item_list {
                 let choice_id = answer_map
                     .get(&item.id)
@@ -415,6 +479,9 @@ impl PermissionCoordinator {
                     .iter()
                     .find(|choice| &choice.id == *choice_id)
                     .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+                if let Some(directory) = &choice.directory {
+                    if !directory_list.contains(directory) { directory_list.push(directory.clone()); }
+                }
                 match choice.resolution {
                     ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
                     ApprovalResolution::TimedOut
@@ -464,22 +531,35 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .remove(approval_id)
                 .expect("validated approval must remain pending while locked");
-            (pending, resolution, rule_list)
+            if resolution != ApprovalResolution::AllowOnce { directory_list.clear(); }
+            (pending, resolution, rule_list, directory_list)
         };
         let event_sink = pending.resolution_sink.as_ref().or(event_sink);
-        let persisted = if !rule_list.is_empty() {
+        let persisted = (|| -> Result<()> {
+          if !directory_list.is_empty() {
+            pending.directory_policy.as_ref().context("directory policy is no longer available")?.save(&directory_list)?;
+          }
+          if !rule_list.is_empty() {
             self.store
                 .write()
                 .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                .set_rule_list(&rule_list)
-        } else {
+                .set_rule_list(&rule_list)?;
+          }
             Ok(())
-        };
+        })();
         if let Err(error) = persisted {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             return Err(error);
         }
         // Queue the terminal event before the provider can resume and finish its turn.
+        if !directory_list.is_empty() {
+            if let Some(sink) = event_sink {
+                sink.send_wait(BackendEvent { address: None, turn_boundary: None,
+                    received_at_ms: None, kind: "directory_access_granted".into(), text: None,
+                    activity: None, summary: None, task_update: None,
+                    data: serde_json::to_value(&directory_list)? }).await?;
+            }
+        }
         Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
         if pending.response.send(resolution).is_err() {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
@@ -556,9 +636,26 @@ impl PermissionCoordinator {
     }
 }
 
+/// Revokes only the matching execution's reported file authorization when its provider settles.
+pub(crate) struct DirectoryExecution {
+    owner: crate::backend::ExecutionOwner,
+    policy: Arc<DirectoryPolicy>,
+    coordinator: Arc<PermissionCoordinator>,
+}
+
+impl Drop for DirectoryExecution {
+    fn drop(&mut self) {
+        if let Ok(mut directory) = self.coordinator.directory_by_owner.lock()
+            && directory.get(&self.owner).is_some_and(|policy| Arc::ptr_eq(policy, &self.policy)) {
+            directory.remove(&self.owner);
+        }
+    }
+}
+
 fn target_rule_list(target: &PermissionTarget, broad: bool) -> Vec<(String, String)> {
     let mut rule_list = Vec::new();
     match target {
+        PermissionTarget::UnknownFile { .. } => {}
         PermissionTarget::Command { command, shell } => {
             let normalization = normalize_command_in(command, shell.unwrap_or_default());
             if normalization.ambiguous {
@@ -655,6 +752,10 @@ fn approval_view(
 
 fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
     let (title, detail) = match target {
+        PermissionTarget::UnknownFile { operation } => (
+            format!("{operation:?} path not supplied"),
+            "The provider did not report a file path. Directory limits and protected paths cannot be verified. Allow only this request or reject it.".into(),
+        ),
         PermissionTarget::Command { command, shell } => (
             "Run command".into(),
             crate::permissions::command::display_command(command, shell.unwrap_or_default()).source,
@@ -680,6 +781,7 @@ fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
                 label: "Allow once".into(),
                 resolution: ApprovalResolution::AllowOnce,
                 rule_list: Vec::new(),
+                directory: None,
             },
             ApprovalChoice {
                 id: "allow_exact".into(),
@@ -689,6 +791,7 @@ fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
                 ),
                 resolution: ApprovalResolution::AllowExact,
                 rule_list: exact_rule_list.clone(),
+                directory: None,
             },
             ApprovalChoice {
                 id: "allow_broad".into(),
@@ -698,30 +801,35 @@ fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
                 ),
                 resolution: ApprovalResolution::AllowBroad,
                 rule_list: broad_rule_list.clone(),
+                directory: None,
             },
             ApprovalChoice {
                 id: "deny_once".into(),
                 label: "Deny once".into(),
                 resolution: ApprovalResolution::DenyOnce,
                 rule_list: Vec::new(),
+                directory: None,
             },
             ApprovalChoice {
                 id: "deny_exact".into(),
                 label: format!("Always deny exact: {}", display_rule_list(&exact_rule_list)),
                 resolution: ApprovalResolution::DenyExact,
                 rule_list: exact_rule_list,
+                directory: None,
             },
             ApprovalChoice {
                 id: "deny_broad".into(),
                 label: format!("Always deny broad: {}", display_rule_list(&broad_rule_list)),
                 resolution: ApprovalResolution::DenyBroad,
                 rule_list: broad_rule_list,
+                directory: None,
             },
             ApprovalChoice {
                 id: "cancel".into(),
                 label: "Reject all".into(),
                 resolution: ApprovalResolution::Cancel,
                 rule_list: Vec::new(),
+                directory: None,
             },
         ],
     };
@@ -779,7 +887,7 @@ fn provider_shell(params: &Value) -> Option<CommandShell> {
 pub fn permission_from_provider(
     method: &str,
     message: &Value,
-    workspace: &str,
+    _workspace: &str,
 ) -> Result<PermissionRequest> {
     let params = message.get("params").unwrap_or(&Value::Null);
     let id = format!("approval-{}", Uuid::new_v4());
@@ -806,11 +914,11 @@ pub fn permission_from_provider(
         let (command, shell) = provider_command(params, method.contains("commandExecution"))?;
         vec![PermissionTarget::Command { command, shell }]
     } else if method.contains("fileChange") || method == "fs/write_text_file" {
-        let path = provider_path(params).unwrap_or_else(|| workspace.into());
-        vec![PermissionTarget::Write { path }]
+        vec![provider_path(params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Write },
+            |path| PermissionTarget::Write { path })]
     } else if method == "fs/read_text_file" {
-        let path = provider_path(params).unwrap_or_else(|| workspace.into());
-        vec![PermissionTarget::Read { path }]
+        vec![provider_path(params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Read },
+            |path| PermissionTarget::Read { path })]
     } else if method.contains("permission") || method.contains("permissions") {
         normalize_permission_payload(params, &encoded)
     } else {
@@ -873,7 +981,7 @@ pub fn permission_from_copilot(
     id: String,
     kind: &str,
     params: Value,
-    workspace: &str,
+    _workspace: &str,
 ) -> PermissionRequest {
     // Notifications wrap the same request that older RPC calls sent directly.
     let params = params.get("permissionRequest").cloned().unwrap_or(params);
@@ -891,12 +999,10 @@ pub fn permission_from_copilot(
                 .to_owned(),
             shell: provider_shell(&params),
         }],
-        "write" => vec![PermissionTarget::Write {
-            path: provider_path(&params).unwrap_or_else(|| workspace.into()),
-        }],
-        "read" => vec![PermissionTarget::Read {
-            path: provider_path(&params).unwrap_or_else(|| workspace.into()),
-        }],
+        "write" => vec![provider_path(&params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Write },
+            |path| PermissionTarget::Write { path })],
+        "read" => vec![provider_path(&params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Read },
+            |path| PermissionTarget::Read { path })],
         "url" => vec![PermissionTarget::Network {
             target: params
                 .get("url")
@@ -967,8 +1073,8 @@ fn normalize_permission_payload(params: &Value, encoded: &str) -> Vec<Permission
             .and_then(Value::as_str)
             .unwrap_or(kind);
         return match kind {
-            "read" | "search" => vec![PermissionTarget::Read { path: title.into() }],
-            "edit" | "delete" | "move" => vec![PermissionTarget::Write { path: title.into() }],
+            "read" | "search" => vec![PermissionTarget::UnknownFile { operation: DirectoryOperation::Read }],
+            "edit" | "delete" | "move" => vec![PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }],
             "execute" => vec![PermissionTarget::Command {
                 command: tool_call
                     .get("rawInput")
@@ -1061,6 +1167,91 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn directory_approval_persists_global_grants_before_releasing_copilot_requests() -> Result<()> {
+        use super::*;
+        let root = tempfile::tempdir()?;
+        let workspace = root.path().join("workspace");
+        let external = root.path().join("external");
+        std::fs::create_dir(&workspace)?;
+        std::fs::create_dir(&external)?;
+        let settings_root = root.path().join("settings");
+        let coordinator = PermissionCoordinator::transient(&workspace)?;
+        let request = crate::backend::BackendRequest {
+            execution_owner: None, harness_session_id: "directory-session".into(), workspace: workspace.display().to_string(),
+            input: crate::backend::BackendInput::from_text("Read and write"), mode: crate::backend::PromptMode::Chat,
+            model: "default".into(), effort: "default".into(), context_window: None,
+            service_tier: crate::backend::ServiceTier::Standard,
+            access: crate::session::AccessPolicy { sandbox: false,
+                read_access: crate::session::DirectoryScope::Workspace, ..Default::default() },
+            execution_mode: PermissionMode::Write, backend_session_id: None, control_context: None,
+        };
+        let address = Some(crate::backend::ProviderAddress {
+            owner: Some(request.owner()?), thread_id: "native".into(), turn_id: "turn".into(),
+        });
+        let directories = coordinator.directories(Some(&settings_root), &request)?;
+        assert!(coordinator.directories(Some(&settings_root), &request).is_err(), "live ownership was replaced");
+        let mut permission = permission_from_copilot("directory".into(), "read",
+            json!({"path":external.join("read.txt")}), &request.workspace);
+        let write = permission_from_copilot("write".into(), "write",
+            json!({"path":external.join("new/deep/write.txt")}), &request.workspace);
+        permission.target_list.extend(write.target_list);
+        let original = permission.clone();
+        let (sink, mut stream) = crate::backend::events::channel();
+        let waiting_coordinator = coordinator.clone();
+        let waiting_address = address.clone();
+        let waiter = tokio::spawn(async move {
+            waiting_coordinator.authorize(PermissionMode::Write, permission, waiting_address, Some(&sink)).await
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await?.unwrap().unwrap();
+        assert_eq!(event.kind, "approval_requested");
+        let approval: ApprovalRequestView = serde_json::from_value(event.data)?;
+        assert_eq!(approval.item_list.len(), 2);
+        let answers = approval.item_list.iter().map(|item| {
+            let choice = item.choice_list.iter().find(|choice| choice.id == "allow_global_directory").unwrap();
+            assert_eq!(choice.directory.as_ref().unwrap().path, dunce::canonicalize(&external).unwrap().display().to_string());
+            ApprovalAnswer { item_id: item.id.clone(), choice_id: choice.id.clone() }
+        }).collect::<Vec<_>>();
+        coordinator.resolve(&approval.id, &answers, None).await?;
+        let global = crate::settings::SettingsStore::open(&settings_root)?
+            .layer_settings(crate::settings::SettingScope::Global, "", "")?.access.unwrap();
+        assert_eq!(global.readable_directory.len(), 1);
+        assert_eq!(global.writable_directory.len(), 1);
+        assert_eq!(waiter.await??, ApprovalResolution::AllowOnce);
+        let first = stream.recv().await.unwrap().unwrap();
+        assert_eq!(first.kind, "directory_access_granted");
+        assert_eq!(stream.recv().await.unwrap().unwrap().kind, "approval_resolved");
+        assert_eq!(coordinator.authorize(PermissionMode::Write, original.clone(), address.clone(), None).await?,
+            ApprovalResolution::AllowOnce);
+        drop(directories);
+        assert!(coordinator.directory_by_owner.lock().unwrap().is_empty());
+        let _directories = coordinator.directories(Some(&settings_root), &request)?;
+        assert_eq!(coordinator.authorize(PermissionMode::Write, original, address.clone(), None).await?,
+            ApprovalResolution::AllowOnce);
+        let missing = permission_from_copilot("missing".into(), "read", json!({}), &request.workspace);
+        assert!(matches!(missing.target_list[0], PermissionTarget::UnknownFile { .. }));
+        assert_eq!(coordinator.store().read().unwrap().compiled().evaluate(PermissionMode::Yolo, &missing)?.decision,
+            PermissionDecision::Ask);
+        assert_eq!(approval_item(&missing.target_list[0], 0).choice_list.len(), 3);
+        let path = external.join("read.txt");
+        coordinator.store().write().unwrap().set_rule_list(&[
+            (CATEGORY_READ.into(), dunce::canonicalize(&external)?.join("read.txt").display().to_string(), PermissionDecision::Deny),
+        ])?;
+        let denied = permission_from_copilot("denied".into(), "read", json!({"path":path}), &request.workspace);
+        assert_eq!(coordinator.authorize(PermissionMode::Yolo, denied, address, None).await?, ApprovalResolution::DenyOnce);
+        let invalid = PermissionRequest { id: "invalid".into(), provider: "test".into(), reason: None,
+            target_list: vec![PermissionTarget::Read { path: String::new() }] };
+        let (sink, mut stream) = crate::backend::events::channel();
+        let address = Some(crate::backend::ProviderAddress { owner: Some(request.owner()?),
+            thread_id: "native".into(), turn_id: "turn".into() });
+        let failure = coordinator.authorize(PermissionMode::Write, invalid, address, Some(&sink)).await.unwrap_err();
+        assert!(failure.to_string().contains("empty"));
+        let event = stream.recv().await.unwrap().unwrap();
+        assert_eq!(event.kind, "error");
+        assert!(event.text.unwrap().contains("empty"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn skill_runtime_grants_preserve_denials_selection_compounds_and_revocation() -> Result<()> {
         use super::*;
@@ -1162,6 +1353,9 @@ mod test {
                 assert!(failure.to_string().contains("shell_command_parse_error"));
                 assert!(failure.to_string().contains("split independent operations"));
                 assert!(coordinator.pending_list().unwrap().is_empty());
+                let event = stream.try_recv().unwrap();
+                assert_eq!(event.kind, "error");
+                assert!(event.text.unwrap().contains("shell_command_parse_error"));
                 assert!(stream.try_recv().is_err());
             }
             let corrected = PermissionRequest {

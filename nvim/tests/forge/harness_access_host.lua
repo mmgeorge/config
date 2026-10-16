@@ -40,12 +40,14 @@ local success, failure = xpcall(function()
   local session_id = state.session.id
   require("forge.views.harness.controller").task_transition({ action = "goal", text = "Continue until interrupted" })
   await(function() return starts == 1 end, "goal start")
-  local access = { sandbox = false, write_access = "workspace", writable_directory = { workspace }, windows_sandbox = "elevated" }
+  local access = { sandbox = false, read_access = "workspace", write_access = "workspace",
+    readable_directory = { data }, writable_directory = { workspace }, windows_sandbox = "elevated" }
   local applied
   require("forge.views.harness.controller").configure({ access = access }, false, function(value) applied = value end)
   await(function() return starts == 2 end, "configuration did not resume goal")
   assert(applied == true and state.session.access.sandbox == false, "configuration waited for goal completion")
   assert(current_session.access.sandbox == false and #current_session.access.writable_directory == 1)
+  assert(current_session.access.read_access == "workspace" and #current_session.access.readable_directory == 1)
   assert(current_session.execution_mode == "write")
   local task_id = current_session.current_task_id
   require("forge.views.harness.controller").set_mode("read")
@@ -59,6 +61,7 @@ local success, failure = xpcall(function()
   local recovered = open(session_id)
   assert(recovered.session.execution_mode == "read")
   assert(recovered.session.access.sandbox == false and #recovered.session.access.writable_directory == 1)
+  assert(recovered.session.access.read_access == "workspace" and #recovered.session.access.readable_directory == 1)
   assert(recovered.session.current_task_id == task_id)
 end, debug.traceback)
 local state = require("forge.session").harness

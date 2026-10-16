@@ -122,7 +122,15 @@ impl AcpSessionState {
                     PermissionTarget::Write { path: path.into() }
                 } else { PermissionTarget::Read { path: path.into() } });
             } else {
-                target_list.push(PermissionTarget::Tool { target: tool["title"].as_str().unwrap_or("ACP tool").into() });
+                target_list.push(match tool["kind"].as_str() {
+                    Some("read" | "search") => PermissionTarget::UnknownFile {
+                        operation: crate::permissions::directory::DirectoryOperation::Read,
+                    },
+                    Some("edit" | "delete" | "move") => PermissionTarget::UnknownFile {
+                        operation: crate::permissions::directory::DirectoryOperation::Write,
+                    },
+                    _ => PermissionTarget::Tool { target: tool["title"].as_str().unwrap_or("ACP tool").into() },
+                });
             }
         }
         let request = PermissionRequest { id: format!("acp-{}", uuid::Uuid::new_v4()),
