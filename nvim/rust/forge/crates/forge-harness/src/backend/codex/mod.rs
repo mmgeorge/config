@@ -1089,7 +1089,7 @@ impl Backend for CodexBackend {
 
     async fn prompt_stream(
         &self,
-        request: BackendRequest,
+        mut request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Codex)?;
@@ -1123,9 +1123,9 @@ impl Backend for CodexBackend {
         }
         let dynamic_tool_definition = ControlToolRegistry.definition_list_for_context(Some(&control_context),request.owner()?.is_root());
         process.set_control_context(control_context);
-        let resolved_model = self.resolve_model(&request, process, &mut output).await?;
+        request.model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
-        output.runtime.model = Some(resolved_model);
+        output.runtime.model = Some(request.model.clone());
         let runtime_event = output.runtime.resolved_event();
         if let Some(sink) = coordinator_event_sink.as_ref() {
             sink.send_wait(runtime_event).await?;
@@ -2036,11 +2036,13 @@ mod test {
     #[tokio::test]
     async fn explicit_turn_excludes_stale_activity_before_and_after_admission() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        for (sends_started, service_tier, resumed) in [
-            (true, crate::backend::ServiceTier::Standard, true),
-            (false, crate::backend::ServiceTier::Fast, true),
-            (true, crate::backend::ServiceTier::Ultrafast, true),
-            (true, crate::backend::ServiceTier::Ultrafast, false),
+        for (sends_started, service_tier, resumed, default_model) in [
+            (true, crate::backend::ServiceTier::Standard, true, false),
+            (false, crate::backend::ServiceTier::Fast, true, false),
+            (true, crate::backend::ServiceTier::Ultrafast, true, false),
+            (true, crate::backend::ServiceTier::Ultrafast, false, false),
+            (true, crate::backend::ServiceTier::Ultrafast, true, true),
+            (true, crate::backend::ServiceTier::Ultrafast, false, true),
         ] {
             let fixture = tempfile::tempdir()?;
             let workspace = fixture.path().to_string_lossy().into_owned();
@@ -2052,6 +2054,12 @@ mod test {
                 trace.clone(),
                             None,
             )?;
+            *backend.default_model.lock().await = Some("gpt-catalog-default".into());
+            let expected_model = if default_model {
+                "gpt-catalog-default"
+            } else {
+                "gpt-5.6-terra"
+            };
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
             let server = tokio::spawn(async move {
@@ -2062,6 +2070,7 @@ mod test {
                         serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                             .unwrap();
                     assert_eq!(request["method"], method);
+                    assert_eq!(request["params"]["model"], expected_model);
                     assert_eq!(request["params"]["serviceTier"], serde_json::to_value(service_tier).unwrap());
                     if method == "turn/start" {
                         assert_eq!(request["params"]["summary"], "auto");
@@ -2134,7 +2143,7 @@ mod test {
                         workspace,
                         input: BackendInput::from_text("new prompt"),
                         mode: PromptMode::Chat,
-                        model: "gpt-5.6-terra".into(),
+                        model: if default_model { "default" } else { expected_model }.into(),
                         effort: "medium".into(),
                         context_window: None,
                         service_tier,
@@ -2147,6 +2156,7 @@ mod test {
                 ),
             )
             .await??;
+            assert_eq!(output.runtime.model.as_deref(), Some(expected_model));
             assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
             assert_eq!(output.evidence.native_state, None);
             let encoded = serde_json::to_string(&output.event)?;

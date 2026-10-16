@@ -36,6 +36,10 @@ opens durable session search and `/undo` opens checkpoint rollback.
 selection policies. See [Project checks](checks.md) for package-aware commands and
 new-test selection.
 
+Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
+check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected
+planned tests or disables selected checks after confirmation.
+
 ## Build and diagnostics
 
 | Command | Arguments | Behavior |

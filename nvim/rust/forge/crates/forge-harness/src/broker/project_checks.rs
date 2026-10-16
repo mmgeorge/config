@@ -169,7 +169,7 @@ impl HarnessBroker {
             .filter(|task| !task.status.terminal())
             .map(|task| task.id);
         let result = match method {
-            HarnessMethod::ChecksList => self.check_runner.catalog_preview(task_id.as_deref()).await?,
+            HarnessMethod::ChecksList => self.check_runner.catalog_preview(task_id.as_deref(), self.session.shell).await?,
             HarnessMethod::ChecksOverride => {
                 let overrides = serde_json::from_value(params)?;
                 self.check_runner

@@ -1,6 +1,8 @@
 mod applicability;
+mod automatic;
 mod changes;
 mod config;
+mod evidence;
 mod model;
 mod invocation;
 mod packages;
@@ -27,3 +29,4 @@ pub(crate) use preview::plan as preview_plan;
 pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::CheckToolScope;
 pub(crate) use tools::ConfigureChecks;
+pub(crate) use automatic::AutomaticChecks;

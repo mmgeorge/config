@@ -173,7 +173,8 @@ impl PlanReviewStore {
         let opened = serde_json::json!({"snapshot":document.snapshot(), "saved_source_digest":document.saved_digest(),
             "plan_id":document.source.document.plan_id, "version":document.source.document.version,
             "path":document.source.path, "public_only":document.source.public_only,
-            "annotation":document.annotation.annotation(), "source_row":document.source_rows()});
+            "annotation":document.annotation.annotation(), "source_row":document.source_rows(),
+            "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
         store.insert(document.id.clone(), (document, admission));
         Ok(opened)
     }
@@ -470,7 +471,8 @@ impl PlanReviewDocument {
         let response = trace.map(|trace| trace.stage("review.build_snapshot"));
         let result = serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(),
             "annotation":self.annotation.annotation(), "public_only":self.source.public_only,
-            "saved_source_digest":self.saved_digest(), "version":self.source.document.version});
+            "saved_source_digest":self.saved_digest(), "version":self.source.document.version,
+            "checks":self.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
         if let Some(stage) = response { stage.complete(serde_json::json!({})); }
         if let Some(stage) = total { stage.complete(serde_json::json!({"revision":self.source.document.version})); }
         Ok(result)
@@ -1230,10 +1232,13 @@ impl PlanReviewDocument {
                         _ => None,
                     }
                 });
+                let check = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
+                    if let super::PlanReviewTarget::Check { id } = &anchor.target { Some(id) } else { None }
+                });
                 row.push(
                     serde_json::json!({"id":format!("{}:{}",block.id.0,position), "text":text,
                     "source_line":line, "block":block.id, "position":{"row":position,"column":0},
-                    "target":target.map(|target| &target.id), "metadata":block.metadata, "test":test}),
+                    "target":target.map(|target| &target.id), "metadata":block.metadata, "test":test, "check":check}),
                 );
             }
         }

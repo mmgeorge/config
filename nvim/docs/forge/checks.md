@@ -5,6 +5,57 @@
 Definitions live in the `checks` section of `.forge.json`. Setup preserves other
 repository settings and asks for your choices before saving.
 
+## Automatic and explicit checks
+
+`enabled` controls whether a check can run. `auto` controls automatic selection
+and defaults to `true` when omitted. An enabled check with `auto: false` remains
+available for explicit runs and explicit plan selection. Prerequisites run when
+required by a selected check, including prerequisites with `auto: false`.
+
+The Auto field in `/checks` changes the task override. Saving defaults writes it
+to project configuration. Plan review shows automatic selection reasons and
+checks explicitly requested by the plan.
+
+While viewing a plan, press `oc` to open its checks picker. `●` marks an enabled
+check and `○` marks a disabled check. Press Space or Enter to toggle the selected
+check. These choices apply only to that plan. Enabling a check also enables its
+prerequisites, and disabling a prerequisite disables its dependent checks.
+
+To remove checks from the plan view, select their rows visually and press `j`,
+the same action used to delete planned tests. Confirming disables those checks
+for this plan. Re-enable them through `oc`. Historical and accepted plans remain
+read-only.
+
+Agents add existing checks with `harness_plan_checks_add`, supplying `plan_id`,
+`expected_version`, and `check_ids`. The tool updates the plan's `checks` list
+without changing repository settings or executing commands. Repeated IDs do not
+create repeated plan entries. `harness_checks_run` accepts multiple `ids`, or
+`all: true` for every enabled check. Explicit runs execute even when earlier
+evidence remains current.
+
+Agents must run automated validation through the checks interface. Direct
+terminal builds, tests, linters, formatters, and validation scripts do not record
+coverage and must not replace check runs. During plan implementation and
+resolution, agents finish the phase and let Harness Checking run validation.
+
+## Completion and repair
+
+Before ordinary work becomes idle, Harness runs applicable automatic checks.
+Intermediate goal turns do not trigger this gate. Successful goal completion
+does. Questions, pending approvals, cancellation, and paused work do not start
+automatic checks.
+
+Harness retains the inputs and coverage of completed runs. A current recorded
+result is reused instead of executing the same check again. Package A's result
+does not satisfy package B, and partial selections do not satisfy wider coverage.
+Relevant edits, changed commands, or changed configuration require new evidence.
+
+A failed result starts a repair turn with its saved diagnostics and output.
+Harness also uses failures already recorded through the run tool without
+repeating the unchanged command. If repair ends with the same failures and no
+relevant changes, automatic repair stops with the failure unresolved.
+Configuration errors require correction through the authorized setup workflow.
+
 ## Tests for changed packages
 
 One definition can run every affected package without naming packages in advance.

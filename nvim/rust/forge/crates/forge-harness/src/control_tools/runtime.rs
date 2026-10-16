@@ -105,10 +105,38 @@ impl ControlToolRuntime {
     }
 
     /// Validate a control invocation and await broker persistence for execution controls.
-    pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+    pub async fn invoke(&mut self, mut invocation: ControlToolInvocation) -> Result<ControlToolResult> {
+        let adding_checks = invocation.name == "harness_plan_checks_add";
+        if adding_checks {
+            super::validate_arguments(&invocation)?;
+            self.require_readable_plan()?;
+            anyhow::ensure!(!self.context.has_active_elicitation, "resolve pending Harness questions before editing the plan");
+            let document = self.plan_document.as_ref().context("no active plan")?;
+            anyhow::ensure!(invocation.arguments["plan_id"].as_str() == Some(document.plan_id.as_str()) && invocation.arguments["expected_version"].as_u64() == Some(document.version), "plan identity or version changed");
+            let mut design = document.design.clone().context("plan has no declaration design")?;
+            let ids: Vec<String> = serde_json::from_value(invocation.arguments["check_ids"].clone())?;
+            let workspace = self.context.workspace_root.as_deref().context("plan has no workspace")?;
+            let snapshot = crate::checks::ConfigSnapshot::load(workspace)?;
+            snapshot.config.validate_selection(&ids)?;
+            design.document.set_checks(&snapshot.config, &ids.into_iter().map(|id| (id, true)).collect())?;
+            if design.document == document.design.as_ref().unwrap().document {
+                return Ok(ControlToolResult { invocation: None, message: self.plan_version_message("Checks already selected") });
+            }
+            let before = serde_json::to_string_pretty(&document.design.as_ref().unwrap().document)?;
+            let after = serde_json::to_string_pretty(&design.document)?;
+            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch", before.lines().map(|line| format!("-{line}")).collect::<Vec<_>>().join("\n"), after.lines().map(|line| format!("+{line}")).collect::<Vec<_>>().join("\n"));
+            invocation = ControlToolInvocation { name: "harness_design_apply_patch".into(), arguments: serde_json::json!({"plan_id":document.plan_id,"expected_version":document.version,"patch":patch}) };
+        }
         let mut output = BackendOutput::default();
         apply_invocation(&invocation, &mut output)?;
-        self.invoke_decoded(invocation, output).await
+        let mut result = self.invoke_decoded(invocation, output).await?;
+        if adding_checks && let Some(document) = &self.plan_document && let Some(design) = &document.design {
+            let workspace = self.context.workspace_root.as_deref().context("plan has no workspace")?;
+            let mut preview = design.clone();
+            preview.check_configuration = Some(crate::checks::ConfigSnapshot::load(workspace)?);
+            result.message.push_str(&format!("\nCheck preview: {}", serde_json::to_string(&crate::checks::preview_plan(workspace, &preview).await?)?));
+        }
+        Ok(result)
     }
 
     /// Execute one control invocation from arguments decoded by the provider boundary.
@@ -117,6 +145,9 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         mut output: BackendOutput,
     ) -> Result<ControlToolResult> {
+        if invocation.name == "harness_plan_checks_add" {
+            return Box::pin(self.invoke(invocation)).await;
+        }
         if let Some(checkpoint) = &self.context.checkpoint { checkpoint.wait().await?; }
         let identity = serde_json::to_string(&invocation)?;
         if let Some((completed, message)) = &self.completion && completed == &identity {
@@ -429,6 +460,31 @@ fn read_design(document: &PlanDocument, file: &serde_json::Value, arguments: &se
 mod test {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn selected_plan_checks_are_versioned_and_replayed_without_changing_configuration() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        let settings = json!({"checks":{"version":2,"definitions":[{"id":"manual","name":"Manual","area":"Tests","category":"test","enabled":true,"auto":false,"trigger":{"kind":"manual"},"all":{"command":"print selected"}}]}});
+        std::fs::write(workspace.join(".forge.json"), settings.to_string()).unwrap();
+        context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
+        let initial = context.plan_document.clone().unwrap();
+        let mut runtime = ControlToolRuntime::new(context);
+        let invocation = |version, ids| ControlToolInvocation { name: "harness_plan_checks_add".into(), arguments: json!({"plan_id":"plan","expected_version":version,"check_ids":ids}) };
+        assert!(runtime.invoke(invocation(99, vec!["manual"])).await.is_err());
+        assert!(runtime.invoke(invocation(1, vec!["missing"])).await.is_err());
+        let accepted = runtime.invoke(invocation(1, vec!["manual", "manual"])).await.unwrap();
+        assert!(accepted.message.contains("Check preview"));
+        let staged = runtime.plan_document().unwrap().clone();
+        assert_eq!(staged.design.as_ref().unwrap().document.checks, vec!["manual"]);
+        let mut output = BackendOutput::default();
+        apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
+        assert_eq!(initial.patch_design(&workspace, output.design_patch.pop().unwrap()).unwrap(), staged);
+        let duplicate = runtime.invoke(invocation(staged.version, vec!["manual"])).await.unwrap();
+        assert!(duplicate.invocation.is_none());
+        assert_eq!(runtime.plan_document().unwrap().version, staged.version);
+        assert_eq!(std::fs::read_to_string(workspace.join(".forge.json")).unwrap(), settings.to_string());
+    }
 
     #[tokio::test]
     async fn uncaptured_reads_guard_first_edits_and_preserve_broker_replay_identity() {

@@ -384,7 +384,7 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
         let mut prompt_admission = None;
-        let edit_trace = if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete) {
+        let edit_trace = if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate) {
             let params = request.params.as_object_mut().context("plan edit requires an object")?;
             params.entry("operation_id").or_insert_with(|| json!(format!("request:{}", request.id)));
             Some(crate::plan::edit_trace::PlanEditTrace::new(registry.runtime.trace(), &session_id, &request.method, &request.params))
@@ -393,7 +393,7 @@ impl HarnessService {
         let capture_stage = edit_trace.as_ref().map(|trace| trace.stage("service.capture_submission"));
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete
+            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate
         ) {
             let params = request
                 .params
@@ -402,7 +402,7 @@ impl HarnessService {
             params.remove("review_document");
             if let Some(review) = params.remove("review") {
                 let input = serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
-                if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename) {
+                if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate | HarnessMethod::PlanEntityRename) {
                     params.insert("review_document".into(), serde_json::to_value(&input.document)?);
                 }
                 let controller = registry.resolve(&session_id).await?;
@@ -1240,7 +1240,7 @@ async fn route_request(
         let task = store.list_task(&session_id)?.into_iter().find(|task| Some(&task.id) == session.current_task_id.as_ref() && !task.status.terminal());
         let task_id = task.as_ref().map(|task|task.id.as_str());
         let result = match method {
-            HarnessMethod::ChecksList => controller.checks.catalog_preview(task_id).await?,
+            HarnessMethod::ChecksList => controller.checks.catalog_preview(task_id, session.shell).await?,
             HarnessMethod::ChecksStatus => serde_json::to_value(controller.checks.status(request.params["run_id"].as_str().context("run_id required")?,request.params["wait_ms"].as_u64().unwrap_or(0)).await?)?,
             HarnessMethod::ChecksCancel => {
                 let id = request.params["run_id"].as_str().context("run_id required")?;
@@ -1297,7 +1297,7 @@ async fn route_request(
             .await_provider_fork(&session_id, &controller)
             .await?;
     }
-    let edit_trace = matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename)
+    let edit_trace = matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate | HarnessMethod::PlanEntityRename)
         .then(|| crate::plan::edit_trace::PlanEditTrace::new(registry.runtime.trace(), &session_id, &request.method, &request.params));
     if route_control_request(&controller, &request, method, message_sink, syntax, edit_trace.as_ref()).await? {
         return Ok(());
@@ -1868,7 +1868,7 @@ async fn route_control_request(
     syntax: &Arc<SyntaxEngine>,
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
 ) -> Result<bool> {
-    if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename) {
+    if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate | HarnessMethod::PlanEntityRename) {
         let dispatch = trace.map(|trace| trace.stage("service.dispatch_edit"));
         let revision_lane = trace.map(|trace| trace.stage("service.revision_lane"));
         let (mut response, events) = if let Some((value, events)) = controller.revision_review.decide(method, request.params.clone()).await? {
@@ -2218,6 +2218,62 @@ mod tests {
         async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
         async fn has_active_turn(&self, _: &str) -> bool { false }
         async fn active_session_id_for(&self, _: &str) -> Option<String> { None }
+    }
+
+    #[tokio::test]
+    async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let config = json!({"checks":{"version":2,"definitions":[{
+            "id":"format", "name":"Rust formatting", "category":"format", "area":"Rust", "enabled":true,
+            "trigger":{"kind":"any_change"}, "scope":"all", "directory":".", "depends_on":[],
+            "all":{"command":"nu", "args":["-c","print checked"]}
+        }]}});
+        std::fs::write(fixture.path().join(".forge.json"), serde_json::to_vec(&config)?)?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let plan = {
+            let mut broker = controller.broker.lock().await;
+            let generated = broker.dispatch(Request { id:2, method:"prompt.submit".into(), params:json!({"text":"/plan add test coverage"}) }).await;
+            assert!(generated.response.error().is_none(), "{:?}", generated.response.error());
+            broker.snapshot()?.active_plan.unwrap()
+        };
+        let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
+            "operation":"plan_open", "document":"checks-review", "view":"checks-view", "plan_id":plan.id,
+            "digest":plan.review_digest, "width":{"columns":80,"tabstop":4}
+        }))?).await?;
+        let annotation_line = projection["source_row"].as_array().unwrap().iter().find(|row| row["target"].is_string()).unwrap()["source_line"].clone();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (index, enabled) in [false, true].into_iter().enumerate() {
+            assert_eq!(projection["checks"][0]["enabled"], !enabled);
+            let row = projection["source_row"][0].clone();
+            service.dispatch(Some(session_id.clone()), Request { id:3, method:"plan.checks.update".into(),
+                params:json!({"enabled":{"format":enabled}, "expected_version":projection["version"],
+                    "draft_source_digest":projection["saved_source_digest"],
+                    "draft_annotation":[{"id":"retained", "source":{"start_line":annotation_line,"end_line":annotation_line,"body":"Keep this feedback."}}],
+                    "review":{"document":"checks-review","view":"checks-view","sequence":index+1,
+                        "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
+                        "target":row["target"],"action":"checks"}}) }, &sink).await?;
+            loop {
+                let frame = output.recv().await?.context("check edit response is missing")?;
+                let value: Value = serde_json::from_slice(frame.bytes())?;
+                if value["id"] != 3 { continue; }
+                assert!(value.get("error").is_none(), "{value}");
+                assert!(value["result"].get("review_error").is_none(), "{value}");
+                projection = value["result"]["review"].clone();
+                break;
+            }
+            assert_eq!(projection["checks"][0]["enabled"], enabled);
+            assert_eq!(projection["source_row"].as_array().unwrap().iter().any(|row| row["check"] == "format"), enabled);
+            assert!(projection["annotation"].as_array().unwrap().iter().any(|annotation| annotation["id"] == "retained"));
+            assert_eq!(serde_json::from_slice::<Value>(&std::fs::read(fixture.path().join(".forge.json"))?)?, config);
+        }
+        let stale = controller.broker.lock().await.dispatch(Request { id:4, method:"plan.checks.update".into(),
+            params:json!({"plan_id":plan.id,"digest":projection["saved_source_digest"], "expected_version":0, "enabled":{"format":false}}) }).await;
+        assert!(stale.response.error().is_some());
+        Ok(())
     }
 
     #[tokio::test]
@@ -2681,7 +2737,7 @@ mod tests {
         let mut review = controller.revision_review.open().unwrap();
         let (sink, mut output) = forge_protocol::outbound::channel();
         for method in [HarnessMethod::PlanAcceptanceBegin, HarnessMethod::PlanRequestChanges,
-            HarnessMethod::PlanCancel, HarnessMethod::PlanEntityRename, HarnessMethod::PlanTestsDelete] {
+            HarnessMethod::PlanCancel, HarnessMethod::PlanEntityRename, HarnessMethod::PlanTestsDelete, HarnessMethod::PlanChecksUpdate] {
             let request = Request { id:2, method:"review".into(), params:json!({"plan_id":"plan"}) };
             let respond = async {
                 let Some(crate::plan::revision_review::RevisionReviewRequest::Decide {

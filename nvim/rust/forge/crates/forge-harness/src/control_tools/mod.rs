@@ -49,6 +49,7 @@ impl ControlToolRegistry {
     /// Build the complete provider-neutral control-tool definition list.
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         vec![
+            ControlToolDefinition { name: "harness_plan_checks_add", description: "Add enabled configured checks to the active draft plan, including nonautomatic checks. Does not run checks or edit repository settings. Duplicate IDs are ignored. Returns the plan version and check preview.", input_schema: strict_object_input_schema(vec![("plan_id", string_schema()), ("expected_version", json!({"type":"integer","minimum":1})), ("check_ids", json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128}))], &["plan_id", "expected_version", "check_ids"]) },
             ControlToolDefinition {name:"harness_checks_list",description:"Read saved project checks, supported scopes, task overrides, configuration revision, and run history. Never invents default commands.",input_schema:strict_object_input_schema(vec![],&[])},
             ControlToolDefinition {name:"harness_checks_configure",description:"Save version-2 project checks during /checks setup or missing-configuration planning bootstrap after the user answers setup questions. Each check requires area and trigger independently of scope. Preserves other .forge.json fields. Inspect checks first for expected_revision. Optional helpers are Nushell under .forge/checks/ with source and expected_digest (null for new files). Validates helper syntax without running configured checks.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks)).expect("checks schema")},
             ControlToolDefinition {name:"harness_checks_run",description:"Run checks matching actual task changes outside plan execution. Explicit ids or selections bypass triggers for those suites. all:true explicitly runs all enabled full suites. Disabled checks cannot run. Returns run_id. Wait for completion before editing source. Unsupported scopes are configuration errors, never a full-suite fallback.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest)).expect("checks schema")},
@@ -207,7 +208,7 @@ impl ControlToolRegistry {
     /// Expose plan mutation only while authoring a plan or resolving an execution.
     pub fn definition_list_for(&self, phase: Option<crate::plan::PlanPhase>) -> Vec<ControlToolDefinition> {
         self.definition_list().into_iter().filter(|definition| {
-            !is_agent_tool(definition.name) && (!matches!(definition.name, "harness_design_apply_patch" | "harness_plan_submit")
+            !is_agent_tool(definition.name) && (!matches!(definition.name, "harness_plan_checks_add" | "harness_design_apply_patch" | "harness_plan_submit")
                 || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
             )
         }).collect()
@@ -219,7 +220,7 @@ impl ControlToolRegistry {
         self.definition_list().into_iter().filter(|definition| {
             if !root {return definition.name.starts_with("harness_repository_") && context.is_some_and(|context|context.repository.is_some());}
             if is_agent_tool(definition.name) {return context.and_then(|context|context.agent.as_ref()).is_some_and(|scope|scope.available());}
-            !matches!(definition.name,"harness_design_apply_patch" | "harness_plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
+            !matches!(definition.name,"harness_plan_checks_add" | "harness_design_apply_patch" | "harness_plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
         }).map(|mut definition| {
             if definition.name == "harness_spawn_agent"
                 && let Some(schema) = context.and_then(|context|context.agent.as_ref()).and_then(|scope|scope.profile_schema()) {
@@ -295,7 +296,7 @@ pub fn apply_invocation(
         }
         "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
         | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output" => {},
-        "harness_plan_phase_done" | "harness_checks_list" | "harness_checks_configure" | "harness_checks_run" | "harness_checks_status" | "harness_checks_cancel" => {},
+        "harness_plan_checks_add" | "harness_plan_phase_done" | "harness_checks_list" | "harness_checks_configure" | "harness_checks_run" | "harness_checks_status" | "harness_checks_cancel" => {},
         "harness_goal_complete" => output.evidence.structured_complete = true,
         "harness_goal_blocked" => output.evidence.structured_blocked = true,
         "harness_goal_status" => output.evidence.tool_called = true,

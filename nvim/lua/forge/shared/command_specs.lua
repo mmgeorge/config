@@ -134,6 +134,7 @@ M.view_specs = {
       hints = { composer = function() return "help (normal)" end } },
   },
   plan_review = {
+    { id = "checks", label = "checks", desc = "Enable or disable checks for this plan", modes = "n", pinned = true },
     { id = "rename_entity", label = "rename", desc = "Rename a symbol introduced by the plan and its uses", modes = "n", pinned = true },
     { id = "references", label = "references", desc = "Find symbol usages in this plan snapshot", modes = "n", pinned = true },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
@@ -145,7 +146,7 @@ M.view_specs = {
     { id = "question", label = "ask", desc = "Ask about the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
     { id = "save", label = "save / ask", desc = "Save feedback and answer new plan questions", modes = { "n", "i" }, pinned = true },
     { id = "delete", label = "delete", desc = "Delete the plan comment under the cursor", modes = "n", pinned = true },
-    { id = "delete_tests", label = "delete tests", desc = "Confirm deletion of selected planned tests", modes = "x", visual = true, pinned = false },
+    { id = "delete_tests", label = "delete tests/checks", desc = "Delete selected planned tests or disable selected checks", modes = "x", visual = true, pinned = false },
     { id = "accept", label = "accept", desc = "Approve the exact saved declaration design", modes = "n", pinned = true },
     { id = "request_changes", label = "changes", desc = "Request a semantic revision from review comments", modes = "n", pinned = true },
     { id = "abort_plan", label = "abort plan", desc = "Abort this active plan and exit Plan mode", modes = "n", pinned = true },

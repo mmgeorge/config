@@ -29,6 +29,12 @@ pub enum CheckState {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Owns one exact accepted command and its durable output identities.
 pub struct CommandCheck {
+    #[serde(default)]
+    /// Stable inputs and selection certified by this attempt.
+    pub evidence: Option<super::evidence::CheckEvidence>,
+    #[serde(default)]
+    /// Original run and command when an automatic run reused recorded evidence.
+    pub reused_from: Option<(String, String)>,
     pub id: String,
     pub command: String,
     #[serde(default)]
@@ -208,6 +214,9 @@ pub struct CheckCommand {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Freezes project configuration and user overrides independently from the design document.
 pub struct CheckRunContext {
+    #[serde(default)]
+    /// Permits automatic execution to reuse current recorded coverage.
+    pub automatic: bool,
     pub trigger: String,
     pub task_id: Option<String>,
     pub snapshot: super::ConfigSnapshot,

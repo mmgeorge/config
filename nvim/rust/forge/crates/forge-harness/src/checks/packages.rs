@@ -65,6 +65,7 @@ impl PackageCatalog {
         workspace: &Path,
         directory: &str,
         manager: PackageManager,
+        toolchain: Option<&str>,
     ) -> Result<Self> {
         let root = workspace.canonicalize()?;
         let directory = root
@@ -76,17 +77,13 @@ impl PackageCatalog {
         );
         let packages = match manager {
             PackageManager::Cargo => {
+                let mut args = toolchain.into_iter().map(str::to_owned).collect::<Vec<_>>();
+                args.extend([
+                    "metadata", "--format-version", "1", "--no-deps", "--offline", "--locked",
+                ].map(str::to_owned));
                 let output = super::invocation::capture(
                     "cargo",
-                    &[
-                        "metadata",
-                        "--format-version",
-                        "1",
-                        "--no-deps",
-                        "--offline",
-                        "--locked",
-                    ]
-                    .map(str::to_owned),
+                    &args,
                     &directory,
                     None,
                     None,

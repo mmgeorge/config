@@ -126,6 +126,10 @@
       "route": "refresh",
       "required": {}
     },
+    "plan_checks_updated": {
+      "route": "refresh",
+      "required": {}
+    },
     "plan_changes_requested": {
       "route": "refresh",
       "required": {}

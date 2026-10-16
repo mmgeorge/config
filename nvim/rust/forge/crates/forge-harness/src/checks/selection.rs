@@ -78,6 +78,9 @@ pub struct RunRequest {
     #[serde(default)]
     pub ids: Vec<String>,
     #[serde(default)]
+    /// Adds explicit suites without excluding automatically applicable suites.
+    pub include: Vec<String>,
+    #[serde(default)]
     pub selections: BTreeMap<String, CheckSelection>,
 }
 

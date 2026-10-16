@@ -365,6 +365,13 @@ implementation conformance does not treat every captured body reference as a com
 workspace or submits a consolidated contract revision, then returns to Checking. Plan revisions
 retain the existing review-wait protocol and never replace the original accepted baseline.
 
+Unique Rust callables within the caller's conditional scope can supply navigation and incoming-use
+evidence without asserting that the current build enables their condition. This includes private
+helpers called by tests inside `#[cfg(test)]` modules. An uncalled helper still fails validation,
+and references to conditionally available types remain unverified.
+Check tables preserve multiline command and diagnostic cells as physical rows before measuring
+their display width, so a package-discovery error remains visible without preventing plan review.
+
 At completion or a blocked result, the broker records an implementation-differences report against
 the original accepted revision. Failure, cancellation, and continuation exhaustion retain an
 incomplete report. Reports compare accepted paths and checkpoint changes, including removed files.
@@ -403,6 +410,35 @@ all contributing files. Workspace-wide inputs require explicit full-workspace de
 Nested excluded packages cannot become accidental members of their parent package. Native
 invocations retain manifest fingerprints and reject changed configuration before execution.
 Every expanded prerequisite must pass before a dependent definition runs.
+
+`enabled` permits execution and `auto` controls trigger-driven selection. Omitted
+`auto` defaults to true. The plan's `checks` list explicitly selects enabled
+checks, and `disabled_checks` suppresses checks for that plan even when their
+automatic triggers match. The plan-specific `oc` picker and visual deletion
+submit `plan.checks.update` through the same versioned review-edit path as test
+deletion. Rust expands prerequisite and dependent choices, recomputes the preview,
+retains annotations, and persists the new review digest. The repository check
+configuration remains unchanged. Check rows carry semantic check identities so
+visual selection remains valid across wrapping and repeated package invocations.
+
+The `checks` list explicitly selects enabled
+definitions without changing their repository defaults. The versioned
+`harness_plan_checks_add` tool adds these references through the normal design
+patch lifecycle. Both previews and execution include required prerequisites.
+
+`CheckEvidence` retains the source checkpoint and execution contract certified by
+an attempt. Automatic gates reuse current evidence within the owning task,
+including evidence from explicit tool runs. Package ownership bounds reuse to
+that package and its metadata. Helpers without declared input boundaries use the
+whole workspace. Partial selections cannot satisfy wider coverage, and changed
+inputs or execution configuration invalidate reuse. Explicit runs always execute.
+
+Ordinary completion and successful goal completion enter the Rust-owned automatic
+gate. Intermediate goal turns, waiting questions, approvals, cancellation, and
+active children do not. The gate runs applicable automatic checks and delivers
+saved failures to a repair exchange retaining the original check owner.
+`AutomaticChecks` persists pending validation and failure delivery. Repeated
+failures without changed inputs stop repair with unresolved diagnostics.
 
 `CheckPreview` uses the same resolver for the check catalog and submitted-plan review. A preview
 is a proposal, not execution evidence. Plans changing package metadata retain pending validation

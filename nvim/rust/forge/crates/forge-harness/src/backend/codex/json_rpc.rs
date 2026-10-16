@@ -217,6 +217,7 @@ pub struct CodexJsonRpc {
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<ControlToolRuntime>,
+    replay_invocation: Option<ControlToolInvocation>,
     accepted_control_invocation_key_set: HashSet<String>,
     mcp: McpContext,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -249,6 +250,7 @@ impl CodexJsonRpc {
             planning_feedback: false,
             plan_document: None,
             control_runtime: None,
+            replay_invocation: None,
             accepted_control_invocation_key_set: HashSet::new(),
             mcp: McpContext::default(),
             permission_coordinator,
@@ -390,6 +392,7 @@ impl CodexJsonRpc {
             rejects_question_resolution(self.planning_feedback, method, &message);
         let provider_request_success =
             if message.get("id").is_some() && message.get("method").is_some() {
+                self.replay_invocation = None;
                 Some(self.respond_to_provider_request(&message).await?)
             } else {
                 None
@@ -403,7 +406,13 @@ impl CodexJsonRpc {
                 response_success,
             )
         {
-            apply_control_request_result(&message, output, response_success)?;
+            if self.control_runtime.is_some() {
+                if let Some(invocation) = self.replay_invocation.take() {
+                    apply_invocation(&invocation, output)?;
+                }
+            } else {
+                apply_control_request_result(&message, output, response_success)?;
+            }
             if let (Some(runtime), Some(request)) = (self.control_runtime.as_ref(), output.design_patch.last_mut())
                 && let Some(digests) = runtime.patch_source_digests(request.expected_version)
             {
@@ -764,6 +773,7 @@ impl CodexJsonRpc {
         if let Some(runtime) = self.control_runtime.as_mut() {
             let result = runtime.invoke_decoded(invocation.clone(), output).await?;
             self.plan_document = runtime.plan_document().cloned();
+            self.replay_invocation = result.invocation;
             return Ok(Some(result.message));
         }
         match invocation.name.as_str() {
@@ -2222,6 +2232,59 @@ fn first_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod test {
     #[tokio::test]
+    async fn selected_checks_replay_before_later_design_edits() -> anyhow::Result<()> {
+        use super::*;
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        std::fs::write(fixture.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
+            "id":"manual", "name":"Manual", "area":"Tests", "category":"test", "enabled":true,
+            "auto":false, "trigger":{"kind":"manual"}, "all":{"command":"print selected"}
+        }]}}).to_string())?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for id in 1..=3 {
+                let response: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(response["id"], id);
+                assert_eq!(response["result"]["success"], true, "{response}");
+            }
+        });
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?, None,
+            Arc::new(TraceStore::open(fixture.path())?), "session".into()).await?;
+        let mut document = crate::plan::test_fixture("plan", "Initial");
+        document.version = 4;
+        document.design = Some(crate::plan::DeclarationDesign::default());
+        let mut context = ControlTurnContext::inactive(crate::backend::PromptMode::Plan);
+        context.plan_state = Some(crate::plan::PlanState::Revising);
+        context.plan_document = Some(document.clone());
+        context.workspace_root = Some(fixture.path().to_owned());
+        process.set_control_context(context);
+        let mut output = BackendOutput::default();
+        for (id, tool, arguments) in [
+            (1, "harness_plan_checks_add", json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]})),
+            (2, "harness_design_apply_patch", json!({"plan_id":"plan","expected_version":5,
+                "patch":"*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Restart fixture\",\n*** End Patch"})),
+            (3, "harness_plan_checks_add", json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]})),
+        ] {
+            process.publish_message(json!({"id":id,"method":"item/tool/call","params":{
+                "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),"tool":tool,"arguments":arguments
+            }}), &mut output).await?;
+        }
+        assert_eq!(output.design_patch.len(), 2);
+        for patch in output.design_patch {
+            document = document.patch_design(fixture.path(), patch)?;
+        }
+        assert_eq!(document.version, 6);
+        assert_eq!(document.design.as_ref().unwrap().document.checks, ["manual"]);
+        assert_eq!(document.design.as_ref().unwrap().document.objective, "Restart fixture");
+        tokio::time::timeout(Duration::from_secs(2), server).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn shell_parse_errors_reach_provider_and_corrected_calls_reuse_connection() -> Result<()> {
         use super::*;
         let fixture = tempfile::tempdir()?;
@@ -2255,7 +2318,16 @@ mod test {
                 "params":{"threadId":"thread","turnId":"turn","command":command,"shell":"powershell"}});
             assert_eq!(process.respond_to_provider_request(&message).await?, accepted);
             assert!(coordinator.pending_list()?.is_empty());
-            assert!(stream.try_recv().is_err());
+            let event = stream.try_recv();
+            if id == 2 {
+                let event = event?;
+                assert_eq!(event.kind, "error");
+                assert!(event.text.as_deref().unwrap().contains("shell_command_parse_error"));
+                assert_eq!(event.address.unwrap().turn_id, "turn");
+                assert!(stream.try_recv().is_err());
+            } else {
+                assert!(event.is_err(), "{event:?}");
+            }
         }
         tokio::time::timeout(Duration::from_secs(2), server).await??;
         Ok(())

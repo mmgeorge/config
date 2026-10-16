@@ -102,7 +102,7 @@ pub(super) fn resolve(
     has_scope: bool,
 ) -> Result<Vec<CheckApplicability>> {
     ensure!(
-        !request.all || (request.ids.is_empty() && request.selections.is_empty()),
+        !request.all || (request.ids.is_empty() && request.include.is_empty() && request.selections.is_empty()),
         "choose all checks or explicit selections, not both"
     );
     let known: BTreeSet<_> = config
@@ -111,7 +111,7 @@ pub(super) fn resolve(
         .map(|check| check.id.as_str())
         .collect();
     ensure!(
-        request.ids.iter().all(|id| known.contains(id.as_str())),
+        request.ids.iter().chain(&request.include).all(|id| known.contains(id.as_str())),
         "unknown check id"
     );
     ensure!(
@@ -124,7 +124,7 @@ pub(super) fn resolve(
     );
     ensure!(
         config.definitions.iter().all(|check| check.enabled
-            || (!request.ids.contains(&check.id) && !request.selections.contains_key(&check.id))),
+            || (!request.ids.contains(&check.id) && !request.include.contains(&check.id) && !request.selections.contains_key(&check.id))),
         "selected check is disabled; re-enable it in /checks"
     );
     let mut result: BTreeMap<_, _> = config
@@ -140,11 +140,14 @@ pub(super) fn resolve(
                 (false, "Disabled for this task".into())
             } else if request.all
                 || request.ids.contains(&check.id)
+                || request.include.contains(&check.id)
                 || request.selections.contains_key(&check.id)
             {
                 (true, "Explicitly requested".into())
             } else if !request.ids.is_empty() {
                 (false, "Not requested".into())
+            } else if !check.auto {
+                (false, "Automatic execution disabled".into())
             } else if matches!(check.trigger, CheckTrigger::Manual) {
                 (false, "Explicit runs only".into())
             } else if !has_scope {

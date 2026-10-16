@@ -12,6 +12,7 @@ local perf = require("forge.infra.perf")
 ---@field public_only boolean
 ---@field saved_source_digest string
 ---@field version integer
+---@field checks {id: string, name: string, stage: string, enabled: boolean, available: boolean, reason?: string}[]
 
 ---@param options table
 ---@param callback fun(owner: table?, failure: string?)
@@ -208,7 +209,7 @@ function M.attach(options, callback)
     if not owner.attached() then receive(nil, "Plan review is not ready") return false end
     local trace_started = perf.now()
     params = vim.deepcopy(params or {})
-    local edit = method == "plan.entity.rename" or method == "plan.tests.delete"
+    local edit = method == "plan.entity.rename" or method == "plan.tests.delete" or method == "plan.checks.update"
     if edit then params.operation_id = params.operation_id or ("plan-edit:" .. trace_started) end
     local capture = perf.trace("harness", "ui.plan.edit.capture", {
       operation_id = params.operation_id, method = method, document = owner.document,
@@ -400,6 +401,7 @@ function M.attach(options, callback)
     if applied.kind ~= "Applied" then options.recovery = nil return nil, applied.reason or applied.kind end
     options.plan = plan
     owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    owner.checks = opened.checks or {}
     sync_view_capture()
     owner.sync_editability()
     local pending = owner.pending_operation
@@ -462,6 +464,7 @@ function M.attach(options, callback)
     local adopted = apply_projection(opened)
     if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
     owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    owner.checks = opened.checks or {}
     owner.ready = true
     if options.configure_view then options.configure_view(owner.view, owner) end
     vim.bo[options.buffer].buftype = "acwrite"
@@ -562,7 +565,7 @@ function M.attach(options, callback)
     end)
     return true
   end
-  ---@return {file: string, name: string}[]?, ForgeDocumentInput?, string?
+  ---@return {file: string, name: string}[]?, ForgeDocumentInput?, string?, table<string, boolean>?
   function owner.selected_tests()
     if not owner.attached() then return nil, nil, "Plan review is not ready" end
     local view = owner.current_view()
@@ -571,19 +574,22 @@ function M.attach(options, callback)
     if mode ~= "v" and mode ~= "V" and mode ~= "\22" then return nil, nil, "Select the planned tests first" end
     local first, last = vim.fn.getpos("v")[2] - 1, vim.api.nvim_win_get_cursor(view.window)[1] - 1
     if first > last then first, last = last, first end
-    local selected, seen = {}, {}
+    local selected, seen, checks = {}, {}, {}
     for row = first, last do
       local metadata = owner.projection.line_meta_list[row + 1]
       local test = metadata and metadata.test
+      local check = metadata and metadata.check
+      if type(check) == "string" then checks[check] = false end
       if type(test) == "table" then
         local identity = vim.json.encode({ test.file, test.name })
         if not seen[identity] then selected[#selected + 1] = vim.deepcopy(test) seen[identity] = true end
       end
     end
     vim.cmd("normal! " .. string.char(27))
-    if #selected == 0 then return nil, nil, "The selection contains no planned tests" end
+    if #selected == 0 and not next(checks) then return nil, nil, "The selection contains no planned tests or checks" end
     local captured, failure = input.capture(owner.replica, view, "delete_tests")
-    return selected, captured, failure
+    ---@cast captured ForgeDocumentInput?
+    return selected, captured, failure, checks
   end
   return owner
 end

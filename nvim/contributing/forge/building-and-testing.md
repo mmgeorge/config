@@ -55,6 +55,8 @@ From the repository root, run an isolated editor test directly in a fresh Neovim
 ```nu
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_workspace_definition.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_review_document.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_selection.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_checks_host.lua
 ```
 
 Enforce an external execution deadline when running these commands through an
@@ -76,6 +78,8 @@ with the release target resolved above:
 ```nu
 cargo test --release --locked --target-dir $target -p forge-harness --lib checks:: -- --test-threads=1
 cargo test --release --locked --target-dir $target -p forge-harness --lib plan::design_review::tests
+cargo test --release --locked --target-dir $target -p forge-harness --lib automatic_checks_repair_once
+cargo test --release --locked --target-dir $target -p forge-harness --lib selected_plan_checks_are_versioned
 ```
 
 The check tests cover package discovery, argument expansion, deduplication,
@@ -88,6 +92,7 @@ the repository root in a fresh Neovim, with an external 30-second deadline:
 
 ```nu
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_package_checks.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_automatic_checks.lua
 ```
 
 The fixture creates a temporary npm workspace and invokes the actual host through
@@ -97,6 +102,15 @@ capture command output. It uses Nushell for the fixture command and does not
 install or run an npm test framework. Success requires exit status zero and host
 cleanup. Use [Extending project checks](extending-project-checks.md) to choose
 additional cases when changing supported package managers or case runners.
+
+The automatic-check fixture exercises the completion gate through a fresh host.
+It verifies one executed failure, one reused failure, a repair turn stopping
+without progress, and explicit multi-check execution including a nonautomatic
+check. It uses a three-second mock provider and a temporary Git repository.
+
+When contributing from inside Harness, configure these commands as project checks
+and invoke the checks interface. The commands document the required targets and
+arguments rather than granting agents a separate terminal-validation path.
 
 ## Verify real language navigation
 

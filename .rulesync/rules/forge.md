@@ -11,6 +11,21 @@ globs:
 
 # Forge Plugin Rules
 
+## Harness Check Ownership
+
+Inside Forge Harness, agents must perform automated validation through the checks
+interface. List configured checks, run selected IDs through `harness_checks_run`,
+and inspect recorded results with `harness_checks_status`. Do not run builds,
+tests, linters, formatters, or validation scripts directly through terminal tools
+or alternate subprocesses. During plan execution, finish the active phase and
+let Harness Checking execute validation. Delegated agents without check tools
+must ask their parent to schedule it after child work settles. Missing coverage
+requires the authorized check-configuration workflow rather than an unrecorded
+command. Read-only source and package-metadata discovery are unaffected.
+
+The build commands below define the required artifact and flags. Harness agents
+must execute them as configured checks when working inside Harness.
+
 ## Manual Rust Builds
 
 The agent or developer changing Forge owns rebuilding its Rust executable. After

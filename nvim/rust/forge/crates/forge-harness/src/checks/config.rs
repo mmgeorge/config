@@ -60,6 +60,9 @@ pub struct CheckDefinition {
     pub name: String,
     pub category: CheckCategory,
     pub enabled: bool,
+    #[serde(default = "automatic_default")]
+    /// Selects this check automatically when its trigger matches.
+    pub auto: bool,
     /// Functional area shown in check selection and review surfaces.
     pub area: String,
     /// Changes that automatically select this check, independent of its scope.
@@ -81,6 +84,10 @@ fn root_directory() -> String {
     ".".into()
 }
 
+fn automatic_default() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Owns explicit project configuration, including an intentionally empty definition list.
@@ -90,6 +97,15 @@ pub struct CheckConfig {
 }
 
 impl CheckConfig {
+    /// Rejects explicit plan selections that cannot execute from this configuration.
+    pub(crate) fn validate_selection(&self, ids: &[String]) -> Result<()> {
+        for id in ids {
+            let definition = self.definitions.iter().find(|definition| &definition.id == id).with_context(|| format!("unknown planned check: {id}"))?;
+            ensure!(definition.enabled, "planned check is disabled: {id}");
+        }
+        Ok(())
+    }
+
     /// Rejects unsupported scopes, duplicate identities, and missing or cyclic prerequisites.
     pub fn validate(&self) -> Result<()> {
         ensure!(

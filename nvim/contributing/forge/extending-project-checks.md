@@ -6,6 +6,12 @@ commands, and the runner records execution evidence. A new package manager or te
 runner must use those boundaries so plan previews and Checking resolve the same
 commands without silently widening coverage.
 
+Automatic selection is independent of availability. `enabled` permits execution,
+while `auto` selects matching checks for plans and completion gates. Explicit plan
+IDs and explicit runs can select enabled nonautomatic checks. Keep the shared
+agent instructions synchronized with these contracts: validation must use the
+checks interface rather than unrecorded terminal commands.
+
 Read [Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate)
 for lifecycle ownership and [Project checks](../../docs/forge/checks.md) for
 configuration examples. Parser and LSP integration is separate and follows
@@ -29,6 +35,10 @@ selected by `package_manager`, not another trigger or an LLM-supplied mapping.
 | Native exact cases | Cargo standard-harness targets validate runtime names and prove the selected tests executed |
 | Other case runners | Scoped shell helpers consume the versioned selection and return a validated receipt |
 
+Cargo discovery preserves an operation's leading `+toolchain` selector. Its
+request-local package cache includes that selector, so checks using different
+toolchains cannot share metadata resolved under another toolchain.
+
 Ownership does not establish dependent-package impact or map arbitrary changed
 source files to individual unit tests. Root workspace manifests and lockfiles in
 multi-package projects require explicit workspace-wide rules. Excluded or
@@ -46,6 +56,7 @@ Rust paths in this table are relative to
 | Package inventories, manifests, and ownership | `checks/packages.rs` |
 | Binding expansion and invocation deduplication | `checks/invocation.rs` |
 | Preparation, dependencies, execution, and evidence | `checks/runner.rs` |
+| Current coverage and repair delivery | `checks/evidence.rs`, `checks/automatic.rs` |
 | Shared catalog and plan previews | `checks/preview.rs`, `checks/tools.rs` |
 | Accepted-plan case inventory | `broker/checks.rs`, `plan/design_tests.rs` |
 | Preview invalidation and plan rendering | `plan/design.rs`, `plan/design_review.rs` |
@@ -111,3 +122,10 @@ Fixtures must cover single-package and multi-package discovery, exclusions,
 deleted paths, deduplication, metadata changes, exact-case failures, and
 cancellation where applicable. Report the executed commands and observed results
 without treating a preview or configuration save as a test run.
+
+Completion-gate fixtures must distinguish provider-turn completion from actual
+idleness. Include intermediate goals, pending questions, cancelled work, explicit
+tool runs reused by automatic checks, and a repair ending without progress.
+Coverage belongs to the original task or exchange across repair turns. Persist
+failure delivery independently of the provider response to avoid repeated repair
+requests after recovery.

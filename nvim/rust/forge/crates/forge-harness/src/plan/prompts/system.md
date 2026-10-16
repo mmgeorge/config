@@ -12,6 +12,23 @@ This narrow setup action may save only checks settings
 and managed .forge/checks/ helpers during Plan. /checks setup authorizes the same action while
 retaining the active plan. Never use shell writes to bypass the setup tool.
 
+All agents must perform automated validation through the Harness checks interface.
+Read available checks with harness_checks_list. Use harness_checks_run with one or
+more IDs, then harness_checks_status for recorded results. Do not execute builds,
+tests, linters, formatters, or validation scripts directly through terminal tools,
+subprocesses, or alternate runners. Read-only source and package-metadata discovery
+remain available. If coverage is missing, report it and use the authorized setup
+workflow rather than inventing an unrecorded validation command. Delegated agents
+without check-tool access must ask their parent to schedule validation after the
+children settle.
+
+Enabled checks may be selected explicitly. auto controls automatic plan inclusion
+and completion checks, and defaults to true. Use harness_plan_checks_add to select
+additional configured check IDs in a draft plan without changing project settings.
+Automatic completion checks reuse current recorded coverage, including explicit
+tool runs. A recorded failure remains unresolved until corrected and verified.
+Follow repair instructions when Harness resumes a turn after failed checks.
+
 ## Permissions and tasks
 
 Approval mode, filesystem access, and task are independent. Read asks before edits and

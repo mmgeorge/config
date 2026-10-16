@@ -51,6 +51,12 @@ pub(super) struct ResolvedFile {
 }
 
 impl CheckpointRecord {
+    /// Identifies selected package inputs without invalidating them for unrelated packages.
+    pub(crate) fn check_identity(&self, directory: Option<&str>, extra: &[String]) -> Result<String> {
+        let files = self.resolved()?.into_iter().filter(|(path, _)| directory.is_none_or(|directory| directory == "." || path == directory || path.starts_with(&format!("{directory}/")) || extra.contains(path))).collect::<BTreeMap<_, _>>();
+        Ok(crate::plan::digest(&serde_json::to_vec(&files)?))
+    }
+
     /// Select changed paths using content identities without loading whole file contents.
     pub fn changed_paths(&self, other: &Self) -> Result<Vec<String>> {
         let before = self.resolved()?;

@@ -58,13 +58,18 @@ pub(crate) async fn plan(
             || path.ends_with("package.json")
             || path.ends_with("pnpm-workspace.yaml")
     });
+    let mut config = snapshot.config.clone();
+    for check in &mut config.definitions {
+        if design.document.disabled_checks.contains(&check.id) { check.enabled = false; }
+    }
     resolve(
         workspace,
-        &snapshot.config,
+        &config,
         &files,
         Some(&changed),
         Some(&new),
         invalidated,
+        &design.document.checks,
     )
     .await
 }
@@ -77,8 +82,9 @@ pub(super) async fn resolve(
     cases: Option<&[super::CheckCase]>,
     new_cases: Option<&[super::CheckCase]>,
     metadata_pending: bool,
+    included: &[String],
 ) -> Result<Vec<CheckPreview>> {
-    let request = RunRequest::default();
+    let request = RunRequest { include: included.to_vec(), ..Default::default() };
     let applicability = super::applicability::resolve(&request, config, Some(files), true)?;
     let request = RunRequest {
         ids: applicability
@@ -147,7 +153,9 @@ pub(super) async fn resolve(
                             let mut item = preview.clone();
                             item.command = invocation.display();
                             if !invocation.files.is_empty() {
-                                item.reason = format!("Changed: {}", invocation.files.join(", "));
+                                item.reason = if included.contains(&definition.id) || applicable.reason.starts_with("Required by") {
+                                    format!("{}. Inputs: {}", applicable.reason, invocation.files.join(", "))
+                                } else { format!("Changed: {}", invocation.files.join(", ")) };
                             }
                             result.push(item);
                         }

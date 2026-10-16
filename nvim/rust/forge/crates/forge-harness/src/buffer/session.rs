@@ -1762,7 +1762,7 @@ mod tests {
         };
         let mut interaction = Exchange {
             lifecycle: None,
-            finalization_error: None,
+            finalization_error: None, check_owner: None,
             finalization_outcome: None,
             agent_id: "primary".into(),
             id: identity.into(),

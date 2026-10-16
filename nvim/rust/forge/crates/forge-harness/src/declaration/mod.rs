@@ -1241,7 +1241,16 @@ impl DeclarationResolver {
                 if !accessible(symbol.visibility, package, scope, origin) {
                     return invalid("declaration is not public outside its crate");
                 }
-                if symbol.conditional {
+                let local_conditional_use = origin.navigation
+                    && origin.package == package
+                    && match symbol.role {
+                        forge_diff::syntax::DeclarationRole::Callable => origin.scope.starts_with(scope),
+                        forge_diff::syntax::DeclarationRole::Module => {
+                            origin.scope.starts_with(&joined(scope, std::slice::from_ref(&symbol.name)))
+                        }
+                        _ => false,
+                    };
+                if symbol.conditional && !local_conditional_use {
                     results.push(unverified("declaration is conditionally compiled"));
                 } else if path.len() == 1 {
                     results.push(resolved(file, symbol));

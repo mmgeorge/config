@@ -1061,6 +1061,36 @@ impl PlanFileStore {
         measure(trace, "delete.semantic_edit", || design_tests::remove(&mut document.design.as_mut().context("test deletion requires a declaration design")?.document.tests, selected))?;
         document.version = document.version.checked_add(1).context("plan version exhausted")?;
         let rendered = measure(trace, "delete.update_test_rows", || design_review::replace_test_inventory(&before, &document))?;
+        self.persist_annotated_edit(session_id, plan_id, document, rendered, &before, annotation, trace)
+    }
+
+    /// Updates check selection without changing repository defaults or discarding review annotations.
+    pub(crate) async fn update_checks(
+        &self, session_id: &str, plan_id: &str, expected_version: u64, expected_digest: &str,
+        changes: &std::collections::BTreeMap<String, bool>, tests: &[DesignTestSelection], trace: Option<&PlanEditTrace>,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let mut document = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(document.version == expected_version, "plan version changed before check selection");
+        anyhow::ensure!(digest(&serde_json::to_vec(&document)?) == expected_digest, "plan changed before check selection");
+        let before = self.render_review(&document)?;
+        let path = self.plan_dir(session_id, plan_id).join("working.json");
+        let annotation = review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?.annotation().to_vec();
+        let design = document.design.as_mut().context("check selection requires a declaration design")?;
+        let config = &design.check_configuration.as_ref().context("plan has no configured checks")?.config;
+        design.document.set_checks(config, changes)?;
+        if !tests.is_empty() { design_tests::remove(&mut design.document.tests, tests)?; }
+        design.check_preview = crate::checks::preview_plan(&self.workspace, design).await?;
+        design.check_preview_source = design.check_preview_fingerprint()?;
+        document.version = document.version.checked_add(1).context("plan version exhausted")?;
+        let rendered = design_review::render(&document)?;
+        self.persist_annotated_edit(session_id, plan_id, document, rendered, &before, annotation, trace)
+    }
+
+    fn persist_annotated_edit(
+        &self, session_id: &str, plan_id: &str, document: PlanDocument, rendered: RenderedPlan,
+        before: &RenderedPlan, annotation: Vec<ReviewAnnotation>, trace: Option<&PlanEditTrace>,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let path = self.plan_dir(session_id, plan_id).join("working.json");
         let (document, rendered, checksum) = self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();

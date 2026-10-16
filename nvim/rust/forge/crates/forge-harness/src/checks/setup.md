@@ -19,7 +19,9 @@ checks that remain useful. Do not run configured checks during setup.
 Categories are format, lint, check, test, and build. Unit, integration, screenshot, accessibility,
 and other suites are named test definitions, not new categories. Format commands verify without
 rewriting files. Build is optional and defaults to development unless the project explicitly
-requires another profile. Enabled checks run automatically. Disabled checks cannot be run by
+requires another profile. Enabled checks can run. auto:true selects a check automatically
+when its trigger matches, while auto:false keeps it available for explicit plan selection or
+tool runs. Ask which checks should be automatic. Disabled checks cannot be run by
 the model until the user enables them. Task overrides remain separate from saved defaults.
 
 Configuration is {version: 2, definitions: [...]}. Each definition has id, name, category, area,
@@ -39,7 +41,7 @@ changed_files with a helper that maps source files to real tests, or all within 
 A cases handler can still support explicit case selection. Use changed_cases defaults only
 for checks intentionally restricted to cases added or modified by an accepted plan.
 Each definition also has
-enabled, scope (all, changed_files, changed_cases, new_cases), directory (project-relative, default "."),
+enabled, auto (defaults to true), scope (all, changed_files, changed_cases, new_cases), directory (project-relative, default "."),
 all: {command}, optional files: {command}, optional cases: {command}, and depends_on: [id].
 Use static single-line commands for the configured shell. Choose execution order in definitions.
 Prefer build/check, test, lint, then format when no project constraint requires another order.

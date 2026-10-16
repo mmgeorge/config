@@ -178,6 +178,29 @@ mod tests {
     }
 
     #[test]
+    fn recorded_test_helper_calls_establish_incoming_uses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut design = design(
+            "lib.rs",
+            "#[cfg(test)] mod tests { fn helper() {} #[test] fn resets() { helper(); } }\n",
+        );
+        validate(&design, workspace.path()).unwrap();
+        for function in design.proposed_calls.get_mut("lib.rs").unwrap() {
+            if function.owner.ends_with("resets") {
+                function.call.as_mut().unwrap()[0].name = "tests::helper".into();
+            }
+        }
+        validate(&design, workspace.path()).unwrap();
+        for function in design.proposed_calls.get_mut("lib.rs").unwrap() {
+            if function.owner.ends_with("resets") {
+                function.call = Some(Vec::new());
+            }
+        }
+        let failure = validate(&design, workspace.path()).unwrap_err().to_string();
+        assert!(failure.contains("helper"), "{failure}");
+    }
+
+    #[test]
     fn rejects_unrecorded_registration_and_accepts_corrective_calls() {
         let workspace = tempfile::tempdir().unwrap();
         let mut design = design(

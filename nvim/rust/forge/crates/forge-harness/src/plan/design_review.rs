@@ -598,8 +598,14 @@ fn rows(
     let start = overview.len();
     overview.push(section_header(BlockId("plan:section:checks".into()), if design.check_preview_current()? { "Planned checks" } else { "Configured checks" })?);
     let lines = review_checks(Some(design), None)?;
+    let check_ids = design.check_preview.iter().filter(|preview| preview.selected || preview.pending).map(|preview| &preview.id).collect::<Vec<_>>();
     for (index,line) in lines.into_iter().enumerate() {
         overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
+        if design.check_preview_current()? && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index)) {
+            section_anchor.push(PlanNavigationAnchor { line: overview.len() as u32,
+                target: PlanReviewTarget::Check { id: (*id).clone() },
+                json_path: "/design/document/checks".into(), path: None, label: format!("Check: {id}") });
+        }
     }
     fold(&mut overview, start, "plan:section:checks")?;
     navigation.anchor.extend(section_anchor);
@@ -612,7 +618,7 @@ fn rows(
 fn review_checks(design: Option<&super::DeclarationDesign>, width: Option<&WidthProfile>) -> Result<Vec<Vec<String>>> {
     if let Some(design) = design && design.check_preview_current()? {
         let mut table = vec![["Stage", "Command", "Scope", "Why", "Status"].map(str::to_owned)];
-        for preview in &design.check_preview {
+        for preview in design.check_preview.iter().filter(|preview| preview.selected || preview.pending) {
             table.push([
                 format!("{:?}", preview.category), preview.command.clone(),
                 format!("{:?}", preview.scope), preview.reason.clone(),
@@ -695,7 +701,9 @@ fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> 
     let mut widths = [0; 5];
     for row in &table {
         for (column, cell) in row.iter().enumerate() {
-            widths[column] = widths[column].max(profile.cells(cell, 0)?);
+            for line in cell.split('\n') {
+                widths[column] = widths[column].max(profile.cells(line, 0)?);
+            }
         }
     }
     let mut lines = Vec::new();
@@ -1072,6 +1080,24 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_table_preserves_multiline_resolution_errors() {
+        let table = vec![
+            ["Stage", "Command", "Scope", "Why", "Status"].map(str::to_owned),
+            ["Test", "cargo test", "Changed files", "Pending validation: cargo metadata failed\nerror: no toolchain selected", "Pending validation"].map(str::to_owned),
+        ];
+        for columns in [60, 100, 170] {
+            let profile = WidthProfile { columns, ..Default::default() };
+            let rows = render_check_table(table.clone(), Some(&profile)).unwrap();
+            let text = rows.iter().flatten().cloned().collect::<Vec<_>>().join("\n");
+            assert!(text.contains("error:"), "{text}");
+            for line in rows.iter().flatten() {
+                assert!(profile.cells(line, 0).unwrap() < columns, "{columns}: {line}");
+            }
+        }
+        render_check_table(table, None).unwrap();
+    }
 
     #[test]
     fn configured_checks_show_scoped_commands_and_keep_repeated_stages() {

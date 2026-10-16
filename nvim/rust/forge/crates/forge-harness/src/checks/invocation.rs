@@ -117,7 +117,7 @@ pub(super) fn display(program: &str, args: &[String]) -> String {
 #[derive(Default)]
 /// Shares package discovery across all definitions resolved for one request.
 pub(super) struct InvocationResolver {
-    catalog: BTreeMap<(PackageManager, String), PackageCatalog>,
+    catalog: BTreeMap<(PackageManager, String, Option<String>), PackageCatalog>,
 }
 
 impl InvocationResolver {
@@ -135,11 +135,14 @@ impl InvocationResolver {
             .as_ref()
             .context("direct invocation requires args")?;
         let catalog = if let Some(manager) = operation.package_manager {
-            let key = (manager, directory.to_owned());
+            let toolchain = (manager == PackageManager::Cargo)
+                .then(|| args.first().filter(|argument| argument.starts_with('+')))
+                .flatten();
+            let key = (manager, directory.to_owned(), toolchain.cloned());
             if !self.catalog.contains_key(&key) {
                 self.catalog.insert(
                     key.clone(),
-                    PackageCatalog::discover(workspace, directory, manager).await?,
+                    PackageCatalog::discover(workspace, directory, manager, toolchain.map(String::as_str)).await?,
                 );
             }
             self.catalog.get(&key)

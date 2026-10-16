@@ -236,6 +236,16 @@ stale after a configuration change. `views/harness/model_picker.lua` owns only p
 state, field cycling, and presentation order. Copilot maps the selected context tier into native
 session creation and `set_model`, while Codex exposes only the controls returned by app-server.
 
+Codex resolves the `default` selection through its model catalog before admitting a turn.
+The resolved model is sent explicitly on thread creation, thread resume, and turn start,
+and the same value supplies the runtime model shown in Harness. Omitting the model after
+resolution can retain a different provider thread default while displaying the catalog default.
+
+Codex persists the control runtime's returned invocation after a successful tool call.
+This preserves lowered operations such as adding plan checks as canonical design patches
+and omits operations the runtime already committed. Subsequent patches therefore replay
+against the same document version the model observed.
+
 `views/harness/model_order.lua` applies one ordering pipeline to the model picker and
 model completion. Copilot orders Auto first, then Claude, GPT, and Gemini with descending
 numeric versions. Equal Claude versions use Opus, Sonnet, and Haiku order. Other equal-version

@@ -10,6 +10,7 @@ local owner = "forge-harness-checks"
 ---@field name string
 ---@field category string
 ---@field enabled boolean
+---@field auto boolean
 ---@field area string
 ---@field trigger {kind: string, include?: string[], exclude?: string[]}
 ---@field scope string
@@ -24,12 +25,14 @@ local owner = "forge-harness-checks"
 ---@field revision string
 ---@field error? string|userdata
 ---@field snapshot? {config: {definitions: ForgeCheckDefinition[]}}|userdata
----@field overrides {enabled: table<string, boolean>, scopes: table<string, string>}
+---@field overrides {enabled: table<string, boolean>, scopes: table<string, string>, auto?: table<string, boolean>}
 ---@field history table[]
 ---@field active_run? string|userdata
 ---@field applicability? {id: string, selected: boolean, reason: string, matched_files: string[]}[]
 ---@field changed_files? string[]|userdata
 ---@field preview? {id: string, command: string, reason: string, selected: boolean, pending: boolean}[]
+---@field coverage? {id: string, command: string, pending: boolean, evidence?: {run_id: string, state: string}}[]
+---@field automatic? {pending: boolean, blocked?: string}
 
 ---@param value any
 ---@return boolean
@@ -117,7 +120,9 @@ function Checks.open(state, host, setup)
     local overrides = catalog.overrides or { enabled = {}, scopes = {} }
     local enabled = overrides.enabled[check.id]
     if enabled == nil then enabled = check.enabled end
-    return enabled, overrides.scopes[check.id] or check.scope or "all"
+    local automatic = (overrides.auto or {})[check.id]
+    if automatic == nil then automatic = check.auto ~= false end
+    return enabled, overrides.scopes[check.id] or check.scope or "all", automatic
   end
 
   local function selected()
@@ -174,6 +179,14 @@ function Checks.open(state, host, setup)
         result[#result + 1] = preview.reason
       end
     end
+    for _, coverage in ipairs(catalog.coverage or {}) do
+      if coverage.id == check.id then
+        local evidence = coverage.evidence
+        result[#result + 1] = type(evidence) == "table"
+          and ("Current evidence: " .. evidence.state .. " · run " .. evidence.run_id)
+          or "Coverage: pending execution"
+      end
+    end
     local command = latest(check)
     if command then
       if type(command.error) == "string" then result[#result + 1] = command.error end
@@ -193,9 +206,12 @@ function Checks.open(state, host, setup)
   local function change(direction)
     local check = selected()
     if not check then return end
-    local enabled, scope = effective(check)
+    local enabled, scope, automatic = effective(check)
     local overrides = vim.deepcopy(catalog.overrides)
     if active_field == "enabled" then overrides.enabled[check.id] = not enabled
+    elseif active_field == "auto" then
+      overrides.auto = overrides.auto or {}
+      overrides.auto[check.id] = not automatic
     else
       local scopes = { "all" }
       if present(check.files) then scopes[#scopes + 1] = "changed_files" end
@@ -253,13 +269,15 @@ function Checks.open(state, host, setup)
       rows[#rows + 1] = { id = "error", label = "Fix checks: " .. (load_error or catalog.error), wrap_label = true }
     end
     for index, check in ipairs(definitions()) do
-      local enabled, scope = effective(check)
+      local enabled, scope, automatic = effective(check)
       local command, duration = latest(check)
       local result = command and ({ pending = "Pending", running = "Running", passed = "Passed", failed = "Failed", blocked = "Blocked", interrupted = "Interrupted", skipped = "Not run", configuration_error = "Configuration error" })[command.state] or "Not run"
+      if command and present(command.reused_from) then result = "Reused: " .. result end
       local focus = selected_id == check.id and active_field
       rows[#rows + 1] = { id = check.id, label = check.name, value = check,
         columns = { string.format("%d. %s", index, check.name), check.category,
           field.render(enabled and "Enabled" or "Disabled", focus == "enabled"), field.render(scope_label(scope), focus == "scope"),
+          field.render(automatic and "Yes" or "No", focus == "auto"),
           result, duration, check.area },
         child_line_list = expanded[check.id] and details(check) or nil }
     end
@@ -279,10 +297,10 @@ function Checks.open(state, host, setup)
             or (load_error and "Check configuration could not be loaded. Fix the error below, then refresh."
               or catalog.configured and "Automatic checks follow task changes. Select a check to inspect its applicability."
               or "No checks configured. Use Setup / edit with agent to choose coverage."),
-          column_headers = { "Check", "Category", "State", "Scope", "Result", "Duration", "Area" }, option_list = rows,
+          column_headers = { "Check", "Category", "State", "Scope", "Auto", "Result", "Duration", "Area" }, option_list = rows,
           footer = "↑↓ select ←→ value Tab field [] pages ↵ run i info e edit f/T scope q close",
           action_list = {
-            { id = "field", key = "<Tab>", callback = function() active_field = active_field == "enabled" and "scope" or "enabled" picker.update(build_spec()) end },
+            { id = "field", key = "<Tab>", callback = function() active_field = ({ enabled = "scope", scope = "auto", auto = "enabled" })[active_field] picker.update(build_spec()) end },
             { id = "previous", command = "previous_value", callback = function() change(-1) end },
             { id = "next", command = "next_value", callback = function() change(1) end },
             { id = "edit", key = "e", callback = function() local check = selected() setup(check and check.id) end },

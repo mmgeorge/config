@@ -228,6 +228,7 @@ impl CheckRunner {
             id: id.clone(),
             revision,
             context: Some(CheckRunContext {
+                automatic: false,
                 trigger,
                 task_id,
                 snapshot,
@@ -285,7 +286,7 @@ impl CheckRunner {
             ensure!(
                 definition.enabled
                     || request.ids.is_empty()
-                    || !request.ids.contains(&definition.id),
+                    || (!request.ids.contains(&definition.id) && !request.include.contains(&definition.id)),
                 "{} is disabled; re-enable it in /checks",
                 definition.id
             );
@@ -321,6 +322,8 @@ impl CheckRunner {
             };
             let position = run.commands.len();
             run.commands.push(CommandCheck {
+                evidence: None,
+                reused_from: None,
                 id: format!("{id}:{position}"),
                 command: operation.unwrap_or(&definition.all).display(),
                 context: Some(CheckCommand {
@@ -424,6 +427,21 @@ impl CheckRunner {
         let cancelled = self.admit(&run.id)?;
         self.run_admitted(run, sink, external_cancelled, cancelled)
             .await
+    }
+
+    /// Finds current evidence in this task without consuming or mutating prior runs.
+    pub(crate) fn evidence(&self, run: &CheckRun, check: &CommandCheck, checkpoint: &crate::checkpoint::CheckpointRecord) -> Result<Option<(String, CommandCheck)>> {
+        let Some(task) = run.context.as_ref().and_then(|context| context.task_id.as_deref()) else { return Ok(None); };
+        for previous in self.history()?.into_iter().rev() {
+            if previous.id == run.id || previous.context.as_ref().and_then(|context| context.task_id.as_deref()) != Some(task) { continue; }
+            for command in previous.commands.iter().rev() {
+                if !matches!(command.state, CheckState::Passed | CheckState::Failed) { continue; }
+                if let Some(evidence) = &command.evidence {
+                    if evidence.covers(command, run, check, checkpoint)? { return Ok(Some((previous.id.clone(), command.clone()))); }
+                }
+            }
+        }
+        Ok(None)
     }
 
     fn admit(&self, id: &str) -> Result<Arc<AtomicBool>> {
@@ -541,6 +559,27 @@ impl CheckRunner {
                 CheckState::Passed | CheckState::Failed => continue,
                 _ => {}
             }
+            let before = self.changes.snapshot().await?;
+            if run.context.as_ref().is_some_and(|context| context.automatic)
+                && let Some(checkpoint) = before.as_ref()
+                && let Some((run_id, previous)) = self.evidence(run, &run.commands[index], checkpoint)?
+            {
+                let command = &mut run.commands[index];
+                command.state = previous.state;
+                command.exit_code = previous.exit_code;
+                command.error = previous.error;
+                command.evidence = previous.evidence;
+                command.reused_from = Some((run_id.clone(), previous.id));
+                command.stdout = previous.stdout;
+                command.stderr = previous.stderr;
+                command.output = previous.output;
+                command.output_bytes = previous.output_bytes;
+                command.preview = previous.preview;
+                command.context.as_mut().unwrap().resolved = previous.context.and_then(|context| context.resolved);
+                run.record(CheckEventKind::CheckFinished, Some(context.definition_id), format!("Reused current check evidence from {run_id}"));
+                self.publish(run, sink).await?;
+                continue;
+            }
             run.commands[index].state = CheckState::Running;
             run.commands[index].started_at_ms = Some(now_ms());
             run.record(
@@ -559,6 +598,15 @@ impl CheckRunner {
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
+            if matches!(run.commands[index].state, CheckState::Passed | CheckState::Failed)
+                && let (Some(before), Some(after)) = (before, self.changes.snapshot().await?)
+            {
+                run.commands[index].evidence = super::evidence::CheckEvidence::capture(run, &run.commands[index], before, &after)?;
+                if run.commands[index].state == CheckState::Passed && run.commands[index].evidence.is_none() {
+                    run.commands[index].state = CheckState::Failed;
+                    run.commands[index].error = Some("Check inputs changed during execution. Verify again after source changes settle.".into());
+                }
+            }
             let check = &run.commands[index];
             let kind = if check.state == CheckState::ConfigurationError {
                 CheckEventKind::ConfigurationError

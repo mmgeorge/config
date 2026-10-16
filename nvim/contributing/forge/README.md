@@ -26,6 +26,9 @@ documents for the work at hand. Do not read every subsystem chapter for a local 
 User-facing commands are documented separately in [Forge commands](../../docs/forge/commands.md)
 and package-aware configuration in [Project checks](../../docs/forge/checks.md).
 
+Harness agents run automated validation through the checks interface so execution
+and coverage are recorded. Procedure commands identify the intended check content.
+
 ## Keep documentation current
 
 Update the affected architecture chapter in the same change when ownership,

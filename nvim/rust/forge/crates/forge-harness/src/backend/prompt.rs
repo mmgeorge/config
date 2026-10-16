@@ -50,7 +50,7 @@ impl BackendRequest {
             crate::session::CheckShell::System => "the system login shell",
         };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Use harness_checks tools for automated validation outside plan execution.\n{question}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use harness_checks_run and harness_checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }

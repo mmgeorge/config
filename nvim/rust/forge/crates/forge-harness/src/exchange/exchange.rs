@@ -62,6 +62,9 @@ pub(crate) enum ExchangeActivity {
 /// Owns one admitted action or plan phase and its backend turns.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
+    #[serde(default)]
+    /// Retains one check baseline across automatic repair exchanges.
+    pub check_owner: Option<String>,
     /// Durable failure that keeps cleanup retryable without replaying execution.
     #[serde(default)]
     pub finalization_error: Option<String>,
@@ -177,7 +180,7 @@ impl Exchange {
             goal_id: None,
             state: ExchangeState::Queued,
             disposition: HistoryDisposition::Current,
-            finalization_error: None,
+            finalization_error: None, check_owner: None,
             finalization_outcome: None,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -841,7 +844,7 @@ mod test {
     fn interaction() -> Exchange {
         Exchange {
             lifecycle: None,
-            finalization_error: None,
+            finalization_error: None, check_owner: None,
             finalization_outcome: None,
             agent_id: "primary".into(),
             id: "interaction-one".into(),

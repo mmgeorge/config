@@ -86,6 +86,10 @@ impl DeclarationDesign {
     pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
         design.check_configuration = Some(crate::checks::ConfigSnapshot::load(workspace)?);
+        design.check_configuration.as_ref().unwrap().config.validate_selection(&design.document.checks)?;
+        for id in &design.document.disabled_checks {
+            anyhow::ensure!(design.check_configuration.as_ref().unwrap().config.definitions.iter().any(|check| &check.id == id), "unknown disabled planned check: {id}");
+        }
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
@@ -113,7 +117,19 @@ impl DeclarationDesign {
     /// Identifies only the planned inputs that determine check selection.
     pub(crate) fn check_preview_fingerprint(&self) -> Result<String> {
         let manifests: BTreeMap<_, _> = self.proposed.iter().filter(|(path, _)| path.ends_with("Cargo.toml") || path.ends_with("package.json") || path.ends_with("pnpm-workspace.yaml")).collect();
-        Ok(super::digest(&serde_json::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, manifests))?))
+        Ok(super::digest(&serde_json::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, &self.document.checks, &self.document.disabled_checks, manifests))?))
+    }
+
+    /// Projects plan choices independently of repository defaults and trigger applicability.
+    pub(crate) fn check_options(&self) -> Vec<serde_json::Value> {
+        self.check_configuration.as_ref().map(|snapshot| snapshot.config.definitions.iter().map(|check| {
+            let enabled = check.enabled && !self.document.disabled_checks.contains(&check.id)
+                && (check.auto || self.document.checks.contains(&check.id)
+                    || self.check_preview.iter().any(|preview| preview.id == check.id && preview.selected));
+            serde_json::json!({"id":check.id, "name":check.name, "stage":check.category,
+                "enabled":enabled, "available":check.enabled,
+                "reason":self.check_preview.iter().find(|preview| preview.id == check.id).map(|preview| &preview.reason)})
+        }).collect()).unwrap_or_default()
     }
 
     /// Rejects cached command previews after selection inputs change.

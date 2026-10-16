@@ -28,9 +28,49 @@ pub struct DesignDocument {
     pub verification: Vec<String>,
     /// Inventories changed and reused tests by file, independently of source language.
     pub tests: Vec<super::design_tests::DesignTestFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Adds configured checks explicitly, independently of automatic triggers.
+    pub checks: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Suppresses configured checks for this plan, including automatic selection.
+    pub disabled_checks: Vec<String>,
 }
 
 impl DesignDocument {
+    /// Applies plan-only choices, enabling prerequisites and disabling dependent checks together.
+    pub(crate) fn set_checks(&mut self, config: &crate::checks::CheckConfig, changes: &std::collections::BTreeMap<String, bool>) -> Result<()> {
+        ensure!(!changes.is_empty() && changes.len() <= 128, "select 1 to 128 checks");
+        for (id, enabled) in changes {
+            let check = config.definitions.iter().find(|check| &check.id == id)
+                .ok_or_else(|| anyhow::anyhow!("unknown planned check: {id}"))?;
+            ensure!(!enabled || check.enabled, "configured check is disabled: {id}");
+        }
+        let mut resolved = changes.clone();
+        loop {
+            let mut added = false;
+            for check in &config.definitions {
+                if resolved.get(&check.id) == Some(&true) {
+                    for dependency in &check.depends_on {
+                        ensure!(resolved.get(dependency) != Some(&false), "conflicting choices for prerequisite {dependency}");
+                        ensure!(config.definitions.iter().any(|candidate| &candidate.id == dependency && candidate.enabled), "configured prerequisite is disabled: {dependency}");
+                        added |= resolved.insert(dependency.clone(), true).is_none();
+                    }
+                }
+                if check.depends_on.iter().any(|dependency| resolved.get(dependency) == Some(&false)) {
+                    ensure!(resolved.get(&check.id) != Some(&true), "conflicting choices for dependent {}", check.id);
+                    added |= resolved.insert(check.id.clone(), false).is_none();
+                }
+            }
+            if !added { break; }
+        }
+        for (id, enabled) in resolved {
+            self.checks.retain(|selected| selected != &id);
+            self.disabled_checks.retain(|selected| selected != &id);
+            if enabled { self.checks.push(id); } else { self.disabled_checks.push(id); }
+        }
+        self.validate()
+    }
+
     /// Projects metadata into one shared order for review, revision diffs, and section reads.
     pub(crate) fn sections(&self) -> Vec<DesignSection> {
         vec![
@@ -109,6 +149,10 @@ impl DesignDocument {
 
     /// Rejects malformed or oversized metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(self.checks.len() <= 128, "plan checks exceeds 128 entries");
+        ensure!(self.checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid planned check id");
+        ensure!(self.disabled_checks.len() <= 128 && self.disabled_checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid disabled plan checks");
+        ensure!(self.checks.iter().all(|id| !self.disabled_checks.contains(id)), "plan check cannot be enabled and disabled");
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
         for action in &self.verification {
