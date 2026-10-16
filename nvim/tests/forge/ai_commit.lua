@@ -118,23 +118,22 @@ local function run()
       assert_equal(params.model.model, "fixture-model")
       callback({ state = "ready", message = "fix: use configured API" })
     end,
-    request = function() error("API generation initialized Harness") end,
+    request_generation = function() error("API generation selected a CLI provider") end,
   }
   ai_commit.ensure("D:/configured-api", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/configured-api", "HEAD").message, "fix: use configured API")
   package.loaded["ai.adapters"] = { get = function() return { commit = "harness" } end }
   package.loaded.ai = { resolve = function() error("Harness fallback resolved an API model") end }
   package.loaded["forge.client"] = {
-    request_host = function() error("Harness fallback bypassed session initialization") end,
-    request = function(method, params, callback)
-      assert_equal(method, "repository.generate")
+    request = function() error("Commit generation initialized a conversation") end,
+    request_generation = function(params, callback)
       assert_equal(params.model, nil, "fallback hardcoded a provider or model")
       callback({ state = "ready", message = "fix: use recent Harness\n\nPreserve the body." })
     end,
   }
   ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
-  package.loaded["forge.client"].request = function(_, _, callback)
+  package.loaded["forge.client"].request_generation = function(_, callback)
     callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
   end
   ai_commit.ensure("D:/unsupported-harness", { ref = "HEAD" })

@@ -72,4 +72,59 @@ assert(vim.deep_equal(before, vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, 
 assert(replica.revision == 2 and #notices == 1)
 input.close(view)
 render.close(replica)
+
+for _, direction in ipairs({ "stage", "unstage" }) do
+  for _, location in ipairs({ "file", "body", "tail" }) do
+    local source_section = direction == "stage" and "unstaged" or "staged"
+    local destination_section = direction == "stage" and "staged" or "unstaged"
+    replica = render.open("cursor-" .. direction .. "-" .. location, {
+      notice = function(message) notices[#notices + 1] = message end,
+    })
+    vim.api.nvim_win_set_buf(0, replica.buffer)
+    assert(render.apply_snapshot(replica, {
+      document = replica.document, revision = 0, view = { kind = "status" },
+      head = { state = "attached", reference = "main", object = "abc" },
+      section = { { kind = source_section, file = { 1, 2 } } },
+      file = { record(1, 1, source_section), record(2, 1, source_section) }, pending = {},
+    }).kind == "Applied")
+    local cursor_block = "file:1"
+    if location ~= "file" then
+      assert(require("forge.nodes").set_open(replica, 0, cursor_block, true))
+      local group = location == "tail" and { "removed", "middle", "last" } or { "removed" }
+      assert(render.apply_body(replica, delivery(1, 1, group)).kind == "Applied")
+      cursor_block = location == "tail" and "body:last" or "body:removed"
+    end
+    local _, cursor_row = replica.sequence:position(cursor_block)
+    vim.api.nvim_win_set_cursor(0, { cursor_row + 1, 2 })
+    local position = vim.api.nvim_win_get_cursor(0)
+    local viewport = vim.fn.winsaveview()
+    assert(render.apply_update(replica, {
+      document = replica.document, operation_id = 1, phase = "accepted", diagnostic = {}, body = {},
+      delta = {
+        document = replica.document, base = 0, next = 1, removed = { 1 },
+        file = { record(3, 1, destination_section) },
+        section = {
+          { kind = source_section, file = { 2 } },
+          { kind = destination_section, file = { 3 } },
+        },
+        pending = { 1 },
+      },
+    }).kind == "Applied")
+    local expected_row = math.min(position[1], vim.api.nvim_buf_line_count(replica.buffer))
+    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { expected_row, position[2] }),
+      direction .. " moved the cursor from the removed " .. location)
+    assert(vim.fn.winsaveview().topline == viewport.topline,
+      direction .. " scrolled the viewport")
+    local settled_position = vim.api.nvim_win_get_cursor(0)
+    assert(render.apply_update(replica, {
+      document = replica.document, operation_id = 1, phase = "settled", diagnostic = {}, body = {},
+      delta = { document = replica.document, base = 1, next = 2,
+        removed = {}, file = {}, section = {}, pending = {} },
+    }).kind == "Applied")
+    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), settled_position),
+      direction .. " settlement moved the cursor")
+    render.close(replica)
+  end
+end
+assert(#notices == 1, table.concat(notices, "\n"))
 print("optimistic status rendering: passed")

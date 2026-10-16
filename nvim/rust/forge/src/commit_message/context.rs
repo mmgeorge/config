@@ -486,6 +486,7 @@ mod tests {
             comparison: Comparison::Head,
             ignored_paths: vec![],
             model: None,
+            generation: None,
         };
         let mut pending = Box::pin(collect(&store, &diff, &request));
         let before_release =
@@ -534,6 +535,7 @@ mod tests {
             comparison: Comparison::Head,
             ignored_paths: vec!["excluded.txt".into()],
             model: None,
+            generation: None,
         };
         let prompt = collect(&store, &diff, &request)
             .await

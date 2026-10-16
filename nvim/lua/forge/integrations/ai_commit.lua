@@ -53,7 +53,7 @@ local function native_request(cwd, ref, ignored, callback, is_current)
     callback(result, failure)
   end
   if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
-  elseif selected == "harness" then require("forge.client").request("repository.generate", params, receive)
+  elseif selected == "harness" then require("forge.client").request_generation(params, receive)
   else require("forge.client").request_host("repository.generate", params, receive) end
 end
 

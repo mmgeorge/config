@@ -28,6 +28,11 @@ local RESERVED_METHOD = {
 ---@alias ForgeCallback fun(result?: any, error?: string, error_detail?: table)
 ---@alias ForgeSubscriber fun(event: string, payload: any, session_id?: string)
 
+---@class ForgeTextGenerationConfig
+---@field backend {kind: string, command: string[]}
+---@field model string
+---@field data_root string
+
 ---@class ForgeClient
 ---@field process table?
 ---@field generation integer
@@ -819,6 +824,26 @@ function M.request_host(method, params, callback, progress)
       write_request(id, method, params)
     end)
   end)
+end
+
+---@param params table
+---@param callback ForgeCallback
+function M.request_generation(params, callback)
+  local harness_config = config.options.harness
+  local selected = session.harness.session
+  local backend = selected and selected.backend or harness_config.backend
+  if not selected and not config.harness_backend_explicit then
+    backend = backend_preference.load(harness_config.backends, backend)
+  end
+  local configured = harness_config.backends[backend]
+  if not configured then callback(nil, "Unknown Harness backend: " .. tostring(backend)) return end
+  ---@type ForgeTextGenerationConfig
+  local generation = {
+    backend = { kind = backend, command = vim.deepcopy(configured.command or {}) },
+    model = selected and selected.model or harness_config.model,
+    data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
+  }
+  M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback)
 end
 
 ---@param action string

@@ -67,7 +67,9 @@ function M.capture(session, retained)
       local block, offset = node.id, canonical_row - start
       local projection_offset = source and session.physical_row
         and original_row - session.physical_row(canonical_row) or nil
-      if not retained(block) then
+      if not retained(block) and session.retain_removed_position then
+        block, offset, projection_offset = nil, 0, nil
+      elseif not retained(block) then
         projection_offset = nil
         block, offset = nil, 0
         local ancestor_size

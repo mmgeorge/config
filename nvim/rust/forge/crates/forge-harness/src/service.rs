@@ -22,6 +22,15 @@ use crate::protocol::HarnessMethod;
 use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 
+/// Defines provider settings for one-shot generation without a conversation lease.
+#[derive(Clone, Debug, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TextGenerationConfig {
+    pub backend: crate::backend::BackendLaunch,
+    pub model: String,
+    pub data_root: PathBuf,
+}
+
 /// Owns lazy Harness initialization and independently serialized session controllers.
 pub struct HarnessService {
     repositories: Arc<RepositoryStore>,
@@ -33,26 +42,39 @@ pub struct HarnessService {
 }
 
 impl HarnessService {
+    /// Generate isolated text from provider settings without resolving a conversation controller.
     pub async fn generate_text(
         &self,
-        session_id: Option<String>,
+        config: TextGenerationConfig,
         workspace: &str,
         purpose: crate::backend::TextGeneration,
         input: &str,
     ) -> Result<String> {
         let _activity = self.admit().await?;
-        let registry = self.registry().await?;
-        let session_id = session_id.as_deref().unwrap_or(&registry.initial_session_id);
-        let controller = registry.resolve(session_id).await?;
-        let selected = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?
-            .load_session(session_id)?
-            .context("Harness generation session is missing")?;
-        let mut request = controller.catalog_request.read().await.clone();
-        request.workspace = workspace.to_owned();
-        request.backend_session_id = None;
-        let text = controller.backend.generate_text(request, purpose, &selected.model, input)
-            .await.with_context(|| format!("{} {} generation failed", selected.backend, purpose.name()))?;
-        purpose.validate(&text)
+        let mut model = config.model;
+        if model == "default" && config.data_root.join("harness.sqlite3").is_file() {
+            if let Some(preference) = SqliteStore::open(&config.data_root)?
+                .load_preference(workspace, &config.backend.kind)? {
+                model = preference.model;
+            }
+        }
+        ensure!(!model.is_empty() && model.len() <= 256, "invalid generation model identity");
+        let temporary = tempfile::tempdir()?;
+        let permission_store = crate::permissions::store::PermissionStore::load(
+            temporary.path().join("permissions.json"), workspace)?;
+        let permission = Arc::new(crate::backend::approval::PermissionCoordinator::new(
+            Arc::new(std::sync::RwLock::new(permission_store))));
+        let trace = Arc::new(crate::trace::TraceStore::open(&config.data_root)?);
+        let backend = crate::backend::build(config.backend, permission, trace, config.data_root)?;
+        let request = crate::backend::BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: format!("generation-{}", uuid::Uuid::new_v4()),
+            workspace: workspace.to_owned(),
+            access: backend.descriptor().kind.resolve_access(crate::session::AccessPolicy::default()),
+            execution_mode: crate::session::PermissionMode::Read,
+            backend_session_id: None,
+        };
+        generate_isolated_text(backend.as_ref(), request, purpose, &model, input).await
     }
 
     pub async fn saved_diff(
@@ -892,6 +914,25 @@ impl SessionControllerRegistry {
                 gate.wait().await
             }
         }
+    }
+}
+
+async fn generate_isolated_text(
+    backend: &dyn crate::backend::Backend,
+    request: crate::backend::BackendCatalogRequest,
+    purpose: crate::backend::TextGeneration,
+    model: &str,
+    input: &str,
+) -> Result<String> {
+    let provider = backend.descriptor().label;
+    let result = backend.generate_text(request, purpose, model, input).await
+        .with_context(|| format!("{provider} {} generation failed", purpose.name()));
+    let cleanup = tokio::time::timeout(Duration::from_secs(8), backend.shutdown()).await
+        .context("Isolated provider shutdown timed out").and_then(|result| result);
+    match (result, cleanup) {
+        (Err(failure), Err(cleanup)) => Err(failure.context(format!("Isolated provider cleanup failed: {cleanup:#}"))),
+        (Err(failure), _) | (_, Err(failure)) => Err(failure),
+        (Ok(text), Ok(())) => purpose.validate(&text),
     }
 }
 
@@ -2196,35 +2237,23 @@ mod tests {
     use forge_diff::cache::CacheLimits;
 
     #[tokio::test]
-    async fn isolated_generation_uses_selected_session_model_without_owning_its_turn() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
-        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
-        let registry = service.registry().await?;
-        let mut store = SqliteStore::open(&fixture.path().join("data"))?;
-        let mut selected = store.load_session(&session_id)?.unwrap();
-        selected.model = "selected-model".into();
-        store.save_session(&selected)?;
-        let backend = Arc::new(GenerationBackend { request: std::sync::Mutex::new(Vec::new()) });
-        {
-            let mut controllers = registry.controller_by_id.write().await;
-            Arc::get_mut(controllers.get_mut(&session_id).unwrap()).unwrap().backend = backend.clone();
-        }
-        let controller = registry.resolve(&session_id).await?;
-        let broker = controller.broker.lock().await;
-        let history_revision = controller.presentation.lock().unwrap().revision();
-        for target in [None, Some(session_id.clone())] {
-            let text = tokio::time::timeout(Duration::from_secs(1),
-                service.generate_text(target, "commit-workspace", TextGeneration::CommitMessage, "Staged diff:\n+change"),
-            ).await??;
-            assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
-        }
-        assert_eq!(controller.presentation.lock().unwrap().revision(), history_revision);
+    async fn isolated_generation_uses_configured_model_without_a_conversation() -> Result<()> {
+        let backend = GenerationBackend {
+            request: std::sync::Mutex::new(Vec::new()), shutdown: AtomicBool::new(false), fail: false,
+        };
+        let request = BackendCatalogRequest {
+            execution_owner: None, harness_session_id: "generation-fixture".into(),
+            workspace: "commit-workspace".into(), access: Default::default(),
+            execution_mode: crate::session::PermissionMode::Read, backend_session_id: None,
+        };
+        let text = generate_isolated_text(&backend, request.clone(), TextGeneration::CommitMessage,
+            "selected-model", "Staged diff:\n+change").await?;
+        assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
+        assert!(backend.shutdown.load(Ordering::Acquire));
         let requests = backend.request.lock().unwrap();
-        assert_eq!(requests.len(), 2);
+        assert_eq!(requests.len(), 1);
         for (request, purpose, model, input) in requests.iter() {
-            assert_eq!(request.harness_session_id, session_id);
+            assert_eq!(request.harness_session_id, "generation-fixture");
             assert_eq!(request.workspace, "commit-workspace");
             assert!(request.backend_session_id.is_none());
             assert_eq!(*purpose, TextGeneration::CommitMessage);
@@ -2232,24 +2261,65 @@ mod tests {
             assert_eq!(input, "Staged diff:\n+change");
         }
         drop(requests);
-        drop(broker);
-        drop(controller);
-        {
-            let mut controllers = registry.controller_by_id.write().await;
-            Arc::get_mut(controllers.get_mut(&session_id).unwrap()).unwrap().backend =
-                Arc::new(SteeringBackend { request: Mutex::new(Vec::new()) });
-        }
-        let error = service.generate_text(Some(session_id), "commit-workspace",
-            TextGeneration::CommitMessage, "Staged diff:\n+change").await.unwrap_err();
+        let unsupported = SteeringBackend { request: Mutex::new(Vec::new()) };
+        let error = generate_isolated_text(&unsupported, request,
+            TextGeneration::CommitMessage, "selected-model", "Staged diff:\n+change").await.unwrap_err();
         let diagnostic = format!("{error:#}");
-        assert!(diagnostic.contains("mock commit_message generation failed"), "{diagnostic}");
+        assert!(diagnostic.contains("commit_message generation failed"), "{diagnostic}");
         assert!(diagnostic.contains("text_generation"), "{diagnostic}");
-        service.shutdown(Duration::from_secs(1)).await?;
+        let failing = GenerationBackend {
+            request: std::sync::Mutex::new(Vec::new()), shutdown: AtomicBool::new(false), fail: true,
+        };
+        let request = BackendCatalogRequest {
+            execution_owner: None, harness_session_id: "generation-failure".into(),
+            workspace: "commit-workspace".into(), access: Default::default(),
+            execution_mode: crate::session::PermissionMode::Read, backend_session_id: None,
+        };
+        let failure = generate_isolated_text(&failing, request, TextGeneration::CommitMessage,
+            "selected-model", "Staged diff:\n+change").await.unwrap_err();
+        assert!(format!("{failure:#}").contains("fixture generation failure"));
+        assert!(failing.shutdown.load(Ordering::Acquire));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn isolated_generation_never_acquires_another_editors_session_lease() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let owner = service();
+        let opened = owner.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let data_root = fixture.path().join("data");
+        let store = SqliteStore::open(&data_root)?;
+        let before = store.load_session(&session_id)?.unwrap();
+        let registry = owner.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let broker = controller.broker.lock().await;
+        let generator = service();
+        let error = tokio::time::timeout(Duration::from_secs(1), generator.generate_text(
+            TextGenerationConfig {
+                backend: crate::backend::BackendLaunch { kind: "mock".into(), command: vec![] },
+                model: "default".into(), data_root,
+            },
+            &before.workspace, TextGeneration::CommitMessage, "Staged diff:\n+change",
+        )).await?.unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("text_generation"), "{diagnostic}");
+        assert!(!diagnostic.contains("controlled by another"), "{diagnostic}");
+        assert!(generator.registry.lock().await.is_none());
+        let after = store.load_session(&session_id)?.unwrap();
+        assert_eq!(after.lease_owner, before.lease_owner);
+        assert_eq!(after.model, before.model);
+        assert_eq!(after.updated_at_ms, before.updated_at_ms);
+        drop(broker);
+        owner.shutdown(Duration::from_secs(1)).await?;
+        generator.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
 
     struct GenerationBackend {
         request: std::sync::Mutex<Vec<(BackendCatalogRequest, TextGeneration, String, String)>>,
+        shutdown: AtomicBool,
+        fail: bool,
     }
 
     #[async_trait::async_trait]
@@ -2257,6 +2327,7 @@ mod tests {
         async fn generate_text(&self, request: BackendCatalogRequest, purpose: TextGeneration,
             model: &str, input: &str) -> Result<String> {
             self.request.lock().unwrap().push((request, purpose, model.into(), input.into()));
+            ensure!(!self.fail, "fixture generation failure");
             Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
         }
         fn descriptor(&self) -> BackendDescriptor {
@@ -2265,7 +2336,10 @@ mod tests {
         async fn prompt_stream(&self, _: BackendRequest, _: Option<BackendEventSink>) -> Result<BackendOutput> {
             anyhow::bail!("isolated generation must not submit a conversational turn")
         }
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            self.shutdown.store(true, Ordering::Release);
+            Ok(())
+        }
         async fn cleanup_execution(&self, _: &str) -> Result<()> { Ok(()) }
         async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
         async fn has_active_turn(&self, _: &str) -> bool { false }

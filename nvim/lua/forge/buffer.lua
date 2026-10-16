@@ -163,7 +163,7 @@ end
 --- Creates a native replica. before_commit runs after preparation, without yielding,
 --- immediately before view capture and native mutation. It must not schedule work.
 ---@param document string
----@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, before_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
+---@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, retain_removed_position?: boolean, before_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
 function M.open(document, options)
   options = options or {}
   identity(document)
@@ -190,6 +190,7 @@ function M.open(document, options)
     source_projected = options.source_projected == true,
     physical = physical, generated = generated, previous_native = previous_native,
     preserve_view = options.preserve_view == true,
+    retain_removed_position = options.retain_removed_position == true,
     before_commit = options.before_commit,
     expected_changedtick = generated and options.expected_changedtick or nil,
     generated_filetype = options.filetype or "forge",

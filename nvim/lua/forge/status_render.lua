@@ -53,6 +53,7 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field width integer
 ---@field context_width? integer
 ---@field row_count integer
+---@field retain_removed_position boolean
 ---@field fold table
 ---@field changedtick integer
 ---@field generation integer
@@ -391,7 +392,9 @@ end
 ---@param options table
 ---@return ForgeStatusReplica
 function M.open(document, options)
-  local session = buffer.open(document, vim.tbl_extend("force", options or {}, { preserve_view = true }))
+  local session = buffer.open(document, vim.tbl_extend("force", options or {}, {
+    preserve_view = true, retain_removed_position = true,
+  }))
   session.file, session.body_owner, session.root, session.commit = {}, {}, Sequence.new(), {}
   session.presentation, session.width, session.generation = { pr = { state = "fetching" }, about = { state = "none" } }, 80, 0
   session.locate = function(row, column) return M.locate(session, row, column) end

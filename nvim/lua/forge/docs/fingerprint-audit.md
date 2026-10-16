@@ -8,6 +8,14 @@ The commit editor reuses the current draft, and Ctrl-A explicitly regenerates fr
 staged contents. The earlier measurements below are historical. Other subsystem
 hash boundaries remain as documented.
 
+Commit generation uses standalone provider requests. The `harness` adapter selects
+the active provider and model, or the configured provider and saved workspace model
+when no conversation is selected. Lua sends those settings through the host-only
+request path without initializing Harness or attaching a conversation ID. Rust
+creates an isolated backend, generates one message, and shuts the backend down on
+success or failure. Generation never resolves a chat-session controller or acquires
+its ownership lease, so another Neovim instance can keep that conversation open.
+
 Forge uses Git object IDs and filesystem metadata for ordinary observation and AI
 message reuse. Exact byte checks remain where a mismatch can authorize a destructive
 write, reuse analysis for different text, or restore the wrong persisted object.

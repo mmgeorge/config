@@ -6,10 +6,16 @@ local function git(arguments)
   local result = vim.system(vim.list_extend({ "git", "-C", fixture }, arguments), { text = true, timeout = 10000 }):wait()
   assert(result.code == 0, result.stderr)
 end
-local function request(comparison, operation)
+---@param comparison string
+---@param operation? string
+---@param generation? ForgeTextGenerationConfig
+---@return table? response
+---@return string? failure
+local function request(comparison, operation, generation)
   local response, failure, completed
   client.request_host("repository.generate", { operation = operation or "generate", workspace = fixture, comparison = comparison,
-    model = { provider = "fixture", model = "fixture" } }, function(result, error)
+    model = not generation and { provider = "fixture", model = "fixture" } or nil,
+    generation = generation }, function(result, error)
       response, failure, completed = result, error, true
     end)
   assert(vim.wait(10000, function() return completed end, 10), "generation host did not respond")
@@ -31,6 +37,12 @@ local ok, failure = xpcall(function()
   git({ "add", "tracked.txt" })
   result, error = request("staged")
   assert(not result and error == "unsupported detached generation provider fixture", vim.inspect({ result, error }))
+  result, error = request("staged", "generate", {
+    backend = { kind = "mock", command = { "mock" } }, model = "fixture-model", data_root = fixture .. "/generation-data",
+  })
+  assert(not result and error:find("text_generation", 1, true), vim.inspect({ result, error }))
+  assert(not error:find("Harness is not initialized", 1, true), error)
+  assert(not client._client.harness_ready, "standalone generation initialized a conversation")
   result, error = request("head", "fingerprint")
   assert(not result and error:find("unknown detached generation operation", 1, true), "obsolete fingerprint request remains supported")
 end, debug.traceback)

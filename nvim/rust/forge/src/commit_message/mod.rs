@@ -7,7 +7,10 @@ use std::time::Duration;
 use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_git::store::RepositoryStore;
-use forge_harness::{backend::TextGeneration, service::HarnessService};
+use forge_harness::{
+    backend::TextGeneration,
+    service::{HarnessService, TextGenerationConfig},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -49,6 +52,7 @@ pub struct GenerationRequest {
     #[serde(default)]
     pub ignored_paths: Vec<String>,
     pub model: Option<ModelSpec>,
+    pub generation: Option<TextGenerationConfig>,
 }
 
 #[derive(Clone, Serialize)]
@@ -86,12 +90,15 @@ impl CommitMessageService {
         &self,
         params: Value,
         harness: &HarnessService,
-        session_id: Option<String>,
     ) -> Result<GenerationResponse> {
         let request: GenerationRequest = serde_json::from_value(params)?;
         ensure!(
             request.operation == "generate",
             "unknown detached generation operation"
+        );
+        ensure!(
+            request.model.is_some() != request.generation.is_some(),
+            "generation requires exactly one API model or standalone provider configuration"
         );
         let permit = Arc::new(GenerationPermit {
             permit: Some(
@@ -142,7 +149,14 @@ impl CommitMessageService {
             );
             provider::generate(&self.http, model, prompt, &permit).await?
         } else {
-            harness.generate_text(session_id, &request.workspace, TextGeneration::CommitMessage, prompt).await?
+            harness
+                .generate_text(
+                    request.generation.context("Missing standalone provider configuration")?,
+                    &request.workspace,
+                    TextGeneration::CommitMessage,
+                    prompt,
+                )
+                .await?
         };
         response.message = Some(message);
         Ok(response)
