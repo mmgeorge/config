@@ -128,7 +128,7 @@ impl AutomaticChecks {
         self.delivered = identities;
         self.blocked = None;
         let prompt = format!(
-            "Automatic checks prevent task completion. Fix the failures below and verify through harness_checks_run and harness_checks_status. Do not run validation commands through terminal tools. Preserve the original task scope. A turn ending with the same failed inputs will stop automatic repair.\n\n{findings}"
+            "Automatic checks prevent task completion. Fix the failures below and verify through checks_run and checks_status. Do not run validation commands through terminal tools. Preserve the original task scope. A turn ending with the same failed inputs will stop automatic repair.\n\n{findings}"
         );
         self.repair_prompt = Some(prompt.clone());
         self.repair_exchange = None;

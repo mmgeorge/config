@@ -387,7 +387,7 @@ impl HarnessBroker {
                     for reference in report.evidence.iter().chain(report.checks.iter().flat_map(|check| &check.evidence)) {
                         anyhow::ensure!(
                             tools.iter().any(|tool| tool["id"].as_str() == Some(reference.as_str())),
-                            "verification evidence {reference} is not a completed tool result in this execution. Call harness_plan_read with only plan_id and use exact IDs from execution.verification_evidence."
+                            "verification evidence {reference} is not a completed tool result in this execution. Call plan_read with only plan_id and use exact IDs from execution.verification_evidence."
                         );
                         if let Some(call_id) = tools.iter().find(|tool| tool["id"].as_str() == Some(reference.as_str()))
                             .and_then(|tool| tool["call_id"].as_str()) {

@@ -1095,8 +1095,8 @@ bound to a live root turn and parent exchange, expires when the turn ends, and i
 at admission. Children receive no delegation tools or root planning authority.
 
 The portable `subagent_tools` setting defaults to false. Enabling it exposes exactly
-`harness_spawn_agent`, `harness_send_message`, `harness_followup_task`, `harness_interrupt_agent`,
-`harness_list_agents`, `harness_agent_activity`, and `harness_agent_tool_output` to the root model. Manual spawning remains available
+`agent_spawn`, `agent_send`, `agent_followup`, `agent_interrupt`,
+`agent_list`, `agent_activity`, and `agent_tool_output` to the root model. Manual spawning remains available
 when the setting is disabled. Completion enters a durable queue of unreported child results.
 The broker sends each result as an attributed parent message through supported active steering,
 or includes it at the next input boundary. Unfinished model delegation can continue the same
@@ -1104,7 +1104,7 @@ exchange after a provider turn ends. Manual completion never starts idle root wo
 wait tool is exposed. Main yields when only delegated work remains, and Harness resumes it
 after the relevant children settle or new user input arrives.
 
-`harness_agent_activity` selects the child's active run before queued follow-ups, or its latest
+`agent_activity` selects the child's active run before queued follow-ups, or its latest
 run when idle. It returns the most recent entries in timeline order, elapsed milliseconds,
 last accepted provider activity, and approval/input state. Tool entries contain lifecycle,
 failure status, elapsed time, and an opaque call reference. They contain no output. Thought and
@@ -1112,7 +1112,7 @@ commentary entries retain up to 4000 Unicode characters with an explicit truncat
 answers remain on the existing completion-delivery path. The tool defaults to five entries,
 with per-call overrides bounded to 1–20.
 
-`harness_agent_tool_output` resolves a reference containing the session, child, exchange,
+`agent_tool_output` resolves a reference containing the session, child, exchange,
 turn, and call identities. The broker validates every ownership boundary before reading.
 References survive child completion and follow-ups. Output reads use zero-based Unicode
 character offsets, default to 8000 characters, and reject limits above 32000. SQLite reads

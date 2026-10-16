@@ -746,7 +746,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
         end
       elseif content and node.item.kind == "tool" then
         local question_control = (content.title or ""):match("^([^%(]+)") or ""
-        if not (question_turn[node.turn_id] and question_control:match("harness_question_ask%s*$")
+        if not (question_turn[node.turn_id] and question_control:match("question_ask%s*$")
             and not content.failed and (content.status == "completed" or content.status == "success")) then
         local first = #result.lines + 1
         append_tool(result, content, ("exchange:%s:turn:%s"):format(interaction.id, node.turn_id), first,

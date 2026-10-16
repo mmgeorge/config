@@ -614,14 +614,14 @@ mod test {
 
     #[test]
     fn long_json_response_starts_beside_branch_in_preview_and_expansion() -> Result<()> {
-        let response = r#"{"ok":false,"tool":"harness_plan_read","phase":"semantic_execution","code":"semantic_execution_failed","message":"plan controls require Harness Plan mode"}"#;
+        let response = r#"{"ok":false,"tool":"plan_read","phase":"semantic_execution","code":"semantic_execution_failed","message":"plan controls require Harness Plan mode"}"#;
         for columns in [40, 70, 120] {
             let profile = WidthProfile { columns, ..WidthProfile::default() };
             let renderer = TranscriptRenderer::new(&profile)?;
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
                     BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), true,
-                    "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
+                    "plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
                 assert!(rows[1].starts_with("  └ "));

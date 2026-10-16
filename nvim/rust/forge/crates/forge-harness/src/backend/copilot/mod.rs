@@ -757,7 +757,7 @@ impl Backend for CopilotBackend {
                     if request.mode == PromptMode::ExecutePlan && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
                         if provider_event.event_type == "tool.execution_start"
-                            && matches!(provider_event.data.get("toolName").and_then(Value::as_str), Some("harness_plan_phase_done"))
+                            && matches!(provider_event.data.get("toolName").and_then(Value::as_str), Some("plan_phase_done"))
                             && let Some(call_id) = call_id {
                             execution_control_call.insert(call_id.to_owned());
                         }
@@ -1771,14 +1771,14 @@ mod test {
         let mut stream = router.activate(context).unwrap();
         router
             .route(ControlToolInvocation {
-                name: "harness_goal_complete".into(),
+                name: "goal_complete".into(),
                 arguments: serde_json::json!({ "summary": "Complete" }),
             })
             .await
             .unwrap();
         assert_eq!(
             stream.receive().await.unwrap().name,
-            "harness_goal_complete"
+            "goal_complete"
         );
     }
 
@@ -1791,7 +1791,7 @@ mod test {
 
         let response = router
             .route(ControlToolInvocation {
-                name: "harness_goal_complete".into(),
+                name: "goal_complete".into(),
                 arguments: serde_json::json!({}),
             })
             .await
@@ -1799,7 +1799,7 @@ mod test {
         let failure: Value = serde_json::from_str(&response).expect("valid failure JSON");
 
         assert_eq!(failure["ok"], false);
-        assert_eq!(failure["tool"], "harness_goal_complete");
+        assert_eq!(failure["tool"], "goal_complete");
         assert_eq!(failure["phase"], "argument_validation");
         assert_eq!(failure["code"], "invalid_arguments");
         assert_eq!(failure["violation"][0]["path"], "<arguments>");
@@ -1815,14 +1815,14 @@ mod test {
         for _ in 0..32 {
             router
                 .route(ControlToolInvocation {
-                    name: "harness_goal_status".into(),
+                    name: "goal_status".into(),
                     arguments: serde_json::json!({ "status": "working" }),
                 })
                 .await
                 .unwrap();
         }
         let terminal = ControlToolInvocation {
-            name: "harness_goal_complete".into(),
+            name: "goal_complete".into(),
             arguments: serde_json::json!({ "summary": "finished" }),
         };
         assert!(
@@ -1833,17 +1833,17 @@ mod test {
                 .to_string()
                 .contains("admission is full")
         );
-        assert_eq!(stream.receive().await.unwrap().name, "harness_goal_status");
+        assert_eq!(stream.receive().await.unwrap().name, "goal_status");
         assert_eq!(
             router.route(terminal).await.unwrap(),
             "Goal control accepted"
         );
         for _ in 0..31 {
-            assert_eq!(stream.receive().await.unwrap().name, "harness_goal_status");
+            assert_eq!(stream.receive().await.unwrap().name, "goal_status");
         }
         assert_eq!(
             stream.receive().await.unwrap().name,
-            "harness_goal_complete"
+            "goal_complete"
         );
         assert!(stream.try_receive().is_err());
     }
@@ -1857,7 +1857,7 @@ mod test {
         assert!(
             router
                 .route(ControlToolInvocation {
-                    name: "harness_goal_complete".into(),
+                    name: "goal_complete".into(),
                     arguments: Value::String("x".repeat(256 * 1024)),
                 })
                 .await
@@ -1869,7 +1869,7 @@ mod test {
         assert_eq!(
             router
                 .route(ControlToolInvocation {
-                    name: "harness_goal_complete".into(),
+                    name: "goal_complete".into(),
                     arguments: serde_json::json!({ "summary": "finished" }),
                 })
                 .await
@@ -1878,7 +1878,7 @@ mod test {
         );
         assert_eq!(
             stream.receive().await.unwrap().name,
-            "harness_goal_complete"
+            "goal_complete"
         );
     }
 

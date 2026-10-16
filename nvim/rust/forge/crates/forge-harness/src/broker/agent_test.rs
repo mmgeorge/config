@@ -485,7 +485,7 @@ impl Backend for RoutingBackend {
         let response = if request.owner()?.is_root() {
             if ordinal == 0 {
                 let scope=request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("missing root authority")?;
-                scope.invoke("harness_spawn_agent",json!({"profile":"routing-child","text":"CHILD_RESULT"})).await?;
+                scope.invoke("agent_spawn",json!({"profile":"routing-child","text":"CHILD_RESULT"})).await?;
                 "Waiting"
             } else {
                 anyhow::ensure!(ordinal == 1,"root continuation duplicated");
@@ -678,7 +678,7 @@ impl Backend for ResultReceivingBackend {
         if !request.input.text().starts_with("EXPLICIT_NEXT_TURN") {
             let scope=request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("root authority missing")?;
             for task in ["first", "second"] {
-                scope.invoke("harness_spawn_agent",json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")})).await?;
+                scope.invoke("agent_spawn",json!({"profile":"worker","text":format!("CHILD_REPORT_{task}")})).await?;
             }
             loop {
                 let notified=self.incoming.notified();
@@ -862,7 +862,7 @@ impl Backend for SuspendedParentBackend {
                 for name in ["ONE", "TWO"] {
                     scope
                         .invoke(
-                            "harness_spawn_agent",
+                            "agent_spawn",
                             json!({"profile":"worker","text":format!("CHILD_{name}")}),
                         )
                         .await?;

@@ -25,7 +25,7 @@ impl BackendRequest {
                 "Answer the anchored plan review question only. Do not edit, submit, implement, or ask follow-up questions."
             }
             PromptMode::ExecutePlan => {
-                "Continue the Execute task at its supplied phase and accepted revision. Use harness_plan_phase_done, not goal completion, to advance execution."
+                "Continue the Execute task at its supplied phase and accepted revision. Use plan_phase_done, not goal completion, to advance execution."
             }
             PromptMode::GoalContinuation => {
                 "Continue the active Goal task toward its objective. Report completion only when all required work is finished, or a concrete blocker when no authorized progress remains."
@@ -39,9 +39,9 @@ impl BackendRequest {
             .as_ref()
             .is_some_and(|context| context.planning_feedback)
         {
-            "Harness already recorded and consumed the supplied planning answers. Do not call harness_question_answer or harness_question_withdraw for them."
+            "Harness already recorded and consumed the supplied planning answers. Do not call question_answer or question_withdraw for them."
         } else {
-            "Use harness_question_answer only for an explicit answer to a currently pending question, and harness_question_withdraw only when that decision is no longer needed."
+            "Use question_answer only for an explicit answer to a currently pending question, and question_withdraw only when that decision is no longer needed."
         };
         let shell = self.control_context.as_ref().map_or(Default::default(), |context|context.check_shell);
         let interpreter = match shell {
@@ -50,10 +50,10 @@ impl BackendRequest {
             crate::session::CheckShell::System => "the system login shell",
         };
         let lsp = if self.control_context.as_ref().and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available()) {
-            "\nLSP exploration is enabled. Prefer harness_lsp for semantic code exploration: workspace_symbols finds names, document_symbols outlines a file, definition/type_definition/implementation resolve a position, references and calls trace use, and hover explains types. Use exact one-based positions from results. Inspect file diagnostics after edits, but stale or unknown diagnostics do not prove a successful typecheck. Results use live editor contents and mark unsaved buffers. Request only needed results and follow next_offset when necessary. Use text search for literals or when LSP is unavailable."
+            "\nLSP exploration is enabled. Prefer lsp for semantic code exploration: workspace_symbols finds names, document_symbols outlines a file, definition/type_definition/implementation resolve a position, references and calls trace use, and hover explains types. Use exact one-based positions from results. Inspect file diagnostics after edits, but stale or unknown diagnostics do not prove a successful typecheck. Results use live editor contents and mark unsaved buffers. Request only needed results and follow next_offset when necessary. Use text search for literals or when LSP is unavailable."
         } else { "" };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use harness_checks_run and harness_checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}{lsp}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use checks_run and checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}{lsp}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }
@@ -116,7 +116,7 @@ mod test {
                 PromptMode::PlanQuestion,
                 "anchored plan review question only",
             ),
-            (PromptMode::ExecutePlan, "harness_plan_phase_done"),
+            (PromptMode::ExecutePlan, "plan_phase_done"),
             (PromptMode::GoalContinuation, "active Goal task"),
             (PromptMode::RequestChanges, "supplied review"),
         ] {

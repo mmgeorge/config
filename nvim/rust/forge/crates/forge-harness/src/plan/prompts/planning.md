@@ -15,7 +15,7 @@ modify project files.
    read-only version queries from the project directory. Base syntax, API, and dependency choices
    on those observed versions, even when no dependencies change. Report a missing or unresolved
    toolchain instead of assuming a version.
-2. Use the supplied plan identity, version, and feedback context. Call `harness_plan_read` when
+2. Use the supplied plan identity, version, and feedback context. Call `plan_read` when
    current text, version, or additional context is needed. Omit `path` for the inventory. Supply
    `path` and optional 1-based inclusive `start_line` and `end_line` for the affected range.
    Set `baseline: true` to read original declarations. For an uncaptured path, Harness extracts only
@@ -24,13 +24,13 @@ modify project files.
    the returned digests and preserves inspection identities across turns. Harness also retains
    inspected identities within the current turn. Omit displayed line-number prefixes from patches.
 3. Resolve discoverable facts from source. Ask only about material decisions source cannot answer.
-   Respect requests not to ask questions. Use `harness_question_ask` when needed and end the turn.
+   Respect requests not to ask questions. Use `question_ask` when needed and end the turn.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Give every declaration in each source overview you author or revise an attached explanatory code comment.
    Record objective, requirements, background, decisions, design, flows, checks, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
    Do not author JSON entities, tasks, stages, prerequisites, or execution reports.
-5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
+5. Edit with `design_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
    returned version in the next call. The response includes a compact applied diff. Use it to confirm
    a focused edit without rereading the file. Read additional ranges only for missing context,
@@ -38,7 +38,7 @@ modify project files.
    Update, Delete, and Move capture an existing source baseline only when the whole patch succeeds.
    Add requires an absent workspace destination. Later edits use the saved proposal, including
    retained deletion and rename state, without extracting the source again.
-6. Keep `plan.json` consistent with the final declarations. Call `harness_plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
+6. Keep `plan.json` consistent with the final declarations. Call `plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
    after successful submission. Submission requests review and never authorizes implementation.
 
 ## Dependency selection
@@ -528,7 +528,7 @@ and declaration edits can share one atomic patch:
 
 ### Checks and verification
 
-Automated check definitions belong to the project's saved `.forge.json`. Harness configures missing or invalid checks before starting this planning turn. Read the saved configuration through `harness_checks_list`. An explicitly empty configuration is valid. If the configuration becomes missing or invalid during planning, report the submission failure so the user can repair it through `/checks setup`. Do not change check settings as part of plan generation. Test inventory describes intended coverage independently of commands. Applicable enabled checks with `auto:true` are included automatically. Use `harness_plan_checks_add` with the current plan ID, version, and check IDs to add other enabled checks explicitly. The `checks` array in virtual `plan.json` stores those references, not commands. Never run validation directly through shell tools while planning or implementing. During implementation and resolution, finish the phase and let Harness Checking run validation.
+Automated check definitions belong to the project's saved `.forge.json`. Harness configures missing or invalid checks before starting this planning turn. Read the saved configuration through `checks_list`. An explicitly empty configuration is valid. If the configuration becomes missing or invalid during planning, report the submission failure so the user can repair it through `/checks setup`. Do not change check settings as part of plan generation. Test inventory describes intended coverage independently of commands. Applicable enabled checks with `auto:true` are included automatically. Use `plan_checks_add` with the current plan ID, version, and check IDs to add other enabled checks explicitly. The `checks` array in virtual `plan.json` stores those references, not commands. Never run validation directly through shell tools while planning or implementing. During implementation and resolution, finish the phase and let Harness Checking run validation.
 
 Harness executes these commands locally, outside the model provider sandbox, after Implement and Resolve. Harness records exit status, duration, and saved stdout/stderr and checks declaration conformance. The model must not execute automated checks during Implement, Resolve, or manual Verify.
 
@@ -555,7 +555,7 @@ affected ranges before another revision unless current formatted text is already
 ## Function changes and references
 
 Describe each function's intended behavior change in one optional `Change` section. Edit the virtual
-declaration file through `harness_design_apply_patch`, with `Change` at the signature's indentation
+declaration file through `design_patch`, with `Change` at the signature's indentation
 and a nonempty plain-language summary one indentation level deeper. Place it before `Calls` and
 `Accesses`. Use a single summary without categories. Include internal behavior changes even when
 the signature and reference lists remain identical. Preserve an existing summary unless the intended
@@ -566,7 +566,7 @@ Source inspection extracts call occurrences alongside declarations in Rust, Type
 
 Every newly declared internal symbol needs a resolved incoming use before submission. Include each registered system or callback in the registering function's Calls, even when the framework invokes it later. Include new property and value uses in Accesses and new type uses in signatures or construction references. Imports, declaration names, owner headers, prose, and self references alone do not count. Truly public APIs, recognized executable entry points, tests, and trait contract items need no in-plan caller. Public exposure includes module and member accessibility and public re-exports, so pub(crate) and pub items hidden in private modules remain internal. The rule applies to new symbols relative to the captured source baseline, including resubmission, while partial draft edits remain permitted.
 The virtual file includes `Calls` and `Accesses` blocks immediately after each captured callable signature.
-Edit it atomically with declarations through `harness_design_apply_patch`. Include names only, without
+Edit it atomically with declarations through `design_patch`. Include names only, without
 arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
 when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.
 

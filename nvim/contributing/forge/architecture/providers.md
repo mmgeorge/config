@@ -22,6 +22,13 @@ tasks share the endpoint lifetime and admit at most 16 connections, with 8 KiB h
 Provider restart retains the native conversation identity and reloads that conversation. Failure to
 load it fails configuration rather than creating replacement history.
 
+`ControlToolRegistry` defines provider-neutral tool names such as `agent_spawn`,
+`agent_send`, `agent_activity`, `design_patch`, and `repository_status`. Names use
+a domain followed by an action or query, without a `harness_` prefix. The current
+LSP query tool is `lsp`. Provider MCP namespaces identify the server separately.
+Catalogs, dispatch, prompts, and activity handling use the same names. Old prefixed
+names are not registered as aliases.
+
 ACP tool updates merge by native tool-call identity, so sparse completion notifications retain
 their original title, category, and content. Structured diff content becomes a `ProviderChangeSet`
 with unified diffs from the provider's reported before and after text. A null before value identifies
@@ -301,7 +308,7 @@ the same credential redaction as MCP arguments and updates as lifecycle events s
 The renderer clips only the visible header to the window width. Completed items remain available
 in full as JSON output. The provider thread, turn, and item IDs correlate live
 updates with durable records. Main and child timelines, activity summaries, and
-`harness_agent_tool_output` consume those same records without provider-specific rendering.
+`agent_tool_output` consume those same records without provider-specific rendering.
 Missing IDs or untyped payloads cannot create fallback tool records.
 
 Shell command headings summarize simple file reads, directory listings, and text searches

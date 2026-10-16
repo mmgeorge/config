@@ -76,7 +76,7 @@ local succeeded, failure = xpcall(function()
   assert(state.session, table.concat(errors, "\n"))
   request("session.configure", { model = "gpt-5.6-terra", effort = "high", service_tier = "fast" })
   request("trace.configure", { enabled = true })
-  request("prompt.submit", { text = "Verify this isolated fixture. First call harness_repository_status with offset 0. "
+  request("prompt.submit", { text = "Verify this isolated fixture. First call repository_status with offset 0. "
     .. "Then read README.md with a shell tool. Do not edit files or call other tools. "
     .. "Determine the counter after 23 updates and whether the result is odd. Explain the arithmetic briefly "
     .. "and finish with CODEX_ACTIVITY_VERIFIED." })
@@ -99,7 +99,7 @@ local succeeded, failure = xpcall(function()
         summary = true
       end
       local item = parameter.item or {}
-      if item.type == "dynamicToolCall" and item.tool == "harness_repository_status" then arguments = true end
+      if item.type == "dynamicToolCall" and item.tool == "repository_status" then arguments = true end
       if item.type == "commandExecution" then command = true end
     end
   end
@@ -125,17 +125,17 @@ local succeeded, failure = xpcall(function()
       break
     end
   end
-  assert(vim.wait(3000, function() return transcript():find("harness_repository_status(", 1, true) end, 10),
+  assert(vim.wait(3000, function() return transcript():find("repository_status(", 1, true) end, 10),
     "expanded transcript lost the dynamic call\n" .. transcript())
   assert(transcript():find('"offset":0', 1, true), "dynamic arguments missing from transcript\n" .. transcript())
   for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:find("harness_repository_status(", 1, true) then
+    if line:find("repository_status(", 1, true) then
       vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
       controller.toggle_activity()
       break
     end
   end
-  assert(vim.wait(3000, function() return transcript():find("Call: harness_repository_status(", 1, true) end, 10),
+  assert(vim.wait(3000, function() return transcript():find("Call: repository_status(", 1, true) end, 10),
     "expanded tool lost its complete call\n" .. transcript())
   assert(transcript():find("CODEX_ACTIVITY_VERIFIED", 1, true), "final answer missing")
   vim.g.forge_codex_activity_result = "pass"

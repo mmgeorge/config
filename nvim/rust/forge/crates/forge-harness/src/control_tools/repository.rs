@@ -162,10 +162,10 @@ impl RepositoryToolScope {
         ensure!(
             matches!(
                 name,
-                "harness_repository_status"
-                    | "harness_repository_changed_paths"
-                    | "harness_repository_diff"
-                    | "harness_repository_file_diff"
+                "repository_status"
+                    | "repository_changed_paths"
+                    | "repository_diff"
+                    | "repository_file_diff"
             ),
             "unknown repository inspection tool"
         );
@@ -206,7 +206,7 @@ impl RepositoryToolScope {
                 )
             })
             .transpose()?;
-        if name == "harness_repository_file_diff" {
+        if name == "repository_file_diff" {
             ensure!(selected_path.is_some(), "file_diff requires path_hex");
         }
         let operation = async {
@@ -226,7 +226,7 @@ impl RepositoryToolScope {
             let mut retained = 0usize;
             let is_diff = matches!(
                 name,
-                "harness_repository_diff" | "harness_repository_file_diff"
+                "repository_diff" | "repository_file_diff"
             );
             let limit = if is_diff { 8 } else { 256 };
             let selected: Vec<_> = snapshot
@@ -266,7 +266,7 @@ impl RepositoryToolScope {
                 let record = if is_diff {
                     self.file_diff(&repository, &observed.change, input.side)
                         .await?
-                } else if name == "harness_repository_changed_paths" {
+                } else if name == "repository_changed_paths" {
                     path_value(&observed.change.path)
                 } else {
                     json!({ "path": path_value(&observed.change.path), "origin": relocation_value(&observed.change), "staged": change_name(observed.change.staged), "unstaged": change_name(observed.change.unstaged) })
@@ -545,7 +545,7 @@ mod tests {
         .unwrap();
         assert!(
             scope
-                .invoke("harness_repository_status", json!({}))
+                .invoke("repository_status", json!({}))
                 .await
                 .unwrap_err()
                 .to_string()
@@ -628,7 +628,7 @@ mod tests {
         assert!(
             scope
                 .invoke(
-                    "harness_repository_status",
+                    "repository_status",
                     json!({ "workspace": "another" })
                 )
                 .await
@@ -637,7 +637,7 @@ mod tests {
         drop(lease);
         assert!(
             scope
-                .invoke("harness_repository_status", json!({}))
+                .invoke("repository_status", json!({}))
                 .await
                 .unwrap_err()
                 .to_string()
@@ -649,7 +649,7 @@ mod tests {
         assert!(
             runtime
                 .invoke(crate::control_tools::ControlToolInvocation {
-                    name: "harness_repository_status".into(),
+                    name: "repository_status".into(),
                     arguments: json!({})
                 })
                 .await
@@ -699,7 +699,7 @@ mod tests {
         .unwrap();
         let status: Value = serde_json::from_str(
             &scope
-                .invoke("harness_repository_status", json!({}))
+                .invoke("repository_status", json!({}))
                 .await
                 .unwrap(),
         )
@@ -712,7 +712,7 @@ mod tests {
         let result: Value = serde_json::from_str(
             &scope
                 .invoke(
-                    "harness_repository_file_diff",
+                    "repository_file_diff",
                     json!({ "path_hex": hex::encode(b"example.txt"), "side": "unstaged" }),
                 )
                 .await
@@ -731,7 +731,7 @@ mod tests {
         let bounded: Value = serde_json::from_str(
             &scope
                 .invoke(
-                    "harness_repository_file_diff",
+                    "repository_file_diff",
                     json!({ "path_hex": hex::encode(b"quoted.txt") }),
                 )
                 .await

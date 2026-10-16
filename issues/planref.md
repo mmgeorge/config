@@ -11,7 +11,7 @@ availability so unresolved references never block saving.
 
 Harness cannot save required integration declarations for the shared symbol
 storage plan. Revision 6 remains saved and unsubmitted, but attempts to add
-integration declarations fail in `harness_design_apply_patch` during
+integration declarations fail in `design_patch` during
 `semantic_execution`.
 
 Affected plan: `e6e14c92-ed36-4aa5-a6c1-aa32286c8d4c`.

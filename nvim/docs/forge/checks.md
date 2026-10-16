@@ -26,10 +26,10 @@ the same action used to delete planned tests. Confirming disables those checks
 for this plan. Re-enable them through `oc`. Historical and accepted plans remain
 read-only.
 
-Agents add existing checks with `harness_plan_checks_add`, supplying `plan_id`,
+Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
 `expected_version`, and `check_ids`. The tool updates the plan's `checks` list
 without changing repository settings or executing commands. Repeated IDs do not
-create repeated plan entries. `harness_checks_run` accepts multiple `ids`, or
+create repeated plan entries. `checks_run` accepts multiple `ids`, or
 `all: true` for every enabled check. Explicit runs execute even when earlier
 evidence remains current.
 

@@ -26,11 +26,11 @@ spawning remains available with the toggle off.
 
 The enabled root receives six tools:
 
-- `harness_spawn_agent` admits a fresh child task.
-- `harness_send_message` retains information and steers an active child when supported.
-- `harness_followup_task` queues another task on the child's own history.
-- `harness_interrupt_agent` cancels active and queued tasks without deleting history.
-- `harness_list_agents` returns owned identities and their latest tasks.
+- `agent_spawn` admits a fresh child task.
+- `agent_send` retains information and steers an active child when supported.
+- `agent_followup` queues another task on the child's own history.
+- `agent_interrupt` cancels active and queued tasks without deleting history.
+- `agent_list` returns owned identities and their latest tasks.
 - `harness_wait_agent` waits for child activity and returns unreported completed tasks.
 
 ## Provider and failure boundaries
@@ -530,9 +530,9 @@ Both authority tests passed with exit zero in 37.62 seconds including compilatio
 
 ## Child activity inspection verified on 2026-10-11
 
-Main has two additional read-only tools. `harness_agent_activity` returns recent thoughts and
+Main has two additional read-only tools. `agent_activity` returns recent thoughts and
 tool metadata without output or final answers. It inspects the active run before queued
-follow-ups. `harness_agent_tool_output` reads a selected call through a stable reference that
+follow-ups. `agent_tool_output` reads a selected call through a stable reference that
 validates root, child, exchange, turn, and tool ownership. Reads remain valid after follow-ups
 and never execute the tool again. Output pagination preserves Unicode and NUL characters
 across stored chunks. Provider activity timestamps remain unchanged by inspection.

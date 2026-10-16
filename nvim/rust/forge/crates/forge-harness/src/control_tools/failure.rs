@@ -365,7 +365,7 @@ pub(crate) fn control_tool_failure_json(
     let active_version = document.map(|plan| plan.version);
     let retry = matches!(
         invocation.name.as_str(),
-        "harness_design_apply_patch" | "harness_plan_edit" | "harness_plan_submit"
+        "design_patch" | "harness_plan_edit" | "plan_submit"
     )
     .then_some(ControlToolRetry {
         action: "correct_and_retry",
@@ -398,7 +398,7 @@ pub(crate) fn control_tool_failure_json(
 }
 
 fn failure_phase(invocation: &ControlToolInvocation) -> ControlToolFailurePhase {
-    if invocation.name == "harness_plan_submit" {
+    if invocation.name == "plan_submit" {
         ControlToolFailurePhase::SubmissionValidation
     } else {
         ControlToolFailurePhase::SemanticExecution
@@ -606,7 +606,7 @@ mod test {
     #[test]
     fn formats_return_only_expansions_as_actionable_submission_json() {
         let invocation = ControlToolInvocation {
-            name: "harness_plan_submit".to_owned(),
+            name: "plan_submit".to_owned(),
             arguments: json!({ "plan_id": "plan-1", "expected_version": 1 }),
         };
         let document = crate::plan::test_fixture("plan-1", "Overview");

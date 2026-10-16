@@ -821,7 +821,7 @@ impl Backend for MockBackend {
         }
         if self.lsp_probe && let Some(arguments) = request.input.text().strip_prefix("LSP ") {
             let context = request.control_context.clone().context("fixture has no control context")?;
-            let invocation = crate::control_tools::ControlToolInvocation { name: "harness_lsp".into(), arguments: serde_json::from_str(arguments)? };
+            let invocation = crate::control_tools::ControlToolInvocation { name: "lsp".into(), arguments: serde_json::from_str(arguments)? };
             let text = match crate::control_tools::ControlToolRuntime::new(context).invoke(invocation).await {
                 Ok(result) => result.message,
                 Err(error) => format!("LSP error: {error:#}"),
@@ -837,8 +837,8 @@ impl Backend for MockBackend {
         let mut steering_text_list = Vec::new();
         if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
             && scope.setup_reviewed() == Some(false) {
-            let catalog: Value = serde_json::from_str(&scope.invoke("harness_checks_list", serde_json::json!({})).await?)?;
-            let rejected = scope.invoke("harness_checks_configure", serde_json::json!({
+            let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
+            let rejected = scope.invoke("checks_configure", serde_json::json!({
                 "expected_revision": catalog["revision"], "config": {"version":2,"definitions":[]}
             })).await;
             anyhow::ensure!(rejected.is_err(), "setup published before the user answered");
@@ -847,10 +847,10 @@ impl Backend for MockBackend {
         }
         if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
             && scope.setup_reviewed() == Some(true) {
-            let catalog: Value = serde_json::from_str(&scope.invoke("harness_checks_list", serde_json::json!({})).await?)?;
+            let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
             let config = if catalog["snapshot"]["config"].is_object() { catalog["snapshot"]["config"].clone() }
                 else { serde_json::json!({"version":2,"definitions":[]}) };
-            scope.invoke("harness_checks_configure", serde_json::json!({
+            scope.invoke("checks_configure", serde_json::json!({
                 "expected_revision": catalog["revision"], "config": config,
             })).await?;
         }
@@ -1346,7 +1346,7 @@ mod test {
     #[test]
     fn provider_instructions_describe_staged_edits_and_revision_scoped_reports() {
         let prompt = super::HARNESS_SYSTEM_MESSAGE;
-        assert!(prompt.contains("harness_design_apply_patch"));
+        assert!(prompt.contains("design_patch"));
         assert!(!prompt.contains("harness_plan_task_report"));
         assert!(!prompt.contains("harness_plan_edit"));
     }

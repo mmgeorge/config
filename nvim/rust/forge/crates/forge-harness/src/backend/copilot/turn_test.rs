@@ -25,7 +25,7 @@ async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
             assert_eq!(message["method"], if resumed { "session.resume" } else { "session.create" });
             assert_eq!(message["params"]["toolSearch"], json!({"enabled":false}));
             assert!(message["params"]["tools"].as_array().context("missing control tools")?
-                .iter().any(|tool| tool["name"] == "harness_plan_read"));
+                .iter().any(|tool| tool["name"] == "plan_read"));
             let session_id = message["params"]["sessionId"].as_str()
                 .context("SDK omitted session identity")?;
             respond(&mut server_write, &message,

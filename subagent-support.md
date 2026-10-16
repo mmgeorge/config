@@ -23,9 +23,9 @@ boundaries are documented in [the Harness architecture](nvim/lua/forge/docs/arch
 | Main preview | Nest child folds under the parent Thought fold. While running, show the latest non-final thought and latest tool heading without output. On completion, collapse the fold over the delegated task's complete timeline. Enter on the heading opens the child timeline in either state. |
 | Tool toggle | Persist `subagent_tools` through Forge settings. Default off. Manual spawning remains available. A visibility change preserves admitted children. |
 
-The enabled root receives `harness_spawn_agent`, `harness_send_message`, `harness_followup_task`,
-`harness_interrupt_agent`, `harness_list_agents`, `harness_agent_activity`, and
-`harness_agent_tool_output`. Children receive zero
+The enabled root receives `agent_spawn`, `agent_send`, `agent_followup`,
+`agent_interrupt`, `agent_list`, `agent_activity`, and
+`agent_tool_output`. Children receive zero
 agent tools and no root planning authority. Successful spawn calls appear as agent entries,
 while failed calls retain their tool error rows.
 
@@ -65,11 +65,11 @@ The final **Open config file** row in `/agent edit` and `/agents edit` opens the
 `subagents.json` in a normal editable tab when you press Enter.
 
 The **Activity entries** row changes the global `activity_limit` with Left/Right or `r`/`h`.
-It defaults to five and accepts 1–20. `harness_agent_activity` can override that count for one
+It defaults to five and accepts 1–20. `agent_activity` can override that count for one
 request. Results contain recent thoughts and tool metadata, with no tool output or final
 answers. Thoughts retain up to 4000 characters and report truncation explicitly.
 
-Each tool entry includes a `call_ref`. Main can pass it to `harness_agent_tool_output` to read
+Each tool entry includes a `call_ref`. Main can pass it to `agent_tool_output` to read
 the recorded result in pages, including while the child runs or after a follow-up begins.
 `offset` and `limit` count Unicode characters. The default page size is 8000 and the maximum
 is 32000. Use `next_offset` to continue. Reads never execute the tool again.

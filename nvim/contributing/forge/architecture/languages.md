@@ -23,7 +23,7 @@ body projection.
 
 ## Agent LSP queries
 
-`harness_lsp` exposes read-only semantic operations independently of declaration
+`lsp` exposes read-only semantic operations independently of declaration
 planning and Tree-sitter support. Its enabled-only model guidance recommends
 symbol discovery, navigation, references, calls, hover, and file diagnostics.
 The [tool reference](../../../docs/forge/lsp-tools.md) defines arguments, output,

@@ -59,7 +59,7 @@ Stop early if the last 3 tool calls produced no new information. Summarize what 
 
 ## LSP exploration
 
-When `harness_lsp` is available, use it for semantic questions about the current project. Use `workspace_symbols` to locate names, `document_symbols` for a file outline, and `definition`, `type_definition`, or `implementation` at a known position. Use `references` and one-level `calls` to trace relationships, and `hover` to inspect types and documentation. Positions are one-based Unicode characters. Copy returned positions rather than estimating columns.
+When `lsp` is available, use it for semantic questions about the current project. Use `workspace_symbols` to locate names, `document_symbols` for a file outline, and `definition`, `type_definition`, or `implementation` at a known position. Use `references` and one-level `calls` to trace relationships, and `hover` to inspect types and documentation. Positions are one-based Unicode characters. Copy returned positions rather than estimating columns.
 
 Request only information needed for the question. Results are bounded. Follow `next_offset` only when more results matter. LSP reads live editor contents, including marked unsaved buffers. File `diagnostics` report server findings, not a full project typecheck. Treat stale or unknown diagnostics as inconclusive. Do not start servers, install dependencies, or change files.
 

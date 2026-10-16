@@ -1192,9 +1192,9 @@ impl TimelineRenderer<'_> {
                                     .find(|tool| tool.id == *tool_id)
                                     .context("timeline content references a missing tool")?;
                                 let question_control = tool.title.split('(').next().unwrap_or("").trim()
-                                    .ends_with("harness_question_ask");
+                                    .ends_with("question_ask");
                                 let admitted_spawn = tool.title.split('(').next().unwrap_or("").trim()
-                                    .ends_with("harness_spawn_agent")
+                                    .ends_with("agent_spawn")
                                     && interaction.node_list.iter().any(|node| matches!(node,
                                         ExchangeNode::AgentReference { agent }
                                             if agent.parent_turn_id.as_deref() == Some(owner.as_str())));
@@ -2861,7 +2861,7 @@ mod tests {
         event.text = None;
         for (id, status) in [("failed-question", "failed"), ("accepted-question", "completed")] {
             event.activity = Some(ToolActivity {
-                id: id.into(), kind: ToolActivityKind::Command, title: "harness_question_ask".into(),
+                id: id.into(), kind: ToolActivityKind::Command, title: "question_ask".into(),
                 output: Some(if status == "failed" { "Invalid options" } else { "Question set accepted" }.into()),
                 output_delta: false, status: Some(status.into()), change: Default::default(),
             });
@@ -3517,7 +3517,7 @@ mod tests {
         update.turn_boundary = None;
         update.activity = Some(crate::backend::ToolActivity {
             id:"spawn-call".into(),kind:crate::backend::ToolActivityKind::ToolCall,
-            title:"harness_spawn_agent(task_name=Nested)".into(),
+            title:"agent_spawn(task_name=Nested)".into(),
             output:Some("SPAWN_PAYLOAD".into()),output_delta:false,status:Some("completed".into()),change:Default::default(),
         });
         parent.observe_turn(&update, 1).unwrap();
@@ -3559,7 +3559,7 @@ mod tests {
         assert!(!text.contains("Child final response"));
         assert!(text.contains("Child tool"));
         assert!(!text.contains("Child tool result"));
-        assert!(!text.contains("harness_spawn_agent"));
+        assert!(!text.contains("agent_spawn"));
         assert!(!text.contains("SPAWN_PAYLOAD"));
         let thought = projected.entry.block.iter().find(|block|block.id.0 == "delegation:thought").unwrap();
         assert!(thought.metadata.layout.as_ref().unwrap().indent > 2);
@@ -3644,7 +3644,7 @@ mod tests {
         }
         let failed = project_at(&failed_entry,&WidthProfile::default(),2).unwrap();
         assert!(failed.entry.block.iter().flat_map(|block|block.text.wire_rows())
-            .any(|row|row.contains("harness_spawn_agent")),"failed spawn errors must remain inspectable");
+            .any(|row|row.contains("agent_spawn")),"failed spawn errors must remain inspectable");
         let inspection = project_at(&TimelineEntry::AgentLifecycle {
             id:"nested-agent".into(),created_at_ms:0,run:crate::agent::Agent::pending("session","Nested","Inspect",0),
             exchange:vec![nested],agent:vec![],

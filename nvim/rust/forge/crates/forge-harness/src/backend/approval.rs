@@ -1508,14 +1508,14 @@ mod test {
             "custom".into(),
             "unknown",
             json!({
-                "permissionRequest":{"kind":"custom-tool", "toolName":"harness_question_ask", "toolDescription":"Ask a question"}
+                "permissionRequest":{"kind":"custom-tool", "toolName":"question_ask", "toolDescription":"Ask a question"}
             }),
             "D:/repo",
         );
         assert_eq!(
             custom.target_list,
             vec![PermissionTarget::Tool {
-                target: "harness_question_ask".into()
+                target: "question_ask".into()
             }]
         );
         assert_eq!(custom.reason.as_deref(), Some("Ask a question"));

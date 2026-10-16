@@ -57,7 +57,7 @@ Stop early if the last 3 tool calls produced no new information. Summarize what 
 
 ## Existing project LSP
 
-When `harness_lsp` is available and the question concerns a dependency already indexed by the current project's running server, read-only `definition`, `type_definition`, `implementation`, and `hover` queries may inspect that resolved dependency. Use `references` or one-level `calls` only when needed to explain its use in the project. This exception does not authorize unrelated local repository exploration.
+When `lsp` is available and the question concerns a dependency already indexed by the current project's running server, read-only `definition`, `type_definition`, `implementation`, and `hover` queries may inspect that resolved dependency. Use `references` or one-level `calls` only when needed to explain its use in the project. This exception does not authorize unrelated local repository exploration.
 
 Use exact returned one-based Unicode positions, request bounded results, and follow `next_offset` only when necessary. Results reflect the project's installed version and may include marked unsaved buffers. Do not infer upstream or latest-version behavior from them. Continue using docs-mcp and official upstream source for remote research. Do not install dependencies or start servers, and treat stale or unknown diagnostics as inconclusive.
 

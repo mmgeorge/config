@@ -19,8 +19,8 @@ pub(crate) use failure::{
 pub use runtime::{ControlToolResult, ControlToolRuntime, ControlTurnContext};
 
 pub(crate) fn is_agent_tool(name: &str) -> bool {
-    matches!(name,"harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
-        | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output")
+    matches!(name,"agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt"
+        | "agent_list" | "agent_activity" | "agent_tool_output")
 }
 
 /// Defines one Harness control tool independently from any provider transport.
@@ -51,77 +51,77 @@ impl ControlToolRegistry {
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         vec![
             lsp::definition(),
-            ControlToolDefinition { name: "harness_plan_checks_add", description: "Add enabled configured checks to the active draft plan, including nonautomatic checks. Does not run checks or edit repository settings. Duplicate IDs are ignored. Returns the plan version and check preview.", input_schema: strict_object_input_schema(vec![("plan_id", string_schema()), ("expected_version", json!({"type":"integer","minimum":1})), ("check_ids", json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128}))], &["plan_id", "expected_version", "check_ids"]) },
-            ControlToolDefinition {name:"harness_checks_list",description:"Read saved project checks, supported scopes, task overrides, configuration revision, and run history. Never invents default commands.",input_schema:strict_object_input_schema(vec![],&[])},
-            ControlToolDefinition {name:"harness_checks_configure",description:"Save version-2 project checks during /checks setup or missing-configuration planning bootstrap after the user answers setup questions. Each check requires area and trigger independently of scope. Preserves other .forge.json fields. Inspect checks first for expected_revision. Optional helpers are Nushell under .forge/checks/ with source and expected_digest (null for new files). Validates helper syntax without running configured checks.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks)).expect("checks schema")},
-            ControlToolDefinition {name:"harness_checks_run",description:"Run checks matching actual task changes outside plan execution. Explicit ids or selections bypass triggers for those suites. all:true explicitly runs all enabled full suites. Disabled checks cannot run. Returns run_id. Wait for completion before editing source. Unsupported scopes are configuration errors, never a full-suite fallback.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest)).expect("checks schema")},
-            ControlToolDefinition {name:"harness_checks_status",description:"Read an owned check run and its recorded results. Optional wait_ms waits for progress, up to 30000 milliseconds. Does not rerun checks.",input_schema:strict_object_input_schema(vec![("run_id",string_schema()),("wait_ms",json!({"type":"integer","minimum":0,"maximum":30000}))],&["run_id"])},
-            ControlToolDefinition {name:"harness_checks_cancel",description:"Cancel an owned active check run. Retains output and execution admission until process collection finishes.",input_schema:strict_object_input_schema(vec![("run_id",string_schema())],&["run_id"])},
+            ControlToolDefinition { name: "plan_checks_add", description: "Add enabled configured checks to the active draft plan, including nonautomatic checks. Does not run checks or edit repository settings. Duplicate IDs are ignored. Returns the plan version and check preview.", input_schema: strict_object_input_schema(vec![("plan_id", string_schema()), ("expected_version", json!({"type":"integer","minimum":1})), ("check_ids", json!({"type":"array","items":{"type":"string"},"minItems":1,"maxItems":128}))], &["plan_id", "expected_version", "check_ids"]) },
+            ControlToolDefinition {name:"checks_list",description:"Read saved project checks, supported scopes, task overrides, configuration revision, and run history. Never invents default commands.",input_schema:strict_object_input_schema(vec![],&[])},
+            ControlToolDefinition {name:"checks_configure",description:"Save version-2 project checks during /checks setup or missing-configuration planning bootstrap after the user answers setup questions. Each check requires area and trigger independently of scope. Preserves other .forge.json fields. Inspect checks first for expected_revision. Optional helpers are Nushell under .forge/checks/ with source and expected_digest (null for new files). Validates helper syntax without running configured checks.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks)).expect("checks schema")},
+            ControlToolDefinition {name:"checks_run",description:"Run checks matching actual task changes outside plan execution. Explicit ids or selections bypass triggers for those suites. all:true explicitly runs all enabled full suites. Disabled checks cannot run. Returns run_id. Wait for completion before editing source. Unsupported scopes are configuration errors, never a full-suite fallback.",input_schema:serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest)).expect("checks schema")},
+            ControlToolDefinition {name:"checks_status",description:"Read an owned check run and its recorded results. Optional wait_ms waits for progress, up to 30000 milliseconds. Does not rerun checks.",input_schema:strict_object_input_schema(vec![("run_id",string_schema()),("wait_ms",json!({"type":"integer","minimum":0,"maximum":30000}))],&["run_id"])},
+            ControlToolDefinition {name:"checks_cancel",description:"Cancel an owned active check run. Retains output and execution admission until process collection finishes.",input_schema:strict_object_input_schema(vec![("run_id",string_schema())],&["run_id"])},
             ControlToolDefinition {
-                name:"harness_spawn_agent",
+                name:"agent_spawn",
                 description:"Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
                 input_schema:strict_object_input_schema(vec![("profile",string_schema()),("text",string_schema())],&["text"]),
             },
             ControlToolDefinition {
-                name:"harness_send_message",
+                name:"agent_send",
                 description:"Supply information to a child by stable ID, canonical path, or task name. Does not start an idle child. Native steering is used only when supported, otherwise information remains in its durable inbox.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
             },
             ControlToolDefinition {
-                name:"harness_followup_task",
+                name:"agent_followup",
                 description:"Admit another task into an existing child's retained conversation. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
             },
             ControlToolDefinition {
-                name:"harness_interrupt_agent",
+                name:"agent_interrupt",
                 description:"Interrupt one child and cancel its queued follow-ups. Retains its identity, history, and informational inbox. Execution capacity remains reserved until cleanup settles.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema())],&["target"]),
             },
             ControlToolDefinition {
-                name:"harness_list_agents",
+                name:"agent_list",
                 description:"List Main and Harness-owned children with execution selections, lifecycle, and latest task outcome. Optional path_prefix filters canonical task paths within this root.",
                 input_schema:strict_object_input_schema(vec![("path_prefix",string_schema())],&[]),
             },
             ControlToolDefinition {
-                name:"harness_agent_activity",
+                name:"agent_activity",
                 description:"Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Defaults to 5 entries. Pass limit (1–20) to request a different count. Does not message or restart the child.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema()),
                     ("limit",json!({"type":"integer","minimum":1,"maximum":20}))],&["target"]),
             },
             ControlToolDefinition {
-                name:"harness_agent_tool_output",
-                description:"Read existing output for a call_ref from harness_agent_activity. Works during execution and after child follow-ups. Offsets and limits count Unicode characters. Default limit 8000, maximum 32000. Follow next_offset for more currently available output. A running call may produce more later. Never executes the tool again.",
+                name:"agent_tool_output",
+                description:"Read existing output for a call_ref from agent_activity. Works during execution and after child follow-ups. Offsets and limits count Unicode characters. Default limit 8000, maximum 32000. Follow next_offset for more currently available output. A running call may produce more later. Never executes the tool again.",
                 input_schema:strict_object_input_schema(vec![("call_ref",string_schema()),
                     ("offset",json!({"type":"integer","minimum":0})),
                     ("limit",json!({"type":"integer","minimum":1,"maximum":32000}))],&["call_ref"]),
             },
             ControlToolDefinition {
-                name: "harness_repository_status",
+                name: "repository_status",
                 description: "Read bounded Git status for the authenticated active interaction workspace. No Status view is required. Each page is a fresh observation, not a mutation precondition.",
                 input_schema: repository_input_schema(false, false),
             },
             ControlToolDefinition {
-                name: "harness_repository_changed_paths",
+                name: "repository_changed_paths",
                 description: "List changed repository paths with exact path_hex identities for the active interaction. At most 256 paths per fresh page.",
                 input_schema: repository_input_schema(false, false),
             },
             ControlToolDefinition {
-                name: "harness_repository_diff",
+                name: "repository_diff",
                 description: "Inspect staged or unstaged changes in the active interaction repository. At most 8 files per fresh page. Sources above 128 KiB or 4096 lines return an explicit limit state. Read-only exact hunks include source hashes.",
                 input_schema: repository_input_schema(true, false),
             },
             ControlToolDefinition {
-                name: "harness_repository_file_diff",
+                name: "repository_file_diff",
                 description: "Inspect a changed file selected by exact path_hex from repository status. Inherits active interaction workspace and read policy. Returns bounded read-only staged or unstaged hunks.",
                 input_schema: repository_input_schema(true, true),
             },
             ControlToolDefinition {
-                name: "harness_design_apply_patch",
-                description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Change summaries, Calls, and Accesses, never executable bodies. Configuration retains complete values. Read affected text through harness_plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and an applied diff capped at 16 KiB. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is a separate array of {title, description, root} objects, or [] when none apply. Each flow follows a value, request, event, record, or artifact through producers, transformations, stores, and consumers. Each recursive node has a compact single-line text label for one semantic role, optional incoming via (transfer or condition), and optional children for downstream transformations or consumers. Use nouns for objects and values, active verb phrases for operations, and no file paths in labels. A single child continues the path. Branch where paths split and repeat a shared downstream stage where they converge. Each arrow means the next node consumes an output of the preceding node. Keep scheduling rules, guards, and lifecycle guarantees in the description. Add a condition only to distinguish alternative data paths. Omit via on roots. Free functions are valid nodes. Harness generates the flow diagrams after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
+                name: "design_patch",
+                description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Change summaries, Calls, and Accesses, never executable bodies. Configuration retains complete values. Read affected text through plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and an applied diff capped at 16 KiB. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is a separate array of {title, description, root} objects, or [] when none apply. Each flow follows a value, request, event, record, or artifact through producers, transformations, stores, and consumers. Each recursive node has a compact single-line text label for one semantic role, optional incoming via (transfer or condition), and optional children for downstream transformations or consumers. Use nouns for objects and values, active verb phrases for operations, and no file paths in labels. A single child continues the path. Branch where paths split and repeat a shared downstream stage where they converge. Each arrow means the next node consumes an output of the preceding node. Keep scheduling rules, guards, and lifecycle guarantees in the description. Add a condition only to distinguish alternative data paths. Omit via on roots. Free functions are valid nodes. Harness generates the flow diagrams after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
                 input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema()),("source_digests",json!({"type":"object","additionalProperties":{"type":"string"}}))], &["plan_id","expected_version","patch"]),
             },
             ControlToolDefinition {
-                name: "harness_plan_read",
+                name: "plan_read",
                 description: "List captured/proposed declaration and configuration paths and plan.json, or read one file as plain text with 1-based line numbers and the active version. Optional start_line and end_line select an inclusive range and require path. Omitted bounds select the beginning or end of the file. Line-number prefixes are presentation only, omit them from patches. plan.json contains objective, optional usage, requirements, background, decisions, design, flows, verification (manual actions), and tests (planned coverage) and has no baseline. Omit path for the inventory and, during execution, current phase, findings, and verification_evidence with completed tool-call IDs. Set baseline true to inspect immutable current-code declarations or complete configuration. For an uncaptured path, extracts only that workspace file and returns its source digest without saving a baseline or changing the version. Read existing files before editing them. Does not return implementation bodies.",
                 input_schema: strict_object_input_schema(
                     vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"})),("start_line",json!({"type":"integer","minimum":1})),("end_line",json!({"type":"integer","minimum":1}))],
@@ -129,7 +129,7 @@ impl ControlToolRegistry {
                 ),
             },
             ControlToolDefinition {
-                name: "harness_plan_submit",
+                name: "plan_submit",
                 description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success confirms submission and the current version. Submission is not implementation approval. No implementation build or second model review runs. In Plan, end the turn after successful submission. During execution, revisions are allowed only in Resolve. Submit one consolidated contract change with a concrete reason. Internal helpers and Calls/Accesses differences do not require a revision. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. The execution tool call waits for the review decision. Continue the same turn using its returned revision and feedback.",
                 input_schema: strict_object_input_schema(
                     vec![
@@ -144,8 +144,8 @@ impl ControlToolRegistry {
                 ),
             },
             ControlToolDefinition {
-                name: "harness_plan_phase_done",
-                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call harness_plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
+                name: "plan_phase_done",
+                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
                 input_schema: strict_object_input_schema(vec![
                     ("phase", json!({"type":"string","enum":["implement","verify","resolve"]})),
                     ("revision", json!({"type":"integer","minimum":1})),
@@ -159,37 +159,37 @@ impl ControlToolRegistry {
                             ("summary", string_schema()),
                             ("evidence", json!({"type":"array","items":{"type":"string"}}))
                         ], &["category","label","outcome","summary","evidence"])})),
-                        ("evidence", json!({"type":"array","description":"Exact completed tool-call IDs from harness_plan_read execution.verification_evidence", "items":{"type":"string"}})),
+                        ("evidence", json!({"type":"array","description":"Exact completed tool-call IDs from plan_read execution.verification_evidence", "items":{"type":"string"}})),
                         ("findings", json!({"type":"array","items":{"type":"string"}})),
                         ("reason", string_schema()), ("reuse_reason", string_schema())
                     ], &["outcome","checks"]))
                 ], &["phase","revision","summary"]),
             },
             ControlToolDefinition {
-                name: "harness_question_ask",
+                name: "question_ask",
                 description: "Pause any Harness turn and present one to three interactive user questions. Use this for explicit requests for multiple-choice questions as well as planning decisions.",
                 input_schema: plan_question_input_schema(),
             },
             ControlToolDefinition {
-                name: "harness_question_answer",
+                name: "question_answer",
                 description: "Record an answer only when the user explicitly and unambiguously answers one currently pending Harness question. Never call this while continuing a planning-feedback turn because Harness already consumed those answers.",
                 input_schema: question_answer_input_schema(),
             },
             ControlToolDefinition {
-                name: "harness_question_withdraw",
+                name: "question_withdraw",
                 description: "Withdraw currently pending Harness questions only when no material user decision remains. Never call this while continuing a planning-feedback turn because Harness already resolved that question set.",
                 input_schema: question_withdraw_input_schema(),
             },
             ControlToolDefinition {
-                name: "harness_goal_complete",
-                description: "Complete an active Goal task only when its objective and all required work are satisfied. Not for Execute tasks, which use harness_plan_phase_done. End the turn after success.",
+                name: "goal_complete",
+                description: "Complete an active Goal task only when its objective and all required work are satisfied. Not for Execute tasks, which use plan_phase_done. End the turn after success.",
                 input_schema: strict_object_input_schema(
                     vec![("summary", string_schema())],
                     &["summary"],
                 ),
             },
             ControlToolDefinition {
-                name: "harness_goal_blocked",
+                name: "goal_blocked",
                 description: "Report an active Goal task blocked when no authorized progress remains, with a concrete cause and what is needed to resume. Not for Execute tasks. Do not use for ordinary effort or user cancellation. End the turn after success.",
                 input_schema: strict_object_input_schema(
                     vec![("reason", string_schema())],
@@ -197,7 +197,7 @@ impl ControlToolRegistry {
                 ),
             },
             ControlToolDefinition {
-                name: "harness_goal_status",
+                name: "goal_status",
                 description: "Report observed nonterminal progress toward an active Goal task. This does not complete an Execute phase or change permissions.",
                 input_schema: strict_object_input_schema(
                     vec![("status", string_schema())],
@@ -210,7 +210,7 @@ impl ControlToolRegistry {
     /// Expose plan mutation only while authoring a plan or resolving an execution.
     pub fn definition_list_for(&self, phase: Option<crate::plan::PlanPhase>) -> Vec<ControlToolDefinition> {
         self.definition_list().into_iter().filter(|definition| {
-            !is_agent_tool(definition.name) && (!matches!(definition.name, "harness_plan_checks_add" | "harness_design_apply_patch" | "harness_plan_submit")
+            !is_agent_tool(definition.name) && (!matches!(definition.name, "plan_checks_add" | "design_patch" | "plan_submit")
                 || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
             )
         }).collect()
@@ -220,12 +220,12 @@ impl ControlToolRegistry {
     pub fn definition_list_for_context(&self, context: Option<&ControlTurnContext>, root: bool) -> Vec<ControlToolDefinition> {
         let phase = context.and_then(|context|context.execution.as_ref().map(|execution|execution.phase));
         self.definition_list().into_iter().filter(|definition| {
-            if definition.name == "harness_lsp" {return context.and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available());}
-            if !root {return definition.name.starts_with("harness_repository_") && context.is_some_and(|context|context.repository.is_some());}
+            if definition.name == "lsp" {return context.and_then(|context|context.lsp.as_ref()).is_some_and(|scope|scope.available());}
+            if !root {return definition.name.starts_with("repository_") && context.is_some_and(|context|context.repository.is_some());}
             if is_agent_tool(definition.name) {return context.and_then(|context|context.agent.as_ref()).is_some_and(|scope|scope.available());}
-            !matches!(definition.name,"harness_plan_checks_add" | "harness_design_apply_patch" | "harness_plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
+            !matches!(definition.name,"plan_checks_add" | "design_patch" | "plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
         }).map(|mut definition| {
-            if definition.name == "harness_spawn_agent"
+            if definition.name == "agent_spawn"
                 && let Some(schema) = context.and_then(|context|context.agent.as_ref()).and_then(|scope|scope.profile_schema()) {
                 definition.input_schema["properties"]["profile"] = schema;
             }
@@ -236,7 +236,7 @@ impl ControlToolRegistry {
     /// Advertise optional root tools before an ACP transport admits its first turn.
     pub fn definition_list_for_owner(&self, owner: &crate::backend::ExecutionOwner, agent_tools: bool, lsp_tools: bool) -> Vec<ControlToolDefinition> {
         self.definition_list().into_iter().filter(|definition| {
-            if definition.name == "harness_lsp" { return lsp_tools; }
+            if definition.name == "lsp" { return lsp_tools; }
             owner.is_root() && (!is_agent_tool(definition.name) || agent_tools)
         }).collect()
     }
@@ -272,11 +272,11 @@ pub fn apply_invocation(
 ) -> Result<()> {
     validate_arguments(invocation)?;
     match invocation.name.as_str() {
-        "harness_design_apply_patch" => {
+        "design_patch" => {
             output.design_patch.push(decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?);
             output.structured_plan = true;
         }
-        "harness_plan_read" => {
+        "plan_read" => {
             output.plan_read = invocation
                 .arguments
                 .get("plan_id")
@@ -284,31 +284,31 @@ pub fn apply_invocation(
                 .map(str::to_owned);
             output.structured_plan = output.plan_read.is_some();
         }
-        "harness_plan_submit" => {
+        "plan_submit" => {
             output.plan_submit = Some(decode_arguments::<PlanSubmitRequest>(invocation)?);
             output.structured_plan = true;
         }
-        "harness_question_ask" => {
+        "question_ask" => {
             output.plan_question =
                 Some(decode_arguments::<PlanQuestionSet>(invocation)?.normalize()?);
         }
-        "harness_question_answer" => {
+        "question_answer" => {
             output.question_answer = Some(decode_arguments::<PlanQuestionAnswer>(invocation)?);
         }
-        "harness_question_withdraw" => {
+        "question_withdraw" => {
             output.question_withdrawal =
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
-        "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
-        | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output" => {},
-        "harness_lsp" | "harness_plan_checks_add" | "harness_plan_phase_done" | "harness_checks_list" | "harness_checks_configure" | "harness_checks_run" | "harness_checks_status" | "harness_checks_cancel" => {},
-        "harness_goal_complete" => output.evidence.structured_complete = true,
-        "harness_goal_blocked" => output.evidence.structured_blocked = true,
-        "harness_goal_status" => output.evidence.tool_called = true,
-        "harness_repository_status"
-        | "harness_repository_changed_paths"
-        | "harness_repository_diff"
-        | "harness_repository_file_diff" => {}
+        "agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt"
+        | "agent_list" | "agent_activity" | "agent_tool_output" => {},
+        "lsp" | "plan_checks_add" | "plan_phase_done" | "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel" => {},
+        "goal_complete" => output.evidence.structured_complete = true,
+        "goal_blocked" => output.evidence.structured_blocked = true,
+        "goal_status" => output.evidence.tool_called = true,
+        "repository_status"
+        | "repository_changed_paths"
+        | "repository_diff"
+        | "repository_file_diff" => {}
         name => anyhow::bail!("unknown Harness control tool: {name}"),
     }
     Ok(())
@@ -567,12 +567,12 @@ mod test {
     #[test]
     fn repository_tools_reject_caller_authority_and_only_accept_advertised_inputs() {
         for name in [
-            "harness_repository_status",
-            "harness_repository_changed_paths",
-            "harness_repository_diff",
-            "harness_repository_file_diff",
+            "repository_status",
+            "repository_changed_paths",
+            "repository_diff",
+            "repository_file_diff",
         ] {
-            let mut arguments = if name == "harness_repository_file_diff" {
+            let mut arguments = if name == "repository_file_diff" {
                 json!({ "path_hex": "612e747874" })
             } else {
                 json!({})
@@ -604,21 +604,21 @@ mod test {
         }
         assert!(
             validate_arguments(&ControlToolInvocation {
-                name: "harness_repository_file_diff".into(),
+                name: "repository_file_diff".into(),
                 arguments: json!({})
             })
             .is_err()
         );
         assert!(
             validate_arguments(&ControlToolInvocation {
-                name: "harness_repository_status".into(),
+                name: "repository_status".into(),
                 arguments: json!({ "side": "staged" })
             })
             .is_err()
         );
         assert!(
             validate_arguments(&ControlToolInvocation {
-                name: "harness_repository_diff".into(),
+                name: "repository_diff".into(),
                 arguments: json!({ "side": "other" })
             })
             .is_err()
@@ -628,9 +628,9 @@ mod test {
     #[test]
     fn design_patch_contract_replaces_legacy_authoring_tools() {
         let definition = ControlToolRegistry.definition_list();
-        assert!(definition.iter().any(|tool| tool.name == "harness_design_apply_patch"));
+        assert!(definition.iter().any(|tool| tool.name == "design_patch"));
         assert!(!definition.iter().any(|tool| matches!(tool.name,"harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report")));
-        let invocation = ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}) };
+        let invocation = ControlToolInvocation { name:"design_patch".into(),arguments:json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}) };
         let mut output = BackendOutput::default();
         apply_invocation(&invocation,&mut output).unwrap();
         assert_eq!(output.design_patch.len(),1);
@@ -650,21 +650,21 @@ mod test {
         assert_eq!(
             name_list,
             [
-                "harness_repository_status",
-                "harness_repository_changed_paths",
-                "harness_repository_diff",
-                "harness_repository_file_diff",
+                "repository_status",
+                "repository_changed_paths",
+                "repository_diff",
+                "repository_file_diff",
                 "harness_plan_edit",
-                "harness_plan_read",
-                "harness_plan_submit",
+                "plan_read",
+                "plan_submit",
                 "harness_plan_deviation",
                 "harness_plan_task_report",
-                "harness_question_ask",
-                "harness_question_answer",
-                "harness_question_withdraw",
-                "harness_goal_complete",
-                "harness_goal_blocked",
-                "harness_goal_status"
+                "question_ask",
+                "question_answer",
+                "question_withdraw",
+                "goal_complete",
+                "goal_blocked",
+                "goal_status"
             ]
         );
 

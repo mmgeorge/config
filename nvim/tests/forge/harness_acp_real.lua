@@ -606,13 +606,13 @@ local succeeded, failure = xpcall(function()
     print("ACP cancellation and compaction lifecycle passed: " .. backend)
   end
   if vim.g.forge_acp_test_control then
-    request("goal.set", { objective = "Verify the Harness control connection by calling harness_goal_complete with a short summary. No files or shell commands are needed. Complete this goal only through that tool." })
+    request("goal.set", { objective = "Verify the Harness control connection by calling goal_complete with a short summary. No files or shell commands are needed. Complete this goal only through that tool." })
     local completed = request("state.get")
     assert(completed.goal and completed.goal.state == "complete", "control tool did not complete the Goal task: " .. vim.inspect(completed.goal))
     print("ACP Harness control workflow passed: " .. backend)
   end
   if vim.g.forge_acp_test_questions then
-    request("prompt.submit", { text = "Call harness_question_ask with one question, id fixture_choice, header Choice, question 'Choose the verification option', and options Alpha / Verify Alpha, Beta / Verify Beta. Set allow_freeform false. Do not call any other tools or start agents. End the turn after the tool. When the user answers later, reply with exactly QUESTION_ANSWER_ALPHA and do not ask another question." })
+    request("prompt.submit", { text = "Call question_ask with one question, id fixture_choice, header Choice, question 'Choose the verification option', and options Alpha / Verify Alpha, Beta / Verify Beta. Set allow_freeform false. Do not call any other tools or start agents. End the turn after the tool. When the user answers later, reply with exactly QUESTION_ANSWER_ALPHA and do not ask another question." })
     local pending = request("state.get").active_elicitation
     assert(pending and pending.owner == "interaction", vim.inspect(pending))
     local history = request("exchange.list")
@@ -652,7 +652,7 @@ local succeeded, failure = xpcall(function()
     print("ACP queued prompts completed in separate ordered exchanges: " .. backend)
   end
   if vim.g.forge_acp_test_plan then
-    request("prompt.submit", { text = "/plan Change example.json so message becomes ACP_PLAN_VERIFIED. Keep the complete JSON proposal. Only create a plan and submit it through harness_plan_submit. Do not implement the change, run builds, tests, shell commands, or start agents. No questions are needed. Keep verification and checks empty for this fixture." })
+    request("prompt.submit", { text = "/plan Change example.json so message becomes ACP_PLAN_VERIFIED. Keep the complete JSON proposal. Only create a plan and submit it through plan_submit. Do not implement the change, run builds, tests, shell commands, or start agents. No questions are needed. Keep verification and checks empty for this fixture." })
     local planned = request("state.get")
     assert(planned.active_plan and planned.active_plan.state == "awaiting_review", vim.inspect(planned.active_plan))
     assert(vim.fn.readfile(workspace .. "/example.json")[1] == '{"message":"before"}', "planning changed the workspace")

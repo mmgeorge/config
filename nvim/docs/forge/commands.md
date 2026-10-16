@@ -33,7 +33,7 @@ commands complete the file argument before the revision argument.
 opens durable session search and `/undo` opens checkpoint rollback.
 
 `/config` includes an **LSP tools** toggle. It enables the read-only
-[`harness_lsp` tool](lsp-tools.md) for model-driven code exploration without
+[`lsp` tool](lsp-tools.md) for model-driven code exploration without
 changing interactive plan navigation or starting language servers.
 
 `/checks` opens project checks, and `/checks setup` configures their commands and

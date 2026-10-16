@@ -199,7 +199,7 @@ local succeeded,failure = xpcall(function()
     updated.document.profiles["model-child"] = vim.deepcopy(updated.document.profiles["test-child"])
     request("agent.profiles.save",{expected_revision=updated.revision,document=updated.document})
     require("forge.views.harness.controller").open_agent_picker()
-    request("prompt.submit",{text="Use harness_spawn_agent with profile model-child and text"
+    request("prompt.submit",{text="Use agent_spawn with profile model-child and text"
       .. " with the task: Reply exactly MODEL_CHILD_R783. Do not use tools. End your turn if only the child remains unfinished. Harness will resume you with its result."
       .. " After receiving the result, reply ROOT_SYNTHESIS_R783. Do not spawn native agents. Do not use files or shell commands."})
     local model_snapshot = request("state.get")

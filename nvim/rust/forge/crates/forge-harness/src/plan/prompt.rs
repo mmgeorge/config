@@ -36,7 +36,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan task. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. Resolve any remaining material decision under the user's question preferences, then call harness_plan_submit with the exact canonical plan ID and version.
+            r#"Continue the existing Harness Plan task. The Harness already recorded and consumed the user's answers below. Do not call question_answer or question_withdraw for them. Incorporate the answers through design_patch edits. Resolve any remaining material decision under the user's question preferences, then call plan_submit with the exact canonical plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -67,7 +67,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved canonical plan in the Harness Plan task. Address every annotation and overall comment. Apply requested design changes with harness_design_apply_patch. Explain when a comment needs no edit or conflicts with another requirement. Do not invent an edit merely to close a comment. Then call harness_plan_submit with the exact resulting plan ID and version.
+            r#"Revise the saved canonical plan in the Harness Plan task. Address every annotation and overall comment. Apply requested design changes with design_patch. Explain when a comment needs no edit or conflicts with another requirement. Do not invent an edit merely to close a comment. Then call plan_submit with the exact resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -112,8 +112,8 @@ Review comments:
         format!(
             "Continue discussing the active canonical plan in the Harness Plan task. \
 Answer questions without editing or resubmitting the plan. When the user requests changes, \
-revise the existing plan through harness_design_apply_patch, then submit the resulting plan ID and version \
-through harness_plan_submit. A successful edit starts a revision of the same plan. \
+revise the existing plan through design_patch, then submit the resulting plan ID and version \
+through plan_submit. A successful edit starts a revision of the same plan. \
 Resolve material uncertainty under the user's question preferences. Resolve pending questions before editing. \
 Do not implement the plan or modify project files. The authoring procedure below applies only when the user requests a revision. For discussion alone, answer without editing or submitting.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
@@ -144,13 +144,13 @@ After answering, choose exactly one outcome:
    Make no control-tool call when the existing questions and options remain material and valid.
 
 2. Answer
-   Call harness_question_answer only when the user explicitly and unambiguously answers a pending question. Do not convert tentative language, discussion, or model preference into an answer.
+   Call question_answer only when the user explicitly and unambiguously answers a pending question. Do not convert tentative language, discussion, or model preference into an answer.
 
 3. Replace
-   Call harness_question_ask with the complete revised question set when the user requests changes or when clarification changes which questions or options remain material. Preserve question IDs only when their meaning remains unchanged. End the turn after replacement.
+   Call question_ask with the complete revised question set when the user requests changes or when clarification changes which questions or options remain material. Preserve question IDs only when their meaning remains unchanged. End the turn after replacement.
 
 4. Withdraw
-   Call harness_question_withdraw when no material user decision remains. Provide a concise reason grounded in an explicit user instruction, delegated judgment, repository evidence, or a resolved requirement. End the turn after withdrawal.
+   Call question_withdraw when no material user decision remains. Provide a concise reason grounded in an explicit user instruction, delegated judgment, repository evidence, or a resolved requirement. End the turn after withdrawal.
 
 Never select an option merely because you recommend it. Never retain a question that no longer affects the implementation. Never withdraw a question merely to avoid asking for input. "Choose for me" explicitly delegates the decision and may resolve the question. Tentative language such as "I'm leaning toward" does not resolve the question. If only part of the question set changes, replace the complete set while retaining unchanged questions and stable IDs. If a new material decision emerges, include it in the complete replacement set. After any control-tool call, let the Harness present or resume the resulting workflow.
 {planning_context}
@@ -187,7 +187,7 @@ mod test {
         assert!(draft.ends_with(request));
         assert!(feedback.contains(request));
         assert!(feedback.ends_with(answer));
-        assert!(feedback.contains("Do not call harness_question_answer"));
+        assert!(feedback.contains("Do not call question_answer"));
         assert!(revision.contains(document_json));
         assert!(revision.contains(annotation_json));
         assert!(revision.contains("Keep file ownership distinct"));
@@ -231,7 +231,7 @@ mod test {
         assert!(prompt.contains("Review comments"));
         assert!(prompt.contains("8: Why replace direction with velocity?"));
         assert!(!prompt.contains("Semantic annotations"));
-        assert!(prompt.contains("harness_design_apply_patch"));
+        assert!(prompt.contains("design_patch"));
         assert!(!prompt.contains("Current rendered plan"));
     }
 
@@ -239,9 +239,9 @@ mod test {
     fn clarification_preserves_the_pending_decision_boundary() {
         let prompt = PlanPrompt::clarification("Refactor", "{\"question\":\"Migration?\"}", "Why?");
         assert!(prompt.contains("mutable decision state"));
-        assert!(prompt.contains("harness_question_answer"));
-        assert!(prompt.contains("harness_question_ask"));
-        assert!(prompt.contains("harness_question_withdraw"));
+        assert!(prompt.contains("question_answer"));
+        assert!(prompt.contains("question_ask"));
+        assert!(prompt.contains("question_withdraw"));
         assert!(prompt.contains("Tentative language"));
         assert!(prompt.contains("Why?"));
         assert!(prompt.contains("Migration?"));
@@ -253,7 +253,7 @@ mod test {
         assert!(prompt.contains("Do not continue the original request"));
         assert!(!prompt.contains("Original planning request"));
         assert!(!prompt.contains("Harness Plan task"));
-        assert!(prompt.contains("harness_question_answer"));
+        assert!(prompt.contains("question_answer"));
     }
 
 }

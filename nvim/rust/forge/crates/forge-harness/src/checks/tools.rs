@@ -158,15 +158,15 @@ impl CheckToolScope {
             !self.cancelled.load(Ordering::Acquire),
             "check tools belong to an inactive interaction"
         );
-        if matches!(name, "harness_checks_list" | "harness_checks_run") {
+        if matches!(name, "checks_list" | "checks_run") {
             self.runner.refresh_changes().await?;
         }
         let result = match name {
-            "harness_checks_list" => self.runner.catalog_preview(self.task_id.as_deref(), self.shell).await?,
-            "harness_checks_configure" => {
+            "checks_list" => self.runner.catalog_preview(self.task_id.as_deref(), self.shell).await?,
+            "checks_configure" => {
                 ensure!(
                     self.setup && self.setup_reviewed,
-                    "Check setup must ask the user about functional areas, automatic suites, and coverage cost with harness_question_ask before saving. Continue /checks setup after the user answers."
+                    "Check setup must ask the user about functional areas, automatic suites, and coverage cost with question_ask before saving. Continue /checks setup after the user answers."
                 );
                 ensure!(
                     self.agent.active_count() == 0,
@@ -204,7 +204,7 @@ impl CheckToolScope {
                     .configure(request, delivery.lifecycle.as_ref())
                     .await?
             }
-            "harness_checks_run" => {
+            "checks_run" => {
                 ensure!(
                     self.can_run
                         && self.agent.active_count() == 0
@@ -251,7 +251,7 @@ impl CheckToolScope {
                 );
                 json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled))).await?})
             }
-            "harness_checks_status" => {
+            "checks_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
                 serde_json::to_value(
                     self.runner
@@ -259,7 +259,7 @@ impl CheckToolScope {
                         .await?,
                 )?
             }
-            "harness_checks_cancel" => {
+            "checks_cancel" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
                 self.runner.cancel(id)?;
                 json!({"run_id":id,"cancellation_requested":true})

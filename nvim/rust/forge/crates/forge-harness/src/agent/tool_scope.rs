@@ -29,23 +29,23 @@ mod tests {
         assert!(AgentToolScope::new(child,"parent".into(),coordinator.clone()).is_err());
         assert!(AgentToolScope::new(ExecutionOwner::root("foreign"),"parent".into(),coordinator.clone()).is_err());
         let (scope,lease) = AgentToolScope::new(ExecutionOwner::root("session"),"parent".into(),coordinator.clone()).unwrap();
-        assert!(scope.invoke("harness_list_agents",json!({})).await.is_err());
-        assert!(scope.invoke("harness_agent_activity",json!({"target":"child"})).await.is_err());
-        assert!(scope.invoke("harness_agent_tool_output",json!({"call_ref":"foreign"})).await.is_err());
+        assert!(scope.invoke("agent_list",json!({})).await.is_err());
+        assert!(scope.invoke("agent_activity",json!({"target":"child"})).await.is_err());
+        assert!(scope.invoke("agent_tool_output",json!({"call_ref":"foreign"})).await.is_err());
         assert!(coordinator.try_receive().is_none());
         coordinator.set_enabled(true);
         assert!(scope.available());
         for limit in [0,21] {
-            assert!(scope.invoke("harness_agent_activity",json!({"target":"child","limit":limit})).await.is_err());
+            assert!(scope.invoke("agent_activity",json!({"target":"child","limit":limit})).await.is_err());
         }
         for limit in [0,32001] {
-            assert!(scope.invoke("harness_agent_tool_output",json!({"call_ref":"foreign","limit":limit})).await.is_err());
+            assert!(scope.invoke("agent_tool_output",json!({"call_ref":"foreign","limit":limit})).await.is_err());
         }
-        assert!(scope.invoke("harness_spawn_agent",json!({"profile":"worker","text":"task","execution_owner":{"session_id":"foreign"}})).await.is_err());
+        assert!(scope.invoke("agent_spawn",json!({"profile":"worker","text":"task","execution_owner":{"session_id":"foreign"}})).await.is_err());
         assert!(coordinator.try_receive().is_none());
         drop(lease);
         assert!(!scope.available());
-        assert!(scope.invoke("harness_list_agents",json!({})).await.is_err());
+        assert!(scope.invoke("agent_list",json!({})).await.is_err());
         assert!(coordinator.try_receive().is_none());
     }
 
@@ -55,7 +55,7 @@ mod tests {
         coordinator.set_enabled(true);
         let (scope,lease) = AgentToolScope::new(ExecutionOwner::root("session"),"parent".into(),coordinator.clone()).unwrap();
         let mut revision = coordinator.subscribe();
-        let invocation = tokio::spawn(async move {scope.invoke("harness_list_agents",json!({})).await});
+        let invocation = tokio::spawn(async move {scope.invoke("agent_list",json!({})).await});
         tokio::time::timeout(std::time::Duration::from_secs(1),revision.changed()).await.unwrap().unwrap();
         drop(lease);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(1),invocation).await.unwrap().unwrap().is_err());
@@ -92,17 +92,17 @@ impl AgentToolScope {
         let text = |field: &str| arguments[field].as_str().filter(|text|!text.trim().is_empty()).map(str::to_owned)
             .with_context(||format!("{name} requires nonempty {field}"));
         let operation = match name {
-            "harness_spawn_agent" => AgentOperation::Spawn(serde_json::from_value(arguments)?),
-            "harness_send_message" => AgentOperation::Message {target:text("target")?,message:text("message")?},
-            "harness_followup_task" => AgentOperation::Followup {target:text("target")?,message:text("message")?},
-            "harness_interrupt_agent" => AgentOperation::Interrupt {target:text("target")?},
-            "harness_list_agents" => AgentOperation::List {prefix:arguments["path_prefix"].as_str().map(str::to_owned)},
-            "harness_agent_activity" => {
+            "agent_spawn" => AgentOperation::Spawn(serde_json::from_value(arguments)?),
+            "agent_send" => AgentOperation::Message {target:text("target")?,message:text("message")?},
+            "agent_followup" => AgentOperation::Followup {target:text("target")?,message:text("message")?},
+            "agent_interrupt" => AgentOperation::Interrupt {target:text("target")?},
+            "agent_list" => AgentOperation::List {prefix:arguments["path_prefix"].as_str().map(str::to_owned)},
+            "agent_activity" => {
                 let limit = arguments.get("limit").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?;
                 if let Some(limit) = limit { super::activity::validate_limit(limit)?; }
                 AgentOperation::Activity {target:text("target")?,limit}
             }
-            "harness_agent_tool_output" => {
+            "agent_tool_output" => {
                 let offset = arguments.get("offset").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?.unwrap_or(0);
                 let limit = arguments.get("limit").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?.unwrap_or(8000);
                 ensure!((1..=32000).contains(&limit), "output limit must be from 1 to 32000 characters");

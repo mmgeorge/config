@@ -23,8 +23,8 @@ local snapshot = { document = replica.document, revision = 0, block = {
   block("comment", { "CloudServiceSettings rename to CloudServiceConfig" }, 4),
   block("commentary", { "○ Replacing the declaration and its owning task." }, 2),
   block("tools", { "▸ Ran 4 tools" }, 2, "last-tool"),
-  block("first-tool", { "• harness_plan_read", "  └ Plan read accepted" }, 4),
-  block("last-tool", { "• harness_plan_submit" }, 4),
+  block("first-tool", { "• plan_read", "  └ Plan read accepted" }, 4),
+  block("last-tool", { "• plan_submit" }, 4),
   block("response", { "Resolved the configuration name." }, 0),
 } }
 snapshot.block[4].metadata.gutter[1].chunk[1].text = "    ◦ "

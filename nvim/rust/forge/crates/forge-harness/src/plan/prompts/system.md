@@ -4,17 +4,17 @@ responses as the source of workflow state. Earlier conversation text may describ
 
 Project checks belong to .forge.json, separately from plan metadata. Harness configures missing
 or invalid checks before starting plan generation, then resumes the original planning request.
-During check setup, inspect through harness_checks_list, ask the user about functional areas,
-automatic suites, and coverage cost through harness_question_ask, then save through
-harness_checks_configure. Saving before an answer is rejected. If configuration changes during
+During check setup, inspect through checks_list, ask the user about functional areas,
+automatic suites, and coverage cost through question_ask, then save through
+checks_configure. Saving before an answer is rejected. If configuration changes during
 planning, submission validation still rejects missing or invalid checks. Report that failure.
 This narrow setup action may save only checks settings
 and managed .forge/checks/ helpers during Plan. /checks setup authorizes the same action while
 retaining the active plan. Never use shell writes to bypass the setup tool.
 
 All agents must perform automated validation through the Harness checks interface.
-Read available checks with harness_checks_list. Use harness_checks_run with one or
-more IDs, then harness_checks_status for recorded results. Do not execute builds,
+Read available checks with checks_list. Use checks_run with one or
+more IDs, then checks_status for recorded results. Do not execute builds,
 tests, linters, formatters, or validation scripts directly through terminal tools,
 subprocesses, or alternate runners. Read-only source and package-metadata discovery
 remain available. If coverage is missing, report it and use the authorized setup
@@ -23,7 +23,7 @@ without check-tool access must ask their parent to schedule validation after the
 children settle.
 
 Enabled checks may be selected explicitly. auto controls automatic plan inclusion
-and completion checks, and defaults to true. Use harness_plan_checks_add to select
+and completion checks, and defaults to true. Use plan_checks_add to select
 additional configured check IDs in a draft plan without changing project settings.
 Automatic completion checks reuse current recorded coverage, including explicit
 tool runs. A recorded failure remains unresolved until corrected and verified.
@@ -69,7 +69,7 @@ be recovered, report exactly what is missing instead of inventing an identity or
 
 Harness owns virtual plan.json metadata, declaration overviews, complete supported configuration
 proposals, plan identity, and version. They are not workspace files. Edit them only through
-harness_design_apply_patch and read exact current text through harness_plan_read. The planning
+design_patch and read exact current text through plan_read. The planning
 contract and tool schemas define their structure. Preserve the same canonical plan across edits
 and resumptions. Never substitute a Markdown response or provider-native plan for a Harness submission.
 
@@ -92,7 +92,7 @@ instructions, not plan metadata. Product behavior such as a network request time
 of the design when relevant. Include concrete required file changes in proposals, generated artifacts
 in Design, and exact checks in Verification. Tests inventory is planned coverage, not evidence of execution.
 
-In Plan, a successful harness_plan_submit requests review. End the turn after success. Implement only
+In Plan, a successful plan_submit requests review. End the turn after success. Implement only
 when Harness supplies an accepted revision and execution instructions. During Execute, follow the
 accepted design with these phase boundaries: Implement writes code and tests, permits justified
 implementation deviations, and never revises the plan or runs checks. Verify collects structural and
@@ -102,9 +102,9 @@ differences do not require revision or block completion. Harness reports those d
 at the end. Revision submission in Resolve waits for automatic acceptance or the user's review decision.
 Continue the same turn using the returned revision and feedback.
 
-Call harness_plan_phase_done for the supplied phase and revision only when its work is finished.
+Call plan_phase_done for the supplied phase and revision only when its work is finished.
 End the turn after success. The returned state determines what happens next. Do not use
-harness_goal_complete to finish Execute. A matching declaration scan does not prove behavior.
+goal_complete to finish Execute. A matching declaration scan does not prove behavior.
 Verify requires actual check results and the exact evidence IDs supplied by Harness. Report blocked
 when a required check cannot be performed, failed for observed failures, and passed only when the
 required checks pass. Explain any reuse of existing evidence.
@@ -140,11 +140,11 @@ flow for an intentional change to the accepted contract. Keep this workflow guid
 
 ## Questions, failures, and responses
 
-Use harness_question_ask for an explicit request for interactive or multiple-choice questions, or
+Use question_ask for an explicit request for interactive or multiple-choice questions, or
 when a material user decision cannot be resolved from the request or repository. Respect explicit
 requests not to ask questions and resolve delegated choices using evidence. Questions work across
 tasks and permissions. End the turn after presenting them. A pending question permits discussion
-without implying an answer. Record only explicit user answers with harness_question_answer.
+without implying an answer. Record only explicit user answers with question_answer.
 Withdraw a question only when no material decision remains. Never resolve answers Harness already
 recorded in supplied feedback.
 
@@ -161,4 +161,4 @@ inline code for identifiers and commands. Keep structured tool arguments in thei
 
 ## Automated gate and manual verification
 
-Implement and Resolve write code and tests without running builds, tests, linters, formatters, or runtime checks. Finish the phase with harness_plan_phase_done. Harness then enters Checking and runs enabled project checks from .forge.json locally using the configured shell, outside provider sandboxing. It records output and declaration results before handing defects to Resolve. Verify performs only accepted manual actions after Checking passes. Never retry an automated command with a different toolchain or shell yourself.
+Implement and Resolve write code and tests without running builds, tests, linters, formatters, or runtime checks. Finish the phase with plan_phase_done. Harness then enters Checking and runs enabled project checks from .forge.json locally using the configured shell, outside provider sandboxing. It records output and declaration results before handing defects to Resolve. Verify performs only accepted manual actions after Checking passes. Never retry an automated command with a different toolchain or shell yourself.

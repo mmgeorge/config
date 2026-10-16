@@ -385,21 +385,21 @@ impl PlanExecutionRecord {
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance assessment in Checking. When writing is finished, call harness_plan_phase_done. Declarations and call/access differences do not gate Implement completion."
+                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance assessment in Checking. When writing is finished, call plan_phase_done. Declarations and call/access differences do not gate Implement completion."
             }
             PlanPhase::Resolve => {
-                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with harness_plan_phase_done so Harness can run declarations and automated checks again. Do not run those checks yourself."
+                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with plan_phase_done so Harness can run declarations and automated checks again. Do not run those checks yourself."
             }
             PlanPhase::Checking => "Harness runs declarations and accepted checks locally. No model turn is admitted for this phase.",
             PlanPhase::Verify => {
-                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed declarations and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked with observations and tool evidence. Report blockers honestly. Send observed defects to Resolve. Retrieve exact evidence IDs with harness_plan_read before submitting results."
+                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed declarations and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked with observations and tool evidence. Report blockers honestly. Send observed defects to Resolve. Retrieve exact evidence IDs with plan_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
             " Report verification.checks with one entry per accepted manual verification action, in plan order. Each entry contains category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
         } else { "" };
         format!(
-            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call harness_goal_complete for this execution.",
+            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with plan_read. Call plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -808,7 +808,7 @@ mod revision_policy_tests {
             let control = ExecutionControlSender { phase, execution_id: "e".into(), generation: 1, sender: sender.clone() };
             assert_eq!(control.require_revision_phase().is_ok(), phase == PlanPhase::Resolve);
             let tools = crate::control_tools::ControlToolRegistry.definition_list_for(Some(phase));
-            for name in ["harness_design_apply_patch", "harness_plan_submit"] {
+            for name in ["design_patch", "plan_submit"] {
                 assert_eq!(tools.iter().any(|tool| tool.name == name), phase == PlanPhase::Resolve);
             }
         }

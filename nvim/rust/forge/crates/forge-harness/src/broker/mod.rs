@@ -3048,7 +3048,7 @@ impl HarnessBroker {
         )?;
         self.store.save_exchange(&interaction)?;
         let prompt = format!(
-            "Harness resolved the pending questions and recorded their response sources. Do not call harness_question_answer or harness_question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
+            "Harness resolved the pending questions and recorded their response sources. Do not call question_answer or question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
         );
         let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some() && interaction.check_setup.is_none()
             && interaction.plan_id.is_some() {
@@ -3273,8 +3273,8 @@ impl HarnessBroker {
             prompt = format!(
                 "Continue the active planning task. The previous provider turn ended without a \
 terminal planning action. Edit the proposed declaration files if needed, then call \
-harness_plan_submit. Ask only a genuinely new unresolved question with \
-harness_question_ask when the user's question preferences allow it. Do not repeat resolved questions. Prose alone does not submit a plan. Report persistent control failures clearly instead of retrying unchanged rejected requests.\n\n\
+plan_submit. Ask only a genuinely new unresolved question with \
+question_ask when the user's question preferences allow it. Do not repeat resolved questions. Prose alone does not submit a plan. Report persistent control failures clearly instead of retrying unchanged rejected requests.\n\n\
 Planning continuation: turn {} of {}.",
                 plan.generation.budget.turn_count + 1,
                 plan.generation.budget.max_turn_count
@@ -6703,7 +6703,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             format!("/goal {objective}")
         } else {
             format!(
-                "Goal: {objective}\nContinue working until the goal is complete. Use harness_goal_complete or harness_goal_blocked to report terminal state."
+                "Goal: {objective}\nContinue working until the goal is complete. Use goal_complete or goal_blocked to report terminal state."
             )
         };
         let (result, mut event) = self
@@ -8183,9 +8183,9 @@ mod test {
             }
             if turn == 0 && self.explicit {
                 let scope = request.control_context.as_ref().unwrap().checks.as_ref().unwrap();
-                let started: Value = serde_json::from_str(&scope.invoke("harness_checks_run", json!({"ids":["verify"]})).await?)?;
+                let started: Value = serde_json::from_str(&scope.invoke("checks_run", json!({"ids":["verify"]})).await?)?;
                 loop {
-                    let run: Value = serde_json::from_str(&scope.invoke("harness_checks_status", json!({"run_id":started["run_id"],"wait_ms":30000})).await?)?;
+                    let run: Value = serde_json::from_str(&scope.invoke("checks_status", json!({"run_id":started["run_id"],"wait_ms":30000})).await?)?;
                     if run["state"] != "running" { break; }
                 }
             }
@@ -8549,7 +8549,7 @@ mod test {
             let turn = self.turn.fetch_add(1,Ordering::AcqRel);
             if turn == 0 {
                 let scope = request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("root has no authenticated agent lane")?;
-                let response = scope.invoke("harness_spawn_agent",json!({"profile":"worker","text":"CHILD_RESULT"})).await?;
+                let response = scope.invoke("agent_spawn",json!({"profile":"worker","text":"CHILD_RESULT"})).await?;
                 assert!(response.contains("admitted"));
             } else {
                 anyhow::ensure!(turn == 1,"parent continuation duplicated");
@@ -9262,8 +9262,8 @@ mod test {
             let context = request.control_context.unwrap();
             let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
             let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
-            runtime.invoke(crate::control_tools::ControlToolInvocation { name:"harness_plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
-            assert!(runtime.invoke(crate::control_tools::ControlToolInvocation { name:"harness_goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
+            runtime.invoke(crate::control_tools::ControlToolInvocation { name:"plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
+            assert!(runtime.invoke(crate::control_tools::ControlToolInvocation { name:"goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
             Ok(crate::backend::BackendOutput { evidence:crate::goal::TurnEvidence { tool_called:true, structured_complete:true, ..Default::default() }, ..Default::default() })
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
@@ -9343,15 +9343,15 @@ mod test {
             std::fs::write(Path::new(&request.workspace).join("added.rs"), "pub fn extra() {}\n")?;
             let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n*** End Patch");
             let mut runtime = ControlToolRuntime::new(context);
-            runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
-            let result = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
+            runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
+            let result = runtime.invoke(ControlToolInvocation { name:"plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
             assert!(!runtime.execution_finished(), "revision review must retain the provider turn");
             let response: Value = serde_json::from_str(&result.message)?;
             assert!(response.get("document").is_none(), "internal canonical source must not inflate tool output");
-            let read = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
+            let read = runtime.invoke(ControlToolInvocation { name:"plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
             let state: Value = serde_json::from_str(&read.message)?;
             assert_eq!(state["execution"]["generation"], response["generation"], "the next tool must use the reviewed generation");
-            let canonical = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),
+            let canonical = runtime.invoke(ControlToolInvocation { name:"plan_read".into(),
                 arguments:json!({"plan_id":plan_id,"path":"plan.json"}) }).await?;
             let rejected = response["plan_state"] == "accepted" && response["revision"] == 1;
             assert_eq!(canonical.message.contains("score reset"), !rejected,
@@ -9598,7 +9598,7 @@ mod test {
             let phase = match turn { 0 => "implement", 2 => "resolve", _ => "verify" };
             let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
             if turn == 0 {
-                let rejected = runtime.invoke(ControlToolInvocation { name: "harness_design_apply_patch".into(), arguments: json!({
+                let rejected = runtime.invoke(ControlToolInvocation { name: "design_patch".into(), arguments: json!({
                     "plan_id":document.plan_id, "expected_version":document.version, "patch":"*** Begin Patch\n*** End Patch"}) }).await.unwrap_err();
                 assert!(rejected.to_string().contains("Resolve"));
                 for (path, overview) in &document.design.as_ref().unwrap().proposed {
@@ -9623,7 +9623,7 @@ mod test {
             }
             if phase == "verify" {
                 let read = runtime.invoke(ControlToolInvocation {
-                    name: "harness_plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
+                    name: "plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
                 }).await.unwrap();
                 let inspection: Value = serde_json::from_str(&read.message).unwrap();
                 let available = inspection["execution"]["verification_evidence"].as_array().unwrap();
@@ -9632,18 +9632,18 @@ mod test {
                 assert_eq!(inspection["execution"]["phase"], "verify");
                 let mut invalid = arguments.clone();
                 invalid["verification"]["evidence"] = json!(["unobserved-check"]);
-                assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:invalid }).await.unwrap_err().to_string().contains("not a completed tool result"));
+                assert!(runtime.invoke(ControlToolInvocation { name:"plan_phase_done".into(), arguments:invalid }).await.unwrap_err().to_string().contains("not a completed tool result"));
                 if turn == 3 {
                     let mut reused = arguments.clone();
                     reused["verification"]["evidence"] = json!(["check-1"]);
-                    assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:reused }).await.unwrap_err().to_string().contains("reused verification evidence"));
+                    assert!(runtime.invoke(ControlToolInvocation { name:"plan_phase_done".into(), arguments:reused }).await.unwrap_err().to_string().contains("reused verification evidence"));
                 }
             }
-            let invocation = ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments };
+            let invocation = ControlToolInvocation { name:"plan_phase_done".into(), arguments };
             let first = runtime.invoke(invocation.clone()).await?;
             let repeated = runtime.invoke(invocation).await?;
             assert_eq!(first.message, repeated.message);
-            assert!(runtime.invoke(ControlToolInvocation { name:"harness_goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
+            assert!(runtime.invoke(ControlToolInvocation { name:"goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
             sink.as_ref().unwrap().send_wait(BackendEvent {
                 received_at_ms: None, address: Some(address.clone()), turn_boundary: None,
                 kind: "usage".into(), text: None,
@@ -10682,7 +10682,7 @@ mod test {
             let mut runtime = ControlToolRuntime::new(context);
             let mut output = crate::backend::BackendOutput::default();
             let read = runtime.invoke(ControlToolInvocation {
-                name: "harness_plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
+                name: "plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
             }).await?;
             apply_invocation(&read.invocation.unwrap(), &mut output)?;
             match turn {
@@ -10690,7 +10690,7 @@ mod test {
                 1 => output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into())),
                 3 => {
                     let edit = runtime.invoke(ControlToolInvocation {
-                        name: "harness_design_apply_patch".into(),
+                        name: "design_patch".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
                             "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n*** End Patch"}),
                     }).await?;
@@ -10698,7 +10698,7 @@ mod test {
                 }
                 4 => {
                     let submit = runtime.invoke(ControlToolInvocation {
-                        name: "harness_plan_submit".into(),
+                        name: "plan_submit".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version}),
                     }).await?;
                     apply_invocation(&submit.invocation.unwrap(), &mut output)?;

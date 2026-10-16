@@ -596,7 +596,7 @@ fn append(output: &mut String, text: &str) {
 /// Defines a compact provider-neutral schema without protocol-specific objects.
 pub(crate) fn definition() -> super::ControlToolDefinition {
     super::ControlToolDefinition {
-        name: "harness_lsp",
+        name: "lsp",
         description: "Query project language servers using live editor contents, waiting for initialization when needed. Positions are one-based Unicode characters. Position operations require path/line/column. Symbols use query; calls require direction. Diagnostics inspect one file and do not prove a full typecheck. Lists default to 20 rows; use next_offset for more. Read-only operations.",
         input_schema: json!({"type":"object","additionalProperties":false,"required":["operation"],"properties":{
             "operation":{"type":"string","enum":["status","definition","type_definition","implementation","references","hover","document_symbols","workspace_symbols","calls","diagnostics"]},

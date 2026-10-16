@@ -6,7 +6,7 @@ the existing global, workspace, and session preference layers. Disabling it
 revokes agent queries without stopping language servers or disabling plan-review
 navigation. Enabled turns receive short guidance recommending semantic queries.
 
-Harness exposes one tool, `harness_lsp`, with an `operation` field:
+Harness exposes one tool, `lsp`, with an `operation` field:
 
 | Operation | Required fields | Purpose |
 | --- | --- | --- |

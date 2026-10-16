@@ -9,7 +9,7 @@ local exchange = {
     { id = "commentary", kind = "assistant", delivery = "commentary", text = "Checking the scope" },
     { id = "answer", kind = "assistant", delivery = "final", text = "I mean a Rust CLI" },
   }, tool = { order = { "ask" }, item = { ask = {
-    id = "ask", title = "harness_question_ask", output = "Question set accepted", status = "completed", failed = false,
+    id = "ask", title = "question_ask", output = "Question set accepted", status = "completed", failed = false,
   } } } } },
   node_list = {
     { kind = "turn_content", id = "commentary-node", turn_id = "turn", item = { kind = "message", id = "commentary" } },

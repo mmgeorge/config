@@ -23,7 +23,7 @@ async fn fragmented_requests_preserve_order_and_notification_silence() {
         json!({"jsonrpc":"2.0", "id":1, "method":"initialize"}),
         json!({"jsonrpc":"2.0", "method":"notifications/initialized"}),
         json!({"jsonrpc":"2.0", "id":2, "method":"tools/list"}),
-        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"harness_goal_status", "arguments":{"status":"🦀"}}}),
+        json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"🦀"}}}),
     ];
     for request in requests {
         let mut encoded = serde_json::to_vec(&request).unwrap();
@@ -113,7 +113,7 @@ async fn oversized_result_returns_one_bounded_error_and_keeps_request_order() {
     let mut child = spawn();
     let mut input = child.stdin.take().unwrap();
     let mut output = BufReader::new(child.stdout.take().unwrap());
-    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"harness_goal_status", "arguments":{"status":"x".repeat(300 * 1024)}}});
+    let request = json!({"jsonrpc":"2.0", "id":11, "method":"tools/call", "params":{"name":"goal_status", "arguments":{"status":"x".repeat(300 * 1024)}}});
     let mut encoded = serde_json::to_vec(&request).unwrap();
     encoded.push(b'\n');
     assert!(encoded.len() < forge_protocol::MAX_FRAME_BYTES);

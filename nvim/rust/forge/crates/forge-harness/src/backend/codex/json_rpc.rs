@@ -597,7 +597,7 @@ impl CodexJsonRpc {
             }
         }
         write_result?;
-        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("harness_plan_phase_done")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
+        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("plan_phase_done")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
             let params = message.get("params").unwrap_or(message);
             if let (Some(thread), Some(turn)) = (params.get("threadId").and_then(Value::as_str), params.get("turnId").and_then(Value::as_str)) {
                 self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn})).await?;
@@ -634,7 +634,7 @@ impl CodexJsonRpc {
                 Ok(json!({
                     "contentItems": [{
                         "type": "inputText",
-                        "text": "Harness already recorded and consumed this planning feedback. Continue with harness_design_apply_patch, harness_question_ask, or harness_plan_submit."
+                        "text": "Harness already recorded and consumed this planning feedback. Continue with design_patch, question_ask, or plan_submit."
                     }],
                     "success": false
                 }))
@@ -735,13 +735,13 @@ impl CodexJsonRpc {
                                     .map(|document| document.version)
                                     .unwrap_or_default()
                             ),
-                            "harness_plan_read" => self
+                            "plan_read" => self
                                 .plan_document
                                 .as_ref()
                                 .map(serde_json::to_string_pretty)
                                 .transpose()?
                                 .context("plan read lost its active canonical document")?,
-                            "harness_plan_submit" => format!(
+                            "plan_submit" => format!(
                                 "Plan version {} passed canonical submission validation.",
                                 self.plan_document
                                     .as_ref()
@@ -780,18 +780,18 @@ impl CodexJsonRpc {
             name if crate::control_tools::is_agent_tool(name) => {
                 anyhow::bail!("agent tools require an authenticated active root turn");
             }
-            "harness_plan_phase_done" => {
+            "plan_phase_done" => {
                 anyhow::bail!("phase completion requires an active execution control context");
             }
             "harness_plan_edit" => {
-                anyhow::bail!("obsolete plan edit tool. Use harness_design_apply_patch");
+                anyhow::bail!("obsolete plan edit tool. Use design_patch");
             }
-            "harness_design_apply_patch" => {
+            "design_patch" => {
                 let request = output.design_patch.pop().context("design patch has no request")?;
                 self.plan_document = Some(self.plan_document.as_ref().context("design patch has no active design")?.patch_design(Path::new(&self.workspace), request)?);
                 return Ok(Some(format!("Declaration patch accepted. Active version: {}",self.plan_document.as_ref().unwrap().version)));
             }
-            "harness_plan_read" => {
+            "plan_read" => {
                 let requested_plan_id = output
                     .plan_read
                     .as_deref()
@@ -809,7 +809,7 @@ impl CodexJsonRpc {
                     return Ok(Some(serde_json::json!({"plan_id":document.plan_id,"version":document.version,"declarations":value}).to_string()));
                 }
             }
-            "harness_plan_submit" => {
+            "plan_submit" => {
                 let submission = output
                     .plan_submit
                     .as_ref()
@@ -921,7 +921,7 @@ fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Va
     planning_feedback
         && matches!(
             control_tool_name(method, params),
-            Some("harness_question_answer" | "harness_question_withdraw")
+            Some("question_answer" | "question_withdraw")
         )
 }
 
@@ -2264,10 +2264,10 @@ mod test {
         process.set_control_context(context);
         let mut output = BackendOutput::default();
         for (id, tool, arguments) in [
-            (1, "harness_plan_checks_add", json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]})),
-            (2, "harness_design_apply_patch", json!({"plan_id":"plan","expected_version":5,
+            (1, "plan_checks_add", json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]})),
+            (2, "design_patch", json!({"plan_id":"plan","expected_version":5,
                 "patch":"*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Restart fixture\",\n*** End Patch"})),
-            (3, "harness_plan_checks_add", json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]})),
+            (3, "plan_checks_add", json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]})),
         ] {
             process.publish_message(json!({"id":id,"method":"item/tool/call","params":{
                 "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),"tool":tool,"arguments":arguments
@@ -2404,7 +2404,7 @@ mod test {
             socket.send(Message::Text(json!({
                 "id": 90, "method": "item/tool/call",
                 "params": {"threadId":"thread", "turnId":"turn", "callId":"phase",
-                    "tool":"harness_plan_phase_done",
+                    "tool":"plan_phase_done",
                     "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
             }).to_string().into())).await.unwrap();
             socket.send(Message::Text(json!({
@@ -2423,7 +2423,7 @@ mod test {
         process.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), &mut output).await?;
         tokio::time::timeout(Duration::from_secs(2), server).await??;
         let failure = process.execute_control_invocation(&ControlToolInvocation {
-            name: "harness_plan_phase_done".into(),
+            name: "plan_phase_done".into(),
             arguments: json!({"phase":"implement","revision":1,"summary":"Implemented"}),
         }, BackendOutput::default()).await.unwrap_err();
         assert!(failure.to_string().contains("active execution control context"));
@@ -2583,7 +2583,7 @@ mod test {
                     "item": {
                         "id": overview,
                         "type": "dynamicToolCall",
-                        "tool": "harness_design_apply_patch",
+                        "tool": "design_patch",
                         "arguments": {
                             "plan_id": "plan-1",
                             "expected_version": 1,
@@ -2652,7 +2652,7 @@ mod test {
                     "item": {
                         "id": "submit-1",
                         "type": "dynamicToolCall",
-                        "tool": "harness_plan_submit",
+                        "tool": "plan_submit",
                         "arguments": {
                             "plan_id": "plan-1",
                             "expected_version": 5
@@ -2666,7 +2666,7 @@ mod test {
             "method": "item/tool/call",
             "params": {
                 "itemId": "submit-1",
-                "tool": "harness_plan_submit",
+                "tool": "plan_submit",
                 "arguments": {
                     "plan_id": "plan-1",
                     "expected_version": 5
@@ -2738,7 +2738,7 @@ mod test {
                 "params": {
                     "item": {
                         "type": "dynamicToolCall",
-                        "tool": "harness_question_ask",
+                        "tool": "question_ask",
                         "arguments": {
                             "questions": [{
                                 "header": "Migration",
@@ -2770,7 +2770,7 @@ mod test {
                 "method": "item/completed",
                 "params": { "item": {
                     "type": "dynamicToolCall",
-                    "tool": "harness_question_answer",
+                    "tool": "question_answer",
                     "arguments": {
                         "question_id": "migration",
                         "response": { "kind": "selected", "option": "Staged" }
@@ -2793,7 +2793,7 @@ mod test {
                 "method": "item/completed",
                 "params": { "item": {
                     "type": "dynamicToolCall",
-                    "tool": "harness_question_withdraw",
+                    "tool": "question_withdraw",
                     "arguments": { "reason": "Repository policy determines the choice." }
                 } }
             }),
@@ -2843,7 +2843,7 @@ mod test {
         normalize_event(
             &json!({
                 "method": "item/commandExecution/completed",
-                "params": { "output": "printed harness_goal_complete as documentation" }
+                "params": { "output": "printed goal_complete as documentation" }
             }),
             &mut output,
             None,
@@ -2861,7 +2861,7 @@ mod test {
             &json!({
                 "method": "item/tool/call",
                 "params": {
-                    "name": "harness_goal_complete",
+                    "name": "goal_complete",
                     "arguments": { "summary": "Complete" }
                 }
             }),
@@ -2918,7 +2918,7 @@ mod test {
             "id": "request-7",
             "method": "item/tool/call",
             "params": {
-                "name": "harness_plan_submit",
+                "name": "plan_submit",
                 "arguments": {
                     "plan_id": "plan-1",
                     "expected_version": 4
@@ -2979,7 +2979,7 @@ mod test {
                     "item": {
                         "id": call_id,
                         "type": "dynamicToolCall",
-                        "tool": "harness_plan_read",
+                        "tool": "plan_read",
                         "arguments": { "plan_id": "plan", "path": "plan.json" },
                         "status": status
                     }
@@ -3092,7 +3092,7 @@ mod test {
         let answer = json!({
             "method": "item/tool/call",
             "params": {
-                "name": "harness_question_answer",
+                "name": "question_answer",
                 "arguments": {
                     "question_id": "reader_mode",
                     "option_id": "preview_cli"
@@ -3102,7 +3102,7 @@ mod test {
         let withdraw = json!({
             "method": "item/tool/call",
             "params": {
-                "name": "harness_question_withdraw",
+                "name": "question_withdraw",
                 "arguments": {
                     "question_id": "reader_mode"
                 }
@@ -3252,7 +3252,7 @@ mod test {
         normalize_event(
             &json!({
                 "method": "item/agentMessage/delta",
-                "params": { "delta": "I will call harness_goal_complete " }
+                "params": { "delta": "I will call goal_complete " }
             }),
             &mut output,
             None,
@@ -3270,7 +3270,7 @@ mod test {
         assert_eq!(output.event.len(), 1);
         assert_eq!(
             output.event[0].text.as_deref(),
-            Some("I will call harness_goal_complete after the plan finishes.")
+            Some("I will call goal_complete after the plan finishes.")
         );
         assert!(!output.evidence.structured_complete);
         assert_eq!(output.event[0].kind, "assistant_message");
@@ -3658,7 +3658,7 @@ mod test {
                         "id": "mcp-control-name",
                         "type": "mcpToolCall",
                         "server": "external-mcp",
-                        "tool": "harness_goal_complete",
+                        "tool": "goal_complete",
                         "status": "completed",
                         "result": { "content": [{ "type": "text", "text": "ordinary result" }] }
                     }
@@ -3674,7 +3674,7 @@ mod test {
             .activity
             .as_ref()
             .expect("external MCP activity");
-        assert_eq!(activity.title, "external-mcp.harness_goal_complete({})");
+        assert_eq!(activity.title, "external-mcp.goal_complete({})");
     }
 
     #[tokio::test]

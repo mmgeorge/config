@@ -258,7 +258,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let mut execute = request(
         repository.path(),
         PromptMode::ExecutePlan,
-        "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call harness_goal_complete.",
+        "Execute the accepted plan now. Create harness-integration.txt containing exactly `verified` followed by a newline, then call goal_complete.",
     );
     execute.execution_mode = PermissionMode::Yolo;
     execute.backend_session_id = planned.backend_session_id.clone();

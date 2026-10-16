@@ -14,8 +14,8 @@ globs:
 ## Harness Check Ownership
 
 Inside Forge Harness, agents must perform automated validation through the checks
-interface. List configured checks, run selected IDs through `harness_checks_run`,
-and inspect recorded results with `harness_checks_status`. Do not run builds,
+interface. List configured checks, run selected IDs through `checks_run`,
+and inspect recorded results with `checks_status`. Do not run builds,
 tests, linters, formatters, or validation scripts directly through terminal tools
 or alternate subprocesses. During plan execution, finish the active phase and
 let Harness Checking execute validation. Delegated agents without check tools
@@ -164,7 +164,7 @@ through interrupt/finalize/resume and display failures instead of leaving the UI
 Validate directories before persisting them. Never disable isolation when selecting YOLO.
 
 Every `/plan` result must stop in a physical editable `PlanReview` file before
-execution. Accept only an explicit `harness_plan_submit` result or a complete
+execution. Accept only an explicit `plan_submit` result or a complete
 native plan artifact. `oY` accepts the exact saved digest and starts the visible
 `Complete the plan` goal. `oN` sends the full edited plan, its diff against the
 last model revision, and every extmark-anchored annotation back for revision.

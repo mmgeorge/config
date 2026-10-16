@@ -251,7 +251,7 @@ impl HarnessBroker {
             .transpose()?
             .unwrap_or_else(|| "No active plan.".into());
         self.check_setup = true;
-        let result = self.run_interaction(format!("Configure project checks through harness_checks_configure. Focus: {selected}.\n\nActive proposed plan (read-only context):\n{plan}\n\n{prompt}"), PromptMode::Chat, Some(admission)).await;
+        let result = self.run_interaction(format!("Configure project checks through checks_configure. Focus: {selected}.\n\nActive proposed plan (read-only context):\n{plan}\n\n{prompt}"), PromptMode::Chat, Some(admission)).await;
         self.check_setup = false;
         if result.is_ok()
             && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_ok()

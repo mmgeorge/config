@@ -111,12 +111,12 @@ while Rust owns resolution and source coordinates.
 inside Harness-owned `plans/<session>/<plan>/working.json`. New plans read `.forge.json` settings
 and start with no captured source files. They perform no repository file discovery or extraction.
 The provider receives the plan identity,
-version, request, and path inventory. `harness_plan_read` reads one virtual file or its baseline as
+version, request, and path inventory. `plan_read` reads one virtual file or its baseline as
 numbered plain text. Optional 1-based inclusive line bounds require a file path. The response retains
 the active version, selected side, actual range, and total line count. An uncaptured-path read extracts
 only that workspace file and returns its full-source digest without changing the saved design or version.
 Inventory reads remain structured and list captured and proposed paths rather than workspace files.
-`harness_design_apply_patch` applies familiar Add File, Update File, Delete File, Move to, and
+`design_patch` applies familiar Add File, Update File, Delete File, Move to, and
 context chunks atomically. The first Update, Delete, or Move captures that path's baseline and source
 digest in the patch candidate. Add and Move reject occupied workspace destinations. Captured removals
 and moves never reload their original source. The control runtime retains inspected digests within a
@@ -167,8 +167,8 @@ repeating work. Successful phase completion ends the model turn so Harness owns 
 transition. Execution revision submission retains the provider turn while the broker commits the
 revision and returns the decision. Ordinary pending-question follow-ups do not claim to be Plan tasks.
 
-`harness_question_ask` pauses either backend on one to three structured decisions while
-`harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
+`question_ask` pauses either backend on one to three structured decisions while
+`plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
 tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
 into SDK `Tool` handlers. Ordinary prose remains an ordinary planning response until the agent
 invokes a structured control tool.
@@ -207,8 +207,8 @@ while a question remains unresolved. These transitions retain the selected execu
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
 Submitting the review page consumes that question set before the provider continuation starts.
-The continuation prompt and control-tool descriptions therefore forbid `harness_question_answer`
-and `harness_question_withdraw` for the embedded planning feedback. The Codex request responder
+The continuation prompt and control-tool descriptions therefore forbid `question_answer`
+and `question_withdraw` for the embedded planning feedback. The Codex request responder
 enforces the same boundary by returning an unsuccessful tool result and omitting the rejected call
 from normalized control output. If Codex edits the plan but ends without submitting or asking a new
 question, the backend starts one bounded corrective provider turn inside the same Harness
@@ -267,8 +267,8 @@ The main question float never maps Ctrl-s and cannot bypass this review boundary
 Answer and skip requests update only the durable elicitation record. Ask and subsequent ordinary
 Harness prompts run read-only follow-up interactions against a mutable decision set. The provider
 must preserve the set without a control call when it remains valid, may replace the complete set
-through `harness_question_ask`, may record only an explicit user answer through
-`harness_question_answer`, and may remove the boundary through `harness_question_withdraw` only
+through `question_ask`, may record only an explicit user answer through
+`question_answer`, and may remove the boundary through `question_withdraw` only
 when user direction or repository evidence proves that no material decision remains. A model
 recommendation never qualifies as an answer.
 Closing the float leaves a Timeline Status reading `Waiting for input (press oe)`. Clarification
@@ -288,7 +288,7 @@ has been restored.
 Elicitation revisions prevent a restored session from repeatedly presenting the same picker, while
 the transient Timeline Status exposes the pending decision after dismissal or restart.
 Plan edit calls persist the structurally valid JSON draft without rendering its intermediate
-cross-section state. `harness_plan_submit` validates ownership coverage and renderability against
+cross-section state. `plan_submit` validates ownership coverage and renderability against
 the complete staged document. A rejected submission returns those violations to the provider and
 leaves the draft editable, while a successful submission atomically refreshes `working.md`, its
 navigation index, and the immutable submitted revision.
@@ -423,7 +423,7 @@ visual selection remains valid across wrapping and repeated package invocations.
 
 The `checks` list explicitly selects enabled
 definitions without changing their repository defaults. The versioned
-`harness_plan_checks_add` tool adds these references through the normal design
+`plan_checks_add` tool adds these references through the normal design
 patch lifecycle. Both previews and execution include required prerequisites.
 
 `CheckEvidence` retains the source checkpoint and execution contract certified by
@@ -516,7 +516,7 @@ configuration, refreshes the projection, and requires reopening the review. Impl
 Resolve write source without executing validation. Their completion persists Checking before
 process admission. Manual Verify begins only after the declaration scan and enabled checks pass.
 
-One Rust-owned runner serves the automatic gate and `harness_checks_run`. Its provider-neutral
+One Rust-owned runner serves the automatic gate and `checks_run`. Its provider-neutral
 tools list configuration, save authorized setup captures, start runs, read status, and cancel
 owned runs. Model-triggered commands follow the existing permission coordinator. The narrow
 setup action writes only checks settings and managed helpers while retaining the active plan.

@@ -4,7 +4,7 @@ Inspect project manifests, existing scripts, CI, test runners, and repository in
 For an empty directory, use the retained original planning request to establish the intended
 tooling before choosing commands. Limit discovery to check setup. Do not draft or implement
 the requested feature. Harness starts the original plan after valid configuration is saved.
-Discovery must be followed by a user conversation. Call harness_question_ask with one to three
+Discovery must be followed by a user conversation. Call question_ask with one to three
 concrete questions before saving. Propose discovered functional areas and ask which suites run
 automatically, which remain explicit, and whether routine verification uses targeted or full
 coverage. Ask about acceptable cost when it changes that choice. Do not invent the user's
@@ -12,7 +12,7 @@ preferences. Configuration publication is rejected until the setup exchange rece
 answer. Continue the same setup exchange after the answers, including after host recovery.
 Present the proposed areas, triggers, coverage, dependencies, and expected cost before saving.
 For a narrow edit, focus the questions on changed decisions rather than repeating settled ones.
-Configure checks only through harness_checks_configure. Read harness_checks_list first for the
+Configure checks only through checks_configure. Read checks_list first for the
 current revision, definitions, overrides, and history. Preserve existing project settings and
 checks that remain useful. Do not run configured checks during setup.
 

@@ -397,7 +397,7 @@ mod test {
             owner:crate::backend::ExecutionOwner::root("root"),mode:PermissionMode::Read,sink:None,
         });
         *state.control.lock().await = Some(ControlToolRuntime::new(ControlTurnContext::inactive(crate::backend::PromptMode::Chat)));
-        let failure = state.request("forge/control",json!({"name":"harness_spawn_agent",
+        let failure = state.request("forge/control",json!({"name":"agent_spawn",
             "arguments":{"provider":"incorrect"}})).await.unwrap_err();
         let diagnostic:Value = serde_json::from_str(&failure.to_string())?;
         assert_eq!(diagnostic["code"],"invalid_arguments");
@@ -492,7 +492,7 @@ mod test {
             assert_eq!(waiting.await.unwrap()["outcome"]["optionId"], "deny");
         }
         let internal = tokio::time::timeout(std::time::Duration::from_secs(1), state.authorize(json!({
-            "toolCall":{"kind":"other","_meta":{"mcp":{"server":"forge-harness-control","tool":"harness_goal_complete"}}},
+            "toolCall":{"kind":"other","_meta":{"mcp":{"server":"forge-harness-control","tool":"goal_complete"}}},
             "options":[{"kind":"allow_once","optionId":"internal-allow"},{"kind":"reject_once","optionId":"deny"}]
         }))).await.unwrap().unwrap();
         assert_eq!(internal["outcome"]["optionId"], "internal-allow");
@@ -542,7 +542,7 @@ mod test {
         assert_eq!(output.event.last().unwrap().summary.as_ref().unwrap().duration_ms, 1234);
         drop(output);
         *state.active.write().await = None;
-        assert!(state.request("forge/control", json!({"name":"harness_plan_read"})).await.is_err());
+        assert!(state.request("forge/control", json!({"name":"plan_read"})).await.is_err());
     }
 
     #[tokio::test]
