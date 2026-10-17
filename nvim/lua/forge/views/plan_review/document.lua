@@ -9,7 +9,7 @@ local perf = require("forge.infra.perf")
 ---@class ForgePlanReviewUpdate
 ---@field snapshot? {document: string, revision: integer, block: table[]}
 ---@field patch? table
----@field source_edit {upsert: {id: string, source_line: integer}[], remove: string[]}
+---@field source_edit {upsert: {id: string, source_line: integer, test_change?: string, test_file?: string, test_summary?: table<string, integer>}[], remove: string[]}
 ---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
 ---@field public_only boolean
 ---@field saved_source_digest string

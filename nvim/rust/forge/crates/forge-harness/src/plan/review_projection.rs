@@ -33,7 +33,7 @@ pub(super) fn update_tests(
         if anchor.line as usize > old_end { anchor.line = (anchor.line as i64 + shift) as u32; }
     }
     let design = source.document.design.as_ref().context("test edit has no design")?;
-    let (mut replacement, navigation) = super::design_review::test_inventory(&design.document.tests)?;
+    let (mut replacement, navigation) = super::design_review::test_inventory(design)?;
     for (index, row) in replacement.iter_mut().enumerate() {
         if let Some(anchor) = navigation.iter().find(|anchor| anchor.line as usize == index + 1) {
             let id = TargetId(format!("plan:declaration:{}", row.id.0));

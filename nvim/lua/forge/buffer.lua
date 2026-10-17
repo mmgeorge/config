@@ -806,6 +806,18 @@ function M.apply_snapshot_part(session, part)
   return M.apply_snapshot(session, snapshot)
 end
 
+--- Select the first matching target in native metadata order at an exact source position.
+---@param targets {id: string, range: {start: {row: integer, column: integer}, ["end"]: {row: integer, column: integer}}}[]
+---@param position {row: integer, column: integer}
+---@return string?
+function M.target_at(targets, position)
+  for _, target in ipairs(targets) do
+    if before_or_equal(target.range.start, position) and not before_or_equal(target.range["end"], position) then
+      return target.id
+    end
+  end
+end
+
 ---@param session table
 ---@param row integer
 ---@param column integer
@@ -826,25 +838,14 @@ function M.locate(session, row, column)
     if not selected then return nil end
     local _, source_row = session.sequence:position(selected.id)
     local offset = row - M.physical_row(session, source_row)
-    local target_id
-    for _, target in ipairs(selected.entry.metadata.target) do
-      local position = { row = offset, column = column }
-      if before_or_equal(target.range.start, position) and not before_or_equal(target.range["end"], position) then target_id = target.id break end
-    end
-    return { block = selected.id, position = { row = offset, column = column }, target = target_id }
+    local position = { row = offset, column = column }
+    return { block = selected.id, position = position, target = M.target_at(selected.entry.metadata.target, position) }
   end
   local node = session.sequence:locate(row)
   if not node then return nil end
   local _, start_row = session.sequence:position(node.id)
   local position = { row = row - start_row, column = column }
-  local target_id
-  for _, target in ipairs(node.entry.metadata.target) do
-    if before_or_equal(target.range.start, position) and not before_or_equal(target.range["end"], position) then
-      target_id = target.id
-      break
-    end
-  end
-  return { block = node.id, position = position, target = target_id }
+  return { block = node.id, position = position, target = M.target_at(node.entry.metadata.target, position) }
 end
 
 ---@param session table

@@ -43,6 +43,31 @@ pub struct FoldPolicy {
     pub expand_children: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Change styling shared by source rows and semantic diff summaries.
+pub enum RowChange {
+    /// An unchanged row without a change marker or background.
+    Context,
+    /// A new row with an addition marker and background.
+    Added,
+    /// A modified row with the shared orange marker and background.
+    Modified,
+    /// A removed row with a deletion marker and background.
+    Removed,
+}
+
+impl RowChange {
+    /// Returns the marker, row background, gutter foreground, and emphasis captures.
+    pub(crate) fn style(self) -> (&'static str, &'static str, &'static str, &'static str) {
+        match self {
+            Self::Context => (" ", "ForgeContextBg", "ForgeContextLineNr", "ForgeContextBg"),
+            Self::Added => ("+", "ForgeAddBg", "ForgeAddLineNr", "ForgeInlineAddBg"),
+            Self::Modified => ("~", "ForgeModifyBg", "ForgeModifyLineNr", "ForgeModifyBg"),
+            Self::Removed => ("-", "ForgeDeleteBg", "ForgeDeleteLineNr", "ForgeInlineDeleteBg"),
+        }
+    }
+}
+
 #[derive(Clone)]
 /// Shared presentation retaining only the current streamed group and layout options.
 pub struct DiffPresenter {
@@ -85,6 +110,20 @@ impl DiffPresenter {
         counts: Option<(u64, u64)>,
     ) -> Result<BufferBlock, ContractError> {
         self.heading(id, change.header(path, counts, false))
+    }
+
+    /// Projects one semantic diff row without inventing source line numbers.
+    pub fn summary(&self, id: BlockId, text: &str, change: RowChange) -> Result<BufferBlock, ContractError> {
+        let mut block = BufferBlock {
+            id, text: BufferText::from_rows([text])?, metadata: Default::default(),
+        };
+        block.metadata.layout = self.options.layout.clone();
+        let (_, background, _, _) = change.style();
+        let columns = [3, 2, 3, 2].into_iter().map(|width| TextChunk {
+            text: " ".repeat(width), capture: background.into(),
+        }).collect();
+        crate::projection::append_change_row(&mut block.metadata, 0, change, columns, self.options.indent)?;
+        Ok(block)
     }
 
     /// Formats a hunk heading while retaining saved heading text when requested.

@@ -14,7 +14,8 @@ local function encode(value)
   for _, row in ipairs(value.source_row) do
     local id = row.block .. ":" .. row.position.row
     retained[id] = true
-    source_edit.upsert[#source_edit.upsert + 1] = { id = id, source_line = row.source_line, test = row.test, check = row.check }
+    source_edit.upsert[#source_edit.upsert + 1] = { id = id, source_line = row.source_line, test = row.test, check = row.check,
+      test_change = row.test_change, test_file = row.test_file, test_summary = row.test_summary }
     if type(row.target) == "string" then
       local block = assert(block_by_id[row.block])
       block.metadata.target = block.metadata.target or {}

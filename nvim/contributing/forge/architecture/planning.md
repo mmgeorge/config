@@ -240,7 +240,9 @@ interaction context with every message, including messages to an already-live se
 
 Plan metadata stores data flows separately from the Design Markdown. `design_flows.rs` owns
 the recursive `text`, optional incoming `via`, and `children` node schema, validates its size and
-depth, and generates code-fenced diagrams. The planning prompt follows values, requests, events,
+depth, and generates typed narrative, diagram, and fence rows. Text exports retain code-fenced
+diagrams, while PlanReview omits fence rows and renders the diagram as native buffer text.
+The planning prompt follows values, requests, events,
 records, and artifacts through producers, transformations, stores, and consumers. Short labels name
 one semantic role each. Paired JSON and rendered examples demonstrate transformations, shared
 consumers, and alternative results. Scheduling rules and lifecycle guarantees stay in descriptions.
@@ -249,10 +251,27 @@ indentation, and only actual splits create indented branches. Branches retain th
 transfer or condition labels and continuation rails. The shared section
 projection places Flows after Design and omits an empty inventory. Section reads, review output,
 and revision diffs use the same generated Markdown without changing the stored JSON.
+Native diagram rows keep literal punctuation and receive neutral prose styling, with exact
+identifier tokens colored through the proposed declaration index. Those tokens reuse narrative
+symbol targets, including definition reveal, ambiguity choices, removed-symbol checks, and
+workspace fallback for code-shaped names. Byte ranges remain relative to the canonical row,
+so hidden fences do not shift definition targets or saved annotation coordinates.
 
 Plan review places Tests after proposed declaration changes, followed by Checks and Verification. Each section
 retains its own fold boundary and navigation targets in both full and public-only views.
 The blank row before Tests stays outside the Changes fold in both views.
+Rust inspection masks test attributes and test-only `cfg` gates in both Public and All views.
+The mask includes attached documentation, nested helpers, and synthetic behavior/reference rows
+through their owning declaration. It leaves saved declarations, validation, test inventory, and
+other languages unchanged. Production-capable conditional declarations remain visible.
+Test file headings use `DiffPresenter::file`, while case names and descriptions use its
+semantic summary rows with shared change gutters and full-row backgrounds. Modified cases
+use the same orange groups as replacement rows. File folds start expanded and retain stable
+path identities through edits. Every case row carries the same file-and-name deletion target.
+Source deliveries include each case's change kind, the file heading's path, and complete
+inventory counts. Optimistic deletion uses those fields without parsing rendered labels or
+markers, preserving counts for cases inside collapsed files. Removing the last case removes
+only its inventory group. Incremental and full projections retain identical targets and folds.
 Public filtering preserves that unhighlighted section spacer even after an empty diff row.
 Changed function versions retain separate fold ranges when shared diff context
 would otherwise join their bodies. The comparison duplicates that context with

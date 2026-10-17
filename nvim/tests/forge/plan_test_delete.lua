@@ -28,7 +28,7 @@ local function presentation(document)
     local metadata = { decoration = {}, editable_region = {}, target = {
       { id = id, range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } },
     } }
-    source[#source + 1] = { id = id, text = text, test = test, source_line = #source + 1,
+    source[#source + 1] = { id = id, text = text, test = test, test_file = not test and text:find(".rs", 1, true) and text or nil, source_line = #source + 1,
       block = id, target = id, position = { row = 0, column = 0 }, metadata = metadata }
     blocks[#blocks + 1] = { id = id, text = { text }, metadata = metadata }
   end

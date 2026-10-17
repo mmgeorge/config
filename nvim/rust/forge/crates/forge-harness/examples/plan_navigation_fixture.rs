@@ -24,7 +24,7 @@ fn main() -> Result<()> {
         "rust" => &["Cargo.toml", "src/lib.rs", "src/model.rs"],
         "typescript" => &["src/main.ts", "src/model.ts"],
         "lua" => &["main.lua", "model.lua"],
-        "behavior" => &["src/change.rs"],
+        "behavior" | "tests" | "flows" => &["src/change.rs"],
         _ => anyhow::bail!("unsupported fixture language"),
     };
     let files = PlanFileStore::new(&data, &workspace);
@@ -107,6 +107,32 @@ fn main() -> Result<()> {
                 source: None,
             }]),
         });
+    }
+    if arguments[4] == "tests" {
+        design.proposed.get_mut("src/change.rs").unwrap().push_str("\n/// Exercises the new test-only helpers.\n#[cfg(test)]\nmod added_tests {\n  #[test]\n  fn added_case();\n}\n");
+        design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
+            owner: "added_tests::added_case".into(), evidence: None,
+            behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm("return".into())),
+            call: Some(Vec::new()),
+        });
+        design.proposed.insert("tests/new.rs".into(), "// Planned integration test file.\n".into());
+        design.document.tests = serde_json::from_value(serde_json::json!([
+            {"file":"src/change.rs","cases":[
+                {"name":"tests::new_case","change":"new","description":"Adds a scenario."},
+                {"name":"tests::changed_case","change":"modified","description":"Updates a long scenario whose full expected result remains readable when the diff wraps across multiple screen rows in a narrow window."},
+                {"name":"tests::removed_case","change":"removed","description":"Removes obsolete coverage."},
+                {"name":"tests::reused_case","change":"reused","description":"Preserves current coverage."}]},
+            {"file":"tests/new.rs","cases":[{"name":"new_file_case","change":"new","description":"Covers a new test file."}]},
+            {"file":"tests/reused.rs","cases":[{"name":"reused_file_case","change":"reused","description":"Keeps a separate existing suite."}]}
+        ]))?;
+    }
+    if arguments[4] == "flows" {
+        design.document.flows = serde_json::from_value(serde_json::json!([
+            {"title":"Restart input","description":"Restore the base and combat state.",
+             "root":{"text":"Fresh R input","children":[
+                 {"text":"restart_round","children":[{"text":"Restored base state"}]},
+                 {"text":"reset_combat","children":[{"text":"Fresh WaveDirector and Weapon state"},{"text":"*literal* cleanup"},{"text":"Starting enemy"}]}]}}
+        ]))?;
     }
     document.design = Some(design);
     document.version += 1;

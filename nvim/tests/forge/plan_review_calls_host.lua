@@ -5,11 +5,11 @@ if not vim.g.forge_plan_calls_grid then
   assert(child > 0)
   local success, failure = xpcall(function()
     vim.rpcrequest(child, "nvim_ui_attach", 160, 48, { rgb = true })
-    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_test_plan_behavior = " .. tostring(vim.g.forge_test_plan_behavior == true) .. "; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
+    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_test_plan_behavior = " .. tostring(vim.g.forge_test_plan_behavior == true) .. "; vim.g.forge_test_plan_flows = " .. tostring(vim.g.forge_test_plan_flows == true) .. "; vim.g.forge_test_plan_tests = " .. tostring(vim.g.forge_test_plan_tests == true) .. "; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
   end, debug.traceback)
   vim.fn.jobstop(child)
   if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-  print(vim.g.forge_test_plan_behavior and "plan_review_behavior_host: passed at 160x48" or vim.g.forge_plan_definition_only and "plan_review_definition_host: passed at 160x48" or "plan_review_calls_host: passed at 160x48")
+  print(vim.g.forge_test_plan_flows and "plan_review_flows_host: passed at 160x48" or vim.g.forge_test_plan_tests and "plan_review_tests_host: passed at 160x48" or vim.g.forge_test_plan_behavior and "plan_review_behavior_host: passed at 160x48" or vim.g.forge_plan_definition_only and "plan_review_definition_host: passed at 160x48" or "plan_review_calls_host: passed at 160x48")
   vim.cmd("qa!")
   return
 end
@@ -22,6 +22,25 @@ local source = { "pub fn leaf() {}", "pub fn run() { leaf(); leaf(); }", "pub st
 if definition_only then
   source[3] = "pub struct Client { pub count: usize, secret: usize }"
   source[4] = "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; client.secret += 1; }"
+end
+if vim.g.forge_test_plan_flows then
+  vim.list_extend(source, {
+    "pub fn restart_round() {}",
+    "pub fn reset_combat() {}",
+    "pub struct WaveDirector;",
+    "pub struct Weapon;",
+  })
+end
+if vim.g.forge_test_plan_tests then
+  vim.list_extend(source, {
+    "/// Exercises the old test-only helpers.",
+    "#[cfg(test)]",
+    "mod tests {",
+    "  fn old_helper() {}",
+    "  #[test]",
+    "  fn old_test() { old_helper(); }",
+    "}",
+  })
 end
 if vim.g.forge_test_plan_behavior then
   vim.list_extend(source, {
@@ -39,7 +58,7 @@ local initialized = vim.system({ "git", "init", "--quiet", workspace }, { text =
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
-local behavior_generator = vim.g.forge_test_plan_behavior and (vim.g.forge_test_fixture_generator
+local behavior_generator = (vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows) and (vim.g.forge_test_fixture_generator
   or require("forge.builder").artifact_root() .. "/build/release/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
@@ -83,8 +102,8 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan change the dispatch interface" })
   require("forge.views.harness.controller").submit()
   await(function() return not state.busy and state.active_plan end, "plan did not arrive")
-  if vim.g.forge_test_plan_behavior then
-    local seeded = vim.system({ behavior_generator, data .. "/forge/harness", workspace, state.session.id, state.active_plan.id, "behavior" }, { text = true }):wait(30000)
+  if vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows then
+    local seeded = vim.system({ behavior_generator, data .. "/forge/harness", workspace, state.session.id, state.active_plan.id, vim.g.forge_test_plan_tests and "tests" or vim.g.forge_test_plan_flows and "flows" or "behavior" }, { text = true }):wait(30000)
     assert(seeded.code == 0, (seeded.stderr or "") .. (seeded.stdout or ""))
     state.active_plan = vim.json.decode(seeded.stdout)
   end
@@ -120,6 +139,125 @@ local success, failure = xpcall(function()
   end
   assert(section_rows.Checks and section_rows.Verification and section_rows.Checks < section_rows.Verification,
     "Checks must appear before Verification")
+  if vim.g.forge_test_plan_flows then
+    vim.o.columns = original_columns
+    local function find_flow(token)
+      for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+        if text:find("→", 1, true) and text:find(token, 1, true) then return index, text end
+      end
+      error("flow token missing: " .. token)
+    end
+    assert(not table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("```text", 1, true), "flow retained a fenced text block")
+    for _, expected in ipairs({ { "restart_round", "@function", "pub fn restart_round" }, { "reset_combat", "@function", "pub fn reset_combat" },
+      { "WaveDirector", "@type", "pub struct WaveDirector" }, { "Weapon", "@type", "pub struct Weapon" } }) do
+      local row, text = find_flow(expected[1])
+      local source_column = assert(text:find(expected[1], 1, true)) - 1
+      vim.api.nvim_set_hl(0, expected[2], { fg = 0x22ddaa })
+      vim.api.nvim_win_set_cursor(review.win, { row, source_column })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      local position = vim.fn.screenpos(review.win, row, source_column + 1)
+      local cell = vim.api.nvim__inspect_cell(1, position.row - 1, position.col - 1)
+      assert(cell[2].foreground == 0x22ddaa, "flow token did not use declaration highlighting: " .. expected[1] .. " " .. vim.inspect(cell))
+      for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, -1, { row - 1, 0 }, { row - 1, -1 }, { details = true })) do
+        assert(mark[4].hl_group ~= "RenderMarkdownCode", "flow retained the code block background")
+      end
+      review.command_set.action_by_id.jump_entity.run({})
+      await(function() return vim.api.nvim_get_current_buf() == review.buf and vim.api.nvim_get_current_line():find(expected[3], 1, true) end,
+        "flow definition did not resolve: " .. expected[1])
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+      assert(vim.api.nvim_get_current_line() == text, "flow jump-back lost its exact diagram row")
+    end
+    local _, literal = find_flow("*literal*")
+    assert(literal:find("*literal*", 1, true), "native flow labels lost literal punctuation")
+    review.command_set.action_by_id.close.run({})
+    require("forge.views.harness.controller").command_set().action_by_id.close.run({})
+    return
+  end
+  if vim.g.forge_test_plan_tests then
+    assert(document.design.proposed["src/change.rs"]:find("mod added_tests", 1, true), "test declarations were removed from saved data")
+    for _, expected_public in ipairs({ true, false }) do
+      if review.public_only ~= expected_public then
+        review.command_set.action_by_id.toggle_public.run({})
+        await(function() return review.public_only == expected_public end, "review visibility did not change")
+      end
+      local visible = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
+      assert(not visible:find("mod added_tests", 1, true) and not visible:find("old_helper", 1, true)
+        and not visible:find("added_case", 1, true), "Rust test declarations leaked into Changes")
+    end
+    local function locate(predicate)
+      for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+        if predicate(text) then return index, text end
+      end
+    end
+    local function file_row(path)
+      return assert(locate(function(text) return text:match("^%a+%s+" .. vim.pesc(path) .. "$") end), "test file heading missing: " .. path)
+    end
+    for _, text in ipairs({ "new_case", "changed_case", "removed_case", "reused_case", "new_file_case", "reused_file_case" }) do
+      assert(locate(function(row) return row == text end), "test files must expand by default: " .. text)
+    end
+    local _, modified_header = locate(function(text) return text:match("^Modified%s+src/change%.rs$") end)
+    local _, new_header = locate(function(text) return text:match("^New%s+tests/new%.rs$") end)
+    assert(modified_header and new_header, "shared diff file status labels are missing")
+    for _, expected in ipairs({ { "new_case", 0x002800, "+" }, { "changed_case", 0x2a1f00, "~" }, { "removed_case", 0x200000, "-" } }) do
+      local row = assert(locate(function(text) return text == expected[1] end))
+      for _, width in ipairs({ 80, 120, 160 }) do
+        vim.o.columns = width
+        vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+        vim.cmd("normal! zz")
+        vim.cmd("redraw!")
+        local screen = vim.fn.screenpos(review.win, row, 1)
+        local edge = vim.api.nvim__inspect_cell(1, screen.row - 1, width - 1)
+        assert(edge[2].background == expected[2], "test diff background stopped before the window edge: " .. expected[1])
+        local cells = {}
+        for column = 1, width do cells[#cells + 1] = vim.fn.screenstring(screen.row, column) end
+        local marker_column = assert(table.concat(cells):find(expected[3] .. " " .. expected[1], 1, true), table.concat(cells))
+        local marker = vim.api.nvim__inspect_cell(1, screen.row - 1, marker_column - 1)
+        assert(marker[1] == expected[3], "test row lost its shared diff gutter: " .. vim.inspect(marker))
+        if expected[3] == "~" then
+          assert(marker[2].foreground == 0xffb86c, "modified gutter is not orange")
+          if width == 80 then
+            local description = vim.api.nvim_buf_get_lines(review.buf, row, row + 1, false)[1]
+            local ending = vim.fn.screenpos(review.win, row + 1, #description + 1)
+            local beginning = vim.fn.screenpos(review.win, row + 1, 3)
+            assert(ending.row > beginning.row, "long test descriptions must wrap")
+            local continuation = vim.api.nvim__inspect_cell(1, beginning.row, beginning.col - 1)
+            assert(continuation[2].background == expected[2], "wrapped test description lost its diff background")
+          end
+        end
+      end
+    end
+    vim.api.nvim_win_set_cursor(review.win, { file_row("tests/new.rs"), 0 })
+    review.command_set.action_by_id.toggle.run({})
+    await(function() return not locate(function(text) return text == "new_file_case" end) end, "test file did not fold")
+    assert(locate(function(text) return text == "changed_case" end), "file folding hid another file")
+    vim.api.nvim_win_set_cursor(review.win, { file_row("tests/new.rs"), 0 })
+    review.command_set.action_by_id.toggle.run({})
+    await(function() return locate(function(text) return text == "new_file_case" end) end, "test file did not expand")
+    vim.api.nvim_win_set_cursor(review.win, { file_row("tests/reused.rs"), 0 })
+    review.command_set.action_by_id.toggle.run({})
+    await(function() return not locate(function(text) return text == "reused_file_case" end) end, "unrelated file did not fold")
+    for _, selected in ipairs({
+      { "  Removes obsolete coverage.", "removed_case", "Tests · 2 new · 1 modified · 2 reused" },
+      { "  Covers a new test file.", "new_file_case", "Tests · 1 new · 1 modified · 2 reused" },
+    }) do
+      local row = assert(locate(function(text) return text == selected[1] end), "test description disappeared")
+      local version = review.owner.version
+      vim.api.nvim_win_set_cursor(review.win, { row, 2 })
+      vim.cmd("normal! V")
+      review.command_set.action_by_id.delete_tests.run({})
+      assert(vim.bo.filetype == "ForgeConfirm", "test description selection did not open delete confirmation")
+      vim.fn.maparg("y", "n", false, true).callback()
+      await(function() return review.owner.version > version end, "test deletion did not settle")
+      assert(not locate(function(text) return text == selected[2] end), "deleted test is still rendered")
+      assert(locate(function(text) return vim.trim(text) == selected[3] end), "test deletion lost the count of folded tests")
+      assert(not locate(function(text) return text == "reused_file_case" end), "test deletion expanded an unrelated file")
+    end
+    assert(not locate(function(text) return text:match("^New%s+tests/new%.rs$") end), "last test deletion left an empty file heading")
+    review.command_set.action_by_id.close.run({})
+    require("forge.views.harness.controller").command_set().action_by_id.close.run({})
+    return
+  end
   if vim.g.forge_test_plan_behavior then
     vim.o.columns = original_columns
     local planned_row, changed_row

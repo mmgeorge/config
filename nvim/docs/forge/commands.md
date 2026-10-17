@@ -97,6 +97,11 @@ Collapsed signatures omit the `[changed]` suffix.
 Old and new function versions expand independently. Collapsing an old function
 keeps added declarations outside its body visible.
 
+Flow diagrams render as native buffer rows with branch rails, literal labels, and declaration-kind
+symbol colors. Press `.` on a function, type, or qualified member name to jump to its definition.
+Ambiguous names use the existing symbol picker. Diagram fences remain part of text exports,
+and do not appear in PlanReview.
+
 Inline-code names in plan prose use declaration-kind colors when the proposed
 plan resolves them. Go to definition opens that proposed declaration, including
 private declarations hidden by the Public filter. Ambiguous names open a picker.
@@ -117,6 +122,13 @@ source definitions.
 Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
 check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected
 planned tests or disables selected checks after confirmation.
+Rust test-only modules and test functions are hidden from Changes in both Public and All views.
+Their saved declarations remain intact, and planned cases remain in Tests.
+The Tests section groups cases under New, Modified, Deleted, or Unchanged file headings.
+File groups expand by default and toggle with the usual fold action. Test names and descriptions
+use shared diff gutters and full-line backgrounds, including orange `~` rows for modified cases.
+Select either a test name or its description to delete that planned case. Deleting the last
+case removes its empty file group without deleting project source files.
 
 ## Build and diagnostics
 

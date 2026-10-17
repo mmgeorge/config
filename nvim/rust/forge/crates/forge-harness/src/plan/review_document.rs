@@ -1308,6 +1308,15 @@ impl PlanReviewDocument {
         let mut row = Vec::new();
         let mut current = HashMap::new();
         let mut row_count = 0;
+        let tests = self.source.document.design.iter().flat_map(|design| &design.document.tests)
+            .flat_map(|file| file.cases.iter().map(move |case| ((file.file.as_str(), case.name.as_str()), case.change)))
+            .collect::<HashMap<_, _>>();
+        let mut test_summary = serde_json::json!({"new":0,"modified":0,"removed":0,"reused":0});
+        for change in tests.values() {
+            let name = serde_json::to_value(change).expect("test change");
+            let count = &mut test_summary[name.as_str().unwrap()];
+            *count = serde_json::json!(count.as_u64().unwrap() + 1);
+        }
         for block in self.document.blocks(self.document.revision(), 0..self.document.block_count()).expect("current document range") {
             for position in 0..block.text.row_count() {
                 let target = block.metadata.target.iter().find(|target| {
@@ -1326,8 +1335,15 @@ impl PlanReviewDocument {
                 let check = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
                     if let super::PlanReviewTarget::Check { id } = &anchor.target { Some(id) } else { None }
                 });
+                let test_change = test.as_ref().and_then(|test| tests.get(&(test.file.as_str(), test.name.as_str())));
+                let test_file = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
+                    matches!(anchor.target, super::PlanReviewTarget::Section { section: super::PlanSection::Tests })
+                        .then_some(anchor.path.as_ref()).flatten()
+                });
                 let id = format!("{}:{}", block.id.0, position);
-                let anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check});
+                let anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check,
+                    "test_change":test_change,"test_file":test_file,
+                    "test_summary":(block.id.0 == "plan:section:tests").then_some(&test_summary)});
                 if self.source_anchor.get(&id) != Some(&anchor) { row.push(anchor.clone()); }
                 current.insert(id, anchor);
                 row_count += 1;

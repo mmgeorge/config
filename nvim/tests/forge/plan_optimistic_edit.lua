@@ -1,22 +1,22 @@
 local preview = require("forge.views.plan_review.test_preview")
 local source = {
   { block = "unrelated", text = "src/first.rs" },
-  { block = "plan:section:tests", text = " Tests · 2 new · 1 modified · 1 removed · 1 reused " },
-  { block = "plan:tests:file:first", text = "  src/first.rs" },
+  { block = "plan:section:tests", text = " Tests · 2 new · 1 modified · 1 removed · 1 reused ", test_summary = { new = 2, modified = 1, removed = 1, reused = 1 } },
+  { block = "plan:tests:file:first", text = "Modified src/first.rs", test_file = "src/first.rs" },
 }
 local selected = {}
-local function test(file, name, marker)
+local function test(file, name, change)
   local selection = { file = file, name = name }
-  source[#source + 1] = { block = file .. name, text = "    " .. marker .. name, test = selection }
-  source[#source + 1] = { block = file .. name .. ":description", text = "      Description", test = selection }
+  source[#source + 1] = { block = file .. name, text = name, test = selection, test_change = change }
+  source[#source + 1] = { block = file .. name .. ":description", text = "  Description", test = selection, test_change = change }
   return selection
 end
-selected[#selected + 1] = test("src/first.rs", "first", "+ ")
-selected[#selected + 1] = test("src/first.rs", "second", "~ ")
-source[#source + 1] = { block = "plan:tests:file:second", text = "  tests/second.rs" }
-local retained = test("tests/second.rs", "keep", "+ ")
-selected[#selected + 1] = test("tests/second.rs", "third", "− ")
-selected[#selected + 1] = test("tests/second.rs", "fourth", "")
+selected[#selected + 1] = test("src/first.rs", "first", "new")
+selected[#selected + 1] = test("src/first.rs", "second", "modified")
+source[#source + 1] = { block = "plan:tests:file:second", text = "New tests/second.rs", test_file = "tests/second.rs" }
+local retained = test("tests/second.rs", "keep", "new")
+selected[#selected + 1] = test("tests/second.rs", "third", "removed")
+selected[#selected + 1] = test("tests/second.rs", "fourth", "reused")
 for index, row in ipairs(source) do row.source_line = index row.position = { row = 0, column = 0 } end
 local baseline = vim.deepcopy(source)
 local projected = preview.project(source, selected)
@@ -31,6 +31,11 @@ selected[#selected + 1] = retained
 projected = preview.project(source, selected)
 assert(projected[2].text == " Tests · None planned ", projected[2].text)
 assert(projected[8].hidden, "last test deletion retained its empty file heading")
+
+local folded = vim.deepcopy(source)
+folded[2].test_summary.reused = 8
+local with_folded = preview.project(folded, selected)
+assert(with_folded[2].text == " Tests · 7 reused ", "deletion lost tests inside collapsed files")
 
 local rename = require("forge.views.plan_review.entity_rename")
 local popup = require("forge.infra.popup_window")

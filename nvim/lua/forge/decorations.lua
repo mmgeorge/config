@@ -8,7 +8,7 @@ local code_info = {}
 ---@param capture string
 ---@return boolean
 function M.full_width(capture)
-  return capture == "ForgeAddBg" or capture == "ForgeDeleteBg" or capture == "RenderMarkdownCode"
+  return capture == "ForgeAddBg" or capture == "ForgeDeleteBg" or capture == "ForgeModifyBg" or capture == "RenderMarkdownCode"
     or capture == "ForgeReviewCommentBox" or capture == "ForgeReviewCommentBoxHeader"
 end
 

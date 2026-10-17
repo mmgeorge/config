@@ -42,8 +42,8 @@ local succeeded, failure = xpcall(function()
   gutter.highlight = original_highlight
   decorations.detach(session)
 
-  local captures = { 'ForgeAddBg', 'ForgeDeleteBg', 'ForgeInlineAddBg', 'ForgeInlineDeleteBg', 'String', 'RenderMarkdownCode' }
-  local expected = { true, true, false, false, false, true }
+  local captures = { 'ForgeAddBg', 'ForgeDeleteBg', 'ForgeModifyBg', 'ForgeInlineAddBg', 'ForgeInlineDeleteBg', 'String', 'RenderMarkdownCode' }
+  local expected = { true, true, true, false, false, false, true }
   local backgrounds = {}
   for index, capture in ipairs(captures) do
     backgrounds[index] = { range = { start = { row = 0, column = 0 }, ['end'] = { row = 1, column = 0 } },
@@ -61,7 +61,7 @@ local succeeded, failure = xpcall(function()
     assert(options.priority == 90, 'background width changed decoration precedence')
   end
   assert(#emitted == #captures)
-  for _, capture in ipairs({ 'ForgeAddBg', 'ForgeDeleteBg' }) do
+  for _, capture in ipairs({ 'ForgeAddBg', 'ForgeDeleteBg', 'ForgeModifyBg' }) do
     local decoration = { range = { start = { row = 2, column = 0 }, ['end'] = { row = 3, column = 0 } },
       capture = capture, priority = 90 }
     for _, length in ipairs({ 0, 5, 10000 }) do

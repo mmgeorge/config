@@ -30,6 +30,45 @@ pub struct DesignFlowNode {
     pub children: Vec<DesignFlowNode>,
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+/// Distinguishes native diagram rows from prose and export-only fence delimiters.
+pub(super) enum FlowRowKind {
+    /// Titles, descriptions, and spacing retain Markdown presentation.
+    Narrative,
+    /// Literal diagram text receives native symbol presentation.
+    Diagram,
+    /// Export delimiters remain outside the visible plan projection.
+    Fence,
+}
+
+/// One flow row with its role in the canonical section text.
+pub(super) struct FlowRow {
+    /// Canonical text before display filtering.
+    pub text: String,
+    /// Rendering role independent of the row's literal contents.
+    pub kind: FlowRowKind,
+}
+
+/// Retains source-row identities while allowing native views to omit Markdown fences.
+pub(super) fn rows(flows: &[DesignFlow]) -> Vec<FlowRow> {
+    let mut output = Vec::new();
+    for (index, flow) in flows.iter().enumerate() {
+        if index > 0 { output.push(FlowRow { text: String::new(), kind: FlowRowKind::Narrative }); }
+        for text in std::iter::once(format!("### {}", flow.title))
+            .chain(std::iter::once(String::new()))
+            .chain(flow.description.split('\n').map(str::to_owned))
+            .chain(std::iter::once(String::new())) {
+            output.push(FlowRow { text, kind: FlowRowKind::Narrative });
+        }
+        output.push(FlowRow { text: "```text".into(), kind: FlowRowKind::Fence });
+        let mut diagram = Vec::new();
+        append_node(&flow.root, "", "", &mut diagram);
+        output.extend(diagram.into_iter().map(|text| FlowRow { text, kind: FlowRowKind::Diagram }));
+        output.push(FlowRow { text: "```".into(), kind: FlowRowKind::Fence });
+    }
+    output
+}
+
 /// Bounds recursive rendering and rejects empty or ambiguous flow labels before persistence.
 pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
     let mut titles = HashSet::new();
@@ -76,20 +115,7 @@ fn validate_label(label: &str) -> Result<()> {
 
 /// Produces canonical Markdown shared by review, section reads, and revision diffs.
 pub(super) fn text(flows: &[DesignFlow]) -> String {
-    flows
-        .iter()
-        .map(|flow| {
-            let mut rows = Vec::new();
-            append_node(&flow.root, "", "", &mut rows);
-            format!(
-                "### {}\n\n{}\n\n```text\n{}\n```",
-                flow.title,
-                flow.description,
-                rows.join("\n")
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    rows(flows).into_iter().map(|row| row.text).collect::<Vec<_>>().join("\n")
 }
 
 fn append_node(node: &DesignFlowNode, prefix: &str, marker: &str, rows: &mut Vec<String>) {

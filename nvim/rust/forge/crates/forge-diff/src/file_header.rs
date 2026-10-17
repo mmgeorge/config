@@ -9,6 +9,8 @@ pub enum FileChange {
     Copied,
     Conflicted,
     Modified,
+    /// A retained file whose displayed inventory has no planned changes.
+    Unchanged,
 }
 
 impl FileChange {
@@ -21,6 +23,7 @@ impl FileChange {
             Self::Copied => "copied",
             Self::Conflicted => "conflicted",
             Self::Modified => "modified",
+            Self::Unchanged => "unchanged",
         }
     }
 
@@ -33,6 +36,7 @@ impl FileChange {
             Self::Copied => ("Copied", "ForgeStatusFileNew"),
             Self::Conflicted => ("Conflict", "ForgeStatusFileDeleted"),
             Self::Modified => ("Modified", "ForgeStatusFileModified"),
+            Self::Unchanged => ("Unchanged", "ForgeStatusPath"),
         };
         let mut chunks = vec![
             TextChunk {
@@ -40,7 +44,7 @@ impl FileChange {
                 capture: capture.into(),
             },
             TextChunk {
-                text: format!("{}{path}", " ".repeat(9 - label.len())),
+                text: format!("{}{path}", " ".repeat(9usize.saturating_sub(label.len()).max(1))),
                 capture: "ForgeStatusPath".into(),
             },
         ];

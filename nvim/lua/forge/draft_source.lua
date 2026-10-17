@@ -52,11 +52,12 @@ function M.attach(replica, comments, source)
     local selected = preceding(row)
     if not selected then return nil end
     local original = selected.source
-    return {
-      block = original.block,
-      position = { row = original.position.row, column = math.min(column, #original.text) },
-      target = original.target ~= vim.NIL and original.target or nil,
-    }
+    local position = { row = original.position.row, column = math.min(column, #original.text) }
+    local targets = original.metadata and original.metadata.target
+    local target
+    if type(targets) == "table" then target = require("forge.buffer").target_at(targets, position)
+    else target = original.target ~= vim.NIL and original.target or nil end
+    return { block = original.block, position = position, target = target }
   end
   replica.physical_row = function(row)
     replica.prepare_source()

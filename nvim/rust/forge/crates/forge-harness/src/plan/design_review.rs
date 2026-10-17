@@ -37,7 +37,7 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
 pub(super) fn replace_test_inventory(previous: &RenderedPlan, document: &PlanDocument) -> Result<RenderedPlan> {
     let (start, end) = test_source_range(previous)?;
     let design = document.design.as_ref().context("test edits require a declaration plan")?;
-    let (block, mut anchors) = test_inventory(&design.document.tests)?;
+    let (block, mut anchors) = test_inventory(design)?;
     let rows = block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
     let previous_rows = previous.markdown.lines().collect::<Vec<_>>();
     ensure!(end <= previous_rows.len(), "test inventory exceeds saved source");
@@ -80,9 +80,10 @@ pub(super) fn project(
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
-    let (source, navigation, hidden, contextual) = rows(document, syntax, public_only, true, trace, revealed)?;
+    let (source, navigation, mut hidden, contextual) = rows(document, syntax, public_only, true, trace, revealed)?;
     // Parse the complete generated section so code-fence context survives per-row projection.
-    let flow_text = super::design_flows::text(&document.design.as_ref().context("declaration review has no design")?.document.flows);
+    let flow_rows = super::design_flows::rows(&document.design.as_ref().context("declaration review has no design")?.document.flows);
+    let flow_text = flow_rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>().join("\n");
     let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
         BlockId("plan:flow-markdown".into()), &flow_text, width,
     )?;
@@ -90,19 +91,33 @@ pub(super) fn project(
     let mut target = HashMap::new();
     let design = document.design.as_ref().context("declaration review has no design")?;
     let narrative_symbols = super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""));
-    let narrative_spans = super::review_symbols::spans(design);
+    let narrative_spans = super::review_symbols::spans(design, &narrative_symbols);
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     let mut omitted = 0;
     for (index, mut row) in source.into_iter().enumerate() {
         if let Some(index) = row.id.0.strip_prefix("plan:metadata:flows:").and_then(|index| index.parse::<usize>().ok()) {
-            row.metadata.markdown = true;
-            for decoration in &flow_markdown.block.metadata.decoration {
-                if decoration.range.start.row == index {
-                    let mut decoration = decoration.clone();
-                    decoration.range.start.row = 0;
-                    decoration.range.end.row = 0;
-                    row.metadata.decoration.push(decoration);
+            match flow_rows[index].kind {
+                super::design_flows::FlowRowKind::Fence => { hidden.insert(row.id.clone()); }
+                super::design_flows::FlowRowKind::Diagram => {
+                    row.metadata.decoration.push(forge_buffer::block::Decoration {
+                        range: forge_buffer::block::TextRange {
+                            start: TextPosition { row: 0, column: 0 },
+                            end: TextPosition { row: 0, column: row.text.row(0).unwrap_or_default().len() },
+                        },
+                        capture: "Comment".into(), priority: 100,
+                    });
+                }
+                super::design_flows::FlowRowKind::Narrative => {
+                    row.metadata.markdown = true;
+                    for decoration in &flow_markdown.block.metadata.decoration {
+                        if decoration.range.start.row == index {
+                            let mut decoration = decoration.clone();
+                            decoration.range.start.row = 0;
+                            decoration.range.end.row = 0;
+                            row.metadata.decoration.push(decoration);
+                        }
+                    }
                 }
             }
         } else if let Some(index) = row.id.0.strip_prefix("plan:configured-checks:").and_then(|index| index.parse::<usize>().ok()) {
@@ -540,7 +555,7 @@ fn rows(
                 text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
             });
             let offset = overview.len() as u32;
-            let (mut tests, mut anchors) = test_inventory(&design.document.tests)?;
+            let (mut tests, mut anchors) = test_inventory(design)?;
             for anchor in &mut anchors { anchor.line += offset; }
             overview.append(&mut tests);
             section_anchor.append(&mut anchors);
@@ -731,7 +746,9 @@ fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
     )?)
 }
 
-pub(super) fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
+pub(super) fn test_inventory(design: &super::DeclarationDesign) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
+    let files = &design.document.tests;
+    let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
     let mut block = vec![section_header(
         BlockId("plan:section:tests".into()),
         &format!("Tests · {}", super::design_tests::summary(files)),
@@ -743,10 +760,14 @@ pub(super) fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> R
     for (file_index, file) in files.iter().enumerate() {
         let start = block.len();
         let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
-        block.push(forge_diff::projection::header(
-            BlockId(id.clone()),
-            vec![TextChunk { text: format!("  {}", file.file), capture: "ForgeStatusHeader".into() }], 0,
-        )?);
+        let change = if !design.baseline.contains_key(&file.file) && design.proposed.contains_key(&file.file) {
+            FileChange::Added
+        } else if design.baseline.contains_key(&file.file) && !design.proposed.contains_key(&file.file) {
+            FileChange::Deleted
+        } else if file.cases.iter().all(|case| case.change == super::DesignTestChange::Reused) {
+            FileChange::Unchanged
+        } else { FileChange::Modified };
+        block.push(presenter.file(BlockId(id.clone()), change, &file.file, None)?);
         anchors.push(PlanNavigationAnchor {
             line: block.len() as u32, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
             json_path: format!("/design/document/tests/{file_index}"), path: Some(file.file.clone()), label: file.file.clone(),
@@ -754,17 +775,26 @@ pub(super) fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> R
         for (case_index, case) in file.cases.iter().enumerate() {
             let case_start = block.len();
             let case_id = format!("{id}:{}", super::digest(case.name.as_bytes()));
-            let (marker, capture) = case.change.presentation();
-            block.push(forge_diff::projection::header(
-                BlockId(case_id.clone()),
-                vec![TextChunk { text: format!("    {marker}"), capture: capture.into() },
-                    TextChunk { text: case.name.strip_prefix("tests::").unwrap_or(&case.name).into(), capture: "@function".into() }], 0,
-            )?);
+            let change = match case.change {
+                super::DesignTestChange::New => forge_diff::presentation::RowChange::Added,
+                super::DesignTestChange::Modified => forge_diff::presentation::RowChange::Modified,
+                super::DesignTestChange::Removed => forge_diff::presentation::RowChange::Removed,
+                super::DesignTestChange::Reused => forge_diff::presentation::RowChange::Context,
+            };
+            let name = case.name.strip_prefix("tests::").unwrap_or(&case.name);
+            let mut heading = presenter.summary(BlockId(case_id.clone()), name, change)?;
+            heading.metadata.visible_decoration.push(forge_buffer::block::Decoration {
+                range: forge_buffer::block::TextRange { start: TextPosition { row: 0, column: 0 }, end: TextPosition { row: 0, column: name.len() } },
+                capture: "@function".into(), priority: 100,
+            });
+            block.push(heading);
             for (line_index, line) in case.description.lines().enumerate() {
-                block.push(BufferBlock {
-                    id: BlockId(format!("{case_id}:description:{line_index}")),
-                    text: BufferText::from_rows([format!("      {line}")])?, metadata: BlockMetadata::default(),
+                let mut description = presenter.summary(BlockId(format!("{case_id}:description:{line_index}")), &format!("  {line}"), change)?;
+                description.metadata.visible_decoration.push(forge_buffer::block::Decoration {
+                    range: forge_buffer::block::TextRange { start: TextPosition { row: 0, column: 0 }, end: TextPosition { row: 0, column: description.text.row(0).unwrap().len() } },
+                    capture: "Comment".into(), priority: 100,
                 });
+                block.push(description);
             }
             for line in case_start + 1..=block.len() {
                 anchors.push(PlanNavigationAnchor {
@@ -1597,6 +1627,35 @@ mod tests {
     }
 
     #[test]
+    fn rust_tests_are_hidden_only_in_review_projection() {
+        let mut document = crate::plan::document::test_fixture("test-filter", "Review production changes");
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("src/lib.rs".into(), super::super::DeclarationFile {
+            text: "pub fn production();\n/// Old test helpers.\n#[cfg(test)]\nmod tests { fn old_helper(); #[test] fn old_test(); }\n".into(),
+            source_digest: "fixture".into(),
+        });
+        design.proposed.insert("src/lib.rs".into(), "pub fn production(value: u32);\n/// New test helpers.\n#[cfg(test)]\nmod tests { fn new_helper(); #[test] fn new_test(); }\n".into());
+        design.document.tests = serde_json::from_value(serde_json::json!([
+            {"file":"src/lib.rs","cases":[{"name":"tests::new_test","change":"new","description":"Checks the new test contract."}]}
+        ])).unwrap();
+        document.design = Some(design);
+        let saved = serde_json::to_string(&document).unwrap();
+        assert!(render(&document).unwrap().markdown.contains("new_helper"));
+        for public_only in [false, true] {
+            let (blocks, targets) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            let changes = blocks.iter().take_while(|block| block.id.0 != "plan:section:tests")
+                .flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert!(changes.contains("production"));
+            for hidden in ["mod tests", "old_helper", "new_helper", "old_test", "new_test", "test helpers", "cfg(test)"] {
+                assert!(!changes.contains(hidden), "{hidden}: {changes}");
+            }
+            assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::TestCase { name, .. } if name == "tests::new_test")));
+            forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("test-filter".into()), blocks).unwrap();
+        }
+        assert_eq!(serde_json::to_string(&document).unwrap(), saved);
+    }
+
+    #[test]
     fn test_inventory_preserves_file_folds_targets_and_change_markers() {
         let mut document = crate::plan::document::test_fixture("tests", "Tests");
         let mut design = super::super::DeclarationDesign::default();
@@ -1624,15 +1683,22 @@ mod tests {
             let endpoint = &changes.metadata.fold[0].end;
             let end_index = block.iter().position(|block| block.id == endpoint.block).unwrap();
             assert!(end_index + usize::from(endpoint.position.row > 0) <= tests_start - 1);
-            for expected in ["    + new_case", "    ~ changed_case", "    − old_case", "    existing_case"] {
+            for expected in ["new_case", "changed_case", "old_case", "existing_case"] {
                 assert!(rows.contains(&expected));
             }
-            let case = block.iter().find(|block| block.text.row(0) == Some("    ~ changed_case")).unwrap();
-            let name = case.metadata.decoration.iter().find(|decoration| decoration.capture == "@function").unwrap();
+            let case = block.iter().find(|block| block.text.row(0) == Some("changed_case")).unwrap();
+            let name = case.metadata.visible_decoration.iter().find(|decoration| decoration.capture == "@function").unwrap();
             assert_eq!(&case.text.row(0).unwrap()[name.range.start.column..name.range.end.column], "changed_case");
             assert!(case.metadata.target.iter().any(|range| matches!(&target[&range.id].target,
                 PlanReviewTarget::TestCase { name, .. } if name == "tests::changed_case")));
             assert_eq!(document.design.as_ref().unwrap().document.tests[0].cases[1].name, "tests::changed_case");
+            assert!(case.metadata.decoration.iter().any(|decoration| decoration.capture == "ForgeModifyBg" && decoration.range.end.row == 1));
+            assert!(case.metadata.gutter[0].chunk.iter().any(|chunk| chunk.text == "~" && chunk.capture == "ForgeModifyLineNr"));
+            let files = block.iter().filter(|block| block.id.0.starts_with("plan:tests:file:") && !block.id.0["plan:tests:file:".len()..].contains(':')).collect::<Vec<_>>();
+            assert_eq!(files.len(), 2);
+            assert!(files.iter().all(|file| file.metadata.fold.len() == 1 && !file.metadata.fold[0].closed));
+            assert!(files[0].text.row(0).unwrap().starts_with("New"));
+            assert!(files[1].text.row(0).unwrap().starts_with("Unchanged"));
             if !public_only {
                 println!("TEST_NAME_FIXTURE:{}", serde_json::json!({"document":"test-names","revision":0,"block":block}));
             }
@@ -1655,15 +1721,16 @@ mod tests {
     }
 
     #[test]
-    fn structured_flows_keep_code_labels_literal_in_both_review_views() {
+    fn structured_flows_render_native_symbols_in_both_review_views() {
         let mut document = crate::plan::document::test_fixture("flows", "Cancel work");
         let mut design = super::super::DeclarationDesign::default();
         design.document.design = "Keep the published value while cancelling pending work.".into();
+        design.proposed.insert("src/flow.rs".into(), "fn cancel_request();\nstruct PendingWork;\nimpl PendingWork { fn stop(); }\n".into());
         design.document.flows = serde_json::from_value(serde_json::json!([{
             "title":"Cancel pending work", "description":"Retain the published value.",
             "root":{"text":"cancel_request", "children":[
-                {"text":"pending_work.stop", "via":"active handle"},
-                {"text":"published_value stays unchanged", "via":"after cancellation"}
+                {"text":"PendingWork::stop", "via":"active handle"},
+                {"text":"*literal* published_value stays unchanged", "via":"after cancellation"}
             ]}
         }])).unwrap();
         document.design = Some(design);
@@ -1677,9 +1744,14 @@ mod tests {
             }));
             assert!(!heading.metadata.fold.is_empty());
             let node = block.iter().find(|block| block.text.row(0) == Some("cancel_request")).unwrap();
-            assert!(node.metadata.markdown);
-            assert!(node.metadata.decoration.iter().any(|style| style.capture == "@markup.raw.block"));
-            assert!(!node.metadata.decoration.iter().any(|style| style.capture == "@markup.italic"));
+            assert!(!node.metadata.markdown);
+            assert!(node.metadata.decoration.iter().any(|style| style.capture == "@function"));
+            assert!(!node.metadata.decoration.iter().any(|style| style.capture == "@markup.raw.block"));
+            assert!(node.metadata.target.iter().any(|range| matches!(&target[&range.id].target, PlanReviewTarget::InlineSymbol { name } if name == "cancel_request")));
+            let member = block.iter().find(|block| block.text.row(0).is_some_and(|text| text.contains("PendingWork::stop"))).unwrap();
+            assert!(member.metadata.target.iter().any(|range| matches!(&target[&range.id].target, PlanReviewTarget::InlineSymbol { name } if name == "PendingWork::stop")));
+            assert!(block.iter().filter(|block| block.id.0.starts_with("plan:metadata:flows:")).all(|block| !block.text.row(0).unwrap_or_default().starts_with("```")));
+            assert!(block.iter().any(|block| block.text.row(0).is_some_and(|row| row.contains("*literal*"))));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/flows"));
             forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("flows".into()), block).unwrap();
         }

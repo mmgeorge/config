@@ -280,6 +280,30 @@ fn syntax_row_range(
     )
 }
 
+/// Applies shared change gutters and full-row backgrounds to source or semantic rows.
+pub(crate) fn append_change_row(
+    metadata: &mut BlockMetadata, row: usize, change: crate::presentation::RowChange,
+    mut columns: Vec<TextChunk>, indent: usize,
+) -> Result<(), ContractError> {
+    if indent > 4096 { return Err(ContractError("diff indentation exceeds 4096 cells")); }
+    if metadata.gutter.len() >= 256 { return Err(ContractError("diff row batch exceeds 256 gutters")); }
+    let (sign, background, number, _) = change.style();
+    if indent > 0 { columns.insert(0, TextChunk { text: " ".repeat(indent), capture: "Normal".into() }); }
+    columns.extend([
+        TextChunk { text: sign.into(), capture: number.into() },
+        TextChunk { text: " ".into(), capture: background.into() },
+    ]);
+    metadata.gutter.push(Gutter { placement: Default::default(), position: TextPosition { row, column: 0 }, chunk: columns, priority: 100 });
+    if change != crate::presentation::RowChange::Context {
+        metadata.decoration.push(Decoration {
+            range: TextRange { start: TextPosition { row, column: 0 }, end: TextPosition { row: row + 1, column: 0 } },
+            capture: background.into(), priority: 90,
+        });
+    }
+    Ok(())
+}
+
+/// Projects source coordinates, change styling, syntax, and intraline emphasis.
 pub fn append_display_row(
     metadata: &mut BlockMetadata,
     row: usize,
@@ -289,93 +313,22 @@ pub fn append_display_row(
     new_syntax: Option<&SyntaxHandle>,
     indent: usize,
 ) -> Result<(), ContractError> {
-    if indent > 4096 {
-        return Err(ContractError("diff indentation exceeds 4096 cells"));
-    }
-    if metadata.gutter.len() >= 256 {
-        return Err(ContractError("diff row batch exceeds 256 gutters"));
-    }
-    let sign = match display.kind {
-        RowKind::Added => "+",
-        RowKind::Removed => "-",
-        RowKind::Context => " ",
+    let change = match display.kind {
+        RowKind::Added => crate::presentation::RowChange::Added,
+        RowKind::Removed => crate::presentation::RowChange::Removed,
+        RowKind::Context => crate::presentation::RowChange::Context,
     };
-    let old = display.old.map_or(String::new(), |coordinate| {
-        (coordinate.line + 1).to_string()
-    });
-    let new = display.new.map_or(String::new(), |coordinate| {
-        (coordinate.line + 1).to_string()
-    });
+    let (_, background, number, emphasis) = change.style();
+    let old = display.old.map_or(String::new(), |coordinate| (coordinate.line + 1).to_string());
+    let new = display.new.map_or(String::new(), |coordinate| (coordinate.line + 1).to_string());
     let old_width = group.old_lines.end.to_string().len().max(3);
     let new_width = group.new_lines.end.to_string().len().max(3);
-    let (background, number, emphasis) = match display.kind {
-        RowKind::Added => ("ForgeAddBg", "ForgeAddLineNr", "ForgeInlineAddBg"),
-        RowKind::Removed => ("ForgeDeleteBg", "ForgeDeleteLineNr", "ForgeInlineDeleteBg"),
-        RowKind::Context => ("ForgeContextBg", "ForgeContextLineNr", "ForgeContextBg"),
-    };
-    metadata.gutter.push(Gutter {
-        placement: Default::default(),
-        position: TextPosition { row, column: 0 },
-        chunk: vec![
-            TextChunk {
-                text: format!("{old:>old_width$}"),
-                capture: if display.old.is_some() {
-                    number
-                } else {
-                    background
-                }
-                .into(),
-            },
-            TextChunk {
-                text: "  ".into(),
-                capture: background.into(),
-            },
-            TextChunk {
-                text: format!("{new:>new_width$}"),
-                capture: if display.new.is_some() {
-                    number
-                } else {
-                    background
-                }
-                .into(),
-            },
-            TextChunk {
-                text: "  ".into(),
-                capture: background.into(),
-            },
-            TextChunk {
-                text: sign.into(),
-                capture: number.into(),
-            },
-            TextChunk {
-                text: " ".into(),
-                capture: background.into(),
-            },
-        ],
-        priority: 100,
-    });
-    if indent > 0 {
-        metadata.gutter.last_mut().unwrap().chunk.insert(
-            0,
-            TextChunk {
-                text: " ".repeat(indent),
-                capture: "Normal".into(),
-            },
-        );
-    }
-    if display.kind != RowKind::Context {
-        metadata.decoration.push(Decoration {
-            range: TextRange {
-                start: TextPosition { row, column: 0 },
-                end: TextPosition {
-                    row: row + 1,
-                    column: 0,
-                },
-            },
-            capture: background.into(),
-            priority: 90,
-        });
-    }
+    append_change_row(metadata, row, change, vec![
+        TextChunk { text: format!("{old:>old_width$}"), capture: if display.old.is_some() { number } else { background }.into() },
+        TextChunk { text: "  ".into(), capture: background.into() },
+        TextChunk { text: format!("{new:>new_width$}"), capture: if display.new.is_some() { number } else { background }.into() },
+        TextChunk { text: "  ".into(), capture: background.into() },
+    ], indent)?;
     if display.is_gap() {
         metadata.visible_decoration.push(Decoration {
             range: TextRange { start: TextPosition { row, column: 0 }, end: TextPosition { row, column: display.text.len() } },
