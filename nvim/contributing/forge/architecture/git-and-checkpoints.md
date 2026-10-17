@@ -195,6 +195,11 @@ commit's immutable old and new objects. All three routes use the same native dif
 excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
 an inventory entry without a text excerpt.
 
+Generated messages default to a title only. Small changes generally do not justify
+a body. A short body is used sparingly, for any
+commit type, only when essential details are not captured by the title and without
+repeating it.
+
 Rename detection preserves the old and new paths in the compact file list. Renamed
 files have no content excerpt, even when their contents also changed. Collection skips
 their source reads, text comparisons, and syntax analysis. Copies retain normal content

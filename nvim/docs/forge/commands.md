@@ -88,6 +88,7 @@ planned tests or disables selected checks after confirmation.
 and untracked changes. It uses the current Forge Status workspace when invoked
 there, otherwise the current working directory. The read-only scratch buffer shows
 the UTF-8 input size, system instructions, and user prompt. Press `q` to close it.
+Long lines wrap at word boundaries without changing the prompt text.
 Each invocation collects current repository state. Empty comparisons appear in
 the buffer, and failed requests produce an error notification.
 Renamed files appear once in the compact file list with their original path and

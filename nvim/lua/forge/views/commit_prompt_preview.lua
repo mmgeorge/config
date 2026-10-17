@@ -39,7 +39,7 @@ function M.open(options)
   vim.b[buffer].forge_commit_prompt_comparison = comparison
   require("forge.window_presentation").attach(buffer, {
     number = false, relativenumber = false, signcolumn = "no", foldcolumn = "0", statuscolumn = "",
-    wrap = false, linebreak = false, foldenable = false, conceallevel = 0, virtualedit = "",
+    wrap = true, linebreak = true, foldenable = false, conceallevel = 0, virtualedit = "",
   })
   local heading = { "Commit prompt preview", "Workspace: " .. workspace, "Comparison: " .. comparison, "" }
   ---@param lines string[]
