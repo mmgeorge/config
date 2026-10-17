@@ -61,6 +61,23 @@ local succeeded, failure = xpcall(function()
     assert(options.priority == 90, 'background width changed decoration precedence')
   end
   assert(#emitted == #captures)
+  for _, capture in ipairs({ 'ForgeAddBg', 'ForgeDeleteBg' }) do
+    local decoration = { range = { start = { row = 2, column = 0 }, ['end'] = { row = 3, column = 0 } },
+      capture = capture, priority = 90 }
+    for _, length in ipairs({ 0, 5, 10000 }) do
+      local projected = assert(decorations.project_row(decoration, 2, 7, length))
+      assert(projected.column == 0 and projected.options.end_row == 8 and projected.options.end_col == 0)
+      assert(projected.options.hl_eol and projected.options.hl_group == capture and projected.options.priority == 90)
+    end
+    assert(not decorations.project_row(decoration, 1, 6, 5), 'decoration leaked before its start')
+    assert(not decorations.project_row(decoration, 3, 8, 5), 'exclusive row endpoint leaked its background')
+  end
+  local inline = { range = { start = { row = 0, column = 2 }, ['end'] = { row = 0, column = 8 } },
+    capture = 'ForgeInlineAddBg', priority = 200 }
+  local projected = assert(decorations.project_row(inline, 0, 4, 6))
+  assert(projected.column == 2 and projected.options.end_row == 4 and projected.options.end_col == 6)
+  assert(not projected.options.hl_eol, 'intraline emphasis expanded beyond its source range')
+  assert(not decorations.project_row(inline, 0, 4, 2), 'clipped empty syntax span was retained')
   gutter.highlight = original_highlight
   decorations.detach(session)
   vim.api.nvim_buf_set_extmark = original_extmark

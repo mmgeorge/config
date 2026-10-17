@@ -539,7 +539,8 @@ Record manual actions in `verification`, an array of actions and expected observ
 Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, `.lua`, and
 `.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, and XML configuration paths (including `.xml`,
 `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`), plus `.gitignore` files whose contents are preserved verbatim. Source overviews retain native layouts but are not compilable implementation files. Never write
-executable function bodies, empty or placeholder bodies, pseudocode, or executable initializers. Preserve
+executable function bodies, empty or placeholder bodies, or executable initializers. Academic
+pseudocode belongs only in an indented `Algorithm` block, never in a native-language body. Preserve
 reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
 
 Use two spaces per indentation level and one blank line between declarations and methods.
@@ -552,20 +553,74 @@ file ranges when their exact current text is unavailable and match that text, in
 Draft patches retain their layout until submission. Submission can reformat declarations, so read
 affected ranges before another revision unless current formatted text is already supplied in feedback.
 
-## Function changes and references
+## Function algorithms, changes, and references
 
-Describe each function's intended behavior change in one optional `Change` section. Edit the virtual
-declaration file through `design_patch`, with `Change` at the signature's indentation
-and a nonempty plain-language summary one indentation level deeper. Place it before `Calls` and
-`Accesses`. Use a single summary without categories. Include internal behavior changes even when
-the signature and reference lists remain identical. Preserve an existing summary unless the intended
-behavior changes. Removing the section withdraws that summary. Configuration documents have no
-function sections. The review includes summary-only edits and folds the summary with the function body.
+Categorize callable behavior against the captured source baseline, including after resubmission:
 
-Source inspection extracts call occurrences alongside declarations in Rust, TypeScript, TSX, and Lua. Property reads and writes also retain named receiver evidence. Render invocations and callable values, including callback registration, under `Calls`. Render property accesses, named values, and construction targets under `Accesses`. Each line contains a bare qualified target, with no arguments. Preserve occurrence order within each category. Parsing retains their existing interleaving and semantic kinds in saved data. All kinds share one ordered occurrence sequence. Rust construction and destructuring field names also count as property uses. Unknown or computed receivers remain unresolved and must not be matched to a same-named property without type evidence.
+- A new function or method requires one nonempty `Algorithm` block describing its complete behavior
+  in academic pseudocode. A `Change` block does not satisfy this requirement.
+- A modified function or method uses one `Change` block of one or two sentences, as succinct as
+  possible, describing only its behavioral delta. Include internal changes even when its signature
+  and reference lists remain identical. Do not restate the complete algorithm or use `Algorithm`
+  for an existing callable. Unmodified callables do not need a `Change` block.
 
-Every newly declared internal symbol needs a resolved incoming use before submission. Include each registered system or callback in the registering function's Calls, even when the framework invokes it later. Include new property and value uses in Accesses and new type uses in signatures or construction references. Imports, declaration names, owner headers, prose, and self references alone do not count. Truly public APIs, recognized executable entry points, tests, and trait contract items need no in-plan caller. Public exposure includes module and member accessibility and public re-exports, so pub(crate) and pub items hidden in private modules remain internal. The rule applies to new symbols relative to the captured source baseline, including resubmission, while partial draft edits remain permitted.
-The virtual file includes `Calls` and `Accesses` blocks immediately after each captured callable signature.
+Place the heading at the signature's indentation and its content one level deeper, before `Calls`,
+`Constructs`, and `Accesses`, in that order. Never combine `Algorithm` and `Change` on one callable.
+Partial drafts may omit a new algorithm, but submission rejects that omission. Preserve an authored
+block unless its intended behavior changes. Removing `Change` withdraws that delta. Configuration
+and non-callable declarations do not have behavior blocks. Review folds both categories with their
+callable and never appends `[changed]` to a collapsed signature.
+
+### Academic pseudocode
+
+Read and apply the `academic-pseudocode` skill before authoring `Algorithm` blocks. Its local
+`SKILL.md` contains the complete writing rules. Keep algorithms as high-level and compact as
+possible while preserving the complete behavioral contract.
+
+For this plan, keep domain identifiers searchable and preserve numeric bounds, tie-breaking,
+saturation, ownership, and deferred effects explicitly. Function signatures already declare inputs
+and results, so do not repeat them as boilerplate in each `Algorithm` block.
+
+Algorithm submission validates statement syntax and indentation with Forge's pseudocode parser.
+Use `target ← expression` for assignment, `if condition`, `otherwise if condition`, `otherwise`,
+`for each item in collection`, and `while condition`. Every control statement needs a nonempty
+body indented with spaces. A trailing colon is optional. Keep each statement on its own line,
+align siblings, and dedent to an existing enclosing level. Use `return` with an optional result.
+Use `break` and `continue` only inside loops. Expressions and operation statements may use concise
+natural language, identifiers, numbers, quoted strings, parentheses, and brackets. Use `=` for
+equality and `≠`, `≤`, or `≥` for comparisons. Omit native-language braces and semicolons.
+Incomplete drafts remain editable. Repair the reported callable, line, and column before resubmitting.
+
+Make construction explicit as `Type(field = value, ...)`, or `Type()` for a zero-field marker.
+Use the exact qualified name from `Constructs`, including factory names such as
+`Store::new(config = config)`. Every target listed in `Constructs` for an Algorithm must have
+a matching invocation with named arguments or no arguments. Construct values before describing
+the operation that queues, spawns, inserts, or publishes them. Reused shared assets are not new
+constructions. Ordinary helper calls may use positional arguments. Do not hide constructed values
+and their initial fields in prose such as "queue a shot with damage".
+
+Source inspection extracts function-body references alongside declarations in Rust, TypeScript,
+TSX, and Lua. Use these sections, with one qualified target per line and no arguments:
+
+- `Calls` records invocations other than construction and callable values, including callback
+  registration. A callable passed as a callback remains here even when it is a factory.
+- `Constructs` records types instantiated directly, such as `Weapon` for `Weapon { ... }` or
+  `new Weapon(...)`, and factory calls whose declared return is an owned named type. List the
+  callable itself, such as `Weapon::new` or `Weapon::default` returning `Self` or `Weapon`.
+  Use the return type, not a method-name convention. Borrowed, scalar, and unit returns stay in
+  `Calls`. Rust tuple and unit constructors belong here when their type is resolved.
+  Do not list a type here merely because it appears in a signature, type annotation, generic
+  argument, cast, or destructuring pattern.
+- `Accesses` records field reads, writes, references, and named value uses. A struct initializer
+  such as `Weapon { cooldown_remaining: 0.0 }` records `Weapon` under `Constructs` and
+  `Weapon::cooldown_remaining` under `Accesses`. Destructured fields also belong in `Accesses`.
+
+Preserve occurrence order and repetitions within each category. Parsing retains captured
+interleaving and semantic kinds in saved data. Unknown or computed receivers remain unresolved
+and must not be matched to a same-named property without type evidence.
+
+Every newly declared internal symbol needs a resolved incoming use before submission. Include each registered system or callback in the registering function's Calls, even when the framework invokes it later. Include new property and value uses in Accesses and new type uses in signatures or Constructs. Imports, declaration names, owner headers, prose, and self references alone do not count. Truly public APIs, recognized executable entry points, tests, and trait contract items need no in-plan caller. Public exposure includes module and member accessibility and public re-exports, so pub(crate) and pub items hidden in private modules remain internal. The rule applies to new symbols relative to the captured source baseline, including resubmission, while partial draft edits remain permitted.
+The virtual file includes `Calls`, `Constructs`, and `Accesses` blocks after each captured callable signature.
 Edit it atomically with declarations through `design_patch`. Include names only, without
 arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
 when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.
@@ -588,6 +643,16 @@ Calls
   validate_policy
   Client::send
   record_metrics
+```
+
+A newly introduced callable instead has an algorithm, with reference evidence listed separately:
+
+```text
+pub fn next_attempt(attempt: u32, limit: u32) -> Option<u32>;
+Algorithm
+  if attempt ≥ limit
+    return none
+  return attempt + 1
 ```
 
 ## Declaration comments

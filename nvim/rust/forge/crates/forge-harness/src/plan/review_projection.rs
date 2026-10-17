@@ -368,8 +368,8 @@ pub(crate) fn project(
 
 pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget, text: &str) {
     match target {
-        PlanReviewTarget::Change { offset, .. } => {
-            append_range(metadata, text.len() - text.trim_start().len(), text.len(), if *offset == 0 { "@keyword" } else { "@comment" });
+        PlanReviewTarget::Behavior { offset, .. } => {
+            append_range(metadata, text.len() - text.trim_start().len(), text.len(), if *offset == 0 { "Normal" } else { "@comment" });
         }
         PlanReviewTarget::Call { name, kind, .. } => {
             let Some(start) = text.find(name) else { return };
@@ -393,6 +393,8 @@ pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanR
             append_range(metadata, start + member, start + name.len(), match kind {
                 super::CallKind::Property => "@variable.member",
                 super::CallKind::Value => "@variable",
+                super::CallKind::Construct if member > 0 && name[member..].chars().next().is_some_and(char::is_lowercase) => "@function.method.call",
+                super::CallKind::Construct => "ForgeWalkthroughType",
                 super::CallKind::Call | super::CallKind::Callback if member > 0 => "@function.method.call",
                 super::CallKind::Call | super::CallKind::Callback => "@function.call",
             });

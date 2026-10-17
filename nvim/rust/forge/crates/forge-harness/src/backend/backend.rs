@@ -930,8 +930,15 @@ impl Backend for MockBackend {
                     }
                     let text = inspected["text"].as_str().ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
                     let removed = text.lines().map(|line| format!("-{line}\n")).collect::<String>();
-                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n*** End Patch")
-                } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n*** End Patch") };
+                    let original = design.baseline.get(path).map(|file| file.text.as_str()).unwrap_or(text);
+                    let behavior = if original.contains("pub fn reviewed_change(") {
+                        "Change\n  Preserve the requested behavior."
+                    } else {
+                        "Algorithm\n  return"
+                    };
+                    let behavior = behavior.lines().map(|line| format!("+{line}\n")).collect::<String>();
+                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n{behavior}*** End Patch")
+                } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n+Algorithm\n+  return\n*** End Patch") };
                 let mut patch = patch;
                 let mut configuration = design.proposed.clone();
                 for path in ["Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj", ".gitignore"] {

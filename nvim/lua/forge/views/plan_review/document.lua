@@ -3,6 +3,7 @@ local client = require("forge.client")
 local buffer = require("forge.buffer")
 local input = require("forge.input")
 local comments = require("forge.draft_comments")
+local decorations = require("forge.decorations")
 local perf = require("forge.infra.perf")
 
 ---@class ForgePlanReviewUpdate
@@ -114,6 +115,10 @@ function M.attach(options, callback)
     return true
   end
   local dispatch_operation
+  local function wrapping()
+    local width = require("forge.content_layout").continuation_indent(owner.replica.sequence)
+    return { indent = true, options = "shift:" .. width }
+  end
   ---@param operation table
   ---@param phase string
   ---@param fields? table
@@ -302,15 +307,10 @@ function M.attach(options, callback)
       for _, record in ipairs(projection.source_record_list) do
         local row = (owner.optimistic_source or source)[record.source_index]
         local metadata = row.metadata or {}
-        for _, decoration_list in ipairs({ metadata.decoration or {} }) do
-          for _, decoration in ipairs(decoration_list) do
-            local span = decoration.range
-            if span.start.row <= row.position.row and span["end"].row >= row.position.row then
-              local start = span.start.row == row.position.row and span.start.column or 0
-              local finish = span["end"].row == row.position.row and span["end"].column or #row.text
-              if finish > start then vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, start,
-                { end_col = math.min(finish, #row.text), hl_group = decoration.capture, priority = decoration.priority }) end
-            end
+        for _, decoration in ipairs(metadata.decoration or {}) do
+          local projected = decorations.project_row(decoration, row.position.row, record.row, #row.text)
+          if projected then
+            vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, projected.column, projected.options)
           end
         end
       end
@@ -369,7 +369,7 @@ function M.attach(options, callback)
       opened = vim.tbl_extend("force", opened, { snapshot = snapshot, source_row = rows })
       source = fragment
     end
-    return buffer.apply_snapshot(owner.replica, opened.snapshot, function()
+    local applied = buffer.apply_snapshot(owner.replica, opened.snapshot, function()
       local focused_id
       for _, annotation in ipairs(owner.comment_state and owner.comment_state.annotation_list or {}) do
         if annotation.focused then focused_id = annotation.id break end
@@ -380,6 +380,11 @@ function M.attach(options, callback)
       owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
       attach_projection(opened, source, focused_id)
     end)
+    if applied.kind == "Applied" then
+      local options = wrapping()
+      for _, view in pairs(owner.views) do input.set_wrapping(view, options) end
+    end
+    return applied
   end
   ---@param plan {id: string, review_digest: string, historical_revision?: integer}
   ---@param opened ForgePlanReviewUpdate
@@ -457,7 +462,7 @@ function M.attach(options, callback)
     local columns = require("forge.window_presentation").capture(window)
     columns.number, columns.relativenumber, columns.statuscolumn = false, false, ""
     local view = input.open(owner.replica, window, { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
-      wrapping = { indent = columns.breakindent, options = columns.breakindentopt } })
+      wrapping = wrapping() })
     owner.views[window] = view
     if owner.projection then
       require("forge.render.harness.markdown").render(options.buffer, window,

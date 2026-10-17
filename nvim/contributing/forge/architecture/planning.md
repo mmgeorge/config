@@ -83,6 +83,54 @@ imports, exports, generics, and signature references without examining implement
 Proposed declarations replace their baseline files. Deleted lines use a separate baseline graph.
 Uncaptured and removed files cannot enter this resolver through filesystem discovery.
 
+Callable behavior is stored as a tagged `FunctionBehavior`, either `Algorithm` or `Change`.
+New functions and methods require a nonempty `Algorithm` at submission. Existing callables use
+`Change` for behavioral deltas, with guidance requiring one or two sentences as succinct as possible.
+The immutable baseline, including file moves, determines which
+category applies. Drafts can remain incomplete, while duplicate or mixed behavior blocks fail
+parsing. Academic pseudocode retains nested indentation through editing, serialization, and review.
+Planning prompts require the globally distributed `academic-pseudocode` skill, whose `SKILL.md`
+contains the writing rules without an external guide dependency.
+Algorithm blocks use the repository-owned `algorithm` Tree-sitter grammar. Submission validates
+statement syntax, balanced expression delimiters, space indentation, nonempty control bodies,
+matching `otherwise` branches, and loop ownership of `break` and `continue`. Errors identify the
+callable and algorithm line and column. Draft patches still retain incomplete text for repair.
+Invocation nodes retain qualified targets, named arguments, and nested calls. Every target in
+the callable's `Constructs` section requires an explicit matching invocation in its Algorithm.
+Constructor arguments use `field = value`, with `Type()` for argument-free construction.
+Missing construction sites and positional constructor arguments fail submission. Comments and
+string contents cannot satisfy this requirement. Ordinary helper calls permit positional arguments.
+The validator checks structure and declared construction sites, not algorithmic correctness or field types.
+Review parses Algorithm rows separately from native declarations and applies its keyword,
+operator, literal, constructor, named-field, and identifier captures at their original displayed byte columns. Change
+blocks retain prose styling. Algorithm-only revisions invalidate the affected syntax cache.
+Algorithm expressions default to comment-gray prose. Assignment targets, standalone operands,
+operator operands, call arguments, and qualified or underscored references receive variable
+styling. Variables and named fields render white. Algorithm and Change headings share the
+reference section heading style used by Calls, Constructs, and Accesses.
+Soft-wrapped plan rows retain their source indentation plus the virtual gutter width, without
+rewriting stored source text. Each window wraps independently at its own width.
+Behavior rows carry category-aware review anchors. Collapsed signatures never append `[changed]`.
+Algorithm definition navigation uses parsed reference segments and the enclosing callable's
+signature. Selecting a parameter name, including a receiver or call argument, jumps to its exact
+signature token. Member lookup first uses the receiver's declared type, including matching
+reference targets inside generic wrappers. Calls and Constructs disambiguate shortened call
+names, while Accesses disambiguates fields and values. Multiple remaining targets report an
+ambiguity without moving the cursor. Literals, comments, and unmatched prose have no target.
+Algorithm references reuse the plan declaration resolver and reveal transaction. Their synthetic
+positions never enter the source-backed LSP request path.
+
+Function-body references use three editable sections: `Calls` for invocations and callbacks,
+`Constructs` for directly instantiated types, and `Accesses` for fields and named values.
+Rust struct literals and TypeScript `new` expressions retain construction evidence separately
+from initialized fields. Resolved Rust tuple and unit constructors use the same category.
+Factory calls returning an owned named type also use `Constructs`, retaining the callable name.
+Captured return types determine classification, including `Self`. Borrowed, scalar, and unit
+returns remain calls. Signature and generic type mentions do not imply construction.
+Construction targets retain their source positions, type color, and definition navigation.
+Known targets that are neither types nor factories fail `Constructs` validation. Unavailable external types remain unchecked.
+Omitted sections retain unknown evidence, while empty sections explicitly record no uses.
+
 ## Source-backed LSP navigation
 
 Narrative inline-code identifiers resolve against the complete proposed declaration index,
@@ -202,7 +250,7 @@ transfer or condition labels and continuation rails. The shared section
 projection places Flows after Design and omits an empty inventory. Section reads, review output,
 and revision diffs use the same generated Markdown without changing the stored JSON.
 
-Plan review places Tests after proposed declaration changes and before Verification. Each section
+Plan review places Tests after proposed declaration changes, followed by Checks and Verification. Each section
 retains its own fold boundary and navigation targets in both full and public-only views.
 The blank row before Tests stays outside the Changes fold in both views.
 Public filtering preserves that unhighlighted section spacer even after an empty diff row.
@@ -412,7 +460,7 @@ broker independently reject those mutations, including calls from stale provider
 
 Checking compares body-free declaration structure and configuration values against the current
 accepted revision. Required declarations, signatures, ownership, and exposed API remain binding.
-Additional internal helpers are permitted. Calls and Accesses record implementation evidence.
+Additional internal helpers are permitted. Calls, Constructs, and Accesses record implementation evidence.
 Planning uses their resolved internal relationships to enforce incoming-use requirements, while
 implementation conformance does not treat every captured body reference as a completion gate. Checking collects declaration findings and executes accepted commands. Resolve fixes the
 workspace or submits a consolidated contract revision, then returns to Checking. Plan revisions
@@ -428,7 +476,7 @@ their display width, so a package-discovery error remains visible without preven
 At completion or a blocked result, the broker records an implementation-differences report against
 the original accepted revision. Failure, cancellation, and continuation exhaustion retain an
 incomplete report. Reports compare accepted paths and checkpoint changes, including removed files.
-They distinguish unspecified reference categories from explicitly empty Calls or Accesses and show
+They distinguish unspecified reference categories from explicitly empty Calls, Constructs, or Accesses and show
 internal additions, contract differences, approved revisions, and unavailable evidence.
 
 The report is an immutable content-addressed object. The execution record and timeline node retain

@@ -186,6 +186,10 @@ Row-preserving single-line edits and metadata-only updates retain identical fold
 Installing decoration metadata invalidates cached screen rows for the affected buffer without
 flushing an intermediate frame. The next redraw applies viewport highlights in every attached
 window, including when a patch changes only highlight metadata and the cursor stays still.
+PlanReview's annotation repaint and viewport decoration share `decorations.project_row` to map
+source spans onto physical rows. Added and removed diff backgrounds retain end-of-line fill,
+including blank rows. Syntax and intraline spans retain their byte ranges. Annotation insertion
+and folding must preserve this distinction without padding source text to the window width.
 Structural edits rebuild native folds and restore each window's fold preferences. With
 Harness logging enabled, `ui.buffer.patch` records validation, view capture, fold capture,
 sequence updates, buffer text writes, metadata installation, editable-region attachment,

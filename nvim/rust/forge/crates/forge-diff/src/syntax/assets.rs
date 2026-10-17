@@ -28,6 +28,7 @@ pub enum SyntaxLanguage {
     MarkdownInline,
     Latex,
     Cue,
+    Algorithm,
 }
 
 impl SyntaxLanguage {
@@ -57,6 +58,7 @@ impl SyntaxLanguage {
         Self::MarkdownInline,
         Self::Latex,
         Self::Cue,
+        Self::Algorithm,
     ];
     pub fn name(self) -> &'static str {
         match self {
@@ -85,6 +87,7 @@ impl SyntaxLanguage {
             Self::MarkdownInline => "markdown_inline",
             Self::Latex => "latex",
             Self::Cue => "cue",
+            Self::Algorithm => "algorithm",
         }
     }
     pub fn for_path(path: &str) -> Option<Self> {
@@ -130,6 +133,7 @@ impl SyntaxLanguage {
             "markdown_inline" => Some(Self::MarkdownInline),
             "latex" | "tex" => Some(Self::Latex),
             "cue" => Some(Self::Cue),
+            "algorithm" | "pseudocode" => Some(Self::Algorithm),
             _ => None,
         }
     }
@@ -139,6 +143,7 @@ impl SyntaxLanguage {
             fn tree_sitter_wgsl() -> *const ();
             fn tree_sitter_latex() -> *const ();
             fn tree_sitter_cue() -> *const ();
+            fn tree_sitter_algorithm() -> *const ();
         }
         match self {
             Self::Rust => tree_sitter_rust::LANGUAGE.into(),
@@ -166,6 +171,7 @@ impl SyntaxLanguage {
             Self::Wgsl => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_wgsl) }),
             Self::Latex => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_latex) }),
             Self::Cue => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_cue) }),
+            Self::Algorithm => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_algorithm) }),
         }
     }
 }
@@ -178,6 +184,12 @@ pub(crate) struct QueryAsset {
 }
 
 pub(crate) const QUERY_ASSET: &[QueryAsset] = &[
+    QueryAsset {
+        language: "algorithm",
+        kind: "highlights",
+        origin: "forge",
+        text: include_str!("../../query/local/algorithm/highlights.scm"),
+    },
     QueryAsset {
         language: "python",
         kind: "highlights",

@@ -13,8 +13,10 @@ pub enum DeclarationCallKind {
     Property,
     /// Takes a callable as a value instead of invoking it directly.
     Callback,
-    /// Reads a named value or constructs a named type.
+    /// Reads a named value.
     Value,
+    /// Constructs a value of a named type.
+    Construct,
 }
 
 /// A source call occurrence, retaining lexical order and receiver evidence.
@@ -45,10 +47,14 @@ pub struct DeclarationCallable {
     pub column: u32,
     /// One-based final signature line before the body.
     pub end_line: u32,
+    /// Declared return type, with Self resolved to the enclosing type when available.
+    pub return_type: Option<String>,
     /// Direct call occurrences in syntax extraction order.
     pub call: Vec<DeclarationCall>,
-    /// Parameter value bindings that shadow same-named imported callables.
-    pub binding: std::collections::BTreeSet<String>,
+    /// Parameter bindings and authored type syntax. Untyped bindings retain None.
+    pub binding: std::collections::BTreeMap<String, Option<String>>,
+    /// Exact authored parameter token positions, excluding implicit receiver bindings.
+    pub binding_position: std::collections::BTreeMap<String, super::DeclarationPosition>,
 }
 
 /// Extracts callable ownership and call expressions from supported source languages.
@@ -147,6 +153,7 @@ impl DeclarationCalls {
         }
         let mut occurrence = HashMap::<String, usize>::new();
         for function in &mut callable {
+            function.return_type = return_type.get(&function.owner).cloned().flatten();
             let ordinal = occurrence.entry(function.owner.clone()).or_default();
             *ordinal += 1;
             if *ordinal > 1 {
@@ -271,8 +278,29 @@ fn collect(
     let mut nested = scope.to_vec();
     if let Some(name) = callable_name(node, source) {
         let mut binding = HashMap::new();
+        if let Some(container) = receiver_owner(node, source) {
+            binding.insert("self".into(), Some(container.clone()));
+            if matches!(node.kind(), "method_definition" | "arrow_function") {
+                binding.insert("this".into(), Some(container));
+            }
+        }
         if let Some(parameters) = node.child_by_field_name("parameters") {
             parameter_types(parameters, source, &mut binding);
+        }
+        lua_annotations(node, source, &mut binding);
+        let mut binding_position = std::collections::BTreeMap::new();
+        let mut parameter = node.child_by_field_name("parameters").into_iter().collect::<Vec<_>>();
+        while let Some(parameter_node) = parameter.pop() {
+            let name = contents(parameter_node, source);
+            if matches!(parameter_node.kind(), "identifier" | "self") && binding.contains_key(name) {
+                let position = parameter_node.start_position();
+                binding_position.entry(name.to_owned()).or_insert(super::DeclarationPosition {
+                    line: position.row as u32 + 1, column: position.column as u32,
+                });
+            } else if parameter_node.kind() != "type_identifier" {
+                let mut children = parameter_node.walk();
+                parameter.extend(parameter_node.named_children(&mut children));
+            }
         }
         let name_node = node.child_by_field_name("name").unwrap_or(node);
         let end = node
@@ -284,8 +312,10 @@ fn collect(
             line: name_node.start_position().row as u32 + 1,
             column: name_node.start_position().column as u32,
             end_line: end as u32 + 1,
+            return_type: None,
             call: Vec::new(),
-            binding: binding.into_keys().collect(),
+            binding: binding.into_iter().collect(),
+            binding_position,
         });
         nested.push(name);
     } else if let Some(name) = container(node, source) {
@@ -508,7 +538,7 @@ fn parameter_types(node: Node<'_>, source: &str, binding: &mut HashMap<String, O
             let name = contents(name, source).trim_start_matches("mut ").to_owned();
             let value = child
                 .child_by_field_name("type")
-                .and_then(|value| base_type(contents(value, source)));
+                .map(|value| contents(value, source).to_owned());
             binding.insert(name, value);
         }
     }
@@ -595,7 +625,7 @@ fn expression_type(
     binding: &HashMap<String, Option<String>>,
 ) -> Option<String> {
     match node.kind() {
-        "identifier" | "self" | "this" => binding.get(contents(node, source)).cloned().flatten(),
+        "identifier" | "self" | "this" => binding.get(contents(node, source)).and_then(|value| value.as_deref()).and_then(base_type),
         "struct_expression" | "new_expression" | "table_constructor" => node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("constructor"))
@@ -764,6 +794,13 @@ fn calls(
     if callable_name(node, source).is_some() {
         return Ok(());
     }
+    if matches!(node.kind(), "type_arguments" | "type_annotation")
+        || node.parent().is_some_and(|parent| {
+            parent.child_by_field_name("type").is_some_and(|type_node| type_node.id() == node.id())
+        })
+    {
+        return Ok(());
+    }
     let boundary = matches!(
         node.kind(),
         "block"
@@ -816,7 +853,7 @@ fn calls(
             if !(language == SyntaxLanguage::Rust && matches!(name.as_str(), "Ok" | "Err" | "Some"))
             {
                 output.push(DeclarationCall {
-                    kind: DeclarationCallKind::Call,
+                    kind: if node.kind() == "new_expression" { DeclarationCallKind::Construct } else { DeclarationCallKind::Call },
                     name,
                     expression: contents(function, source).into(),
                     unresolved: shadowed_target(function, source, returns, binding),
@@ -824,6 +861,18 @@ fn calls(
                     column: reference_token(function).start_position().column as u32,
                 });
             }
+        }
+    }
+    if language == SyntaxLanguage::Rust && node.kind() == "struct_expression" {
+        if let Some(target) = node.child_by_field_name("name").or_else(|| node.child_by_field_name("type")) {
+            output.push(DeclarationCall {
+                kind: DeclarationCallKind::Construct,
+                name: base_type(contents(target, source)).unwrap_or_else(|| contents(target, source).into()),
+                expression: contents(target, source).into(),
+                unresolved: false,
+                line: reference_token(target).start_position().row as u32 + 1,
+                column: reference_token(target).start_position().column as u32,
+            });
         }
     }
     if language == SyntaxLanguage::Rust
@@ -892,7 +941,7 @@ fn calls(
         && !invocation_target(node)
         && !binding.contains_key(contents(node, source))
         && !node.parent().is_some_and(|parent| {
-            matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier" | "field_expression" | "member_expression" | "dot_index_expression" | "method_index_expression" | "subscript_expression" | "bracket_index_expression" | "parameters" | "parameter" | "closure_parameters" | "variable_list" | "type_annotation" | "type_arguments")
+            matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier" | "field_expression" | "member_expression" | "dot_index_expression" | "method_index_expression" | "subscript_expression" | "bracket_index_expression" | "parameters" | "parameter" | "closure_parameters" | "variable_list" | "type_annotation" | "type_arguments" | "struct_expression" | "struct_pattern")
                 || matches!(parent.kind(), "let_declaration" | "variable_declarator") && parent.child_by_field_name("pattern").or_else(|| parent.child_by_field_name("name")).is_some_and(|name| name.id() == node.id())
         })
     {
@@ -982,6 +1031,22 @@ fn shadowed_target(
 #[cfg(test)]
 mod tests {
     use super::{DeclarationCallKind, DeclarationCalls, base_type};
+
+    #[test]
+    fn signature_bindings_retain_types_and_exact_parameter_positions() {
+        for (path, source, expected_type) in [
+            ("main.rs", "pub fn run(\n  input: ResMut<crate::Client>\n);", Some("ResMut<crate::Client>")),
+            ("main.ts", "export function run(\n  input: Client\n): void;", Some(": Client")),
+            ("main.lua", "---@param input Client\nfunction run(input)\nend", Some("Client")),
+        ] {
+            let functions = DeclarationCalls::extract(path, source, true).unwrap();
+            let function = functions.iter().find(|function| function.owner == "run").unwrap();
+            assert_eq!(function.binding["input"].as_deref(), expected_type, "{path}");
+            let position = function.binding_position["input"];
+            let row = source.lines().nth(position.line as usize - 1).unwrap();
+            assert!(row[position.column as usize..].starts_with("input"), "{path}");
+        }
+    }
 
     #[test]
     fn receiver_type_inference_requires_a_named_type() {
@@ -1127,6 +1192,22 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Client::send", "z", "a", "z"]
         );
+    }
+
+    #[test]
+    fn construction_targets_exclude_type_mentions_and_destructuring() {
+        let source = "struct Weapon { cooldown: f32 } fn setup(input: Option<&Weapon>) { let typed: Option<&Weapon> = None; inspect::<Option<&Weapon>>(); let weapon = Weapon { cooldown: 0.0 }; let Weapon { cooldown } = weapon; }";
+        let functions = DeclarationCalls::extract("lib.rs", source, false).unwrap();
+        let setup = functions.iter().find(|function| function.owner == "setup").unwrap();
+        let weapons = setup.call.iter().filter(|reference| reference.name == "Weapon").collect::<Vec<_>>();
+        assert_eq!(weapons.len(), 1, "{:#?}", setup.call);
+        assert_eq!(weapons[0].kind, DeclarationCallKind::Construct);
+        assert_eq!(&source[weapons[0].column as usize..][..6], "Weapon");
+        assert_eq!(setup.call.iter().filter(|reference| reference.name == "Weapon::cooldown" && reference.kind == DeclarationCallKind::Property).count(), 2);
+        let functions = DeclarationCalls::extract("main.ts", "function setup(input: Weapon) { const typed: Weapon = input; const weapon = new Weapon(); Weapon.create(); }", false).unwrap();
+        let references = &functions[0].call;
+        assert_eq!(references.iter().filter(|reference| reference.kind == DeclarationCallKind::Construct).map(|reference| reference.name.as_str()).collect::<Vec<_>>(), ["Weapon"]);
+        assert!(references.iter().any(|reference| reference.name == "Weapon.create" && reference.kind == DeclarationCallKind::Call));
     }
 
     #[test]

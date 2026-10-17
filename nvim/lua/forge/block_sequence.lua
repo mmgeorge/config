@@ -1,6 +1,7 @@
 ---@class ForgeSequenceEntry
 ---@field row_count integer
 ---@field metadata table
+---@field row_layout? table<integer, ForgeRowLayout>
 
 ---@class ForgeSequenceNode
 ---@field id string

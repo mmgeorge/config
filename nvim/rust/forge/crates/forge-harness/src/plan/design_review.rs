@@ -75,7 +75,7 @@ pub(super) fn project(
     annotation: &[ReviewAnnotation],
     revision: &HashMap<String, (RegionRevision, EditSequence)>,
     focused: Option<&str>,
-    syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
+    syntax: &HashMap<(String, String), super::review_source::ReviewSyntax>,
     public_only: bool,
     trace: Option<&ReviewTrace>,
     revealed: &HashSet<(String, String, u32)>,
@@ -127,13 +127,20 @@ pub(super) fn project(
         let context = contextual.contains(&row.id);
         if context { omitted += 1; }
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
-            if matches!(anchor.target, PlanReviewTarget::Call { .. } | PlanReviewTarget::Change { .. }) {
+            if matches!(anchor.target, PlanReviewTarget::Call { .. } | PlanReviewTarget::Behavior { .. })
+                && !row.metadata.visible_decoration.iter().any(|decoration| decoration.capture.ends_with(".algorithm")) {
                 super::review_projection::append_semantic_style(&mut row.metadata, &anchor.target, row.text.row(0).unwrap_or_default());
-                if let PlanReviewTarget::Call { path, side, name, kind: super::CallKind::Value, .. } = &anchor.target
-                    && narrative_symbols.is_type(path, side, name)
+                if let PlanReviewTarget::Call { path, side, name, kind, .. } = &anchor.target
+                    && matches!(kind, super::CallKind::Value | super::CallKind::Construct)
                     && let Some(reference) = row.metadata.visible_decoration.last_mut()
                 {
-                    reference.capture = "ForgeWalkthroughType".into();
+                    match narrative_symbols.capture(path, side, name) {
+                        Some("@type") => reference.capture = "ForgeWalkthroughType".into(),
+                        Some("@function") if *kind == super::CallKind::Construct => {
+                            reference.capture = if name.contains([':', '.']) { "@function.method.call" } else { "@function.call" }.into();
+                        }
+                        _ => (),
+                    }
                 }
             }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
@@ -210,7 +217,7 @@ pub(super) fn project(
 
 fn rows(
     document: &PlanDocument,
-    syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
+    syntax: &HashMap<(String, String), super::review_source::ReviewSyntax>,
     public_only: bool,
     inspection: bool,
     trace: Option<&ReviewTrace>,
@@ -371,11 +378,17 @@ fn rows(
                     && let Some(handle) = syntax.get(&(source_path.clone(), side.into())) {
                     forge_diff::projection::append_syntax_row(
                         &mut metadata,
-                        handle,
+                        &handle.declaration,
                         source_row,
                         0,
                         row_text,
                     )?;
+                }
+                if presentation.get(&(source_path.clone(), side.into()))
+                    .and_then(|file| file.behavior_row.get(&line))
+                    .is_some_and(|(_, _, category)| *category == "Algorithm")
+                    && let Some(handle) = syntax.get(&(source_path.clone(), side.into())).and_then(|syntax| syntax.algorithm.as_ref()) {
+                    forge_diff::projection::append_syntax_row(&mut metadata, handle, line, 0, row_text)?;
                 }
                 if inspection
                     && !visibility
@@ -437,12 +450,12 @@ fn rows(
                         path: Some(source_path.clone()), label: format!("{source_path}: {owner}: {} {name}", kind.label()),
                     });
                 }
-                if let Some((owner, offset)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.change_row.get(&line)) {
+                if let Some((owner, offset, category)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.behavior_row.get(&line)) {
                     navigation.anchor.push(PlanNavigationAnchor {
                         line: block.len() as u32,
-                        target: PlanReviewTarget::Change { path: source_path.clone(), side: side.into(), owner: owner.clone(), offset: *offset },
-                        json_path: format!("/design/{side}_calls/{}/{}/change/{offset}", pointer(source_path), pointer(owner)),
-                        path: Some(source_path.clone()), label: format!("{source_path}: {owner}: Change"),
+                        target: PlanReviewTarget::Behavior { path: source_path.clone(), side: side.into(), owner: owner.clone(), offset: *offset },
+                        json_path: format!("/design/{side}_calls/{}/{}/behavior/{offset}", pointer(source_path), pointer(owner)),
+                        path: Some(source_path.clone()), label: format!("{source_path}: {owner}: {category}"),
                     });
                 }
             }
@@ -488,6 +501,25 @@ fn rows(
         if matches!(section, super::PlanSection::Usage | super::PlanSection::Requirements | super::PlanSection::Decisions | super::PlanSection::Flows)
             && metadata.text.trim().is_empty() {
             continue;
+        }
+        if section == super::PlanSection::ManualVerification {
+            let start = overview.len();
+            overview.push(section_header(BlockId("plan:section:checks".into()), "Checks")?);
+            let lines = review_checks(Some(design), None)?;
+            let check_ids = design.check_preview.iter().filter(|preview| preview.selected || preview.pending).map(|preview| &preview.id).collect::<Vec<_>>();
+            for (index, line) in lines.into_iter().enumerate() {
+                overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
+                if design.check_preview_current()? && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index)) {
+                    section_anchor.push(PlanNavigationAnchor { line: overview.len() as u32,
+                        target: PlanReviewTarget::Check { id: (*id).clone() },
+                        json_path: "/design/document/checks".into(), path: None, label: format!("Check: {id}") });
+                }
+            }
+            fold(&mut overview, start, "plan:section:checks")?;
+            overview.push(BufferBlock {
+                id: BlockId("plan:section:checks:separator".into()),
+                text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
+            });
         }
         if section == super::PlanSection::Tests {
             let changes_start = overview.len();
@@ -541,19 +573,6 @@ fn rows(
             text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
     }
-    let start = overview.len();
-    overview.push(section_header(BlockId("plan:section:checks".into()), if design.check_preview_current()? { "Planned checks" } else { "Configured checks" })?);
-    let lines = review_checks(Some(design), None)?;
-    let check_ids = design.check_preview.iter().filter(|preview| preview.selected || preview.pending).map(|preview| &preview.id).collect::<Vec<_>>();
-    for (index,line) in lines.into_iter().enumerate() {
-        overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
-        if design.check_preview_current()? && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index)) {
-            section_anchor.push(PlanNavigationAnchor { line: overview.len() as u32,
-                target: PlanReviewTarget::Check { id: (*id).clone() },
-                json_path: "/design/document/checks".into(), path: None, label: format!("Check: {id}") });
-        }
-    }
-    fold(&mut overview, start, "plan:section:checks")?;
     navigation.anchor.extend(section_anchor);
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
@@ -1051,6 +1070,70 @@ fn pointer(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn algorithm_syntax_preserves_native_rows_and_behavior_anchors() {
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxRequest};
+        use forge_diff::workers::{AnalysisPool, PoolLimits, WorkPriority};
+        let engine = SyntaxEngine::new(std::sync::Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2 })));
+        for (path, text) in [
+            ("main.rs", "pub fn run();\npub struct Following;\n"),
+            ("main.ts", "export function run(): void;\nexport class Following {}\n"),
+            ("main.lua", "function run()\nend\nfunction following()\nend\n"),
+        ] {
+            let algorithm = "result ← ProbeResult(value = inspect(value))\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds\nif result ≠ none\n  return result\nreturn none";
+            let calls = vec![super::super::FunctionBody { owner: "run".into(),
+                behavior: Some(super::super::FunctionBehavior::Algorithm(algorithm.into())), evidence: None, call: None }];
+            let presentation = super::super::calls::present(path, text, &calls).unwrap();
+            let mut syntax = HashMap::new();
+            let mut handles = Vec::new();
+            for (language, source) in [
+                (SyntaxLanguage::for_path(path).unwrap(), presentation.plain.clone()),
+                (SyntaxLanguage::Algorithm, presentation.algorithm_source().unwrap()),
+            ] {
+                handles.push(engine.analyze(SyntaxRequest {
+                    source: SourceVersion::new(source.into_bytes(), Representation::DisplayOnly).unwrap(),
+                    language, priority: WorkPriority::Foreground, deadline: None,
+                }).await.unwrap());
+            }
+            syntax.insert((path.into(), "proposed".into()), super::super::review_source::ReviewSyntax {
+                declaration: handles.remove(0), algorithm: Some(handles.remove(0)),
+            });
+            let mut document = crate::plan::document::test_fixture("algorithm-syntax", "Algorithm syntax");
+            let mut design = super::super::DeclarationDesign::default();
+            design.proposed.insert(path.into(), text.into());
+            design.proposed_calls.insert(path.into(), calls);
+            document.design = Some(design);
+            let original = document.clone();
+            let (blocks, targets) = project(&document, &Default::default(), &[], &HashMap::new(), None, &syntax, false, None, &HashSet::new()).unwrap();
+            for (fragment, token, capture) in [
+                ("result ← ProbeResult", "←", "@operator.algorithm"),
+                ("result ← ProbeResult", "ProbeResult", "@type.algorithm"),
+                ("result ← ProbeResult", "value", "@variable.member.algorithm"),
+                ("if result", "if", "@keyword.conditional.algorithm"),
+                ("return result", "return", "@keyword.return.algorithm"),
+                ("Decrease cooldown_remaining", "cooldown_remaining", "@variable.algorithm"),
+                ("Decrease cooldown_remaining", "weapon.cooldown", "@variable.algorithm"),
+            ] {
+                let block = blocks.iter().find(|block| block.text.row(0).unwrap_or_default().contains(fragment)).unwrap();
+                let text = block.text.row(0).unwrap();
+                assert!(block.metadata.visible_decoration.iter().any(|span| span.capture == capture
+                    && &text[span.range.start.column..span.range.end.column] == token), "{path}: {fragment}");
+                assert!(!block.metadata.visible_decoration.iter().any(|span| span.capture == "@comment"));
+                assert!(block.metadata.target.iter().any(|range| targets.get(&range.id)
+                    .is_some_and(|anchor| matches!(anchor.target, PlanReviewTarget::Behavior { .. }))));
+            }
+            let prose = blocks.iter().find(|block| block.text.row(0).unwrap_or_default().contains("Decrease cooldown_remaining")).unwrap();
+            let prose_text = prose.text.row(0).unwrap();
+            assert!(prose.metadata.visible_decoration.iter().any(|span| span.capture == "@comment.algorithm"
+                && prose_text[span.range.start.column..span.range.end.column].starts_with("Decrease")));
+            assert!(!prose.metadata.visible_decoration.iter().any(|span| span.capture == "@variable.algorithm"
+                && &prose_text[span.range.start.column..span.range.end.column] == "Decrease"));
+            assert!(blocks.iter().any(|block| block.text.row(0).unwrap_or_default().contains("following")
+                || block.text.row(0).unwrap_or_default().contains("Following")));
+            assert_eq!(document, original);
+        }
+    }
+
     #[test]
     fn check_table_preserves_multiline_resolution_errors() {
         let table = vec![
@@ -1200,12 +1283,13 @@ mod tests {
         }];
         design.check_preview_source = design.check_preview_fingerprint().unwrap();
         let rendered = render(&document).unwrap();
-        assert!(rendered.markdown.contains("Planned checks"));
+        assert!(rendered.markdown.find(" Checks ").unwrap() < rendered.markdown.find(" Verification ").unwrap());
         assert!(rendered.markdown.contains("cargo test --package combat --tests"));
         assert!(rendered.markdown.contains("Will run"));
         document.design.as_mut().unwrap().proposed.insert("new.rs".into(), "fn added();".into());
         let rendered = render(&document).unwrap();
         assert!(!rendered.markdown.contains("cargo test --package combat --tests"));
+        assert!(rendered.markdown.find(" Checks ").unwrap() < rendered.markdown.find(" Verification ").unwrap());
     }
 
     #[test]
@@ -1290,7 +1374,7 @@ mod tests {
                 source: SourceVersion::new(presentation.plain.as_bytes().to_vec(), Representation::DisplayOnly).unwrap(),
                 language: SyntaxLanguage::Rust, priority: WorkPriority::Foreground, deadline: None,
             }).await.unwrap();
-            syntax.insert(("state.rs".into(), side.into()), handle);
+            syntax.insert(("state.rs".into(), side.into()), super::super::review_source::ReviewSyntax { declaration: handle, algorithm: None });
         }
         for public_only in [false, true] {
             let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &syntax, public_only, None, &HashSet::new()).unwrap();
@@ -1311,7 +1395,7 @@ mod tests {
         let declaration = "pub fn run();\n";
         design.baseline.insert("main.rs".into(), super::super::DeclarationFile { text: declaration.into(), source_digest: String::new() });
         design.proposed.insert("main.rs".into(), declaration.into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.\nRecord the final attempt.".into()) }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, owner: "run".into(), call: None, behavior: Some(crate::plan::FunctionBehavior::Change("Stop retrying authentication failures.\nRecord the final attempt.".into())) }]);
         document.design = Some(design);
         let original = document.clone();
         let rendered = render(&document).unwrap();
@@ -1319,8 +1403,8 @@ mod tests {
         assert!(!rendered.markdown.contains("Calls"));
         for public_only in [false, true] {
             let (blocks, targets) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
-            assert_eq!(targets.values().filter(|anchor| matches!(anchor.target, PlanReviewTarget::Change { .. })).count(), 3);
-            assert!(blocks.iter().filter(|block| block.text.row(0).unwrap().contains("pub fn run")).any(|heading| heading.metadata.fold.iter().any(|fold| fold.closed && fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.contains("[changed]")))));
+            assert_eq!(targets.values().filter(|anchor| matches!(anchor.target, PlanReviewTarget::Behavior { .. })).count(), 3);
+            assert!(blocks.iter().filter(|block| block.text.row(0).unwrap().contains("pub fn run")).any(|heading| heading.metadata.fold.iter().any(|fold| fold.closed && fold.collapsed_suffix.as_ref().is_some_and(|suffix| !suffix.contains("[changed]")))));
             for block in blocks.iter().filter(|block| block.text.row(0).unwrap().contains("Stop retrying")) {
                 assert!(block.metadata.visible_decoration.iter().any(|capture| capture.capture == "@comment"));
             }
@@ -1340,13 +1424,13 @@ mod tests {
         let after = before.replace("old", "shared");
         design.baseline.insert("arena.rs".into(), super::super::DeclarationFile { text: before.into(), source_digest: String::new() });
         design.proposed.insert("arena.rs".into(), after.clone());
-        let calls = vec![super::super::FunctionBody { evidence: None, change: None, owner: "ArenaPlugin::new".into(), call: Some(vec![
+        let calls = vec![super::super::FunctionBody { evidence: None, behavior: None, owner: "ArenaPlugin::new".into(), call: Some(vec![
             super::super::CallSite { kind: super::super::CallKind::Call, name: "ArenaConfig::validate".into(), source: None, unresolved: false },
             super::super::CallSite { kind: super::super::CallKind::Property, name: "ArenaConfig::enabled".into(), source: None, unresolved: false },
         ]) }];
         design.baseline_calls.insert("arena.rs".into(), calls.clone());
         let mut proposed = calls;
-        proposed[0].change = Some("Reject invalid configuration before registration.".into());
+        proposed[0].behavior = Some(crate::plan::FunctionBehavior::Change("Reject invalid configuration before registration.".into()));
         design.proposed_calls.insert("arena.rs".into(), proposed);
         document.design = Some(design);
         let original = document.clone();
@@ -1358,7 +1442,7 @@ mod tests {
                 source: SourceVersion::new(plain.into_bytes(), Representation::DisplayOnly).unwrap(),
                 language: SyntaxLanguage::Rust, priority: WorkPriority::Foreground, deadline: None,
             }).await.unwrap();
-            syntax.insert(("arena.rs".into(), side.into()), handle);
+            syntax.insert(("arena.rs".into(), side.into()), super::super::review_source::ReviewSyntax { declaration: handle, algorithm: None });
         }
         for public_only in [false, true] {
             let design = document.design.as_ref().unwrap();
@@ -1413,7 +1497,7 @@ mod tests {
         design.proposed.insert("main.rs".into(),
             "pub struct PlayerAbilities { pub health: u32 }\n\n/// Creates the configured application.\nfn main();\n\nfn configure_game();\n\nfn setup();\n".into());
         let body = |owner: &str, target: &str, change: Option<&str>| super::super::FunctionBody {
-            evidence: None, owner: owner.into(), change: change.map(str::to_owned),
+            evidence: None, owner: owner.into(), behavior: change.map(|text| crate::plan::FunctionBehavior::Change(text.into())),
             call: Some(vec![super::super::CallSite {
                 kind: super::super::CallKind::Call, name: target.into(), source: None, unresolved: false,
             }]),
@@ -1482,10 +1566,12 @@ mod tests {
             ("Projectile", super::super::CallKind::Value, vec![("Projectile", "ForgeWalkthroughType")]),
             ("projectile_alias", super::super::CallKind::Value, vec![("projectile_alias", "ForgeWalkthroughType")]),
             ("MAX_SHOTS", super::super::CallKind::Value, vec![("MAX_SHOTS", "@variable")]),
+            ("construct_alias", super::super::CallKind::Construct, vec![("construct_alias", "ForgeWalkthroughType")]),
+            ("Projectile::ready", super::super::CallKind::Construct, vec![("Projectile", "@type"), ("ready", "@function.method.call")]),
         ];
         design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionBody { evidence: None,
             owner: "main".into(),
-            change: None,
+            behavior: None,
             call: Some(cases.iter().map(|(name, kind, _)| super::super::CallSite {
                 name: (*name).into(), kind: *kind, source: None, unresolved: false,
             }).collect()),
@@ -1553,11 +1639,12 @@ mod tests {
             assert!(!rows.iter().any(|row| row.contains("= existing_case")));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/tests/1/cases/0"));
             let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
+            let checks_start = block.iter().position(|block| block.id.0 == "plan:section:checks").unwrap();
             let verification_start = block.iter().position(|block| block.id.0 == "plan:section:verification").unwrap();
-            assert!(tests_start < verification_start);
+            assert!(tests_start < checks_start && checks_start < verification_start);
             let endpoint = &block[tests_start].metadata.fold[0].end.block;
             assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < verification_start);
-            assert_eq!(block[tests_start..verification_start].iter().map(|block| block.metadata.fold.len()).sum::<usize>(), 3);
+            assert_eq!(block[tests_start..checks_start].iter().map(|block| block.metadata.fold.len()).sum::<usize>(), 3);
             let changes = block.iter().find(|block| block.id.0 == "plan:section:changes").unwrap();
             let endpoint = &changes.metadata.fold[0].end.block;
             assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < tests_start);
@@ -1969,8 +2056,8 @@ mod tests {
         assert_eq!(folded_header[4].text.row(0), Some(" Changes "));
         assert!(folded_header[5].text.row(0).unwrap().starts_with("Modified src/lib.rs"));
         assert!(folded_header[6].text.row(0).unwrap().starts_with("@@"));
-        assert_eq!(folded_header[7].text.row(0), Some(" Verification "));
-        assert_eq!(folded_header[8].text.row(0), Some(" Configured checks "));
+        assert_eq!(folded_header[7].text.row(0), Some(" Checks "));
+        assert_eq!(folded_header[8].text.row(0), Some(" Verification "));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

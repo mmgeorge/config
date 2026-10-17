@@ -166,6 +166,9 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgeFileStatusRenamed", { fg = "#c678dd" })
   vim.api.nvim_set_hl(0, "ForgeDependencyName", { fg = palette.teal })
   vim.api.nvim_set_hl(0, "ForgePlanMetadata", { link = "Normal" })
+  vim.api.nvim_set_hl(0, "@variable.algorithm", { fg = palette.white })
+  vim.api.nvim_set_hl(0, "@variable.member.algorithm", { fg = palette.white })
+  vim.api.nvim_set_hl(0, "@comment.algorithm", { link = "Comment" })
   if keyword_modifier.fg == normal.fg then
     vim.api.nvim_set_hl(0, "@keyword.modifier", { fg = "#ff79c6", bold = true })
   end

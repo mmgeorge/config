@@ -305,7 +305,7 @@ mod test {
             "lib.rs".into(),
             vec![crate::plan::FunctionBody { evidence: None,
                 owner: "standard".into(),
-                change: Some("Returns settings without a network request.".into()),
+                behavior: Some(crate::plan::FunctionBehavior::Change("Returns settings without a network request.".into())),
                 call: None,
             }],
         );

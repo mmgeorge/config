@@ -64,6 +64,14 @@ automation tool. A fixture that prints success but remains alive does not pass.
 Host fixtures require a built executable. Parameterized language tests require
 the setup below and must not be invoked without those parameters.
 
+After building both `forge` and the `plan_navigation_fixture` example, verify new
+`Algorithm` blocks, modified `Change` blocks, nested pseudocode indentation, and
+collapsed signatures without status suffixes:
+
+```text
+nvim --headless -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.g.forge_test_plan_behavior = true" -l nvim/tests/forge/plan_review_calls_host.lua
+```
+
 `nvim/tools/run_tests.nu` is the batch runner and owns process-tree deadlines.
 The installed Nushell currently reports a type mismatch in its nullable `result`
 assignment before collecting the fixture result. Until that runner is repaired,

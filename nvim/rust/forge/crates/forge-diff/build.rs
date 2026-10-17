@@ -1,6 +1,6 @@
 use std::path::Path;
 
-const GRAMMAR: &[&str] = &["wgsl", "latex", "cue"];
+const GRAMMAR: &[&str] = &["wgsl", "latex", "cue", "algorithm"];
 
 fn main() {
     for name in GRAMMAR {
@@ -12,6 +12,7 @@ fn main() {
             .opt_level(1)
             .flag_if_supported("-std=c11")
             .flag_if_supported("/std:c11")
+            .flag_if_supported("/utf-8")
             .include(&source)
             .file(source.join("parser.c"));
 

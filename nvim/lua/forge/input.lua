@@ -61,6 +61,14 @@ end
 ---@field baseline table<string, string|boolean|number>
 ---@field cursor? integer[]
 
+---Update owned continuation options without replacing the view or its input identity.
+---@param view ForgeInputView
+---@param wrapping {indent: boolean, options: string}
+function M.set_wrapping(view, wrapping)
+  view.wrapping = vim.deepcopy(wrapping)
+  if view.active then present(view) end
+end
+
 ---@class ForgeDocumentInput
 ---@field document string
 ---@field revision integer

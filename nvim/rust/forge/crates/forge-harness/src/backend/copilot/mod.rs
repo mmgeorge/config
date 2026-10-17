@@ -35,6 +35,7 @@ use github_copilot_sdk::rpc::{
     SlashCommandInvocationResult,
 };
 use github_copilot_sdk::tool::ToolHandler;
+use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::{ContextTier, ToolSearchConfig};
 use github_copilot_sdk::{
     CliProgram, Client, ClientOptions, DeliveryMode, MessageOptions, Model, PermissionRequestData,
@@ -234,7 +235,7 @@ impl CopilotBackend {
                 session
                     .set_model(
                         &request.model,
-                        model_options(reasoning_effort, request.context_window.as_deref()),
+                        Some(model_options(reasoning_effort, request.context_window.as_deref())),
                     )
                     .await
                     .context("set Copilot session model")?;
@@ -286,6 +287,7 @@ impl CopilotBackend {
             config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort.clone();
+            config.reasoning_summary = Some(ReasoningSummary::Concise);
             config.context_tier = request.context_window.clone();
             config.streaming = Some(true);
             config.system_message = Some(system_message);
@@ -312,6 +314,7 @@ impl CopilotBackend {
             config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort;
+            config.reasoning_summary = Some(ReasoningSummary::Concise);
             config.context_tier = request.context_window.clone();
             config.streaming = Some(true);
             config.system_message = Some(system_message);
@@ -1371,8 +1374,8 @@ fn selected_reasoning_effort(
 fn model_options(
     reasoning_effort: Option<String>,
     context_window: Option<&str>,
-) -> Option<SetModelOptions> {
-    let mut options = SetModelOptions::default();
+) -> SetModelOptions {
+    let mut options = SetModelOptions::default().with_reasoning_summary(ReasoningSummary::Concise);
     if let Some(reasoning_effort) = reasoning_effort {
         options = options.with_reasoning_effort(reasoning_effort);
     }
@@ -1380,11 +1383,11 @@ fn model_options(
         let context_tier = match context_window {
             "default" => ContextTier::Default,
             "long_context" => ContextTier::LongContext,
-            _ => return Some(options),
+            _ => return options,
         };
         options = options.with_context_tier(context_tier);
     }
-    (options.reasoning_effort.is_some() || options.context_tier.is_some()).then_some(options)
+    options
 }
 
 #[derive(Default)]
@@ -1950,13 +1953,17 @@ mod test {
 
     #[test]
     fn applies_reasoning_and_context_to_a_native_model_switch() {
-        let options = model_options(Some("high".into()), Some("long_context")).unwrap();
+        let options = model_options(Some("high".into()), Some("long_context"));
 
         assert_eq!(options.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(options.reasoning_summary, Some(ReasoningSummary::Concise));
         assert!(matches!(
             options.context_tier,
             Some(ContextTier::LongContext)
         ));
+        for context in [None, Some("unknown")] {
+            assert_eq!(model_options(None, context).reasoning_summary, Some(ReasoningSummary::Concise));
+        }
     }
 
     #[tokio::test]

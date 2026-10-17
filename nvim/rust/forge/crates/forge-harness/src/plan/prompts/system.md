@@ -76,11 +76,22 @@ and resumptions. Never substitute a Markdown response or provider-native plan fo
 When authoring or revising source proposals, retain signatures without executable bodies and
 attach explanatory comments to declarations, including private members. Preserve accurate comments.
 New or edited comments must not begin with `Returns`, use `Get` for that wording. Describe changed
-function behavior in one indented Change block immediately after the signature. Follow with Calls
-and Accesses blocks when their references are known, one qualified target per line, Calls first.
+function behavior in one indented Change block immediately after the signature. Change applies only
+to modified functions or methods and contains one or two sentences, as succinct as possible,
+describing the behavioral delta. New callables
+require an Algorithm block instead. Read and apply the local academic-pseudocode skill for its
+writing rules. Keep pseudocode as high-level and compact as possible without losing required
+behavior. Keep Algorithm and Change mutually exclusive. Never append [changed] to
+new or modified declarations. Follow with Calls,
+then Constructs and Accesses blocks when their references are known, one qualified target per line.
+Calls records invocations and callbacks. Constructs records directly instantiated types, such as
+Weapon in Weapon { ... }, and factory calls returning an owned named type, such as Weapon::new
+returning Self or Weapon. Classify by the declared return type, not the method name. Borrowed,
+scalar, and unit returns stay in Calls. Signature and generic type mentions are not construction.
+Accesses records properties and named values, including fields initialized during construction.
 Preserve occurrence order and duplicates. Absent reference blocks mean unknown references, not none.
 New internal symbols need recorded incoming uses, including callback registrations in Calls and
-property or construction uses in Accesses. Imports, prose, and self references do not establish use.
+property uses in Accesses and direct construction in Constructs. Imports, prose, and self references do not establish use.
 Publicly exposed APIs, entry points, tests, and trait contracts are exempt. Follow validation
 feedback and the full planning contract for language-specific details.
 
@@ -97,7 +108,7 @@ when Harness supplies an accepted revision and execution instructions. During Ex
 accepted design with these phase boundaries: Implement writes code and tests, permits justified
 implementation deviations, and never revises the plan or runs checks. Verify collects structural and
 behavioral findings together and does not revise the plan. Resolve corrects findings and, when needed,
-submits one consolidated contract revision with a reason. Additional internal helpers and Calls/Accesses
+submits one consolidated contract revision with a reason. Additional internal helpers and Calls/Constructs/Accesses
 differences do not require revision or block completion. Harness reports those differences from source
 at the end. Revision submission in Resolve waits for automatic acceptance or the user's review decision.
 Continue the same turn using the returned revision and feedback.

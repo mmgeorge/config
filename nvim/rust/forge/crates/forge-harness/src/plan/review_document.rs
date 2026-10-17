@@ -192,7 +192,10 @@ impl PlanReviewStore {
                 let (before, after) = if side == "baseline" {
                     (previous.baseline.get(path).map(|file| &file.text), current.baseline.get(path).map(|file| &file.text))
                 } else { (previous.proposed.get(path), current.proposed.get(path)) };
-                if before.is_some() && before == after {
+                let (before_calls, after_calls) = if side == "baseline" {
+                    (previous.baseline_calls.get(path), current.baseline_calls.get(path))
+                } else { (previous.proposed_calls.get(path), current.proposed_calls.get(path)) };
+                if before.is_some() && before == after && before_calls == after_calls {
                     source.declaration_syntax.insert((path.clone(), side.clone()), handle.clone());
                 }
             }
@@ -674,12 +677,12 @@ impl PlanReviewDocument {
                     let anchor = targets.get(&range.id)?;
                     let selected = match &anchor.target {
                         super::PlanReviewTarget::Call { path, side, owner, name, kind } => reference.kind == kind.label() && path == &reference.path && side == &reference.side && owner == &reference.owner && name == &reference.name,
-                        super::PlanReviewTarget::Declaration { path, side, line, .. } => !matches!(reference.kind.as_str(), "call" | "property") && path == &reference.path && side == &reference.side && *line == reference.line,
+                        super::PlanReviewTarget::Declaration { path, side, line, .. } => !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct") && path == &reference.path && side == &reference.side && *line == reference.line,
                         _ => reference.anchor.as_ref().is_some_and(|saved| saved.json_path == anchor.json_path),
                     };
                     selected.then(|| (index, forge_buffer::block::BlockAnchor {
                         block: block.id.clone(), position: TextPosition { row: range.range.start.row,
-                            column: if matches!(reference.kind.as_str(), "call" | "property") { block.text.row(range.range.start.row).unwrap_or("").find(&reference.name).unwrap_or(0) } else { reference.column as usize } },
+                            column: if matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct") { block.text.row(range.range.start.row).unwrap_or("").find(&reference.name).unwrap_or(0) } else { reference.column as usize } },
                     }))
                 })
             })
@@ -694,7 +697,7 @@ impl PlanReviewDocument {
             (design.proposed.get(&reference.path).map(String::as_str), design.proposed_calls.get(&reference.path))
         };
         let presentation = super::calls::present(&reference.path, text.context("reference file is missing")?, calls.map(Vec::as_slice).unwrap_or_default())?;
-        let selected_row = if matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value") {
+        let selected_row = if matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct") {
             presentation.call_row.iter().find_map(|(row, (owner, name, kind))| {
                 (owner == &reference.owner && name == &reference.name && kind.label() == reference.kind).then_some(*row)
             })
@@ -790,7 +793,7 @@ impl PlanReviewDocument {
             }
             ensure!(action == "open", "this design action is unavailable");
             let (path, side) = match &anchor.target {
-                PlanReviewTarget::Declaration { path, side, .. } | PlanReviewTarget::Call { path, side, .. } | PlanReviewTarget::Change { path, side, .. } => (path, side.as_str()),
+                PlanReviewTarget::Declaration { path, side, .. } | PlanReviewTarget::Call { path, side, .. } | PlanReviewTarget::Behavior { path, side, .. } => (path, side.as_str()),
                 PlanReviewTarget::File { path } => (path, "proposed"),
                 _ => anyhow::bail!("select a declaration file or line"),
             };
@@ -958,7 +961,7 @@ impl PlanReviewDocument {
             let resolver = self.source.resolver.get().context("declaration resolver is unavailable")?;
             let mut resolver = resolver.lock().map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
             let resolver = if side == "baseline" { &mut resolver.1 } else { &mut resolver.0 };
-            return Ok(match kind { super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, owner, name), super::CallKind::Property => resolver.property(path, owner, name), super::CallKind::Value => resolver.value(path, owner, name) });
+            return Ok(match kind { super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, owner, name), super::CallKind::Property => resolver.property(path, owner, name), super::CallKind::Value => resolver.value(path, owner, name), super::CallKind::Construct => resolver.construct(path, owner, name) });
         }
         let super::PlanReviewTarget::Declaration {
             path,
@@ -1066,7 +1069,36 @@ impl PlanReviewDocument {
         row: &str,
         column: usize,
     ) -> Result<serde_json::Value> {
-        if let Some(source) = self.workspace_definition(anchor, row, column)? {
+        let mut selected = anchor.clone();
+        let algorithm = matches!(anchor.target, super::PlanReviewTarget::Behavior { .. });
+        if let super::PlanReviewTarget::Behavior { path, side, owner, offset } = &anchor.target {
+            let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
+            let (declarations, bodies) = if side == "baseline" {
+                (design.baseline.get(path).map(|file| file.text.as_str()), &design.baseline_calls)
+            } else { (design.proposed.get(path).map(String::as_str), &design.proposed_calls) };
+            let body = bodies.get(path).into_iter().flatten().find(|body| body.owner == *owner)
+                .context("Algorithm callable is unavailable")?;
+            let reference = match super::calls::algorithm_reference(path, declarations.context("Algorithm declarations are unavailable")?, body, *offset, row, column) {
+                Ok(Some(reference)) => reference,
+                Ok(None) => return Ok(serde_json::json!({"message":"Select a parsed identifier in the Algorithm."})),
+                Err(error) => return Ok(serde_json::json!({"message":error.to_string()})),
+            };
+            match reference {
+                super::calls::AlgorithmTarget::Binding { name, position } => {
+                    return self.declaration_destination(side, crate::declaration::DeclarationDestination {
+                        path: self.source.workspace.join(path).to_string_lossy().into_owned(),
+                        line: position.line, column: position.column, proposed: true, name, module_file: false,
+                    });
+                }
+                super::calls::AlgorithmTarget::Reference(reference) => {
+                    selected.target = super::PlanReviewTarget::Call {
+                        path: path.clone(), side: side.clone(), owner: owner.clone(), name: reference.name, kind: reference.kind,
+                    };
+                }
+            }
+        }
+        let anchor = &selected;
+        if !algorithm && let Some(source) = self.workspace_definition(anchor, row, column)? {
             return Ok(serde_json::json!({"workspace_definition":source}));
         }
         use crate::declaration::DeclarationResolution;
@@ -2675,6 +2707,46 @@ mod tests {
         assert!(document.workspace_definition(&anchor, "  Client.count", 10).unwrap().is_none());
     }
     #[test]
+    fn construction_navigation_reveals_type_uses_and_returns_to_definition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
+        let mut canonical = crate::plan::document::test_fixture("plan", "Construction navigation");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Construct a weapon.".into();
+        design.document.background = "The setup function needs a ready weapon.".into();
+        design.document.design = "Setup constructs the weapon and initializes its cooldown.".into();
+        let (text, bodies) = crate::plan::calls::parse("lib.rs", "/// Player weapon.\npub struct Weapon {\n  /// Remaining cooldown.\n  pub cooldown: u32,\n}\nimpl Weapon {\n  /// Creates a ready weapon.\n  pub fn ready() -> Self;\n}\n/// Creates a ready weapon.\npub fn setup();\nConstructs\n  Weapon\n  Weapon::ready\nAccesses\n  Weapon::cooldown\n", &[]).unwrap();
+        design.proposed.insert("lib.rs".into(), text);
+        design.proposed_calls.insert("lib.rs".into(), bodies);
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
+        let mut document = PlanReviewDocument::new(DocumentId("constructs".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let block = document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("struct Weapon"))).unwrap();
+        let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).find(|anchor| matches!(anchor.target, crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().clone();
+        let row = block.text.row(0).unwrap();
+        let references = document.references(&anchor, row, row.find("Weapon").unwrap()).unwrap();
+        let construction = references["references"].as_array().unwrap().iter().find(|reference| reference["kind"] == "construct").unwrap();
+        assert_eq!(construction["text"].as_str().unwrap().trim(), "Weapon");
+        let revealed = document.reveal_reference(construction["id"].as_str().unwrap()).unwrap();
+        let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(revealed["jump"].clone()).unwrap();
+        let block = document.document.block(&jump.block).unwrap();
+        let row = block.text.row(0).unwrap().to_owned();
+        assert_eq!(row.trim(), "Weapon");
+        assert!(block.metadata.visible_decoration.iter().any(|span| span.capture == "ForgeWalkthroughType"));
+        let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).next().unwrap().clone();
+        let definition = document.jump_declaration(&anchor, &row, row.find("Weapon").unwrap()).unwrap();
+        assert!(definition.get("declarations").is_none());
+        let destination: forge_buffer::block::BlockAnchor = serde_json::from_value(definition["jump"].clone()).unwrap();
+        assert!(document.document.block(&destination.block).unwrap().text.row(0).unwrap().contains("struct Weapon"));
+        assert_eq!(serde_json::to_vec(&document.source.document).unwrap(), saved);
+        println!("CONSTRUCT_FIXTURE:{}", serde_json::to_string(&document.snapshot()).unwrap());
+    }
+
+    #[test]
     fn property_navigation_reveals_filtered_uses_and_previews_planned_rename() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
@@ -2837,7 +2909,7 @@ mod tests {
         design.document.design = "Expose sender relationships for review.".into();
         design.proposed.insert("client.ts".into(), "/// Sends a request.\nexport function send(): void;\n".into());
         design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nclass Runner { private run(): void; }\n".into());
-        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { evidence: None, change: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);
+        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { evidence: None, behavior: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);
         design.baseline.insert("run.ts".into(), crate::plan::DeclarationFile { text: design.proposed["run.ts"].clone(), source_digest: String::new() });
         design.baseline_calls.insert("run.ts".into(), design.proposed_calls["run.ts"].clone());
         canonical.design = Some(design);

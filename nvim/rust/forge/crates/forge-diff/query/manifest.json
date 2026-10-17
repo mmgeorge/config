@@ -749,6 +749,11 @@
       "path": "query/upstream/python/locals.scm",
       "origin": "nvim-treesitter/queries/python/locals.scm",
       "sha256": "370635358588e6d66e6065dd9fb1e21d864e8eb125abbf4728e573bc06ef4921"
+    },
+    {
+      "path": "query/local/algorithm/highlights.scm",
+      "origin": "forge/algorithm",
+      "sha256": "504ede5d412fe01483724d71f54bca2ab0614525a8b9e5814bd4e1aec6c4ee9f"
     }
   ]
 }

@@ -1,6 +1,8 @@
 //! Exact-source syntax trees share native parsing between highlights and structural context.
 
 mod assets;
+mod algorithm;
+pub use algorithm::{AlgorithmInvocation, AlgorithmReference, algorithm_reference, validate_algorithm};
 mod context;
 mod query;
 mod configuration;
@@ -255,6 +257,7 @@ mod tests {
             ("markdown_inline", "**bold**"),
             ("latex", "\\section{Example}"),
             ("cue", "value: 1"),
+            ("algorithm", "value ← 1\nif value ≥ 1\n  return value"),
         ] {
             let language = SyntaxLanguage::from_name(name).unwrap();
             let handle = engine
@@ -305,6 +308,7 @@ mod tests {
             ("markdown_inline", "**bold**"),
             ("latex", "\\section{Example}"),
             ("cue", "value: 1"),
+            ("algorithm", "value ← 1\nif value ≥ 1\n  return value"),
         ] {
             let handle = engine
                 .analyze(request(SyntaxLanguage::from_name(name).unwrap(), text))
@@ -314,11 +318,11 @@ mod tests {
             capture_count += handle.captures().len();
         }
         let usage = engine.usage();
-        assert_eq!(SyntaxLanguage::ALL.len(), 25);
+        assert_eq!(SyntaxLanguage::ALL.len(), 26);
         assert_eq!(usage.active_jobs, 0);
-        assert!(usage.cached_entries > 0 && usage.cached_entries <= 25);
+        assert!(usage.cached_entries > 0 && usage.cached_entries <= 26);
         eprintln!(
-            "syntax_acceptance={{\"languages\":25,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
+            "syntax_acceptance={{\"languages\":26,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
             usage.cached_entries,
             started.elapsed().as_micros(),
         );
@@ -369,6 +373,8 @@ mod tests {
             ("latex", SyntaxLanguage::Latex),
             ("tex", SyntaxLanguage::Latex),
             ("cue", SyntaxLanguage::Cue),
+            ("algorithm", SyntaxLanguage::Algorithm),
+            ("pseudocode", SyntaxLanguage::Algorithm),
         ] {
             assert_eq!(SyntaxLanguage::from_name(name), Some(language), "{name}");
         }
@@ -391,6 +397,7 @@ mod tests {
             ("src/sample.ipp", SyntaxLanguage::Cpp),
             ("src/sample.tpp", SyntaxLanguage::Cpp),
             ("config.cue", SyntaxLanguage::Cue),
+            ("procedure.algorithm", SyntaxLanguage::Algorithm),
             ("readme.md", SyntaxLanguage::Markdown),
             ("queries/highlights.scm", SyntaxLanguage::Query),
             ("config.yml", SyntaxLanguage::Yaml),
@@ -403,7 +410,7 @@ mod tests {
         ] {
             assert_eq!(SyntaxLanguage::for_path(path), Some(language), "{path}");
         }
-        assert_eq!(SyntaxLanguage::ALL.len(), 25);
+        assert_eq!(SyntaxLanguage::ALL.len(), 26);
     }
 
     #[tokio::test]

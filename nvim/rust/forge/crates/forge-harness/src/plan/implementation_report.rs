@@ -201,7 +201,11 @@ impl ImplementationReport {
                 }
                 match DeclarationCalls::extract(&path, &source, false) {
                     Ok(observed) => {
-                        let observed = super::calls::from_extracted(observed);
+                        let mut observed = super::calls::from_extracted(observed);
+                        let mut actual_design = original.clone();
+                        actual_design.proposed.insert(path.clone(), overview.clone());
+                        let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &actual_design, false)?;
+                        super::calls::classify(&path, &mut observed, &mut resolver);
                         let planned = original
                             .proposed_calls
                             .get(&path)
@@ -217,17 +221,12 @@ impl ImplementationReport {
                             let actual_body = observed.iter().find(|body| body.owner == owner);
                             for (label, category) in [
                                 ("Calls", super::CallKind::Call),
+                                ("Constructs", super::CallKind::Construct),
                                 ("Accesses", super::CallKind::Property),
                             ] {
                                 let category_known = expected_body
                                     .and_then(|body| body.evidence)
-                                    .is_some_and(|evidence| {
-                                        if category == super::CallKind::Call {
-                                            evidence.calls
-                                        } else {
-                                            evidence.accesses
-                                        }
-                                    });
+                                    .is_some_and(|evidence| evidence.contains(category));
                                 let targets = |body: Option<&super::FunctionBody>| {
                                     body.into_iter()
                                         .flat_map(|body| body.call.iter().flatten())
@@ -305,6 +304,21 @@ mod tests {
             file: Vec::new(),
             unavailable: Vec::new(),
         }
+    }
+
+    #[test]
+    fn source_report_separates_construction_from_field_access() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let objects = ObjectStore::open(data.path()).unwrap();
+        std::fs::write(workspace.path().join("lib.rs"), "pub struct Weapon { pub cooldown: u32 } pub fn setup() { let weapon = Weapon { cooldown: 0 }; }").unwrap();
+        let (overview, body) = calls::parse("lib.rs", "pub struct Weapon { pub cooldown: u32 }\npub fn setup();\nConstructs\nAccesses\n  Weapon::cooldown\n", &[]).unwrap();
+        let mut design = DeclarationDesign::default();
+        design.proposed.insert("lib.rs".into(), overview);
+        design.proposed_calls.insert("lib.rs".into(), body);
+        let (report, _) = report().capture(&design, None, None, &objects, workspace.path()).unwrap();
+        assert!(report.file[0].references.iter().any(|reference| reference.category == "Constructs" && reference.expected == Some(Vec::new()) && reference.observed == ["Weapon"]));
+        assert!(!report.file[0].references.iter().any(|reference| reference.category == "Accesses"));
     }
 
     #[test]

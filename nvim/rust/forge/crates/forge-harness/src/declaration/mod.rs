@@ -181,6 +181,7 @@ pub(crate) struct DeclarationResolver {
     /// Correlates navigation work with the currently admitted review input.
     pub(crate) trace: Option<trace::DeclarationTrace>,
     work: ResolutionWork,
+    returns: HashMap<PathBuf, Vec<forge_diff::syntax::DeclarationCallable>>,
 }
 
 #[derive(Clone, Default, Serialize)]
@@ -255,6 +256,7 @@ impl DeclarationResolver {
             bytes: 0,
             trace: None,
             work: Default::default(),
+            returns: HashMap::new(),
         };
         let paths = resolver
             .snapshot
@@ -609,6 +611,21 @@ impl DeclarationResolver {
                     result,
                 );
             }
+            let path = file.path.strip_prefix(&self.workspace).unwrap_or(&file.path).to_string_lossy().replace('\\', "/");
+            if let Some(functions) = design.proposed_calls.get(&path) {
+                for function in functions {
+                    for reference in function.call.iter().flatten().filter(|reference| reference.kind == crate::plan::CallKind::Construct) {
+                        let position = reference.source.as_ref().map(|source| DeclarationPosition { line: source.line, column: source.column })
+                            .or_else(|| file.index.symbol.iter().find(|symbol| {
+                                symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("::") == function.owner
+                            }).map(|symbol| symbol.position))
+                            .unwrap_or(DeclarationPosition { line: 1, column: 0 });
+                        let result = if reference.unresolved { unverified("Construction target includes an opaque local binding") }
+                            else { self.construct(&path, &function.owner, &reference.name) };
+                        record(&mut report, &self.workspace, &file.path, position, &reference.name, result);
+                    }
+                }
+            }
         }
         let mut seen = HashSet::new();
         report.diagnostic.retain(|diagnostic| {
@@ -616,6 +633,7 @@ impl DeclarationResolver {
                 diagnostic.path.clone(),
                 diagnostic.line,
                 diagnostic.column,
+                diagnostic.reference.clone(),
                 diagnostic.reason.clone(),
             ))
         });
@@ -899,6 +917,45 @@ impl DeclarationResolver {
         if matches!(result, DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }) { return result; }
         let separator = if path.ends_with(".rs") { "::" } else { "." };
         self.type_target(path, &owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &name.split(separator).map(str::to_owned).collect::<Vec<_>>())
+    }
+
+    /// Resolve a type or a callable whose declared return is an owned named type.
+    pub(crate) fn construct(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
+        let target = self.value(path, owner, name);
+        match self.role(&target) {
+            Some(forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Variant) | None => target,
+            Some(forge_diff::syntax::DeclarationRole::Callable) if self.factory(&target) => target,
+            Some(_) => DeclarationResolution::Invalid {
+                reason: "Constructs requires a type, variant, or factory returning an owned named type. Put other invocations in Calls and value or property uses in Accesses.".into(),
+            },
+        }
+    }
+
+    /// Classify factories by their captured return type, excluding borrowed and scalar results.
+    pub(crate) fn factory(&mut self, target: &DeclarationResolution) -> bool {
+        let DeclarationResolution::Resolved { destination } = target else { return false; };
+        let path = PathBuf::from(&destination.path);
+        if !self.returns.contains_key(&path) {
+            let Some(source) = self.read(&path) else { return false; };
+            let Ok(functions) = forge_diff::syntax::DeclarationCalls::extract(&destination.path, &source, true) else { return false; };
+            self.returns.insert(path.clone(), functions);
+        }
+        let Some(function) = self.returns[&path].iter().find(|function| function.line == destination.line && function.column == destination.column) else { return false; };
+        let Some(return_type) = &function.return_type else { return false; };
+        let name = return_type.split('<').next().unwrap_or(return_type).trim().trim_end_matches("::");
+        if name.is_empty() || !name.chars().all(|character| character.is_alphanumeric() || "_:.$".contains(character)) {
+            return false;
+        }
+        if rust_primitive(name) || matches!(name, "void" | "never" | "unknown" | "any" | "string" | "number" | "boolean" | "object" | "undefined" | "null" | "symbol" | "bigint") {
+            return false;
+        }
+        let owner = function.owner.clone();
+        let name = name.to_owned();
+        let Some(relative) = path.strip_prefix(&self.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/")) else { return false; };
+        let separator = if relative.ends_with(".rs") { "::" } else { "." };
+        let returned = self.type_target(&relative, &owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &name.split(separator).map(str::to_owned).collect::<Vec<_>>());
+        self.role(&returned) == Some(forge_diff::syntax::DeclarationRole::Type)
+            || matches!(returned, DeclarationResolution::Unverified { .. })
     }
 
     /// Resolve a call target in its caller's lexical declaration scope.
@@ -1353,7 +1410,7 @@ impl DeclarationResolver {
 
 pub(crate) fn fingerprint(design: &DeclarationDesign) -> String {
     crate::plan::digest(
-        &serde_json::to_vec(&(&design.proposed, &design.cargo_lock))
+        &serde_json::to_vec(&(&design.proposed, &design.proposed_calls, &design.cargo_lock))
             .expect("string maps serialize"),
     )
 }

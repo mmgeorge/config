@@ -249,6 +249,12 @@ The resolved model is sent explicitly on thread creation, thread resume, and tur
 and the same value supplies the runtime model shown in Harness. Omitting the model after
 resolution can retain a different provider thread default while displaying the catalog default.
 
+Codex requests concise reasoning summaries on thread creation, thread resume, and each turn start.
+Copilot requests concise reasoning summaries on session creation, session resume, and model changes.
+The setting only affects models that support configurable summaries. Claude and Antigravity's
+current ACP integrations expose no corresponding summary-detail control. Summary preferences
+do not change reasoning effort or assistant commentary.
+
 Codex persists the control runtime's returned invocation after a successful tool call.
 This preserves lowered operations such as adding plan checks as canonical design patches
 and omits operations the runtime already committed. Subsequent patches therefore replay

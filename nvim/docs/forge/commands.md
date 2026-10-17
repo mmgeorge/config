@@ -58,6 +58,9 @@ opens durable session search and `/undo` opens checkpoint rollback.
 The live status line shows the current phase, elapsed time, and interrupt key.
 The latest thought appears below in italics, aligned with the phase label, and
 wraps to the window width.
+Codex and Copilot request concise reasoning summaries when the selected model supports them.
+Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
+Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
 
 `/config` includes an **LSP tools** toggle. It enables the read-only
 [`lsp` tool](lsp-tools.md) for model-driven code exploration without
@@ -74,6 +77,23 @@ groups without repeating that `impl` header. Explicit reference navigation can
 reveal nearby context around a declaration outside the displayed changes.
 Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
+New functions and methods contain an `Algorithm` block in academic pseudocode.
+Algorithm blocks highlight control keywords, assignment and comparison operators, literals,
+and identifiers. Variables and named fields are white, while descriptive prose is comment gray.
+Algorithm and Change headings use the same style as Calls, Constructs, and Accesses.
+Wrapped rows preserve source indentation after the diff gutter. Constructors retain type highlighting.
+Press `.` on an Algorithm parameter name to jump to that parameter in the function signature.
+Press it on a call or member name to jump to its declaration. Receiver types take priority,
+then Calls, Constructs, and Accesses resolve shortened names. Ambiguous matches report the
+candidate names without moving the cursor. Jump-back returns to the original Algorithm token.
+Write constructions explicitly as `Projectile(damage = 1)` or `CombatEntity()` for a marker.
+Each `Constructs` entry must match an invocation in the Algorithm, using its exact qualified
+name and named arguments. Keep construction separate from the operation that queues or inserts it.
+Submission checks statement syntax and indentation, including branch and loop
+structure, and reports the callable and failing line. Drafts can remain incomplete while edited.
+Modified functions use `Change` for behavioral deltas in one or two succinct
+sentences. Expand a function to read its behavior and reference sections.
+Collapsed signatures omit the `[changed]` suffix.
 Old and new function versions expand independently. Collapsing an old function
 keeps added declarations outside its body visible.
 
@@ -83,7 +103,11 @@ private declarations hidden by the Public filter. Ambiguous names open a picker.
 Definition jumps reveal omitted declarations and open their enclosing folds in
 PlanReview. Definitions outside the plan open in normal source buffers.
 Save pending annotations before a definition jump that changes the projection.
-Type references under `Accesses` use green type highlighting.
+`Constructs` lists directly instantiated types in green and factory calls with function highlighting.
+Factories are identified by their owned named return type. `Calls` lists other invocations and
+callbacks, while `Accesses` lists fields and named values. Type mentions in
+signatures do not imply construction. References use the same definition navigation.
+Type references retained under `Accesses` also use green type highlighting.
 Test names use function highlighting and omit the leading `tests::` in the file
 list. Navigation and test selection retain the full qualified name.
 Names absent from the plan fall back to exact workspace symbol lookup through

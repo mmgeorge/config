@@ -1,0 +1,4 @@
+{
+  "grammars": [{ "name": "algorithm", "camelcase": "Algorithm", "scope": "source.algorithm", "path": ".", "file-types": ["algorithm"] }],
+  "metadata": { "version": "0.1.0", "license": "MIT", "description": "Forge academic pseudocode statements" }
+}

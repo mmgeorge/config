@@ -580,7 +580,7 @@ mod test {
         assert!(error.to_string().contains("private"));
         assert_eq!(runtime.plan_document(), Some(&draft));
         let declaration = &runtime.plan_document().unwrap().design.as_ref().unwrap().proposed["src/lib.rs"];
-        let repair_patch = format!("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Accesses\n+  Owner::private\n*** End Patch", declaration.lines().last().unwrap());
+        let repair_patch = format!("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Algorithm\n+  inspect owner.private\n+Accesses\n+  Owner::private\n*** End Patch", declaration.lines().last().unwrap());
         runtime.invoke(change(3, &repair_patch)).await.unwrap();
         runtime.invoke(ControlToolInvocation { name:"plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":4}) }).await.unwrap();
         assert!(runtime.invoke(change(4,patch)).await.is_err());
@@ -613,7 +613,7 @@ mod test {
         for arguments in [json!({"plan_id":"plan", "start_line":1}), json!({"plan_id":"plan", "path":"src/lib.rs", "start_line":6}), json!({"plan_id":"plan", "path":"src/lib.rs", "start_line":5, "end_line":4})] {
             assert!(runtime.invoke(read(arguments)).await.is_err());
         }
-        let result = runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n*** End Patch"}) }).await.unwrap();
+        let result = runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n+Algorithm\n+  return the number of targets\n*** End Patch"}) }).await.unwrap();
         assert!(result.message.contains("version is 2") && result.message.contains("-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;"));
         let baseline = runtime.invoke(read(json!({"plan_id":"plan", "path":"src/lib.rs", "baseline":true, "start_line":5, "end_line":99}))).await.unwrap();
         assert!(baseline.message.contains("(baseline) · lines 5-5 of 5") && baseline.message.contains("collectible_count()"));
@@ -631,6 +631,10 @@ mod test {
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         design.document.design = "Keep generated declarations outside the hand-authored API.".into();
         design.proposed.insert("src/lib.rs".into(), "/// Declares generated types supplied during implementation.\npub mod generated;\nuse generated::*;\n/// Accepts the generated request.\npub fn inspect(value: Generated);\n".into());
+        design.proposed_calls.insert("src/lib.rs".into(), vec![crate::plan::FunctionBody {
+            owner: "inspect".into(), evidence: None, call: None,
+            behavior: Some(crate::plan::FunctionBehavior::Algorithm("inspect value".into())),
+        }]);
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
         let result = runtime.invoke(ControlToolInvocation { name:"plan_submit".into(), arguments:json!({"plan_id":"plan","expected_version":1}) }).await.unwrap();

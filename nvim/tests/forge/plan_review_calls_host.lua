@@ -5,11 +5,11 @@ if not vim.g.forge_plan_calls_grid then
   assert(child > 0)
   local success, failure = xpcall(function()
     vim.rpcrequest(child, "nvim_ui_attach", 160, 48, { rgb = true })
-    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
+    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_test_plan_behavior = " .. tostring(vim.g.forge_test_plan_behavior == true) .. "; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
   end, debug.traceback)
   vim.fn.jobstop(child)
   if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-  print(vim.g.forge_plan_definition_only and "plan_review_definition_host: passed at 160x48" or "plan_review_calls_host: passed at 160x48")
+  print(vim.g.forge_test_plan_behavior and "plan_review_behavior_host: passed at 160x48" or vim.g.forge_plan_definition_only and "plan_review_definition_host: passed at 160x48" or "plan_review_calls_host: passed at 160x48")
   vim.cmd("qa!")
   return
 end
@@ -23,6 +23,15 @@ if definition_only then
   source[3] = "pub struct Client { pub count: usize, secret: usize }"
   source[4] = "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; client.secret += 1; }"
 end
+if vim.g.forge_test_plan_behavior then
+  vim.list_extend(source, {
+    "pub fn movement_direction(keys: u32) -> u32 { keys }",
+    "pub struct PlayerAbilities { pub cooldown: u32 }",
+    "impl PlayerAbilities { pub fn start_dash(&mut self, direction: u32) {} }",
+    "pub struct Other;",
+    "impl Other { pub fn start_dash(&mut self, direction: u32) {} }",
+  })
+end
 vim.fn.writefile(source, workspace .. "/src/change.rs")
 vim.fn.writefile({ "[package]", 'name = "call_navigation"', 'version = "0.1.0"', 'edition = "2021"', "[lib]", 'path = "src/change.rs"' }, workspace .. "/Cargo.toml")
 vim.fn.writefile({ "invalid Rust {" }, workspace .. "/unrelated.rs")
@@ -30,6 +39,8 @@ local initialized = vim.system({ "git", "init", "--quiet", workspace }, { text =
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
+local behavior_generator = vim.g.forge_test_plan_behavior and (vim.g.forge_test_fixture_generator
+  or require("forge.builder").artifact_root() .. "/build/release/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors, warnings = {}, {}
@@ -72,6 +83,11 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan change the dispatch interface" })
   require("forge.views.harness.controller").submit()
   await(function() return not state.busy and state.active_plan end, "plan did not arrive")
+  if vim.g.forge_test_plan_behavior then
+    local seeded = vim.system({ behavior_generator, data .. "/forge/harness", workspace, state.session.id, state.active_plan.id, "behavior" }, { text = true }):wait(30000)
+    assert(seeded.code == 0, (seeded.stderr or "") .. (seeded.stdout or ""))
+    state.active_plan = vim.json.decode(seeded.stdout)
+  end
   local artifact = state.active_plan.working_path:gsub("%.md$", ".json")
   local canonical = vim.fn.readfile(artifact, "b")
   local revision_path = vim.fs.dirname(artifact) .. "/revisions/submitted-0001.json"
@@ -97,6 +113,193 @@ local success, failure = xpcall(function()
   require("forge.views.plan_review").open(state.active_plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "PlanReview did not open")
   local review = state.plan_review
+  local section_rows = {}
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row == " Checks " or row == " Verification " then section_rows[vim.trim(row)] = index end
+    assert(row ~= " Planned checks " and row ~= " Configured checks ", "obsolete check section title")
+  end
+  assert(section_rows.Checks and section_rows.Verification and section_rows.Checks < section_rows.Verification,
+    "Checks must appear before Verification")
+  if vim.g.forge_test_plan_behavior then
+    vim.o.columns = original_columns
+    local planned_row, changed_row
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      assert(not row:find("[changed]", 1, true), "collapsed signature retained [changed]")
+      if row:find("pub fn planned_probe", 1, true) then planned_row = index end
+      if row:find("pub fn run", 1, true) then changed_row = index end
+    end
+    assert(planned_row and changed_row, "new and modified callable signatures are missing")
+    vim.api.nvim_win_set_cursor(review.win, { planned_row, 0 })
+    review.command_set.action_by_id.toggle.run({})
+    await(function()
+      return table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("result ← value", 1, true)
+    end, "Algorithm did not expand")
+    local algorithm_row, nested_indent, branch_indent
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(row) == "Algorithm" then algorithm_row = index end
+      if vim.trim(row) == "if result ≠ none:" then branch_indent = #(row:match("^%s*") or "") end
+      if vim.trim(row) == "return ProbeResult(value = result)" then nested_indent = #(row:match("^%s*") or "") end
+    end
+    assert(algorithm_row and nested_indent == branch_indent + 2, "Algorithm lost nested pseudocode indentation")
+    vim.api.nvim_win_set_cursor(review.win, { changed_row, 0 })
+    review.command_set.action_by_id.toggle.run({})
+    await(function()
+      return table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("Preserve behavior while reviewing", 1, true)
+    end, "Change did not expand")
+    assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("Change", 1, true), "modified callable lost Change")
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(row) == "Algorithm" then algorithm_row = index break end
+    end
+    local highlighted_row
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(row) == "if result ≠ none:" then highlighted_row = index break end
+    end
+    assert(highlighted_row, "Algorithm conditional is missing")
+    vim.api.nvim_set_hl(0, "@keyword.conditional.algorithm", { fg = 0x22ddaa })
+    vim.api.nvim_win_set_cursor(review.win, { highlighted_row, 0 })
+    vim.cmd("normal! zz")
+    vim.cmd("redraw!")
+    local screen_row = vim.fn.screenpos(review.win, highlighted_row, 1).row
+    local cells = {}
+    for column = 1, 160 do cells[#cells + 1] = vim.fn.screenstring(screen_row, column) end
+    local screen_text = table.concat(cells)
+    local column = assert(screen_text:find("if result", 1, true), screen_text)
+    local cell = vim.api.nvim__inspect_cell(1, screen_row - 1, column - 1)
+    assert(cell[2].foreground == 0x22ddaa, "Algorithm keyword did not render its Tree-sitter color: " .. vim.inspect(cell))
+    vim.api.nvim_set_hl(0, "@type.algorithm", { fg = 0xffaa55 })
+    vim.api.nvim_set_hl(0, "@variable.member.algorithm", { fg = 0xaa77dd })
+    local constructor_row
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(row) == "return ProbeResult(value = result)" then constructor_row = index break end
+    end
+    assert(constructor_row, "explicit construction is missing")
+    vim.api.nvim_win_set_cursor(review.win, { constructor_row, 0 })
+    vim.cmd("redraw!")
+    local constructor_screen_row = vim.fn.screenpos(review.win, constructor_row, 1).row
+    local constructor_cells = {}
+    for position = 1, 160 do constructor_cells[#constructor_cells + 1] = vim.fn.screenstring(constructor_screen_row, position) end
+    local constructor_text = table.concat(constructor_cells)
+    for _, expected in ipairs({ { "ProbeResult", 0xffaa55 }, { "value =", 0xaa77dd } }) do
+      local position = assert(constructor_text:find(expected[1], 1, true), constructor_text)
+      local rendered = vim.api.nvim__inspect_cell(1, constructor_screen_row - 1, position - 1)
+      assert(rendered[2].foreground == expected[2], "constructor highlight did not render: " .. vim.inspect(rendered))
+    end
+    for _, jump in ipairs({
+      { "direction ← movement_direction(0)", "movement_direction", "pub fn movement_direction", "movement_direction" },
+      { "abilities.start_dash(direction)", "start_dash", "pub fn start_dash", "start_dash" },
+      { "abilities.start_dash(direction)", "abilities", "abilities: &mut PlayerAbilities", "abilities" },
+      { "result ← value", "value", "value: Option<u32>", "value" },
+      { "abilities.cooldown ← 0", "cooldown", "cooldown: u32", "cooldown" },
+    }) do
+      local origin_row, origin_column
+      for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+        if vim.trim(text) == jump[1] then origin_row, origin_column = index, assert(text:find(jump[2], 1, true)) - 1 break end
+      end
+      assert(origin_row, "Algorithm navigation origin missing: " .. jump[1])
+      vim.api.nvim_win_set_cursor(review.win, { origin_row, origin_column })
+      local window_count = #vim.api.nvim_list_wins()
+      review.command_set.action_by_id.jump_entity.run({})
+      await(function()
+        return vim.api.nvim_get_current_buf() == review.buf and vim.api.nvim_get_current_line():find(jump[3], 1, true)
+      end, "Algorithm definition did not resolve: " .. jump[2] .. " " .. table.concat(warnings, "\n"))
+      if jump[2] == "start_dash" then
+        local before = table.concat(vim.api.nvim_buf_get_lines(review.buf,
+          math.max(0, vim.api.nvim_win_get_cursor(review.win)[1] - 4), vim.api.nvim_win_get_cursor(review.win)[1], false), "\n")
+        assert(before:find("impl PlayerAbilities", 1, true), "Algorithm selected the wrong receiver type: " .. before)
+      end
+      assert(vim.api.nvim_get_current_line():sub(vim.api.nvim_win_get_cursor(review.win)[2] + 1):match("^" .. jump[4]),
+        "Algorithm definition selected the wrong token: " .. jump[2])
+      assert(vim.api.nvim_get_current_win() == review.win and #vim.api.nvim_list_wins() == window_count,
+        "Algorithm definition opened another window")
+      vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+      assert(vim.trim(vim.api.nvim_get_current_line()) == jump[1], "Algorithm jump-back lost its origin")
+    end
+    vim.api.nvim_set_hl(0, "ForgeAddBg", { bg = 0x123425 })
+    for _ = 1, 2 do
+      for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+        if row:find("pub fn planned_probe", 1, true) then
+          vim.api.nvim_win_set_cursor(review.win, { index, 0 })
+          break
+        end
+      end
+      review.command_set.action_by_id.toggle.run({})
+    end
+    review.owner.action("comment", function(result, failure) assert(result and not failure, failure) end)
+    vim.cmd("stopinsert")
+    for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(row) == "return ProbeResult(value = result)" then constructor_row = index break end
+    end
+    local source_namespace = vim.api.nvim_get_namespaces()["ForgePlanDraftSource" .. review.buf]
+    local source_background
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(review.buf, source_namespace, { constructor_row - 1, 0 }, { constructor_row - 1, -1 }, { details = true })) do
+      if mark[4].hl_group == "ForgeAddBg" then source_background = mark[4] end
+    end
+    assert(source_background and source_background.hl_eol and source_background.end_row == constructor_row,
+      "PlanReview repaint lost the full-row background: " .. vim.inspect(source_background))
+    for _, width in ipairs({ 160, 80, 120 }) do
+      vim.o.columns = width
+      vim.api.nvim_win_set_cursor(review.win, { constructor_row, 0 })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      local row = vim.fn.screenpos(review.win, constructor_row, 1).row
+      local edge = vim.api.nvim__inspect_cell(1, row - 1, width - 1)
+      assert(edge[2].background == 0x123425,
+        "PlanReview addition background stopped before the window edge at width " .. width .. ": " .. vim.inspect(edge))
+    end
+    vim.o.columns = original_columns
+    vim.api.nvim_set_hl(0, "Normal", { fg = 0xc0c0c0, bg = 0 })
+    vim.api.nvim_set_hl(0, "Comment", { fg = 0x888888 })
+    local headers = {}
+    for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      local label = vim.trim(text)
+      if vim.tbl_contains({ "Algorithm", "Change", "Calls", "Constructs", "Accesses" }, label) then
+        vim.api.nvim_win_set_cursor(review.win, { index, 0 })
+        vim.cmd("normal! zz")
+        vim.cmd("redraw!")
+        local position = vim.fn.screenpos(review.win, index, assert((text:find(label, 1, true))))
+        local cell = vim.api.nvim__inspect_cell(1, position.row - 1, position.col - 1)
+        assert((cell[2].foreground or 0xc0c0c0) == 0xc0c0c0, label .. " header does not share reference heading styling: " .. vim.inspect(cell))
+        headers[label] = true
+      end
+    end
+    assert(headers.Algorithm and headers.Change and headers.Constructs, "behavior and reference heading fixture is incomplete")
+    local prose_row, prose_text
+    for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if text:find("Decrease cooldown_remaining", 1, true) then prose_row, prose_text = index, text break end
+    end
+    assert(prose_row, "long Algorithm prose is missing")
+    for _, width in ipairs({ 80, 120, 160 }) do
+      vim.o.columns = width
+      vim.api.nvim_win_set_cursor(review.win, { prose_row, 0 })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      local first = vim.fn.screenpos(review.win, prose_row, assert((prose_text:find("Decrease", 1, true))))
+      local last = vim.fn.screenpos(review.win, prose_row, #prose_text)
+      local prose_cell = vim.api.nvim__inspect_cell(1, first.row - 1, first.col - 1)
+      assert(prose_cell[2].foreground == 0x888888, "Algorithm prose is not comment gray")
+      local variable = vim.fn.screenpos(review.win, prose_row, assert((prose_text:find("cooldown_remaining", 1, true))))
+      local variable_cell = vim.api.nvim__inspect_cell(1, variable.row - 1, variable.col - 1)
+      assert(variable_cell[2].foreground == 0xffffff, "Algorithm variable is not white")
+      if width < 160 then assert(last.row > first.row, "long Algorithm row did not wrap at " .. width) end
+      for row = first.row + 1, last.row do
+        local cells = {}
+        for column = 1, width do cells[#cells + 1] = vim.fn.screenstring(row, column) end
+        local first_text = table.concat(cells):find("%S")
+        assert(first_text == first.col, "wrapped Algorithm indentation differs at " .. width .. ": " .. vim.inspect({ first.col, first_text,
+          vim.wo[review.win].breakindentopt, require("forge.content_layout").continuation_indent(review.owner.replica.sequence) }))
+        local cell = vim.api.nvim__inspect_cell(1, row - 1, first.col - 1)
+        assert(cell[2].background == 0x123425, "wrapped Algorithm lost its diff background")
+      end
+    end
+    vim.o.columns = original_columns
+    vim.api.nvim_win_set_cursor(review.win, { algorithm_row, 0 })
+    vim.cmd("normal! zz")
+    vim.g.forge_plan_behavior_verified = true
+    if vim.g.forge_test_manual then return end
+    review.command_set.action_by_id.close.run({})
+    require("forge.views.harness.controller").command_set().action_by_id.close.run({})
+    return
+  end
   if definition_only then
   assert(not table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("secret: usize", 1, true),
     "private property leaked into the initial Public view")
@@ -179,7 +382,7 @@ local success, failure = xpcall(function()
   assert(call_count <= 1, "review did not deduplicate the saved occurrences")
   assert(call_count == 0 and table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn run() {...}", 1, true), "Calls body did not start collapsed")
   for _, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-    assert(not row:match("^%s*Calls$") and not row:match("^%s*Accesses$"), "collapsed functions exposed a body category")
+    assert(not row:match("^%s*Calls$") and not row:match("^%s*Constructs$") and not row:match("^%s*Accesses$"), "collapsed functions exposed a body category")
   end
   local run_row
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -240,7 +443,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-i>", true, false, true), "ntx", false)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), property_cursor), "forward jump did not return to the selected access")
   local expanded_body = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
-  assert(expanded_body:find("pub fn update(client: &mut Client) {\n  Calls\n    leaf\n  Accesses\n    Client::count\n}", 1, true), "reference selection did not reveal both categories inside the function body")
+  assert(expanded_body:find("pub fn update(client: &mut Client) {\n  Calls\n    leaf\n  Constructs\n  Accesses\n    Client::count\n}", 1, true), "reference selection did not reveal both categories inside the function body")
   local following_comment = false
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if row == "/// Describes the following declaration." then
@@ -431,6 +634,10 @@ local success, failure = xpcall(function()
   review.command_set.action_by_id.close.run({})
   require("forge.views.harness.controller").command_set().action_by_id.close.run({})
 end, debug.traceback)
+if success and vim.g.forge_test_manual and vim.g.forge_plan_behavior_verified then
+  print("plan_review_behavior_host: passed at " .. vim.o.columns .. "x" .. vim.o.lines)
+  return
+end
 picker.close(false)
 require("forge.views.harness.workspace").release(state)
 client.stop()

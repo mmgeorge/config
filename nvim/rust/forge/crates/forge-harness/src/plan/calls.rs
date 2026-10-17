@@ -25,16 +25,19 @@ pub enum CallKind {
     Property,
     /// Takes a callable as a value, including callback registration.
     Callback,
-    /// Reads a named value or constructs a named type.
+    /// Reads a named value.
     Value,
+    /// Constructs a named type directly or invokes a factory returning an owned named type.
+    Construct,
 }
 
 impl CallKind {
-    /// Group semantic references into the two editable body sections.
+    /// Group semantic references into editable body sections.
     pub(crate) fn category(self) -> Self {
         match self {
             Self::Call | Self::Callback => Self::Call,
             Self::Property | Self::Value => Self::Property,
+            Self::Construct => Self::Construct,
         }
     }
     /// Preserve canonical bytes for older invocation-only plan snapshots.
@@ -49,6 +52,7 @@ impl CallKind {
             Self::Property => "property",
             Self::Callback => "callback",
             Self::Value => "value",
+            Self::Construct => "construct",
         }
     }
 }
@@ -89,19 +93,62 @@ pub struct FunctionBody {
     pub evidence: Option<ReferenceEvidence>,
     /// Callable identity within its saved declaration file.
     pub owner: String,
-    /// Intended behavior change, absent until authored through the declaration patch tool.
+    /// Authored algorithm for a new callable or behavior change for an existing callable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub change: Option<String>,
+    pub behavior: Option<FunctionBehavior>,
     /// Ordered occurrences, including repeated targets. Absence means references are unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<Vec<CallSite>>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(tag = "kind", content = "text", rename_all = "snake_case")]
+/// Mutually exclusive behavioral sections preserved in editable and rendered plans.
+pub enum FunctionBehavior {
+    /// Complete academic pseudocode for a newly introduced callable.
+    Algorithm(String),
+    /// Intended behavioral delta for an existing callable.
+    Change(String),
+}
+
+impl FunctionBehavior {
+    /// Editable section heading for this behavior category.
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            Self::Algorithm(_) => "Algorithm",
+            Self::Change(_) => "Change",
+        }
+    }
+
+    /// Authored content, including nested pseudocode indentation.
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            Self::Algorithm(text) | Self::Change(text) => text,
+        }
+    }
+}
+
 /// Distinguishes omitted reference categories from explicitly empty blocks.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct ReferenceEvidence {
+    /// Whether invocations and callbacks were inspected or authored.
     pub calls: bool,
+    /// Whether properties and named values were inspected or authored.
     pub accesses: bool,
+    /// Whether direct constructions and factory calls were inspected or authored.
+    pub constructs: bool,
+}
+
+impl ReferenceEvidence {
+    /// Tests whether the category has known evidence, including an empty list.
+    pub(crate) fn contains(self, kind: CallKind) -> bool {
+        match kind.category() {
+            CallKind::Call => self.calls,
+            CallKind::Property => self.accesses,
+            CallKind::Construct => self.constructs,
+            _ => unreachable!(),
+        }
+    }
 }
 
 /// Maps display rows to saved declarations and call identities.
@@ -112,12 +159,25 @@ pub(crate) struct CallPresentation {
     pub plain: String,
     pub declaration: DeclarationPresentation,
     pub call_row: BTreeMap<usize, (String, String, CallKind)>,
-    pub change_row: BTreeMap<usize, (String, u32)>,
+    pub behavior_row: BTreeMap<usize, (String, u32, &'static str)>,
     /// Rendered body boundaries keyed by their final signature row.
     pub body: BTreeMap<usize, CallBody>,
     pub plain_row: Vec<usize>,
     /// Original declaration rows mapped to their rendered rows, excluding synthetic body rows.
     pub declaration_row: BTreeMap<usize, usize>,
+}
+
+impl CallPresentation {
+    /// Preserve displayed coordinates while isolating Algorithm rows from native declarations.
+    pub(crate) fn algorithm_source(&self) -> Option<String> {
+        self.behavior_row.values().any(|(_, _, category)| *category == "Algorithm").then(|| {
+            self.declaration.text.lines().enumerate().map(|(row, text)| {
+                if self.behavior_row.get(&row).is_some_and(|(_, _, category)| *category == "Algorithm") {
+                    format!("{text}\n")
+                } else { "\n".into() }
+            }).collect()
+        })
+    }
 }
 
 impl CallPresentation {
@@ -164,9 +224,9 @@ pub(crate) fn from_extracted(
 ) -> Vec<FunctionBody> {
     functions
         .into_iter()
-        .map(|function| FunctionBody { evidence: Some(ReferenceEvidence { calls: true, accesses: true }),
+        .map(|function| FunctionBody { evidence: Some(ReferenceEvidence { calls: true, accesses: true, constructs: true }),
             owner: function.owner,
-            change: None,
+            behavior: None,
             call: Some(function
                 .call
                 .into_iter()
@@ -176,6 +236,7 @@ pub(crate) fn from_extracted(
                         forge_diff::syntax::DeclarationCallKind::Property => CallKind::Property,
                         forge_diff::syntax::DeclarationCallKind::Callback => CallKind::Callback,
                         forge_diff::syntax::DeclarationCallKind::Value => CallKind::Value,
+                        forge_diff::syntax::DeclarationCallKind::Construct => CallKind::Construct,
                     },
                     name: call.name,
                     unresolved: call.unresolved,
@@ -195,17 +256,25 @@ pub(crate) fn classify(path: &str, functions: &mut [FunctionBody], resolver: &mu
     let mut classification = BTreeMap::new();
     for function in functions {
         for reference in function.call.iter_mut().flatten() {
-            if reference.unresolved || !matches!(reference.kind, CallKind::Value | CallKind::Property) { continue; }
-            let key = (function.owner.clone(), reference.name.clone(), reference.kind);
+            let invocation = reference.kind == CallKind::Call;
+            if reference.unresolved || !(matches!(reference.kind, CallKind::Value | CallKind::Property) || invocation) { continue; }
+            let key = (function.owner.clone(), reference.name.clone(), reference.kind, reference.source.is_some());
             let kind = classification.entry(key).or_insert_with(|| {
                 let target = resolver.value(path, &function.owner, &reference.name);
                 match resolver.role(&target) {
+                    Some(forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Variant)
+                        if path.ends_with(".rs") && reference.source.is_some() => CallKind::Construct,
+                    Some(forge_diff::syntax::DeclarationRole::Callable) if invocation && reference.source.is_some() && resolver.factory(&target) => CallKind::Construct,
+                    _ if invocation => CallKind::Call,
                     Some(forge_diff::syntax::DeclarationRole::Callable) => CallKind::Callback,
                     Some(forge_diff::syntax::DeclarationRole::Value | forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Module) => CallKind::Value,
                     _ => reference.kind,
                 }
             });
             reference.kind = *kind;
+            if *kind == CallKind::Construct && let Some(evidence) = &mut function.evidence {
+                evidence.constructs = true;
+            }
         }
     }
 }
@@ -213,6 +282,76 @@ pub(crate) fn classify(path: &str, functions: &mut [FunctionBody], resolver: &mu
 /// Return an editable file view in declaration and stored call order.
 pub(crate) fn combined(path: &str, text: &str, calls: &[FunctionBody]) -> Result<String> {
     Ok(insert(path, text, calls, false, false)?.declaration.text)
+}
+
+/// A signature binding or declaration reference selected in an Algorithm.
+pub(crate) enum AlgorithmTarget {
+    Binding { name: String, position: forge_diff::syntax::DeclarationPosition },
+    Reference(CallSite),
+}
+
+/// Resolve a parsed Algorithm identifier using signature bindings before reference metadata.
+pub(crate) fn algorithm_reference(
+    path: &str,
+    declarations: &str,
+    body: &FunctionBody,
+    offset: u32,
+    row: &str,
+    column: usize,
+) -> Result<Option<AlgorithmTarget>> {
+    let Some(FunctionBehavior::Algorithm(algorithm)) = &body.behavior else { return Ok(None); };
+    let Some(source) = offset.checked_sub(1).and_then(|offset| algorithm.lines().nth(offset as usize)) else { return Ok(None); };
+    let Some(indent) = row.len().checked_sub(source.len()).filter(|_| row.ends_with(source)) else { return Ok(None); };
+    let Some(column) = column.checked_sub(indent).map(|column| column + 1) else { return Ok(None); };
+    let Some(reference) = forge_diff::syntax::algorithm_reference(algorithm, offset as usize, column)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))? else { return Ok(None); };
+    let function = DeclarationCalls::extract(path, declarations, true)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().find(|function| function.owner == body.owner)
+        .context("Algorithm callable signature is unavailable")?;
+    if reference.first && let Some(position) = function.binding_position.get(&reference.segment) {
+        return Ok(Some(AlgorithmTarget::Binding { name: reference.segment, position: *position }));
+    }
+    if !reference.last { return Ok(None); }
+    let member = reference.segment;
+    let separator = if path.ends_with(".rs") { "::" } else { "." };
+    let receiver = reference.name.rsplit_once('.').map(|(receiver, _)| receiver);
+    let declared_type = receiver.and_then(|receiver| function.binding.get(receiver)).and_then(|binding| binding.as_deref());
+    let types = declared_type.into_iter().flat_map(|declared| declared.trim().trim_start_matches(':').split(|character: char|
+        !character.is_alphanumeric() && !"_:$.'".contains(character)))
+        .filter(|part| !part.is_empty() && !part.starts_with('\'') && !matches!(*part, "mut" | "const" | "dyn" | "impl"))
+        .collect::<std::collections::BTreeSet<_>>();
+    let qualified = reference.name.contains("::") || receiver.is_some_and(|receiver|
+        receiver.chars().next().is_some_and(char::is_uppercase));
+    let eligible = |call: &&CallSite| if reference.invocation {
+        matches!(call.kind, CallKind::Call | CallKind::Callback | CallKind::Construct)
+    } else { matches!(call.kind, CallKind::Property | CallKind::Value) };
+    let mut candidates = body.call.iter().flatten().filter(eligible)
+        .filter(|call| if qualified { call.name.replace("::", ".") == reference.name.replace("::", ".") }
+            else { call.name.rsplit([':', '.']).next() == Some(member.as_str()) })
+        .map(|call| ((call.name.clone(), call.kind), call.clone()))
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if !types.is_empty() {
+        let typed = candidates.iter().filter(|((name, _), _)|
+            name.rsplit_once("::").or_else(|| name.rsplit_once('.')).is_some_and(|(container, _)| types.iter().any(|declared|
+                container == *declared || (!declared.contains([':', '.']) && container.rsplit([':', '.']).next() == Some(*declared)))))
+            .map(|(key, call)| (key.clone(), call.clone())).collect::<std::collections::BTreeMap<_, _>>();
+        if !typed.is_empty() { candidates = typed; }
+        else if types.len() == 1 {
+            let name = format!("{}{separator}{member}", types.first().unwrap());
+            let kind = if reference.invocation { CallKind::Call } else { CallKind::Property };
+            return Ok(Some(AlgorithmTarget::Reference(CallSite { name, kind, source: None, unresolved: false })));
+        }
+    }
+    ensure!(candidates.len() <= 1, "Algorithm reference `{}` is ambiguous: {}", reference.name,
+        candidates.keys().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", "));
+    if let Some((_, call)) = candidates.pop_first() { return Ok(Some(AlgorithmTarget::Reference(call))); }
+    if !reference.invocation { return Ok(None); }
+    let name = if receiver.is_some() && !qualified {
+        ensure!(types.len() == 1, "Algorithm receiver has no unique signature type or Calls target");
+        format!("{}{separator}{member}", types.first().unwrap())
+    } else { reference.name };
+    let kind = if member.chars().next().is_some_and(char::is_uppercase) { CallKind::Construct } else { CallKind::Call };
+    Ok(Some(AlgorithmTarget::Reference(CallSite { name, kind, source: None, unresolved: false })))
 }
 
 /// Render function summaries and unique references while preserving saved occurrence order.
@@ -246,7 +385,7 @@ pub(crate) fn present(path: &str, text: &str, calls: &[FunctionBody]) -> Result<
         + result.plain_row.capacity() * std::mem::size_of::<usize>()
         + result.declaration_row.len() * 64
         + result.call_row.values().map(|(owner, name, _)| owner.capacity() + name.capacity() + 128).sum::<usize>()
-        + result.change_row.values().map(|(owner, _)| owner.capacity() + 96).sum::<usize>()
+        + result.behavior_row.values().map(|(owner, _, _)| owner.capacity() + 96).sum::<usize>()
         + result.body.values().map(|body| body.owner.capacity() + 128).sum::<usize>();
     let result = Arc::new(result);
     if bytes <= PRESENTATION_CACHE_BYTES {
@@ -286,7 +425,7 @@ pub(crate) fn insert(
                     .collect(),
             },
             call_row: BTreeMap::new(),
-            change_row: BTreeMap::new(),
+            behavior_row: BTreeMap::new(),
             body: BTreeMap::new(),
             plain_row: (0..text.lines().count()).collect(),
             declaration_row: (0..text.lines().count()).map(|row| (row, row)).collect(),
@@ -309,7 +448,7 @@ pub(crate) fn insert(
     let mut output = String::new();
     let mut source = Vec::new();
     let mut call_row = BTreeMap::new();
-    let mut change_row = BTreeMap::new();
+    let mut behavior_row = BTreeMap::new();
     let mut body = BTreeMap::new();
     let mut declaration_row = BTreeMap::new();
     let lua = path.ends_with(".lua");
@@ -335,17 +474,17 @@ pub(crate) fn insert(
                 let opening = source.len() - 1;
                 let heading = declaration_row[&(function.line as usize - 1)];
                 let body_indent = if review { "  " } else { "" };
-                if let Some(change) = &calls.change {
-                    for (offset, summary) in std::iter::once("Change").chain(change.lines()).enumerate() {
-                        change_row.insert(source.len(), (function.owner.clone(), offset as u32));
+                if let Some(behavior) = &calls.behavior {
+                    for (offset, summary) in std::iter::once(behavior.label()).chain(behavior.text().lines()).enumerate() {
+                        behavior_row.insert(source.len(), (function.owner.clone(), offset as u32, behavior.label()));
                         let summary_indent = if offset == 0 { "" } else { "  " };
                         if summary.is_empty() { output.push('\n'); }
                         else { output.push_str(&format!("{indent}{body_indent}{summary_indent}{summary}\n")); }
                         source.push(Some(DeclarationPosition { line: function.line, column: function.column }));
                     }
                 }
-                for kind in [CallKind::Call, CallKind::Property] {
-                    if calls.evidence.is_some_and(|evidence| if kind == CallKind::Call { !evidence.calls } else { !evidence.accesses }) {
+                for kind in [CallKind::Call, CallKind::Construct, CallKind::Property] {
+                    if calls.evidence.is_some_and(|evidence| !evidence.contains(kind)) {
                         continue;
                     }
                     let Some(occurrences) = &calls.call else { continue };
@@ -369,6 +508,7 @@ pub(crate) fn insert(
                     let heading = match kind {
                         CallKind::Call => "Calls",
                         CallKind::Property => "Accesses",
+                        CallKind::Construct => "Constructs",
                         _ => unreachable!(),
                     };
                     output.push_str(&format!("{indent}{body_indent}{heading}\n"));
@@ -395,12 +535,7 @@ pub(crate) fn insert(
                             owner: function.owner.clone(),
                             heading,
                             end: source.len(),
-                            collapsed_suffix: match (lua, calls.change.is_some()) {
-                                (true, true) => " ... end [changed]",
-                                (false, true) => "...} [changed]",
-                                (true, false) => " ... end",
-                                (false, false) => "...}",
-                            },
+                            collapsed_suffix: if lua { " ... end" } else { "...}" },
                         },
                     );
                     output.push_str(&format!("{indent}{}\n", if lua { "end" } else { "}" }));
@@ -425,7 +560,7 @@ pub(crate) fn insert(
             source,
         },
         call_row,
-        change_row,
+        behavior_row,
         body,
         plain_row,
         declaration_row,
@@ -471,27 +606,73 @@ pub(crate) fn visibility(
 }
 
 enum BodySection {
-    Change(String),
+    Behavior(FunctionBehavior),
     References(CallKind, Vec<(String, CallKind)>),
+}
+
+/// Require algorithms for new callables at submission while keeping draft edits incomplete.
+pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()> {
+    for (path, text) in &design.proposed {
+        let original_path = design.moved.iter()
+            .find(|(_, destination)| *destination == path)
+            .map_or(path, |(original, _)| original);
+        let original = design.baseline.get(original_path)
+            .map(|file| DeclarationCalls::extract(original_path, &file.text, true))
+            .transpose().map_err(|error| anyhow::anyhow!("{error:?}"))?
+            .unwrap_or_default();
+        let original_owner = original.iter().map(|function| function.owner.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        let proposed = DeclarationCalls::extract(path, text, true)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        for function in proposed {
+            let body = design.proposed_calls.get(path).into_iter().flatten()
+                .find(|body| body.owner == function.owner);
+            let behavior = body.and_then(|body| body.behavior.as_ref());
+            if original_owner.contains(function.owner.as_str()) {
+                ensure!(!matches!(behavior, Some(FunctionBehavior::Algorithm(_))),
+                    "{path}: existing callable {} uses Change, not Algorithm", function.owner);
+            } else {
+                ensure!(matches!(behavior, Some(FunctionBehavior::Algorithm(text)) if !text.trim().is_empty()),
+                    "{path}: new callable {} requires a nonempty Algorithm block", function.owner);
+                if let Some(FunctionBehavior::Algorithm(text)) = behavior {
+                    let invocations = forge_diff::syntax::validate_algorithm(text)
+                        .map_err(|error| anyhow::anyhow!("{path}: {}: {error:?}", function.owner))?;
+                    for construction in body.into_iter().flat_map(|body| body.call.iter().flatten())
+                        .filter(|call| call.kind == CallKind::Construct) {
+                        let matching = invocations.iter().filter(|invocation| invocation.name == construction.name)
+                            .collect::<Vec<_>>();
+                        ensure!(!matching.is_empty(), "{path}: {}: Algorithm must explicitly construct {} using {}(field = value) or {}() for a marker",
+                            function.owner, construction.name, construction.name, construction.name);
+                        for invocation in matching {
+                            ensure!(!invocation.has_positional_argument,
+                                "{path}: {}: Algorithm line {}, column {}: construction {} requires named arguments (field = value)",
+                                function.owner, invocation.line, invocation.column, construction.name);
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 #[derive(Default)]
 struct FunctionSection {
-    change: Option<String>,
+    behavior: Option<FunctionBehavior>,
     reference: BTreeMap<CallKind, Vec<(String, CallKind)>>,
 }
 
 fn protected_declaration_lines(path: &str, text: &str, lines: &[&str]) -> Result<std::collections::BTreeSet<usize>> {
     let regions = DeclarationCalls::protected_regions(path, text)
         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    if !lines.iter().any(|line| line.trim() == "Change") {
+    if !lines.iter().any(|line| matches!(line.trim(), "Algorithm" | "Change")) {
         return Ok(regions.into_iter().flatten().collect());
     }
     let mut sections = Vec::new();
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
-        if matches!(line.trim(), "Change" | "Calls" | "Accesses") {
+        if matches!(line.trim(), "Algorithm" | "Change" | "Calls" | "Constructs" | "Accesses") {
             let start = index;
             let indent = line.len() - line.trim_start().len();
             index += 1;
@@ -546,11 +727,11 @@ pub(crate) fn parse(
     let mut index = 0;
     while index < lines.len() {
         let line = lines[index];
-        if matches!(line.trim(), "Change" | "Calls" | "Accesses") && !protected.contains(&index) {
-            let kind = if line.trim() == "Accesses" {
-                CallKind::Property
-            } else {
-                CallKind::Call
+        if matches!(line.trim(), "Algorithm" | "Change" | "Calls" | "Constructs" | "Accesses") && !protected.contains(&index) {
+            let kind = match line.trim() {
+                "Accesses" => CallKind::Property,
+                "Constructs" => CallKind::Construct,
+                _ => CallKind::Call,
             };
             let indent = line.len() - line.trim_start().len();
             let preceding = original_line
@@ -558,7 +739,7 @@ pub(crate) fn parse(
                 .copied()
                 .context("Function uses must follow a callable declaration")?;
             index += 1;
-            if line.trim() == "Change" {
+            if matches!(line.trim(), "Algorithm" | "Change") {
                 let start = index;
                 while index < lines.len() {
                     let value = lines[index];
@@ -572,11 +753,16 @@ pub(crate) fn parse(
                 index = end;
                 let summary_indent = lines[start..end].iter().filter(|value| !value.trim().is_empty())
                     .map(|value| value.len() - value.trim_start().len()).min()
-                    .context("Change requires an indented, nonempty summary")?;
-                let change = lines[start..end].iter().map(|value| {
+                    .with_context(|| format!("{} requires indented, nonempty content", line.trim()))?;
+                let content = lines[start..end].iter().map(|value| {
                     if value.trim().is_empty() { "" } else { &value[summary_indent..] }
                 }).collect::<Vec<_>>().join("\n");
-                block.push((original_line.len(), preceding, BodySection::Change(change)));
+                let behavior = if line.trim() == "Algorithm" {
+                    FunctionBehavior::Algorithm(content)
+                } else {
+                    FunctionBehavior::Change(content)
+                };
+                block.push((original_line.len(), preceding, BodySection::Behavior(behavior)));
                 continue;
             }
             let mut names = Vec::new();
@@ -621,9 +807,9 @@ pub(crate) fn parse(
             .context("Function body sections must immediately follow a callable signature")?;
         let entry = sections.entry(line).or_default();
         match section {
-            BodySection::Change(change) => {
-                ensure!(entry.change.is_none(), "duplicate Change block for {}", function.owner);
-                entry.change = Some(change);
+            BodySection::Behavior(behavior) => {
+                ensure!(entry.behavior.is_none(), "only one Algorithm or Change block is allowed for {}", function.owner);
+                entry.behavior = Some(behavior);
             }
             BodySection::References(kind, names) => {
                 ensure!(!entry.reference.contains_key(&kind), "duplicate {:?} block for {}", kind, function.owner);
@@ -638,6 +824,7 @@ pub(crate) fn parse(
         let evidence = references_available.then_some(ReferenceEvidence {
             calls: sections.reference.contains_key(&CallKind::Call),
             accesses: sections.reference.contains_key(&CallKind::Property),
+            constructs: sections.reference.contains_key(&CallKind::Construct),
         });
         let mut category = sections.reference
             .into_iter()
@@ -676,7 +863,7 @@ pub(crate) fn parse(
             .map(|(name, kind)| -> Result<CallSite> {
                 let unresolved = function
                     .binding
-                    .iter()
+                    .keys()
                     .any(|binding| name == *binding || name.starts_with(&format!("{binding}.")));
                 let captured = remaining
                     .get_mut(&(name.clone(), kind))
@@ -697,7 +884,7 @@ pub(crate) fn parse(
             .collect::<Result<Vec<_>>>()?;
         output.push(FunctionBody { evidence,
             owner: function.owner.clone(),
-            change: sections.change,
+            behavior: sections.behavior,
             call: references_available.then_some(call),
         });
     }
@@ -713,6 +900,170 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn algorithm_navigation_prefers_signature_then_reference_evidence() {
+        let declarations = "pub fn run(abilities: &mut PlayerAbilities, wrapped: ResMut<PlayerAbilities>, keys: Keys);";
+        let mut body = FunctionBody {
+            owner: "run".into(), evidence: None,
+            behavior: Some(FunctionBehavior::Algorithm("abilities.start_dash(keys)".into())),
+            call: Some(vec![
+                CallSite { name: "Other::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
+                CallSite { name: "PlayerAbilities::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
+                CallSite { name: "PlayerAbilities::remaining".into(), kind: CallKind::Property, source: None, unresolved: false },
+                CallSite { name: "movement_direction".into(), kind: CallKind::Call, source: None, unresolved: false },
+            ]),
+        };
+        let select = |body: &FunctionBody, source: &str, token: &str| {
+            let mut body = body.clone();
+            body.behavior = Some(FunctionBehavior::Algorithm(source.into()));
+            algorithm_reference("main.rs", declarations, &body, 1, &format!("    {source}"), 4 + source.find(token).unwrap())
+        };
+        for token in ["abilities", "keys"] {
+            let AlgorithmTarget::Binding { name, position } = select(&body, "abilities.start_dash(keys)", token).unwrap().unwrap() else { panic!("expected parameter"); };
+            assert_eq!(name, token);
+            assert_eq!(&declarations[position.column as usize..position.column as usize + name.len()], name);
+        }
+        for (source, token, expected, kind) in [
+            ("abilities.start_dash(keys)", "start_dash", "PlayerAbilities::start_dash", CallKind::Call),
+            ("wrapped.start_dash(keys)", "start_dash", "PlayerAbilities::start_dash", CallKind::Call),
+            ("abilities.remaining", "remaining", "PlayerAbilities::remaining", CallKind::Property),
+            ("movement_direction(keys)", "movement_direction", "movement_direction", CallKind::Call),
+            ("start_dash(keys)", "start_dash", "", CallKind::Call),
+        ] {
+            let result = select(&body, source, token);
+            if expected.is_empty() { assert!(result.err().unwrap().to_string().contains("ambiguous")); continue; }
+            let AlgorithmTarget::Reference(reference) = result.unwrap().unwrap() else { panic!("expected declaration"); };
+            assert_eq!((reference.name.as_str(), reference.kind), (expected, kind));
+        }
+        body.call.as_mut().unwrap().retain(|reference| reference.name != "PlayerAbilities::start_dash");
+        let AlgorithmTarget::Reference(reference) = select(&body, "abilities.start_dash(keys)", "start_dash").unwrap().unwrap() else { panic!("expected typed declaration"); };
+        assert_eq!(reference.name, "PlayerAbilities::start_dash", "unrelated Calls must not override a known receiver type");
+        let AlgorithmTarget::Reference(reference) = select(&body, "unknown.start_dash(keys)", "start_dash").unwrap().unwrap() else { panic!("expected reference evidence"); };
+        assert_eq!(reference.name, "Other::start_dash");
+        assert!(select(&body, "Decrease cooldown", "Decrease").unwrap().is_none());
+        assert!(select(&body, "return \"abilities\"", "abilities").unwrap().is_none());
+    }
+
+    #[test]
+    fn algorithm_receiver_navigation_uses_typescript_and_lua_signature_types() {
+        for (path, declarations) in [
+            ("main.ts", "export function run(client: Client): void;"),
+            ("main.lua", "---@param client Client\nfunction run(client)\nend"),
+        ] {
+            let source = "client.send()";
+            let body = FunctionBody {
+                owner: "run".into(), evidence: None,
+                behavior: Some(FunctionBehavior::Algorithm(source.into())),
+                call: Some(vec![CallSite { name: "Other.send".into(), kind: CallKind::Call, source: None, unresolved: false }]),
+            };
+            let AlgorithmTarget::Reference(reference) = algorithm_reference(path, declarations, &body, 1, source, 7).unwrap().unwrap()
+                else { panic!("expected typed reference for {path}"); };
+            assert_eq!(reference.name, "Client.send", "{path}");
+        }
+    }
+
+    #[test]
+    fn algorithm_sections_preserve_nested_pseudocode_and_reference_boundaries() {
+        for (path, source) in [
+            ("main.rs", "pub fn run() {}\n"),
+            ("main.ts", "export function run() {}\n"),
+            ("main.tsx", "export function run() {}\n"),
+            ("main.lua", "function run()\nend\n"),
+        ] {
+            let declaration = DeclarationOverview::extract(path, source).unwrap();
+            let algorithm = "for each item in items:\n  if item = none: continue\n  result ← inspect(item)\n  if result contains \" or /* or [[:\n    return result";
+            let authored = format!("{declaration}Algorithm\n  {}\nCalls\n  inspect\n", algorithm.replace('\n', "\n  "));
+            let (parsed, bodies) = parse(path, &authored, &[]).unwrap();
+            assert_eq!(bodies[0].behavior, Some(FunctionBehavior::Algorithm(algorithm.into())));
+            assert_eq!(bodies[0].call.as_ref().unwrap()[0].name, "inspect");
+            assert_eq!(combined(path, &parsed, &bodies).unwrap(), authored);
+            let restored: Vec<FunctionBody> = serde_json::from_slice(&serde_json::to_vec(&bodies).unwrap()).unwrap();
+            let presentation = present(path, &parsed, &restored).unwrap();
+            assert!(presentation.declaration.text.contains("Algorithm\n"));
+            assert!(presentation.behavior_row.values().all(|(_, _, category)| *category == "Algorithm"));
+            assert!(presentation.body.values().all(|body| !body.collapsed_suffix.contains("[changed]")));
+        }
+    }
+
+    #[test]
+    fn behavior_sections_reject_empty_duplicate_and_mixed_categories() {
+        for invalid in [
+            "Algorithm\n  return none\n",
+            "pub struct Data;\nAlgorithm\n  return none\n",
+            "pub fn run();\nAlgorithm\n",
+            "pub fn run();\nAlgorithm\n  \nCalls\n",
+            "pub fn run();\nAlgorithm\n  return none\nAlgorithm\n  return none\n",
+            "pub fn run();\nAlgorithm\n  return none\nChange\n  Update the result.\n",
+            "pub fn run();\nChange\n  Update the result.\nAlgorithm\n  return none\n",
+        ] {
+            assert!(parse("main.rs", invalid, &[]).is_err(), "{invalid}");
+        }
+        let documented = "/*\nAlgorithm\n  return none\n*/\npub fn run();\n";
+        assert_eq!(parse("main.rs", documented, &[]).unwrap(), (documented.into(), vec![]));
+    }
+
+    #[test]
+    fn submission_requires_algorithms_only_for_new_callable_identities() {
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.baseline.insert("before.rs".into(), crate::plan::DeclarationFile {
+            text: "pub fn existing();\n".into(), source_digest: String::new(),
+        });
+        design.moved.insert("before.rs".into(), "after.rs".into());
+        let proposed = "pub fn existing();\npub fn added();\n";
+        design.proposed.insert("after.rs".into(), proposed.into());
+        assert!(validate_behaviors(&design).unwrap_err().to_string().contains("added requires a nonempty Algorithm"));
+        for category in ["Change", "Algorithm"] {
+            let (text, bodies) = parse("after.rs", &format!("{proposed}{category}\n  return none\n"), &[]).unwrap();
+            design.proposed.insert("after.rs".into(), text);
+            design.proposed_calls.insert("after.rs".into(), bodies);
+            assert_eq!(validate_behaviors(&design).is_ok(), category == "Algorithm");
+        }
+        let (text, bodies) = parse("after.rs", "pub fn existing();\nAlgorithm\n  return none\npub fn added();\nAlgorithm\n  return none\n", &[]).unwrap();
+        design.proposed.insert("after.rs".into(), text);
+        design.proposed_calls.insert("after.rs".into(), bodies);
+        assert!(validate_behaviors(&design).unwrap_err().to_string().contains("existing callable existing uses Change"));
+    }
+
+    #[test]
+    fn algorithm_drafts_remain_editable_but_submission_reports_structure_errors() {
+        let (text, bodies) = parse("main.rs", "pub fn run();\nAlgorithm\n  if ready\n  return value\n", &[]).unwrap();
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.proposed.insert("main.rs".into(), text);
+        design.proposed_calls.insert("main.rs".into(), bodies);
+        let error = validate_behaviors(&design).unwrap_err().to_string();
+        assert!(error.contains("main.rs: run") && error.contains("Algorithm line 1"));
+        design.proposed_calls.get_mut("main.rs").unwrap()[0].behavior =
+            Some(FunctionBehavior::Algorithm("if ready\n  return value\nreturn none".into()));
+        validate_behaviors(&design).unwrap();
+    }
+
+    #[test]
+    fn algorithm_construction_requires_explicit_matching_names_and_field_values() {
+        for (algorithm, accepted) in [
+            ("queue a Projectile with damage 1\nmarker ← CombatEntity()", false),
+            ("description ← \"Projectile(damage = 1)\"\nmarker ← CombatEntity()", false),
+            ("# Projectile(damage = 1)\nmarker ← CombatEntity()", false),
+            ("projectile ← Other::Projectile(damage = 1)\nmarker ← CombatEntity()", false),
+            ("projectile ← Projectile(1)\nmarker ← CombatEntity()", false),
+            ("projectile ← Projectile(damage = 1)", false),
+            ("projectile ← Projectile(damage = 1)\nother ← Projectile(2)\nmarker ← CombatEntity()", false),
+            ("projectile ← Projectile(damage = 1)\nmarker ← CombatEntity()", true),
+            ("queue spawn(Projectile(damage = inspect(value)), CombatEntity())", true),
+        ] {
+            let mut design = crate::plan::DeclarationDesign::default();
+            design.proposed.insert("main.rs".into(), "pub fn launch();\n".into());
+            design.proposed_calls.insert("main.rs".into(), vec![FunctionBody {
+                owner: "launch".into(), evidence: None,
+                behavior: Some(FunctionBehavior::Algorithm(algorithm.into())),
+                call: Some(["Projectile", "CombatEntity"].into_iter().map(|name| CallSite {
+                    kind: CallKind::Construct, name: name.into(), source: None, unresolved: false,
+                }).collect()),
+            }]);
+            let result = validate_behaviors(&design);
+            assert_eq!(result.is_ok(), accepted, "{algorithm}: {result:?}");
+        }
+    }
 
     #[test]
     fn inline_receiver_types_round_trip_without_becoming_reference_names() {
@@ -777,11 +1128,11 @@ mod tests {
     fn presentation_cache_tracks_declarations_and_reference_metadata() {
         let text = "pub fn cache_probe();\n";
         let body = vec![FunctionBody { evidence: None, owner: "cache_probe".into(),
-            change: Some("Keep the original behavior.".into()), call: None }];
+            behavior: Some(crate::plan::FunctionBehavior::Change("Keep the original behavior.".into())), call: None }];
         let original = present("cache_probe.rs", text, &body).unwrap();
         assert!(Arc::ptr_eq(&original, &present("cache_probe.rs", text, &body).unwrap()));
         let mut changed = body.clone();
-        changed[0].change = Some("Use the changed behavior.".into());
+        changed[0].behavior = Some(crate::plan::FunctionBehavior::Change("Use the changed behavior.".into()));
         let revised = present("cache_probe.rs", text, &changed).unwrap();
         assert!(!Arc::ptr_eq(&original, &revised));
         assert!(revised.declaration.text.contains("Use the changed behavior."));
@@ -791,10 +1142,27 @@ mod tests {
     }
 
     #[test]
+    fn constructs_round_trip_separately_from_calls_and_accesses() {
+        let source = "struct Weapon { cooldown: f32 } pub fn setup() { register(); let first = Weapon { cooldown: 0.0 }; let second = Weapon { cooldown: 1.0 }; }";
+        let declaration = DeclarationOverview::extract("lib.rs", source).unwrap();
+        let captured = extract("lib.rs", source).unwrap();
+        let editable = combined("lib.rs", &declaration, &captured).unwrap();
+        assert!(editable.contains("Constructs\n  Weapon\n  Weapon\n"), "{editable}");
+        assert!(editable.contains("Accesses\n  Weapon::cooldown\n  Weapon::cooldown\n"), "{editable}");
+        assert_eq!(parse("lib.rs", &editable, &captured).unwrap().1, captured);
+        let display = present("lib.rs", &declaration, &captured).unwrap();
+        assert_eq!(display.call_row.values().filter(|(_, name, kind)| name == "Weapon" && *kind == CallKind::Construct).count(), 1);
+        let (_, empty) = parse("lib.rs", "pub fn setup();\nConstructs\n", &[]).unwrap();
+        assert_eq!(empty[0].evidence, Some(ReferenceEvidence { calls: false, constructs: true, accesses: false }));
+        assert!(parse("lib.rs", "pub fn setup();\nConstructs\nConstructs\n", &[]).is_err());
+        assert!(parse("lib.rs", "pub fn setup();\nConstructs\n  Weapon()\n", &[]).is_err());
+    }
+
+    #[test]
     fn reference_evidence_distinguishes_omitted_and_empty_categories() {
         for (text, calls, accesses) in [("Calls\n", true, false), ("Accesses\n", false, true), ("Calls\nAccesses\n", true, true)] {
             let (declarations, body) = parse("lib.rs", &format!("pub fn run();\n{text}"), &[]).unwrap();
-            assert_eq!(body[0].evidence, Some(ReferenceEvidence { calls, accesses }));
+            assert_eq!(body[0].evidence, Some(ReferenceEvidence { calls, accesses, constructs: false }));
             let saved = serde_json::to_string(&body).unwrap();
             let loaded: Vec<FunctionBody> = serde_json::from_str(&saved).unwrap();
             assert_eq!(parse("lib.rs", &combined("lib.rs", &declarations, &loaded).unwrap(), &[]).unwrap().1, body);
@@ -813,7 +1181,7 @@ mod tests {
             let authored = format!("{}Change\n  Stop retrying authentication failures.\n\n  Record the final attempt.\n", declaration);
             let (parsed, body) = parse(path, &authored, &[]).unwrap();
             assert_eq!(parsed, declaration);
-            assert_eq!(body[0].change.as_deref(), Some("Stop retrying authentication failures.\n\nRecord the final attempt."));
+            assert_eq!(body[0].behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures.\n\nRecord the final attempt."));
             assert_eq!(body[0].call, None);
             assert_eq!(combined(path, &parsed, &body).unwrap(), authored);
             let saved = serde_json::to_value(&body).unwrap();
@@ -821,11 +1189,11 @@ mod tests {
             assert_eq!(serde_json::from_value::<Vec<FunctionBody>>(saved).unwrap(), body);
             let review = present(path, &parsed, &body).unwrap();
             assert!(review.call_row.is_empty());
-            assert_eq!(review.change_row.len(), 4);
-            assert!(review.body.values().all(|body| body.collapsed_suffix.contains("[changed]")));
+            assert_eq!(review.behavior_row.len(), 4);
+            assert!(review.body.values().all(|body| !body.collapsed_suffix.contains("[changed]")));
             assert!(!review.declaration.text.contains("Calls"));
             let mut captured = extract(path, source).unwrap();
-            captured[0].change = body[0].change.clone();
+            captured[0].behavior = body[0].behavior.clone();
             assert_eq!(parse(path, &combined(path, &parsed, &captured).unwrap(), &captured).unwrap().1, captured);
         }
     }
@@ -859,7 +1227,7 @@ mod tests {
         assert_eq!(body[0].call, Some(vec![]));
         let editable = combined("main.rs", &declaration, &body).unwrap();
         assert!(editable.contains("Calls\n"));
-        assert_eq!(parse("main.rs", "pub fn run();\nCalls\n", &body).unwrap().1[0].change, None);
+        assert_eq!(parse("main.rs", "pub fn run();\nCalls\n", &body).unwrap().1[0].behavior, None);
     }
 
     #[test]
@@ -1043,7 +1411,7 @@ mod tests {
         )
         .unwrap();
         assert!(calls[0].call.as_ref().unwrap()[0].unresolved);
-        let previous = vec![FunctionBody { evidence: None, change: None,
+        let previous = vec![FunctionBody { evidence: None, behavior: None,
             owner: "run".into(),
             call: Some(vec![CallSite {
                 kind: crate::plan::CallKind::Call,

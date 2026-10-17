@@ -87,7 +87,9 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_hl(0, "Normal", { fg = 0xffffff, bg = 0 })
   vim.api.nvim_set_hl(0, "ForgeHunkHeader", { fg = 0xaa0000 })
   vim.api.nvim_set_hl(0, "ForgeHunkBoundary", { fg = 0xaaaaaa })
-  local function inspect_source(text, expected_color)
+  vim.api.nvim_set_hl(0, "ForgeAddBg", { bg = 0x123425 })
+  vim.api.nvim_set_hl(0, "ForgeDeleteBg", { bg = 0x351a22 })
+  local function inspect_source(text, expected_color, expected_background)
     vim.cmd("normal! zR")
     local source_row
     for row, line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)) do
@@ -105,6 +107,10 @@ local success, failure = xpcall(function()
     local column = vim.fn.strdisplaywidth(screen_text:sub(1, byte_column - 1)) + 1
     local cell = vim.api.nvim__inspect_cell(1, screen_row - 1, column - 1)
     assert(cell[2].foreground == expected_color, "context foreground differs: " .. vim.inspect(cell))
+    if expected_background then
+      local edge = vim.api.nvim__inspect_cell(1, screen_row - 1, 119)
+      assert(edge[2].background == expected_background, "status diff background stopped before the window edge: " .. vim.inspect(edge))
+    end
   end
   assert(vim.wait(10000, function() return state.ready and state.replica.status == "Applied" end, 10), "status did not open")
   for _, entry in ipairs(source) do
@@ -157,6 +163,8 @@ local success, failure = xpcall(function()
     inspect_source(entry.outer or entry.declaration, 0x22ddaa)
     inspect_source(entry.declaration, 0x22ddaa)
     inspect_source(gap_text, 0xaaaaaa)
+    inspect_source(("%s%s value_8 = 8;"):format(indent, entry.binding), 0x22ddaa, 0x351a22)
+    inspect_source(("%s%s value_8 = 908;"):format(indent, entry.binding), 0x22ddaa, 0x123425)
   end
   assert(#notices == 0, table.concat(notices, "\n"))
 end, debug.traceback)

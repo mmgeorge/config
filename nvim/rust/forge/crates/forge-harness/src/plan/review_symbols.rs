@@ -39,14 +39,15 @@ impl NarrativeSymbols {
     }
 
     /// Prefer the owning file's declaration and leave ambiguous external names unclassified.
-    pub fn is_type(&self, path: &str, side: &str, name: &str) -> bool {
+    pub fn capture(&self, path: &str, side: &str, name: &str) -> Option<&'static str> {
         let symbols = if side == "baseline" { &self.baseline } else { &self.proposed };
         let matching = symbols.iter().filter(|symbol| matches(symbol, name)).collect::<Vec<_>>();
         let local = matching.iter().filter(|symbol| Path::new(&symbol.destination.path) == Path::new(path)).collect::<Vec<_>>();
         if !local.is_empty() {
-            return local.iter().all(|symbol| symbol.capture == "@type");
+            let capture = local[0].capture;
+            return local.iter().all(|symbol| symbol.capture == capture).then_some(capture);
         }
-        matches!(matching.as_slice(), [symbol] if symbol.capture == "@type")
+        match matching.as_slice() { [symbol] => Some(symbol.capture), _ => None }
     }
 }
 

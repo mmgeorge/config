@@ -148,6 +148,58 @@
           "sha256": "1af55e34d738e1ea8045654131f526908cc373ce1f38da11dc2cc0847c23a678"
         }
       ]
+    },
+    {
+      "name": "algorithm",
+      "url": "local:forge-algorithm",
+      "revision": "repository-owned",
+      "location": "",
+      "generator": {
+        "version": "tree-sitter 0.26.8",
+        "arguments": [
+          "generate",
+          "--abi",
+          "14"
+        ]
+      },
+      "files": [
+        {
+          "path": "README.md",
+          "sha256": "4b13a8e878eae7e7742997299560fc2652aa7069274f5c769edf0100c9d220c7"
+        },
+        {
+          "path": "grammar.js",
+          "sha256": "45a0e19a30c3fe506c62d3b027d340a70701728e1fcc1dba87d8580615c6e20f"
+        },
+        {
+          "path": "tree-sitter.json",
+          "sha256": "09107282731a03136647d8509e037fd4be61610e30e2fef83035fb71a50e06ce"
+        },
+        {
+          "path": "src/grammar.json",
+          "sha256": "c6bc11699c343c10cd659cb16a3c732afacd00ea2eec07bf4d9a3c991beedd42"
+        },
+        {
+          "path": "src/node-types.json",
+          "sha256": "b03575f366a9e08ab314f946c97353fe91a3ab9f1a0cbb994b3eac630398a28f"
+        },
+        {
+          "path": "src/parser.c",
+          "sha256": "a91b8df115f800e77b54314824d6992ccec008fb525c91a010ee3a72a785fc57"
+        },
+        {
+          "path": "src/tree_sitter/alloc.h",
+          "sha256": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea"
+        },
+        {
+          "path": "src/tree_sitter/array.h",
+          "sha256": "31e60a1bff6f715afacce03b5b70efe42b58371b4f9595dd4af52a577ff9608c"
+        },
+        {
+          "path": "src/tree_sitter/parser.h",
+          "sha256": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2"
+        }
+      ]
     }
   ]
 }

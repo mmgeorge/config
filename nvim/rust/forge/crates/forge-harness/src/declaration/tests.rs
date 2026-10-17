@@ -21,6 +21,45 @@ fn typescript(root: &Path, files: &[(&str, &str)]) -> (DeclarationDesign, Declar
 }
 
 #[test]
+fn constructs_validate_types_and_reject_known_non_types() {
+    let root = tempfile::tempdir().unwrap();
+    let text = "pub struct Weapon { pub cooldown: f32 }\npub const LIMIT: u32;\npub fn factory();\npub fn setup();\nConstructs\n  Weapon\n  factory\n  LIMIT\n  ExternalWeapon\n";
+    let (declaration, calls) = crate::plan::calls::parse("lib.rs", text, &[]).unwrap();
+    let mut design = design(&[("lib.rs", &declaration)]);
+    design.proposed_calls.insert("lib.rs".into(), calls);
+    let mut resolver = DeclarationResolver::planned(root.path(), &design, false).unwrap();
+    let report = resolver.validate(&design);
+    assert!(!report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "Weapon"));
+    for name in ["factory", "LIMIT"] {
+        assert!(report.diagnostic.iter().any(|diagnostic| diagnostic.reference == name && diagnostic.error && diagnostic.reason.contains("Constructs requires a type")), "{report:?}");
+    }
+    assert!(report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "ExternalWeapon" && !diagnostic.error));
+}
+
+#[test]
+fn captured_rust_constructors_keep_factories_and_type_mentions_separate() {
+    let root = tempfile::tempdir().unwrap();
+    let source = "pub struct Unit;\npub struct Tuple(u32);\npub struct Record { pub count: u32 }\nimpl Record { pub fn new() -> Self { Self { count: 0 } } pub fn ready() -> Record { Self::new() } pub fn view(&self) -> &Record { self } pub fn count(&self) -> u32 { self.count } }\npub fn make() -> Record { Record::new() }\npub fn run(input: Option<&Record>) { let _typed: Option<&Record> = None; inspect::<Record>(); consume(Unit); consume(Tuple(1)); consume(Record { count: 1 }); Record::new(); Record::ready(); make(); register(Record::new); }";
+    let declaration = forge_diff::syntax::DeclarationOverview::extract("lib.rs", source).unwrap();
+    let (_, mut resolver) = local(root.path(), &[("lib.rs", &declaration)]);
+    let mut functions = crate::plan::calls::extract("lib.rs", source).unwrap();
+    crate::plan::calls::classify("lib.rs", &mut functions, &mut resolver);
+    let run = functions.iter().find(|function| function.owner == "run").unwrap();
+    let constructors = run.call.iter().flatten().filter(|reference| reference.kind == crate::plan::CallKind::Construct).map(|reference| reference.name.as_str()).collect::<Vec<_>>();
+    assert_eq!(constructors, ["Unit", "Tuple", "Record", "Record::new", "Record::ready", "make"]);
+    assert!(run.call.iter().flatten().any(|reference| reference.name == "Record::new" && reference.kind == crate::plan::CallKind::Callback));
+    for (name, factory) in [("Record::new", true), ("Record::ready", true), ("make", true), ("Record::view", false), ("Record::count", false)] {
+        let target = resolver.callable("lib.rs", "run", name);
+        assert_eq!(resolver.factory(&target), factory, "{name}: {target:?}");
+    }
+    let (declaration, mut authored) = crate::plan::calls::parse("lib.rs", &format!("{declaration}Constructs\n  Record::new\nCalls\n  Record::ready\n"), &[]).unwrap();
+    crate::plan::calls::classify("lib.rs", &mut authored, &mut resolver);
+    let combined = crate::plan::calls::combined("lib.rs", &declaration, &authored).unwrap();
+    assert!(combined.contains("Constructs\n  Record::new\n"), "{combined}");
+    assert!(combined.contains("Calls\n  Record::ready\n"), "authored callback lost its category: {combined}");
+}
+
+#[test]
 fn external_module_navigation_selects_the_module_file() {
     let root = tempfile::tempdir().unwrap();
     for (declaration, destination) in [

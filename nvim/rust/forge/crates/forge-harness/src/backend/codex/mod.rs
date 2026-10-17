@@ -215,7 +215,7 @@ impl CodexBackend {
 
     async fn configured_parameters(&self, mut parameter: Value, request: &BackendRequest,
         process: &mut CodexJsonRpc, output: &mut BackendOutput) -> Result<Value> {
-        parameter["config"]["model_reasoning_summary"] = json!("auto");
+        parameter["config"]["model_reasoning_summary"] = json!("concise");
         if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
             let mut config = resources.configure(process,output,&request.workspace).await?;
             if let Some(existing) = parameter.get("config").and_then(Value::as_object) {
@@ -886,7 +886,7 @@ impl CodexBackend {
         continuing_exchange: bool,
         mut params: Value,
     ) -> Result<(Value, bool, Vec<Value>)> {
-        params["summary"] = json!("auto");
+        params["summary"] = json!("concise");
         let request_id = process.send_request("turn/start", params).await?;
         self.active_turn_by_session.lock().await.insert(
             request.runtime_key()?,
@@ -2064,9 +2064,9 @@ mod test {
                     assert_eq!(request["params"]["model"], expected_model);
                     assert_eq!(request["params"]["serviceTier"], serde_json::to_value(service_tier).unwrap());
                     if method == "turn/start" {
-                        assert_eq!(request["params"]["summary"], "auto");
+                        assert_eq!(request["params"]["summary"], "concise");
                     } else {
-                        assert_eq!(request["params"]["config"]["model_reasoning_summary"], "auto");
+                        assert_eq!(request["params"]["config"]["model_reasoning_summary"], "concise");
                     }
                     let mut messages = vec![
                         json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),

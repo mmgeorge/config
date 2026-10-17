@@ -114,6 +114,23 @@ function M.prepare(entry, read_row)
   end
 end
 
+---Measure the leading virtual columns excluded from native continuation indentation.
+---@param sequence ForgeBlockSequence
+---@return integer
+function M.continuation_indent(sequence)
+  local width = 0
+  for _, node in pairs(sequence.node) do
+    for _, layout in pairs(node.entry.row_layout or {}) do
+      local leading = 0
+      for _, insertion in ipairs(layout.insertion) do
+        if insertion.position.column == 0 then leading = leading + insertion.width end
+      end
+      width = math.max(width, leading)
+    end
+  end
+  return width
+end
+
 ---@param buffer integer
 ---@param namespace integer
 ---@param start_row integer

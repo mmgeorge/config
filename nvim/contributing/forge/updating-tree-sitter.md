@@ -25,6 +25,9 @@ Prefer an upstream Cargo grammar crate over copying parser sources. Use a pinned
 upstream Git dependency when the required compatible binding is not published.
 Keep local sources only for a necessary patch or incompatible upstream binding.
 WGSL, CUE, and LaTeX currently retain local bindings for runtime compatibility.
+The repository-owned Algorithm grammar has no upstream dependency. Its `grammar.js` and
+generated assets live under `grammar/algorithm/`. Regenerate it with the CLI version and ABI
+recorded in its README and manifest, then refresh its grammar and highlight-query hashes.
 Do not update only Neovim's parser installation and assume the native parser
 changed. For local exceptions, never replace generated `parser.c` without its
 required scanner, headers, node metadata, and provenance.

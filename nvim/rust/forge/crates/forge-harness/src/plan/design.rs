@@ -92,6 +92,7 @@ impl DeclarationDesign {
         }
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
+        super::calls::validate_behaviors(&design)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
         for path in paths {
             for directory in Path::new(&path).ancestors().skip(1) {
@@ -186,7 +187,7 @@ impl DeclarationDesign {
             overview
         };
         let (file, mut calls) = overview;
-        if calls.iter().flat_map(|function| function.call.iter().flatten()).any(|reference| matches!(reference.kind, super::CallKind::Value | super::CallKind::Property)) {
+        if calls.iter().flat_map(|function| function.call.iter().flatten()).any(|reference| matches!(reference.kind, super::CallKind::Value | super::CallKind::Property | super::CallKind::Call)) {
             let mut captured = self.clone();
             captured.proposed.insert(path.into(), file.text.clone());
             let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &captured, false)?;
@@ -497,7 +498,7 @@ impl DeclarationDesign {
             }
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
-        if candidate.proposed_calls.values().flatten().flat_map(|function| function.call.iter().flatten()).any(|reference| !reference.unresolved && matches!(reference.kind, super::CallKind::Value | super::CallKind::Property)) {
+        if candidate.proposed_calls.values().flatten().flat_map(|function| function.call.iter().flatten()).any(|reference| !reference.unresolved && matches!(reference.kind, super::CallKind::Value | super::CallKind::Property | super::CallKind::Call)) {
             let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &candidate, false)?;
             for (path, functions) in &mut candidate.proposed_calls {
                 super::calls::classify(path, functions, &mut resolver);
@@ -1105,8 +1106,8 @@ mod tests {
         assert_eq!(changed.baseline["main.rs"].text, changed.proposed["main.rs"]);
         assert_eq!(changed.changed_paths(), vec!["main.rs".to_owned()]);
         assert_eq!(changed.baseline_calls["main.rs"][0].call, changed.proposed_calls["main.rs"][0].call);
-        assert_eq!(changed.baseline_calls["main.rs"][0].change, None);
-        assert_eq!(changed.proposed_calls["main.rs"][0].change.as_deref(), Some("Stop retrying authentication failures."));
+        assert_eq!(changed.baseline_calls["main.rs"][0].behavior, None);
+        assert_eq!(changed.proposed_calls["main.rs"][0].behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures."));
         assert_eq!(std::fs::read_to_string(workspace.path().join("main.rs")).unwrap(), source);
         assert!(changed.read(Some("main.rs"), false).unwrap()["text"].as_str().unwrap().contains("Change\n"));
         let snapshot = serde_json::to_vec(&changed).unwrap();

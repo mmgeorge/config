@@ -13,7 +13,7 @@ local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "Plan checks" }, path)
 local version, enabled, pending = 1, true, nil
 local function presentation(document)
-  local rows = { { text = "Planned checks" } }
+  local rows = { { text = "Checks" } }
   if enabled then rows[#rows + 1] = { text = "Test  cargo test  All  Will run", check = "tests" } end
   local source, blocks = {}, {}
   for index, row in ipairs(rows) do

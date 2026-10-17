@@ -52,7 +52,7 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
                             && (symbol.role != DeclarationRole::Callable
                                 || matches!(
                                     kind.as_str(),
-                                    "call" | "callback" | "value" | "property"
+                                    "call" | "callback" | "value" | "property" | "construct"
                                 ))
                     })
                 });
@@ -121,7 +121,8 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
                 DeclarationRole::Property => {
                     "Add its read, write, construction, or destructuring use to the user's Accesses section."
                 }
-                _ => "Add a resolved type reference or a named use in Calls or Accesses.",
+                DeclarationRole::Type => "Add its signature reference or construction to the caller's Constructs section.",
+                _ => "Add a resolved type reference or a named use in Calls, Constructs, or Accesses.",
             };
             let role = match symbol.role {
                 DeclarationRole::Callable => "function",
@@ -305,6 +306,20 @@ mod tests {
             failure.contains("Item") && failure.contains("count") && failure.contains("LIMIT"),
             "{failure}"
         );
+    }
+
+    #[test]
+    fn authored_constructs_supply_incoming_type_uses() {
+        let workspace = tempfile::tempdir().unwrap();
+        let design = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+struct Weapon;\n+pub fn setup();\n+Constructs\n+  Weapon\n*** End Patch").unwrap();
+        validate(&design, workspace.path()).unwrap();
+        let index = PlanReferenceIndex::design(&design, workspace.path()).unwrap();
+        assert!(index.occurrence.iter().any(|reference| reference.name == "Weapon" && reference.kind == "construct"));
+        let mut omitted = design.clone();
+        omitted.proposed_calls.clear();
+        assert!(validate(&omitted, workspace.path()).is_err());
+        let factory = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+struct Weapon;\n+impl Weapon { fn ready() -> Self; }\n+pub fn setup();\n+Constructs\n+  Weapon::ready\n*** End Patch").unwrap();
+        validate(&factory, workspace.path()).unwrap();
     }
 
     #[test]

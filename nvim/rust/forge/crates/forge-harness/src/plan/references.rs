@@ -255,6 +255,7 @@ impl PlanReferenceIndex {
                         let resolution = match kind {
                             super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, &function.owner, name),
                             super::CallKind::Value => resolver.value(path, &function.owner, name),
+                            super::CallKind::Construct => resolver.construct(path, &function.owner, name),
                             super::CallKind::Property => {
                                 resolver.property(path, &function.owner, name)
                             }
@@ -642,7 +643,7 @@ impl PlanReferenceIndex {
             .or_default()
             .insert((symbol.position.line, symbol.position.column));
         for reference in self.occurrence.iter().filter(|reference| {
-            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "body_qualifier")
+            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct" | "body_qualifier")
         }) {
             let text = &design.proposed[&reference.path];
             let row = text
@@ -810,7 +811,7 @@ impl PlanReferenceIndex {
                 .occurrence
                 .iter()
                 .filter(|reference| {
-                    !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "body_qualifier")
+                    !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct" | "body_qualifier")
                         && reference.path == *path
                         && reference.line == *line
                         && reference.column <= column
@@ -1193,7 +1194,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![
                     super::super::CallSite {
@@ -1270,7 +1271,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "client.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, change: Some("Stop retrying authentication failures in send.".into()),
+            vec![super::super::FunctionBody { evidence: None, behavior: Some(crate::plan::FunctionBehavior::Change("Stop retrying authentication failures in send.".into())),
                 owner: "send".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1294,7 +1295,7 @@ mod tests {
         let function = &renamed.design.as_ref().unwrap().proposed_calls["client.ts"][0];
         assert_eq!(function.owner, "deliver");
         assert_eq!(function.call.as_ref().unwrap()[0].name, "deliver");
-        assert_eq!(function.change.as_deref(), Some("Stop retrying authentication failures in send."));
+        assert_eq!(function.behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures in send."));
         assert_eq!(index.call.len(), 1);
     }
 
@@ -1317,11 +1318,11 @@ mod tests {
         design.proposed_calls.insert(
             "src/lib.rs".into(),
             vec![
-                super::super::FunctionBody { evidence: None, change: None,
+                super::super::FunctionBody { evidence: None, behavior: None,
                     owner: "Client::send".into(),
                     call: Some(Vec::new()),
                 },
-                super::super::FunctionBody { evidence: None, change: None,
+                super::super::FunctionBody { evidence: None, behavior: None,
                     owner: "run".into(),
                     call: Some(vec![super::super::CallSite {
                         kind: crate::plan::CallKind::Call,
@@ -1380,7 +1381,7 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(),"pub struct Extra;\nimpl Extra { pub fn prepare(&self); }\npub struct Client;\nimpl Client { pub fn send(&self); }\npub fn run();\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1423,7 +1424,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1472,7 +1473,7 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self, other: &Client);\n}\npub fn run(client: &Client);\npub struct Settings { pub client: Client }\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1544,7 +1545,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1579,7 +1580,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1663,7 +1664,7 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, change: None,
+            vec![super::super::FunctionBody { evidence: None, behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,

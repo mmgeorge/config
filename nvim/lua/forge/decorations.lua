@@ -12,6 +12,35 @@ function M.full_width(capture)
     or capture == "ForgeReviewCommentBox" or capture == "ForgeReviewCommentBoxHeader"
 end
 
+---@class ForgeProjectedDecoration
+---@field column integer
+---@field options {end_row: integer, end_col: integer, hl_group: string, hl_eol: boolean, priority: integer, ephemeral?: boolean}
+
+---Project an intersecting source span onto one physical row, retaining full-row backgrounds.
+---@param decoration {range: {start: {row: integer, column: integer}, ["end"]: {row: integer, column: integer}}, capture: string, priority: integer}
+---@param relative integer Source row within the block.
+---@param row integer Physical buffer row.
+---@param length? integer Current source byte length, when edited text needs clipping.
+---@return ForgeProjectedDecoration? # Nil when the source row does not intersect the span or clipping removes it.
+function M.project_row(decoration, relative, row, length)
+  local first, last = decoration.range.start, decoration.range["end"]
+  if relative < first.row or relative > last.row or (relative == last.row and last.column == 0) then return nil end
+  local column = relative == first.row and first.column or 0
+  local full_width = M.full_width(decoration.capture)
+  local continues = last.row > relative
+  local finish = continues and (length or 0) or last.column
+  if length then finish = math.min(finish, length) end
+  if not continues and finish <= column then return nil end
+  return {
+    column = column,
+    options = {
+      end_row = (continues or full_width) and row + 1 or row,
+      end_col = (continues or full_width) and 0 or finish,
+      hl_group = decoration.capture, hl_eol = full_width, priority = decoration.priority,
+    },
+  }
+end
+
 local function overlay_chunks(overlay)
   local language = overlay.capture:match("^RenderMarkdownCodeInfo:(.+)$")
   if not language then return { { overlay.text, overlay.capture } } end
@@ -41,14 +70,10 @@ local function emit(tree, buffer, row, relative)
   emit(tree.left, buffer, row, relative)
   local span = tree.span
   if span.range.start.row > relative then return end
-  local finish = span.range["end"]
-  if finish.row > relative or (finish.row == relative and finish.column > 0) then
-    vim.api.nvim_buf_set_extmark(buffer, namespace, row, span.range.start.row == relative and span.range.start.column or 0, {
-      end_row = finish.row > relative and row + 1 or row,
-      end_col = finish.row > relative and 0 or finish.column,
-      hl_group = span.capture, hl_eol = M.full_width(span.capture),
-      priority = span.priority, ephemeral = true,
-    })
+  local projected = M.project_row(span, relative, row)
+  if projected then
+    projected.options.ephemeral = true
+    vim.api.nvim_buf_set_extmark(buffer, namespace, row, projected.column, projected.options)
   end
   emit(tree.right, buffer, row, relative)
 end

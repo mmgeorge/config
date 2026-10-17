@@ -24,7 +24,7 @@ mod references;
 mod workspace_definition;
 pub use workspace_definition::{DefinitionLocation, WorkspaceDefinition};
 mod reference_context;
-pub use calls::{CallKind, CallSite, CallPosition, FunctionBody};
+pub use calls::{CallKind, CallSite, CallPosition, FunctionBody, FunctionBehavior};
 mod design_review;
 mod deviation;
 mod document;
@@ -1374,7 +1374,7 @@ mod test {
         );
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![FunctionBody { evidence: None, change: None,
+            vec![FunctionBody { evidence: None, behavior: None,
                 owner: "introduced".into(),
                 call: Some(vec![
                     CallSite {

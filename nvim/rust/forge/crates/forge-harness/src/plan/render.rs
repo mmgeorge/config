@@ -127,7 +127,7 @@ pub enum PlanReviewTarget {
         owner: String,
         name: String,
     },
-    Change {
+    Behavior {
         path: String,
         side: String,
         owner: String,

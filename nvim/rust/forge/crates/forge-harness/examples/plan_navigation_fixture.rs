@@ -24,6 +24,7 @@ fn main() -> Result<()> {
         "rust" => &["Cargo.toml", "src/lib.rs", "src/model.rs"],
         "typescript" => &["src/main.ts", "src/model.ts"],
         "lua" => &["main.lua", "model.lua"],
+        "behavior" => &["src/change.rs"],
         _ => anyhow::bail!("unsupported fixture language"),
     };
     let files = PlanFileStore::new(&data, &workspace);
@@ -43,7 +44,7 @@ fn main() -> Result<()> {
             .into_iter()
             .map(|function| FunctionBody {
                 owner: function.owner,
-                change: None,
+                behavior: None,
                 evidence: None,
                 call: Some(
                     function
@@ -57,6 +58,7 @@ fn main() -> Result<()> {
                                 DeclarationCallKind::Callback => CallKind::Callback,
                                 DeclarationCallKind::Property => CallKind::Property,
                                 DeclarationCallKind::Value => CallKind::Value,
+                                DeclarationCallKind::Construct => CallKind::Construct,
                             },
                             source: Some(CallPosition {
                                 line: call.line,
@@ -79,9 +81,32 @@ fn main() -> Result<()> {
         design.baseline_calls.insert((*path).into(), bodies.clone());
         let mut proposed = bodies;
         for body in &mut proposed {
-            body.change = Some("Preserve behavior while reviewing definition navigation.".into());
+            body.behavior = Some(forge_harness::plan::FunctionBehavior::Change("Preserve behavior while reviewing definition navigation.".into()));
         }
         design.proposed_calls.insert((*path).into(), proposed);
+    }
+    if arguments[4] == "behavior" {
+        design.proposed.get_mut("src/change.rs").unwrap().push_str(
+            "\n/// Holds the optional probe result.\npub struct ProbeResult {\n  /// Value observed by the probe.\n  pub value: Option<u32>\n}\n/// Preserves the optional value.\npub fn planned_probe(\n  value: Option<u32>,\n  abilities: &mut PlayerAbilities\n) -> ProbeResult;\n",
+        );
+        design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
+            owner: "planned_probe".into(),
+            behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
+                "result ← value\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds with a zero floor while preserving the stored firing order\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
+            )),
+            evidence: None,
+            call: Some(vec![
+                CallSite { name: "movement_direction".into(), kind: CallKind::Call, source: None, unresolved: false },
+                CallSite { name: "PlayerAbilities::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
+                CallSite { name: "Other::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
+                CallSite { name: "PlayerAbilities::cooldown".into(), kind: CallKind::Property, source: None, unresolved: false },
+                CallSite {
+                name: "ProbeResult".into(),
+                unresolved: false,
+                kind: CallKind::Construct,
+                source: None,
+            }]),
+        });
     }
     document.design = Some(design);
     document.version += 1;

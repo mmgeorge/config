@@ -125,12 +125,19 @@ language entry point. Prefer this path when adding a language.
 
 WGSL, CUE, and LaTeX retain local parser sources because their selected upstream
 Rust bindings require older Tree-sitter runtimes. `forge-diff/grammar/manifest.json`
-records only these exceptions and their exact file hashes. `forge-diff/build.rs`
+records local grammar sources and their exact file hashes. `forge-diff/build.rs`
 compiles their parsers and scanners. The separate patched PowerShell grammar
 remains a Cargo path patch under `forge/vendor/`. Bash and Zsh already use upstream
 Cargo grammar dependencies in `forge-harness` for shell approval analysis.
 Harness also consumes the shared Nushell grammar. Its approval classifier must
 continue rejecting unresolved execution and environment changes after parser updates.
+
+The repository-owned `algorithm` grammar is also compiled by `forge-diff/build.rs`.
+It parses academic pseudocode statements independently of a declaration's native language.
+The native syntax registry exposes `algorithm` and `pseudocode` aliases, and Algorithm review
+rows use the shared syntax worker pool and `query/local/algorithm/highlights.scm`. The grammar
+manifest records its source and generated asset hashes and its Tree-sitter CLI/ABI command.
+The submission validator adds indentation and control-flow nesting checks to the parsed statements.
 
 The pinned `tree-sitter` and `tree-sitter-language` dependencies define the runtime
 and grammar binding boundary. A compatible generated-parser ABI does not remove

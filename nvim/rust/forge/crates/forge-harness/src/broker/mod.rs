@@ -9364,7 +9364,7 @@ mod test {
             let before = serde_json::to_string(description)?;
             let after = serde_json::to_string(&format!("{description} Preserve score reset behavior."))?;
             std::fs::write(Path::new(&request.workspace).join("added.rs"), "pub fn extra() {}\n")?;
-            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n*** End Patch");
+            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n+Algorithm\n+  return 0\n*** End Patch");
             let mut runtime = ControlToolRuntime::new(context);
             runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
             let result = runtime.invoke(ControlToolInvocation { name:"plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
@@ -10802,7 +10802,7 @@ mod test {
                     let edit = runtime.invoke(ControlToolInvocation {
                         name: "design_patch".into(),
                         arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
-                            "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n*** End Patch"}),
+                            "patch":"*** Begin Patch\n*** Add File: src/controls.rs\n+pub fn keyboard_movement();\n+Algorithm\n+  update movement from keyboard input\n*** End Patch"}),
                     }).await?;
                     apply_invocation(&edit.invocation.unwrap(), &mut output)?;
                 }
@@ -10973,8 +10973,10 @@ mod test {
         let document = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).expect("planning context retains the design");
         let design = document.design.as_ref().expect("declaration design");
         let path = "src/migration.rs";
-        let text = format!("/// {}\npub fn migrate();\n",overview.replace('\n'," "));
-        let patch = if let Some(previous) = design.proposed.get(path) {
+        let text = format!("/// {}\npub fn migrate();\nAlgorithm\n  return\n",overview.replace('\n'," "));
+        let patch = if design.proposed.contains_key(path) {
+            let document = design.read(Some(path), false).unwrap();
+            let previous = document["text"].as_str().unwrap();
             format!("*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",previous.lines().map(|line| format!("-{line}\n")).collect::<String>(),text.lines().map(|line| format!("+{line}\n")).collect::<String>())
         } else { format!("*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",text.lines().map(|line| format!("+{line}\n")).collect::<String>()) };
         let previous_metadata = serde_json::to_string_pretty(&design.document).unwrap()

@@ -957,9 +957,9 @@ async fn analyze_plan_source(
                     if let Some(stage) = stage { stage.complete(json!({"cached":true,"source_bytes":text.len()})); }
                     continue;
                 }
-                let presentation =
-                    forge_diff::syntax::DeclarationOverview::present(&path, text)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
+                let presentation = crate::plan::calls::present(&path, text,
+                    calls.get(&path).map(Vec::as_slice).unwrap_or_default())?;
                 check()?;
                 let Some(language) =
                     forge_diff::syntax::DeclarationOverview::language(&path)
@@ -970,7 +970,7 @@ async fn analyze_plan_source(
                 let handle = syntax
                     .analyze(SyntaxRequest {
                         source: forge_diff::source::SourceVersion::new(
-                            presentation.text.as_bytes().to_vec(),
+                            presentation.plain.as_bytes().to_vec(),
                             forge_diff::source::Representation::DisplayOnly,
                         )?,
                         language,
@@ -981,9 +981,19 @@ async fn analyze_plan_source(
                     .map_err(|error| {
                         anyhow::anyhow!("Declaration syntax analysis failed: {error:?}")
                     })?;
+                check()?;
+                let algorithm = if let Some(algorithm) = presentation.algorithm_source() {
+                    Some(syntax.analyze(SyntaxRequest {
+                        source: forge_diff::source::SourceVersion::new(algorithm.into_bytes(), forge_diff::source::Representation::DisplayOnly)?,
+                        language: SyntaxLanguage::Algorithm,
+                        priority: forge_diff::workers::WorkPriority::Visible,
+                        deadline: Some(Instant::now() + Duration::from_secs(10)),
+                    }).await.map_err(|error| anyhow::anyhow!("Algorithm syntax analysis failed: {error:?}"))?)
+                } else { None };
+                check()?;
                 source
                     .declaration_syntax
-                    .insert((path.clone(), side.into()), handle);
+                    .insert((path.clone(), side.into()), crate::plan::review_source::ReviewSyntax { declaration: handle, algorithm });
                 if let Some(stage) = stage { stage.complete(json!({"cached":false,"source_bytes":text.len()})); }
             }
         }

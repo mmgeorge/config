@@ -45,7 +45,7 @@ impl ReferenceLocation {
         }
         if matches!(
             reference.kind.as_str(),
-            "call" | "property" | "callback" | "value"
+            "call" | "property" | "callback" | "value" | "construct"
         ) {
             Self::Call(
                 reference.path.clone(),

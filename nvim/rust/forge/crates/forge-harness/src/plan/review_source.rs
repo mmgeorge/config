@@ -2,6 +2,15 @@ use super::{PlanDocument, PlanFileStore, RenderedPlan, digest};
 use anyhow::{Context, Result};
 use std::path::Path;
 
+#[derive(Clone)]
+/// Native declarations and isolated Algorithm rows for one immutable file side.
+pub(crate) struct ReviewSyntax {
+    /// Native-language analysis of the declaration-only source.
+    pub declaration: forge_diff::syntax::SyntaxHandle,
+    /// Algorithm analysis with rows aligned to the displayed declaration source.
+    pub algorithm: Option<forge_diff::syntax::SyntaxHandle>,
+}
+
 pub(crate) struct PlanReviewSource {
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
@@ -19,7 +28,7 @@ pub(crate) struct PlanReviewSource {
     pub saved_digest: String,
     pub syntax: Option<forge_diff::syntax::SyntaxHandle>,
     pub declaration_syntax:
-        std::collections::HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
+        std::collections::HashMap<(String, String), ReviewSyntax>,
 }
 
 pub(crate) struct ReviewTrace {
