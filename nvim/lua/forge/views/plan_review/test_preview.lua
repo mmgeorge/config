@@ -46,13 +46,33 @@ function M.project(source, selected)
     if not retained_file[test.file] then removed_file[test.file] = true end
   end
   local summary = {}
+  local capture = { new = "ForgeAddRange", modified = "ForgeModifyRange", removed = "ForgeDeleteRange", reused = "Comment" }
   for _, change in ipairs({ "new", "modified", "removed", "reused" }) do
-    if counts[change] > 0 then summary[#summary + 1] = counts[change] .. " " .. change end
+    if counts[change] > 0 then summary[#summary + 1] = { text = counts[change] .. " " .. change, capture = capture[change] } end
   end
   for _, row in ipairs(preview) do
     if type(row.test_file) == "string" and removed_file[row.test_file] then row.hidden = true end
     if row.block == "plan:section:tests" then
-      row.text = " Tests · " .. (#summary > 0 and table.concat(summary, " · ") or "None planned") .. " "
+      row.text = ""
+      row.metadata = vim.deepcopy(row.metadata or {})
+      row.metadata.decoration = {}
+      local function append(text, group)
+        local start = #row.text
+        row.text = row.text .. text
+        row.metadata.decoration[#row.metadata.decoration + 1] = {
+          range = { start = { row = 0, column = start }, ["end"] = { row = 0, column = #row.text } },
+          capture = group, priority = 100,
+        }
+      end
+      append(" Tests ", "RenderMarkdownH1")
+      append("· ", "Comment")
+      if #summary == 0 then append("None planned", "Comment") end
+      for index, part in ipairs(summary) do
+        if index > 1 then append(" · ", "Comment") end
+        append(part.text, part.capture)
+      end
+      append(" ", "Normal")
+      row.test_summary = vim.deepcopy(counts)
     end
   end
   return preview

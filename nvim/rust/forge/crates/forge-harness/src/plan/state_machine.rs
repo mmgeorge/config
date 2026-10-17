@@ -38,7 +38,7 @@ impl PlanStateMachine {
                     PlanState::Generating
                 }
             }
-            (PlanState::Generating | PlanState::Revising, PlanEvent::PlanSubmitted) => {
+            (PlanState::Generating | PlanState::Revising | PlanState::AwaitingReview, PlanEvent::PlanSubmitted) => {
                 PlanState::AwaitingReview
             }
             (PlanState::AwaitingReview, PlanEvent::ChangesRequested) => PlanState::Revising,
@@ -133,6 +133,10 @@ mod test {
         let mut record = plan(PlanState::Generating);
         PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 2).unwrap();
         assert_eq!(record.state, PlanState::AwaitingReview);
+        PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 3).unwrap();
+        assert_eq!(record.state, PlanState::AwaitingReview);
+        PlanStateMachine::apply(&mut record, PlanEvent::Accepted, 4).unwrap();
+        assert!(PlanStateMachine::apply(&mut record, PlanEvent::PlanSubmitted, 5).is_err());
         assert!(PlanStateMachine::apply(&mut record, PlanEvent::QuestionAsked, 3).is_err());
     }
 

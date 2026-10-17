@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BlockMetadata, BufferBlock, FoldRange, TargetRange, TextChunk, TextPosition, TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, EditSequence, FoldId, RegionRevision, TargetId};
 use forge_buffer::text::BufferText;
@@ -121,7 +121,8 @@ pub(super) fn project(
                 }
             }
         } else if let Some(index) = row.id.0.strip_prefix("plan:configured-checks:").and_then(|index| index.parse::<usize>().ok()) {
-            row.text = BufferText::from_rows(&check_rows[index])?;
+            row.text = check_rows[index].text.clone();
+            row.metadata.decoration = check_rows[index].metadata.decoration.clone();
         } else if row.id.0.starts_with("plan:metadata:")
             && !row.id.0.starts_with("plan:metadata:checks:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
@@ -522,8 +523,8 @@ fn rows(
             overview.push(section_header(BlockId("plan:section:checks".into()), "Checks")?);
             let lines = review_checks(Some(design), None)?;
             let check_ids = design.check_preview.iter().filter(|preview| preview.selected || preview.pending).map(|preview| &preview.id).collect::<Vec<_>>();
-            for (index, line) in lines.into_iter().enumerate() {
-                overview.push(BufferBlock {id:BlockId(format!("plan:configured-checks:{index}")),text:BufferText::from_rows(line)?,metadata:BlockMetadata::default()});
+            for (index, row) in lines.into_iter().enumerate() {
+                overview.push(row);
                 if design.check_preview_current()? && let Some(id) = index.checked_sub(2).and_then(|index| check_ids.get(index)) {
                     section_anchor.push(PlanNavigationAnchor { line: overview.len() as u32,
                         target: PlanReviewTarget::Check { id: (*id).clone() },
@@ -594,7 +595,7 @@ fn rows(
     Ok((block, navigation, hidden, contextual_block))
 }
 
-fn review_checks(design: Option<&super::DeclarationDesign>, width: Option<&WidthProfile>) -> Result<Vec<Vec<String>>> {
+fn review_checks(design: Option<&super::DeclarationDesign>, width: Option<&WidthProfile>) -> Result<Vec<BufferBlock>> {
     if let Some(design) = design && design.check_preview_current()? {
         let mut table = vec![["Stage", "Command", "Scope", "Why", "Status"].map(str::to_owned)];
         for preview in design.check_preview.iter().filter(|preview| preview.selected || preview.pending) {
@@ -612,17 +613,22 @@ fn review_checks(design: Option<&super::DeclarationDesign>, width: Option<&Width
 fn configured_checks(
     snapshot: Option<&crate::checks::ConfigSnapshot>,
     width: Option<&WidthProfile>,
-) -> Result<Vec<Vec<String>>> {
+) -> Result<Vec<BufferBlock>> {
     use crate::checks::{CheckScope, CheckTrigger};
 
-    let Some(snapshot) = snapshot else {
-        return Ok(vec![vec![
-            "Unconfigured · use /checks setup before submission.".into(),
-        ]]);
+    let message = match snapshot {
+        None => Some("Unconfigured · use /checks setup before submission."),
+        Some(snapshot) if snapshot.config.definitions.is_empty() => Some("No automated checks configured."),
+        _ => None,
     };
-    if snapshot.config.definitions.is_empty() {
-        return Ok(vec![vec!["No automated checks configured.".into()]]);
+    if let Some(message) = message {
+        return Ok(vec![BufferBlock {
+            id: BlockId("plan:configured-checks:0".into()),
+            text: BufferText::from_rows([message])?,
+            metadata: BlockMetadata::default(),
+        }]);
     }
+    let snapshot = snapshot.context("configured checks have no snapshot")?;
     let mut commands = HashMap::new();
     for check in &snapshot.config.definitions {
         let operation = match check.scope {
@@ -675,7 +681,7 @@ fn configured_checks(
     render_check_table(table, width)
 }
 
-fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> Result<Vec<Vec<String>>> {
+fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> Result<Vec<BufferBlock>> {
     let profile = width.cloned().unwrap_or_default();
     let mut widths = [0; 5];
     for row in &table {
@@ -699,6 +705,12 @@ fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> 
         }
     }
     for (index, row) in table.iter().enumerate() {
+        // Direct check invocations use PowerShell-compatible quoting in their display form.
+        let highlights = if index > 0 && width.is_some() {
+            crate::permissions::shell::highlights(&row[1], crate::permissions::shell::CommandShell::PowerShell)
+        } else {
+            Vec::new()
+        };
         let wrapped = row
             .iter()
             .enumerate()
@@ -710,29 +722,48 @@ fn render_check_table(table: Vec<[String; 5]>, width: Option<&WidthProfile>) -> 
             .collect::<Result<Vec<_>, _>>()?;
         let height = wrapped.iter().map(Vec::len).max().unwrap_or(1);
         let mut rendered = Vec::new();
+        let mut metadata = BlockMetadata::default();
+        let mut command_offset = 0;
         for row_index in 0..height {
-            let cells = wrapped
-                .iter()
-                .enumerate()
-                .map(|(column, rows)| {
-                    let cell = rows.get(row_index).map(String::as_str).unwrap_or_default();
-                    Ok(format!(
-                        "{cell}{}",
-                        " ".repeat(widths[column].saturating_sub(profile.cells(cell, 0)?))
-                    ))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            rendered.push(cells.join(" │ ").trim_end().to_owned());
+            let mut line = String::new();
+            for (column, rows) in wrapped.iter().enumerate() {
+                if column > 0 { line.push_str(" │ "); }
+                let cell = rows.get(row_index).map(String::as_str).unwrap_or_default();
+                if column == 1 {
+                    for highlight in &highlights {
+                        let start = highlight.range.start.max(command_offset);
+                        let end = highlight.range.end.min(command_offset + cell.len());
+                        if start < end {
+                            metadata.decoration.push(Decoration {
+                                range: TextRange {
+                                    start: TextPosition { row: row_index, column: line.len() + start - command_offset },
+                                    end: TextPosition { row: row_index, column: line.len() + end - command_offset },
+                                },
+                                capture: highlight.group.clone(),
+                                priority: 100u16.saturating_add(highlight.priority.try_into().unwrap_or(u16::MAX)),
+                            });
+                        }
+                    }
+                    command_offset += cell.len();
+                    if row[1].as_bytes().get(command_offset) == Some(&b'\n') { command_offset += 1; }
+                }
+                line.push_str(cell);
+                line.push_str(&" ".repeat(widths[column].saturating_sub(profile.cells(cell, 0)?)));
+            }
+            rendered.push(line.trim_end().to_owned());
         }
-        lines.push(rendered);
+        lines.push(BufferBlock { id: BlockId(format!("plan:configured-checks:{}", lines.len())),
+            text: BufferText::from_rows(rendered)?, metadata });
         if index == 0 {
-            lines.push(vec![
-                widths
+            lines.push(BufferBlock {
+                id: BlockId(format!("plan:configured-checks:{}", lines.len())),
+                text: BufferText::from_rows([widths
                     .iter()
                     .map(|width| "─".repeat(*width))
                     .collect::<Vec<_>>()
-                    .join("─┼─"),
-            ]);
+                    .join("─┼─")])?,
+                metadata: BlockMetadata::default(),
+            });
         }
     }
     Ok(lines)
@@ -749,10 +780,11 @@ fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
 pub(super) fn test_inventory(design: &super::DeclarationDesign) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
     let files = &design.document.tests;
     let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
-    let mut block = vec![section_header(
-        BlockId("plan:section:tests".into()),
-        &format!("Tests · {}", super::design_tests::summary(files)),
-    )?];
+    let mut heading = vec![TextChunk { text: " Tests ".into(), capture: "RenderMarkdownH1".into() },
+        TextChunk { text: "· ".into(), capture: "Comment".into() }];
+    heading.extend(super::design_tests::summary(files));
+    heading.push(TextChunk { text: " ".into(), capture: "Normal".into() });
+    let mut block = vec![forge_diff::projection::header(BlockId("plan:section:tests".into()), heading, 0)?];
     let mut anchors = vec![PlanNavigationAnchor {
         line: 1, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
         json_path: "/design/document/tests".into(), path: None, label: "Tests".into(),
@@ -1173,13 +1205,44 @@ mod tests {
         for columns in [60, 100, 170] {
             let profile = WidthProfile { columns, ..Default::default() };
             let rows = render_check_table(table.clone(), Some(&profile)).unwrap();
-            let text = rows.iter().flatten().cloned().collect::<Vec<_>>().join("\n");
+            let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
             assert!(text.contains("error:"), "{text}");
-            for line in rows.iter().flatten() {
+            for line in rows.iter().flat_map(|row| row.text.wire_rows()) {
                 assert!(profile.cells(line, 0).unwrap() < columns, "{columns}: {line}");
             }
         }
         render_check_table(table, None).unwrap();
+    }
+
+    #[test]
+    fn check_table_projects_command_syntax_across_wrapped_quotes_and_unicode() {
+        let toolchain = "\"+nightly-2026-04-01-x86_64-pc-windows-msvc\"";
+        let command = format!("cargo {toolchain} fmt --all -- --check\nnu -c \"print 日本語\"");
+        for columns in [60, 100, 170] {
+            let profile = WidthProfile { columns, ..Default::default() };
+            let table = vec![
+                ["Stage", "Command", "Scope", "Triggers", "Requires"].map(str::to_owned),
+                ["Format", &command, "All", "src/**", "—"].map(str::to_owned),
+            ];
+            let blocks = render_check_table(table, Some(&profile)).unwrap();
+            let row = &blocks[2];
+            let captured = |capture: &str| row.metadata.decoration.iter()
+                .filter(|span| span.capture == capture)
+                .map(|span| {
+                    assert_eq!(span.range.start.row, span.range.end.row);
+                    let line = row.text.row(span.range.start.row).unwrap();
+                    let cells = line.split(" │ ").collect::<Vec<_>>();
+                    let command_start = cells[0].len() + " │ ".len();
+                    assert!(span.range.start.column >= command_start);
+                    assert!(span.range.end.column <= command_start + cells[1].len());
+                    &line[span.range.start.column..span.range.end.column]
+                }).collect::<String>();
+            assert_eq!(captured("ForgeHarnessCommand"), "cargonu");
+            assert_eq!(captured("String"), format!("{toolchain}\"print 日本語\""));
+            let options = captured("ForgeHarnessOption");
+            assert!(options.contains("--all") && options.contains("--check") && options.contains("-c"), "{options}");
+            assert!(blocks[..2].iter().all(|row| row.metadata.decoration.is_empty()));
+        }
     }
 
     #[test]
@@ -1675,6 +1738,16 @@ mod tests {
             let rows = block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
             assert!(rows.contains(&" Tests · 1 new · 1 modified · 1 removed · 1 reused "));
             let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
+            let heading = &block[tests_start];
+            let text = heading.text.row(0).unwrap();
+            for (label, capture) in [(" Tests ", "RenderMarkdownH1"), ("1 new", "ForgeAddRange"),
+                ("1 modified", "ForgeModifyRange"), ("1 removed", "ForgeDeleteRange"), ("1 reused", "Comment")] {
+                let span = heading.metadata.decoration.iter().find(|span| span.capture == capture
+                    && &text[span.range.start.column..span.range.end.column] == label);
+                assert!(span.is_some(), "missing {capture} for {label}");
+            }
+            assert!(heading.metadata.decoration.iter().filter(|span| span.capture == "RenderMarkdownH1")
+                .all(|span| span.range.end.column == " Tests ".len()));
             assert_eq!(block[tests_start - 1].text.row(0), Some(""));
             assert_eq!(block[tests_start - 1].id.0, "plan:section:changes:separator");
             assert!(block[tests_start - 1].metadata.decoration.is_empty());

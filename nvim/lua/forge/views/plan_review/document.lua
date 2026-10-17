@@ -62,8 +62,8 @@ function M.attach(options, callback)
     if not node or not row then return end
     for _, target in ipairs(node.entry.metadata.target or {}) do
       if target.id == captured.target then
-        vim.api.nvim_buf_set_extmark(options.buffer, symbol_namespace, buffer.physical_row(owner.replica, row + target.range.start.row), target.range.start.column, {
-          end_row = buffer.physical_row(owner.replica, row + target.range["end"].row), end_col = target.range["end"].column,
+        vim.api.nvim_buf_set_extmark(options.buffer, symbol_namespace, buffer.physical_row(owner.replica, row + target.range.start.row), buffer.physical_column(owner.replica, row + target.range.start.row, target.range.start.column), {
+          end_row = buffer.physical_row(owner.replica, row + target.range["end"].row), end_col = buffer.physical_column(owner.replica, row + target.range["end"].row, target.range["end"].column),
           hl_group = capture, priority = 130,
         })
         return
@@ -116,8 +116,7 @@ function M.attach(options, callback)
   end
   local dispatch_operation
   local function wrapping()
-    local width = require("forge.content_layout").continuation_indent(owner.replica.sequence)
-    return { indent = true, options = "shift:" .. width }
+    return { indent = true, options = "shift:0" }
   end
   ---@param operation table
   ---@param phase string
@@ -296,6 +295,8 @@ function M.attach(options, callback)
     project_source()
     local source_lines = {}
     for _, row in ipairs(source) do
+      local node = source_document.sequence.node[row.block]
+      row.display_indent = node and require("forge.content_layout").leading_width(node.entry, row.position.row) or 0
       source_lines[#source_lines + 1] = row.text
       row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL and row.source_line > 0
     end
@@ -308,7 +309,7 @@ function M.attach(options, callback)
         local row = (owner.optimistic_source or source)[record.source_index]
         local metadata = row.metadata or {}
         for _, decoration in ipairs(metadata.decoration or {}) do
-          local projected = decorations.project_row(decoration, row.position.row, record.row, #row.text)
+          local projected = decorations.project_row(decoration, row.position.row, record.row, #row.text, row.display_indent)
           if projected then
             vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, projected.column, projected.options)
           end
@@ -321,6 +322,7 @@ function M.attach(options, callback)
       end
     end
     owner.comment_state = nil
+    owner.replica.materialized_prefix = true
     owner.replica.physical_row = nil
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
       source_provider = function() return owner.optimistic_source or source end, after_render = paint,
@@ -375,7 +377,7 @@ function M.attach(options, callback)
         if annotation.focused then focused_id = annotation.id break end
       end
       comments.detach(options.buffer, false)
-      owner.replica.locate, owner.replica.physical_row = nil, nil
+      owner.replica.locate, owner.replica.physical_row, owner.replica.physical_column = nil, nil, nil
       owner.replica.source_layout_row = nil
       owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
       attach_projection(opened, source, focused_id)

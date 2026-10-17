@@ -3860,6 +3860,7 @@ Planning continuation: turn {} of {}.",
                     )?;
                 plan.document_version = document.version;
                 plan.submitted_version = Some(document.version);
+                plan.acceptance = None;
                 plan.title = document.title.clone();
                 plan.review_digest = Some(digest);
                 plan.validation_warning = validation_warning;

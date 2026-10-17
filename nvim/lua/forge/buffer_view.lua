@@ -47,6 +47,7 @@ end
 ---@field row integer Offset inside the retained block.
 ---@field original_row integer Zero-based native cursor row before the update.
 ---@field column integer Zero-based byte column.
+---@field source_column? boolean Column is canonical and requires projection on restore.
 ---@field projection_offset? integer Physical offset within an attached annotation.
 ---@field view table Native winsaveview state.
 
@@ -103,7 +104,9 @@ function M.capture(session, retained)
         end
       end
       result[#result + 1] = {
-        window = window, block = block, row = offset, original_row = original_row, column = cursor[2],
+        window = window, block = block, row = offset, original_row = original_row,
+        column = source and projection_offset == 0 and source.position.column or cursor[2],
+        source_column = source ~= nil and projection_offset == 0,
         projection_offset = projection_offset,
         source_row = block and session.projection and not session.project_source
           and require("forge.node_projection").source_position(session, block, {row=offset,column=0}).row or nil,
@@ -130,12 +133,13 @@ function M.restore(session, retained)
         row = start + math.min(offset, node.entry.row_count - 1)
       end
       local row_count = session.row_count
+      local canonical_row = row
       if session.source_projected and session.physical_row then
         row_count = vim.api.nvim_buf_line_count(session.buffer)
         row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
       end
       vim.api.nvim_win_call(saved.window, function()
-        local column = saved.column
+        local column = saved.source_column and require("forge.buffer").physical_column(session, canonical_row, saved.column) or saved.column
         local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
         local insertion = vim.api.nvim_get_current_win() == saved.window and vim.fn.mode(1):match("^[iR]") ~= nil
         column = math.min(column, math.max(0, #line - (insertion and 0 or 1)))

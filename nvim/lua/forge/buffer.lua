@@ -398,7 +398,7 @@ local function install_metadata(session, prepared, replace_all)
       local entry, mark = prepared.block[id], {}
       local start_row = prepared.position[id]
       local layout_marks = require("forge.content_layout").install(session.buffer, session.namespace,
-        start_row, entry, layout_row)
+        start_row, entry, layout_row, session.materialized_prefix)
       session.layout_marks = session.layout_marks or {}
       session.layout_marks[id] = layout_marks
       vim.list_extend(mark, layout_marks)
@@ -442,7 +442,7 @@ function M.refresh_source_layout(session, locate)
       if not previous[handle] then retained[#retained + 1] = handle end
     end
     local _, start = session.sequence:position(node.id)
-    local marks = require("forge.content_layout").install(session.buffer, session.namespace, start, node.entry, locate)
+    local marks = require("forge.content_layout").install(session.buffer, session.namespace, start, node.entry, locate, session.materialized_prefix)
     session.layout_marks[node.id] = marks
     vim.list_extend(retained, marks)
     session.marks[node.id] = retained
@@ -869,6 +869,15 @@ function M.physical_row(session, row)
     end
   end
   return row + delta
+end
+
+---Map a canonical source column into its displayed row.
+---@param session table
+---@param row integer Canonical generated source row.
+---@param column integer Canonical byte column.
+---@return integer
+function M.physical_column(session, row, column)
+  return session.physical_column and session.physical_column(row, column) or column
 end
 
 ---@class ForgeBufferFragment

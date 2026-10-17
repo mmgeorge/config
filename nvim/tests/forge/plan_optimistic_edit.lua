@@ -22,6 +22,12 @@ local baseline = vim.deepcopy(source)
 local projected = preview.project(source, selected)
 assert(vim.deep_equal(source, baseline), "preview mutated the canonical source")
 assert(projected[2].text == " Tests · 1 new ", projected[2].text)
+local heading = projected[2]
+for _, span in ipairs(heading.metadata.decoration) do
+  local text = heading.text:sub(span.range.start.column + 1, span.range["end"].column)
+  if span.capture == "RenderMarkdownH1" then assert(text == " Tests ", "counts retained the section background") end
+  if text == "1 new" then assert(span.capture == "ForgeAddRange", "new count lost its foreground color") end
+end
 assert(projected[3].hidden and not projected[1].hidden, "empty file removal hid unrelated text")
 for index, row in ipairs(projected) do
   assert(row.source_line == source[index].source_line and row.block == source[index].block, "preview changed source identity")
@@ -30,6 +36,7 @@ end
 selected[#selected + 1] = retained
 projected = preview.project(source, selected)
 assert(projected[2].text == " Tests · None planned ", projected[2].text)
+assert(projected[2].metadata.decoration[3].capture == "Comment", "empty inventory must use neutral text")
 assert(projected[8].hidden, "last test deletion retained its empty file heading")
 
 local folded = vim.deepcopy(source)

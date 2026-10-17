@@ -38,6 +38,14 @@ assert(replica.locate(4, 17).target == "last-target", "symbol endpoints must rem
 vim.api.nvim_exec_autocmds("CursorMoved", { buffer = buffer })
 assert(replica.physical_row(43) > 1, "compact comments must retain source positions")
 assert(replica.physical_row(44) == vim.api.nvim_buf_line_count(buffer), "final source boundaries must include comments")
+source[2].display_indent = 6
+comments.update(buffer, {})
+local displayed = replica.physical_row(43)
+assert(vim.api.nvim_buf_get_lines(buffer, displayed, displayed + 1, false)[1] == "      " .. source[2].text)
+assert(replica.physical_column(43, 5) == 11, "source-to-display mapping lost its row prefix")
+assert(replica.locate(displayed, 11).target == "director" and replica.locate(displayed, 24).target == "weapon",
+  "display padding shifted symbol navigation away from canonical source columns")
+assert(replica.locate(displayed, 0).position.column == 0, "presentation padding produced a negative source column")
 comments.detach(buffer)
 vim.api.nvim_buf_delete(buffer, { force = true })
 print("draft_source: exact symbol navigation and sparse source boundaries survive local comments")

@@ -114,19 +114,15 @@ function M.prepare(entry, read_row)
   end
 end
 
----Measure the leading virtual columns excluded from native continuation indentation.
----@param sequence ForgeBlockSequence
+---Measure one row's leading presentation columns.
+---@param entry ForgeLayoutEntry
+---@param row integer
 ---@return integer
-function M.continuation_indent(sequence)
+function M.leading_width(entry, row)
   local width = 0
-  for _, node in pairs(sequence.node) do
-    for _, layout in pairs(node.entry.row_layout or {}) do
-      local leading = 0
-      for _, insertion in ipairs(layout.insertion) do
-        if insertion.position.column == 0 then leading = leading + insertion.width end
-      end
-      width = math.max(width, leading)
-    end
+  local layout = entry.row_layout and entry.row_layout[row]
+  for _, insertion in ipairs(layout and layout.insertion or {}) do
+    if insertion.position.column == 0 then width = width + insertion.width end
   end
   return width
 end
@@ -136,8 +132,9 @@ end
 ---@param start_row integer
 ---@param entry ForgeLayoutEntry
 ---@param physical_row? fun(row: integer): integer? Maps visible source rows into an annotated buffer.
+---@param materialized? boolean Leading presentation columns already exist as display whitespace.
 ---@return integer[]
-function M.install(buffer, namespace, start_row, entry, physical_row)
+function M.install(buffer, namespace, start_row, entry, physical_row, materialized)
   local marks = {}
   for row, row_layout in pairs(entry.row_layout) do
     local target_row = physical_row and physical_row(start_row + row) or nil
@@ -146,9 +143,11 @@ function M.install(buffer, namespace, start_row, entry, physical_row)
       for _, insertion in ipairs(row_layout.insertion) do
         local chunks = {}
         for _, chunk in ipairs(insertion.chunk) do chunks[#chunks + 1] = { chunk.text, chunk.capture } end
+        local leading = materialized and M.leading_width(entry, row) or 0
+        local column = insertion.position.column == 0 and 0 or insertion.position.column + leading
         marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace,
-          target_row, insertion.position.column, {
-          virt_text = chunks, virt_text_pos = "inline", hl_mode = "combine", priority = insertion.priority,
+          target_row, column, {
+          virt_text = chunks, virt_text_pos = materialized and column == 0 and "overlay" or "inline", hl_mode = "combine", priority = insertion.priority,
           right_gravity = true, strict = true,
         })
       end

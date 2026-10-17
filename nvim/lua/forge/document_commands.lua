@@ -13,6 +13,9 @@ local function selected_rows(session)
   local first, last = math.min(anchor, cursor), math.max(anchor, cursor)
   local rows = vim.api.nvim_buf_get_lines(session.buffer, first - 1, last, true)
   for index, text in ipairs(rows) do
+    local location = session.decoration_location and session.decoration_location(first + index - 2)
+    text = text:sub((location and location.display_indent or 0) + 1)
+    rows[index] = text
     local layout = gutter.bounds(session, first + index - 1)
     if layout then
       local fragment, column = {}, 0

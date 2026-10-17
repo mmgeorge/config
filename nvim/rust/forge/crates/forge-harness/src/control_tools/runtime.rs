@@ -310,7 +310,7 @@ impl ControlToolRuntime {
                         return Ok(ControlToolResult { invocation: None, message });
                     }
                     self.plan_document = Some(submitted);
-                    self.terminal = true;
+                    self.context.plan_state = Some(PlanState::AwaitingReview);
                     return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });
                 }
                 let workspace_root = self
@@ -321,7 +321,7 @@ impl ControlToolRuntime {
                 validate_workspace_references(document, workspace_root)?;
                 render_plan(document)?;
                 self.plan_document = Some(document.clone());
-                self.terminal = true;
+                self.context.plan_state = Some(PlanState::AwaitingReview);
                 Ok(ControlToolResult {
                     invocation: Some(invocation),
                     message: self.plan_version_message("Plan passed canonical submission validation"),
@@ -403,8 +403,8 @@ impl ControlToolRuntime {
     fn require_editable_plan(&self) -> Result<()> {
         self.require_readable_plan()?;
         anyhow::ensure!(
-            matches!(self.context.plan_state, Some(PlanState::Generating | PlanState::Revising)),
-            "plan submission requires a generating or revising plan"
+            matches!(self.context.plan_state, Some(PlanState::Generating | PlanState::Revising | PlanState::AwaitingReview)),
+            "plan submission requires a draft or reviewable plan"
         );
         Ok(())
     }
@@ -583,11 +583,65 @@ mod test {
         let repair_patch = format!("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Algorithm\n+  inspect owner.private\n+Accesses\n+  Owner::private\n*** End Patch", declaration.lines().last().unwrap());
         runtime.invoke(change(3, &repair_patch)).await.unwrap();
         runtime.invoke(ControlToolInvocation { name:"plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":4}) }).await.unwrap();
-        assert!(runtime.invoke(change(4,patch)).await.is_err());
+        assert!(!runtime.terminal);
+        runtime.invoke(ControlToolInvocation { name:"plan_read".into(),arguments:json!({"plan_id":"plan"}) }).await.unwrap();
     }
 
 
 
+
+    #[tokio::test]
+    async fn submitted_algorithms_remain_editable_and_only_the_latest_submission_is_replayed() {
+        let mut context = planning_context();
+        context.plan_state = Some(PlanState::AwaitingReview);
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Return the current value.".into();
+        design.document.background = "The value is exposed through a public function.".into();
+        design.document.design = "Keep the public function and revise its returned value.".into();
+        design.proposed.insert("api.rs".into(), "pub fn value() -> u32;\n".into());
+        design.proposed_calls.insert("api.rs".into(), vec![crate::plan::FunctionBody {
+            owner: "value".into(), evidence: None, call: Some(Vec::new()),
+            behavior: Some(crate::plan::FunctionBehavior::Algorithm("return 0".into())),
+        }]);
+        context.plan_document.as_mut().unwrap().design = Some(design);
+        let initial = context.plan_document.clone().unwrap();
+        let workspace = context.workspace_root.clone().unwrap();
+        let mut runtime = ControlToolRuntime::new(context);
+        let mut output = BackendOutput::default();
+        let submit = |version| ControlToolInvocation {
+            name: "plan_submit".into(), arguments: json!({"plan_id":"plan","expected_version":version}),
+        };
+        for _ in 0..2 {
+            let accepted = runtime.invoke(submit(1)).await.unwrap();
+            apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
+        }
+        let read = runtime.invoke(ControlToolInvocation {
+            name: "plan_read".into(), arguments: json!({"plan_id":"plan","path":"api.rs"}),
+        }).await.unwrap();
+        assert!(read.message.contains("return 0"));
+        let accepted = runtime.invoke(ControlToolInvocation {
+            name: "design_patch".into(), arguments: json!({"plan_id":"plan","expected_version":1,
+                "patch":"*** Begin Patch\n*** Update File: api.rs\n@@\n-  return 0\n+  return 1\n*** End Patch"}),
+        }).await.unwrap();
+        apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
+        assert!(output.plan_submit.is_none(), "an edit retained the older accepted submission");
+        assert!(runtime.invoke(submit(1)).await.is_err(), "a stale version was resubmitted");
+        let accepted = runtime.invoke(submit(2)).await.unwrap();
+        apply_invocation(&accepted.invocation.unwrap(), &mut output).unwrap();
+        let submission = output.plan_submit.unwrap();
+        assert_eq!(submission.expected_version, 2);
+        assert!(!runtime.terminal);
+        let mut replayed = initial;
+        for patch in output.design_patch {
+            replayed = replayed.patch_design(&workspace, patch).unwrap();
+        }
+        let files = crate::plan::PlanFileStore::new(workspace.join("data"), &workspace);
+        files.write_working_document("session", "plan", &replayed).unwrap();
+        let (submitted, _, _) = files.submit_document_revision("session", "plan", 1, submission.expected_version).unwrap();
+        assert_eq!(submitted.version, 2);
+        assert_eq!(submitted.design.unwrap().proposed_calls["api.rs"][0].behavior,
+            Some(crate::plan::FunctionBehavior::Algorithm("return 1".into())));
+    }
 
     #[tokio::test]
     async fn focused_declaration_reads_and_patches_return_exact_context() {
@@ -720,7 +774,7 @@ mod test {
             arguments: json!({ "plan_id": "plan", "expected_version": 1 }),
         }).await.unwrap();
         assert!(result.message.contains("passed canonical submission validation"));
-        assert!(runtime.terminal);
+        assert!(!runtime.terminal);
     }
 
     #[tokio::test]

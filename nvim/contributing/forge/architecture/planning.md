@@ -85,7 +85,10 @@ Uncaptured and removed files cannot enter this resolver through filesystem disco
 
 Callable behavior is stored as a tagged `FunctionBehavior`, either `Algorithm` or `Change`.
 New functions and methods require a nonempty `Algorithm` at submission. Existing callables use
-`Change` for behavioral deltas, with guidance requiring one or two sentences as succinct as possible.
+`Change` for behavioral deltas, preferably one short sentence stating the concrete problem or
+purpose and the behavior that addresses it. A second sentence is reserved for essential detail.
+The reason must follow from the task or inspected baseline, without inventing a defect or
+restating unchanged behavior.
 The immutable baseline, including file moves, determines which
 category applies. Drafts can remain incomplete, while duplicate or mixed behavior blocks fail
 parsing. Academic pseudocode retains nested indentation through editing, serialization, and review.
@@ -108,8 +111,11 @@ Algorithm expressions default to comment-gray prose. Assignment targets, standal
 operator operands, call arguments, and qualified or underscored references receive variable
 styling. Variables and named fields render white. Algorithm and Change headings share the
 reference section heading style used by Calls, Constructs, and Accesses.
-Soft-wrapped plan rows retain their source indentation plus the virtual gutter width, without
-rewriting stored source text. Each window wraps independently at its own width.
+Soft-wrapped plan rows retain their own source indentation and gutter width. The review buffer
+reserves leading display whitespace per row, with gutters overlaid on that space. Source-column
+mapping excludes this padding from navigation and copying. Stored source text stays unchanged.
+Each window wraps independently at its own width. Shared background decorations repeat across
+the continuation margin, including the whitespace before wrapped test descriptions.
 Behavior rows carry category-aware review anchors. Collapsed signatures never append `[changed]`.
 Algorithm definition navigation uses parsed reference segments and the enclosing callable's
 signature. Selecting a parameter name, including a receiver or call argument, jumps to its exact
@@ -191,7 +197,7 @@ or full typechecking of the proposed program.
 
 ## Validation, persistence, flows, and review questions
 
-The submit tool runs reference validation before becoming terminal, so the provider can repair a
+The submit tool runs reference validation before accepting a version, so the provider can repair a
 rejected design in the same turn. The broker repeats validation on the formatted snapshot before
 freezing it. `DeclarationDesign.validation` stores generated location-bearing diagnostics and its
 snapshot fingerprint. Patches invalidate that evidence. Review displays a collapsible Validation
@@ -260,6 +266,11 @@ so hidden fences do not shift definition targets or saved annotation coordinates
 
 Plan review places Tests after proposed declaration changes, followed by Checks and Verification. Each section
 retains its own fold boundary and navigation targets in both full and public-only views.
+Check command cells reuse the shell syntax highlighter used by permission previews. They parse
+the complete displayed invocation before table wrapping, then project token byte ranges into
+each wrapped cell. Quoted arguments retain their capture across row boundaries, while headers,
+padding, separators, and other columns remain outside command syntax. The parser uses the
+PowerShell-compatible quoting produced by direct check invocation display on every platform.
 The blank row before Tests stays outside the Changes fold in both views.
 Rust inspection masks test attributes and test-only `cfg` gates in both Public and All views.
 The mask includes attached documentation, nested helpers, and synthetic behavior/reference rows
@@ -269,6 +280,9 @@ Test file headings use `DiffPresenter::file`, while case names and descriptions 
 semantic summary rows with shared change gutters and full-row backgrounds. Modified cases
 use the same orange groups as replacement rows. File folds start expanded and retain stable
 path identities through edits. Every case row carries the same file-and-name deletion target.
+The Tests heading reserves the section background for its label. Adjacent inventory counts use
+green, orange, and red foregrounds for new, modified, and removed tests, with reused counts in
+neutral gray. Optimistic deletions update these text spans before the revised projection arrives.
 Source deliveries include each case's change kind, the file heading's path, and complete
 inventory counts. Optimistic deletion uses those fields without parsing rendered labels or
 markers, preserving counts for cases inside collapsed files. Removing the last case removes
@@ -297,8 +311,11 @@ invokes a structured control tool.
 captures the active plan state, canonical document, resolved question digests, elicitation,
 execution, and goal state, then both adapters feed every control invocation through that Rust
 runtime before forwarding it. Versioned patches atomically mutate virtual files and plan metadata,
-so both providers share the same authoring and validation boundary. The runtime terminalizes question asks and plan
-submissions, rejects controls outside their state, and treats an already-consumed question digest
+so all providers share the same authoring and validation boundary. Submission leaves the runtime
+open for reads, edits, and resubmission in the same turn. A later accepted patch or question clears
+the pending submission, and only the last successfully submitted current version reaches review.
+The runtime terminalizes question asks and execution phase completion, rejects controls outside
+their state, and treats an already-consumed question digest
 as an idempotent success rather than creating another picker. The broker still replays accepted
 operations against durable state with optimistic version checks, which keeps the session-scoped
 broker document authoritative. Adapters export a control invocation into aggregate
@@ -323,7 +340,7 @@ and answer continuations retain its planning context. Reading leaves `AwaitingRe
 A successful version-checked edit applies `ChangesRequested`, changes the exchange to
 `PlanRevision`, and clears pending acceptance. The planning loop then requires submission or a
 new question before completion. A rejected edit does not start a revision. Tool authorization
-allows discussion reads and edits but rejects resubmission without an edit and rejects editing
+allows discussion reads, edits, and revalidation through resubmission, but rejects editing
 while a question remains unresolved. These transitions retain the selected execution authorization.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
@@ -333,7 +350,7 @@ and `question_withdraw` for the embedded planning feedback. The Codex request re
 enforces the same boundary by returning an unsuccessful tool result and omitting the rejected call
 from normalized control output. If Codex edits the plan but ends without submitting or asking a new
 question, the backend starts one bounded corrective provider turn inside the same Harness
-interaction and requires the missing terminal control action. Codex app-server can expose one
+interaction and requires a current submission or new question. Codex app-server can expose one
 dynamic control invocation through both lifecycle and request messages. The JSON-RPC transport
 normalizes that invocation once across the full Harness request, including its corrective turn.
 This keeps one reviewed answer set attached to one planning interaction instead of reopening the

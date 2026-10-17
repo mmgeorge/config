@@ -38,8 +38,10 @@ modify project files.
    Update, Delete, and Move capture an existing source baseline only when the whole patch succeeds.
    Add requires an absent workspace destination. Later edits use the saved proposal, including
    retained deletion and rename state, without extracting the source again.
-6. Keep `plan.json` consistent with the final declarations. Call `plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
-   after successful submission. Submission requests review and never authorizes implementation.
+6. Keep `plan.json` consistent with the final declarations. Call `plan_submit` with the exact current `plan_id` and `expected_version`.
+   Submission requests review and never authorizes implementation. If further work or user input arrives
+   in the same turn, continue reading and editing the plan, then submit its latest version again.
+   Any edit after submission requires a new successful submission before the plan is ready for review.
 
 ## Dependency selection
 
@@ -559,10 +561,13 @@ Categorize callable behavior against the captured source baseline, including aft
 
 - A new function or method requires one nonempty `Algorithm` block describing its complete behavior
   in academic pseudocode. A `Change` block does not satisfy this requirement.
-- A modified function or method uses one `Change` block of one or two sentences, as succinct as
-  possible, describing only its behavioral delta. Include internal changes even when its signature
-  and reference lists remain identical. Do not restate the complete algorithm or use `Algorithm`
-  for an existing callable. Unmodified callables do not need a `Change` block.
+- A modified function or method uses one `Change` block, preferably one short sentence: state
+  the concrete problem or purpose, then the behavioral change that addresses it. Ground the reason
+  in the task or inspected baseline, without inventing a defect. Use a second short sentence only
+  when essential. Omit unchanged behavior and implementation detail that does not explain the delta.
+  Include internal changes even when its signature and reference lists remain identical. Do not
+  restate the complete algorithm or use `Algorithm` for an existing callable. Unmodified callables
+  do not need a `Change` block.
 
 Place the heading at the signature's indentation and its content one level deeper, before `Calls`,
 `Constructs`, and `Accesses`, in that order. Never combine `Algorithm` and `Change` on one callable.
@@ -638,7 +643,8 @@ additional indentation level:
 ```text
 pub fn dispatch(client: &Client);
 Change
-  Stop retrying authentication failures and record the final attempt.
+  Avoid futile retries of rejected credentials by stopping on authentication
+  failure and recording the final attempt.
 Calls
   validate_policy
   Client::send

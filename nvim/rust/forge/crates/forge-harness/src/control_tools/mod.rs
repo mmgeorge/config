@@ -135,7 +135,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "plan_submit",
-                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success confirms submission and the current version. Submission is not implementation approval. No implementation build or second model review runs. In Plan, end the turn after successful submission. During execution, revisions are allowed only in Resolve. Submit one consolidated contract change with a concrete reason. Internal helpers and Calls/Constructs/Accesses differences do not require a revision. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. The execution tool call waits for the review decision. Continue the same turn using its returned revision and feedback.",
+                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success confirms submission and the current version. Submission is not implementation approval. No implementation build or second model review runs. In Plan, tools remain available after submission. Continue on further work or user input, then submit the latest version again. Any later accepted edit invalidates the pending submission until resubmitted. During execution, revisions are allowed only in Resolve. Submit one consolidated contract change with a concrete reason. Internal helpers and Calls/Constructs/Accesses differences do not require a revision. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. The execution tool call waits for the review decision. Continue the same turn using its returned revision and feedback.",
                 input_schema: strict_object_input_schema(
                     vec![
                         ("plan_id", string_schema()),
@@ -317,6 +317,7 @@ pub fn apply_invocation(
     match invocation.name.as_str() {
         "design_patch" => {
             output.design_patch.push(decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?);
+            output.plan_submit = None;
             output.structured_plan = true;
         }
         "plan_read" => {
@@ -334,6 +335,7 @@ pub fn apply_invocation(
         "question_ask" => {
             output.plan_question =
                 Some(decode_arguments::<PlanQuestionSet>(invocation)?.normalize()?);
+            output.plan_submit = None;
         }
         "question_answer" => {
             output.question_answer = Some(decode_arguments::<PlanQuestionAnswer>(invocation)?);

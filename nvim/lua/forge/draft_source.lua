@@ -52,7 +52,7 @@ function M.attach(replica, comments, source)
     local selected = preceding(row)
     if not selected then return nil end
     local original = selected.source
-    local position = { row = original.position.row, column = math.min(column, #original.text) }
+    local position = { row = original.position.row, column = math.min(math.max(0, column - (original.display_indent or 0)), #original.text) }
     local targets = original.metadata and original.metadata.target
     local target
     if type(targets) == "table" then target = require("forge.buffer").target_at(targets, position)
@@ -70,6 +70,12 @@ function M.attach(replica, comments, source)
       else low = middle + 1 end
     end
     return following or vim.api.nvim_buf_line_count(comments.buf)
+  end
+  replica.physical_column = function(row, column)
+    replica.prepare_source()
+    local physical = by_canonical[row]
+    local original = physical and by_row[physical]
+    return column + (original and original.display_indent or 0)
   end
   local after_render = comments.after_render
   replica.source_layout_row = function(row)

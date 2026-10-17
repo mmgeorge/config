@@ -4,10 +4,13 @@ local M = {}
 ---@param row integer One-based buffer row.
 ---@return ForgeRowLayout?
 function M.bounds(session, row)
-  local node = session.sequence:locate(row - 1)
+  local location = session.decoration_location and session.decoration_location(row - 1)
+  if session.decoration_location and not location then return nil end
+  local node = location and session.sequence.node[location.block] or session.sequence:locate(row - 1)
   if not node then return nil end
   local _, start = session.sequence:position(node.id)
-  return node.entry.row_layout and node.entry.row_layout[row - 1 - start]
+  local relative = location and location.position.row or row - 1 - start
+  return node.entry.row_layout and node.entry.row_layout[relative]
 end
 
 function M.normalize(session, selection)
@@ -27,6 +30,8 @@ function M.normalize(session, selection)
   local column, offset = position[3] - 1, position[4]
   if selection then
     column, offset = bounds.column, 0
+  elseif session.materialized_prefix then
+    column, offset = math.max(column, bounds.column + bounds.width), 0
   elseif #text <= bounds.column or column <= bounds.column then
     column, offset = bounds.column, bounds.width
   elseif column >= #text then
@@ -51,11 +56,14 @@ function M.highlight(session, window, row, namespace)
     for _, chunk in ipairs(entry.chunk) do
       chunks[#chunks + 1] = { chunk.text, "Visual" }
     end
-    local screen = vim.fn.screenpos(window, row + 1, entry.position.column + 1)
+    local location = session.decoration_location and session.decoration_location(row)
+    local prefix = location and location.display_indent or 0
+    local physical_column = entry.position.column == 0 and 0 or entry.position.column + prefix
+    local screen = vim.fn.screenpos(window, row + 1, physical_column + 1)
     local column = entry.position.column == 0 and 0
       or screen.col - origin - vim.fn.getwininfo(window)[1].textoff
     if screen.row > 0 and column >= 0 then
-      vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, entry.position.column, {
+      vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, physical_column, {
         virt_text = chunks, virt_text_win_col = column, priority = 65535, hl_mode = "replace", ephemeral = true,
       })
     end

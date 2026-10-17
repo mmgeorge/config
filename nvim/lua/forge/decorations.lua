@@ -14,15 +14,16 @@ end
 
 ---@class ForgeProjectedDecoration
 ---@field column integer
----@field options {end_row: integer, end_col: integer, hl_group: string, hl_eol: boolean, priority: integer, ephemeral?: boolean}
+---@field options {end_row: integer, end_col: integer, hl_group: string, hl_eol: boolean, line_hl_group?: string, priority: integer, ephemeral?: boolean}
 
 ---Project an intersecting source span onto one physical row, retaining full-row backgrounds.
 ---@param decoration {range: {start: {row: integer, column: integer}, ["end"]: {row: integer, column: integer}}, capture: string, priority: integer}
 ---@param relative integer Source row within the block.
 ---@param row integer Physical buffer row.
 ---@param length? integer Current source byte length, when edited text needs clipping.
+---@param prefix? integer Materialized presentation columns before the source text.
 ---@return ForgeProjectedDecoration? # Nil when the source row does not intersect the span or clipping removes it.
-function M.project_row(decoration, relative, row, length)
+function M.project_row(decoration, relative, row, length, prefix)
   local first, last = decoration.range.start, decoration.range["end"]
   if relative < first.row or relative > last.row or (relative == last.row and last.column == 0) then return nil end
   local column = relative == first.row and first.column or 0
@@ -32,11 +33,12 @@ function M.project_row(decoration, relative, row, length)
   if length then finish = math.min(finish, length) end
   if not continues and finish <= column then return nil end
   return {
-    column = column,
+    column = full_width and 0 or column + (prefix or 0),
     options = {
       end_row = (continues or full_width) and row + 1 or row,
-      end_col = (continues or full_width) and 0 or finish,
+      end_col = (continues or full_width) and 0 or finish + (prefix or 0),
       hl_group = decoration.capture, hl_eol = full_width, priority = decoration.priority,
+      line_hl_group = full_width and decoration.capture or nil,
     },
   }
 end
@@ -65,17 +67,23 @@ local function build(values, first, last)
     finish = math.max(end_row, left and left.finish or -1, right and right.finish or -1) }
 end
 
-local function emit(tree, buffer, row, relative)
+local function emit(tree, buffer, row, relative, prefix, indent)
   if not tree or tree.finish < relative then return end
-  emit(tree.left, buffer, row, relative)
+  emit(tree.left, buffer, row, relative, prefix, indent)
   local span = tree.span
   if span.range.start.row > relative then return end
-  local projected = M.project_row(span, relative, row)
+  local projected = M.project_row(span, relative, row, nil, prefix)
   if projected then
     projected.options.ephemeral = true
+    if projected.options.hl_eol and indent > 0 then
+      projected.options.virt_text = { { string.rep(" ", indent), span.capture } }
+      projected.options.virt_text_win_col = 0
+      projected.options.virt_text_repeat_linebreak = true
+      projected.options.hl_mode = "combine"
+    end
     vim.api.nvim_buf_set_extmark(buffer, namespace, row, projected.column, projected.options)
   end
-  emit(tree.right, buffer, row, relative)
+  emit(tree.right, buffer, row, relative, prefix, indent)
 end
 
 vim.api.nvim_set_decoration_provider(namespace, {
@@ -93,11 +101,20 @@ vim.api.nvim_set_decoration_provider(namespace, {
     local node = location and session.sequence.node[location.block]
     if not node then return end
     local relative = location.position.row
+    local prefix = location.display_indent or 0
+    local indent = 0
+    if vim.wo[window].breakindent then
+      local text = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
+      local available = vim.api.nvim_win_get_width(window) - vim.fn.getwininfo(window)[1].textoff
+      local minimum = tonumber(vim.wo[window].breakindentopt:match("min:(%d+)")) or 20
+      indent = math.min(vim.fn.strdisplaywidth(text:match("^%s*") or ""), math.max(0, available - minimum))
+    end
     if relative == 0 then
       require("forge.content_layout").draw_fold(window, buffer, namespace, row,
         node.entry.metadata.layout, require("forge.nodes").display(node.entry))
     end
-    emit(node.entry.visible_decoration, buffer, row, relative)
+    if indent > 0 then emit(node.entry.row_background, buffer, row, relative, prefix, indent) end
+    emit(node.entry.visible_decoration, buffer, row, relative, prefix, indent)
     local source_overlay = node.entry.source_overlay_row[relative]
     if source_overlay or node.entry.source_highlight then
       local mode = vim.api.nvim_get_mode().mode:sub(1, 1):lower()
@@ -110,12 +127,12 @@ vim.api.nvim_set_decoration_provider(namespace, {
       end
       local reveal = vim.wo[window].conceallevel == 0
         or (selected and not vim.wo[window].concealcursor:find(mode, 1, true))
-      if not reveal then emit(node.entry.source_highlight, buffer, row, relative) end
+      if not reveal then emit(node.entry.source_highlight, buffer, row, relative, prefix, indent) end
       for _, overlay in ipairs(source_overlay or {}) do
         local right_aligned = overlay.capture == "ForgeRightAlignedOwner"
         if not reveal or right_aligned then
           if right_aligned and overlay.range.start.column < overlay.range["end"].column then
-            vim.api.nvim_buf_set_extmark(buffer, namespace, row, overlay.range.start.column, {
+            vim.api.nvim_buf_set_extmark(buffer, namespace, row, overlay.range.start.column + prefix, {
               virt_text = { { string.rep(" ", vim.fn.strdisplaywidth(overlay.text)), "Normal" } },
               virt_text_pos = "overlay", hl_mode = "replace",
               priority = overlay.priority + 1, ephemeral = true,
@@ -126,7 +143,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
             virt_text_pos = right_aligned and "right_align" or "overlay",
             hl_mode = "combine", priority = overlay.priority, ephemeral = true,
           }
-          vim.api.nvim_buf_set_extmark(buffer, namespace, row, overlay.range.start.column, options)
+          vim.api.nvim_buf_set_extmark(buffer, namespace, row, overlay.range.start.column + prefix, options)
         end
       end
     end
@@ -136,6 +153,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
 
 ---@class ForgeDecoratedEntry: ForgeLayoutEntry
 ---@field source_overlay_row table<integer, table[]>
+---@field row_background? table
 ---@field visible_decoration? table
 ---@field source_highlight? table
 
@@ -149,6 +167,12 @@ function M.prepare(entry, read_row)
     entry.source_overlay_row[row][#entry.source_overlay_row[row] + 1] = overlay
   end
   require("forge.content_layout").prepare(entry, read_row)
+  local background = {}
+  for _, span in ipairs(entry.metadata.decoration or {}) do
+    if M.full_width(span.capture) then background[#background + 1] = span end
+  end
+  table.sort(background, function(left, right) return left.range.start.row < right.range.start.row end)
+  entry.row_background = build(background, 1, #background)
   for _, kind in ipairs({ "visible_decoration", "source_highlight" }) do
     local values = vim.list_extend({}, entry.metadata[kind] or {})
     local order = {}

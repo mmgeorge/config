@@ -125,6 +125,7 @@ local success, failure = xpcall(function()
   owner.action("open", function(value) selected = value end, original_window)
   action = requests[#requests]
   vim.bo[native_buffer].modifiable = true
+  local previous_text = vim.api.nvim_buf_get_lines(native_buffer, 0, 1, false)[1]
   vim.api.nvim_buf_set_text(native_buffer, 0, 0, 0, 0, { "new " })
   assert(not owner.is_current(action.params.input), "follow-up effect retained authority after newer physical typing")
   action.callback({ json_path = "/title" })
@@ -133,7 +134,7 @@ local success, failure = xpcall(function()
   assert(not owner.closed, "closing an unsaved draft disposed its owner")
   generation = 2
   assert(owner.close())
-  assert(vim.api.nvim_buf_is_valid(native_buffer) and vim.api.nvim_buf_get_lines(native_buffer, 0, 1, false)[1] == "new # Native plan")
+  assert(vim.api.nvim_buf_is_valid(native_buffer) and vim.api.nvim_buf_get_lines(native_buffer, 0, 1, false)[1] == "new " .. previous_text)
 end, debug.traceback)
 if owner then owner.close() end
 client.request_for, client.host_accepting = original_request, original_accepting

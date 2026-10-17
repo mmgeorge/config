@@ -98,8 +98,9 @@ function M.open(review, references, captured)
     if not review.owner.is_current(captured, false) or not vim.api.nvim_win_is_valid(review.win) then return end
     local _, row = review.owner.replica.sequence:position(origin_block)
     if not row then return end
-    origin.lnum = require("forge.buffer").physical_row(review.owner.replica, row) + origin_position.row + 1
-    origin.col = origin_position.column
+    row = row + origin_position.row
+    origin.lnum = require("forge.buffer").physical_row(review.owner.replica, row) + 1
+    origin.col = require("forge.buffer").physical_column(review.owner.replica, row, origin_position.column)
     vim.api.nvim_win_call(review.win, function() vim.fn.winrestview(origin) end)
     review.owner.current_view(review.win).cursor = vim.api.nvim_win_get_cursor(review.win)
   end

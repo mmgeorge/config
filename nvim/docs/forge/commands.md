@@ -109,6 +109,9 @@ Definition jumps reveal omitted declarations and open their enclosing folds in
 PlanReview. Definitions outside the plan open in normal source buffers.
 The `open` action uses the same definition navigation, or opens the source file from a file heading.
 Declaration navigation never opens a popup.
+While a planning response is running, follow-up instructions can revise and resubmit the plan
+in that same response. A later edit requires a new submission before review. Submission never
+authorizes implementation.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

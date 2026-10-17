@@ -96,8 +96,8 @@ pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
     Ok(())
 }
 
-/// Summarizes planned changes without presenting execution pass or fail status.
-pub(super) fn summary(files: &[DesignTestFile]) -> String {
+/// Summarizes planned changes with foreground colors independent of the section label.
+pub(super) fn summary(files: &[DesignTestFile]) -> Vec<forge_buffer::block::TextChunk> {
     let mut counts = [0usize; 4];
     for case in files.iter().flat_map(|file| &file.cases) {
         counts[match case.change {
@@ -105,10 +105,19 @@ pub(super) fn summary(files: &[DesignTestFile]) -> String {
             DesignTestChange::Removed => 2, DesignTestChange::Reused => 3,
         }] += 1;
     }
-    let parts = counts.into_iter().zip(["new", "modified", "removed", "reused"])
-        .filter(|(count, _)| *count > 0).map(|(count, label)| format!("{count} {label}"))
-        .collect::<Vec<_>>();
-    if parts.is_empty() { "None planned".into() } else { parts.join(" · ") }
+    let mut chunks = Vec::new();
+    for ((count, label), capture) in counts.into_iter().zip(["new", "modified", "removed", "reused"])
+        .zip(["ForgeAddRange", "ForgeModifyRange", "ForgeDeleteRange", "Comment"]) {
+        if count == 0 { continue; }
+        if !chunks.is_empty() {
+            chunks.push(forge_buffer::block::TextChunk { text: " · ".into(), capture: "Comment".into() });
+        }
+        chunks.push(forge_buffer::block::TextChunk { text: format!("{count} {label}"), capture: capture.into() });
+    }
+    if chunks.is_empty() {
+        chunks.push(forge_buffer::block::TextChunk { text: "None planned".into(), capture: "Comment".into() });
+    }
+    chunks
 }
 
 /// Projects the complete inventory for section reads and revision diffs.

@@ -103,7 +103,9 @@ instructions, not plan metadata. Product behavior such as a network request time
 of the design when relevant. Include concrete required file changes in proposals, generated artifacts
 in Design, and exact checks in Verification. Tests inventory is planned coverage, not evidence of execution.
 
-In Plan, a successful plan_submit requests review. End the turn after success. Implement only
+In Plan, a successful plan_submit requests review and leaves plan tools available. If further
+work or user input arrives, revise and resubmit the latest version in the same turn. An edit after
+submission invalidates that submission until the edited version is submitted successfully. Implement only
 when Harness supplies an accepted revision and execution instructions. During Execute, follow the
 accepted design with these phase boundaries: Implement writes code and tests, permits justified
 implementation deviations, and never revises the plan or runs checks. Verify collects structural and

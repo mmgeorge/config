@@ -5,6 +5,8 @@ if not vim.g.forge_plan_calls_grid then
   assert(child > 0)
   local success, failure = xpcall(function()
     vim.rpcrequest(child, "nvim_ui_attach", 160, 48, { rgb = true })
+    -- Initialize highlight tracing before rendering content to keep cell attributes valid.
+    vim.rpcrequest(child, "nvim_exec_lua", "vim.api.nvim__inspect_cell(1, 0, 0); vim.cmd('redraw!')", {})
     vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_test_plan_behavior = " .. tostring(vim.g.forge_test_plan_behavior == true) .. "; vim.g.forge_test_plan_flows = " .. tostring(vim.g.forge_test_plan_flows == true) .. "; vim.g.forge_test_plan_tests = " .. tostring(vim.g.forge_test_plan_tests == true) .. "; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
   end, debug.traceback)
   vim.fn.jobstop(child)
@@ -187,8 +189,41 @@ local success, failure = xpcall(function()
     end
     local function locate(predicate)
       for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-        if predicate(text) then return index, text end
+        local source = review.owner.replica.decoration_location(index - 1)
+        if predicate(source and source.text or text) then return index, text end
       end
+    end
+    local function check_test_heading()
+      local row, text = locate(function(value) return value:find(" Tests · ", 1, true) == 1 end)
+      assert(row, "test heading is missing")
+      vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      vim.api.nvim__redraw({ valid = false, flush = true })
+      local function cell(column)
+        local screen = vim.fn.screenpos(review.win, row, column)
+        local inspected = vim.api.nvim__inspect_cell(1, screen.row - 1, screen.col - 1)
+        return inspected[2]
+      end
+      assert(cell(2).background == 0xffffff, "Tests label lost its white background")
+      assert(cell(#" Tests " + 1).background ~= 0xffffff, "separator retained the label background")
+      for kind, color in pairs({ new = 0x50fa7b, modified = 0xffb86c, removed = 0xff5555, reused = 0x888888 }) do
+        local column = text:find("%d+ " .. kind)
+        if column then
+          local highlighted = cell(column)
+          assert(highlighted.foreground == color and highlighted.background ~= 0xffffff,
+            "test count has incorrect foreground or background: " .. kind .. " " .. vim.inspect(highlighted))
+        end
+      end
+    end
+    vim.api.nvim_set_hl(0, "RenderMarkdownH1", { fg = 0, bg = 0xffffff })
+    vim.api.nvim_set_hl(0, "ForgeAddRange", { fg = 0x50fa7b })
+    vim.api.nvim_set_hl(0, "ForgeModifyRange", { fg = 0xffb86c })
+    vim.api.nvim_set_hl(0, "ForgeDeleteRange", { fg = 0xff5555 })
+    vim.api.nvim_set_hl(0, "Comment", { fg = 0x888888 })
+    for _, width in ipairs({ 80, 120, 160 }) do
+      vim.o.columns = width
+      check_test_heading()
     end
     local function file_row(path)
       return assert(locate(function(text) return text:match("^%a+%s+" .. vim.pesc(path) .. "$") end), "test file heading missing: " .. path)
@@ -221,8 +256,13 @@ local success, failure = xpcall(function()
             local ending = vim.fn.screenpos(review.win, row + 1, #description + 1)
             local beginning = vim.fn.screenpos(review.win, row + 1, 3)
             assert(ending.row > beginning.row, "long test descriptions must wrap")
-            local continuation = vim.api.nvim__inspect_cell(1, beginning.row, beginning.col - 1)
-            assert(continuation[2].background == expected[2], "wrapped test description lost its diff background")
+            for screen_row = beginning.row + 1, ending.row do
+              for column = 1, width do
+                local cell = vim.api.nvim__inspect_cell(1, screen_row - 1, column - 1)
+                assert(cell[2].background == expected[2], "wrapped test description lost its diff background: "
+                  .. vim.inspect({ row = screen_row, column = column, cell = cell }))
+              end
+            end
           end
         end
       end
@@ -248,7 +288,9 @@ local success, failure = xpcall(function()
       review.command_set.action_by_id.delete_tests.run({})
       assert(vim.bo.filetype == "ForgeConfirm", "test description selection did not open delete confirmation")
       vim.fn.maparg("y", "n", false, true).callback()
+      check_test_heading()
       await(function() return review.owner.version > version end, "test deletion did not settle")
+      check_test_heading()
       assert(not locate(function(text) return text == selected[2] end), "deleted test is still rendered")
       assert(locate(function(text) return vim.trim(text) == selected[3] end), "test deletion lost the count of folded tests")
       assert(not locate(function(text) return text == "reused_file_case" end), "test deletion expanded an unrelated file")
@@ -424,7 +466,7 @@ local success, failure = xpcall(function()
         for column = 1, width do cells[#cells + 1] = vim.fn.screenstring(row, column) end
         local first_text = table.concat(cells):find("%S")
         assert(first_text == first.col, "wrapped Algorithm indentation differs at " .. width .. ": " .. vim.inspect({ first.col, first_text,
-          vim.wo[review.win].breakindentopt, require("forge.content_layout").continuation_indent(review.owner.replica.sequence) }))
+          vim.wo[review.win].breakindentopt }))
         local cell = vim.api.nvim__inspect_cell(1, row - 1, first.col - 1)
         assert(cell[2].background == 0x123425, "wrapped Algorithm lost its diff background")
       end

@@ -1,4 +1,22 @@
 vim.loader.enable(false)
+if not vim.g.forge_checks_grid then
+  for _, width in ipairs({ 60, 100, 160 }) do
+    local child = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
+    assert(child > 0)
+    local success, failure = pcall(function()
+      vim.rpcrequest(child, "nvim_ui_attach", width, 40, { rgb = true })
+      vim.rpcrequest(child, "nvim_exec_lua", [[
+        vim.g.forge_checks_grid = true
+        vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim')
+        dofile('nvim/tests/forge/plan_checks_host.lua')
+      ]], {})
+    end)
+    vim.fn.jobstop(child)
+    assert(success, failure)
+  end
+  print("plan_checks_host: command syntax and check controls passed at 60, 100, and 160 columns")
+  return
+end
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -6,7 +24,7 @@ vim.fn.mkdir(data, "p")
 local config = vim.json.encode({ checks = { version = 2, definitions = {{
   id = "tests", name = "Package tests", category = "test", area = "Project", enabled = true,
   trigger = { kind = "any_change" }, scope = "all", directory = ".", depends_on = {},
-  all = { command = "nu", args = { "-c", "print checked" } },
+  all = { command = "cargo", args = { "+nightly-2026-04-01-x86_64-pc-windows-msvc", "fmt", "--all", "--", "--check" } },
 }} } })
 vim.fn.writefile({ config }, workspace .. "/.forge.json")
 assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
@@ -40,6 +58,31 @@ local success, failure = xpcall(function()
   await(function() return state.plan_review and state.plan_review.owner.ready end, "plan review")
   local review = state.plan_review
   assert(review.owner.checks[1].enabled)
+  local color = { ForgeHarnessCommand = 0xff3333, String = 0x00ff44, ForgeHarnessOption = 0x00aaff }
+  for group, value in pairs(color) do vim.api.nvim_set_hl(0, group, { fg = value }) end
+  local captured = {}
+  for _, source in ipairs(review.owner.source) do
+    if source.block:find("plan:configured-checks:", 1, true) then
+      for _, span in ipairs(source.metadata.decoration or {}) do
+        if span.range.start.row == source.position.row and color[span.capture] then
+          local _, start = review.owner.replica.sequence:position(source.block)
+          local canonical = start + source.position.row
+          local row = review.owner.replica.physical_row(canonical)
+          local column = review.owner.replica.physical_column(canonical, span.range.start.column)
+          vim.api.nvim_win_set_cursor(review.win, { row + 1, column })
+          vim.cmd("normal! zz")
+          vim.cmd("redraw!")
+          local screen = vim.fn.screenpos(review.win, row + 1, column + 1)
+          local cell = vim.api.nvim__inspect_cell(1, screen.row - 1, screen.col - 1)
+          assert(cell[2].foreground == color[span.capture], "command capture lost its screen color: " .. vim.inspect({ span, cell }))
+          captured[span.capture] = (captured[span.capture] or "") .. source.text:sub(span.range.start.column + 1, span.range["end"].column)
+        end
+      end
+    end
+  end
+  assert(captured.ForgeHarnessCommand == "cargo", "check executable was not highlighted")
+  assert(captured.String == '"+nightly-2026-04-01-x86_64-pc-windows-msvc"', "wrapped quoted argument lost syntax")
+  assert(captured.ForgeHarnessOption and captured.ForgeHarnessOption:find("--check", 1, true), "check options were not highlighted")
   review.command_set.action_by_id.checks.run({})
   vim.fn.maparg("<Space>", "n", false, true).callback()
   await(function() return not state.busy and not review.owner.checks[1].enabled end, "disable check")

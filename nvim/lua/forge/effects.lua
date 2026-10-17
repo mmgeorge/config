@@ -48,14 +48,16 @@ function M.apply(session, view, effect)
       local position = assert(effect.position, "cursor position is missing")
       assert(position.row >= 0 and position.row < node.entry.row_count and position.row == math.floor(position.row), "cursor row is outside block")
       local _, start_row = session.sequence:position(effect.block)
-      start_row = require("forge.buffer").physical_row(session, start_row)
-      local row = vim.api.nvim_buf_get_lines(session.buffer, start_row + position.row, start_row + position.row + 1, true)[1]
-      local byte = row:byte(position.column + 1)
-      assert(position.column >= 0 and position.column <= #row and position.column == math.floor(position.column)
+      local source_row = start_row + position.row
+      local column = require("forge.buffer").physical_column(session, source_row, position.column)
+      start_row = require("forge.buffer").physical_row(session, source_row)
+      local row = vim.api.nvim_buf_get_lines(session.buffer, start_row, start_row + 1, true)[1]
+      local byte = row:byte(column + 1)
+      assert(column >= 0 and column <= #row and column == math.floor(column)
         and (not byte or byte < 128 or byte >= 192), "cursor column splits UTF-8")
       view.effect[effect.id] = true
       if effect.jump then vim.api.nvim_win_call(view.window, function() vim.cmd("normal! m'") end) end
-      vim.api.nvim_win_set_cursor(view.window, { start_row + position.row + 1, position.column })
+      vim.api.nvim_win_set_cursor(view.window, { start_row + 1, column })
       if effect.viewport then require("forge.buffer_view").restore_viewport(session, effect.viewport) end
       view.cursor = vim.api.nvim_win_get_cursor(view.window)
     elseif effect.kind == "open_source" then
