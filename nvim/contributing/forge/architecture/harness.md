@@ -1480,6 +1480,11 @@ metadata from the committed sequence, never from label text or target suffixes.
 Active labels are Working, Planning, Revising plan, Compacting, Implementing, Verifying,
 Resolving, Stopping, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
+Active status headings show the phase and elapsed time. The latest reasoning
+preview appears directly below in italics, aligned with the phase label, and
+wraps within the content width. The preview parses Markdown from at most 4096
+characters without retaining its emphasis markers. Execution comparisons may
+add their file-attention summary. Lua appends the interrupt hint to the heading.
 
 `health.notice` resolves local failures before user approval waits and otherwise preserves the
 native status. User decisions display a static `◷` sign for review, approval, and

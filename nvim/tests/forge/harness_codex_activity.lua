@@ -25,7 +25,7 @@ local errors = {}
 ---@type table<string, boolean>
 local resolved_approval = {}
 ---@type string?
-local working_summary
+local working_status
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
 end
@@ -53,7 +53,10 @@ local function request(method, parameter)
     end
     if state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf) then
       for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-        if line:match("^Working .+ · .+") then working_summary = line end
+        if line:match("^Working ·") then
+          assert(line:match("^Working · %d+s$"), "live status exposed reasoning: " .. line)
+          working_status = line
+        end
       end
     end
     if vim.g.forge_codex_activity_visual then vim.cmd.redraw() end
@@ -104,7 +107,7 @@ local succeeded, failure = xpcall(function()
     end
   end
   if summary then
-    assert(working_summary, "live status did not render the provider's readable reasoning summary")
+    assert(working_status, "live status did not render during provider reasoning")
   end
   assert(arguments and command, "real Codex did not execute both requested tool types: " .. trace_path)
   local controller = require("forge.views.harness.controller")
@@ -146,7 +149,7 @@ local succeeded, failure = xpcall(function()
     assert(vim.uv.fs_copyfile(trace_path, output .. "/trace.jsonl"))
     vim.fn.writefile(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), output .. "/transcript.txt")
     vim.fn.writefile({ vim.json.encode({ result = "pass", columns = vim.o.columns, rows = vim.o.lines,
-      summary_emitted = summary, working_summary = working_summary,
+      summary_emitted = summary, working_status = working_status,
       trace = output .. "/trace.jsonl" }) }, output .. "/result.json")
   end
   if not vim.g.forge_codex_activity_visual then print("HARNESS_CODEX_ACTIVITY_PASS trace=" .. trace_path) end

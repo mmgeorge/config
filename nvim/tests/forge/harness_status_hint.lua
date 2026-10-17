@@ -50,10 +50,12 @@ assert(buffer.apply_snapshot(transcript, {
 assert(displayed() == "", "review hint must disappear when the status changes")
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 2, block = { {
-    id = "status", text = { "", "Working · 2s · Inspecting repository structure" },
+    id = "status", text = { "", "Planning · 37s", "Considering new ECS components." },
     metadata = { status = { row = 1, animated = true, hint = "working" }, target = { { id = "status:working", range = {
       start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
-    } } }, decoration = {}, fold = {}, editable_region = {} },
+    } } }, decoration = { { range = {
+      start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 },
+    }, capture = "ForgeHarnessCommentary", priority = 100 } }, fold = {}, editable_region = {} },
   } },
 }).kind == "Applied")
 hint.render(transcript, command_set, 120)
@@ -79,6 +81,9 @@ local text, marks = working_marks()
 assert(text:find("<C-c> interrupt", 1, true), text)
 assert(#marks == 2 and marks[1][2] == 1 and marks[1][3] == 0)
 assert(marks[2][3] == 0 and marks[2][4].virt_text_pos == "eol")
+assert(marks[1][4].end_row == 1, "status color extended into the italic thought")
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 2, 3, false)[1] == "Considering new ECS components.",
+  "thought preview did not share the phase label's content column")
 local first = marks[1][4].sign_text
 local state = require("forge.session").harness
 local original_session = state.session
@@ -132,7 +137,7 @@ assert(failed[1][4].virt_text[1][2] == "ForgeHarnessToolFailure", "approval hid 
 transcript.status_notice = nil
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 4, block = { {
-    id = "status", text = { "", "Working · 2s · Inspecting repository structure" },
+    id = "status", text = { "", "Planning · 37s" },
     metadata = { status = { row = 1, animated = true, hint = "working" },
       target = {}, decoration = {}, fold = {}, editable_region = {} },
   } },
@@ -186,7 +191,7 @@ assert(footer[3].virt_lines[1][1][1] == "Generating session name…")
 assert(footer[1] == 2 and footer[3].virt_lines_above, "footer was not anchored outside trailing folds")
 transcript.rename_status = nil
 hint.render(transcript, command_set, 120)
-assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working · 2s · Inspecting repository structure",
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Planning · 37s",
   "terminal status modified the exchange clock")
 for revision, phase in ipairs({ "review-plan", "working" }) do
   local label = phase == "working" and "Working · 1s" or "Waiting for plan review"

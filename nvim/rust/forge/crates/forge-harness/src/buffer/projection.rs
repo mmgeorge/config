@@ -446,19 +446,16 @@ impl TimelineRenderer<'_> {
                         )
                     },
                     SessionPhase::Working {
-                        reasoning_summary,
                         activity,
                         execution,
                         ..
                     } => {
                         let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
                         working_status_text(
-                            self.width,
                             elapsed_seconds,
-                            reasoning_summary.as_deref(),
                             *activity,
                             execution.as_ref(),
-                        )?
+                        )
                     }
                     SessionPhase::AwaitingInput { .. } => "Waiting for your answer".into(),
                     SessionPhase::AwaitingApproval { .. } => "Waiting for your approval".into(),
@@ -553,6 +550,9 @@ impl TimelineRenderer<'_> {
                             },
                         },
                     });
+                }
+                if let SessionPhase::Working { reasoning_summary: Some(summary), .. } = status {
+                    append_reasoning_preview(&mut block, &self.content_width(), summary)?;
                 }
                 self.push(block)?;
                 if let SessionPhase::Working { execution: Some(execution), activity, .. } = status
@@ -1977,15 +1977,35 @@ fn history_prefix(disposition: crate::exchange::HistoryDisposition) -> &'static 
     }
 }
 
-const WORKING_STATUS_RESERVED_CELLS: usize = 28;
+fn append_reasoning_preview(block: &mut BufferBlock, width: &WidthProfile, summary: &str) -> Result<()> {
+    let bounded = summary.chars().take(4_096).collect::<String>();
+    let normalized = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
+    if normalized.is_empty() {
+        return Ok(());
+    }
+    let rendered = forge_buffer::markdown::MarkdownRenderer::render(
+        BlockId(format!("{}:reasoning", block.id.0)), &normalized, width,
+    )?;
+    let start = block.text.row_count();
+    let mut rows = block.text.wire_rows();
+    rows.extend(rendered.block.text.wire_rows());
+    block.text = forge_buffer::text::BufferText::from_rows(rows)?;
+    block.metadata.decoration.push(Decoration {
+        range: TextRange {
+            start: TextPosition { row: start, column: 0 },
+            end: TextPosition { row: block.text.row_count(), column: 0 },
+        },
+        capture: "ForgeHarnessCommentary".into(),
+        priority: 100,
+    });
+    Ok(())
+}
 
 fn working_status_text(
-    width: &WidthProfile,
     elapsed_seconds: u64,
-    reasoning_summary: Option<&str>,
     activity: WorkflowActivity,
     execution: Option<&ExecutionStatus>,
-) -> Result<String> {
+) -> String {
     let phase = activity.active_label();
     if let Some(execution) = execution.filter(|execution|
         WorkflowActivity::from(execution.phase) == activity && execution.has_comparison()) {
@@ -1996,43 +2016,9 @@ fn working_status_text(
         let attention = if count == 1 { "1 file needs attention".into() }
             else if count > 1 { format!("{count} files need attention") }
             else { "all files matched".into() };
-        return Ok(format!("{phase} · {elapsed_seconds}s · {attention}"));
+        return format!("{phase} · {elapsed_seconds}s · {attention}");
     }
-    let prefix = format!("{phase} · {elapsed_seconds}s");
-    let Some(reasoning_summary) = reasoning_summary else {
-        return Ok(prefix);
-    };
-    let bounded = reasoning_summary.chars().take(4_096).collect::<String>();
-    let normalized = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return Ok(prefix);
-    }
-    let occupied = width.cells(&prefix, 0)? + 4 + WORKING_STATUS_RESERVED_CELLS;
-    let available = width.columns.saturating_sub(occupied);
-    if available < 4 {
-        return Ok(prefix);
-    }
-    let summary = truncate_to_cells(width, &normalized, available)?;
-    Ok(format!("{prefix} · {summary}"))
-}
-
-fn truncate_to_cells(width: &WidthProfile, text: &str, max_cells: usize) -> Result<String> {
-    if width.cells(text, 0)? <= max_cells {
-        return Ok(text.to_owned());
-    }
-    let mut truncated = String::new();
-    for character in text.chars() {
-        truncated.push(character);
-        if width.cells(&format!("{truncated}…"), 0)? > max_cells {
-            truncated.pop();
-            break;
-        }
-    }
-    while !truncated.is_empty() && width.cells(&format!("{truncated}…"), 0)? > max_cells {
-        truncated.pop();
-    }
-    truncated.push('…');
-    Ok(truncated)
+    format!("{phase} · {elapsed_seconds}s")
 }
 
 fn token_display(tokens: u64) -> String {
@@ -3989,7 +3975,7 @@ mod tests {
             },
         }, &WidthProfile::default(), 133_000).unwrap();
         let initial = render(execution.clone());
-        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention"]);
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention", "Checking files"]);
         assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
         assert!(initial.entry.block[1].metadata.fold[0].closed);
         let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
@@ -4005,7 +3991,7 @@ mod tests {
         execution.progress.unverified.clear();
         execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
-        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched"]);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched", "Checking files"]);
         assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
     }
 
@@ -4064,30 +4050,69 @@ mod tests {
     }
 
     #[test]
-    fn working_status_shows_one_normalized_reasoning_summary_line() {
-        let projection = project_at(
-            &TimelineEntry::Status { agent_count: 0,
-                id: "session:status".into(),
-                created_at_ms: 0,
-                status: SessionPhase::Working {
-                    duration_ms: 0, started_at_ms: Some(1_000),
-                    activity: WorkflowActivity::Working,
-                    execution: None,
-                    reasoning_summary: Some(
-                        "Inspecting\n repository   structure before making changes".into(),
-                    ),
+    fn working_status_keeps_reasoning_below_the_heading_in_italics() {
+        for activity in [
+            WorkflowActivity::Working, WorkflowActivity::Planning, WorkflowActivity::Revising,
+            WorkflowActivity::Implementing, WorkflowActivity::Checking, WorkflowActivity::Verifying,
+            WorkflowActivity::Resolving, WorkflowActivity::Goal,
+        ] {
+            let projection = project_at(
+                &TimelineEntry::Status { agent_count: 0,
+                    id: "session:status".into(),
+                    created_at_ms: 0,
+                    status: SessionPhase::Working {
+                        duration_ms: 0, started_at_ms: Some(1_000),
+                        activity,
+                        execution: None,
+                        reasoning_summary: Some(
+                            "**Considering virtual program implementation**\nI'm thinking about changes".into(),
+                        ),
+                    },
                 },
-            },
-            &WidthProfile::default(),
-            4_999,
-        )
-        .unwrap();
+                &WidthProfile::default(),
+                4_999,
+            )
+            .unwrap();
 
-        assert_eq!(projection.entry.block[0].text.row_count(), 2);
-        assert_eq!(
-            projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working · 3s · Inspecting repository structure bef…"]
-        );
+            let block = &projection.entry.block[0];
+            let rows = block.text.wire_rows();
+            assert_eq!(rows[0], "");
+            assert_eq!(rows[1], format!("{} · 3s", activity.active_label()));
+            assert_eq!(rows[2..].join(" "), "Considering virtual program implementation I'm thinking about changes");
+            assert!(rows[2..].iter().all(|row| !row.starts_with(' ')));
+            assert!(block.metadata.status.as_ref().unwrap().animated);
+            assert_eq!(block.metadata.status.as_ref().unwrap().row, 1);
+            assert!(block.metadata.decoration.iter().any(|decoration|
+                decoration.capture == "ForgeHarnessCommentary"
+                    && decoration.range.start.row == 2
+                    && decoration.range.start.column == 0
+                    && decoration.range.end.row == rows.len()));
+        }
+    }
+
+    #[test]
+    fn working_status_wraps_reasoning_and_omits_empty_previews() {
+        for summary in ["", " \n\t ", "**Considering new ECS components** with Unicode 界 and enough detail to wrap"] {
+            let width = WidthProfile { columns: 32, ..Default::default() };
+            let projection = project_at(&TimelineEntry::Status {
+                id: "session:status".into(), created_at_ms: 0, agent_count: 0,
+                status: SessionPhase::Working {
+                    duration_ms: 37_000, started_at_ms: None,
+                    activity: WorkflowActivity::Planning, execution: None,
+                    reasoning_summary: Some(summary.into()),
+                },
+            }, &width, 0).unwrap();
+            let rows = projection.entry.block[0].text.wire_rows();
+            assert_eq!(rows[1], "Planning · 37s");
+            if summary.trim().is_empty() {
+                assert_eq!(rows.len(), 2);
+            } else {
+                assert!(rows.len() > 3);
+                assert!(rows[2..].iter().all(|row| width.cells(row, 0).unwrap() <= 32));
+                assert_eq!(rows[2..].iter().map(|row| row.trim()).collect::<Vec<_>>().join(" "),
+                    "Considering new ECS components with Unicode 界 and enough detail to wrap");
+            }
+        }
     }
 
     #[test]

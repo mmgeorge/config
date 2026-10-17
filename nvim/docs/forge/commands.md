@@ -55,6 +55,10 @@ file list but have no excerpts, including license files with Markdown or text ex
 `ForgeHarnessLog` requires an open Harness session. Inside Harness, `/sessions`
 opens durable session search and `/undo` opens checkpoint rollback.
 
+The live status line shows the current phase, elapsed time, and interrupt key.
+The latest thought appears below in italics, aligned with the phase label, and
+wraps to the window width.
+
 `/config` includes an **LSP tools** toggle. It enables the read-only
 [`lsp` tool](lsp-tools.md) for model-driven code exploration without
 changing interactive plan navigation or starting language servers.
