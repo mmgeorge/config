@@ -2,7 +2,7 @@
 
 mod assets;
 mod algorithm;
-pub use algorithm::{AlgorithmInvocation, AlgorithmReference, algorithm_reference, validate_algorithm};
+pub use algorithm::{AlgorithmInvocation, AlgorithmReference, algorithm_reference, algorithm_references, validate_algorithm};
 mod context;
 mod query;
 mod configuration;

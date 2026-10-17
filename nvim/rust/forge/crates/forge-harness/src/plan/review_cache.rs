@@ -11,7 +11,7 @@ pub(super) struct ReviewCache {
 impl ReviewCache {
     /// Reuses validation only for identical canonical bytes at the requested strength.
     pub(super) fn validate(&self, document: &PlanDocument, submitted: bool) -> Result<()> {
-        let checksum = digest(&serde_json::to_vec(document)?);
+        let checksum = digest(&crate::plan::codec::to_vec(document)?);
         {
             let current = self.current.lock().map_err(|_| anyhow::anyhow!("plan cache lock poisoned"))?;
             if current.as_ref().is_some_and(|entry| entry.checksum == checksum && (!submitted || entry.submitted)) {
@@ -30,7 +30,7 @@ impl ReviewCache {
 
     /// Returns a rendering only when its complete canonical input is unchanged.
     pub(super) fn rendered(&self, document: &PlanDocument) -> Result<Option<RenderedPlan>> {
-        let checksum = digest(&serde_json::to_vec(document)?);
+        let checksum = digest(&crate::plan::codec::to_vec(document)?);
         let current = self.current.lock().map_err(|_| anyhow::anyhow!("plan cache lock poisoned"))?;
         Ok(current.as_ref().filter(|entry| entry.checksum == checksum).and_then(|entry| entry.rendered.clone()))
     }
@@ -39,7 +39,7 @@ impl ReviewCache {
     pub(super) fn remember(&self, document: &PlanDocument, rendered: &RenderedPlan) -> Result<()> {
         anyhow::ensure!(rendered.navigation.plan_id == document.plan_id
             && rendered.navigation.plan_version == document.version, "rendered plan identity changed");
-        let checksum = digest(&serde_json::to_vec(document)?);
+        let checksum = digest(&crate::plan::codec::to_vec(document)?);
         let mut current = self.current.lock().map_err(|_| anyhow::anyhow!("plan cache lock poisoned"))?;
         *current = Some(CachedReview { checksum, rendered: Some(rendered.clone()), submitted: true });
         Ok(())

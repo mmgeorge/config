@@ -66,7 +66,9 @@ local succeeded, failure = xpcall(function()
       capture = capture, priority = 90 }
     for _, length in ipairs({ 0, 5, 10000 }) do
       local projected = assert(decorations.project_row(decoration, 2, 7, length))
-      assert(projected.column == 0 and projected.options.end_row == 8 and projected.options.end_col == 0)
+      assert(projected.column == 0 and projected.options.end_row == 7 and projected.options.end_col == 0,
+        'row background must not include the following row')
+      assert(projected.options.line_hl_group == capture)
       assert(projected.options.hl_eol and projected.options.hl_group == capture and projected.options.priority == 90)
     end
     assert(not decorations.project_row(decoration, 1, 6, 5), 'decoration leaked before its start')

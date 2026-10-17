@@ -155,6 +155,7 @@ impl ReferenceEvidence {
 pub(crate) struct CallPresentation {
     visibility: [OnceLock<forge_diff::syntax::DeclarationVisibility>; 2],
     folding: OnceLock<Vec<forge_diff::syntax::DeclarationFold>>,
+    callable: OnceLock<Vec<forge_diff::syntax::DeclarationCallable>>,
     /// Signature-only text used by declaration analysis before synthetic bodies are rendered.
     pub plain: String,
     pub declaration: DeclarationPresentation,
@@ -168,6 +169,16 @@ pub(crate) struct CallPresentation {
 }
 
 impl CallPresentation {
+    /// Reuses parsed callable identities and attached source boundaries during comparison.
+    pub(crate) fn callables(&self, path: &str) -> Result<&[forge_diff::syntax::DeclarationCallable]> {
+        if self.callable.get().is_none() {
+            let callable = DeclarationCalls::extract(path, &self.plain, true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let _ = self.callable.set(callable);
+        }
+        Ok(self.callable.get().unwrap())
+    }
+
     /// Preserve displayed coordinates while isolating Algorithm rows from native declarations.
     pub(crate) fn algorithm_source(&self) -> Option<String> {
         self.behavior_row.values().any(|(_, _, category)| *category == "Algorithm").then(|| {
@@ -308,10 +319,24 @@ pub(crate) fn algorithm_reference(
     let function = DeclarationCalls::extract(path, declarations, true)
         .map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().find(|function| function.owner == body.owner)
         .context("Algorithm callable signature is unavailable")?;
+    resolve_algorithm_reference(path, &function, body, reference)
+}
+
+/// Resolve a parsed segment consistently for navigation, validation, and rename.
+pub(crate) fn resolve_algorithm_reference(
+    path: &str,
+    function: &forge_diff::syntax::DeclarationCallable,
+    body: &FunctionBody,
+    reference: forge_diff::syntax::AlgorithmReference,
+) -> Result<Option<AlgorithmTarget>> {
     if reference.first && let Some(position) = function.binding_position.get(&reference.segment) {
         return Ok(Some(AlgorithmTarget::Binding { name: reference.segment, position: *position }));
     }
-    if !reference.last { return Ok(None); }
+    if !reference.last {
+        return Ok(reference.segment.chars().next().is_some_and(char::is_uppercase).then(||
+            AlgorithmTarget::Reference(CallSite { name: reference.prefix.replace('.', if path.ends_with(".rs") { "::" } else { "." }),
+                kind: CallKind::Value, source: None, unresolved: false })));
+    }
     let member = reference.segment;
     let separator = if path.ends_with(".rs") { "::" } else { "." };
     let receiver = reference.name.rsplit_once('.').map(|(receiver, _)| receiver);
@@ -345,7 +370,11 @@ pub(crate) fn algorithm_reference(
     ensure!(candidates.len() <= 1, "Algorithm reference `{}` is ambiguous: {}", reference.name,
         candidates.keys().map(|(name, _)| name.as_str()).collect::<Vec<_>>().join(", "));
     if let Some((_, call)) = candidates.pop_first() { return Ok(Some(AlgorithmTarget::Reference(call))); }
-    if !reference.invocation { return Ok(None); }
+    if !reference.invocation {
+        return Ok(qualified.then(|| AlgorithmTarget::Reference(CallSite {
+            name: reference.name.replace('.', separator), kind: CallKind::Property, source: None, unresolved: false,
+        })));
+    }
     let name = if receiver.is_some() && !qualified {
         ensure!(types.len() == 1, "Algorithm receiver has no unique signature type or Calls target");
         format!("{}{separator}{member}", types.first().unwrap())
@@ -410,6 +439,7 @@ pub(crate) fn insert(
         return Ok(CallPresentation {
             visibility: Default::default(),
             folding: Default::default(),
+            callable: Default::default(),
             plain: text.into(),
             declaration: DeclarationPresentation {
                 text: text.into(),
@@ -554,6 +584,7 @@ pub(crate) fn insert(
     Ok(CallPresentation {
         visibility: Default::default(),
         folding: Default::default(),
+        callable: Default::default(),
         plain: text.into(),
         declaration: DeclarationPresentation {
             text: output,
@@ -637,6 +668,18 @@ pub(super) fn validate_behaviors(design: &super::DeclarationDesign) -> Result<()
                 if let Some(FunctionBehavior::Algorithm(text)) = behavior {
                     let invocations = forge_diff::syntax::validate_algorithm(text)
                         .map_err(|error| anyhow::anyhow!("{path}: {}: {error:?}", function.owner))?;
+                    for reference in forge_diff::syntax::algorithm_references(text)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                        .into_iter().filter(|reference| reference.last && !reference.first && !reference.invocation && !reference.construction_field) {
+                        let line = reference.line;
+                        let column = reference.column;
+                        let Some(AlgorithmTarget::Reference(target)) = resolve_algorithm_reference(path, &function, body.unwrap(), reference)? else { continue };
+                        ensure!(body.unwrap().call.iter().flatten().any(|call|
+                            call.name.replace("::", ".") == target.name.replace("::", ".")
+                            && matches!(call.kind, CallKind::Property | CallKind::Value)),
+                            "{path}: {}: Algorithm line {line}, column {column}: field {} requires a matching Accesses target",
+                            function.owner, target.name);
+                    }
                     for construction in body.into_iter().flat_map(|body| body.call.iter().flatten())
                         .filter(|call| call.kind == CallKind::Construct) {
                         let matching = invocations.iter().filter(|invocation| invocation.name == construction.name)
@@ -902,6 +945,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn algorithm_typed_fields_require_matching_accesses() {
+        for (expression, access, valid) in [
+            ("Record Projectile.previous_position", Some("Projectile::previous_position"), true),
+            ("Record Projectile.previous_position", None, false),
+            ("Record Projectile.missing", Some("Projectile::previous_position"), false),
+            ("Advance the position", None, true),
+        ] {
+            let mut design = super::super::DeclarationDesign::default();
+            design.proposed.insert("main.rs".into(), "pub struct Projectile { pub previous_position: u32 }\npub fn run();\n".into());
+            design.proposed_calls.insert("main.rs".into(), vec![FunctionBody {
+                owner: "run".into(), evidence: None, behavior: Some(FunctionBehavior::Algorithm(expression.into())),
+                call: Some(access.into_iter().map(|name| CallSite { name: name.into(), kind: CallKind::Property, source: None, unresolved: false }).collect()),
+            }]);
+            let result = validate_behaviors(&design);
+            assert_eq!(result.is_ok(), valid, "{expression}: {result:?}");
+            if !valid { assert!(result.unwrap_err().to_string().contains("matching Accesses")); }
+        }
+    }
+
+    #[test]
     fn algorithm_navigation_prefers_signature_then_reference_evidence() {
         let declarations = "pub fn run(abilities: &mut PlayerAbilities, wrapped: ResMut<PlayerAbilities>, keys: Keys);";
         let mut body = FunctionBody {
@@ -925,6 +988,7 @@ mod tests {
             assert_eq!(&declarations[position.column as usize..position.column as usize + name.len()], name);
         }
         for (source, token, expected, kind) in [
+            ("Record Projectile.previous_position", "Projectile", "Projectile", CallKind::Value),
             ("abilities.start_dash(keys)", "start_dash", "PlayerAbilities::start_dash", CallKind::Call),
             ("wrapped.start_dash(keys)", "start_dash", "PlayerAbilities::start_dash", CallKind::Call),
             ("abilities.remaining", "remaining", "PlayerAbilities::remaining", CallKind::Property),

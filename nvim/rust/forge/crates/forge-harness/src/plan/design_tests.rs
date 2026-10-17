@@ -59,6 +59,16 @@ pub(crate) struct DesignTestSelection {
     pub name: String,
 }
 
+/// Match a test to its declaration while rejecting ambiguous module suffixes.
+pub(super) fn declaration_line(functions: &[forge_diff::syntax::DeclarationCallable], name: &str) -> Option<u32> {
+    if let Some(function) = functions.iter().find(|function| function.owner == name) { return Some(function.line); }
+    let mut matching = functions.iter().filter(|function|
+        name.strip_suffix(&function.owner).is_some_and(|prefix| prefix.ends_with("::"))
+            || function.owner.strip_suffix(name).is_some_and(|prefix| prefix.ends_with("::")));
+    let line = matching.next()?.line;
+    matching.next().is_none().then_some(line)
+}
+
 /// Remove exactly the reviewed entries, rejecting stale or ambiguous selections before mutation.
 pub(crate) fn remove(files: &mut Vec<DesignTestFile>, selected: &[DesignTestSelection]) -> Result<()> {
     ensure!(!selected.is_empty(), "select at least one planned test");
@@ -134,6 +144,14 @@ pub(super) fn text(files: &[DesignTestFile]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_lines_reject_ambiguous_leaf_names() {
+        let functions = forge_diff::syntax::DeclarationCalls::extract("tests.rs", "mod first { fn same(); }\nmod second { fn same(); }", true).unwrap();
+        assert_eq!(declaration_line(&functions, "same"), None);
+        assert_eq!(declaration_line(&functions, "crate::first::same"), Some(1));
+        assert_eq!(declaration_line(&functions, "second::same"), Some(2));
+    }
 
     #[test]
     fn complete_inventories_and_selections_preserve_every_file_and_case() {

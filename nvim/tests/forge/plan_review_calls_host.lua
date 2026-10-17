@@ -145,11 +145,15 @@ local success, failure = xpcall(function()
     vim.o.columns = original_columns
     local function find_flow(token)
       for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-        if text:find("→", 1, true) and text:find(token, 1, true) then return index, text end
+        if (text:find("→", 1, true) or text:find("↓", 1, true) or text:find("←", 1, true) or text:find("┄▶", 1, true)) and text:find(token, 1, true) then return index, text end
       end
       error("flow token missing: " .. token)
     end
     assert(not table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("```text", 1, true), "flow retained a fenced text block")
+    local flow_text = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
+    assert(flow_text:find("On Fresh R input", 1, true) and flow_text:find("↓ reset_combat", 1, true), "flow lost its trigger or sequential order")
+    assert(flow_text:find("if old combat entities exist", 1, true), "flow lost its branch condition")
+    assert(not flow_text:find("Fresh R input\n  ├", 1, true), "sequential reset actions became sibling result branches")
     for _, expected in ipairs({ { "restart_round", "@function", "pub fn restart_round" }, { "reset_combat", "@function", "pub fn reset_combat" },
       { "WaveDirector", "@type", "pub struct WaveDirector" }, { "Weapon", "@type", "pub struct Weapon" } }) do
       local row, text = find_flow(expected[1])
@@ -190,12 +194,16 @@ local success, failure = xpcall(function()
     local function locate(predicate)
       for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
         local source = review.owner.replica.decoration_location(index - 1)
-        if predicate(source and source.text or text) then return index, text end
+        if predicate(source and source.text or text, source) then return index, text end
       end
     end
     local function check_test_heading()
       local row, text = locate(function(value) return value:find(" Tests · ", 1, true) == 1 end)
       assert(row, "test heading is missing")
+      assert(vim.api.nvim_buf_get_lines(review.buf, row - 2, row - 1, false)[1] == "",
+        "Tests must have a blank row before its heading")
+      assert(vim.api.nvim_win_call(review.win, function() return vim.fn.foldclosed(row - 1) end) == -1,
+        "Tests spacer must stay outside collapsed declarations")
       vim.api.nvim_win_set_cursor(review.win, { row, 0 })
       vim.cmd("normal! zz")
       vim.cmd("redraw!")
@@ -221,19 +229,74 @@ local success, failure = xpcall(function()
     vim.api.nvim_set_hl(0, "ForgeModifyRange", { fg = 0xffb86c })
     vim.api.nvim_set_hl(0, "ForgeDeleteRange", { fg = 0xff5555 })
     vim.api.nvim_set_hl(0, "Comment", { fg = 0x888888 })
+    vim.api.nvim_set_hl(0, "Normal", { fg = 0xffffff, bg = 0x000000 })
     for _, width in ipairs({ 80, 120, 160 }) do
       vim.o.columns = width
       check_test_heading()
+      for _, name in ipairs({ " Tests · ", " Checks " }) do
+        local row = assert(locate(function(text) return text:find(name, 1, true) == 1 end))
+        assert(vim.api.nvim_buf_get_lines(review.buf, row - 2, row - 1, false)[1] == "",
+          "section must have a blank row before its heading: " .. name)
+        vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+        vim.cmd("normal! zz")
+        vim.cmd("redraw!")
+        local heading = vim.fn.screenpos(review.win, row, 1)
+        local spacer = vim.fn.screenpos(review.win, row - 1, 1)
+        assert(spacer.row == heading.row - 1, "section spacer is hidden: " .. name)
+        for column = 1, width do
+          local cell = vim.api.nvim__inspect_cell(1, spacer.row - 1, column - 1)
+          assert(cell[1] == " " and (cell[2].background == nil or cell[2].background == 0),
+            "section spacer must be blank with the normal background: " .. name .. " " .. vim.inspect(cell))
+        end
+      end
     end
     local function file_row(path)
-      return assert(locate(function(text) return text:match("^%a+%s+" .. vim.pesc(path) .. "$") end), "test file heading missing: " .. path)
+      return assert(locate(function(_, source) return source and source.test_file == path end), "test file heading missing: " .. path)
     end
     for _, text in ipairs({ "new_case", "changed_case", "removed_case", "reused_case", "new_file_case", "reused_file_case" }) do
       assert(locate(function(row) return row == text end), "test files must expand by default: " .. text)
     end
-    local _, modified_header = locate(function(text) return text:match("^Modified%s+src/change%.rs$") end)
-    local _, new_header = locate(function(text) return text:match("^New%s+tests/new%.rs$") end)
+    local _, modified_header = locate(function(text, source) return source and source.test_file == "src/change.rs" and text:match("^Modified%s+src/change%.rs %+1 %-1$") end)
+    local _, new_header = locate(function(text, source) return source and source.test_file == "tests/new.rs" and text:match("^New%s+tests/new%.rs %+1 %-0$") end)
     assert(modified_header and new_header, "shared diff file status labels are missing")
+    local function check_file_counts()
+      local row, text = locate(function(value, source) return source and source.test_file == "src/change.rs" and value:match("^Modified%s+src/change%.rs %+[0-9]+ %-[0-9]+$") end)
+      assert(row, "test file counts are missing")
+      vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      local start = vim.fn.screenpos(review.win, row, 1)
+      for column = 1, vim.api.nvim_win_get_width(review.win) do
+        local cell = vim.api.nvim__inspect_cell(1, start.row - 1, column - 1)
+        assert(cell[2].background == nil or cell[2].background == 0x000000,
+          "test file heading inherited a diff background: " .. vim.inspect(cell))
+      end
+      for _, expected in ipairs({ { "+", 0x50fa7b }, { "-", 0xff5555 } }) do
+        local column = assert(text:find(expected[1], 1, true))
+        local position = vim.fn.screenpos(review.win, row, column)
+        local cell = vim.api.nvim__inspect_cell(1, position.row - 1, position.col - 1)
+        assert(cell[2].foreground == expected[2], "file test count lost its diff color")
+      end
+    end
+    check_file_counts()
+    for _, path in ipairs({ "src/change.rs", "tests/new.rs", "tests/reused.rs" }) do
+      local row = file_row(path)
+      vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+      vim.cmd("normal! zz")
+      vim.cmd("redraw!")
+      local screen = vim.fn.screenpos(review.win, row, 1)
+      for column = 1, vim.api.nvim_win_get_width(review.win) do
+        local cell = vim.api.nvim__inspect_cell(1, screen.row - 1, column - 1)
+        assert(cell[2].background == nil or cell[2].background == 0,
+          "test file heading inherited a diff background: " .. path .. " " .. vim.inspect(cell))
+      end
+    end
+    local function test_line(text, name)
+      for index, line in ipairs(vim.split(text, "\n", { plain = true })) do
+        if line:find("fn " .. name .. "(", 1, true) then return index end
+      end
+      error("missing test declaration: " .. name)
+    end
     for _, expected in ipairs({ { "new_case", 0x002800, "+" }, { "changed_case", 0x2a1f00, "~" }, { "removed_case", 0x200000, "-" } }) do
       local row = assert(locate(function(text) return text == expected[1] end))
       for _, width in ipairs({ 80, 120, 160 }) do
@@ -246,6 +309,10 @@ local success, failure = xpcall(function()
         assert(edge[2].background == expected[2], "test diff background stopped before the window edge: " .. expected[1])
         local cells = {}
         for column = 1, width do cells[#cells + 1] = vim.fn.screenstring(screen.row, column) end
+        local declarations = expected[3] == "-" and document.design.baseline["src/change.rs"].text or document.design.proposed["src/change.rs"]
+        local line = test_line(declarations, expected[1])
+        assert(table.concat(cells):match(tostring(line) .. "%s+%" .. expected[3] .. "%s+" .. expected[1]),
+          "test gutter lost its declaration line: " .. table.concat(cells))
         local marker_column = assert(table.concat(cells):find(expected[3] .. " " .. expected[1], 1, true), table.concat(cells))
         local marker = vim.api.nvim__inspect_cell(1, screen.row - 1, marker_column - 1)
         assert(marker[1] == expected[3], "test row lost its shared diff gutter: " .. vim.inspect(marker))
@@ -257,6 +324,12 @@ local success, failure = xpcall(function()
             local beginning = vim.fn.screenpos(review.win, row + 1, 3)
             assert(ending.row > beginning.row, "long test descriptions must wrap")
             for screen_row = beginning.row + 1, ending.row do
+              local marker = vim.api.nvim__inspect_cell(1, screen_row - 1, marker_column - 1)
+              assert(marker[1] == "~" and marker[2].foreground == 0xffb86c,
+                "wrapped test description lost its change marker: " .. vim.inspect(marker))
+              for column = 1, marker_column - 1 do
+                assert(vim.fn.screenstring(screen_row, column) == " ", "continuation repeated a declaration line number")
+              end
               for column = 1, width do
                 local cell = vim.api.nvim__inspect_cell(1, screen_row - 1, column - 1)
                 assert(cell[2].background == expected[2], "wrapped test description lost its diff background: "
@@ -289,8 +362,13 @@ local success, failure = xpcall(function()
       assert(vim.bo.filetype == "ForgeConfirm", "test description selection did not open delete confirmation")
       vim.fn.maparg("y", "n", false, true).callback()
       check_test_heading()
+      local optimistic_row = file_row("src/change.rs")
+      local optimistic_text = vim.api.nvim_buf_get_lines(review.buf, optimistic_row - 1, optimistic_row, false)[1]
+      assert(optimistic_text:match("^Modified%s+src/change%.rs %+1 %-0$"), "test file counts did not update optimistically: " .. optimistic_text)
+      check_file_counts()
       await(function() return review.owner.version > version end, "test deletion did not settle")
       check_test_heading()
+      assert(locate(function(text, source) return source and source.test_file == "src/change.rs" and text:match("^Modified%s+src/change%.rs %+1 %-0$") end), "saved test file counts did not update")
       assert(not locate(function(text) return text == selected[2] end), "deleted test is still rendered")
       assert(locate(function(text) return vim.trim(text) == selected[3] end), "test deletion lost the count of folded tests")
       assert(not locate(function(text) return text == "reused_file_case" end), "test deletion expanded an unrelated file")
@@ -309,6 +387,19 @@ local success, failure = xpcall(function()
       if row:find("pub fn run", 1, true) then changed_row = index end
     end
     assert(planned_row and changed_row, "new and modified callable signatures are missing")
+    vim.api.nvim_win_set_cursor(review.win, { changed_row, 0 })
+    vim.cmd("normal! zz")
+    vim.cmd("redraw!")
+    local changed_screen = vim.fn.screenpos(review.win, changed_row, 1)
+    local changed_cells = {}
+    for column = 1, vim.api.nvim_win_get_width(review.win) do
+      changed_cells[column] = vim.fn.screenstring(changed_screen.row, column)
+    end
+    local marker_column = assert(table.concat(changed_cells):find("~ ", 1, true), "modified callable signature has no ~ marker")
+    local marker = vim.api.nvim__inspect_cell(1, changed_screen.row - 1, marker_column - 1)
+    assert(marker[2].foreground == 0xffb86c, "modified callable marker is not orange")
+    local edge = vim.api.nvim__inspect_cell(1, changed_screen.row - 1, vim.api.nvim_win_get_width(review.win) - 1)
+    assert(edge[2].background == 0x2a1f00, "modified callable background stopped before the window edge")
     vim.api.nvim_win_set_cursor(review.win, { planned_row, 0 })
     review.command_set.action_by_id.toggle.run({})
     await(function()
@@ -364,12 +455,24 @@ local success, failure = xpcall(function()
       local rendered = vim.api.nvim__inspect_cell(1, constructor_screen_row - 1, position - 1)
       assert(rendered[2].foreground == expected[2], "constructor highlight did not render: " .. vim.inspect(rendered))
     end
+    for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(text) == "Record ProbeResult.value" then
+        vim.api.nvim_win_set_cursor(review.win, { index, 0 })
+        vim.cmd("normal! zz")
+        vim.cmd("redraw!")
+        local position = vim.fn.screenpos(review.win, index, assert((text:find("ProbeResult", 1, true))))
+        local rendered = vim.api.nvim__inspect_cell(1, position.row - 1, position.col - 1)
+        assert(rendered[2].foreground == 0xffaa55, "qualified Algorithm type lost its type highlight")
+      end
+    end
     for _, jump in ipairs({
       { "direction ← movement_direction(0)", "movement_direction", "pub fn movement_direction", "movement_direction" },
       { "abilities.start_dash(direction)", "start_dash", "pub fn start_dash", "start_dash" },
       { "abilities.start_dash(direction)", "abilities", "abilities: &mut PlayerAbilities", "abilities" },
       { "result ← value", "value", "value: Option<u32>", "value" },
       { "abilities.cooldown ← 0", "cooldown", "cooldown: u32", "cooldown" },
+      { "Record ProbeResult.value", "ProbeResult", "pub struct ProbeResult", "ProbeResult" },
+      { "Record ProbeResult.value", "value", "pub value: Option<u32>", "value" },
     }) do
       local origin_row, origin_column
       for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -394,6 +497,38 @@ local success, failure = xpcall(function()
       vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
       assert(vim.trim(vim.api.nvim_get_current_line()) == jump[1], "Algorithm jump-back lost its origin")
     end
+    vim.o.columns = original_columns
+    for index, text in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if vim.trim(text) == "Record ProbeResult.value" then
+        vim.api.nvim_win_set_cursor(review.win, { index, assert(text:find("value", 1, true)) - 1 })
+        break
+      end
+    end
+    local previous_version = review.owner.version
+    review.command_set.action_by_id.rename_entity.run({})
+    local rename_input
+    await(function()
+      for _, buffer in ipairs(vim.api.nvim_list_bufs()) do
+        if vim.bo[buffer].filetype == "ForgeRenameInput" then rename_input = buffer return true end
+      end
+    end, "rename from Algorithm did not open")
+    vim.api.nvim_buf_set_lines(rename_input, 0, -1, false, { "payload" })
+    vim.api.nvim_exec_autocmds("TextChangedI", { buffer = rename_input })
+    assert(#vim.api.nvim_buf_get_extmarks(review.buf, vim.api.nvim_create_namespace("ForgePlanRename"), 0, -1, {}) >= 4,
+      "rename preview did not include Algorithm fields and constructor labels")
+    local confirm = vim.api.nvim_buf_call(rename_input, function() return vim.fn.maparg("<CR>", "n", false, true) end)
+    confirm.callback()
+    await(function() return review.owner.version > previous_version end, "Algorithm rename did not persist")
+    local renamed = vim.json.decode(table.concat(vim.fn.readfile(artifact, "b"), "\n"))
+    local renamed_body
+    for _, body in ipairs(renamed.design.proposed_calls["src/change.rs"]) do
+      if body.owner == "planned_probe" then renamed_body = body.behavior.text end
+    end
+    assert(renamed_body and renamed_body:find("Record ProbeResult.payload", 1, true)
+      and renamed_body:find("ProbeResult(payload = result)", 1, true), "Algorithm rename missed a field use")
+    assert(renamed_body:find("result ← value", 1, true), "Algorithm rename changed the same-named signature variable")
+    assert(vim.deep_equal(renamed.design.baseline, document.design.baseline), "Algorithm rename changed captured baselines")
+    assert(vim.deep_equal(vim.fn.readfile(workspace .. "/src/change.rs"), source), "Algorithm rename edited implementation source")
     vim.api.nvim_set_hl(0, "ForgeAddBg", { bg = 0x123425 })
     for _ = 1, 2 do
       for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -407,7 +542,7 @@ local success, failure = xpcall(function()
     review.owner.action("comment", function(result, failure) assert(result and not failure, failure) end)
     vim.cmd("stopinsert")
     for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-      if vim.trim(row) == "return ProbeResult(value = result)" then constructor_row = index break end
+      if vim.trim(row) == "return ProbeResult(payload = result)" then constructor_row = index break end
     end
     local source_namespace = vim.api.nvim_get_namespaces()["ForgePlanDraftSource" .. review.buf]
     local source_background

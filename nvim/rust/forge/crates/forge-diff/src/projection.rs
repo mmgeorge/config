@@ -311,13 +311,14 @@ pub fn append_display_row(
     group: &DisplayHunk,
     old_syntax: Option<&SyntaxHandle>,
     new_syntax: Option<&SyntaxHandle>,
+    change: Option<crate::presentation::RowChange>,
     indent: usize,
 ) -> Result<(), ContractError> {
-    let change = match display.kind {
+    let change = change.unwrap_or_else(|| match display.kind {
         RowKind::Added => crate::presentation::RowChange::Added,
         RowKind::Removed => crate::presentation::RowChange::Removed,
         RowKind::Context => crate::presentation::RowChange::Context,
-    };
+    });
     let (_, background, number, emphasis) = change.style();
     let old = display.old.map_or(String::new(), |coordinate| (coordinate.line + 1).to_string());
     let new = display.new.map_or(String::new(), |coordinate| (coordinate.line + 1).to_string());
@@ -577,7 +578,7 @@ mod tests {
             new_lines: 0..7,
             raw_range: 0..1,
         };
-        append_display_row(&mut metadata, 0, &row, &group, None, None, 0).unwrap();
+        append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).unwrap();
         assert_eq!(row.text, "λnew");
         assert_eq!(
             metadata.gutter[0]
@@ -599,6 +600,7 @@ mod tests {
                 0,
                 &invalid,
                 &group,
+                None,
                 None,
                 None,
                 0,
@@ -640,7 +642,7 @@ mod tests {
             new_lines: 0..1,
             raw_range: 0..1,
         };
-        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, 0).is_ok());
+        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).is_ok());
         assert!(metadata.decoration.len() + metadata.visible_decoration.len() > 8192);
     }
 
@@ -676,7 +678,7 @@ mod tests {
                 emphasis_fallback: None,
             };
             let mut metadata = BlockMetadata::default();
-            append_display_row(&mut metadata, 0, &row, &group, None, None, 0).unwrap();
+            append_display_row(&mut metadata, 0, &row, &group, None, None, None, 0).unwrap();
             assert_eq!(metadata.gutter[0].chunk[0].text.len(), 4);
             assert_eq!(metadata.gutter[0].chunk[2].text.len(), 3);
             assert_eq!(metadata.gutter[0].chunk[4].capture, number);

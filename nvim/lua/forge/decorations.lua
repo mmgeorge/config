@@ -35,7 +35,7 @@ function M.project_row(decoration, relative, row, length, prefix)
   return {
     column = full_width and 0 or column + (prefix or 0),
     options = {
-      end_row = (continues or full_width) and row + 1 or row,
+      end_row = full_width and row or continues and row + 1 or row,
       end_col = (continues or full_width) and 0 or finish + (prefix or 0),
       hl_group = decoration.capture, hl_eol = full_width, priority = decoration.priority,
       line_hl_group = full_width and decoration.capture or nil,
@@ -67,23 +67,32 @@ local function build(values, first, last)
     finish = math.max(end_row, left and left.finish or -1, right and right.finish or -1) }
 end
 
-local function emit(tree, buffer, row, relative, prefix, indent)
+local function emit(tree, buffer, row, relative, prefix, indent, continuation)
   if not tree or tree.finish < relative then return end
-  emit(tree.left, buffer, row, relative, prefix, indent)
+  emit(tree.left, buffer, row, relative, prefix, indent, continuation)
   local span = tree.span
   if span.range.start.row > relative then return end
   local projected = M.project_row(span, relative, row, nil, prefix)
   if projected then
     projected.options.ephemeral = true
     if projected.options.hl_eol and indent > 0 then
-      projected.options.virt_text = { { string.rep(" ", indent), span.capture } }
+      local chunks, column = {}, 0
+      for _, marker in ipairs(continuation or {}) do
+        if marker.column < indent then
+          chunks[#chunks + 1] = { string.rep(" ", marker.column - column), span.capture }
+          chunks[#chunks + 1] = { marker.text, { span.capture, marker.capture } }
+          column = marker.column + #marker.text
+        end
+      end
+      chunks[#chunks + 1] = { string.rep(" ", indent - column), span.capture }
+      projected.options.virt_text = chunks
       projected.options.virt_text_win_col = 0
       projected.options.virt_text_repeat_linebreak = true
       projected.options.hl_mode = "combine"
     end
     vim.api.nvim_buf_set_extmark(buffer, namespace, row, projected.column, projected.options)
   end
-  emit(tree.right, buffer, row, relative, prefix, indent)
+  emit(tree.right, buffer, row, relative, prefix, indent, continuation)
 end
 
 vim.api.nvim_set_decoration_provider(namespace, {
@@ -102,6 +111,8 @@ vim.api.nvim_set_decoration_provider(namespace, {
     if not node then return end
     local relative = location.position.row
     local prefix = location.display_indent or 0
+    local row_layout = node.entry.row_layout[relative]
+    local continuation = row_layout and row_layout.continuation
     local indent = 0
     if vim.wo[window].breakindent then
       local text = vim.api.nvim_buf_get_lines(buffer, row, row + 1, false)[1] or ""
@@ -113,8 +124,8 @@ vim.api.nvim_set_decoration_provider(namespace, {
       require("forge.content_layout").draw_fold(window, buffer, namespace, row,
         node.entry.metadata.layout, require("forge.nodes").display(node.entry))
     end
-    if indent > 0 then emit(node.entry.row_background, buffer, row, relative, prefix, indent) end
-    emit(node.entry.visible_decoration, buffer, row, relative, prefix, indent)
+    if indent > 0 then emit(node.entry.row_background, buffer, row, relative, prefix, indent, continuation) end
+    emit(node.entry.visible_decoration, buffer, row, relative, prefix, indent, continuation)
     local source_overlay = node.entry.source_overlay_row[relative]
     if source_overlay or node.entry.source_highlight then
       local mode = vim.api.nvim_get_mode().mode:sub(1, 1):lower()

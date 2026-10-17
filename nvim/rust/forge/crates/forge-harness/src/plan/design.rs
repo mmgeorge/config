@@ -118,7 +118,7 @@ impl DeclarationDesign {
     /// Identifies only the planned inputs that determine check selection.
     pub(crate) fn check_preview_fingerprint(&self) -> Result<String> {
         let manifests: BTreeMap<_, _> = self.proposed.iter().filter(|(path, _)| path.ends_with("Cargo.toml") || path.ends_with("package.json") || path.ends_with("pnpm-workspace.yaml")).collect();
-        Ok(super::digest(&serde_json::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, &self.document.checks, &self.document.disabled_checks, manifests))?))
+        Ok(super::digest(&super::codec::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, &self.document.checks, &self.document.disabled_checks, manifests))?))
     }
 
     /// Projects plan choices independently of repository defaults and trigger applicability.
@@ -323,7 +323,7 @@ impl DeclarationDesign {
             if path == PLAN_DOCUMENT_PATH {
                 ensure!(!baseline, "plan.json has no source baseline");
                 return Ok(
-                    serde_json::json!({"path":path,"side":"proposed","text":format!("{}\n",serde_json::to_string_pretty(&self.document)?)}),
+                    serde_json::json!({"path":path,"side":"proposed","text":format!("{}\n",super::codec::to_string_pretty(&self.document)?)}),
                 );
             }
             validate_path(path)?;
@@ -434,9 +434,9 @@ impl DeclarationDesign {
             }
             let body = &lines[start..position];
             if path == PLAN_DOCUMENT_PATH {
-                let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
+                let original = format!("{}\n", super::codec::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
-                candidate.document = serde_json::from_str(&text)
+                candidate.document = super::codec::from_str(&text)
                     .context("invalid plan.json document")?;
                 continue;
             }
@@ -858,7 +858,7 @@ mod tests {
             "background": "`src/request.rs` owns pending uploads. Publication currently happens immediately.",
             "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
             "design": "`Request` retains cancellation state until pending work finishes.",
-            "flows": [{"title":"Cancel request", "description":"Cancel before publication and retain the current texture.", "root":{"text":"Request.cancel", "children":[{"text":"TextureStreaming.discard", "via":"cancellation"}]}}],
+            "flows": [{"title":"Cancel request", "description":"Cancel before publication and retain the current texture.", "trigger":"cancellation requested", "steps":[{"action":"Request.cancel"},{"action":"TextureStreaming.discard"}]}],
             "verification": ["Cancel an upload and confirm the current texture remains visible."],
             "tests": [{"file":"src/request.rs", "cases":[{"name":"tests::cancellation", "change":"new", "description":"Cancel before publication and retain the current texture."}]}]
         });
@@ -880,7 +880,7 @@ mod tests {
         let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
-        assert!(rendered.markdown.contains("Request.cancel → cancellation → TextureStreaming.discard"));
+        assert!(rendered.markdown.contains("On cancellation requested\n  → Request.cancel\n  ↓ TextureStreaming.discard"));
         for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "verification", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
@@ -899,8 +899,14 @@ mod tests {
             assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_metadata)).is_err());
         }
         let mut invalid_flow = metadata.clone();
-        invalid_flow["flows"][0]["root"]["text"] = serde_json::json!("");
+        invalid_flow["flows"][0]["steps"][0]["action"] = serde_json::json!("");
         assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_flow)).is_err());
+        let mut nested_result = metadata.clone();
+        nested_result["flows"][0]["steps"][0]["effects"] = serde_json::json!([{
+            "target":"shield charges", "change":"grant", "steps":[{"action":"take_hit"}]
+        }]);
+        let error = changed.patch(workspace.path(), &Default::default(), &replace(&changed, &nested_result)).unwrap_err();
+        assert!(format!("{error:#}").contains("unknown field"));
         assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
         for tests in [
             serde_json::json!([{"file":"../outside.rs", "cases":metadata["tests"][0]["cases"]}]),

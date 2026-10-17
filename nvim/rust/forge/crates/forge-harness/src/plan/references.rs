@@ -37,6 +37,7 @@ pub(crate) struct PlanReferenceIndex {
     pub call: BTreeMap<(String, String, String, super::CallKind), String>,
     pub structured: BTreeMap<String, String>,
     pub unresolved: BTreeMap<(String, String, String, super::CallKind), String>,
+    algorithm: BTreeMap<(String, String, u32, u32), (String, usize, usize)>,
 }
 
 impl PlanReferenceIndex {
@@ -291,6 +292,25 @@ impl PlanReferenceIndex {
                     }
                 }
             }
+            for body in calls.get(path).into_iter().flatten() {
+                let Some(super::FunctionBehavior::Algorithm(source)) = &body.behavior else { continue };
+                let Some(function) = callable.get(body.owner.as_str()) else { continue };
+                let lines = source.lines().collect::<Vec<_>>();
+                for reference in forge_diff::syntax::algorithm_references(source).map_err(|error| anyhow::anyhow!("{error:?}"))? {
+                    let key = (path.clone(), body.owner.clone(), reference.line as u32, reference.column as u32 - 1);
+                    let length = reference.segment.len();
+                    let width = lines[reference.line - 1].len();
+                    let Ok(Some(super::calls::AlgorithmTarget::Reference(target))) =
+                        super::calls::resolve_algorithm_reference(path, function, body, reference) else { continue };
+                    let resolution = match target.kind {
+                        super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, &body.owner, &target.name),
+                        super::CallKind::Construct => resolver.construct(path, &body.owner, &target.name),
+                        super::CallKind::Property => resolver.property(path, &body.owner, &target.name),
+                        super::CallKind::Value => resolver.value(path, &body.owner, &target.name),
+                    };
+                    if let Some(symbol) = identity(resolution) { output.algorithm.insert(key, (symbol, length, width)); }
+                }
+            }
             output.declaration.insert(path.clone(), index);
         }
         let mut capture_by_path = BTreeMap::new();
@@ -363,7 +383,7 @@ impl PlanReferenceIndex {
 
     fn legacy(document: &PlanDocument, workspace: &std::path::Path) -> Result<Self> {
         let rendered = super::render_plan_at(document, workspace)?;
-        let canonical = serde_json::to_value(document)?;
+        let canonical = crate::plan::codec::to_value(document)?;
         let mut output = Self::default();
         let mut seen = BTreeSet::new();
         for anchor in rendered.navigation.anchor {
@@ -606,6 +626,22 @@ impl PlanReferenceIndex {
 
         let mut output = document.clone();
         let design = output.design.as_mut().unwrap();
+        let mut algorithm_edits = BTreeMap::<(String, String), BTreeSet<(u32, u32)>>::new();
+        for ((path, owner, line, column), (target, _, _)) in &self.algorithm {
+            if target == identity { algorithm_edits.entry((path.clone(), owner.clone())).or_default().insert((*line, *column)); }
+        }
+        for ((path, owner), positions) in algorithm_edits {
+            let body = design.proposed_calls.get_mut(&path).into_iter().flatten().find(|body| body.owner == owner)
+                .ok_or_else(|| anyhow::anyhow!("Algorithm owner is unavailable"))?;
+            let Some(super::FunctionBehavior::Algorithm(source)) = &mut body.behavior else { continue };
+            let mut offsets = vec![0];
+            for (offset, byte) in source.bytes().enumerate() { if byte == b'\n' { offsets.push(offset + 1); } }
+            for (line, column) in positions.into_iter().rev() {
+                let start = offsets[line as usize - 1] + column as usize;
+                ensure!(source.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()), "Algorithm rename token changed");
+                source.replace_range(start..start + symbol.name.len(), name);
+            }
+        }
         let index = DeclarationIndex::extract(&definition_path, &design.proposed[&definition_path])
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         ensure!(
@@ -828,6 +864,17 @@ impl PlanReferenceIndex {
                 }),
             _ => self.structured.get(&anchor.json_path).map(String::as_str),
         }
+    }
+
+    /// Select an Algorithm token after removing its presentation indentation.
+    pub(crate) fn selected_algorithm(&self, anchor: &PlanNavigationAnchor, row: &str, column: usize) -> Option<&str> {
+        let PlanReviewTarget::Behavior { path, owner, offset, side } = &anchor.target else { return None };
+        if side != "proposed" { return None; }
+        self.algorithm.range((path.clone(), owner.clone(), *offset, 0)..=(path.clone(), owner.clone(), *offset, u32::MAX))
+            .find_map(|((_, _, _, start), (symbol, length, width))| {
+                let selected = column.checked_sub(row.len().checked_sub(*width)?)?;
+                (*start as usize <= selected && selected < *start as usize + length).then_some(symbol.as_str())
+            })
     }
 }
 
@@ -1297,6 +1344,43 @@ mod tests {
         assert_eq!(function.call.as_ref().unwrap()[0].name, "deliver");
         assert_eq!(function.behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures in send."));
         assert_eq!(index.call.len(), 1);
+    }
+
+    #[test]
+    fn algorithm_rename_tracks_resolved_types_fields_and_methods_without_editing_prose() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("algorithm-rename", "Rename");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert("main.rs".into(), "pub struct Client { pub endpoint: u32 }\npub struct Other { pub endpoint: u32 }\nimpl Client { pub fn send(&self); }\npub fn run(client: &Client, other: &Other);\n".into());
+        let source = "Record Client.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0\ncreated ← Client(endpoint = 1)\nreturn \"Client.endpoint client.send()\" # Client.endpoint";
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody {
+            owner: "run".into(), evidence: None, behavior: Some(super::super::FunctionBehavior::Algorithm(source.into())),
+            call: Some([("Client::send", super::super::CallKind::Call), ("Client::endpoint", super::super::CallKind::Property),
+                ("Other::endpoint", super::super::CallKind::Property)].into_iter().map(|(name, kind)| super::super::CallSite {
+                    name: name.into(), kind, source: None, unresolved: false,
+                }).collect()),
+        }]);
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        for (old, new, expected) in [
+            ("Client", "Transport", "Record Transport.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0"),
+            ("endpoint", "address", "Record Client.address\nclient.send()\nvalue ← client.address\nother.endpoint ← 0"),
+            ("send", "dispatch", "Record Client.endpoint\nclient.dispatch()\nvalue ← client.endpoint\nother.endpoint ← 0"),
+        ] {
+            let symbol = index.declaration["main.rs"].symbol.iter().find(|symbol|
+                symbol.name == old && (old == "Client" || symbol.scope.iter().any(|part| part == "Client"))).unwrap();
+            let identity = &index.definition[&("main.rs".into(), symbol.position.line, symbol.position.column)].0;
+            let renamed = index.renamed(&document, identity, new).unwrap();
+            let text = renamed.design.as_ref().unwrap().proposed_calls["main.rs"][0].behavior.as_ref().unwrap().text();
+            assert!(text.starts_with(expected), "{text}");
+            assert!(text.contains(match old {
+                "Client" => "created ← Transport(endpoint = 1)",
+                "endpoint" => "created ← Client(address = 1)",
+                _ => "created ← Client(endpoint = 1)",
+            }), "{text}");
+            assert!(text.ends_with("return \"Client.endpoint client.send()\" # Client.endpoint"), "{text}");
+        }
+        assert_eq!(document.design.as_ref().unwrap().proposed_calls["main.rs"][0].behavior.as_ref().unwrap().text(), source);
     }
 
     #[test]

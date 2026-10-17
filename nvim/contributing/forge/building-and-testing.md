@@ -72,6 +72,10 @@ collapsed signatures without status suffixes:
 nvim --headless -u NONE --cmd "set rtp^=./nvim" --cmd "lua vim.g.forge_test_plan_behavior = true" -l nvim/tests/forge/plan_review_calls_host.lua
 ```
 
+Set `forge_test_plan_flows = true` instead to verify independently triggered flows,
+ordered actions, conditional branches, symbol highlighting, and definition jumps
+in the rendered editor grid.
+
 `nvim/tools/run_tests.nu` is the batch runner and owns process-tree deadlines.
 The installed Nushell currently reports a type mismatch in its nullable `result`
 assignment before collecting the fixture result. Until that runner is repaired,

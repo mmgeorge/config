@@ -103,19 +103,24 @@ the callable's `Constructs` section requires an explicit matching invocation in 
 Constructor arguments use `field = value`, with `Type()` for argument-free construction.
 Missing construction sites and positional constructor arguments fail submission. Comments and
 string contents cannot satisfy this requirement. Ordinary helper calls permit positional arguments.
-The validator checks structure and declared construction sites, not algorithmic correctness or field types.
+Qualified and signature-resolved field references require matching Accesses entries, which use
+the declaration validator's member resolution. The validator does not type-check expression
+values or prove algorithmic correctness.
 Review parses Algorithm rows separately from native declarations and applies its keyword,
 operator, literal, constructor, named-field, and identifier captures at their original displayed byte columns. Change
 blocks retain prose styling. Algorithm-only revisions invalidate the affected syntax cache.
 Algorithm expressions default to comment-gray prose. Assignment targets, standalone operands,
 operator operands, call arguments, and qualified or underscored references receive variable
-styling. Variables and named fields render white. Algorithm and Change headings share the
+styling. Type qualifiers such as `Projectile` in `Projectile.previous_position` use the type
+highlight. Variables and named fields render white. Algorithm and Change headings share the
 reference section heading style used by Calls, Constructs, and Accesses.
 Soft-wrapped plan rows retain their own source indentation and gutter width. The review buffer
 reserves leading display whitespace per row, with gutters overlaid on that space. Source-column
 mapping excludes this padding from navigation and copying. Stored source text stays unchanged.
 Each window wraps independently at its own width. Shared background decorations repeat across
-the continuation margin, including the whitespace before wrapped test descriptions.
+the continuation margin, including the whitespace before wrapped test descriptions. Wrapped
+diff rows repeat the change marker without repeating declaration line numbers. Full-row
+backgrounds stop at their owning row, leaving file headings and section spacers uncolored.
 Behavior rows carry category-aware review anchors. Collapsed signatures never append `[changed]`.
 Algorithm definition navigation uses parsed reference segments and the enclosing callable's
 signature. Selecting a parameter name, including a receiver or call argument, jumps to its exact
@@ -125,6 +130,9 @@ names, while Accesses disambiguates fields and values. Multiple remaining target
 ambiguity without moving the cursor. Literals, comments, and unmatched prose have no target.
 Algorithm references reuse the plan declaration resolver and reveal transaction. Their synthetic
 positions never enter the source-backed LSP request path.
+Rename uses the same parsed segments and resolved identities for Algorithm call targets, type
+qualifiers, fields, and constructor field labels. Preview and committed edits preserve comments,
+strings, unrelated receivers, and same-named signature bindings.
 
 Function-body references use three editable sections: `Calls` for invocations and callbacks,
 `Constructs` for directly instantiated types, and `Accesses` for fields and named values.
@@ -245,19 +253,17 @@ current context through `developerInstructions` on both thread start and resume,
 resumption. Copilot appends shared instructions when creating or resuming a session and sends current
 interaction context with every message, including messages to an already-live session.
 
-Plan metadata stores data flows separately from the Design Markdown. `design_flows.rs` owns
-the recursive `text`, optional incoming `via`, and `children` node schema, validates its size and
-depth, and generates typed narrative, diagram, and fence rows. Text exports retain code-fenced
-diagrams, while PlanReview omits fence rows and renders the diagram as native buffer text.
-The planning prompt follows values, requests, events,
-records, and artifacts through producers, transformations, stores, and consumers. Short labels name
-one semantic role each. Paired JSON and rendered examples demonstrate transformations, shared
-consumers, and alternative results. Scheduling rules and lifecycle guarantees stay in descriptions.
-Short chains share a line, longer chains continue with arrows at the same
-indentation, and only actual splits create indented branches. Branches retain their incoming
-transfer or condition labels and continuation rails. The shared section
-projection places Flows after Design and omits an empty inventory. Section reads, review output,
-and revision diffs use the same generated Markdown without changing the stored JSON.
+Plan metadata stores execution flows separately from Design prose. `design_flows.rs` owns
+the typed `trigger` and ordered `steps` schema. Steps contain actions, reads, terminal effects,
+and conditional branches with their own steps. Effects contain only `target` and `change` and
+cannot nest execution. The validator requires triggers, nonempty step lists, branch conditions,
+and plain labels. Later independent events require separate flows even when they share state.
+Rendering and validation traverse nested branches iteratively without flow-count, step-count,
+or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, `←` for
+inputs, and `┄▶` for effects. Branch rails retain their conditions and nesting. Text exports
+retain fences while PlanReview renders the same diagram rows as native buffer text.
+Section reads, review, and revision diffs use the same canonical projection. Plan schema 13
+replaces the generic node tree without converting older persisted plan formats.
 Native diagram rows keep literal punctuation and receive neutral prose styling, with exact
 identifier tokens colored through the proposed declaration index. Those tokens reuse narrative
 symbol targets, including definition reveal, ambiguity choices, removed-symbol checks, and
@@ -280,18 +286,32 @@ Test file headings use `DiffPresenter::file`, while case names and descriptions 
 semantic summary rows with shared change gutters and full-row backgrounds. Modified cases
 use the same orange groups as replacement rows. File folds start expanded and retain stable
 path identities through edits. Every case row carries the same file-and-name deletion target.
+Rust test labels show the leaf function name while retaining the complete qualified identity.
+Test gutters use matching old and proposed declaration line numbers. Missing or ambiguous
+declarations leave the number blank, and description rows retain the same gutter width.
 The Tests heading reserves the section background for its label. Adjacent inventory counts use
 green, orange, and red foregrounds for new, modified, and removed tests, with reused counts in
 neutral gray. Optimistic deletions update these text spans before the revised projection arrives.
-Source deliveries include each case's change kind, the file heading's path, and complete
-inventory counts. Optimistic deletion uses those fields without parsing rendered labels or
+Each file heading shows `+N -N` for added and removed test cases, excluding modified and reused
+cases from both totals. Source deliveries include each case's change kind, the file heading's
+path, and complete section and per-file inventory counts. Optimistic deletion uses those fields without parsing rendered labels or
 markers, preserving counts for cases inside collapsed files. Removing the last case removes
 only its inventory group. Incremental and full projections retain identical targets and folds.
 Public filtering preserves that unhighlighted section spacer even after an empty diff row.
-Changed function versions retain separate fold ranges when shared diff context
-would otherwise join their bodies. The comparison duplicates that context with
-one source side per row, preserving source coordinates and added/removed counts.
-Collapsing a baseline function therefore cannot hide proposed declarations.
+Declaration comparisons match unique Tree-sitter callable owners before aligning lines.
+The longest ordered chain supplies start and end boundaries, including attached comments
+and attributes. The existing histogram matcher compares each intervening range without
+matching repeated call lines against unrelated functions. Ambiguous owners and reordered
+regions retain ordinary line comparison. Source order, byte ranges, and both line-number
+columns remain authoritative. Changed callable signatures and revised lines inside matched
+callables use the shared orange `~` presentation. New callables retain green `+` rows.
+
+This follows the ordered-anchor approach described in Git's
+[patience implementation](https://github.com/git/git/blob/c51408889c3b372814bc20b9431c3b74d0d268eb/xdiff/xpatience.c),
+with callable identities replacing unique text lines and histogram comparison handling the gaps.
+[Difftastic's syntax matching](https://difftastic.wilfred.me.uk/diffing.html) motivates retaining
+syntax ownership before display alignment. Forge uses declaration boundaries here rather than
+implementing Difftastic's complete syntax-tree graph search.
 
 `plan/prompts/planning.md` owns the virtual file procedure, metadata roles, declaration syntax,
 validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedback, revision, and

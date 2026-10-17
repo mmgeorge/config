@@ -15,6 +15,8 @@ pub(super) struct FileDiff {
     pub new_path: Option<String>,
     /// Shared diff groups including structural context.
     pub hunk: Vec<ReviewHunk>,
+    /// Matched callable ownership used by review-only modification styling.
+    pub alignment: super::review_alignment::ReviewAlignment,
 }
 
 impl FileDiff {
@@ -36,11 +38,14 @@ impl FileDiff {
             old: SourceVersion::new(old.as_bytes().to_vec(), Representation::DisplayOnly)?,
             new: SourceVersion::new(new.as_bytes().to_vec(), Representation::DisplayOnly)?,
         };
-        let diff = forge_diff::raw::compute_hunks(source)?;
+        let alignment = super::review_alignment::ReviewAlignment::new(path, destination, before, after)?;
+        let diff = if alignment.anchors.is_empty() { forge_diff::raw::compute_hunks(source)? }
+            else { forge_diff::raw::compute_anchored_hunks(source, &alignment.anchors)? };
         let mut result = Self {
             old_path: before.map(|_| path.into()),
             new_path: after.map(|_| destination.into()),
             hunk: Vec::new(),
+            alignment,
         };
         let old_context = before
             .map(|source| DeclarationContext::new(path, source))
@@ -85,11 +90,6 @@ impl FileDiff {
             }
             if chunk.state == DisplayState::Complete {
                 break;
-            }
-        }
-        if let Some(before) = before {
-            for hunk in &mut result.hunk {
-                hunk.separate_function_sides(before, after);
             }
         }
         for (side, source, context) in [
@@ -190,71 +190,6 @@ pub(super) struct ReviewHunk {
     pub row: Vec<DisplayRow>,
 }
 
-impl ReviewHunk {
-    fn separate_function_sides(&mut self, before: &CallPresentation, after: Option<&CallPresentation>) {
-        // Shared context can align bodies from different functions. Separate their
-        // source coordinates before folds consume contiguous display rows.
-        let baseline = before.declaration.text.lines().collect::<Vec<_>>();
-        for (&start, body) in &before.body {
-            let first = body.heading;
-            let end = body.end;
-            let Some(opening) = self.row.iter().position(|row|
-                row.old.is_some_and(|coordinate| coordinate.line == first)) else {
-                continue;
-            };
-            let Some(closing) = self.row.iter().position(|row|
-                row.old.is_some_and(|coordinate| coordinate.line == end)) else {
-                continue;
-            };
-            if closing <= opening {
-                continue;
-            }
-            let proposed = after.and_then(|after| after.body.iter().find(|(_, candidate)| candidate.owner == body.owner));
-            let shares_boundaries = proposed.is_some_and(|(&proposed_start, proposed_body)| {
-                self.row.iter().any(|row| row.old.is_some_and(|coordinate| coordinate.line == start)
-                    && row.new.is_some_and(|coordinate| coordinate.line == proposed_start))
-                    && self.row[closing].new.is_some_and(|coordinate| coordinate.line == proposed_body.end)
-            });
-            let crosses_declaration = self.row[opening..=closing].iter().any(|row| row.new.is_some_and(|coordinate|
-                proposed.is_none_or(|(_, candidate)| !(candidate.heading..=candidate.end).contains(&coordinate.line))));
-            if shares_boundaries && !crosses_declaration {
-                continue;
-            }
-            if !self.row[opening..=closing].iter().any(|row| row.new.is_some()) {
-                continue;
-            }
-            let insertion = self.row[..opening].iter().rposition(|row| row.old.is_some())
-                .map_or(opening, |previous| previous + 1);
-            let group_index = self.row[opening].group_index;
-            let mut removed = std::collections::BTreeMap::new();
-            let mut following = Vec::new();
-            for mut row in self.row.drain(opening..=closing) {
-                if row.old.is_some_and(|coordinate| (first..=end).contains(&coordinate.line)) {
-                    let line = row.old.unwrap().line;
-                    if row.new.is_some() {
-                        let mut old = row.clone();
-                        old.new = None;
-                        removed.insert(line, old);
-                        row.old = None;
-                        following.push(row);
-                    } else {
-                        removed.insert(line, row);
-                    }
-                } else {
-                    following.push(row);
-                }
-            }
-            self.row.splice(opening..opening, following);
-            let removed = (first..=end).map(|line| removed.remove(&line).unwrap_or_else(|| DisplayRow {
-                group_index, text: baseline[line].into(), kind: RowKind::Context,
-                old: Some(SourceCoordinate { side: SourceSide::Old, line, byte_column: 0 }),
-                new: None, raw_id: None, emphasis: Vec::new(), emphasis_fallback: None,
-            })).collect::<Vec<_>>();
-            self.row.splice(insertion..insertion, removed);
-        }
-    }
-}
-
 struct DeclarationContext {
     scope: Vec<(usize, usize, usize)>,
     offset: Vec<usize>,
@@ -336,6 +271,38 @@ impl DeclarationContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inserted_declarations_do_not_separate_existing_callable_versions() {
+        use super::super::calls::{CallKind, CallSite, FunctionBody};
+        let calls = |owner: &str, target: &str| FunctionBody { owner: owner.into(), behavior: None, evidence: None,
+            call: Some(vec![CallSite { name: target.into(), kind: CallKind::Call, source: None, unresolved: false }]) };
+        let before = super::super::calls::present("main.rs", "/// Starts the application.\nfn main();\nfn setup();\n",
+            &[calls("main", "setup")]).unwrap();
+        let mut source = String::new();
+        let mut bodies = Vec::new();
+        for index in 0..40 {
+            source.push_str(&format!("/// New gameplay system.\nfn system_{index}();\n"));
+            bodies.push(calls(&format!("system_{index}"), "setup"));
+        }
+        source.push_str("/// Starts the application.\nfn main();\nfn setup();\n");
+        bodies.push(calls("main", "system_0"));
+        let after = super::super::calls::present("main.rs", &source, &bodies).unwrap();
+        let diff = FileDiff::new("main.rs", "main.rs", Some(&before), Some(&after), &[]).unwrap();
+        let rows = diff.hunk.iter().flat_map(|hunk| &hunk.row).collect::<Vec<_>>();
+        let main = rows.iter().filter(|row| row.text.starts_with("fn main")).collect::<Vec<_>>();
+        assert_eq!(main.len(), 1, "main must remain one matched declaration");
+        assert!(main[0].old.is_some() && main[0].new.is_some());
+        assert!(diff.alignment.modified(main[0]));
+        assert!(rows.iter().filter(|row| row.text.starts_with("fn system_")).all(|row|
+            row.kind == RowKind::Added && row.old.is_none() && !diff.alignment.modified(row)));
+        let first = before.declaration.text.lines().collect::<Vec<_>>();
+        let second = after.declaration.text.lines().collect::<Vec<_>>();
+        for row in rows {
+            if let Some(old) = row.old { assert_eq!(row.text, first[old.line]); }
+            if let Some(new) = row.new { assert_eq!(row.text, second[new.line]); }
+        }
+    }
 
     #[test]
     fn reference_navigation_only_adds_the_selected_context() {

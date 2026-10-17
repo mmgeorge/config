@@ -15,6 +15,7 @@ local M = {}
 ---@field column integer
 ---@field width integer
 ---@field insertion ForgePrefixInsertion[]
+---@field continuation {column: integer, text: string, capture: string}[]
 
 ---@class ForgePrefixSign
 ---@field row integer
@@ -46,7 +47,7 @@ function M.prepare(entry, read_row)
   local function append(row, column, chunks, priority)
     local row_layout = entry.row_layout[row]
     if not row_layout then
-      row_layout = { column = column, width = 0, insertion = {} }
+      row_layout = { column = column, width = 0, insertion = {}, continuation = {} }
       entry.row_layout[row] = row_layout
     end
     local insertion = row_layout.insertion[#row_layout.insertion]
@@ -105,7 +106,15 @@ function M.prepare(entry, read_row)
         end
       end
       local width = 0
-      for _, chunk in ipairs(insertion.chunk) do width = width + vim.fn.strdisplaywidth(chunk.text, start + width) end
+      for _, chunk in ipairs(insertion.chunk) do
+        if (chunk.text == "+" or chunk.text == "~" or chunk.text == "-")
+          and (chunk.capture == "ForgeAddLineNr" or chunk.capture == "ForgeModifyLineNr" or chunk.capture == "ForgeDeleteLineNr") then
+          row_layout.continuation[#row_layout.continuation + 1] = {
+            column = start + width, text = chunk.text, capture = chunk.capture,
+          }
+        end
+        width = width + vim.fn.strdisplaywidth(chunk.text, start + width)
+      end
       insertion.width = width
       preceding_width = preceding_width + width
     end

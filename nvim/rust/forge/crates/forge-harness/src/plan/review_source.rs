@@ -63,7 +63,7 @@ impl PlanFileStore {
             .join("revisions")
             .join(format!("submitted-{revision:04}.json"));
         let submitted = read_source(&path)?;
-        let document: PlanDocument = serde_json::from_slice(&submitted)?;
+        let document: PlanDocument = super::codec::from_slice(&submitted)?;
         self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
@@ -71,7 +71,7 @@ impl PlanFileStore {
         );
         let saved = RenderedPlan {
             markdown: String::from_utf8(read_source(&path.with_extension("md"))?)?,
-            navigation: serde_json::from_slice(&read_source(&path.with_extension("index.json"))?)?,
+            navigation: super::codec::from_slice(&read_source(&path.with_extension("index.json"))?)?,
         };
         let (rendered, saved_navigation) = if document.design.is_some() {
             (
@@ -110,13 +110,13 @@ impl PlanFileStore {
     ) -> Result<PlanReviewSource> {
         let directory = self.plan_dir(session_id, plan_id);
         let working = read_source(&directory.join("working.json"))?;
-        let document: PlanDocument = serde_json::from_slice(&working)?;
+        let document: PlanDocument = super::codec::from_slice(&working)?;
         self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
             "reviewed plan identity changed"
         );
-        let canonical = serde_json::to_vec(&document)?;
+        let canonical = super::codec::to_vec(&document)?;
         anyhow::ensure!(
             digest(&canonical) == expected_digest,
             "working plan changed after review"
@@ -126,13 +126,13 @@ impl PlanFileStore {
         let saved_navigation = match revision {
             Some(revision) => {
                 let submitted_path = directory.join("revisions").join(format!("submitted-{revision:04}.json"));
-                let submitted: PlanDocument = serde_json::from_slice(&read_source(&submitted_path)?)?;
-                anyhow::ensure!(serde_json::to_vec(&submitted)? == canonical,
+                let submitted: PlanDocument = super::codec::from_slice(&read_source(&submitted_path)?)?;
+                anyhow::ensure!(super::codec::to_vec(&submitted)? == canonical,
                     "submitted plan bytes changed after review");
                 if document.design.is_some() {
                     anyhow::ensure!(physical == read_source(&submitted_path.with_extension("md"))?,
                         "physical plan review changed after the submitted revision");
-                    Some(serde_json::from_slice(&read_source(&submitted_path.with_extension("index.json"))?)?)
+                    Some(super::codec::from_slice(&read_source(&submitted_path.with_extension("index.json"))?)?)
                 } else {
                     anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan review changed after review");
                     None
@@ -140,8 +140,8 @@ impl PlanFileStore {
             }
             None => {
                 anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan draft changed after review");
-                let navigation: super::PlanNavigationIndex = serde_json::from_slice(&read_source(&directory.join("working.index.json"))?)?;
-                anyhow::ensure!(serde_json::to_vec(&navigation)? == serde_json::to_vec(&rendered.navigation)?,
+                let navigation: super::PlanNavigationIndex = super::codec::from_slice(&read_source(&directory.join("working.index.json"))?)?;
+                anyhow::ensure!(super::codec::to_vec(&navigation)? == super::codec::to_vec(&rendered.navigation)?,
                     "plan draft navigation changed after review");
                 document.design.is_some().then_some(navigation)
             }

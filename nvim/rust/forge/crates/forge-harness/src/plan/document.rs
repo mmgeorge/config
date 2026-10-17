@@ -587,7 +587,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 12;
+pub const PLAN_SCHEMA_VERSION: u32 = 13;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -728,7 +728,7 @@ impl PlanDocument {
 
     /// Serialize the semantic planning surface without Harness-derived state.
     pub fn model_json(&self) -> Result<String> {
-        Ok(serde_json::to_string_pretty(&self.model_value()?)?)
+        Ok(super::codec::to_string_pretty(&self.model_value()?)?)
     }
 
     /// Omit deferred verification instructions from code-writing handoffs.
@@ -740,14 +740,16 @@ impl PlanDocument {
                 document.remove("checks");
             }
         }
-        Ok(serde_json::to_string_pretty(&value)?)
+        Ok(super::codec::to_string_pretty(&value)?)
     }
 
     fn model_value(&self) -> Result<serde_json::Value> {
         if let Some(design) = &self.design {
-            return Ok(serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"document":design.document,"declaration_files":design.read(None,false)?}));
+            let mut value = serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.read(None,false)?});
+            value["document"] = super::codec::to_value(&design.document)?;
+            return Ok(value);
         }
-        let mut value = serde_json::to_value(self)?;
+        let mut value = super::codec::to_value(self)?;
         value.as_object_mut().expect("PlanDocument serializes as an object").remove("prompt");
         hide_derived_state(&mut value);
         Ok(value)

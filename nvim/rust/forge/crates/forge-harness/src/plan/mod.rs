@@ -20,6 +20,7 @@ mod design_tests;
 pub use design_tests::DesignTestChange;
 pub(crate) use design_tests::DesignTestSelection;
 pub(crate) mod calls;
+mod codec;
 mod references;
 mod workspace_definition;
 pub use workspace_definition::{DefinitionLocation, WorkspaceDefinition};
@@ -30,6 +31,7 @@ mod deviation;
 mod document;
 mod review_file_layout;
 mod review_diff;
+mod review_alignment;
 mod review_delivery;
 #[cfg(test)]
 pub(crate) use review_delivery::reconstruct;
@@ -845,7 +847,7 @@ impl PlanFileStore {
         let path = self.plan_dir(session_id, plan_id).join("working.json");
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read working plan document {}", path.display()))?;
-        let document = serde_json::from_str::<PlanDocument>(&content)
+        let document = codec::from_str::<PlanDocument>(&content)
             .with_context(|| format!("decode working plan document {}", path.display()))?;
         self.review_cache.validate(&document, false)?;
         Ok(document)
@@ -1030,7 +1032,7 @@ impl PlanFileStore {
             &plan_directory.join("working.index.json"),
             &rendered.navigation,
         ))?;
-        let checksum = measure(trace, "persist.digest", || Ok(digest(serde_json::to_vec(&document)?.as_slice())))?;
+        let checksum = measure(trace, "persist.digest", || Ok(digest(crate::plan::codec::to_vec(&document)?.as_slice())))?;
         self.review_cache.remember(&document, &rendered)?;
         Ok((document, rendered, checksum))
     }
@@ -1040,7 +1042,7 @@ impl PlanFileStore {
         &self, session_id: &str, plan_id: &str, revision: u32,
         reviewed: &review_source::PlanReviewSource,
     ) -> Result<()> {
-        let checksum = digest(&serde_json::to_vec(&reviewed.document)?);
+        let checksum = digest(&crate::plan::codec::to_vec(&reviewed.document)?);
         let current = self.capture_review_source(session_id, plan_id, None, &checksum)?;
         anyhow::ensure!(current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
             "working plan changed before the review decision");
@@ -1057,7 +1059,7 @@ impl PlanFileStore {
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let mut document = measure(trace, "delete.read_validate", || self.read_working_document(session_id, plan_id))?;
         anyhow::ensure!(document.version == expected_version, "plan version changed before test deletion");
-        anyhow::ensure!(digest(&serde_json::to_vec(&document)?) == expected_digest, "plan changed before test deletion");
+        anyhow::ensure!(digest(&crate::plan::codec::to_vec(&document)?) == expected_digest, "plan changed before test deletion");
         let before = measure(trace, "delete.render_previous", || self.render_review(&document))?;
         let path = self.plan_dir(session_id, plan_id).join("working.json");
         let annotation = measure(trace, "delete.read_annotations", || Ok(review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(&path)?))?
@@ -1075,7 +1077,7 @@ impl PlanFileStore {
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let mut document = self.read_working_document(session_id, plan_id)?;
         anyhow::ensure!(document.version == expected_version, "plan version changed before check selection");
-        anyhow::ensure!(digest(&serde_json::to_vec(&document)?) == expected_digest, "plan changed before check selection");
+        anyhow::ensure!(digest(&crate::plan::codec::to_vec(&document)?) == expected_digest, "plan changed before check selection");
         let before = self.render_review(&document)?;
         let path = self.plan_dir(session_id, plan_id).join("working.json");
         let annotation = review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?.annotation().to_vec();
@@ -1128,7 +1130,7 @@ impl PlanFileStore {
             .join(format!("submitted-{revision:04}.json"));
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read submitted plan document {}", path.display()))?;
-        let document: PlanDocument = serde_json::from_str(&content)
+        let document: PlanDocument = codec::from_str(&content)
             .with_context(|| format!("decode submitted plan document {}", path.display()))?;
         document.validate()?;
         Ok(document)
@@ -1193,7 +1195,7 @@ impl PlanFileStore {
                 {
                     continue;
                 }
-                let mut document = serde_json::from_slice::<PlanDocument>(&fs::read(&path)?)?;
+                let mut document = codec::from_slice::<PlanDocument>(&fs::read(&path)?)?;
                 document.plan_id = target_plan_id.to_owned();
                 let rendered = render_plan_at(&document, &self.workspace)?;
                 let stem = name.trim_end_matches(".json");
@@ -1218,7 +1220,7 @@ impl PlanFileStore {
 }
 
 fn write_json_atomically(path: &Path, value: &impl Serialize) -> Result<()> {
-    let content = serde_json::to_vec_pretty(value)?;
+    let content = crate::plan::codec::to_vec_pretty(value)?;
     write_bytes_atomically(path, &content)
 }
 
@@ -1337,7 +1339,7 @@ mod test {
         assert_eq!(store.read_submitted_document("session", "fast-review", 1).unwrap(), document);
         let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         crate::checks::configure_fixture(&reopened.workspace);
-        let checksum = digest(&serde_json::to_vec(&deleted).unwrap());
+        let checksum = digest(&crate::plan::codec::to_vec(&deleted).unwrap());
         let reviewed = reopened.capture_review_source("session", "fast-review", None, &checksum).unwrap();
         assert_eq!(reviewed.document, deleted);
         assert!(reopened.capture_review_source("session", "fast-review", Some(1), &checksum).is_err());

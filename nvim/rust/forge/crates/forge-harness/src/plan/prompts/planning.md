@@ -307,111 +307,69 @@ Keep acceptance-critical behavior in the plan, placing each detail in its design
 
 ### Flows
 
-Write `flows` as an array of objects with `title`, `description`, and `root`. Harness renders this
-section after Design, generating the headings, arrows, branches, and layout. Do not put diagrams
-or a Flows heading inside `design`.
+Write `flows` as an array of `{title, description, trigger, steps}` objects, or [] when no runtime
+flow adds useful information. Harness generates the diagram after Design. Do not put a Flows
+heading or hand-formatted arrows in `design` or flow labels.
 
-Each flow follows one value, request, event, record, or artifact from its producer through
-transformations and stores to its consumers. Connect the concrete objects and functions established
-in Ownership. Use `description` for 1–2 sentences explaining the flow's purpose or result, keeping
-the diagram labels compact. Prefer 1–3 independent flows. Use [] when the change has no meaningful
-runtime or data flow.
+Each flow describes one execution started by one explicit event. Use a concise description for
+its purpose and ordering guarantees. Separate events into separate flows even when they share
+state: collecting a shield stores charges, while a later enemy contact reads those charges.
+Do not connect these actions into one execution merely because one uses the other's output.
 
-Each node has plain, single-line `text`, optional `via`, and optional `children`:
-- `text` gives each node one semantic role. Use nouns for components, workers, inputs, outputs,
-  states, stores, and artifacts. Use active verb phrases for operations and transformations.
-  Functions are valid nodes and need no wrapper type. Keep labels short, concrete, and free of
-  file paths, backticks, bullets, arrows, and Markdown formatting.
-- `via` names the value, event, result, or condition crossing the incoming boundary when that
-  relationship needs clarification. Omit it on the root.
-- `children` names the next transformations, stores, or consumers. A single child continues the
-  chain. Branch where data or execution paths split. Use one primary root per flow when supported
-  by the design. Represent convergence by repeating the shared downstream stage at the end of
-  each producer branch, and explain in the description that these labels name one shared stage.
-  Omit children or use [] at a leaf.
+- `trigger` names the event that starts this execution.
+- `steps` is an ordered array. Each step has a required `action` naming a function or concrete
+  operation, optional `reads` naming its inputs, optional `effects`, and optional `branches`.
+- Each effect has exactly `target` and `change`. It is terminal data describing an observable
+  change, such as create, update, remove, or preserve. Effects cannot have steps, actions,
+  children, branches, or triggers. Put subsequent execution in the enclosing `steps` array.
+- Each branch has a required `condition` and a nonempty `steps` array. The condition is evaluated
+  during the current execution. A later event requires a new flow, not a conditional branch.
+  Each applicable branch runs its steps before the next enclosing step. When alternatives are
+  exclusive, write mutually exclusive conditions explicitly. Branches do not mean parallel work.
 
-Show representation changes as explicit transformations and keep one stable name per representation.
-Each arrow means the next node consumes an output from the preceding node, through production,
-transformation, storage, or consumption. Keep scheduling rules, guards, lifecycle guarantees, and
-explanations in the description. Put a condition in the diagram only when it distinguishes
-alternative data paths. Choose a narrower flow when a diagram requires unrelated inputs or long
-explanatory labels. Keep local algorithms and configuration values in declarations. Before
-submission, check that each flow describes the same solution as Design and that
-every producer and consumer discussed in its description appears in the path. Store facts and
-relationships, not hand-formatted diagram text. Flow titles must be unique. The structural limits are 32 flows,
-512 total nodes, and 32 node levels, separate from the recommendation to keep flows concise.
+Use plain, single-line labels and the exact declaration names where available. Keep input state
+in `reads` and resulting state in `effects`, rather than treating data as executable steps.
+Flow titles must be unique. There are no total flow, step-count, or nesting-depth limits.
+Keep diagrams focused for readability without omitting meaningful execution or effects.
 
-These examples pair structured flow fields with their generated output. Use the relevant pattern
-with the proposed solution's own objects and operations.
-
-**Transformation.** Each stage consumes the preceding output. The description explains when the
-application loads its configuration.
+For example, collection and contact are independent triggers:
 
 ```json
-{
-  "title": "Load configuration",
-  "description": "The application loads its configuration once at startup.",
-  "root": {"text": "Config file", "children": [
-    {"text": "parse_config", "children": [
-      {"text": "Config", "children": [{"text": "Application"}]}
-    ]}
-  ]}
-}
+[
+  {
+    "title": "Collect a shield",
+    "description": "Collection stores protection for a later accepted hit.",
+    "trigger": "player overlaps a shield pickup",
+    "steps": [{
+      "action": "collect_shield_pickups",
+      "reads": ["ShieldPickup", "PlayerAbilities"],
+      "effects": [{"target": "PlayerAbilities", "change": "grant shield charges to"}]
+    }]
+  },
+  {
+    "title": "Absorb contact",
+    "description": "An accepted contact consumes available protection.",
+    "trigger": "accepted enemy contact",
+    "steps": [{
+      "action": "PlayerAbilities.take_hit",
+      "reads": ["shield charges"],
+      "branches": [{
+        "condition": "shield charges remain",
+        "steps": [{"action": "absorb hit", "effects": [
+          {"target": "shield charge", "change": "consume one"},
+          {"target": "contact immunity", "change": "start"}
+        ]}]
+      }]
+    }]
+  }
+]
 ```
 
-```text
-Config file → parse_config → Config → Application
-```
-
-**Shared consumers.** Branches identify separate consumers of the same stored data. The description
-explains the persistence guarantee rather than placing it inside a node.
-
-```json
-{
-  "title": "Preserve editor changes",
-  "description": "DraftCache retains editor changes across buffer closure for background saving and session recovery.",
-  "root": {"text": "Editor change", "children": [
-    {"text": "DraftCache", "children": [
-      {"text": "SyncWorker", "children": [
-        {"text": "SaveRequest", "children": [{"text": "Storage"}]}
-      ]},
-      {"text": "SessionRecovery", "children": [{"text": "Restored buffer"}]}
-    ]}
-  ]}
-}
-```
-
-```text
-Editor change → DraftCache
-  ├→ SyncWorker → SaveRequest → Storage
-  └→ SessionRecovery → Restored buffer
-```
-
-**Alternative results.** Branches identify the outputs and their consumers. The description explains
-the failure condition without adding a guard node.
-
-```json
-{
-  "title": "Decode a response",
-  "description": "Malformed response bytes produce a request failure without reaching the decoded-response consumer.",
-  "root": {"text": "Response bytes", "children": [
-    {"text": "decode_response", "children": [
-      {"text": "DecodedResponse", "children": [{"text": "RequestResult"}]},
-      {"text": "DecodeError", "children": [{"text": "RequestFailure"}]}
-    ]}
-  ]}
-}
-```
-
-```text
-Response bytes → decode_response
-  ├→ DecodedResponse → RequestResult
-  └→ DecodeError → RequestFailure
-```
+The renderer uses `→` for the first action, `↓` for subsequent execution, `←` for inputs, and
+`┄▶` for effects. Conditions introduce branch steps. Effects never acquire execution arrows.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
-Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
-to 16 KiB. Requirements allow at most 256 entries and Decisions at most 128 entries.
+Encode paragraph breaks as `\n\n` inside JSON strings.
 The required tests array inventories every test involved in the plan, grouped by project-relative
 file. Each cases entry names the test (module-qualified when needed), its change (new, modified,
 removed, or reused), and a description of the scenario and expected result or removal rationale.
@@ -420,7 +378,7 @@ reused, omit unrelated repository tests, and use [] when no tests apply. Keep na
 a file and list each file once. Native Cargo case checks require the full runtime test name.
 Use the optional target field (lib, bin:<name>, or test:<name>) when a file belongs to multiple
 Cargo test targets. new_cases checks select only new entries, while changed_cases checks select
-new and modified entries. At most 256 files and 1024 cases are allowed. Tests is rendered
+new and modified entries. Tests is rendered
 before Verification and records planned coverage. Verification retains execution commands and manual checks.
 Objective, Background, and Design must be nonempty before submission.
 
@@ -444,53 +402,64 @@ A plan's metadata can use this shape:
   "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Separate preparation from publication so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.",
   "flows": [
     {
-      "title": "Replace a texture",
-      "description": "Publish the prepared replacement at a frame boundary. Retire the previous allocation after its last submitted frame completes.",
-      "root": {
-        "text": "TextureRequest",
-        "children": [
-          {
-            "text": "TextureStreaming.prepare",
-            "children": [
-              {
-                "text": "PreparedTexture",
-                "children": [
-                  {
-                    "text": "TextureRegistry.publish",
-                    "children": [
-                      {
-                        "text": "Published handle",
-                        "children": [{"text": "Renderer"}]
-                      },
-                      {
-                        "text": "Replaced allocation",
-                        "children": [{"text": "TextureRegistry.retire"}]
-                      }
-                    ]
-                  }
-                ]
-              }
-            ]
-          }
-        ]
-      }
+      "title": "Publish a replacement",
+      "description": "Publication at a frame boundary selects the prepared texture for rendering.",
+      "trigger": "prepared replacement is ready at a frame boundary",
+      "steps": [
+        {
+          "action": "TextureRegistry.publish",
+          "reads": [
+            "PreparedTexture"
+          ],
+          "effects": [
+            {
+              "target": "published handle",
+              "change": "replace"
+            }
+          ]
+        },
+        {
+          "action": "Renderer",
+          "reads": [
+            "published handle"
+          ]
+        }
+      ]
+    },
+    {
+      "title": "Retire an old allocation",
+      "description": "The replaced allocation remains alive until its last submitted frame completes.",
+      "trigger": "last submitted frame using the old allocation completes",
+      "steps": [
+        {
+          "action": "TextureRegistry.retire",
+          "effects": [
+            {
+              "target": "replaced allocation",
+              "change": "release"
+            }
+          ]
+        }
+      ]
     },
     {
       "title": "Cancel preparation",
-      "description": "The request handle sends cancellation to the preparation worker, which releases the unpublished allocation.",
-      "root": {
-        "text": "TextureRequest.cancel",
-        "children": [
-          {
-            "text": "TextureStreaming.discard",
-            "children": [
-              {
-                "text": "Released allocation"
-              }
-            ]
-          }
-        ]
-      }
+      "description": "Cancellation releases only the unpublished replacement.",
+      "trigger": "cancellation requested",
+      "steps": [
+        {
+          "action": "TextureRequest.cancel"
+        },
+        {
+          "action": "TextureStreaming.discard",
+          "effects": [
+            {
+              "target": "unpublished allocation",
+              "change": "release"
+            }
+          ]
+        }
+      ]
     }
   ],
   "verification": ["Cancel a pending replacement and confirm the current texture remains visible.", "Replace a texture with frames in flight and confirm rendering remains valid."],
@@ -595,6 +564,10 @@ Use `break` and `continue` only inside loops. Expressions and operation statemen
 natural language, identifiers, numbers, quoted strings, parentheses, and brackets. Use `=` for
 equality and `≠`, `≤`, or `≥` for comparisons. Omit native-language braces and semicolons.
 Incomplete drafts remain editable. Repair the reported callable, line, and column before resubmitting.
+
+Keep explicit field references consistent with `Accesses`: `Projectile.previous_position` in
+an Algorithm requires `Projectile::previous_position` in Rust's `Accesses` section. Use signature
+bindings for instance receivers when available. Qualified fields must name real declared members.
 
 Make construction explicit as `Type(field = value, ...)`, or `Type()` for a zero-field marker.
 Use the exact qualified name from `Constructs`, including factory names such as

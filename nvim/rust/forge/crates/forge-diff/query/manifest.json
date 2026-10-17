@@ -753,7 +753,7 @@
     {
       "path": "query/local/algorithm/highlights.scm",
       "origin": "forge/algorithm",
-      "sha256": "504ede5d412fe01483724d71f54bca2ab0614525a8b9e5814bd4e1aec6c4ee9f"
+      "sha256": "24db28853e6445ab57ae90a5aeb1d1570a25bf65d014521277f6ed74e3508927"
     }
   ]
 }

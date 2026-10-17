@@ -92,7 +92,7 @@ fn main() -> Result<()> {
         design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
             owner: "planned_probe".into(),
             behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
-                "result ← value\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds with a zero floor while preserving the stored firing order\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
+                "result ← value\nRecord ProbeResult.value\ndirection ← movement_direction(0)\nabilities.start_dash(direction)\nabilities.cooldown ← 0\nDecrease cooldown_remaining and weapon.cooldown by elapsed seconds with a zero floor while preserving the stored firing order\nif result ≠ none:\n  return ProbeResult(value = result)\nreturn ProbeResult(value = none)".into(),
             )),
             evidence: None,
             call: Some(vec![
@@ -100,6 +100,7 @@ fn main() -> Result<()> {
                 CallSite { name: "PlayerAbilities::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
                 CallSite { name: "Other::start_dash".into(), kind: CallKind::Call, source: None, unresolved: false },
                 CallSite { name: "PlayerAbilities::cooldown".into(), kind: CallKind::Property, source: None, unresolved: false },
+                CallSite { name: "ProbeResult::value".into(), kind: CallKind::Property, source: None, unresolved: false },
                 CallSite {
                 name: "ProbeResult".into(),
                 unresolved: false,
@@ -109,6 +110,8 @@ fn main() -> Result<()> {
         });
     }
     if arguments[4] == "tests" {
+        design.proposed.get_mut("src/change.rs").unwrap().push_str("\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn new_case();\n  #[test]\n  fn changed_case();\n  #[test]\n  fn reused_case();\n}\n");
+        design.baseline.get_mut("src/change.rs").unwrap().text.push_str("\n#[cfg(test)]\nmod history {\n  #[test]\n  fn removed_case();\n}\n");
         design.proposed.get_mut("src/change.rs").unwrap().push_str("\n/// Exercises the new test-only helpers.\n#[cfg(test)]\nmod added_tests {\n  #[test]\n  fn added_case();\n}\n");
         design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
             owner: "added_tests::added_case".into(), evidence: None,
@@ -118,10 +121,10 @@ fn main() -> Result<()> {
         design.proposed.insert("tests/new.rs".into(), "// Planned integration test file.\n".into());
         design.document.tests = serde_json::from_value(serde_json::json!([
             {"file":"src/change.rs","cases":[
-                {"name":"tests::new_case","change":"new","description":"Adds a scenario."},
-                {"name":"tests::changed_case","change":"modified","description":"Updates a long scenario whose full expected result remains readable when the diff wraps across multiple screen rows in a narrow window."},
-                {"name":"tests::removed_case","change":"removed","description":"Removes obsolete coverage."},
-                {"name":"tests::reused_case","change":"reused","description":"Preserves current coverage."}]},
+                {"name":"combat::tests::new_case","change":"new","description":"Adds a scenario."},
+                {"name":"combat::tests::changed_case","change":"modified","description":"Updates a long scenario whose full expected result remains readable when the diff wraps across multiple screen rows in a narrow window."},
+                {"name":"history::removed_case","change":"removed","description":"Removes obsolete coverage."},
+                {"name":"combat::tests::reused_case","change":"reused","description":"Preserves current coverage."}]},
             {"file":"tests/new.rs","cases":[{"name":"new_file_case","change":"new","description":"Covers a new test file."}]},
             {"file":"tests/reused.rs","cases":[{"name":"reused_file_case","change":"reused","description":"Keeps a separate existing suite."}]}
         ]))?;
@@ -129,9 +132,12 @@ fn main() -> Result<()> {
     if arguments[4] == "flows" {
         design.document.flows = serde_json::from_value(serde_json::json!([
             {"title":"Restart input","description":"Restore the base and combat state.",
-             "root":{"text":"Fresh R input","children":[
-                 {"text":"restart_round","children":[{"text":"Restored base state"}]},
-                 {"text":"reset_combat","children":[{"text":"Fresh WaveDirector and Weapon state"},{"text":"*literal* cleanup"},{"text":"Starting enemy"}]}]}}
+             "trigger":"Fresh R input","steps":[
+                 {"action":"restart_round","effects":[{"target":"base state","change":"restore"}]},
+                 {"action":"reset_combat","reads":["WaveDirector"],
+                  "effects":[{"target":"WaveDirector and Weapon state","change":"reset"},{"target":"starting enemy","change":"create"}],
+                  "branches":[{"condition":"old combat entities exist","steps":[{"action":"remove old entities","effects":[{"target":"*literal* cleanup","change":"perform"}]}]}]}
+             ]}
         ]))?;
     }
     document.design = Some(design);

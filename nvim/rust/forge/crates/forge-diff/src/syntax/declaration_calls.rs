@@ -43,6 +43,8 @@ pub struct DeclarationCallable {
     pub owner: String,
     /// One-based line of the callable name.
     pub line: u32,
+    /// One-based first attached documentation, attribute, or signature line.
+    pub heading_line: u32,
     /// Zero-based byte column of the callable name.
     pub column: u32,
     /// One-based final signature line before the body.
@@ -307,9 +309,18 @@ fn collect(
             .child_by_field_name("body")
             .map(|body| body.start_position().row)
             .unwrap_or(node.end_position().row);
+        let mut heading = node.start_position().row;
+        let mut preceding = node.prev_named_sibling();
+        while let Some(previous) = preceding {
+            if !matches!(previous.kind(), "attribute_item" | "line_comment" | "block_comment" | "comment")
+                || previous.end_position().row + 1 < heading { break; }
+            heading = previous.start_position().row;
+            preceding = previous.prev_named_sibling();
+        }
         output.push(DeclarationCallable {
             owner: owner(scope, &name, language),
             line: name_node.start_position().row as u32 + 1,
+            heading_line: heading as u32 + 1,
             column: name_node.start_position().column as u32,
             end_line: end as u32 + 1,
             return_type: None,

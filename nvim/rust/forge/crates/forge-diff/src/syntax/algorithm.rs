@@ -20,6 +20,12 @@ pub struct AlgorithmInvocation {
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Parsed reference under a source cursor, independent of declaration resolution.
 pub struct AlgorithmReference {
+    /// One-based source line of the selected identifier.
+    pub line: usize,
+    /// One-based UTF-8 byte column of the selected identifier.
+    pub column: usize,
+    /// Qualified spelling through the selected identifier.
+    pub prefix: String,
     /// Qualified reference spelling without separator whitespace.
     pub name: String,
     /// Identifier segment selected by the cursor, excluding separators and whitespace.
@@ -32,28 +38,37 @@ pub struct AlgorithmReference {
     pub end_column: usize,
     /// Whether the reference is the target of an explicit invocation.
     pub invocation: bool,
+    /// Whether this token names a field in an explicit type construction.
+    pub construction_field: bool,
 }
 
 /// Select a reference by one-based line and byte column, excluding prose strings and comments.
 /// Complete references remain available when another part of a draft is incomplete.
 pub fn algorithm_reference(source: &str, line: usize, column: usize) -> Result<Option<AlgorithmReference>, SyntaxError> {
+    Ok(algorithm_references(source)?.into_iter().find(|reference|
+        reference.line == line && reference.column <= column && column < reference.column + reference.segment.len()))
+}
+
+/// Enumerate parsed identifier segments, excluding strings and comments even in incomplete drafts.
+pub fn algorithm_references(source: &str) -> Result<Vec<AlgorithmReference>, SyntaxError> {
     let mut parser = Parser::new();
     parser.set_language(&SyntaxLanguage::Algorithm.grammar())
         .map_err(|error| SyntaxError::Language(error.to_string()))?;
     let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
     let mut cursor = tree.root_node().walk();
+    let mut result = Vec::new();
     loop {
         let node = cursor.node();
         let start = node.start_position();
         let end = node.end_position();
-        if node.kind() == "reference" && !node.has_error() && start.row + 1 == line
-            && start.row == end.row && start.column < column && column <= end.column {
+        if node.kind() == "reference" && !node.has_error() && start.row == end.row {
             let mut children = node.walk();
             let identifiers = node.named_children(&mut children).collect::<Vec<_>>();
-            let Some((index, identifier)) = identifiers.iter().enumerate().find(|(_, identifier)|
-                identifier.start_position().column < column && column <= identifier.end_position().column
-            ) else { return Ok(None); };
-            return Ok(Some(AlgorithmReference {
+            for (index, identifier) in identifiers.iter().enumerate() {
+                result.push(AlgorithmReference {
+                line: start.row + 1,
+                column: identifier.start_position().column + 1,
+                prefix: source[node.start_byte()..identifier.end_byte()].split_whitespace().collect(),
                 name: source[node.byte_range()].split_whitespace().collect(),
                 segment: source[identifier.byte_range()].to_owned(),
                 first: index == 0,
@@ -61,12 +76,30 @@ pub fn algorithm_reference(source: &str, line: usize, column: usize) -> Result<O
                 end_column: end.column + 1,
                 invocation: node.parent().is_some_and(|parent| parent.kind() == "invocation"
                     && !parent.has_error() && parent.child_by_field_name("function") == Some(node)),
-            }));
+                construction_field: false,
+            });
+            }
+        }
+        if node.kind() == "named_argument" && !node.has_error()
+            && let Some(identifier) = node.child_by_field_name("name")
+            && let Some(invocation) = node.parent().and_then(|parent| parent.parent())
+            && invocation.kind() == "invocation"
+            && let Some(target) = invocation.child_by_field_name("function") {
+            let target = source[target.byte_range()].split_whitespace().collect::<String>();
+            if target.rsplit([':', '.']).next().and_then(|name| name.chars().next()).is_some_and(char::is_uppercase) {
+                let segment = source[identifier.byte_range()].to_owned();
+                let name = format!("{target}.{segment}");
+                result.push(AlgorithmReference {
+                    line: identifier.start_position().row + 1, column: identifier.start_position().column + 1,
+                    prefix: name.clone(), name, segment, first: false, last: true,
+                    end_column: identifier.end_position().column + 1, invocation: false, construction_field: true,
+                });
+            }
         }
         if cursor.goto_first_child() { continue; }
         loop {
             if cursor.goto_next_sibling() { break; }
-            if !cursor.goto_parent() { return Ok(None); }
+            if !cursor.goto_parent() { return Ok(result); }
         }
     }
 }

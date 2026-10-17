@@ -362,8 +362,12 @@ fn rows(
             block.push(presenter.hunk(BlockId(hunk_id.clone()), &hunk.group,
                 forge_diff::presentation::HunkHeading::Counts { added: counts.0 as usize, removed: counts.1 as usize })?);
             for (row_index, row) in hunk.row.iter().enumerate() {
-                let mut metadata = presenter.rows(BlockId(format!("{hunk_id}:row:{row_index}")),
-                    std::slice::from_ref(row), &hunk.group, None, None)?.metadata;
+                let id = BlockId(format!("{hunk_id}:row:{row_index}"));
+                let mut metadata = if file.alignment.modified(row) {
+                    presenter.row(id, row, &hunk.group, forge_diff::presentation::RowChange::Modified)?.metadata
+                } else {
+                    presenter.rows(id, std::slice::from_ref(row), &hunk.group, None, None)?.metadata
+                };
                 if row.old.map(|coordinate| coordinate.line).is_none() && row.new.map(|coordinate| coordinate.line).is_none() {
                     block.push(BufferBlock {
                         id: BlockId(format!("{hunk_id}:row:{row_index}")),
@@ -790,6 +794,16 @@ pub(super) fn test_inventory(design: &super::DeclarationDesign) -> Result<(Vec<B
         json_path: "/design/document/tests".into(), path: None, label: "Tests".into(),
     }];
     for (file_index, file) in files.iter().enumerate() {
+        let original_path = design.moved.iter().find(|(_, destination)| *destination == &file.file)
+            .map_or(&file.file, |(original, _)| original);
+        let declarations = |text: Option<&str>| -> Result<Vec<forge_diff::syntax::DeclarationCallable>> {
+            if forge_diff::syntax::DeclarationOverview::language(&file.file).is_none() { return Ok(Vec::new()); }
+            text.map(|text| forge_diff::syntax::DeclarationCalls::extract(&file.file, text, true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))).transpose().map(Option::unwrap_or_default)
+        };
+        let before = declarations(design.baseline.get(original_path).map(|file| file.text.as_str()))?;
+        let after = declarations(design.proposed.get(&file.file).map(String::as_str))?;
+        let line_width = before.iter().chain(&after).map(|function| function.line).max().unwrap_or(0).to_string().len().max(3);
         let start = block.len();
         let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
         let change = if !design.baseline.contains_key(&file.file) && design.proposed.contains_key(&file.file) {
@@ -799,7 +813,11 @@ pub(super) fn test_inventory(design: &super::DeclarationDesign) -> Result<(Vec<B
         } else if file.cases.iter().all(|case| case.change == super::DesignTestChange::Reused) {
             FileChange::Unchanged
         } else { FileChange::Modified };
-        block.push(presenter.file(BlockId(id.clone()), change, &file.file, None)?);
+        let counts = file.cases.iter().fold((0, 0), |(added, removed), case| (
+            added + u64::from(case.change == super::DesignTestChange::New),
+            removed + u64::from(case.change == super::DesignTestChange::Removed),
+        ));
+        block.push(presenter.file(BlockId(id.clone()), change, &file.file, Some(counts))?);
         anchors.push(PlanNavigationAnchor {
             line: block.len() as u32, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
             json_path: format!("/design/document/tests/{file_index}"), path: Some(file.file.clone()), label: file.file.clone(),
@@ -813,15 +831,19 @@ pub(super) fn test_inventory(design: &super::DeclarationDesign) -> Result<(Vec<B
                 super::DesignTestChange::Removed => forge_diff::presentation::RowChange::Removed,
                 super::DesignTestChange::Reused => forge_diff::presentation::RowChange::Context,
             };
-            let name = case.name.strip_prefix("tests::").unwrap_or(&case.name);
-            let mut heading = presenter.summary(BlockId(case_id.clone()), name, change)?;
+            let name = if file.file.ends_with(".rs") { case.name.rsplit("::").next().unwrap() } else { &case.name };
+            let lines = [
+                (case.change != super::DesignTestChange::New).then(|| super::design_tests::declaration_line(&before, &case.name)).flatten(),
+                (case.change != super::DesignTestChange::Removed).then(|| super::design_tests::declaration_line(&after, &case.name)).flatten(),
+            ];
+            let mut heading = presenter.summary(BlockId(case_id.clone()), name, change, lines, line_width)?;
             heading.metadata.visible_decoration.push(forge_buffer::block::Decoration {
                 range: forge_buffer::block::TextRange { start: TextPosition { row: 0, column: 0 }, end: TextPosition { row: 0, column: name.len() } },
                 capture: "@function".into(), priority: 100,
             });
             block.push(heading);
             for (line_index, line) in case.description.lines().enumerate() {
-                let mut description = presenter.summary(BlockId(format!("{case_id}:description:{line_index}")), &format!("  {line}"), change)?;
+                let mut description = presenter.summary(BlockId(format!("{case_id}:description:{line_index}")), &format!("  {line}"), change, [None, None], line_width)?;
                 description.metadata.visible_decoration.push(forge_buffer::block::Decoration {
                     range: forge_buffer::block::TextRange { start: TextPosition { row: 0, column: 0 }, end: TextPosition { row: 0, column: description.text.row(0).unwrap().len() } },
                     capture: "Comment".into(), priority: 100,
@@ -1580,7 +1602,7 @@ mod tests {
     }
 
     #[test]
-    fn replaced_function_folds_keep_added_declarations_outside_the_removed_body() {
+    fn matched_function_fold_keeps_both_revisions_and_excludes_new_declarations() {
         let mut document = crate::plan::document::test_fixture("replacement", "Replace main");
         let mut design = super::super::DeclarationDesign::default();
         design.baseline.insert("main.rs".into(), super::super::DeclarationFile {
@@ -1616,30 +1638,21 @@ mod tests {
             assert!(text.contains("pub struct PlayerAbilities"), "{text}");
             assert!(text.contains("Creates the original application"), "{text}");
             assert!(text.contains("Creates the configured application"), "{text}");
-            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
-            let old = blocks.iter().find(|block| block.metadata.fold.iter()
-                .any(|fold| fold.id.0.contains(":baseline:") && block.text.row(0) == Some("fn main() {"))).unwrap();
-            let old_fold = old.metadata.fold.iter().find(|fold| fold.id.0.contains(":baseline:")).unwrap().id.clone();
+            assert_eq!(text.matches("fn main()").count(), 1, "{text}");
+            assert!(!text.contains("restart_round"), "{text}");
             let new = blocks.iter().find(|block| block.metadata.fold.iter()
                 .any(|fold| fold.id.0.contains(":proposed:") && block.text.row(0) == Some("fn main() {"))).unwrap();
             let new_fold = new.metadata.fold.iter().find(|fold| fold.id.0.contains(":proposed:")).unwrap().id.clone();
+            assert!(new.metadata.gutter.iter().flat_map(|gutter| &gutter.chunk).any(|chunk| chunk.text == "~"));
             let expanded = forge_buffer::collapse::project(blocks.clone(),
-                &HashMap::from([(old_fold, false)])).unwrap();
+                &HashMap::from([(new_fold.clone(), false)])).unwrap();
             let text = expanded.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
-            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
+            assert_eq!(text.matches("fn main()").count(), 1, "{text}");
             assert!(text.contains("pub struct PlayerAbilities"), "{text}");
             assert!(text.contains("restart_round"), "{text}");
-            assert!(!text.contains("Use the shared gameplay configuration."), "{text}");
-            let proposed = forge_buffer::collapse::project(blocks,
-                &HashMap::from([(new_fold, false)])).unwrap();
-            let text = proposed.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
-            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
             assert!(text.contains("Use the shared gameplay configuration."), "{text}");
-            assert!(!text.contains("restart_round"), "{text}");
             if !public_only {
-                println!("PLAN_REPLACEMENT_FIXTURE:{}", serde_json::json!({
-                    "collapsed": collapsed, "baseline": expanded, "proposed": proposed,
-                }));
+                assert!(text.contains("fn configure_game()"), "{text}");
             }
         }
     }
@@ -1719,6 +1732,30 @@ mod tests {
     }
 
     #[test]
+    fn test_inventory_uses_leaf_labels_and_declaration_line_numbers() {
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("src/combat.rs".into(), super::super::DeclarationFile {
+            text: "mod tests {\n  fn kept();\n  fn gone();\n}\n".into(), source_digest: String::new(),
+        });
+        design.proposed.insert("src/combat.rs".into(), "mod tests {\n  fn added();\n  fn kept();\n}\n".into());
+        design.document.tests = serde_json::from_value(serde_json::json!([
+            {"file":"src/combat.rs","cases":[
+                {"name":"combat::tests::added","change":"new","description":"New coverage."},
+                {"name":"combat::tests::kept","change":"modified","description":"Changed coverage."},
+                {"name":"combat::tests::gone","change":"removed","description":"Retired coverage."},
+                {"name":"combat::tests::unwritten","change":"new","description":"Not declared yet."}]}
+        ])).unwrap();
+        let (blocks, anchors) = test_inventory(&design).unwrap();
+        for (label, old, new) in [("added", "", "2"), ("kept", "2", "3"), ("gone", "3", ""), ("unwritten", "", "")] {
+            let block = blocks.iter().find(|block| block.text.row(0) == Some(label)).unwrap();
+            let gutter = &block.metadata.gutter[0].chunk;
+            assert_eq!(gutter[0].text.trim(), old, "{label}");
+            assert_eq!(gutter[2].text.trim(), new, "{label}");
+        }
+        assert!(anchors.iter().any(|anchor| matches!(&anchor.target, PlanReviewTarget::TestCase { name, .. } if name == "combat::tests::added")));
+    }
+
+    #[test]
     fn test_inventory_preserves_file_folds_targets_and_change_markers() {
         let mut document = crate::plan::document::test_fixture("tests", "Tests");
         let mut design = super::super::DeclarationDesign::default();
@@ -1772,6 +1809,8 @@ mod tests {
             assert!(files.iter().all(|file| file.metadata.fold.len() == 1 && !file.metadata.fold[0].closed));
             assert!(files[0].text.row(0).unwrap().starts_with("New"));
             assert!(files[1].text.row(0).unwrap().starts_with("Unchanged"));
+            assert!(files[0].text.row(0).unwrap().ends_with("src/tool.rs +1 -1"));
+            assert!(files[1].text.row(0).unwrap().ends_with("tests/runtime.rs +0 -0"));
             if !public_only {
                 println!("TEST_NAME_FIXTURE:{}", serde_json::json!({"document":"test-names","revision":0,"block":block}));
             }
@@ -1801,10 +1840,11 @@ mod tests {
         design.proposed.insert("src/flow.rs".into(), "fn cancel_request();\nstruct PendingWork;\nimpl PendingWork { fn stop(); }\n".into());
         design.document.flows = serde_json::from_value(serde_json::json!([{
             "title":"Cancel pending work", "description":"Retain the published value.",
-            "root":{"text":"cancel_request", "children":[
-                {"text":"PendingWork::stop", "via":"active handle"},
-                {"text":"*literal* published_value stays unchanged", "via":"after cancellation"}
-            ]}
+            "trigger":"cancellation requested", "steps":[
+                {"action":"cancel_request"},
+                {"action":"PendingWork::stop", "reads":["active handle"],
+                 "effects":[{"target":"*literal* published_value", "change":"preserve"}]}
+            ]
         }])).unwrap();
         document.design = Some(design);
         for public_only in [false, true] {
@@ -1816,7 +1856,7 @@ mod tests {
                     && style.range.end.column == " Flows ".len()
             }));
             assert!(!heading.metadata.fold.is_empty());
-            let node = block.iter().find(|block| block.text.row(0) == Some("cancel_request")).unwrap();
+            let node = block.iter().find(|block| block.text.row(0) == Some("  → cancel_request")).unwrap();
             assert!(!node.metadata.markdown);
             assert!(node.metadata.decoration.iter().any(|style| style.capture == "@function"));
             assert!(!node.metadata.decoration.iter().any(|style| style.capture == "@markup.raw.block"));

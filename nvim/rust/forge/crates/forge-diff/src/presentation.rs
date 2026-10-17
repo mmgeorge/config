@@ -112,16 +112,19 @@ impl DiffPresenter {
         self.heading(id, change.header(path, counts, false))
     }
 
-    /// Projects one semantic diff row without inventing source line numbers.
-    pub fn summary(&self, id: BlockId, text: &str, change: RowChange) -> Result<BufferBlock, ContractError> {
+    /// Projects a semantic diff row with optional one-based old/new declaration lines.
+    pub fn summary(&self, id: BlockId, text: &str, change: RowChange, lines: [Option<u32>; 2], line_width: usize) -> Result<BufferBlock, ContractError> {
         let mut block = BufferBlock {
             id, text: BufferText::from_rows([text])?, metadata: Default::default(),
         };
         block.metadata.layout = self.options.layout.clone();
-        let (_, background, _, _) = change.style();
-        let columns = [3, 2, 3, 2].into_iter().map(|width| TextChunk {
-            text: " ".repeat(width), capture: background.into(),
-        }).collect();
+        let (_, background, number, _) = change.style();
+        let width = line_width.max(3).max(lines.iter().flatten().map(|line| line.to_string().len()).max().unwrap_or(0));
+        let mut columns = Vec::new();
+        for line in lines {
+            columns.push(TextChunk { text: format!("{:>width$}", line.map(|line| line.to_string()).unwrap_or_default()), capture: number.into() });
+            columns.push(TextChunk { text: "  ".into(), capture: background.into() });
+        }
         crate::projection::append_change_row(&mut block.metadata, 0, change, columns, self.options.indent)?;
         Ok(block)
     }
@@ -195,6 +198,14 @@ impl DiffPresenter {
         self.batch(id, rows, |_| Some(group), old, new)
     }
 
+    /// Presents one source row with a semantic change category and its original coordinates.
+    pub fn row(&self, id: BlockId, row: &DisplayRow, group: &DisplayHunk, change: RowChange) -> Result<BufferBlock, ContractError> {
+        let mut block = BufferBlock { id, text: BufferText::from_rows([&row.text])?, metadata: Default::default() };
+        block.metadata.layout = self.options.layout.clone();
+        crate::projection::append_display_row(&mut block.metadata, 0, row, group, None, None, Some(change), self.options.indent)?;
+        Ok(block)
+    }
+
     /// Projects a bounded delivery that may cross group boundaries without losing gutter widths.
     pub fn batch<'group>(
         &self,
@@ -220,6 +231,7 @@ impl DiffPresenter {
                 group,
                 old,
                 new,
+                None,
                 self.options.indent,
             )?;
         }

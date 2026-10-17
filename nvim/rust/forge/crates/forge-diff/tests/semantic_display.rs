@@ -310,7 +310,7 @@ async fn structural_gaps_preserve_syntax_and_source_coordinates_across_delivery_
                 for row in &expected {
                     let mut metadata = forge_buffer::block::BlockMetadata::default();
                     forge_diff::projection::append_display_row(&mut metadata, 0, row,
-                        cursor().group(row.group_index).unwrap(), Some(&old), Some(&new), 0).unwrap();
+                        cursor().group(row.group_index).unwrap(), Some(&old), Some(&new), None, 0).unwrap();
                     if row.is_gap() {
                         assert_eq!(row.text.trim(), "...");
                         assert!(row.raw_id.is_none());

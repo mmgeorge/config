@@ -11,9 +11,20 @@ local function test(file, name, change)
   source[#source + 1] = { block = file .. name .. ":description", text = "  Description", test = selection, test_change = change }
   return selection
 end
+local function counts(row, summary)
+  row.test_summary = summary
+  row.text = row.text .. " +" .. summary.new .. " -" .. summary.removed
+  local column = assert(row.text:find("+", 1, true)) - 1
+  row.metadata = { decoration = {
+    { range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = column } }, capture = "ForgeStatusPath", priority = 100 },
+    { range = { start = { row = 0, column = column }, ["end"] = { row = 0, column = column + 2 } }, capture = "ForgeAddRange", priority = 100 },
+  } }
+end
+counts(source[3], { new = 1, modified = 1, removed = 0, reused = 0 })
 selected[#selected + 1] = test("src/first.rs", "first", "new")
 selected[#selected + 1] = test("src/first.rs", "second", "modified")
 source[#source + 1] = { block = "plan:tests:file:second", text = "New tests/second.rs", test_file = "tests/second.rs" }
+counts(source[#source], { new = 1, modified = 0, removed = 1, reused = 1 })
 local retained = test("tests/second.rs", "keep", "new")
 selected[#selected + 1] = test("tests/second.rs", "third", "removed")
 selected[#selected + 1] = test("tests/second.rs", "fourth", "reused")
@@ -29,6 +40,8 @@ for _, span in ipairs(heading.metadata.decoration) do
   if text == "1 new" then assert(span.capture == "ForgeAddRange", "new count lost its foreground color") end
 end
 assert(projected[3].hidden and not projected[1].hidden, "empty file removal hid unrelated text")
+assert(projected[8].text == "New tests/second.rs +1 -0", "file counts included descriptions or modified tests")
+assert(projected[8].test_summary.removed == 0, "file summary did not update")
 for index, row in ipairs(projected) do
   assert(row.source_line == source[index].source_line and row.block == source[index].block, "preview changed source identity")
   if row.test and row.test.name ~= "keep" then assert(row.hidden, "deleted test description remained visible") end

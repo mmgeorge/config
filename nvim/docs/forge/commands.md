@@ -98,7 +98,10 @@ Old and new function versions expand independently. Collapsing an old function
 keeps added declarations outside its body visible.
 
 Flow diagrams render as native buffer rows with branch rails, literal labels, and declaration-kind
-symbol colors. Press `.` on a function, type, or qualified member name to jump to its definition.
+symbol colors. Each flow starts with its trigger. `→` starts execution, `↓` continues it, `←` marks
+inputs, and `┄▶` marks resulting state changes. Conditional branches contain actions, while results
+cannot contain further steps. Independent events appear as separate flows.
+Press `.` on a function, type, or qualified member name to jump to its definition.
 Ambiguous names use the existing symbol picker. Diagram fences remain part of text exports,
 and do not appear in PlanReview.
 

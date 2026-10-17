@@ -12,7 +12,7 @@ if not vim.g.forge_wrapping_grid then
   end)
   vim.fn.jobstop(child)
   assert(success, failure)
-  print("plan_review_wrapping: prose indentation and complete diff backgrounds passed at 40, 80, and 120 columns")
+  print("plan_review_wrapping: prose indentation, diff backgrounds, and continuation markers passed at 40, 80, and 120 columns")
   return
 end
 
@@ -28,15 +28,22 @@ local owner = require("forge.views.plan_review.document").attach({ session_id = 
   window = window, plan = { id = "plan", review_digest = "digest" } }, function(_, failure) assert(not failure, failure) end)
 local text = "Integrate combat with directional dash, health and immunity, timed collection combos, and the ten-orb victory condition. "
 local block, source = {}, {}
-for index, prefix in ipairs({ "", "  - ", "    " }) do
+local changes = {
+  [3] = { marker = "~", background = "ForgeModifyBg", number = "ForgeModifyLineNr", color = 0x2a1f00 },
+  [4] = { marker = "+", background = "ForgeAddBg", number = "ForgeAddLineNr", color = 0x002800 },
+  [5] = { marker = "-", background = "ForgeDeleteBg", number = "ForgeDeleteLineNr", color = 0x200000 },
+}
+for index, prefix in ipairs({ "", "  - ", "    ", "    ", "    " }) do
   local id = "row-" .. index
   local line = prefix .. text .. text
   local metadata = { decoration = {}, target = {}, editable_region = {} }
-  if index == 3 then
+  local change = changes[index]
+  if change then
     metadata.gutter = { { position = { row = 0, column = 0 }, priority = 200,
-      chunk = { { text = "       ~  ", capture = "Normal" } } } }
+      chunk = { { text = "       ", capture = change.background },
+        { text = change.marker, capture = change.number }, { text = "  ", capture = change.background } } } }
     metadata.decoration = { { range = { start = { row = 0, column = 0 }, ["end"] = { row = 1, column = 0 } },
-      capture = "ForgeModifyBg", priority = 100 } }
+      capture = change.background, priority = 100 } }
   end
   block[index] = { id = id, text = { line }, metadata = metadata }
   source[index] = { id = id, block = id, text = line, position = { row = 0, column = 0 },
@@ -44,10 +51,13 @@ for index, prefix in ipairs({ "", "  - ", "    " }) do
 end
 request.receive({ path = vim.fn.tempname() .. ".md", version = 1, saved_source_digest = "saved", annotation = {},
   source_row = source, snapshot = { document = request.params.document, revision = 0, block = block } })
-vim.api.nvim_set_hl(0, "ForgeModifyBg", { bg = 0x2a1f00 })
+for _, change in pairs(changes) do
+  vim.api.nvim_set_hl(0, change.background, { bg = change.color })
+  vim.api.nvim_set_hl(0, change.number, { fg = 0xffb86c })
+end
 for _, width in ipairs({ 40, 80, 120 }) do
   vim.o.columns = width
-  for row, expected_indent in ipairs({ 0, 2, 14 }) do
+  for row, expected_indent in ipairs({ 0, 2, 14, 14, 14 }) do
     vim.api.nvim_win_set_cursor(window, { row, 0 })
     vim.cmd("normal! zt")
     vim.cmd("redraw!")
@@ -60,9 +70,13 @@ for _, width in ipairs({ 40, 80, 120 }) do
       for column = 1, width do
         local cell = vim.api.nvim__inspect_cell(1, screen_row - 1, column - 1)
         cells[column] = cell[1]
-        if row == 3 then
-          assert(cell[2].background == 0x2a1f00, "diff background gap at " .. screen_row .. ":" .. column)
+        if changes[row] then
+          assert(cell[2].background == changes[row].color, "diff background gap at " .. screen_row .. ":" .. column .. " " .. vim.inspect(cell))
         end
+      end
+      if changes[row] then
+        assert(cells[8] == changes[row].marker, "continuation lost its change marker")
+        cells[8] = " "
       end
       assert(table.concat(cells):find("%S") == expected_indent + 1,
         "continuation inherited another row's indent: " .. vim.inspect({ width, row, table.concat(cells) }))

@@ -98,7 +98,7 @@ impl PlanReviewStore {
         );
         Ok(
             serde_json::json!({"plan_id":document.source.document.plan_id,
-            "digest":super::digest(&serde_json::to_vec(&document.source.document)?),
+            "digest":super::digest(&crate::plan::codec::to_vec(&document.source.document)?),
             "saved_source_digest":document.source.saved_digest,
             "annotations":document.annotation.annotation().iter().filter(|annotation| annotation.kind == ReviewAnnotationKind::Comment && !annotation.source.body.trim().is_empty())
                 .map(|annotation| {
@@ -120,7 +120,9 @@ impl PlanReviewStore {
         document.validate_input(input)?;
         ensure!(!document.source.historical, "historical plan revisions are read-only");
         let design = document.source.document.design.as_ref().context("plan questions require a declaration design")?;
-        let context = serde_json::to_string_pretty(&serde_json::json!({"document":design.document,"proposed":design.proposed}))?;
+        let mut context = serde_json::json!({"proposed":design.proposed});
+        context["document"] = super::codec::to_value(&design.document)?;
+        let context = super::codec::to_string_pretty(&context)?;
         let mut question = Vec::new();
         for annotation in document.annotation.annotation().iter().filter(|annotation|
             annotation.kind == ReviewAnnotationKind::Question && annotation.reply.is_none() && !annotation.source.body.trim().is_empty()) {
@@ -309,7 +311,7 @@ impl PlanReviewStore {
         }
         if action == "schema" {
             document.validate_input(input)?;
-            let text = serde_json::to_string_pretty(&document.source.document)?;
+            let text = crate::plan::codec::to_string_pretty(&document.source.document)?;
             let text = forge_buffer::text::BufferText::from_rows(text.lines())?;
             let snapshot = BufferDocument::new(
                 DocumentId(format!("plan:schema:{}", uuid::Uuid::new_v4())),
@@ -505,7 +507,7 @@ impl PlanReviewDocument {
             "historical plan revisions are read-only"
         );
         ensure!(
-            !matches!(&anchor.target, super::PlanReviewTarget::Declaration { side, .. } | super::PlanReviewTarget::Call { side, .. } if side != "proposed"),
+            !matches!(&anchor.target, super::PlanReviewTarget::Declaration { side, .. } | super::PlanReviewTarget::Call { side, .. } | super::PlanReviewTarget::Behavior { side, .. } if side != "proposed"),
             "baseline symbols cannot be renamed"
         );
         let design = self
@@ -541,8 +543,8 @@ impl PlanReviewDocument {
         } else {
             column as u32
         };
-        let identity = index
-            .selected(&selected_anchor, saved_column)
+        let identity = index.selected_algorithm(anchor, row, column)
+            .or_else(|| index.selected(&selected_anchor, saved_column))
             .context("select a resolved symbol defined in the plan")?;
         let (_, symbol) =
             index.rename_definition(&self.source.document, identity)?;
@@ -616,6 +618,12 @@ impl PlanReviewDocument {
                                     }
                                 }
                                 offset += part.len() + separator.len();
+                            }
+                            continue;
+                        }
+                        super::PlanReviewTarget::Behavior { side, .. } if side == "proposed" => {
+                            if index.selected_algorithm(anchor, row, column) == Some(identity) {
+                                preview.push(serde_json::json!({"block":block.id,"column":column,"length":symbol.name.len()}));
                             }
                             continue;
                         }
@@ -891,7 +899,7 @@ impl PlanReviewDocument {
                 "# {}\n\n{}\n\n```json\n{}\n```",
                 entity.name,
                 entity.description,
-                serde_json::to_string_pretty(entity)?
+                crate::plan::codec::to_string_pretty(entity)?
             );
             let id = format!("plan:info:{}", uuid::Uuid::new_v4());
             let rendered = forge_buffer::markdown::MarkdownRenderer::render(
@@ -1286,10 +1294,14 @@ impl PlanReviewDocument {
             .flat_map(|file| file.cases.iter().map(move |case| ((file.file.as_str(), case.name.as_str()), case.change)))
             .collect::<HashMap<_, _>>();
         let mut test_summary = serde_json::json!({"new":0,"modified":0,"removed":0,"reused":0});
-        for change in tests.values() {
-            let name = serde_json::to_value(change).expect("test change");
-            let count = &mut test_summary[name.as_str().unwrap()];
-            *count = serde_json::json!(count.as_u64().unwrap() + 1);
+        let mut file_summary = HashMap::new();
+        for ((path, _), change) in &tests {
+            let name = crate::plan::codec::to_value(change).expect("test change");
+            let file = file_summary.entry(*path).or_insert_with(|| serde_json::json!({"new":0,"modified":0,"removed":0,"reused":0}));
+            for summary in [&mut test_summary, file] {
+                let count = &mut summary[name.as_str().unwrap()];
+                *count = serde_json::json!(count.as_u64().unwrap() + 1);
+            }
         }
         for block in self.document.blocks(self.document.revision(), 0..self.document.block_count()).expect("current document range") {
             for position in 0..block.text.row_count() {
@@ -1317,7 +1329,8 @@ impl PlanReviewDocument {
                 let id = format!("{}:{}", block.id.0, position);
                 let anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check,
                     "test_change":test_change,"test_file":test_file,
-                    "test_summary":(block.id.0 == "plan:section:tests").then_some(&test_summary)});
+                    "test_summary":(block.id.0 == "plan:section:tests").then_some(&test_summary)
+                        .or_else(|| test_file.and_then(|path| file_summary.get(path.as_str())))});
                 if self.source_anchor.get(&id) != Some(&anchor) { row.push(anchor.clone()); }
                 current.insert(id, anchor);
                 row_count += 1;
@@ -2664,7 +2677,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let saved = crate::plan::codec::to_vec(&document.source.document).unwrap();
         let design = document.source.document.design.as_ref().unwrap();
         assert!(
             document
@@ -2697,7 +2710,7 @@ mod tests {
         assert_eq!(result["workspace_definition"]["column"], caller.lines().nth(1).unwrap().find("count").unwrap());
         assert!(result.get("declarations").is_none());
         assert_eq!(
-            serde_json::to_vec(&document.source.document).unwrap(),
+            crate::plan::codec::to_vec(&document.source.document).unwrap(),
             saved
         );
         std::fs::write(temporary.path().join("run.ts"), caller.replace("client.count", "client.other")).unwrap();
@@ -2721,7 +2734,7 @@ mod tests {
         let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
         let source = store.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("constructs".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
-        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let saved = crate::plan::codec::to_vec(&document.source.document).unwrap();
         let block = document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("struct Weapon"))).unwrap();
         let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).find(|anchor| matches!(anchor.target, crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().clone();
         let row = block.text.row(0).unwrap();
@@ -2739,7 +2752,7 @@ mod tests {
         assert!(definition.get("declarations").is_none());
         let destination: forge_buffer::block::BlockAnchor = serde_json::from_value(definition["jump"].clone()).unwrap();
         assert!(document.document.block(&destination.block).unwrap().text.row(0).unwrap().contains("struct Weapon"));
-        assert_eq!(serde_json::to_vec(&document.source.document).unwrap(), saved);
+        assert_eq!(crate::plan::codec::to_vec(&document.source.document).unwrap(), saved);
         println!("CONSTRUCT_FIXTURE:{}", serde_json::to_string(&document.snapshot()).unwrap());
     }
 
@@ -2777,7 +2790,7 @@ mod tests {
             None,
         )
         .unwrap();
-        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let saved = crate::plan::codec::to_vec(&document.source.document).unwrap();
         let block = document
             .snapshot()
             .block
@@ -2848,7 +2861,7 @@ mod tests {
                 .contains("count: number")
         );
         assert_eq!(
-            serde_json::to_vec(&document.source.document).unwrap(),
+            crate::plan::codec::to_vec(&document.source.document).unwrap(),
             saved
         );
     }
@@ -2914,7 +2927,7 @@ mod tests {
         let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
         let source = store.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("references".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
-        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let saved = crate::plan::codec::to_vec(&document.source.document).unwrap();
         assert!(document.source.public_only);
         assert!(!document.snapshot().block.iter().any(|block| block.text.row(0) == Some("function run(): void;")));
         let source_line: HashMap<_, _> = document.target.iter().map(|(id, anchor)| (id.clone(), anchor.line)).collect();
@@ -2928,7 +2941,7 @@ mod tests {
         let baseline_context = super::super::reference_context::ReferenceContext::build(&document.source, true).unwrap();
         let mut baseline_call = document.reference.lock().unwrap().get(&false).unwrap().occurrence.iter().find(|reference| reference.kind == "call").unwrap().clone();
         baseline_call.side = "baseline".into();
-        let baseline_entry = serde_json::to_value(baseline_context.entry(&baseline_call).unwrap()).unwrap();
+        let baseline_entry = crate::plan::codec::to_value(baseline_context.entry(&baseline_call).unwrap()).unwrap();
         assert_eq!(baseline_entry["text"].as_str().unwrap().trim(), "send");
         assert_eq!(baseline_entry["side"], "baseline");
         let result = document.reveal_reference(call["id"].as_str().unwrap()).unwrap();
@@ -2942,7 +2955,7 @@ mod tests {
         }
         assert!(document.document.block(&jump.block).unwrap().metadata.collapse.iter().any(|fold| !fold.closed && fold.id.0.starts_with("plan:calls:")));
         assert!(document.document.block(&jump.block).unwrap().metadata.collapse.iter().all(|fold| !fold.closed));
-        assert_eq!(serde_json::to_vec(&document.source.document).unwrap(), saved);
+        assert_eq!(crate::plan::codec::to_vec(&document.source.document).unwrap(), saved);
         assert!(document.source.public_only);
         let revision = document.document.revision();
         document.reveal_reference(call["id"].as_str().unwrap()).unwrap();
