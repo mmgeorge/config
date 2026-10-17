@@ -195,7 +195,17 @@ commit's immutable old and new objects. All three routes use the same native dif
 excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
 an inventory entry without a text excerpt.
 
-Generated messages default to a title only. Small changes generally do not justify
+The Lua generation owner maintains one persistent notification per workspace and
+comparison. It shows an animated spinner, the resolved API model or configured
+Harness model, and elapsed seconds. Completion, failure, cancellation, and
+superseding requests stop the timer. Generation errors replace that notification
+even if the commit buffer was edited or closed while waiting. Failed regeneration
+preserves the prior draft. Empty or malformed successful responses fail explicitly.
+The current request returns a completed response, so the notification does not
+receive streaming provider thought summaries.
+
+The shared prompt requests fast generation with minimal reasoning while retaining
+factual accuracy. Generated messages default to a title only. Small changes generally do not justify
 a body. A short body is used sparingly, for any
 commit type, only when essential details are not captured by the title and without
 repeating it.

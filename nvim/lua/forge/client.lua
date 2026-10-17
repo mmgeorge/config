@@ -827,7 +827,8 @@ end
 
 ---@param params table
 ---@param callback ForgeCallback
-function M.request_generation(params, callback)
+---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
+function M.request_generation(params, callback, on_model)
   local harness_config = config.options.harness
   local selected = session.harness.session
   local backend = selected and selected.backend or harness_config.backend
@@ -842,6 +843,9 @@ function M.request_generation(params, callback)
     model = selected and selected.model or harness_config.model,
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
   }
+  if on_model then
+    on_model((selected and selected.resolved_model or generation.model) .. " (" .. backend .. ")")
+  end
   M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback)
 end
 

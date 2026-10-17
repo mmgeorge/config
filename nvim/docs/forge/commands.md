@@ -23,7 +23,12 @@ commands complete the file argument before the revision argument.
 ## Generated commit messages
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
-selected model. The context starts with changed files and added/deleted line counts.
+selected model. A persistent notification shows an animated spinner, model name,
+and elapsed seconds until generation completes. Failures display the error and
+preserve the existing draft, including edits made while waiting. The current
+request does not stream thought summaries.
+
+The context starts with changed files and added/deleted line counts.
 Source excerpts retain function signatures. Modified functions include the first 20
 changed body lines and two nearby unchanged lines. Added and removed functions retain
 only their attributes and signatures. Test functions follow the same rule.
@@ -44,6 +49,10 @@ License files and common dependency lockfiles keep their paths and change counts
 file list but have no excerpts, including license files with Markdown or text extensions.
 
 ## Harness and permissions
+
+A file-write request in Read mode offers **Switch to Write mode** or **Stay in Read mode**.
+Switching resumes the task under the configured directory limits and permission rules.
+Staying in Read mode rejects that request.
 
 | Command | Arguments | Behavior |
 | --- | --- | --- |

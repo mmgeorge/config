@@ -232,9 +232,7 @@ return {
             return
           end
 
-          require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
-            vim.notify(message, level, { title = "commit" })
-          end)
+          require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd)
         end,
       })
     end,

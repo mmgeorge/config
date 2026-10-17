@@ -58,6 +58,9 @@ pub struct ApprovalRequestView {
     pub provider: String,
     pub reason: Option<String>,
     pub item_list: Vec<ApprovalItem>,
+    /// Requires a root task mode transition instead of a one-time file approval.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub required_mode: Option<PermissionMode>,
     /// Captures the original deadline independently of the active window.
     #[serde(default)]
     pub deadline: Option<InputDeadline>,
@@ -337,6 +340,17 @@ impl PermissionCoordinator {
                         label: format!("Allow and add to global {label} directories: {}", grant.path),
                         resolution: ApprovalResolution::AllowOnce, rule_list: Vec::new(), directory: Some(grant) });
                 }
+            }
+        }
+        if execution_mode == PermissionMode::Read
+            && execution_owner.as_ref().is_none_or(crate::backend::ExecutionOwner::is_root)
+            && evaluation.pending_target_list.iter().any(|target| matches!(target,
+                PermissionTarget::Write { .. } | PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }))
+        {
+            view.required_mode = Some(PermissionMode::Write);
+            for item in &mut view.item_list {
+                item.choice_list.retain(|choice| matches!(choice.resolution,
+                    ApprovalResolution::DenyOnce | ApprovalResolution::Cancel));
             }
         }
         view.execution_owner = execution_owner;
@@ -737,6 +751,7 @@ fn approval_view(
         turn_id: None,
         provider: request.provider.clone(),
         reason: request.reason.clone(),
+        required_mode: None,
         item_list: evaluation
             .pending_target_list
             .iter()
@@ -1167,6 +1182,47 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn read_mode_file_requests_require_a_mode_transition_without_granting_rules() {
+        for (mode, target, root, expected) in [
+            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, true, true),
+            (PermissionMode::Read, PermissionTarget::Write { path: "source.rs".into() }, true, true),
+            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Read }, true, false),
+            (PermissionMode::Write, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, true, false),
+            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, false, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let coordinator = PermissionCoordinator::transient(directory.path()).unwrap();
+            let before = coordinator.store.read().unwrap().open().1;
+            let owner = if root { crate::backend::ExecutionOwner::root("session") }
+                else { crate::backend::ExecutionOwner { session_id: "session".into(), agent_id: "child".into() } };
+            let (sink, mut stream) = crate::backend::events::channel();
+            let waiting_coordinator = coordinator.clone();
+            let waiting = tokio::spawn(async move {
+                waiting_coordinator.authorize(mode, PermissionRequest {
+                    id: "file-request".into(), provider: "test".into(), reason: None, target_list: vec![target],
+                }, Some(crate::backend::ProviderAddress { owner: Some(owner), thread_id: "thread".into(), turn_id: "turn".into() }),
+                    Some(&sink)).await.unwrap()
+            });
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await.unwrap().unwrap().unwrap();
+            let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
+            assert_eq!(approval.required_mode, expected.then_some(PermissionMode::Write));
+            if expected {
+                let error = coordinator.resolve(&approval.id, &[ApprovalAnswer {
+                    item_id: "0".into(), choice_id: "allow_once".into(),
+                }], None).await.unwrap_err();
+                assert!(error.to_string().contains("unknown approval choice"));
+                assert_eq!(coordinator.pending_list().unwrap().len(), 1);
+                assert!(approval.item_list[0].choice_list.iter().all(|choice| choice.rule_list.is_empty() && choice.directory.is_none()));
+            }
+            coordinator.resolve(&approval.id, &[ApprovalAnswer {
+                item_id: "0".into(), choice_id: "deny_once".into(),
+            }], None).await.unwrap();
+            assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
+            assert_eq!(coordinator.store.read().unwrap().open().1, before);
+        }
+    }
+
     #[tokio::test]
     async fn directory_approval_persists_global_grants_before_releasing_copilot_requests() -> Result<()> {
         use super::*;

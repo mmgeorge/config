@@ -188,7 +188,6 @@ function M.attach(options)
     local revision = owner.about_revision
     local function accept_about(result)
       if not alive() or revision ~= owner.about_revision then return end
-      if result.state == "error" and result.error then notifications.error("Commit generation failed: " .. result.error) end
       owner.about = result
       owner.presentation.about = { state = result.state, text = result.message or "" }
       publish()

@@ -773,6 +773,15 @@ function M.present_approval(reopen)
   end
   require("forge.views.harness.approval").open(request, {
     owner_label = owner_label,
+    switch_mode = function(mode, callback)
+      if harness_state() ~= state or state.host_error or not state.session
+        or not vim.iter(state.approval or {}):any(function(pending) return pending.id == request.id end) then
+        notifications.error("This permission request is no longer active", "Harness permission")
+        callback(false)
+        return
+      end
+      M.task_transition({ action = "permission", mode = mode }, nil, callback)
+    end,
     interrupt = function()
       if child_id then M.agent_action("interrupt", child_id)
       else M.task_transition({ action = "pause" }) end

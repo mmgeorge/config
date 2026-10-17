@@ -62,6 +62,26 @@ task.receive(state, { id = latest.params.operation_id, state = "failed", error =
 assert(not state.busy and state.execution_notice == "cleanup did not settle" and #failures == 1)
 assert(last("state.get"))
 reset()
+state.session.execution_mode = "read"
+state.approval = { { id = "write-request", required_mode = "write", item_list = {} } }
+local approval = require("forge.views.harness.approval")
+local original_open, approval_host = approval.open, nil
+approval.open = function(_, host) approval_host = host end
+controller.present_approval()
+approval.open = original_open
+local mode_completed
+approval_host.switch_mode("write", function(changed) mode_completed = changed end)
+local mode_operation = last("task.transition")
+assert(mode_operation.params.action == "permission" and mode_operation.params.mode == "write")
+assert(mode_completed == nil, "approval mode choice must wait for the task transition")
+mode_operation.reply({ state = "accepted" })
+task.receive(state, { id = mode_operation.params.operation_id, state = "completed" })
+assert(mode_completed == true)
+state.approval = {}
+local request_count = #requests
+approval_host.switch_mode("write", function(changed) assert(changed == false) end)
+assert(#requests == request_count, "stale approval changed the task mode")
+reset()
 state.host_error, state.execution_notice, state.busy = "host stopped", "Reopen Harness", false
 state.queue = { { text = "keep queued", task_id = "task" } }
 controller.cancel_turn()

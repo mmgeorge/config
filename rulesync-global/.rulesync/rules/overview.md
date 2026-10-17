@@ -46,6 +46,12 @@ globs:
   workflow, or rule is being applied (*"I'm using the Rust workflow..."*, *"I will
   locate the method..."*). Execute tools and output direct answers immediately.
 - **No Semicolons:** Do not use semicolons in conversational or narrative prose.
+- **Concise Progress Commentary:** Keep progress updates to one or two short
+  sentences. Report only a new finding, consequential decision, blocker, or
+  verification result. Omit repeated context, detailed design explanations,
+  routine tool narration, and skill announcements unless higher-priority
+  instructions require them. Put detailed rationale in the requested artifact
+  or final response.
 
 # Code Explanations and Walkthroughs
 

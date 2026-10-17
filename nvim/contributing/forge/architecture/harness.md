@@ -845,6 +845,11 @@ The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/forge/permissions.json`, compiles command and resource matchers once, and
 gives every surfaced provider request to one `PermissionCoordinator`. `allow` proceeds immediately,
 `deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
+File writes requested by a root task in Read mode offer a switch to Write mode instead of
+a one-time file approval, including when the provider omits the path. Confirming uses the
+existing task permission transition to interrupt, collect, and resume the same task. It
+preserves configured directory access and permission rules. Staying in Read mode denies
+the request without persisting a rule. Child requests retain their own permission scope.
 Persistent approval choices atomically replace exact or broad JSON rules with allow or deny. The
 permission document remains outside provider write authority, including shell commands that name it.
 The command permission category displays as `shell` while retaining the Rulesync `bash` storage key.

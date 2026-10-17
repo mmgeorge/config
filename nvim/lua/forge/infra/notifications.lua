@@ -5,9 +5,49 @@
 ---@field format_failures fun(failures: ForgeGitFailure[]): string
 ---@field git_failures fun(title: string, failures: ForgeGitFailure[])
 ---@field debug fun(message: string, level?: integer, opts?: table)
+---@field progress fun(id: string, title: string, message: fun(elapsed_seconds: integer): string): ForgeProgressNotice
 local M = {}
 
 local config = require("forge.infra.config")
+
+---@class ForgeProgressNotice
+---@field finish fun(message?: string, level?: integer) Stop animation and optionally replace the notice. Repeated calls have no effect.
+
+--- Keeps one notification visible until its owner finishes the operation.
+---@param id string Notification identity, unique among active operations.
+---@param title string
+---@param message fun(elapsed_seconds: integer): string Current status, evaluated on each animation frame.
+---@return ForgeProgressNotice notice The caller must finish this notice on every terminal path.
+function M.progress(id, title, message)
+  local started = vim.uv.hrtime()
+  local active = true
+  local timer = assert(vim.uv.new_timer(), "Cannot create progress notification timer")
+  local frame_list = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+  local function render()
+    if not active then return end
+    local elapsed = math.floor((vim.uv.hrtime() - started) / 1e9)
+    vim.notify(message(elapsed), vim.log.levels.INFO, {
+      id = id, title = title, timeout = false,
+      icon = frame_list[math.floor((vim.uv.hrtime() - started) / 120e6) % #frame_list + 1],
+    })
+  end
+  local notice = {}
+  function notice.finish(text, level)
+    if not active then return end
+    active = false
+    timer:stop()
+    timer:close()
+    if text then
+      vim.notify(text, level or vim.log.levels.INFO, {
+        id = id, title = title, timeout = level == vim.log.levels.ERROR and 8000 or 3000,
+        icon = level == vim.log.levels.ERROR and "✗" or "✓",
+      })
+    end
+  end
+  render()
+  timer:start(120, 120, vim.schedule_wrap(render))
+  return notice
+end
 
 ---@param message string
 ---@param title? string

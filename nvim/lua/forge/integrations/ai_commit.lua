@@ -6,6 +6,8 @@
 ---@field ref? string
 ---@field message? string
 ---@field error? string
+---@field model? string
+---@field notice? ForgeProgressNotice
 ---@field waiters fun(result: ForgeAICommitState)[]
 
 ---@class ForgeAICommitModule
@@ -20,6 +22,9 @@ local notifications = require("forge.infra.notifications")
 ---@param backend ForgeAICommitBackend?
 function M.set_backend(backend) M._backend = backend end
 function M.reset_backend()
+  for _, state in pairs(M._states) do
+    if state.notice then state.notice.finish("Commit generation cancelled") end
+  end
   M._backend, M._state = nil, nil
   M._states, M._request_ids = {}, {}
 end
@@ -28,13 +33,16 @@ local function text_to_lines(text)
   return vim.split(tostring(text or ""):gsub("\r\n", "\n"), "\n", { plain = true })
 end
 
-local function native_request(cwd, ref, ignored, callback, is_current)
+local function native_request(cwd, ref, ignored, callback, is_current, on_model)
   local selected = require("ai.adapters").get().commit
   local model
   if selected ~= "harness" then
     local resolved, failure = require("ai").resolve(selected)
     if not resolved then callback(nil, failure) return end
     model = { provider = resolved.provider.name, model = resolved.model, thinking = resolved.thinking }
+    on_model(model.model .. (model.thinking ~= nil and (" · thinking " .. tostring(model.thinking)) or ""))
+  else
+    on_model("Harness")
   end
   local params = { operation = "generate", workspace = cwd,
     comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
@@ -42,10 +50,11 @@ local function native_request(cwd, ref, ignored, callback, is_current)
   local lifetime = M._states
   local function receive(result, failure)
     if M._states ~= lifetime or (is_current and not is_current()) then return end
-    if result and result.state == "retry" then
+    if type(result) == "table" and result.state == "retry" then
       vim.defer_fn(function()
         if M._states == lifetime and (not is_current or is_current()) then
-          native_request(cwd, ref, ignored, callback, is_current)
+          local ok, failure = pcall(native_request, cwd, ref, ignored, callback, is_current, on_model)
+          if not ok then callback(nil, tostring(failure)) end
         end
       end, 120)
       return
@@ -53,7 +62,7 @@ local function native_request(cwd, ref, ignored, callback, is_current)
     callback(result, failure)
   end
   if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
-  elseif selected == "harness" then require("forge.client").request_generation(params, receive)
+  elseif selected == "harness" then require("forge.client").request_generation(params, receive, on_model)
   else require("forge.client").request_host("repository.generate", params, receive) end
 end
 
@@ -127,26 +136,60 @@ function M.ensure(cwd, opts, cb)
   if not opts.force and current then
     if opts.on_start and current.state == "generating" then opts.on_start(current) end
     if current.state == "generating" and cb then
-      if #current.waiters >= 64 then cb({ state = "error", error = "Commit generation waiter admission is full", waiters = {} }) return end
+      if #current.waiters >= 64 then
+        local failure = "Commit generation waiter admission is full"
+        notifications.error(failure, "Forge commit")
+        cb({ state = "error", error = failure, waiters = {} })
+        return
+      end
       current.waiters[#current.waiters + 1] = cb
     elseif cb then cb(current) end
     return
   end
   local waiters = current and current.state == "generating" and current.waiters or {}
+  if current and current.notice then current.notice.finish() end
   if cb then waiters[#waiters + 1] = cb end
   local key = state_key(cwd, ref)
   M._request_ids[key] = (M._request_ids[key] or 0) + 1
   local request_id = M._request_ids[key]
-  local state = { state = "generating", cwd = cwd, ref = ref, waiters = waiters }
-  if not set_state(cwd, ref, state) then M._request_ids[key] = nil notify_waiters(state) return end
-  if opts.on_start then opts.on_start(state) end
-  native_request(cwd, ref, opts.ignored_paths, function(result, failure)
-    if M._request_ids[key] ~= request_id or get_state(cwd, ref) ~= state then return end
-    state.state = result and result.state or "error"
-    state.message = result and result.message
-    state.error = failure
+  local state = { state = "generating", cwd = cwd, ref = ref, waiters = waiters,
+    message = current and current.message, model = "resolving model" }
+  if not set_state(cwd, ref, state) then
+    M._request_ids[key] = nil
+    notifications.error(state.error, "Forge commit")
     notify_waiters(state)
-  end, function() return M._request_ids[key] == request_id and get_state(cwd, ref) == state end)
+    return
+  end
+  if opts.on_start then opts.on_start(state) end
+  local subject = ref == "latest_commit" and "latest commit message" or ref == "staged" and "staged commit message" or "About draft"
+  state.notice = notifications.progress("forge.commit_generation:" .. cwd .. ":" .. ref, "Forge commit", function(elapsed)
+    return ("Generating %s\n%s · %ds"):format(subject, state.model, elapsed)
+  end)
+  local function complete(result, failure)
+    if M._request_ids[key] ~= request_id or get_state(cwd, ref) ~= state or state.state ~= "generating" then return end
+    if type(result) ~= "table" then result = nil end
+    if not failure and result and result.state == "ready"
+      and (type(result.message) ~= "string" or vim.trim(result.message) == "") then
+      failure = "Commit generation returned no message"
+    elseif not failure and (not result or (result.state ~= "ready" and result.state ~= "none")) then
+      failure = result and result.error or "Commit generation returned an invalid response"
+    end
+    if failure then failure = tostring(failure) end
+    state.state = failure and "error" or result.state
+    state.error = failure
+    if state.state == "ready" then state.message = result.message
+    elseif state.state == "none" then state.message = nil end
+    local message = state.state == "error" and ("Commit generation failed: " .. failure)
+      or state.state == "ready" and ("Generated " .. subject .. "\n" .. state.model)
+      or ref == "latest_commit" and "No latest commit to describe"
+      or ref == "staged" and "No staged changes to describe" or "No changes to describe"
+    state.notice.finish(message, state.state == "error" and vim.log.levels.ERROR or vim.log.levels.INFO)
+    notify_waiters(state)
+  end
+  local ok, failure = pcall(native_request, cwd, ref, opts.ignored_paths, complete,
+    function() return M._request_ids[key] == request_id and get_state(cwd, ref) == state and state.state == "generating" end,
+    function(model) state.model = model end)
+  if not ok then complete(nil, tostring(failure)) end
 end
 
 ---@param cwd? string
@@ -167,6 +210,7 @@ function M.clear(cwd, ref)
   M._states[key] = nil
   if ref == "HEAD" and M._state == current then M._state = nil end
   if current and current.state == "generating" then
+    if current.notice then current.notice.finish("Commit generation cancelled") end
     current.state, current.message = "none", nil
     notify_waiters(current)
   end
@@ -184,10 +228,9 @@ end
 
 ---@param buf integer
 ---@param cwd string
----@param notify? fun(message: string, level: integer)
 ---@param regenerate? boolean
 ---@param comparison? "latest_commit"
-function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate, comparison)
+function M.populate_commit_buffer_when_ready(buf, cwd, regenerate, comparison)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if not regenerate and vim.b[buf].forge_ai_commit_populate_started then return end
   vim.b[buf].forge_ai_commit_populate_started = true
@@ -207,13 +250,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate, compa
   local function apply_message(state)
     if not vim.api.nvim_buf_is_valid(buf) or vim.b[buf].forge_ai_commit_revision ~= revision then return end
     if vim.api.nvim_buf_get_changedtick(buf) ~= changedtick then return end
-    if state.state ~= "ready" or not state.message then
-      if notify then
-        if state.state == "error" then notify(state.error or "Unable to generate commit message", vim.log.levels.WARN)
-        elseif regenerate and state.state == "none" then notify(comparison == "latest_commit" and "No latest commit to describe" or "No staged changes to describe", vim.log.levels.INFO) end
-      end
-      return
-    end
+    if state.state ~= "ready" or not state.message then return end
     local message_lines = text_to_lines(state.message)
     if regenerate and replace_end < #lines then message_lines[#message_lines + 1] = "" end
     local was_modifiable = vim.bo[buf].modifiable
@@ -226,11 +263,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate, compa
   end
   local ref = comparison or (regenerate and "staged" or "HEAD")
   if not regenerate and not get_state(cwd, ref) then return end
-  M.ensure(cwd, { ref = ref, force = regenerate == true,
-    on_start = function()
-      if notify then notify(regenerate and (comparison == "latest_commit" and "Generating latest commit message..." or "Generating staged commit message...") or "Waiting for About draft...", vim.log.levels.INFO) end
-    end,
-  }, apply_message)
+  M.ensure(cwd, { ref = ref, force = regenerate == true }, apply_message)
 end
 
 return M

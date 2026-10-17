@@ -1,5 +1,21 @@
 vim.opt.runtimepath:prepend("nvim")
 vim.loader.enable(false)
+if not vim.g.forge_approval_grid then
+  local child = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
+  assert(child > 0)
+  local success, failure = pcall(function()
+    vim.rpcrequest(child, "nvim_ui_attach", 130, 44, { rgb = true })
+    vim.rpcrequest(child, "nvim_exec_lua", [[
+      vim.g.forge_approval_grid = true
+      dofile('nvim/tests/forge/harness_approval.lua')
+    ]], {})
+  end)
+  vim.fn.jobstop(child)
+  assert(success, failure)
+  print("harness_approval: rendered grid passed at 130x44")
+  vim.cmd("qa!")
+  return
+end
 vim.o.columns = 130
 local approval = require("forge.views.harness.approval")
 local picker = require("forge.views.picker")
@@ -179,6 +195,47 @@ local ok, failure = pcall(function()
     assert(not approval.is_open())
   end
 
+  local mode_request = { id = "write-mode", required_mode = "write", item_list = {
+    { id = "file", title = "Write path not supplied", detail = "old pathless message", command_list = {},
+      choice_list = { { id = "deny_once", label = "Deny once" }, { id = "cancel", label = "Reject all" } } },
+  } }
+  local changed, mode_callback = 0, nil
+  host.resolve = function() error("switching mode must not approve the pending write") end
+  host.switch_mode = function(mode, callback)
+    assert(mode == "write")
+    changed, mode_callback = changed + 1, callback
+  end
+  approval.open(mode_request, host)
+  local mode_text = table.concat(vim.api.nvim_buf_get_lines(picker._state_for_test().buf, 0, -1, false), "\n")
+  assert(picker._state_for_test().spec.page_list[1].title == "Switch to Write mode?"
+    and mode_text:find("Stay in Read mode", 1, true), mode_text)
+  assert(not mode_text:find("path not supplied", 1, true) and not mode_text:find("Allow once", 1, true))
+  vim.cmd("redraw!")
+  local screen = {}
+  for row = 1, vim.o.lines do
+    local cells = {}
+    for column = 1, vim.o.columns do cells[#cells + 1] = vim.fn.screenstring(row, column) end
+    screen[#screen + 1] = table.concat(cells)
+  end
+  local rendered_mode = table.concat(screen, "\n")
+  assert(rendered_mode:find("Switch to Write mode?", 1, true) and rendered_mode:find("Stay in Read mode", 1, true), rendered_mode)
+  assert(not rendered_mode:find("path not supplied", 1, true), rendered_mode)
+  choose("switch_write")
+  choose("switch_write")
+  assert(changed == 1 and approval.is_open(), "mode switch must wait for the transition and ignore duplicate confirmation")
+  mode_callback(false)
+  choose("switch_write")
+  assert(changed == 2, "failed mode transition must remain retryable")
+  mode_callback(true)
+  assert(not approval.is_open())
+  host.resolve = function(id, answers, callback)
+    assert(id == "write-mode" and #answers == 1 and answers[1].choice_id == "deny_once")
+    callback(true)
+  end
+  approval.open(mode_request, host)
+  choose("stay_read")
+  assert(not approval.is_open() and changed == 2, "staying in Read must reject without switching mode")
+
   local command = [[ForEach-Object { Get-ChildItem "$_.FullName" -Directory -Filter "bevy*0.19.1"; Write-Output 'done; a|b' }]]
   assert(command_detail.format(context(command, command)).text == table.concat({
     "ForEach-Object {",
@@ -266,4 +323,3 @@ if not ok then
   vim.cmd("cquit 1")
 end
 print("harness_approval: passed")
-vim.cmd("qa!")

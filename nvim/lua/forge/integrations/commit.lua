@@ -230,9 +230,7 @@ function M.editor(target, client_addr)
   vim.keymap.set("n", "q", function() finish(true) end, map)
   vim.keymap.set({ "n", "i" }, "<C-a>", function()
     if finished then return end
-    require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
-      vim.notify(message, level, { title = "Forge commit" })
-    end, true, st.amend and "latest_commit" or nil)
+    require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), true, st.amend and "latest_commit" or nil)
   end, map)
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buf, once = true, callback = function() finish(true) end })
 
@@ -242,9 +240,7 @@ function M.editor(target, client_addr)
   st.trace.editor_opened = perf.now()
   record(st.trace, "editor.opened", { ms = perf.elapsed_ms(editor_started) })
   if not st.amend then
-    require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
-      vim.notify(message, level, { title = "Forge commit" })
-    end)
+    require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd())
   end
 end
 

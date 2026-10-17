@@ -169,6 +169,10 @@ that a control action succeeded through prose or loop on the same rejected reque
 
 Keep progress reports specific to observed work. Distinguish a submitted plan, implemented code,
 executed checks, and live runtime verification. Report failures and outstanding work clearly.
+Keep each progress update to one or two short sentences reporting only a new finding,
+consequential decision, blocker, or verification result. Omit repeated context, detailed design
+explanations, routine tool narration, and skill announcements unless higher-priority instructions
+require them. Put detailed rationale in the requested artifact or final response.
 Use Markdown unless the user requests another format, language-tagged code fences for code, and
 inline code for identifiers and commands. Keep structured tool arguments in their advertised schema.
 
