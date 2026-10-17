@@ -140,11 +140,14 @@ local function commit_chunks(commit, role, reference_width)
   return result
 end
 
-local function summary_chunks(summary)
+local function summary_chunks(summary, failure_text)
   summary = summary or {}
   local text = summary.text and summary.text:match("[^\n]*") or ""
   local capture = "ForgeStatusPR"
   if text == "" then
+    if failure_text and (summary.state == "error" or summary.state == "unavailable") then
+      return { { failure_text, "ForgeStatusObjectId" } }
+    end
     text = ({ fetching = "...fetching...", generating = "...generating...", error = "error", unavailable = "unavailable" })[summary.state] or "none"
     capture = summary.state == "error" and "ErrorMsg" or (summary.state == "fetching" or summary.state == "generating") and "ForgeStatusFetching" or "ForgeStatusObjectId"
   end
@@ -173,7 +176,7 @@ local function context_entries(session, context)
       append(leading, role, role == "upstream" and "Merge" or "Push", { { remote.status, "ForgeStatusFetching" } })
     elseif commit then append(leading, role, role == "upstream" and "Merge" or "Push", commit_chunks(commit, role, reference_width)) end
   end
-  append(leading, "pr", "PR", summary_chunks(session.presentation.pr))
+  append(leading, "pr", "PR", summary_chunks(session.presentation.pr, "none"))
   append(leading, "about", "About", summary_chunks(session.presentation.about))
   local issues = {}
   for _, number in ipairs(context.issues) do issues[#issues + 1] = "#" .. number end

@@ -45,6 +45,18 @@ vim.cmd("only")
 render.resize(replica, vim.api.nvim_get_current_win())
 verify()
 assert(vim.deep_equal(original, vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, false)), "resizing rewrote header text")
+for _, state in ipairs({ "error", "unavailable" }) do
+  render.present_context(replica, { pr = { state = state, text = "" }, about = { state = "error", text = "" } })
+  local _, pr_start = replica.sequence:position("status:context:pr")
+  local pr_line = vim.api.nvim_buf_get_lines(replica.buffer, pr_start, pr_start + 1, false)[1]
+  assert(pr_line:match("^PR:%s+none$"), "failed PR lookup was not rendered as none: " .. pr_line)
+  local pr_chunk = replica.source_entry["status:context:pr"].chunk[1]
+  assert(pr_chunk[#pr_chunk][2] == "ForgeStatusObjectId", "absent PR retained error highlighting")
+  assert(replica.presentation.pr.state == state, "display fallback changed the lookup state")
+  local _, about_start = replica.sequence:position("status:context:about")
+  local about_line = vim.api.nvim_buf_get_lines(replica.buffer, about_start, about_start + 1, false)[1]
+  assert(about_line:match("^About:%s+error$"), "PR fallback hid a commit generation error")
+end
 input.close(view)
 require("forge.buffer").close(replica)
-print("status_header_width: Unicode cap, reference alignment, native wrapping and cursor movement passed")
+print("status_header_width: Unicode cap, alignment, wrapping, cursor movement and PR fallback passed")
