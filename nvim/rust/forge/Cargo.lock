@@ -886,7 +886,27 @@ dependencies = [
  "tokio",
  "toml",
  "tree-sitter",
+ "tree-sitter-c",
+ "tree-sitter-c-sharp",
+ "tree-sitter-cpp",
+ "tree-sitter-css",
+ "tree-sitter-glsl",
+ "tree-sitter-html",
+ "tree-sitter-javascript",
+ "tree-sitter-json",
  "tree-sitter-language",
+ "tree-sitter-lua",
+ "tree-sitter-md",
+ "tree-sitter-nu",
+ "tree-sitter-python",
+ "tree-sitter-query",
+ "tree-sitter-rust",
+ "tree-sitter-slang",
+ "tree-sitter-toml-ng",
+ "tree-sitter-typescript",
+ "tree-sitter-vim",
+ "tree-sitter-vimdoc",
+ "tree-sitter-yaml",
 ]
 
 [[package]]
@@ -4247,14 +4267,204 @@ dependencies = [
 ]
 
 [[package]]
+name = "tree-sitter-c"
+version = "0.23.5"
+source = "git+https://github.com/tree-sitter/tree-sitter-c?rev=2a265d69a4caf57108a73ad2ed1e6922dd2f998c#2a265d69a4caf57108a73ad2ed1e6922dd2f998c"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-c-sharp"
+version = "0.23.1"
+source = "git+https://github.com/tree-sitter/tree-sitter-c-sharp?rev=b5eb5742f6a7e9438bee22ce8026d6b927be2cd7#b5eb5742f6a7e9438bee22ce8026d6b927be2cd7"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-cpp"
+version = "0.23.4"
+source = "git+https://github.com/tree-sitter/tree-sitter-cpp?rev=e5cea0ec884c5c3d2d1e41a741a66ce13da4d945#e5cea0ec884c5c3d2d1e41a741a66ce13da4d945"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-css"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5ad6489794d41350d12a7fbe520e5199f688618f43aace5443980d1ddcf1b29e"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-glsl"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df0ee57cbf4c2b35d3a7f17a01bf33c0ef2e85987cb85e516ac8c6904c4e62ac"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-html"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "261b708e5d92061ede329babaaa427b819329a9d427a1d710abb0f67bbef63ee"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-javascript"
+version = "0.23.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf40bf599e0416c16c125c3cec10ee5ddc7d1bb8b0c60fa5c4de249ad34dc1b1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-json"
+version = "0.24.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4d727acca406c0020cffc6cf35516764f36c8e3dc4408e5ebe2cb35a947ec471"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-language"
 version = "0.1.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca0d1bf6fdd806e43ae5198f82f527056d359def39e54e67a0f478ac09dac081"
 
 [[package]]
+name = "tree-sitter-lua"
+version = "0.3.0"
+source = "git+https://github.com/tree-sitter-grammars/tree-sitter-lua?rev=db16e76558122e834ee214c8dc755b4a3edc82a9#db16e76558122e834ee214c8dc755b4a3edc82a9"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-md"
+version = "0.4.0"
+source = "git+https://github.com/tree-sitter-grammars/tree-sitter-markdown?rev=413285231ce8fa8b11e7074bbe265b48aa7277f9#413285231ce8fa8b11e7074bbe265b48aa7277f9"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-nu"
+version = "0.0.1"
+source = "git+https://github.com/nushell/tree-sitter-nu?rev=4f577aaa735154f934594b598a69ed7b1b707cf6#4f577aaa735154f934594b598a69ed7b1b707cf6"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
 name = "tree-sitter-powershell"
 version = "0.26.4"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-python"
+version = "0.23.6"
+source = "git+https://github.com/tree-sitter/tree-sitter-python?rev=710796b8b877a970297106e5bbc8e2afa47f86ec#710796b8b877a970297106e5bbc8e2afa47f86ec"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-query"
+version = "0.5.1"
+source = "git+https://github.com/tree-sitter-grammars/tree-sitter-query?rev=930202c2a80965a7a9ca018b5b2a08b25dfa7f12#930202c2a80965a7a9ca018b5b2a08b25dfa7f12"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-rust"
+version = "0.24.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "439e577dbe07423ec2582ac62c7531120dbfccfa6e5f92406f93dd271a120e45"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-slang"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "667fe30ff3ed3af5134e21b7a2aa7978aa0b00bd9f9a8481f0a899c1caceb004"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-toml-ng"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9adc2c898ae49730e857d75be403da3f92bb81d8e37a2f918a08dd10de5ebb1"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-typescript"
+version = "0.23.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6c5f76ed8d947a75cc446d5fccd8b602ebf0cde64ccf2ffa434d873d7a575eff"
+dependencies = [
+ "cc",
+ "tree-sitter-language",
+]
+
+[[package]]
+name = "tree-sitter-vim"
+version = "0.5.0"
+source = "git+https://github.com/tree-sitter-grammars/tree-sitter-vim?rev=11b688a1f0e97c0c4e3dbabf4a38016335f4d237#11b688a1f0e97c0c4e3dbabf4a38016335f4d237"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-vimdoc"
+version = "3.0.1"
+source = "git+https://github.com/neovim/tree-sitter-vimdoc?rev=2694c3d27e2ca98a0ccde72f33887394300d524e#2694c3d27e2ca98a0ccde72f33887394300d524e"
+dependencies = [
+ "cc",
+ "tree-sitter",
+]
+
+[[package]]
+name = "tree-sitter-yaml"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d0c99f2b92b677f1a18b6b232fa9329afb5758118238a7d0b29cae324ef50d5e"
 dependencies = [
  "cc",
  "tree-sitter-language",

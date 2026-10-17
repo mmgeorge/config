@@ -195,31 +195,92 @@ commit's immutable old and new objects. All three routes use the same native dif
 excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
 an inventory entry without a text excerpt.
 
+Rename detection preserves the old and new paths in the compact file list. Renamed
+files have no content excerpt, even when their contents also changed. Collection skips
+their source reads, text comparisons, and syntax analysis. Copies retain normal content
+comparison behavior.
+
 The constructed system instructions and user prompt together contain at most 500,000
 UTF-8 bytes. This application limit counts text before JSON escaping, not model tokens
 or provider-added context. The prompt starts with changed paths and full addition/deletion
-counts, followed by excerpts in path order. Paths whose filename contains `test` or `spec`,
-or which lie under a test/spec directory, follow other paths. No lockfile classification
-or dependency summarization runs. Inventory emission stops if the inventory itself reaches
+counts for content comparisons, followed by excerpts in path order. Paths whose filename contains `test` or `spec`,
+or which lie under a test/spec directory, follow other paths. License and lockfile changes
+retain inventory entries but have no excerpts. No dependency summarization runs.
+Inventory emission stops if the inventory itself reaches
 the byte limit.
 
 The shared syntax engine supplies declaration extents, signature rows, and recognized
-import ranges from exact old and new sources. The formatter assigns a source row to its
-innermost declaration and emits it once. It preserves complete signatures and selects
+import ranges from exact old and new sources. Inline callbacks remain in their enclosing
+expression, while bound functions retain their binding and signature. Attached attributes
+and documentation remain with their declaration signature. Declaration identities
+include lexical owners so same-named methods in different classes or implementations do
+not share budgets. Unchanged signature rows pair overloaded declarations before unique-name
+matching, and ambiguous names are never paired by ordinal position. The formatter assigns
+rows to declarations for selection, then emits body rows once in their original diff order.
+When unrelated declarations separate a matched function's old and new signature rows,
+the formatter groups those signature rows at the new declaration's position. Each pair
+is atomic at the byte limit and appears once. It preserves enclosing signatures and selects
 the first 20 changed body rows per declaration, counting additions and removals together.
+Added and removed functions retain only their attributes, documentation, and signatures.
+The formatter requires an unpaired callable declaration with an added or deleted signature.
+Unchanged rows follow their new-source declaration when diff alignment reuses lines from
+a removed function. Matched functions keep their body excerpts even
+when their signatures and bodies both change. Non-callable types and configuration
+retain their existing excerpt selection. Ambiguous declaration matches retain body
+excerpts instead of being classified as additions or removals. Test functions follow
+the same lifecycle rules as other functions. Added and removed bodies, including
+nested declarations and closing braces, contribute only to omission counts.
+Inline bodies are clipped after the signature on their shared source row.
 Two unchanged rows surround selected changes, overlapping context merges, and omitted
-ranges use `... N lines omitted (+A -D)`. Gutter prefixes are `+ `, `- `, and two spaces.
-Imports remain in inventory counts but are excluded from excerpts. Fully omitted files
+ranges use `... N lines (+A -D)`, including omitted nested declarations between
+retained rows. Whitespace-only gaps emit no marker. Single-line gaps retain the actual
+line and its gutter instead of an omission marker, including otherwise hidden function
+body rows. This display exception can retain one additional changed row beyond a
+declaration's normal allowance, while the global byte limit still stops emission.
+Gutter prefixes are `+ `, `- `, and two spaces.
+Standalone imports remain in inventory counts but are excluded from excerpts. Rows shared
+with other statements and runtime import calls remain visible to avoid hiding executable
+changes. Fully omitted files
 receive no detail heading. The global limit stops subsequent emission rather than
 reducing the per-declaration allowance or redistributing it to later files.
 
 Markdown and plain-text paths (`.md` and `.txt`, case-insensitive) retain every changed
-row with two context rows and have no 20-row limit. Unavailable grammars and malformed
-syntax use ordinary diff excerpts with the same byte limit. Python currently follows
-that fallback because this host does not bundle a Python grammar. Optional syntax work
+row with two context rows and have no 20-row limit, except inventory-only paths.
+Inventory-only matching uses the final filename, case-insensitively, before syntax work:
+
+- `LICENSE`, `LICENSE.md`, `LICENSE.txt`, and `LICENSE.rst`.
+- Any filename containing `.lock`, covering Cargo, Yarn, Bun, Poetry, uv, Pipenv,
+  Composer, Bundler, Gradle, NuGet, Dart, Elixir, Deno, Nix, Conan, R, and OCaml locks.
+- `package-lock.json`, `.package-lock.json`, `npm-shrinkwrap.json`, and `pnpm-lock.yaml`.
+- `Package.resolved`, `pylock.toml`, and named `pylock.<name>.toml` files with one name segment.
+- Conda lock filenames containing `conda-lock` and ending in `.yml` or `.yaml`, and
+  Cabal filenames ending in `.project.freeze`.
+- `Manifest.toml`, `JuliaManifest.toml`, and `Manifest-v<major>.<minor>.toml` with numeric versions.
+
+The exceptional names follow the package managers' formats:
+[npm](https://docs.npmjs.com/files/package-lock.json/),
+[pnpm](https://github.com/pnpm/pnpm.io/blob/main/docs/lockfile.md),
+[Python](https://packaging.python.org/en/latest/specifications/pylock-toml/),
+[Swift](https://docs.swift.org/package-manager/PackageDescription/PackageDescription.html),
+[Conda](https://conda.org/learn/ceps/cep-0037/),
+[Cabal](https://cabal.readthedocs.io/en/latest/cabal-project-description-file.html), and
+[Julia](https://pkgdocs.julialang.org/v1/toml-files/).
+Directory names do not trigger these exclusions. Other manifests and source files retain
+their excerpts. Unavailable grammars and malformed
+syntax use ordinary diff excerpts with the same byte limit. Python uses the bundled
+grammar and retains decorators and multiline signatures. CUE imports are excluded,
+while its definitions and fields use ordinary changed rows. Optional syntax work
 has a shared two-second deadline, after which remaining files use the diff fallback.
 Repository acquisition and comparison failures remain request failures rather than
 being converted into an empty change set.
+
+`ForgeDebugCommitPromptPreview [head|staged|latest_commit]` uses the `preview`
+operation on `repository.generate`. It shares context collection, syntax analysis,
+admission, and the 500,000-byte input limit with generation. The native response
+returns the exact system and user strings with their combined UTF-8 byte count.
+Preview requests reject provider configuration and return before provider dispatch.
+Lua displays the result in a read-only scratch buffer and ignores responses after
+that buffer closes. Superseded observations retry at most three times.
 
 ## Exchange checkpoints and change attribution
 

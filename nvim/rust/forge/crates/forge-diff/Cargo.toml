@@ -13,6 +13,26 @@ sha2 = "0.10"
 tokio = { version = "1.48", features = ["rt", "sync", "time"] }
 tree-sitter = "=0.27.0"
 tree-sitter-language = "=0.1.8"
+tree-sitter-c = { git = "https://github.com/tree-sitter/tree-sitter-c", rev = "2a265d69a4caf57108a73ad2ed1e6922dd2f998c" }
+tree-sitter-cpp = { git = "https://github.com/tree-sitter/tree-sitter-cpp", rev = "e5cea0ec884c5c3d2d1e41a741a66ce13da4d945" }
+tree-sitter-c-sharp = { git = "https://github.com/tree-sitter/tree-sitter-c-sharp", rev = "b5eb5742f6a7e9438bee22ce8026d6b927be2cd7" }
+tree-sitter-css = "=0.23.2"
+tree-sitter-glsl = "=0.2.0"
+tree-sitter-html = "=0.23.2"
+tree-sitter-javascript = "=0.23.1"
+tree-sitter-json = "=0.24.8"
+tree-sitter-lua = { git = "https://github.com/tree-sitter-grammars/tree-sitter-lua", rev = "db16e76558122e834ee214c8dc755b4a3edc82a9" }
+tree-sitter-md = { git = "https://github.com/tree-sitter-grammars/tree-sitter-markdown", rev = "413285231ce8fa8b11e7074bbe265b48aa7277f9" }
+tree-sitter-nu = { git = "https://github.com/nushell/tree-sitter-nu", rev = "4f577aaa735154f934594b598a69ed7b1b707cf6" }
+tree-sitter-python = { git = "https://github.com/tree-sitter/tree-sitter-python", rev = "710796b8b877a970297106e5bbc8e2afa47f86ec" }
+tree-sitter-query = { git = "https://github.com/tree-sitter-grammars/tree-sitter-query", rev = "930202c2a80965a7a9ca018b5b2a08b25dfa7f12" }
+tree-sitter-rust = "=0.24.2"
+tree-sitter-slang = "=0.3.1"
+tree-sitter-toml-ng = "=0.7.0"
+tree-sitter-typescript = "=0.23.2"
+tree-sitter-vim = { git = "https://github.com/tree-sitter-grammars/tree-sitter-vim", rev = "11b688a1f0e97c0c4e3dbabf4a38016335f4d237" }
+tree-sitter-vimdoc = { git = "https://github.com/neovim/tree-sitter-vimdoc", rev = "2694c3d27e2ca98a0ccde72f33887394300d524e" }
+tree-sitter-yaml = "=0.7.0"
 regex = "1"
 serde_json = "1"
 toml = "0.9"

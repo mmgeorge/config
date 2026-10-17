@@ -42,7 +42,10 @@ for _, grammar in ipairs(grammar_manifest.grammar or {}) do
     grammar_bytes = grammar_bytes + #(file_text(path))
   end
 end
-assert_true(vim.tbl_count(grammar_name) == 22, "expected exactly 22 configured grammars")
+assert_true(vim.tbl_count(grammar_name) == 3, "expected WGSL, CUE, and LaTeX as the only local grammars")
+for _, name in ipairs({ "wgsl", "cue", "latex" }) do
+  assert_true(grammar_name[name], "missing local grammar exception: " .. name)
+end
 
 local query_file_count = 0
 local query_bytes = 0
@@ -61,7 +64,7 @@ for _, entry in ipairs(query_manifest.file or {}) do
 end
 
 local aliases = {
-  "rust", "typescript", "ts", "tsx", "typescriptreact", "lua", "vim", "vimdoc", "help", "json", "query",
+  "rust", "typescript", "ts", "tsx", "typescriptreact", "lua", "python", "py", "pyi", "pyw", "c", "cpp", "c++", "vim", "vimdoc", "help", "json", "query", "scm",
   "javascript", "js", "javascriptreact", "css", "html", "wgsl", "wgslx", "glsl", "frag", "vert", "c_sharp",
   "cs", "csharp", "toml", "slang", "shaderslang", "yaml", "nu", "markdown", "markdown_inline", "latex", "tex", "cue",
 }
@@ -73,7 +76,7 @@ end
 local elapsed_us = math.floor((vim.uv.hrtime() - started) / 1000)
 print(vim.json.encode({
   fixture = "syntax_resource_acceptance",
-  grammars = vim.tbl_count(grammar_name),
+  vendored_grammars = vim.tbl_count(grammar_name),
   aliases = #aliases,
   grammar_files = grammar_file_count,
   grammar_bytes = grammar_bytes,

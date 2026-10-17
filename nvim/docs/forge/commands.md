@@ -24,15 +24,24 @@ commands complete the file argument before the revision argument.
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
 selected model. The context starts with changed files and added/deleted line counts.
-Source excerpts retain function signatures, the first 20 changed body lines, and two
-nearby unchanged lines. Test/spec files follow other files. Import changes remain in
-the counts but are omitted from excerpts. Markdown and plain-text changes retain all
+Source excerpts retain function signatures. Modified functions include the first 20
+changed body lines and two nearby unchanged lines. Added and removed functions retain
+only their attributes and signatures. Test functions follow the same rule.
+Changed old/new signature pairs appear together. Body lines
+stay in original diff order, including inline
+callbacks and nested functions. Test/spec files follow other files. Standalone imports
+remain in the counts but are omitted from excerpts. Mixed import/code rows and runtime
+import calls remain visible. Markdown and plain-text changes retain all
 changed lines instead of applying the 20-line limit.
 
 The constructed input is capped at 500,000 UTF-8 bytes. At that limit, further excerpts
 stop, including signatures. Files without an included excerpt appear only in the file
-list. Omitted ranges within an excerpt show `... N lines omitted (+A -D)`. Unsupported
-or malformed syntax uses ordinary diff excerpts rather than signature-aware excerpts.
+list. Omitted ranges within an excerpt show `... N lines (+A -D)`.
+Whitespace-only gaps have no marker. A single omitted line is shown directly, even
+when the function body would otherwise be hidden, subject to the global byte limit.
+Unsupported or malformed syntax uses ordinary diff excerpts rather than signature-aware excerpts.
+License files and common dependency lockfiles keep their paths and change counts in the
+file list but have no excerpts, including license files with Markdown or text extensions.
 
 ## Harness and permissions
 
@@ -73,6 +82,16 @@ planned tests or disables selected checks after confirmation.
 | `:ForgeBuild` | None | Explicitly build Forge and report the selected executable |
 | `:ForgeStartupLog` | None | Open the startup diagnostic log |
 | `:ForgeGitConfigCacheReset` | None | Clear the cached Git configuration location |
+| `:ForgeDebugCommitPromptPreview [comparison]` | Optional `head`, `staged`, or `latest_commit` | Inspect the exact system instructions and compact commit context without calling a model |
+
+`ForgeDebugCommitPromptPreview` defaults to `head`, including staged, unstaged,
+and untracked changes. It uses the current Forge Status workspace when invoked
+there, otherwise the current working directory. The read-only scratch buffer shows
+the UTF-8 input size, system instructions, and user prompt. Press `q` to close it.
+Each invocation collects current repository state. Empty comparisons appear in
+the buffer, and failed requests produce an error notification.
+Renamed files appear once in the compact file list with their original path and
+have no detailed content excerpt, including when the rename also contains edits.
 
 A successful build does not replace an executable already loaded by a running
 host. Restart Neovim to use the rebuilt host. Compilation errors appear as build

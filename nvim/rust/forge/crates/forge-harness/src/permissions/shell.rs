@@ -381,6 +381,10 @@ fn invocation(
         return Err(());
     }
     let folded = executable.to_ascii_lowercase();
+    if shell == CommandShell::Nushell && matches!(folded.as_str(), "overlay" | "hide" | "hide-env")
+    {
+        return Err(());
+    }
     if matches!(
         folded.as_str(),
         "eval"

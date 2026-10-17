@@ -234,6 +234,9 @@ mod tests {
             ("typescript", "const value: number = 1;"),
             ("tsx", "const view = <div>Hi</div>;"),
             ("lua", "local value = 1"),
+            ("python", "def example(value: int) -> int:\n    return value + 1\n"),
+            ("c", "int calculate(int value) { return value + 1; }"),
+            ("cpp", "template<typename Value> Value calculate(Value value) { return value + 1; }"),
             ("vim", "let value = 1"),
             ("vimdoc", "*example* example help"),
             ("json", "{\"value\": 1}"),
@@ -281,6 +284,9 @@ mod tests {
             ("typescript", "const value: number = 1;"),
             ("tsx", "const view = <div>Hi</div>;"),
             ("lua", "local value = 1"),
+            ("python", "def example(value: int) -> int:\n    return value + 1\n"),
+            ("c", "int calculate(int value) { return value + 1; }"),
+            ("cpp", "template<typename Value> Value calculate(Value value) { return value + 1; }"),
             ("vim", "let value = 1"),
             ("vimdoc", "*example* example help"),
             ("json", "{\"value\": 1}"),
@@ -308,11 +314,11 @@ mod tests {
             capture_count += handle.captures().len();
         }
         let usage = engine.usage();
-        assert_eq!(SyntaxLanguage::ALL.len(), 22);
+        assert_eq!(SyntaxLanguage::ALL.len(), 25);
         assert_eq!(usage.active_jobs, 0);
-        assert!(usage.cached_entries > 0 && usage.cached_entries <= 22);
+        assert!(usage.cached_entries > 0 && usage.cached_entries <= 25);
         eprintln!(
-            "syntax_acceptance={{\"languages\":22,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
+            "syntax_acceptance={{\"languages\":25,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
             usage.cached_entries,
             started.elapsed().as_micros(),
         );
@@ -327,11 +333,19 @@ mod tests {
             ("tsx", SyntaxLanguage::Tsx),
             ("typescriptreact", SyntaxLanguage::Tsx),
             ("lua", SyntaxLanguage::Lua),
+            ("python", SyntaxLanguage::Python),
+            ("py", SyntaxLanguage::Python),
+            ("pyi", SyntaxLanguage::Python),
+            ("pyw", SyntaxLanguage::Python),
             ("vim", SyntaxLanguage::Vim),
             ("vimdoc", SyntaxLanguage::Vimdoc),
             ("help", SyntaxLanguage::Vimdoc),
             ("json", SyntaxLanguage::Json),
             ("query", SyntaxLanguage::Query),
+            ("scm", SyntaxLanguage::Query),
+            ("c", SyntaxLanguage::C),
+            ("cpp", SyntaxLanguage::Cpp),
+            ("c++", SyntaxLanguage::Cpp),
             ("javascript", SyntaxLanguage::Javascript),
             ("js", SyntaxLanguage::Javascript),
             ("javascriptreact", SyntaxLanguage::Javascript),
@@ -360,6 +374,23 @@ mod tests {
         }
         for (path, language) in [
             ("src/main.rs", SyntaxLanguage::Rust),
+            ("src/main.py", SyntaxLanguage::Python),
+            ("src/main.pyi", SyntaxLanguage::Python),
+            ("src/main.pyw", SyntaxLanguage::Python),
+            ("src/sample.c", SyntaxLanguage::C),
+            ("src/sample.h", SyntaxLanguage::C),
+            ("src/sample.cpp", SyntaxLanguage::Cpp),
+            ("src/sample.cc", SyntaxLanguage::Cpp),
+            ("src/sample.cxx", SyntaxLanguage::Cpp),
+            ("src/sample.C", SyntaxLanguage::Cpp),
+            ("src/sample.c++", SyntaxLanguage::Cpp),
+            ("src/sample.hpp", SyntaxLanguage::Cpp),
+            ("src/sample.hh", SyntaxLanguage::Cpp),
+            ("src/sample.hxx", SyntaxLanguage::Cpp),
+            ("src/sample.h++", SyntaxLanguage::Cpp),
+            ("src/sample.ipp", SyntaxLanguage::Cpp),
+            ("src/sample.tpp", SyntaxLanguage::Cpp),
+            ("config.cue", SyntaxLanguage::Cue),
             ("readme.md", SyntaxLanguage::Markdown),
             ("queries/highlights.scm", SyntaxLanguage::Query),
             ("config.yml", SyntaxLanguage::Yaml),
@@ -372,7 +403,7 @@ mod tests {
         ] {
             assert_eq!(SyntaxLanguage::for_path(path), Some(language), "{path}");
         }
-        assert_eq!(SyntaxLanguage::ALL.len(), 22);
+        assert_eq!(SyntaxLanguage::ALL.len(), 25);
     }
 
     #[tokio::test]
@@ -633,6 +664,34 @@ mod tests {
                 query::CompiledQuery::new(&grammar, &text)
                     .unwrap_or_else(|error| panic!("{} {kind}: {error:?}", language.name()));
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn python_outline_includes_decorators_and_does_not_treat_dicts_as_closing_delimiters() {
+        let source = "from typing import (\n    Any,\n)\n@decorate\nclass Client:\n    @classmethod\n    async def fetch(\n        cls, value: int,\n    ) -> dict[str, int]:\n        return {\n            \"value\": value,\n        }\n";
+        let handle = engine().analyze(request(SyntaxLanguage::Python, source)).await.unwrap();
+        let outline = handle.outline();
+        assert_eq!(outline.import, [0..3]);
+        assert_eq!(outline.scope.len(), 2);
+        assert_eq!(outline.scope[0].identity, "class_definition:Client");
+        assert_eq!(outline.scope[0].signature, 3..5);
+        assert_eq!(outline.scope[1].identity, "class_definition:Client/function_definition:fetch");
+        assert_eq!(outline.scope[1].signature, 5..9);
+        assert_eq!(outline.scope[1].extent, 5..12);
+        assert_eq!(outline.scope[1].closing, None);
+        assert_eq!(handle.hunk_context(10).unwrap().label, "Client.fetch");
+        assert!(!handle.captures().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cue_highlights_definitions_fields_and_imports() {
+        let source = "package schema\nimport \"strings\"\n#Server: {\n    port: int & >0\n}\nserver: #Server & {port: 8080}\n";
+        let handle = engine().analyze(request(SyntaxLanguage::Cue, source)).await.unwrap();
+        assert!(!handle.0.tree[0].root_node().has_error());
+        assert_eq!(handle.outline().import, [1..2]);
+        for row in [2, 3, 5] {
+            assert!(handle.captures_intersecting_rows(row, row + 1).next().is_some(), "missing CUE captures for row {row}");
         }
     }
 }

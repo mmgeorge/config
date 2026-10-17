@@ -77,23 +77,23 @@
     },
     {
       "path": "query/upstream/nu/folds.scm",
-      "origin": "nvim-treesitter/queries/nu/folds.scm",
-      "sha256": "f0a34869c99e37a090280f5648badade85719bef5d377ddfec4c6a5dbe569465"
+      "origin": "https://github.com/nushell/tree-sitter-nu/blob/4f577aaa735154f934594b598a69ed7b1b707cf6/queries/nu/folds.scm",
+      "sha256": "0ad0923003c53520116ff8dd201b6edf2f2bee69c8735726ba28a9a8e80c4dcb"
     },
     {
       "path": "query/upstream/nu/highlights.scm",
-      "origin": "nvim-treesitter/queries/nu/highlights.scm",
-      "sha256": "2e5303e1cdca5822d26e9233606f05f6b789d280bb18b145e50d78723488b1c1"
+      "origin": "https://github.com/nushell/tree-sitter-nu/blob/4f577aaa735154f934594b598a69ed7b1b707cf6/queries/nu/highlights.scm",
+      "sha256": "18952440f0a88e8f4ed431d977fac826e110cfb24ec45823edc89142f2181a1e"
     },
     {
       "path": "query/upstream/nu/indents.scm",
-      "origin": "nvim-treesitter/queries/nu/indents.scm",
-      "sha256": "7d36312eb9fefd47ef0471b4fcd1b735b654d9c51044030e91cd418d7c6b30d5"
+      "origin": "https://github.com/nushell/tree-sitter-nu/blob/4f577aaa735154f934594b598a69ed7b1b707cf6/queries/nu/indents.scm",
+      "sha256": "e315acdf043347e73e8fe745ab886b64c91e06b2e44b0971966fedc32f321b2d"
     },
     {
       "path": "query/upstream/nu/injections.scm",
-      "origin": "nvim-treesitter/queries/nu/injections.scm",
-      "sha256": "6e19701723a14fab37013bf4e490da2908edf975cae6ddb1ed90b9499d4ab224"
+      "origin": "https://github.com/nushell/tree-sitter-nu/blob/4f577aaa735154f934594b598a69ed7b1b707cf6/queries/nu/injections.scm",
+      "sha256": "f9f868638a5369c6d7e231d50ad5821987e41d7030110887c0e37949556d24e9"
     },
     {
       "path": "query/upstream/yaml/folds.scm",
@@ -688,7 +688,7 @@
     {
       "path": "query/forge/python/diff_context.scm",
       "origin": "nvim/lua/forge/queries/python/diff_context.scm",
-      "sha256": "6be04f5e7a8f215c32b3aca557de3fc6b1988c636a2a0902a4f090302b96f1aa"
+      "sha256": "38f82c39810c24e9a4c2bef89568030d222c8ab50f5e22553cece855ad42d617"
     },
     {
       "path": "query/forge/rust/diff_context.scm",
@@ -724,6 +724,31 @@
       "path": "query/forge/typescript/diff_inventory.scm",
       "origin": "nvim/lua/forge/queries/typescript/diff_inventory.scm",
       "sha256": "ed21906b7dd1cbd8d95fc45977c2b03df0bae4f72db79d713d81195fff42f768"
+    },
+    {
+      "path": "query/upstream/python/folds.scm",
+      "origin": "nvim-treesitter/queries/python/folds.scm",
+      "sha256": "7ea0eb74ffee66415a3b6fd51b47873b411bc80d8eb4dfb7aa6ffa0cf7fad1f3"
+    },
+    {
+      "path": "query/upstream/python/highlights.scm",
+      "origin": "nvim-treesitter/queries/python/highlights.scm",
+      "sha256": "e53e306c8c9552fdeeea61f587c2c4012832b61d51cebec89115001549943cf0"
+    },
+    {
+      "path": "query/upstream/python/indents.scm",
+      "origin": "nvim-treesitter/queries/python/indents.scm",
+      "sha256": "50781d783a18a566581d8280c53e150454d1e3523cfcd4f1401bb3a228a98e80"
+    },
+    {
+      "path": "query/upstream/python/injections.scm",
+      "origin": "nvim-treesitter/queries/python/injections.scm",
+      "sha256": "6917cf43968549f2773b5c2c24f280480ca035afcad7839c577ec540ae8d7564"
+    },
+    {
+      "path": "query/upstream/python/locals.scm",
+      "origin": "nvim-treesitter/queries/python/locals.scm",
+      "sha256": "370635358588e6d66e6065dd9fb1e21d864e8eb125abbf4728e573bc06ef4921"
     }
   ]
 }

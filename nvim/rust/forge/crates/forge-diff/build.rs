@@ -1,33 +1,10 @@
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
-const GRAMMAR: &[(&str, &str)] = &[
-    ("rust", ""),
-    ("typescript", "typescript/"),
-    ("tsx", "tsx/"),
-    ("lua", ""),
-    ("vim", ""),
-    ("vimdoc", ""),
-    ("json", ""),
-    ("query", ""),
-    ("javascript", ""),
-    ("css", ""),
-    ("html", ""),
-    ("wgsl", ""),
-    ("glsl", ""),
-    ("c_sharp", ""),
-    ("toml", ""),
-    ("slang", ""),
-    ("yaml", ""),
-    ("nu", ""),
-    ("markdown", "tree-sitter-markdown/"),
-    ("markdown_inline", "tree-sitter-markdown-inline/"),
-    ("latex", ""),
-    ("cue", ""),
-];
+const GRAMMAR: &[&str] = &["wgsl", "latex", "cue"];
 
 fn main() {
-    for (name, location) in GRAMMAR {
-        let source = grammar_source(name, location);
+    for name in GRAMMAR {
+        let source = Path::new("grammar").join(name).join("src");
         let mut compiler = cc::Build::new();
         compiler
             .warnings(false)
@@ -46,8 +23,4 @@ fn main() {
         compiler.compile(&format!("forge_grammar_{name}"));
     }
     println!("cargo:rerun-if-changed=grammar");
-}
-
-fn grammar_source(name: &str, location: &str) -> PathBuf {
-    Path::new("grammar").join(name).join(location).join("src")
 }

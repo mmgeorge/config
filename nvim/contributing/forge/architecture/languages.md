@@ -8,9 +8,10 @@ Read [Adding a language](../adding-language.md), [Updating Tree-sitter](../updat
 
 | Capability | Source of truth | Result |
 | --- | --- | --- |
-| Native syntax rendering | `forge-diff/src/syntax/assets.rs`, bundled grammar and query manifests | Highlight and injection captures for real source |
+| Native syntax rendering | `forge-diff/src/syntax/assets.rs`, Cargo grammar dependencies, and local asset manifests | Highlight and injection captures for real source |
 | Declaration planning | `DeclarationOverview::language` and the declaration adapters | Body-free interfaces, imports, fields, documentation, and formatting |
 | Structural references | `declaration_index.rs`, `declaration_calls.rs`, and Harness plan modules | Scopes, callable owners, reference expressions, and source coordinates |
+| Commit-message excerpts | `SyntaxHandle::outline` and `src/commit_message/excerpt.rs` | Signatures and bounded changed-body excerpts, with ordinary diff fallback |
 | Workspace definitions | Shared Lua LSP adapter plus the running project server | Definition locations for captured real-source occurrences |
 | Package ownership | Harness `checks/packages.rs` and package-manager metadata | Cargo, npm, and pnpm workspace members owning changed files |
 | Test selection | Harness check selections, invocation resolver, and runner | Package checks or exact planned cases, with execution evidence |
@@ -20,6 +21,32 @@ registry. Extensions and aliases must be added to the correct registry for each
 promised capability. Rust, TypeScript, TSX, and Lua have plan-specific adapters.
 Configuration formats retain their values rather than using executable-language
 body projection.
+
+Native syntax includes Python (`.py`, `.pyi`, `.pyw`) and CUE (`.cue`) without
+installing editor parsers or language servers. Python uses a pinned upstream
+grammar crate and the local query assets. Its context queries
+recognize decorated functions and classes once, preserving their outer scope.
+Python and CUE do not have declaration-planning adapters.
+
+Native C and C++ syntax uses upstream grammar crates and the existing query assets.
+`.c` and `.h` select C. `.cpp`, `.cc`, `.cxx`, `.C`, `.c++`, `.hpp`, `.hh`,
+`.hxx`, `.h++`, `.ipp`, and `.tpp` select C++. The `c++` language alias selects
+the `cpp` parser. `.scm` and the `scm` alias select the Tree-sitter query grammar,
+not Scheme. These languages require no editor parser installation and do not
+add declaration-planning or agent structural-query adapters.
+
+Commit excerpts select syntax automatically from the file path. They require no
+user configuration or language server. A language's signature and import support
+must be verified separately from highlighting. The current regression matrix
+covers Rust, TypeScript, JavaScript, Lua, Python, C, and C++ signatures,
+JSON/TOML/YAML/CUE/query diffs, unknown-language fallback, and complete
+Markdown/plain-text changes. C and C++ extraction follows function declarators,
+retains template headers, recognizes bound lambdas, and excludes `#include` rows.
+Parse errors disable only the affected declarations or imports. Recovered valid
+subtrees remain eligible for excerpts, so conditional C/C++ linkage blocks do
+not force an entire shared header into ordinary diff fallback.
+Contributor acceptance requirements are in
+[Commit-message excerpt coverage](../adding-language.md#commit-message-excerpt-coverage).
 
 ## Agent LSP queries
 
@@ -89,13 +116,25 @@ does not imply a source-to-test mapping. See
 boundary and [Planning](planning.md#project-checks-and-the-harness-checking-gate)
 for selection, preview, and execution ownership.
 
-## Bundled parser and query ownership
+## Parser and query ownership
 
-`forge-diff/grammar/manifest.json` pins parser origin, revision, source subdirectory,
-and exact vendored file hashes. `forge-diff/build.rs` compiles the C parser and an
-optional scanner. `SyntaxLanguage::grammar` binds the exported entry point.
+`forge-diff/Cargo.toml` selects upstream grammar crates and exact Git revisions.
+`Cargo.lock` pins their resolved packages. Each grammar dependency compiles its
+own generated parser and scanner, and `SyntaxLanguage::grammar` consumes its Rust
+language entry point. Prefer this path when adding a language.
+
+WGSL, CUE, and LaTeX retain local parser sources because their selected upstream
+Rust bindings require older Tree-sitter runtimes. `forge-diff/grammar/manifest.json`
+records only these exceptions and their exact file hashes. `forge-diff/build.rs`
+compiles their parsers and scanners. The separate patched PowerShell grammar
+remains a Cargo path patch under `forge/vendor/`. Bash and Zsh already use upstream
+Cargo grammar dependencies in `forge-harness` for shell approval analysis.
+Harness also consumes the shared Nushell grammar. Its approval classifier must
+continue rejecting unresolved execution and environment changes after parser updates.
+
 The pinned `tree-sitter` and `tree-sitter-language` dependencies define the runtime
-ABI used by those grammars.
+and grammar binding boundary. A compatible generated-parser ABI does not remove
+an upstream Rust crate's dependency constraints.
 
 `forge-diff/query/manifest.json` records native query provenance. `QUERY_ASSET`
 embeds and orders query text for the native service. Neovim runtime overrides in

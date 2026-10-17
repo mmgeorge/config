@@ -7,6 +7,9 @@ pub enum SyntaxLanguage {
     Typescript,
     Tsx,
     Lua,
+    Python,
+    C,
+    Cpp,
     Vim,
     Vimdoc,
     Json,
@@ -33,6 +36,9 @@ impl SyntaxLanguage {
         Self::Typescript,
         Self::Tsx,
         Self::Lua,
+        Self::Python,
+        Self::C,
+        Self::Cpp,
         Self::Vim,
         Self::Vimdoc,
         Self::Json,
@@ -58,6 +64,9 @@ impl SyntaxLanguage {
             Self::Typescript => "typescript",
             Self::Tsx => "tsx",
             Self::Lua => "lua",
+            Self::Python => "python",
+            Self::C => "c",
+            Self::Cpp => "cpp",
             Self::Vim => "vim",
             Self::Vimdoc => "vimdoc",
             Self::Json => "json",
@@ -85,6 +94,8 @@ impl SyntaxLanguage {
             "rs" => "rust",
             "md" => "markdown",
             "scm" => "query",
+            "h" => "c",
+            "C" | "cc" | "cxx" | "c++" | "hpp" | "hh" | "hxx" | "h++" | "ipp" | "tpp" => "cpp",
             "yml" => "yaml",
             "jsx" | "mjs" | "cjs" => "javascript",
             "mts" | "cts" => "typescript",
@@ -98,10 +109,13 @@ impl SyntaxLanguage {
             "typescript" | "ts" => Some(Self::Typescript),
             "tsx" | "typescriptreact" => Some(Self::Tsx),
             "lua" => Some(Self::Lua),
+            "python" | "py" | "pyi" | "pyw" => Some(Self::Python),
+            "c" => Some(Self::C),
+            "cpp" | "c++" => Some(Self::Cpp),
             "vim" => Some(Self::Vim),
             "vimdoc" | "help" => Some(Self::Vimdoc),
             "json" => Some(Self::Json),
-            "query" => Some(Self::Query),
+            "query" | "scm" => Some(Self::Query),
             "javascript" | "js" | "javascriptreact" => Some(Self::Javascript),
             "css" => Some(Self::Css),
             "html" => Some(Self::Html),
@@ -119,60 +133,40 @@ impl SyntaxLanguage {
             _ => None,
         }
     }
-    /// Returns the vendored grammar for syntax analysis outside the highlighting service.
+    /// Returns the selected upstream or locally compiled grammar.
     pub fn grammar(self) -> Language {
         unsafe extern "C" {
-            fn tree_sitter_rust() -> *const ();
-            fn tree_sitter_typescript() -> *const ();
-            fn tree_sitter_tsx() -> *const ();
-            fn tree_sitter_lua() -> *const ();
-            fn tree_sitter_vim() -> *const ();
-            fn tree_sitter_vimdoc() -> *const ();
-            fn tree_sitter_json() -> *const ();
-            fn tree_sitter_query() -> *const ();
-            fn tree_sitter_javascript() -> *const ();
-            fn tree_sitter_css() -> *const ();
-            fn tree_sitter_html() -> *const ();
             fn tree_sitter_wgsl() -> *const ();
-            fn tree_sitter_glsl() -> *const ();
-            fn tree_sitter_c_sharp() -> *const ();
-            fn tree_sitter_toml() -> *const ();
-            fn tree_sitter_slang() -> *const ();
-            fn tree_sitter_yaml() -> *const ();
-            fn tree_sitter_nu() -> *const ();
-            fn tree_sitter_markdown() -> *const ();
-            fn tree_sitter_markdown_inline() -> *const ();
             fn tree_sitter_latex() -> *const ();
             fn tree_sitter_cue() -> *const ();
         }
-        let function = match self {
-            Self::Rust => tree_sitter_rust as unsafe extern "C" fn() -> *const (),
-            Self::Typescript => tree_sitter_typescript as unsafe extern "C" fn() -> *const (),
-            Self::Tsx => tree_sitter_tsx as unsafe extern "C" fn() -> *const (),
-            Self::Lua => tree_sitter_lua as unsafe extern "C" fn() -> *const (),
-            Self::Vim => tree_sitter_vim as unsafe extern "C" fn() -> *const (),
-            Self::Vimdoc => tree_sitter_vimdoc as unsafe extern "C" fn() -> *const (),
-            Self::Json => tree_sitter_json as unsafe extern "C" fn() -> *const (),
-            Self::Query => tree_sitter_query as unsafe extern "C" fn() -> *const (),
-            Self::Javascript => tree_sitter_javascript as unsafe extern "C" fn() -> *const (),
-            Self::Css => tree_sitter_css as unsafe extern "C" fn() -> *const (),
-            Self::Html => tree_sitter_html as unsafe extern "C" fn() -> *const (),
-            Self::Wgsl => tree_sitter_wgsl as unsafe extern "C" fn() -> *const (),
-            Self::Glsl => tree_sitter_glsl as unsafe extern "C" fn() -> *const (),
-            Self::CSharp => tree_sitter_c_sharp as unsafe extern "C" fn() -> *const (),
-            Self::Toml => tree_sitter_toml as unsafe extern "C" fn() -> *const (),
-            Self::Slang => tree_sitter_slang as unsafe extern "C" fn() -> *const (),
-            Self::Yaml => tree_sitter_yaml as unsafe extern "C" fn() -> *const (),
-            Self::Nu => tree_sitter_nu as unsafe extern "C" fn() -> *const (),
-            Self::Markdown => tree_sitter_markdown as unsafe extern "C" fn() -> *const (),
-            Self::MarkdownInline => {
-                tree_sitter_markdown_inline as unsafe extern "C" fn() -> *const ()
-            }
-            Self::Latex => tree_sitter_latex as unsafe extern "C" fn() -> *const (),
-            Self::Cue => tree_sitter_cue as unsafe extern "C" fn() -> *const (),
-        };
-        // Each linked generated function returns a static language from the pinned grammar manifest.
-        Language::new(unsafe { LanguageFn::from_raw(function) })
+        match self {
+            Self::Rust => tree_sitter_rust::LANGUAGE.into(),
+            Self::Typescript => tree_sitter_typescript::LANGUAGE_TYPESCRIPT.into(),
+            Self::Tsx => tree_sitter_typescript::LANGUAGE_TSX.into(),
+            Self::Lua => tree_sitter_lua::LANGUAGE.into(),
+            Self::Python => tree_sitter_python::LANGUAGE.into(),
+            Self::C => tree_sitter_c::LANGUAGE.into(),
+            Self::Cpp => tree_sitter_cpp::LANGUAGE.into(),
+            Self::Vim => tree_sitter_vim::language(),
+            Self::Vimdoc => tree_sitter_vimdoc::language(),
+            Self::Json => tree_sitter_json::LANGUAGE.into(),
+            Self::Query => tree_sitter_query::LANGUAGE.into(),
+            Self::Javascript => tree_sitter_javascript::LANGUAGE.into(),
+            Self::Css => tree_sitter_css::LANGUAGE.into(),
+            Self::Html => tree_sitter_html::LANGUAGE.into(),
+            Self::Glsl => tree_sitter_glsl::LANGUAGE_GLSL.into(),
+            Self::CSharp => tree_sitter_c_sharp::LANGUAGE.into(),
+            Self::Toml => tree_sitter_toml_ng::LANGUAGE.into(),
+            Self::Slang => tree_sitter_slang::LANGUAGE_SLANG.into(),
+            Self::Yaml => tree_sitter_yaml::LANGUAGE.into(),
+            Self::Nu => tree_sitter_nu::LANGUAGE.into(),
+            Self::Markdown => tree_sitter_md::LANGUAGE.into(),
+            Self::MarkdownInline => tree_sitter_md::INLINE_LANGUAGE.into(),
+            Self::Wgsl => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_wgsl) }),
+            Self::Latex => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_latex) }),
+            Self::Cue => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_cue) }),
+        }
     }
 }
 
@@ -184,6 +178,24 @@ pub(crate) struct QueryAsset {
 }
 
 pub(crate) const QUERY_ASSET: &[QueryAsset] = &[
+    QueryAsset {
+        language: "python",
+        kind: "highlights",
+        origin: "upstream",
+        text: include_str!("../../query/upstream/python/highlights.scm"),
+    },
+    QueryAsset {
+        language: "python",
+        kind: "locals",
+        origin: "upstream",
+        text: include_str!("../../query/upstream/python/locals.scm"),
+    },
+    QueryAsset {
+        language: "python",
+        kind: "injections",
+        origin: "upstream",
+        text: include_str!("../../query/upstream/python/injections.scm"),
+    },
     QueryAsset {
         language: "javascript",
         kind: "diff_context",

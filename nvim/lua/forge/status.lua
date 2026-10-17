@@ -689,6 +689,8 @@ function M.open(options)
   require("forge.startup_log").write("status.buffer.opened", { document = document,
     elapsed_ms = math.floor((vim.uv.hrtime() - open_started) / 1e6) })
   vim.b[state.replica.buffer].forge_native_document = true
+  vim.b[state.replica.buffer].forge_workspace = options.workspace
+    or (options.filename and vim.fs.dirname(options.filename)) or vim.fn.getcwd()
   local loading_namespace = vim.api.nvim_create_namespace("ForgeStatusLoading")
   vim.api.nvim_buf_set_extmark(state.replica.buffer, loading_namespace, 0, 0, {
     virt_text = { { "Loading Forge status…", "Comment" } },

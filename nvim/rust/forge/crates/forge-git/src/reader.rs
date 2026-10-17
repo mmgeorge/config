@@ -74,7 +74,7 @@ impl StatusReader {
         let mut result = Self::status_selected(
             repository,
             None,
-            gix::status::tree_index::TrackRenames::Disabled,
+            gix::status::tree_index::TrackRenames::Given(Default::default()),
             check,
         )?;
         let candidate: Vec<_> = result

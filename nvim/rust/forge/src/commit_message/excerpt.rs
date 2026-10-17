@@ -16,7 +16,9 @@ const CONTEXT_LINES: usize = 2;
 const INSTRUCTIONS: &str = "Generate a conventional commit message for these changes.\n\n\
 The diff is compacted. '+ ' marks added lines, '- ' removed lines, and '  ' unchanged lines. \
 Signatures are retained. Omission markers include added and removed line counts. \
-Import changes are excluded from excerpts. Files without excerpts appear only in the file list. \
+Added and removed functions include signatures only. \
+Renamed files, license changes, and lockfile changes appear only in the file list. \
+Standalone import changes are excluded from excerpts. Files without excerpts appear only in the file list. \
 Describe visible changes without guessing the contents of omitted lines.\n\nChanged files:\n";
 
 /// A complete file comparison retained until inventory and excerpt selection finish.
@@ -25,7 +27,7 @@ pub(super) struct ChangedFile {
     pub path: String,
     /// Non-content changes such as relocation or file mode.
     pub note: String,
-    /// Exact text comparison, absent for binary or unsupported content.
+    /// Exact text comparison, absent for renames, binary files, or unsupported content.
     pub analysis: Option<AnalysisHandle>,
 }
 
@@ -35,16 +37,15 @@ impl ChangedFile {
             .analysis
             .as_ref()
             .map(|analysis| analysis.line_counts());
-        let counts = counts.map_or_else(
-            || "counts unavailable".into(),
-            |counts| format!("+{} -{}", counts.added, counts.deleted),
-        );
+        let counts = counts.map(|counts| format!("+{} -{}", counts.added, counts.deleted));
         let path = self.path.replace('\n', "\\n").replace('\r', "\\r");
-        if self.note.is_empty() {
-            format!("{path} ({counts})")
-        } else {
-            format!("{path} ({counts}, {})", self.note)
-        }
+        let detail = match (counts, self.note.is_empty()) {
+            (Some(counts), true) => counts,
+            (Some(counts), false) => format!("{counts}, {}", self.note),
+            (None, false) => self.note.clone(),
+            (None, true) => "counts unavailable".into(),
+        };
+        format!("{path} ({detail})")
     }
 }
 
@@ -94,6 +95,7 @@ struct ObjectRows {
     rows: Vec<usize>,
     signature: Vec<usize>,
     closing: Vec<usize>,
+    changed: bool,
 }
 
 /// Construct one bounded prompt for every comparison and provider route.
@@ -123,6 +125,9 @@ async fn render(files: &mut [ChangedFile], syntax: &Arc<SyntaxEngine>, limit: us
     for file in files.iter() {
         if writer.stopped {
             break;
+        }
+        if inventory_only(&file.path) {
+            continue;
         }
         let Some(analysis) = file.analysis.as_ref() else {
             continue;
@@ -158,6 +163,51 @@ fn test_path(path: &str) -> bool {
         || path
             .split(['/', '\\'])
             .any(|part| matches!(part, "test" | "tests" | "spec" | "specs" | "__tests__"))
+}
+
+fn inventory_only(path: &str) -> bool {
+    let filename = path
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
+        .to_ascii_lowercase();
+    let python_lock = filename
+        .strip_prefix("pylock.")
+        .and_then(|name| name.strip_suffix(".toml"))
+        .is_some_and(|name| !name.is_empty() && !name.contains('.'));
+    let julia_lock = filename
+        .strip_prefix("manifest-v")
+        .and_then(|name| name.strip_suffix(".toml"))
+        .and_then(|version| version.split_once('.'))
+        .is_some_and(|(major, minor)| {
+            !major.is_empty()
+                && !minor.is_empty()
+                && major
+                    .bytes()
+                    .chain(minor.bytes())
+                    .all(|byte| byte.is_ascii_digit())
+        });
+    filename.contains(".lock")
+        || matches!(
+            filename.as_str(),
+            "license"
+                | "license.md"
+                | "license.txt"
+                | "license.rst"
+                | "package-lock.json"
+                | ".package-lock.json"
+                | "npm-shrinkwrap.json"
+                | "pnpm-lock.yaml"
+                | "package.resolved"
+                | "pylock.toml"
+                | "manifest.toml"
+                | "juliamanifest.toml"
+        )
+        || (filename.contains("conda-lock")
+            && (filename.ends_with(".yml") || filename.ends_with(".yaml")))
+        || filename.ends_with(".project.freeze")
+        || python_lock
+        || julia_lock
 }
 
 async fn outline(
@@ -252,36 +302,157 @@ fn imported(outline: &SourceOutline, row: Option<usize>) -> bool {
     row.is_some_and(|row| outline.import.iter().any(|range| range.contains(&row)))
 }
 
-fn objects(rows: &[DiffRow<'_>], old: &SourceOutline, new: &SourceOutline) -> Vec<ObjectRows> {
+fn signature_row_limit(
+    outline: &SourceOutline,
+    row: Option<usize>,
+    signature_only: &[bool],
+) -> Option<usize> {
+    let row = row?;
+    outline
+        .scope
+        .iter()
+        .zip(signature_only)
+        .filter(|(scope, only)| **only && scope.extent.contains(&row))
+        .filter_map(|(scope, _)| {
+            if !scope.signature.contains(&row) {
+                Some(0)
+            } else if row + 1 == scope.signature.end {
+                Some(scope.signature_end_column)
+            } else {
+                None
+            }
+        })
+        .min()
+}
+
+fn objects(
+    rows: &[DiffRow<'_>],
+    old: &SourceOutline,
+    new: &SourceOutline,
+) -> (Vec<ObjectRows>, Vec<bool>, Vec<bool>) {
     let mut result: Vec<_> = (0..=new.scope.len())
         .map(|_| ObjectRows::default())
         .collect();
+    let owners: Vec<_> = rows
+        .iter()
+        .map(|row| (owner(old, row.old), owner(new, row.new)))
+        .collect();
+    let mut candidates = vec![None; old.scope.len()];
+    let mut ambiguous = vec![false; old.scope.len()];
+    for (row, (old_scope, new_scope)) in rows.iter().zip(&owners) {
+        let (Some(old_scope), Some(new_scope), Some(old_line), Some(new_line)) =
+            (*old_scope, *new_scope, row.old, row.new)
+        else {
+            continue;
+        };
+        if row.changed()
+            || old.scope[old_scope].identity != new.scope[new_scope].identity
+            || !old.scope[old_scope].signature.contains(&old_line)
+            || !new.scope[new_scope].signature.contains(&new_line)
+        {
+            continue;
+        }
+        if candidates[old_scope].is_some_and(|candidate| candidate != new_scope) {
+            ambiguous[old_scope] = true;
+        }
+        candidates[old_scope] = Some(new_scope);
+    }
+    let mut references = vec![0; new.scope.len()];
+    for (candidate, ambiguous) in candidates.iter().zip(&ambiguous) {
+        if let Some(candidate) = candidate.filter(|_| !ambiguous) {
+            references[candidate] += 1;
+        }
+    }
+    let mut used = vec![false; new.scope.len()];
+    for (candidate, ambiguous) in candidates.iter_mut().zip(&ambiguous) {
+        *candidate = candidate.filter(|candidate| !ambiguous && references[*candidate] == 1);
+        if let Some(candidate) = candidate {
+            used[*candidate] = true;
+        }
+    }
     let mut by_identity: HashMap<&str, Vec<usize>> = HashMap::new();
-    for (index, scope) in new.scope.iter().enumerate().rev() {
+    for (index, scope) in new
+        .scope
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !used[*index])
+    {
         by_identity
             .entry(&scope.identity)
             .or_default()
             .push(index + 1);
     }
+    let mut remaining: HashMap<&str, usize> = HashMap::new();
+    for (index, scope) in old.scope.iter().enumerate() {
+        if candidates[index].is_none() {
+            *remaining.entry(&scope.identity).or_default() += 1;
+        }
+    }
     let old_owner: Vec<_> = old
         .scope
         .iter()
-        .map(|scope| {
-            by_identity
-                .get_mut(scope.identity.as_str())
-                .and_then(Vec::pop)
+        .enumerate()
+        .map(|(index, scope)| {
+            candidates[index]
+                .map(|candidate| candidate + 1)
+                .or_else(|| {
+                    by_identity
+                        .get_mut(scope.identity.as_str())
+                        .filter(|available| {
+                            available.len() == 1 && remaining[scope.identity.as_str()] == 1
+                        })
+                        .and_then(Vec::pop)
+                })
                 .unwrap_or_else(|| {
                     result.push(ObjectRows::default());
                     result.len() - 1
                 })
         })
         .collect();
-    for (index, row) in rows.iter().enumerate() {
+    let signature_only = old
+        .scope
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            scope.is_callable
+                && old_owner[index] > new.scope.len()
+                && !new
+                    .scope
+                    .iter()
+                    .enumerate()
+                    .any(|(candidate, declaration)| {
+                        declaration.identity == scope.identity
+                            && !old_owner.contains(&(candidate + 1))
+                    })
+                && rows.iter().any(|row| {
+                    row.marker == '-' && row.old.is_some_and(|line| scope.signature.contains(&line))
+                })
+        })
+        .collect();
+    let new_signature_only = new
+        .scope
+        .iter()
+        .enumerate()
+        .map(|(index, scope)| {
+            scope.is_callable
+                && !old_owner.contains(&(index + 1))
+                && !old
+                    .scope
+                    .iter()
+                    .enumerate()
+                    .any(|(candidate, declaration)| {
+                        declaration.identity == scope.identity
+                            && old_owner[candidate] > new.scope.len()
+                    })
+                && rows.iter().any(|row| {
+                    row.marker == '+' && row.new.is_some_and(|line| scope.signature.contains(&line))
+                })
+        })
+        .collect();
+    for (index, (row, (old_scope, new_scope))) in rows.iter().zip(owners).enumerate() {
         if imported(old, row.old) || imported(new, row.new) {
             continue;
         }
-        let old_scope = owner(old, row.old);
-        let new_scope = owner(new, row.new);
         let group = new_scope
             .map(|scope| scope + 1)
             .or_else(|| old_scope.map(|scope| old_owner[scope]))
@@ -306,10 +477,28 @@ fn objects(rows: &[DiffRow<'_>], old: &SourceOutline, new: &SourceOutline) -> Ve
         if closing {
             object.closing.push(index);
         }
+        if row.changed() {
+            result[group].changed = true;
+            for (scope, declaration) in new.scope.iter().enumerate() {
+                if row
+                    .new
+                    .is_some_and(|line| declaration.extent.contains(&line))
+                {
+                    result[scope + 1].changed = true;
+                }
+            }
+            for (scope, declaration) in old.scope.iter().enumerate() {
+                if row
+                    .old
+                    .is_some_and(|line| declaration.extent.contains(&line))
+                {
+                    result[old_owner[scope]].changed = true;
+                }
+            }
+        }
     }
-    result.retain(|object| object.rows.iter().any(|index| rows[*index].changed()));
-    result.sort_by_key(|object| object.rows.first().copied().unwrap_or(usize::MAX));
-    result
+    result.retain(|object| object.changed);
+    (result, signature_only, new_signature_only)
 }
 
 fn emit_file(
@@ -319,11 +508,14 @@ fn emit_file(
     new: &SourceOutline,
     document: bool,
 ) {
-    let rows = rows(file.analysis.as_ref().unwrap());
-    let groups = objects(&rows, old, new);
-    let mut file_started = false;
-    for object in groups {
-        let mut selected = vec![false; rows.len()];
+    let mut rows = rows(file.analysis.as_ref().unwrap());
+    let (groups, old_signature_only, new_signature_only) = objects(&rows, old, new);
+    let mut selected = vec![false; rows.len()];
+    let mut signature = vec![false; rows.len()];
+    for object in &groups {
+        for index in &object.signature {
+            signature[*index] = true;
+        }
         for index in object.signature.iter().chain(&object.closing) {
             selected[*index] = true;
         }
@@ -355,6 +547,10 @@ fn emit_file(
                     let Some(neighbor) = object.rows.get(cursor).copied() else {
                         break;
                     };
+                    let previous = if backwards { cursor + 1 } else { cursor - 1 };
+                    if neighbor.abs_diff(object.rows[previous]) != 1 {
+                        break;
+                    }
                     if rows[neighbor].changed() {
                         if !selected[neighbor] {
                             break;
@@ -366,68 +562,114 @@ fn emit_file(
                 }
             }
         }
-        // Signatures are atomic at the byte boundary, even when spread over many rows.
-        let mut prefix = if file_started {
-            String::from("\n")
+    }
+    for (index, row) in rows.iter_mut().enumerate() {
+        let limit = if row.new.is_some() {
+            signature_row_limit(new, row.new, &new_signature_only)
         } else {
-            format!("\n{}\n\n", file.heading())
+            signature_row_limit(old, row.old, &old_signature_only)
         };
-        let first_body = object
-            .rows
+        if let Some(limit) = limit {
+            if limit == 0 {
+                selected[index] = false;
+                signature[index] = false;
+            } else if limit < row.text.len() {
+                row.text = &row.text[..limit];
+            }
+        }
+    }
+    let mut signature_blocks = HashMap::new();
+    let mut regrouped = vec![false; rows.len()];
+    for object in &groups {
+        let indices: Vec<_> = object
+            .signature
             .iter()
-            .position(|index| !object.signature.contains(index))
-            .unwrap_or(object.rows.len());
-        for index in &object.rows[..first_body] {
-            if selected[*index] {
-                prefix.push_str(&rows[*index].render());
-            }
+            .copied()
+            .filter(|index| selected[*index] && signature[*index])
+            .collect();
+        if !indices.iter().any(|index| rows[*index].marker == '-')
+            || !indices.iter().any(|index| rows[*index].marker == '+')
+            || indices.windows(2).all(|pair| pair[1] == pair[0] + 1)
+        {
+            continue;
         }
-        let mut started = false;
-        let mut gap = Vec::new();
-        let mut position = first_body;
-        while position < object.rows.len() {
-            let index = object.rows[position];
-            if selected[index] {
-                if !gap.is_empty() {
-                    prefix.push_str(&gap_text(&rows, &gap));
-                    gap.clear();
-                }
-                let signature = object.signature.contains(&index);
-                loop {
-                    prefix.push_str(&rows[object.rows[position]].render());
-                    position += 1;
-                    if !signature
-                        || position == object.rows.len()
-                        || !object.signature.contains(&object.rows[position])
-                    {
-                        break;
-                    }
-                }
-                if !writer.append(&prefix) {
-                    return;
-                }
-                prefix.clear();
-                started = true;
-                file_started = true;
-            } else {
-                gap.push(index);
-                position += 1;
-            }
+        let anchor = *indices
+            .iter()
+            .find(|index| rows[**index].new.is_some())
+            .unwrap();
+        for index in &indices {
+            regrouped[*index] = true;
         }
-        if !started && !prefix.is_empty() && !object.signature.is_empty() {
+        signature_blocks.insert(anchor, indices);
+    }
+    let mut prefix = format!("\n{}\n\n", file.heading());
+    let mut started = false;
+    let mut gap = Vec::new();
+    let mut position = 0;
+    while position < rows.len() {
+        if let Some(indices) = signature_blocks.remove(&position) {
+            if !gap.is_empty() {
+                prefix.push_str(&gap_text(&rows, &gap));
+                gap.clear();
+            }
+            for index in indices {
+                prefix.push_str(&rows[index].render());
+            }
             if !writer.append(&prefix) {
                 return;
             }
+            prefix.clear();
             started = true;
-            file_started = true;
+            position += 1;
+            continue;
         }
-        if started && !gap.is_empty() && !writer.append(&gap_text(&rows, &gap)) {
+        if regrouped[position]
+            || imported(old, rows[position].old)
+            || imported(new, rows[position].new)
+        {
+            position += 1;
+            continue;
+        }
+        if !selected[position] {
+            gap.push(position);
+            position += 1;
+            continue;
+        }
+        if !gap.is_empty() {
+            prefix.push_str(&gap_text(&rows, &gap));
+            gap.clear();
+        }
+        // Body rows keep raw diff order. A signature or paired signature block is atomic.
+        let signature_chunk = signature[position];
+        loop {
+            prefix.push_str(&rows[position].render());
+            position += 1;
+            if !signature_chunk
+                || position == rows.len()
+                || !signature[position]
+                || regrouped[position]
+            {
+                break;
+            }
+        }
+        if !writer.append(&prefix) {
             return;
         }
+        prefix.clear();
+        started = true;
+    }
+    if started && !gap.is_empty() {
+        writer.append(&gap_text(&rows, &gap));
     }
 }
 
 fn gap_text(rows: &[DiffRow<'_>], gap: &[usize]) -> String {
+    if gap.iter().all(|index| rows[*index].text.trim().is_empty()) {
+        return String::new();
+    }
+    if let [index] = gap {
+        return rows[*index].render();
+    }
     let added = gap
         .iter()
         .filter(|index| rows[**index].marker == '+')
@@ -436,7 +678,7 @@ fn gap_text(rows: &[DiffRow<'_>], gap: &[usize]) -> String {
         .iter()
         .filter(|index| rows[**index].marker == '-')
         .count();
-    format!("  ... {} lines omitted (+{added} -{removed})\n", gap.len())
+    format!("  ... {} lines (+{added} -{removed})\n", gap.len())
 }
 
 #[cfg(test)]

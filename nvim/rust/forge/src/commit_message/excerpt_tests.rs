@@ -3,6 +3,9 @@ use forge_diff::cache::CacheLimits;
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair};
 
+#[path = "excerpt_regression_tests.rs"]
+mod regression;
+
 struct Fixture {
     diff: Arc<DiffEngine>,
     syntax: Arc<SyntaxEngine>,
@@ -43,7 +46,7 @@ impl Fixture {
 }
 
 #[tokio::test]
-async fn rust_typescript_javascript_and_lua_keep_multiline_signatures_and_gutters() {
+async fn parsed_functions_keep_multiline_signatures_and_gutters() {
     let fixture = Fixture::new();
     let cases = [
         (
@@ -70,11 +73,30 @@ async fn rust_typescript_javascript_and_lua_keep_multiline_signatures_and_gutter
             "    return value\n",
             "end\n",
         ),
+        (
+            "code.py",
+            "def calculate(\n    value: int,\n) -> int:\n",
+            "    return value\n",
+            "",
+        ),
+        (
+            "code.c",
+            "int calculate(\n    int value\n) {\n",
+            "    return value;\n",
+            "}\n",
+        ),
+        (
+            "code.cpp",
+            "template<typename Value>\nValue calculate(\n    Value value\n) {\n",
+            "    return value;\n",
+            "}\n",
+        ),
     ];
     for (path, signature, operation, closing) in cases {
-        let padding = "    -- padding\n";
         let padding = if path.ends_with("lua") {
-            padding.repeat(8)
+            "    -- padding\n".repeat(8)
+        } else if path.ends_with("py") {
+            "    # padding\n".repeat(8)
         } else {
             "    // padding\n".repeat(8)
         };
@@ -95,10 +117,7 @@ async fn rust_typescript_javascript_and_lua_keep_multiline_signatures_and_gutter
             )),
             "{path}: {output}"
         );
-        assert!(
-            output.contains("... 6 lines omitted (+0 -0)"),
-            "{path}: {output}"
-        );
+        assert!(output.contains("... 6 lines (+0 -0)"), "{path}: {output}");
     }
 }
 
@@ -144,7 +163,7 @@ async fn first_twenty_body_changes_are_fixed_and_reset_for_each_function() {
 #[tokio::test]
 async fn context_windows_merge_and_stop_at_two_unchanged_lines() {
     let fixture = Fixture::new();
-    let old = "fn run() {\n    far_before();\n    before_two();\n    before_one();\n    first(0);\n    bridge();\n    second(0);\n    after_one();\n    after_two();\n    far_after();\n}\n";
+    let old = "fn run() {\n    far_before_extra();\n    far_before();\n    before_two();\n    before_one();\n    first(0);\n    bridge();\n    second(0);\n    after_one();\n    after_two();\n    far_after();\n    far_after_extra();\n}\n";
     let new = old
         .replace("first(0)", "first(1)")
         .replace("second(0)", "second(1)");
@@ -170,10 +189,16 @@ async fn new_deleted_and_changed_signatures_retain_exact_source() {
     let source = "fn added(\n    argument: i32,\n) -> i32 {\n    argument + 1\n}\n";
     let added = fixture.text("source.rs", "", source).await;
     let removed = fixture.text("source.rs", source, "").await;
-    for line in source.lines() {
+    for line in source.lines().take(3) {
         assert!(added.contains(&format!("+ {line}\n")), "{added}");
+    }
+    for line in source.lines().take(3) {
         assert!(removed.contains(&format!("- {line}\n")), "{removed}");
     }
+    assert!(!removed.contains("argument + 1"), "{removed}");
+    assert!(removed.contains("... 2 lines (+0 -2)"), "{removed}");
+    assert!(!added.contains("argument + 1"), "{added}");
+    assert!(added.contains("... 2 lines (+2 -0)"), "{added}");
     let changed = fixture
         .text("source.rs", source, &source.replace("i32", "i64"))
         .await;
@@ -202,7 +227,7 @@ async fn nested_functions_emit_each_source_line_once() {
 }
 
 #[tokio::test]
-async fn recognized_imports_are_inventory_only_in_rust_typescript_lua_and_javascript() {
+async fn recognized_imports_are_inventory_only() {
     let fixture = Fixture::new();
     let cases = [
         (
@@ -225,6 +250,26 @@ async fn recognized_imports_are_inventory_only_in_rust_typescript_lua_and_javasc
             "local dependency = require('old')\nlocal function run() end\n",
             "local dependency = require('new')\nlocal function run() end\n",
         ),
+        (
+            "source.lua",
+            "local dependency = require 'old'\nlocal function run() end\n",
+            "local dependency = require 'new'\nlocal function run() end\n",
+        ),
+        (
+            "source.js",
+            "const dependency = require('old');\nfunction run() {}\n",
+            "const dependency = require('new');\nfunction run() {}\n",
+        ),
+        (
+            "source.py",
+            "from old import Item\ndef run():\n    pass\n",
+            "from new import Item\ndef run():\n    pass\n",
+        ),
+        (
+            "schema.cue",
+            "package schema\nimport \"strings\"\nvalue: 1\n",
+            "package schema\nimport \"math\"\nvalue: 1\n",
+        ),
     ];
     for (path, old, new) in cases {
         let output = fixture.text(path, old, new).await;
@@ -238,7 +283,7 @@ async fn recognized_imports_are_inventory_only_in_rust_typescript_lua_and_javasc
 }
 
 #[tokio::test]
-async fn json_toml_yaml_and_python_use_real_diff_fallback() {
+async fn configuration_and_unknown_languages_retain_changed_rows() {
     let fixture = Fixture::new();
     let cases = [
         (
@@ -260,10 +305,10 @@ async fn json_toml_yaml_and_python_use_real_diff_fallback() {
             "count: 2",
         ),
         (
-            "source.py",
-            "def calculate(value):\n    return value\n",
-            "def calculate(value):\n    return value + 1\n",
-            "return value + 1",
+            "schema.cue",
+            "package schema\n#Server: {\n    port: int & >0\n}\nserver: #Server & {port: 80}\n",
+            "package schema\n#Server: {\n    port: int & >1024\n}\nserver: #Server & {port: 8080}\n",
+            "+     port: int & >1024",
         ),
         ("unknown.ext", "old\n", "new\n", "+ new"),
     ];
@@ -354,13 +399,13 @@ async fn global_limit_stops_without_shrinking_the_twenty_line_allowance_or_split
             .map(|position| format!("    step_{position}(\"λ🦀\");\n"))
             .collect::<String>()
     );
-    let mut files = vec![fixture.file("source.rs", "", &source).await];
+    let mut files = vec![fixture.file("source.rs", "fn run() {\n}\n", &source).await];
     let full = render(&mut files, &fixture.syntax, 20_000).await;
     for limit in [500, 600, 700, 800, 900, 1000] {
         let output = render(&mut files, &fixture.syntax, limit).await;
         assert!(output.len() <= limit);
         assert!(full.starts_with(&output), "limit {limit}: {output}");
-        assert!(output.ends_with('\n'));
+        assert!(output.is_empty() || output.ends_with('\n'));
     }
     assert_eq!(
         full.lines()
@@ -420,7 +465,7 @@ async fn crlf_unicode_and_missing_final_newlines_preserve_visible_text() {
 }
 
 #[tokio::test]
-async fn every_parsed_function_language_obeys_the_body_limit_for_additions_and_deletions() {
+async fn every_parsed_function_language_omits_added_and_removed_bodies() {
     let fixture = Fixture::new();
     for (path, signature, statement, closing) in [
         ("source.rs", "fn run() {\n", "    step();\n", "}\n"),
@@ -432,6 +477,7 @@ async fn every_parsed_function_language_obeys_the_body_limit_for_additions_and_d
             "    step()\n",
             "end\n",
         ),
+        ("source.py", "def run():\n", "    step()\n", ""),
     ] {
         let source = format!("{signature}{}{closing}", statement.repeat(35));
         for (old, new, marker) in [("", source.as_str(), '+'), (source.as_str(), "", '-')] {
@@ -441,22 +487,28 @@ async fn every_parsed_function_language_obeys_the_body_limit_for_additions_and_d
                     .lines()
                     .filter(|line| line.starts_with(&format!("{marker}     step")))
                     .count(),
-                20,
+                0,
                 "{path}: {output}"
             );
             assert!(
                 output.contains(&format!("{marker} {}", signature.trim_end())),
                 "{path}: {output}"
             );
+            if !closing.is_empty() {
+                assert_eq!(
+                    output.contains(&format!("{marker} {}", closing.trim_end())),
+                    false,
+                    "{path}: {output}"
+                );
+            }
             assert!(
-                output.contains(&format!("{marker} {}", closing.trim_end())),
-                "{path}: {output}"
-            );
-            assert!(
-                output.contains(if marker == '+' {
-                    "15 lines omitted (+15 -0)"
-                } else {
-                    "15 lines omitted (+0 -15)"
+                output.contains(&{
+                    let omitted = 35 + usize::from(!closing.is_empty());
+                    if marker == '+' {
+                        format!("{omitted} lines (+{omitted} -0)")
+                    } else {
+                        format!("{omitted} lines (+0 -{omitted})")
+                    }
                 }),
                 "{path}: {output}"
             );
@@ -490,4 +542,99 @@ async fn inventory_itself_cannot_exceed_the_global_byte_limit() {
     assert!(output.len() <= 1024);
     assert!(output.contains("0000-") && !output.contains("0099-"));
     assert!(output.ends_with('\n'));
+}
+
+#[tokio::test]
+async fn python_decorated_async_methods_retain_their_complete_signature() {
+    let fixture = Fixture::new();
+    let signature = "    @classmethod\n    @cache(ttl=30)\n    async def fetch(\n        cls,\n        value: int,\n    ) -> dict[str, int]:\n";
+    let source = format!(
+        "class Client:\n{signature}{}        return {{\"value\": value}}\n",
+        "        # padding\n".repeat(8)
+    );
+    let updated = source.replace("\"value\": value", "\"value\": value + 1");
+    for path in ["client.py", "client.pyi", "client.pyw"] {
+        let output = fixture.text(path, &source, &updated).await;
+        for line in signature.lines() {
+            assert_eq!(
+                output.matches(&format!("  {line}\n")).count(),
+                1,
+                "{output}"
+            );
+        }
+        assert!(
+            output.contains("+         return {\"value\": value + 1}"),
+            "{output}"
+        );
+        assert!(output.contains("6 lines (+0 -0)"), "{output}");
+    }
+}
+
+#[tokio::test]
+async fn python_additions_deletions_and_signature_edits_preserve_decorators() {
+    let fixture = Fixture::new();
+    let source = "@cache\ndef calculate(\n    value: int,\n) -> int:\n    return value + 1\n";
+    for (old, new, marker) in [("", source, '+'), (source, "", '-')] {
+        let output = fixture.text("source.py", old, new).await;
+        for line in source.lines().take(4) {
+            assert!(output.contains(&format!("{marker} {line}\n")), "{output}");
+        }
+        assert!(
+            output.contains(&format!("{marker}     return value + 1\n")),
+            "{output}"
+        );
+    }
+    let output = fixture
+        .text("source.py", source, &source.replace("int", "float"))
+        .await;
+    assert!(output.contains("  @cache\n"), "{output}");
+    assert!(output.contains("-     value: int,\n"), "{output}");
+    assert!(output.contains("+     value: float,\n"), "{output}");
+}
+
+#[tokio::test]
+async fn python_nested_functions_emit_each_changed_line_once() {
+    let fixture = Fixture::new();
+    let old = "def outer(value):\n    def inner():\n        return 1\n    return inner()\n";
+    let new = old
+        .replace("return 1", "return 2")
+        .replace("return inner()", "return inner() + value");
+    let output = fixture.text("source.py", old, &new).await;
+    for line in [
+        "  def outer(value):\n",
+        "      def inner():\n",
+        "+         return 2\n",
+        "+     return inner() + value\n",
+    ] {
+        assert_eq!(output.matches(line).count(), 1, "{output}");
+    }
+}
+
+#[tokio::test]
+async fn python_multiline_imports_do_not_hide_neighboring_function_changes() {
+    let fixture = Fixture::new();
+    let old = "import old\nfrom dependency import (\n    First,\n    Second,\n)\ndef run():\n    return 1\n";
+    let new = old
+        .replace("import old", "import next")
+        .replace("Second", "Third")
+        .replace("return 1", "return 2");
+    let output = fixture.text("source.py", old, &new).await;
+    assert!(output.contains("  source.py (+3 -3)"), "{output}");
+    assert!(output.contains("+     return 2"), "{output}");
+    assert!(
+        !output.contains("Third") && !output.contains("import next"),
+        "{output}"
+    );
+}
+
+#[tokio::test]
+async fn malformed_python_retains_ordinary_changed_rows() {
+    let fixture = Fixture::new();
+    let output = fixture
+        .text("broken.py", "def broken(\nold\n", "def broken(\nnew\n")
+        .await;
+    assert!(
+        output.contains("- old\n") && output.contains("+ new\n"),
+        "{output}"
+    );
 }

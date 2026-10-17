@@ -89,6 +89,19 @@ pub async fn collect(
             record.submodule.is_none(),
             "generation cannot describe a changed submodule as a text diff"
         );
+        if let Some(relocation) = relocation.filter(|value| value.kind == ChangeKind::Renamed) {
+            files.push(ChangedFile {
+                path: String::from_utf8_lossy(record.path.raw()).into_owned(),
+                note: format!(
+                    "Renamed from {}",
+                    String::from_utf8_lossy(relocation.origin.raw())
+                        .replace('\n', "\\n")
+                        .replace('\r', "\\r")
+                ),
+                analysis: None,
+            });
+            continue;
+        }
         let old_mode = head.map_or(0, |head| head.mode);
         let new_mode = if request.comparison != Comparison::Head {
             index.unwrap().mode
@@ -300,6 +313,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn renamed_files_remain_inventory_only_in_every_comparison() {
+        for (destination, modified, binary) in [
+            ("renamed.rs", false, false),
+            ("renamed.rs", true, false),
+            ("SOURCE.rs", false, false),
+            ("binary.dat", false, true),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            git(root, &["init", "--quiet"]);
+            git(root, &["config", "user.name", "Forge Test"]);
+            git(root, &["config", "user.email", "forge@example.invalid"]);
+            git(root, &["config", "core.autocrlf", "false"]);
+            git(root, &["config", "core.ignorecase", "false"]);
+            git(root, &["config", "status.renames", "false"]);
+            let source = format!(
+                "fn renamed_marker() {{\n{}}}\n",
+                "    original_body();\n".repeat(30)
+            );
+            let contents = if binary {
+                b"binary\0contents".as_slice()
+            } else {
+                source.as_bytes()
+            };
+            std::fs::write(root.join("source.rs"), contents).unwrap();
+            git(root, &["add", "."]);
+            git(root, &["commit", "--quiet", "-m", "initial"]);
+            git(root, &["mv", "source.rs", "rename-step"]);
+            git(root, &["mv", "rename-step", destination]);
+            if modified {
+                std::fs::write(
+                    root.join(destination),
+                    source.replacen("original_body", "edited_body", 1),
+                )
+                .unwrap();
+                git(root, &["add", destination]);
+            }
+            let store = RepositoryStore::default();
+            let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+            let syntax = SyntaxEngine::new(diff.analysis_pool());
+            let mut request = GenerationRequest {
+                operation: "preview".into(),
+                workspace: root.to_string_lossy().into_owned(),
+                comparison: Comparison::Head,
+                ignored_paths: vec![],
+                model: None,
+                generation: None,
+            };
+            for (label, comparison) in [
+                ("head", Comparison::Head),
+                ("staged", Comparison::Staged),
+                ("latest_commit", Comparison::LatestCommit),
+            ] {
+                if comparison == Comparison::LatestCommit {
+                    git(root, &["commit", "--quiet", "-m", "rename"]);
+                }
+                request.comparison = comparison;
+                let context = collect(&store, &diff, &syntax, &request).await.unwrap();
+                let prompt = context.prompt.unwrap();
+                let entry = format!("  {destination} (Renamed from source.rs)\n");
+                assert_eq!(prompt.matches(&entry).count(), 1, "{label}: {prompt}");
+                assert!(
+                    !prompt.contains("renamed_marker") && !prompt.contains("edited_body"),
+                    "{prompt}"
+                );
+                assert_eq!(context.source_requests, 0, "{label}");
+                assert_eq!(context.diff_pairs, 0, "{label}");
+                assert_eq!(syntax.usage().cached_entries, 0);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn commit_context_caps_large_files_and_keeps_inventory_for_latest_commit() {
         let directory = tempfile::Builder::new()
             .prefix(".forge-commit-")
@@ -394,7 +480,7 @@ mod tests {
             panic!("temporary syntax load permanently failed commit preparation: {error:#}")
         });
         let prompt = context.prompt.unwrap();
-        assert!(prompt.contains("- fn before() {}") && prompt.contains("+ fn after() {}"));
+        assert!(prompt.contains("- fn before() {") && prompt.contains("+ fn after() {"));
         assert_eq!(pool.usage().admitted_jobs, 0);
     }
 
