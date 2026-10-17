@@ -2166,6 +2166,67 @@ mod test {
     }
 
     #[test]
+    fn spaced_powershell_arrays_survive_provider_approval_transport() {
+        let source = "Get-Content Cargo.toml, .forge.json, .gitignore";
+        let captured = r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'Get-Content Cargo.toml, .forge.json, .gitignore'"#;
+        let requests = [
+            permission_from_provider(
+                "item/commandExecution/requestApproval",
+                &json!({"params":{"command":captured}}),
+                ".",
+            )
+            .unwrap(),
+            permission_from_provider(
+                "item/commandExecution/requestApproval",
+                &json!({"params":{"args":["pwsh", "-Command", source]}}),
+                ".",
+            )
+            .unwrap(),
+            permission_from_copilot(
+                "spaced-array".into(),
+                "shell",
+                json!({"fullCommandText":source,"shell":"pwsh"}),
+                ".",
+            ),
+        ];
+        for request in requests {
+            assert_eq!(
+                request.target_list,
+                vec![PermissionTarget::Command {
+                    command: source.into(),
+                    shell: Some(CommandShell::PowerShell),
+                }]
+            );
+            for decision in ["allow", "ask", "deny"] {
+                let rules = json!({"permission":{"bash":{"*":"allow","Get-Content *":decision}}});
+                let compiled = crate::permissions::matcher::CompiledPermissionDocument::compile(
+                    crate::permissions::document::parse_permission_document(&rules.to_string())
+                        .unwrap(),
+                    ".",
+                );
+                let evaluation = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+                if decision == "ask" {
+                    let view = approval_view(&request, &evaluation);
+                    assert_eq!(view.item_list.len(), 1);
+                    assert_eq!(view.item_list[0].command_list[0].source, source);
+                    assert_eq!(
+                        view.item_list[0].command_list[0].focus_range_list,
+                        vec![0..source.len()]
+                    );
+                }
+                assert_eq!(
+                    evaluation.decision,
+                    match decision {
+                        "allow" => PermissionDecision::Allow,
+                        "ask" => PermissionDecision::Ask,
+                        _ => PermissionDecision::Deny,
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
     fn comma_argument_review_marks_each_command_in_the_original_script() {
         let source = "probe one,two | probe three,four; probe five,six";
         let target = PermissionTarget::Command {

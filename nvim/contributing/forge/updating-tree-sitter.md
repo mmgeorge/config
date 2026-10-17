@@ -24,6 +24,13 @@ Do not update only Neovim's parser installation and assume the bundled native
 parser changed. Do not replace generated `parser.c` without its required scanner,
 headers, node metadata, and provenance.
 
+Harness's PowerShell grammar uses the Cargo patch under
+`nvim/rust/forge/vendor/tree-sitter-powershell/`. Its `FORGE-PATCH.md` and
+`grammar.patch` record the upstream base and local source changes, and
+`nvim/rust/forge/vendor/grammar-manifest.json` records all vendored bytes.
+Regenerate with the recorded CLI and ABI before refreshing those hashes.
+The remaining shell grammars retain their Cargo or native grammar manifest pins.
+
 ## Update sequence
 
 1. **Record the existing asset selection.** Identify the manifest entry, upstream

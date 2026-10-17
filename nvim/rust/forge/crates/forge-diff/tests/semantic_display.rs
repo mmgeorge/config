@@ -97,13 +97,9 @@ async fn semantic_windows_merge_and_shared_boundaries_render_once_in_typescript_
         let raw = diff.hunks().to_vec();
         assert_eq!(raw.len(), 4);
         assert_eq!(group_hunks(&diff, 3).len(), 3);
-        for compact in [false, true] {
+        {
             let make_cursor = || {
-                let cursor = if compact {
-                    DisplayCursor::compact(diff.clone(), 3)
-                } else {
-                    DisplayCursor::new(diff.clone(), 3)
-                };
+                let cursor = DisplayCursor::new(diff.clone(), 3);
                 cursor.with_syntax_context(Some(&old), Some(&new))
             };
             let mut cursor = make_cursor();
@@ -169,7 +165,7 @@ async fn semantic_bridge_accepts_six_hidden_lines_but_rejects_seven() {
             &modified.join("\n"),
         )
         .await;
-        let cursor = DisplayCursor::compact(diff, 3)
+        let cursor = DisplayCursor::new(diff, 3)
             .with_syntax_context(Some(&old), Some(&new));
         assert!(cursor.group(groups - 1).is_some());
         assert!(
@@ -195,7 +191,7 @@ async fn semantic_bridge_does_not_join_unrelated_functions() {
         &modified.join("\n"),
     )
     .await;
-    let mut cursor = DisplayCursor::compact(diff, 3)
+    let mut cursor = DisplayCursor::new(diff, 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert!(cursor.group(1).is_some());
     assert!(cursor.group(2).is_none());
@@ -233,7 +229,7 @@ async fn nested_rust_methods_share_ancestor_boundaries_without_merging_sibling_s
         &modified.join("\n"),
     )
     .await;
-    let mut cursor = DisplayCursor::compact(diff, 3)
+    let mut cursor = DisplayCursor::new(diff, 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert_eq!(cursor.context_label(0), Some("fn first() {"));
     assert_eq!(cursor.context_label(1), Some("fn second() {"));
@@ -272,7 +268,7 @@ async fn deletion_only_context_uses_the_old_declaration_and_preserves_line_mappi
     )
     .await;
     let raw = diff.hunks().to_vec();
-    let mut cursor = DisplayCursor::compact(diff.clone(), 3)
+    let mut cursor = DisplayCursor::new(diff.clone(), 3)
         .with_syntax_context(Some(&old), Some(&new));
     assert_eq!(cursor.group(0).unwrap().raw_ids.len(), 2);
     assert!(cursor.group(1).is_none());
@@ -286,4 +282,94 @@ async fn deletion_only_context_uses_the_old_declaration_and_preserves_line_mappi
         }
     }
     assert_eq!(diff.hunks(), raw);
+}
+
+#[tokio::test]
+async fn structural_gaps_preserve_syntax_and_source_coordinates_across_delivery_limits() {
+    for (language, opening, method, binding) in [
+        (SyntaxLanguage::Rust, "impl Foo {", "  fn foobar(&self) {", "let"),
+        (SyntaxLanguage::Typescript, "class Foo {", "  foobar() {", "const"),
+    ] {
+        for newline in ["\n", "\r\n"] {
+            let mut original = vec![opening.to_owned(), method.to_owned()];
+            original.extend((0..40).map(|index| format!("    {binding} value_{index} = {index};")));
+            original.extend(["  }".into(), "}".into()]);
+            let mut proposed = original.clone();
+            proposed[12] = format!("    {binding} value_10 = 999;");
+            let (diff, old, new) = analysis(language, &original.join(newline), &proposed.join(newline)).await;
+            {
+                let cursor = || {
+                    DisplayCursor::new(diff.clone(), 3)
+                        .with_syntax_context(Some(&old), Some(&new))
+                };
+                let expected = drain(&mut cursor(), 256);
+                assert_eq!(expected, drain(&mut cursor(), 1));
+                assert!(expected.iter().any(DisplayRow::is_gap));
+                assert_eq!(expected.iter().filter(|row| row.text == opening).count(), 1);
+                assert_eq!(expected.iter().filter(|row| row.text == method).count(), 1);
+                for row in &expected {
+                    let mut metadata = forge_buffer::block::BlockMetadata::default();
+                    forge_diff::projection::append_display_row(&mut metadata, 0, row,
+                        cursor().group(row.group_index).unwrap(), Some(&old), Some(&new), 0).unwrap();
+                    if row.is_gap() {
+                        assert_eq!(row.text.trim(), "...");
+                        assert!(row.raw_id.is_none());
+                        assert!(metadata.visible_decoration.iter().all(|capture| !capture.capture.ends_with(language.name())));
+                    } else {
+                        if let Some(coordinate) = row.old { assert_eq!(row.text, original[coordinate.line]); }
+                        if let Some(coordinate) = row.new { assert_eq!(row.text, proposed[coordinate.line]); }
+                        if row.text == opening || row.text == method {
+                            assert!(metadata.visible_decoration.iter().any(|capture| capture.capture.ends_with(language.name())), "missing syntax: {row:?}");
+                        }
+                    }
+                }
+                let mut streamed = cursor();
+                let mut actual = Vec::new();
+                loop {
+                    let chunk = streamed.next_rows(ChunkLimits { rows: 2, text_bytes: 3, decorations: 1 });
+                    assert!(chunk.rows.len() <= 1);
+                    assert!(!chunk.rows.is_empty() || chunk.state == DisplayState::Complete);
+                    actual.extend(chunk.rows);
+                    if chunk.state == DisplayState::Complete { break; }
+                }
+                assert_eq!(actual.iter().map(|row| (&row.text, row.old, row.new)).collect::<Vec<_>>(),
+                    expected.iter().map(|row| (&row.text, row.old, row.new)).collect::<Vec<_>>());
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn one_omitted_source_line_is_shown_instead_of_an_ellipsis() {
+    let mut original = vec!["impl Foo {".to_owned(), "  fn foobar(&self) {".to_owned()];
+    original.extend((0..12).map(|index| format!("    let value_{index} = {index};")));
+    original.extend(["  }".into(), "}".into()]);
+    let mut proposed = original.clone();
+    proposed[3] = "    let value_1 = 999;".into();
+    let (diff, old, new) = analysis(SyntaxLanguage::Rust, &original.join("\n"), &proposed.join("\n")).await;
+    let mut cursor = DisplayCursor::new(diff, 3).with_syntax_context(Some(&old), Some(&new));
+    let rows = drain(&mut cursor, 1);
+    let hidden = rows.iter().find(|row| row.new.is_some_and(|coordinate| coordinate.line == 2)).unwrap();
+    assert_eq!(hidden.text, original[2]);
+    assert!(!hidden.is_gap());
+    assert_eq!(hidden.old.unwrap().line, 2);
+}
+
+#[tokio::test]
+async fn an_omitted_method_separates_the_impl_header_from_the_changed_method() {
+    let mut original = vec!["impl Foo {".to_owned(), "    fn untouched(&self) {".to_owned()];
+    original.extend((0..12).map(|index| format!("        let untouched_{index} = {index};")));
+    original.extend(["    }".into(), "    fn foobar(&self) {".into()]);
+    original.extend((0..24).map(|index| format!("        let changed_{index} = {index};")));
+    original.extend(["    }".into(), "}".into()]);
+    let modified = original.join("\n").replace("changed_12 = 12", "changed_12 = 999");
+    let (diff, old, new) = analysis(SyntaxLanguage::Rust, &original.join("\n"), &modified).await;
+    let mut cursor = DisplayCursor::new(diff, 3).with_syntax_context(Some(&old), Some(&new));
+    let rows = drain(&mut cursor, 1);
+    assert_eq!(rows[0].text, "impl Foo {");
+    assert!(rows[1].is_gap());
+    assert_eq!(rows[2].text, "    fn foobar(&self) {");
+    assert!(rows.iter().all(|row| !row.text.contains("untouched")));
+    assert_eq!(rows.iter().filter(|row| row.text == "impl Foo {").count(), 1);
+    assert!(rows.iter().any(|row| row.kind == RowKind::Added && row.text.contains("changed_12 = 999")));
 }

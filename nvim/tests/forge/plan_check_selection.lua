@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 client.host_generation = function() return 1 end
@@ -27,6 +28,7 @@ local function presentation(document)
     snapshot = { document = document, revision = version - 1, block = blocks } }
 end
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   if method == "plan.checks.update" then pending = { params = params, callback = callback } return end
   assert(method == "harness.document", method)
   callback(params.operation == "plan_open" and presentation(params.document) or {})

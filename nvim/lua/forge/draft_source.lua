@@ -70,6 +70,20 @@ function M.attach(replica, comments, source)
     end
     return following or vim.api.nvim_buf_line_count(comments.buf)
   end
+  local after_render = comments.after_render
+  replica.source_layout_row = function(row)
+    replica.prepare_source()
+    return by_canonical[row]
+  end
+  local function refresh_layout()
+    replica.prepare_source()
+    require("forge.buffer").refresh_source_layout(replica, replica.source_layout_row)
+  end
+  comments.after_render = function(...)
+    if after_render then after_render(...) end
+    refresh_layout()
+  end
+  refresh_layout()
 end
 
 return M

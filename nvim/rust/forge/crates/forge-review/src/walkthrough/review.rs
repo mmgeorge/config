@@ -169,21 +169,11 @@ impl WalkthroughService {
                     )?,
                 }
             }
+            let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
             let mut cursor = DisplayCursor::at_source_line(analysis, 3, side, change.row);
             if let Some(group) = cursor.group(0) {
-                push(
-                    &mut excerpt.block,
-                    "review:hunk",
-                    &format!(
-                        "@@ -{},{} +{},{} @@",
-                        group.old_lines.start + 1,
-                        group.old_lines.len(),
-                        group.new_lines.start + 1,
-                        group.new_lines.len()
-                    ),
-                    &width,
-                )?;
-                color_block(excerpt.block.last_mut().unwrap(), "ForgeHunkHeader");
+                excerpt.block.push(presenter.hunk(
+                    BlockId("review:hunk".into()), group, forge_diff::presentation::HunkHeading::Ranges)?);
             }
             let anchor_visible = cursor.group(0).is_some_and(|group| {
                 (if old_side { &group.old_lines } else { &group.new_lines })
@@ -195,22 +185,10 @@ impl WalkthroughService {
                     owner.lock().expect("walkthrough document").admission.check()?;
                     let chunk = cursor.next_rows(ChunkLimits::default());
                     for display in &chunk.rows {
-                        let mut block = BufferBlock {
-                            id: BlockId(format!("walkthrough:review:row:{row_index}")),
-                            text: BufferText::from_rows([display.text.as_str()])?,
-                            metadata: BlockMetadata::default(),
-                        };
-                        forge_diff::projection::append_display_row(
-                            &mut block.metadata,
-                            0,
-                            display,
-                            cursor
-                                .group(display.group_index)
-                                .context("missing review hunk")?,
-                            old_syntax.as_ref(),
-                            new_syntax.as_ref(),
-                            0,
-                        )?;
+                        let mut block = presenter.rows(
+                            BlockId(format!("walkthrough:review:row:{row_index}")), std::slice::from_ref(display),
+                            cursor.group(display.group_index).context("missing review hunk")?,
+                            old_syntax.as_ref(), new_syntax.as_ref())?;
                         if let Some(coordinate) = if old_side { display.old } else { display.new } {
                             source_target(&mut excerpt, &mut block, coordinate.line);
                         }

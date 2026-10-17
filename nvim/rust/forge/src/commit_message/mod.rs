@@ -1,4 +1,5 @@
 mod context;
+mod excerpt;
 mod provider;
 
 use std::sync::Arc;
@@ -6,6 +7,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
+use forge_diff::syntax::SyntaxEngine;
 use forge_git::store::RepositoryStore;
 use forge_harness::{
     backend::TextGeneration,
@@ -66,16 +68,22 @@ pub struct GenerationResponse {
 pub struct CommitMessageService {
     repository: Arc<RepositoryStore>,
     diff: Arc<DiffEngine>,
+    syntax: Arc<SyntaxEngine>,
     http: reqwest::Client,
     admission: Arc<Semaphore>,
     completed: Arc<Notify>,
 }
 
 impl CommitMessageService {
-    pub fn new(repository: Arc<RepositoryStore>, diff: Arc<DiffEngine>) -> Result<Self> {
+    pub fn new(
+        repository: Arc<RepositoryStore>,
+        diff: Arc<DiffEngine>,
+        syntax: Arc<SyntaxEngine>,
+    ) -> Result<Self> {
         Ok(Self {
             repository,
             diff,
+            syntax,
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(120))
                 .redirect(reqwest::redirect::Policy::none())
@@ -108,18 +116,19 @@ impl CommitMessageService {
             ),
             completed: Arc::clone(&self.completed),
         });
-        let context = match context::collect(&self.repository, &self.diff, &request).await {
-            Ok(context) => context,
-            Err(failure) if context::generation_was_superseded(&failure) => {
-                return Ok(GenerationResponse {
-                    state: "retry".into(),
-                    message: None,
-                    source_requests: 0,
-                    diff_pairs: 0,
-                });
-            }
-            Err(failure) => return Err(failure),
-        };
+        let context =
+            match context::collect(&self.repository, &self.diff, &self.syntax, &request).await {
+                Ok(context) => context,
+                Err(failure) if context::generation_was_superseded(&failure) => {
+                    return Ok(GenerationResponse {
+                        state: "retry".into(),
+                        message: None,
+                        source_requests: 0,
+                        diff_pairs: 0,
+                    });
+                }
+                Err(failure) => return Err(failure),
+            };
         let mut response = GenerationResponse {
             state: if context.prompt.is_some() {
                 "ready"
@@ -151,7 +160,9 @@ impl CommitMessageService {
         } else {
             harness
                 .generate_text(
-                    request.generation.context("Missing standalone provider configuration")?,
+                    request
+                        .generation
+                        .context("Missing standalone provider configuration")?,
                     &request.workspace,
                     TextGeneration::CommitMessage,
                     prompt,

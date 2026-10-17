@@ -63,9 +63,7 @@ pub struct CommandHighlight {
 fn parse_tree(command: &str, shell: CommandShell) -> Option<Tree> {
     let language = shell.grammar()?;
     // The pinned Zsh grammar treats escaped newlines as command boundaries.
-    if command.trim().is_empty()
-        || (shell == CommandShell::Zsh && command.contains("\\\n"))
-    {
+    if command.trim().is_empty() || (shell == CommandShell::Zsh && command.contains("\\\n")) {
         return None;
     }
     let mut parser = Parser::new();
@@ -177,9 +175,7 @@ pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization 
         if depth > 64
             || visited > 8192
             || node.is_error()
-            || (node.is_missing()
-                && !(shell == CommandShell::PowerShell
-                    && powershell_array_separator(node, command)))
+            || node.is_missing()
             || unsupported(node, command, shell)
         {
             result.ambiguous = true;
@@ -229,59 +225,6 @@ pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization 
         result.ambiguous = true;
     }
     result
-}
-
-// The pinned grammar inserts a missing space before comma-prefixed bare array values.
-// Accept only adjacent literal arguments so recovery cannot conceal executable syntax.
-fn powershell_array_separator(node: Node<'_>, source: &str) -> bool {
-    if node.kind() != " " {
-        return false;
-    }
-    let Some(separator) = node.parent().filter(|parent| {
-        parent.kind() == "command_argument_sep"
-            && parent
-                .parent()
-                .is_some_and(|parent| parent.kind() == "command_elements")
-    }) else {
-        return false;
-    };
-    let Some(previous) = separator.prev_named_sibling() else {
-        return false;
-    };
-    let Some(next) = separator.next_named_sibling() else {
-        return false;
-    };
-    let literal = |node: Node<'_>| {
-        let token = text(node, source);
-        let token = token.strip_prefix(',').unwrap_or(token);
-        node.kind() == "generic_token"
-            && !token.is_empty()
-            && !token.chars().any(|character| {
-                character.is_whitespace()
-                    || matches!(
-                        character,
-                        ',' | '$'
-                            | '`'
-                            | '\''
-                            | '"'
-                            | '('
-                            | ')'
-                            | '{'
-                            | '}'
-                            | '['
-                            | ']'
-                            | '@'
-                            | '|'
-                            | '&'
-                            | ';'
-                    )
-            })
-    };
-    previous.end_byte() == separator.start_byte()
-        && separator.end_byte() == next.start_byte()
-        && text(next, source).starts_with(',')
-        && literal(previous)
-        && literal(next)
 }
 
 // The pinned grammar confuses a leading ForEach-Object with the foreach keyword.
@@ -512,7 +455,7 @@ fn invocation(
         return Err(());
     }
     let raw = text(node, source);
-    let command = raw.trim().to_owned();
+    let command = trim_invocation(raw, shell).to_owned();
     let source_start = node.start_byte() + raw.len() - raw.trim_start().len();
     let source_range = source_start..source_start + command.len();
     let mut token_list = shell_token_list(&command, shell).map_err(|_| ())?;
@@ -536,6 +479,35 @@ fn invocation(
         command_name,
         structural,
     }))
+}
+
+fn trim_invocation(source: &str, shell: CommandShell) -> &str {
+    let source = source.trim_start();
+    let escape = match shell {
+        CommandShell::PowerShell => Some('`'),
+        CommandShell::Bash | CommandShell::Zsh => Some('\\'),
+        _ => None,
+    };
+    let mut end = source.len();
+    while let Some((offset, character)) = source[..end].char_indices().next_back() {
+        if !character.is_whitespace() {
+            break;
+        }
+        // Escaped trailing whitespace belongs to the argument, including a literal CR.
+        if escape.is_some_and(|escape| {
+            source[..offset]
+                .chars()
+                .rev()
+                .take_while(|&character| character == escape)
+                .count()
+                % 2
+                == 1
+        }) {
+            break;
+        }
+        end = offset;
+    }
+    &source[..end]
 }
 
 #[cfg(test)]

@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local harness = require("forge.session").harness
@@ -7,6 +8,7 @@ vim.notify = function(message) notice[#notice + 1] = tostring(message) end
 client.host_generation = function() return 1 end
 client.host_accepting = function() return true end
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   pending[#pending + 1] = { method = method, params = params, callback = callback }
 end
 package.loaded["forge.views.harness.controller"] = {

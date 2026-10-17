@@ -6,8 +6,9 @@ local comments = require("forge.draft_comments")
 local perf = require("forge.infra.perf")
 
 ---@class ForgePlanReviewUpdate
----@field snapshot {document: string, revision: integer, block: table[]}
----@field source_row {block: string, position: {row: integer}, source_line: integer}[]
+---@field snapshot? {document: string, revision: integer, block: table[]}
+---@field patch? table
+---@field source_edit {upsert: {id: string, source_line: integer}[], remove: string[]}
 ---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
 ---@field public_only boolean
 ---@field saved_source_digest string
@@ -19,6 +20,7 @@ local perf = require("forge.infra.perf")
 ---@return table
 function M.attach(options, callback)
   local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {} }
+  local delivery = {}
   local function alive()
     return not owner.closed and owner.generation == client.host_generation() and client.host_accepting()
       and vim.api.nvim_buf_is_valid(options.buffer)
@@ -343,6 +345,11 @@ function M.attach(options, callback)
     return settle
   end
   local function apply_projection(opened, source)
+    if not source then
+      local snapshot, rows, fragment = require("forge.views.plan_review.delivery").apply(delivery, opened)
+      opened = vim.tbl_extend("force", opened, { snapshot = snapshot, source_row = rows })
+      source = fragment
+    end
     return buffer.apply_snapshot(owner.replica, opened.snapshot, function()
       local focused_id
       for _, annotation in ipairs(owner.comment_state and owner.comment_state.annotation_list or {}) do
@@ -350,6 +357,7 @@ function M.attach(options, callback)
       end
       comments.detach(options.buffer, false)
       owner.replica.locate, owner.replica.physical_row = nil, nil
+      owner.replica.source_layout_row = nil
       owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
       attach_projection(opened, source, focused_id)
     end)
@@ -362,11 +370,12 @@ function M.attach(options, callback)
     local operation_id = owner.active_edit_operation_id
     perf.event("harness", "ui.plan.edit.update", { operation_id = operation_id, document = owner.document, phase = "begin" })
     if not alive() then return nil, "Plan host is unavailable. The local draft remains in its buffer." end
-    if type(opened) ~= "table" or type(opened.snapshot) ~= "table" or type(opened.source_row) ~= "table" then
+    if type(opened) ~= "table" or type(opened.source_edit) ~= "table" then
       return nil, "Updated plan review is missing"
     end
-    local valid, source = pcall(buffer.fragment, opened.snapshot, true)
-    if not valid then return nil, tostring(source) end
+    local valid, snapshot, rows, source = pcall(require("forge.views.plan_review.delivery").apply, delivery, opened)
+    if not valid then return nil, tostring(snapshot) end
+    opened = vim.tbl_extend("force", opened, { snapshot = snapshot, source_row = rows })
     local source_by_position, source_by_target, annotation_by_id, previous_by_line = {}, {}, {}, {}
     for _, row in ipairs(opened.source_row) do
       source_by_position[row.block .. ":" .. row.position.row] = row.source_line
@@ -436,7 +445,13 @@ function M.attach(options, callback)
         require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection))
     end
     if owner.ready and alive() then
-      request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(_, failure)
+      request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(result, failure)
+        if not failure and result and result.patch and result.patch ~= vim.NIL then
+          local refreshed = vim.tbl_extend("keep", result, { version = owner.version, public_only = owner.public_only,
+            saved_source_digest = owner.saved_source_digest, checks = owner.checks })
+          local applied, problem = owner.update(options.plan, refreshed)
+          if not applied then failure = problem end
+        end
         if failure and options.notice then options.notice(failure) end
       end)
     end

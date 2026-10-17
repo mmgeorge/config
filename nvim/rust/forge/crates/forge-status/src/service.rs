@@ -11,11 +11,10 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use forge_buffer::{
-    block::{BlockMetadata, BufferBlock, TargetRange, TextPosition, TextRange},
+    block::{BlockMetadata, TargetRange, TextPosition, TextRange},
     identity::{BlockId, DocumentId, TargetId},
     patch::{BufferPatch, BufferSnapshot},
     sequence::SequenceEdit,
-    text::BufferText,
 };
 use forge_diff::{
     display::{ChunkLimits, DisplayCursor, DisplayState},
@@ -399,10 +398,16 @@ impl StatusService {
             .identity
             .worktree_root
             .as_ref()
-            .context("local diff requires worktree")?;
-        let relative = filename
-            .strip_prefix(root)
-            .context("local file is outside resolved worktree")?;
+            .context("local diff requires worktree")?
+            .clone();
+        let relative = self.store.reads
+            .submit(root.as_os_str().as_encoded_bytes().len(), move |cancellation| {
+                cancellation.check()?;
+                let root = root.canonicalize().context("resolve local diff worktree")?;
+                Ok(filename.strip_prefix(root)
+                    .context("local file is outside resolved worktree")?.to_path_buf())
+            })?
+            .finish().await?;
         let mut raw = Vec::new();
         for component in relative.components() {
             let std::path::Component::Normal(component) = component else {
@@ -1085,6 +1090,7 @@ impl StatusService {
             _ => None,
         }
         .copied()
+        .flatten()
         .unwrap_or(forge_diff::source::SourceCoordinate {
             side: forge_diff::source::SourceSide::New,
             line: 0,
@@ -1266,9 +1272,17 @@ impl StatusService {
                 rows: 128,
                 ..ChunkLimits::default()
             });
-        let mut rows = Vec::with_capacity(chunk.rows.len());
+        let mut block = match forge_diff::presentation::DiffPresenter::new(Default::default()).batch(
+            BlockId(document.next_id("body")?), &chunk.rows,
+            |index| file.cursor.as_ref().and_then(|cursor| cursor.group(index)),
+            file.old_syntax.as_ref(), file.new_syntax.as_ref()) {
+            Ok(block) => block,
+            Err(failure) => {
+                file.state = BodyState::Unavailable(failure.to_string());
+                return self.deliver(document, target, file);
+            }
+        };
         let mut source_rows = Vec::with_capacity(chunk.rows.len());
-        let mut metadata = BlockMetadata::default();
         for (row, display) in chunk.rows.iter().enumerate() {
             let range = TextRange {
                 start: TextPosition { row, column: 0 },
@@ -1296,47 +1310,23 @@ impl StatusService {
             } else {
                 target.clone()
             };
-            metadata.target.push(TargetRange {
-                id: row_target,
-                range: range.clone(),
-            });
-            if let Err(failure) = forge_diff::projection::append_display_row(
-                &mut metadata,
-                row,
-                display,
-                file.cursor
-                    .as_ref()
-                    .and_then(|cursor| cursor.group(display.group_index))
-                    .context("diff display group is missing")?,
-                file.old_syntax.as_ref(),
-                file.new_syntax.as_ref(),
-                0,
-            ) {
-                file.state = BodyState::Unavailable(failure.to_string());
-                return self.deliver(document, target, file);
+            if !display.is_gap() {
+                block.metadata.target.push(TargetRange {
+                    id: row_target,
+                    range: range.clone(),
+                });
             }
-            rows.push(display.text.clone());
-            source_rows.push(
-                display
-                    .new
-                    .or(display.old)
-                    .context("diff row has no source coordinate")?,
-            );
+            source_rows.push(display.new.or(display.old));
         }
         file.state = match &chunk.state {
             DisplayState::More => BodyState::Partial,
             DisplayState::Complete => BodyState::Ready,
         };
         let retained = chunk.text_bytes
-            + (metadata.decoration.len() + metadata.visible_decoration.len()) * 160
-            + metadata.target.len() * 160
-            + metadata.gutter.len() * 128
-            + source_rows.capacity() * std::mem::size_of::<forge_diff::source::SourceCoordinate>();
-        let block = BufferBlock {
-            id: BlockId(document.next_id("body")?),
-            text: BufferText::from_rows(rows)?,
-            metadata,
-        };
+            + (block.metadata.decoration.len() + block.metadata.visible_decoration.len()) * 160
+            + block.metadata.target.len() * 160
+            + block.metadata.gutter.len() * 128
+            + source_rows.capacity() * std::mem::size_of::<Option<forge_diff::source::SourceCoordinate>>();
         let projection = crate::hunks::project(
             document,
             file,
@@ -1410,7 +1400,7 @@ impl StatusService {
             projected.is_some() || generation == repository.generation(),
             "status body source generation changed"
         );
-        let cursor = DisplayCursor::compact(analysis.clone(), 3);
+        let cursor = DisplayCursor::new(analysis.clone(), 3);
         Ok((analysis, cursor, None, None, None))
     }
 }

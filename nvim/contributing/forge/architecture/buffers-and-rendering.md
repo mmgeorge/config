@@ -143,17 +143,30 @@ checkpoint comparison rather than inference from command output.
 
 ## Shared diff integration
 
-ForgeStatus, PR review, and the Harness tree route file headers and hunk bodies
-through `diff_component.lua`. It owns the call into `diff_render.build_fancy_diff_rows` plus the
-`status_buffer.add_fancy_row` and `status_buffer.add_segment_line` accumulation used by every
-consumer. `diff_tree.lua` supplies checkpoint paths, expansion keys, caller-selected indentation,
-and interaction metadata without recomposing any visual row. The result retains the native
-`diff_row_spans` state shape, and `row_emitter.lua` applies that same state in ForgeStatus, PR review,
-and Harness. No Harness code reconstructs background or syntax ranges. The shared path keeps Tree-sitter syntax, file
-labels, stats, gutters, row backgrounds, intraline replacements,
-diff-line identities, and annotation coordinates consistent across live work and later review.
-Harness materializes file and hunk children from semantic expansion state. Other consumers may
-request the fully materialized tree and retain their existing view controller.
+`forge-diff::presentation::DiffPresenter` owns file and hunk headings, source-row
+styling, gutter widths, and fold boundaries for status, PlanReview, PR and commit
+reviews, walkthrough excerpts, and Harness change trees. Consumers supply source
+rows, stable block identities, and domain targets. The presenter never performs
+repository mutations or resolves plan and comment actions.
+
+Presentation options reuse `ContentLayout` for nesting and marker columns.
+Count headings serve status and PlanReview. Source-range headings serve PR and
+walkthrough views. Saved timeline headings retain their exact text, including
+suffixes, and saved patch rows retain their existing context. The shared patch
+adapter normalizes those rows without recomputing the diff. Timeline summaries,
+indentation, expansion policies, and immutable declaration navigation remain
+owned by Harness.
+
+`DisplayCursor::new` provides the single compact policy for generated diffs.
+It retains changed rows, context between grouped edits, and enclosing structural
+boundaries. It omits ordinary unchanged context outside each group. Plan visibility
+filtering removes empty hunks and their omission markers without discarding saved
+annotation anchors.
+
+Local comment projection reanchors layout through `forge.buffer` and the shared
+`content_layout` installer after source rows move. Hidden rows receive no gutters.
+The adapter replaces owned layout marks rather than relying on their gravity
+through ambiguous edits involving identical omission rows.
 
 ## Refresh cadence and decoration updates
 
@@ -301,8 +314,20 @@ The transcript renders these deltas through the shared change tree, independentl
 of the Task, Description, and Validation delta. Metadata revisions compare the plain text
 of each section, omit unchanged sections, and retain paragraph breaks. Their
 navigation opens that section's immutable text rather than internal JSON.
-PlanReview continues to compare source with
-the complete proposal. Transcript declaration targets retain the plan identity,
+PlanReview compares source with the complete proposal and uses the shared diff
+context rules on declaration rows. Each change retains compact changed rows
+and enclosing declaration boundaries. Related scopes merge when their padded
+windows are at most six lines apart. Shared opening rows appear once in the first
+group and closing rows once in the last. Distant edits retain separate groups.
+Explicit reference navigation can reveal declarations outside those regions through
+three-line excerpts and enclosing boundaries, without expanding the complete file.
+Initial PlanReview delivery contains compact blocks once. Updates carry disjoint
+patches and changed source anchors, retaining unchanged text and highlighting in
+the Lua fragment. The comment adapter rebuilds its physical projection locally.
+Enclosing declarations retain normal syntax highlighting. Omitted ranges render
+`...` without declaration or edit targets, while a single omitted line retains its
+source text and coordinates. Shared diff delivery preserves these rows across chunks.
+Transcript declaration targets retain the plan identity,
 submitted revision, path, and side. `plan.declaration` reads that immutable
 snapshot, and navigation opens a read-only declaration buffer. Removed rows open
 the previous proposal, or the source baseline on the first submission. Navigation

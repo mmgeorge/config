@@ -8,8 +8,8 @@ pub(crate) struct PlanReviewSource {
     pub resolver: std::sync::Arc<tokio::sync::OnceCell<std::sync::Mutex<(crate::declaration::DeclarationResolver, crate::declaration::DeclarationResolver)>>>,
     pub historical: bool,
     pub public_only: bool,
-    /// Keeps referenced file sides visible without changing the public filter.
-    pub revealed: std::collections::HashSet<(String, String)>,
+    /// Keeps selected reference context visible without changing the public filter.
+    pub revealed: std::collections::HashSet<(String, String, u32)>,
     pub collapse: std::collections::HashMap<forge_buffer::identity::FoldId, bool>,
     pub path: std::path::PathBuf,
     pub workspace: std::path::PathBuf,

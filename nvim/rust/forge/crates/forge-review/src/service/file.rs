@@ -57,7 +57,7 @@ pub(crate) struct RetainedFile {
     pub block: Vec<BufferBlock>,
     pub target: std::collections::BTreeMap<TargetId, super::thread_projection::ReviewTarget>,
     pub cursor: Option<forge_diff::display::DisplayCursor>,
-    pub group: Option<usize>,
+    pub presenter: forge_diff::presentation::DiffPresenter,
     pub next_block: usize,
     pub projected_blocks: usize,
 }
@@ -101,7 +101,7 @@ impl ReviewService {
                 block: Vec::new(),
                 target: std::collections::BTreeMap::new(),
                 cursor: file.cursor.take(),
-                group: file.group,
+                presenter: file.presenter.clone(),
                 next_block: file.next_block,
                 projected_blocks: file.projected_blocks,
             };
@@ -188,7 +188,7 @@ impl ReviewService {
                 let file = document.file.get_mut(&path).expect("validated review file");
                 file.summary = work.summary;
                 file.cursor = work.cursor;
-                file.group = work.group;
+                file.presenter = work.presenter;
                 file.next_block = work.next_block;
                 if projected_blocks > 0 {
                     file.projected_blocks = projected_blocks - usize::from(old_more)
@@ -374,7 +374,7 @@ impl ReviewService {
                     block: Vec::new(),
                     target: std::collections::BTreeMap::new(),
                     cursor: None,
-                    group: None,
+                    presenter: forge_diff::presentation::DiffPresenter::new(Default::default()),
                     next_block: 0,
                     projected_blocks: 0,
                 };
@@ -528,36 +528,17 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
     let prefix = format!("file:{:016x}", hash.finish());
     let mut candidate = Vec::new();
     for display in &chunk.rows {
-        if file.group != Some(display.group_index) {
-            let group = cursor
-                .group(display.group_index)
-                .context("diff display group is missing")?;
-            let text = format!(
-                "@@ -{},{} +{},{} @@",
-                group.old_lines.start + 1,
-                group.old_lines.len(),
-                group.new_lines.start + 1,
-                group.new_lines.len()
-            );
-            candidate.push(BufferBlock {
-                id: BlockId(format!("{prefix}:group:{}", display.group_index)),
-                text: BufferText::from_rows(vec![text])?,
-                metadata: BlockMetadata::default(),
-            });
-            file.group = Some(display.group_index);
+        let group = cursor.group(display.group_index).context("diff display group is missing")?;
+        if let Some(heading) = file.presenter.begin_hunk(display.group_index,
+            BlockId(format!("{prefix}:group:{}", display.group_index)), group,
+            forge_diff::presentation::HunkHeading::Ranges)? {
+            candidate.push(heading);
         }
-        let mut metadata = BlockMetadata::default();
-        forge_diff::projection::append_display_row(
-            &mut metadata,
-            0,
-            display,
-            cursor
-                .group(display.group_index)
-                .context("diff display group is missing")?,
-            file.old_syntax.as_ref(),
-            file.new_syntax.as_ref(),
-            0,
-        )?;
+        let mut block = file.presenter.rows(
+            BlockId(format!("{prefix}:row:{}", file.next_block + candidate.len())),
+            std::slice::from_ref(display),
+            cursor.group(display.group_index).context("diff display group is missing")?,
+            file.old_syntax.as_ref(), file.new_syntax.as_ref())?;
         if let Some(anchor) = inline_anchor(&revision, &path, display) {
             let target = TargetId(format!(
                 "{prefix}:inline:{}",
@@ -572,7 +553,7 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
                     .is_none(),
                 "review inline target identity collision"
             );
-            metadata.target.push(TargetRange {
+            block.metadata.target.push(TargetRange {
                 id: target,
                 range: TextRange {
                     start: TextPosition { row: 0, column: 0 },
@@ -580,14 +561,7 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
                 },
             });
         }
-        candidate.push(BufferBlock {
-            id: BlockId(format!(
-                "{prefix}:row:{}",
-                file.next_block + candidate.len()
-            )),
-            text: BufferText::from_rows(vec![display.text.clone()])?,
-            metadata,
-        });
+        candidate.push(block);
     }
     file.summary.more = chunk.state == DisplayState::More;
     file.next_block += candidate.len();

@@ -53,6 +53,7 @@ impl ForgeRuntime {
         let generation = commit_message::CommitMessageService::new(
             Arc::clone(&repositories),
             Arc::clone(&diff),
+            Arc::clone(&syntax),
         )?;
         let harness = HarnessService::new(
             Arc::clone(&repositories),

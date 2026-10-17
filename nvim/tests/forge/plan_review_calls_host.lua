@@ -1,4 +1,18 @@
 vim.loader.enable(false)
+if not vim.g.forge_plan_calls_grid then
+  local test_path = debug.getinfo(1, "S").source:sub(2)
+  local child = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
+  assert(child > 0)
+  local success, failure = xpcall(function()
+    vim.rpcrequest(child, "nvim_ui_attach", 160, 48, { rgb = true })
+    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
+  end, debug.traceback)
+  vim.fn.jobstop(child)
+  if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
+  print("plan_review_calls_host: passed at 160x48")
+  vim.cmd("qa!")
+  return
+end
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1 and vim.fn.mkdir(data, "p") == 1)
@@ -24,6 +38,17 @@ package.loaded["forge.builder"] = { ensure = function(callback)
 end }
 local client = require("forge.client")
 client._set_launcher_for_test(vim.system)
+require("forge.views.plan_review.references").show_caller = true
+local definition = require("forge.views.plan_review.workspace_definition")
+definition.request = function(query, current, receive)
+  local name = source[query.line]:sub(query.column + 1):match("^[%w_]+")
+  local line = assert(({ count = 3, leaf = 1 })[name], "unexpected fixture definition: " .. tostring(name))
+  local cancelled = false
+  vim.schedule(function()
+    if not cancelled and current() then receive({ path = query.path, line = line, column = assert(source[line]:find(name, 1, true)) - 1 }) end
+  end)
+  return function() cancelled = true end
+end
 local state = require("forge.session").harness
 local picker = require("forge.views.picker")
 local function await(predicate, message)
@@ -89,7 +114,8 @@ local success, failure = xpcall(function()
   assert(paragraph_height(split_window) > wide_height, "same-buffer split did not wrap the paragraph at its own width")
   vim.api.nvim_win_set_width(review.win, 40)
   vim.cmd("redraw!")
-  assert(paragraph_height(review.win) > wide_height, "narrowing PlanReview did not reflow its paragraph")
+  assert(paragraph_height(review.win) > wide_height, ("narrowing PlanReview did not reflow its paragraph: columns=%d width=%d wide=%d narrow=%d row=%d wrap=%s")
+    :format(vim.o.columns, vim.api.nvim_win_get_width(review.win), wide_height, paragraph_height(review.win), description_row, tostring(vim.wo[review.win].wrap)))
   vim.api.nvim_win_set_width(review.win, 110)
   vim.cmd("redraw!")
   assert(paragraph_height(review.win) == wide_height, "widening PlanReview retained obsolete line breaks")
@@ -351,7 +377,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(input, 0, -1, false, { "dispatch" })
   local confirm = vim.api.nvim_buf_call(input, function() return vim.fn.maparg("<CR>", "n", false, true) end)
   confirm.callback()
-  await(function() return not state.busy and state.plan_review ~= review and state.plan_review and state.plan_review.owner.ready end, "rename did not create a new review")
+  await(function() return not state.busy and state.plan_review == review and review.owner.version == document.version + 1 end, "rename did not update the retained review")
   local renamed = vim.json.decode(table.concat(vim.fn.readfile(artifact, "b"), "\n"))
   assert(renamed.version == document.version + 1, "rename did not advance the plan version")
   assert(renamed.design.proposed["src/change.rs"]:find("pub fn dispatch", 1, true), "rename did not persist the new declaration")

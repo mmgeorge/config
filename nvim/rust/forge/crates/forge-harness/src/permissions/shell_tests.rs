@@ -20,6 +20,16 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
     for fixture in fixture_list {
         let source = fixture.replace("CHECK", "probe");
         let parsed = normalize_command_in(&source, shell);
+        if parsed.ambiguous {
+            let mut parser = Parser::new();
+            parser.set_language(&shell.grammar().unwrap()).unwrap();
+            let tree = parser.parse(&source, None).unwrap();
+            failure_list.push(format!(
+                "{source}\n{parsed:?}\n{}",
+                tree.root_node().to_sexp()
+            ));
+            continue;
+        }
         for invocation in &parsed.invocation_list {
             assert_eq!(
                 source.get(invocation.source_range.clone()),
@@ -191,6 +201,269 @@ fn powershell_comma_arguments_keep_independent_permissions_and_source_ranges() {
 }
 
 #[test]
+fn powershell_spaced_array_arguments_preserve_command_boundaries() {
+    check_matrix(
+        CommandShell::PowerShell,
+        &[
+            "CHECK Cargo.toml, .forge.json, .gitignore",
+            "CHECK -Path Cargo.toml, .forge.json, .gitignore -Raw",
+            "CHECK one, two,three, four",
+            "CHECK one , two , three",
+            "CHECK one,\ttwo",
+            "CHECK one,\ntwo",
+            "CHECK 'one', 'two'",
+            "CHECK \"one\", \"two\"",
+            "CHECK 'one file', two, \"three files\"",
+            "CHECK *.rs, *.toml",
+            "CHECK C:\\one, D:\\two",
+            "CHECK café, 世界",
+            "CHECK one, two | CHECK three, four; CHECK five, six",
+            "if ($true) { CHECK one, two } else { CHECK three, four }",
+            "CHECK one, two; Write-Output $(CHECK nested)",
+            "CHECK one, $(CHECK nested), two",
+            "CHECK one, # continued array\n two",
+            "CHECK @('one', 'two')",
+            "CHECK (CHECK nested), two",
+        ],
+    );
+}
+
+#[test]
+fn powershell_native_options_and_adjacent_expressions_remain_arguments() {
+    check_matrix(
+        CommandShell::PowerShell,
+        &[
+            "CHECK -C5 needle",
+            "CHECK -C5F needle",
+            "CHECK -0F needle",
+            "CHECK -- needle",
+            "CHECK --flag=value",
+            "CHECK --flag=path/file.txt",
+            "CHECK --flag=",
+            "CHECK --flag=\"two words\"",
+            "CHECK --flag=$value",
+            "CHECK -Path:Cargo.toml",
+            "CHECK $value(CHECK nested)",
+            "CHECK $_(CHECK nested)",
+            "CHECK $?(CHECK nested)",
+            "CHECK \"a$variable#b\"",
+            "CHECK one`,two",
+            "CHECK one`;two",
+        ],
+    );
+}
+
+fn check_execution(shell: CommandShell, source: &str, expected: &[&str]) {
+    let parsed = normalize_command_in(source, shell);
+    assert!(!parsed.ambiguous, "{shell:?}: {source}\n{parsed:?}");
+    let actual = parsed
+        .invocation_list
+        .iter()
+        .filter(|invocation| !invocation.structural)
+        .map(|invocation| invocation.command_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(actual, expected, "{shell:?}: {source}");
+    for invocation in &parsed.invocation_list {
+        assert_eq!(
+            source.get(invocation.source_range.clone()),
+            Some(invocation.source.as_str()),
+            "{shell:?}: {source}"
+        );
+        for decision in ["allow", "ask", "deny"] {
+            let mut rules = serde_json::json!({"*":"allow"});
+            rules[format!("{} *", invocation.command_name)] = decision.into();
+            let compiled = CompiledPermissionDocument::compile(
+                parse_permission_document(
+                    &serde_json::json!({"permission":{"bash":rules}}).to_string(),
+                )
+                .unwrap(),
+                ".",
+            );
+            let request = PermissionRequest {
+                id: "execution".into(),
+                provider: "test".into(),
+                reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: source.into(),
+                    shell: Some(shell),
+                }],
+            };
+            let evaluated = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+            if invocation.structural && decision == "ask" {
+                assert_eq!(
+                    evaluated.decision,
+                    PermissionDecision::Allow,
+                    "structural commands defer to their bodies: {source}"
+                );
+                assert!(evaluated.pending_target_list.is_empty());
+                continue;
+            }
+            assert_eq!(
+                evaluated.decision,
+                match decision {
+                    "allow" => PermissionDecision::Allow,
+                    "ask" => PermissionDecision::Ask,
+                    _ => PermissionDecision::Deny,
+                },
+                "{shell:?}: {source}"
+            );
+            if decision == "ask" {
+                let expected = parsed
+                    .invocation_list
+                    .iter()
+                    .filter(|candidate| candidate.command_name == invocation.command_name)
+                    .map(|candidate| PermissionTarget::Command {
+                        command: candidate.source.clone(),
+                        shell: Some(shell),
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    evaluated.pending_target_list, expected,
+                    "{shell:?}: {source}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn every_shell_literal_arguments_comments_and_compounds_preserve_all_commands() {
+    let arguments = [
+        "'semi;pipe|amp&'",
+        "'λ 世界'",
+        "\"plain value\"",
+        "'hash#literal'",
+        "'comma,value'",
+    ];
+    for shell in [
+        CommandShell::PowerShell,
+        CommandShell::Bash,
+        CommandShell::Zsh,
+        CommandShell::Nushell,
+    ] {
+        for argument in arguments {
+            let sources = [
+                format!("first {argument}; second {argument}"),
+                format!("first {argument} | second {argument}"),
+                format!("first {argument}\nsecond {argument}"),
+                format!("first {argument} # second is literal comment text\nsecond {argument}"),
+            ];
+            for source in sources {
+                for source in [source.clone(), source.replace('\n', "\r\n")] {
+                    check_execution(shell, &source, &["first", "second"]);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn every_shell_retains_each_nested_executable_and_its_independent_policy() {
+    let common = [
+        ("outer 'literal; hidden | command'", vec!["outer"]),
+        (
+            "outer café; middle 世界 | last",
+            vec!["outer", "middle", "last"],
+        ),
+    ];
+    for shell in [
+        CommandShell::PowerShell,
+        CommandShell::Bash,
+        CommandShell::Zsh,
+        CommandShell::Nushell,
+    ] {
+        for (source, expected) in &common {
+            check_execution(shell, source, expected);
+        }
+    }
+    for (source, expected) in [
+        ("outer one, $(inner value), two", vec!["outer", "inner"]),
+        (
+            "if (condition) { yes value } else { no value }",
+            vec!["condition", "yes", "no"],
+        ),
+        (
+            "outer | ForEach-Object { inner $_; last $_ }",
+            vec!["outer", "inner", "last"],
+        ),
+        ("foreach ($entry in @(1,2)) { inner $entry }", vec!["inner"]),
+        (
+            "try { outer } catch { recover } finally { cleanup }",
+            vec!["outer", "recover", "cleanup"],
+        ),
+        ("outer $value(inner value)", vec!["outer", "inner"]),
+        ("outer --value=$(inner value)", vec!["outer", "inner"]),
+        ("outer literal`;not_a_command", vec!["outer"]),
+        ("outer literal`|not_a_command", vec!["outer"]),
+        ("outer literal`,not_a_command", vec!["outer"]),
+        ("outer a`\ninner", vec!["outer"]),
+        ("outer a`\r\ninner value", vec!["outer", "inner"]),
+        ("outer value `\r\n| inner value", vec!["outer", "inner"]),
+        (
+            "Get-Content Cargo.toml, .forge.json, .gitignore",
+            vec!["Get-Content"],
+        ),
+        (
+            "Get-ChildItem | Where-Object { Test-Path $_ }",
+            vec!["Get-ChildItem", "Test-Path"],
+        ),
+        (
+            "Write-Output --flag=$(Get-Item item)",
+            vec!["Write-Output", "Get-Item"],
+        ),
+    ] {
+        check_execution(CommandShell::PowerShell, source, &expected);
+    }
+    for shell in [CommandShell::Bash, CommandShell::Zsh] {
+        for (source, expected) in [
+            ("outer \"$(inner value)\"", vec!["outer", "inner"]),
+            ("outer <(inner value)", vec!["outer", "inner"]),
+            (
+                "if condition; then yes; else no; fi",
+                vec!["condition", "yes", "no"],
+            ),
+            (
+                "for entry in one two; do inner \"$entry\"; done",
+                vec!["inner"],
+            ),
+            ("{ outer; (inner); } | last", vec!["outer", "inner", "last"]),
+        ] {
+            check_execution(shell, source, &expected);
+        }
+    }
+    for (source, expected) in [
+        ("outer (inner value)", vec!["outer", "inner"]),
+        (
+            "if (condition) { yes } else { no }",
+            vec!["condition", "yes", "no"],
+        ),
+        (
+            "outer | each {|entry| inner $entry; last $entry }",
+            vec!["outer", "inner", "last"],
+        ),
+        ("for entry in [one two] { inner $entry }", vec!["inner"]),
+        (
+            "try { outer } catch {|error| recover $error }",
+            vec!["outer", "recover"],
+        ),
+    ] {
+        check_execution(CommandShell::Nushell, source, &expected);
+    }
+}
+
+#[test]
+fn powershell_flat_arrays_preserve_parser_depth_and_work_limits() {
+    let operands = (0..256)
+        .map(|index| format!("file{index}.txt"))
+        .collect::<Vec<_>>();
+    let source = format!("Get-Content {}", operands.join(", "));
+    check_execution(CommandShell::PowerShell, &source, &["Get-Content"]);
+
+    let oversized = format!("Get-Content {}", vec!["file.txt"; 10000].join(", "));
+    reject_matrix(CommandShell::PowerShell, &[&oversized]);
+}
+
+#[test]
 fn powershell_unresolved_execution_never_inherits_an_allow_rule() {
     reject_matrix(
         CommandShell::PowerShell,
@@ -223,6 +496,15 @@ fn powershell_unresolved_execution_never_inherits_an_allow_rule() {
             "probe one,",
             "probe one,,two",
             "probe one,two; if ($true) { probe value",
+            "probe one, two; & $command value",
+            "probe one, $(Invoke-Expression $code), two",
+            "probe one, (custom-wrapper { probe hidden }), two",
+            "probe one, two > file",
+            "probe one, two; $env:PATH = 'bad'",
+            "probe one, two; probe 'unfinished",
+            "probe one, two,",
+            "probe one, , two",
+            "probe a`\r\nInvoke-Expression $code",
         ],
     );
 }
@@ -390,12 +672,20 @@ fn parser_preserves_complete_commands_beyond_former_byte_limit() {
         let parsed = normalize_command_in(&source, shell);
         assert!(!parsed.ambiguous, "{shell:?}");
         assert_eq!(parsed.invocation_list.len(), 2, "{shell:?}");
-        assert_eq!(parsed.invocation_list[0].token_list, ["probe", payload.as_str()], "{shell:?}");
+        assert_eq!(
+            parsed.invocation_list[0].token_list,
+            ["probe", payload.as_str()],
+            "{shell:?}"
+        );
         assert_eq!(parsed.invocation_list[1].source, "probe after", "{shell:?}");
         let final_command = source.rfind("probe").unwrap();
-        assert!(highlights(&source, shell).iter().any(|capture|
-            capture.group == "ForgeHarnessCommand" && capture.range.start >= final_command),
-            "{shell:?}");
+        assert!(
+            highlights(&source, shell)
+                .iter()
+                .any(|capture| capture.group == "ForgeHarnessCommand"
+                    && capture.range.start >= final_command),
+            "{shell:?}"
+        );
     }
 }
 
@@ -590,18 +880,30 @@ fn shell_quote_decoding_preserves_policy_arguments() {
 
 #[test]
 fn unhandled_string_encodings_fail_closed_instead_of_losing_quoting() {
-    reject_matrix(CommandShell::Bash, &["probe $'a\\nb'", "probe $\"translated\""]);
-    reject_matrix(CommandShell::Zsh, &["probe $'a\\nb'", "probe a\\\nb", "probe \"a\\\nb\""]);
-    reject_matrix(CommandShell::PowerShell, &[
-        "probe @'\na|b\n'@", "probe “a|b”", "probe a`|b", "probe a`\nb",
-    ]);
-    reject_matrix(CommandShell::Nushell, &[
-        "probe r#'a|b'#", "probe \"a\\qb\"", "probe \"a\\u{110000}b\"",
-    ]);
+    reject_matrix(
+        CommandShell::Bash,
+        &["probe $'a\\nb'", "probe $\"translated\""],
+    );
+    reject_matrix(
+        CommandShell::Zsh,
+        &["probe $'a\\nb'", "probe a\\\nb", "probe \"a\\\nb\""],
+    );
+    reject_matrix(
+        CommandShell::PowerShell,
+        &["probe @'\na|b\n'@", "probe “a|b”"],
+    );
+    reject_matrix(
+        CommandShell::Nushell,
+        &[
+            "probe r#'a|b'#",
+            "probe \"a\\qb\"",
+            "probe \"a\\u{110000}b\"",
+        ],
+    );
 }
 
 #[test]
-fn lexical_escapes_remain_exact_when_the_grammar_rejects_the_script() {
+fn lexical_escapes_preserve_arguments_and_rejected_syntax_stays_rejected() {
     for (shell, source, expected) in [
         (CommandShell::PowerShell, "probe a`|b", "a|b"),
         (CommandShell::PowerShell, "probe a`\nb", "a\nb"),
@@ -610,7 +912,14 @@ fn lexical_escapes_remain_exact_when_the_grammar_rejects_the_script() {
     ] {
         let tokens = super::super::command::shell_token_list(source, shell).unwrap();
         assert_eq!(tokens, ["probe", expected]);
-        assert!(normalize_command_in(source, shell).ambiguous);
+        let parsed = normalize_command_in(source, shell);
+        if shell == CommandShell::PowerShell {
+            assert!(!parsed.ambiguous);
+            assert_eq!(parsed.invocation_list.len(), 1);
+            assert_eq!(parsed.invocation_list[0].token_list, tokens);
+        } else {
+            assert!(parsed.ambiguous);
+        }
     }
 }
 

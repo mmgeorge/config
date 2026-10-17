@@ -1,0 +1,62 @@
+--- upstream/grammar.js
++++ forge/grammar.js
+@@ -103,7 +103,7 @@
+         /\"(\s*\#*)*/, // this is a trick to avoid tree-sitter allowing comment between tokens, as string should be tokenize but powershell allow subexpression inside it...
+         repeat(
+           choice(
+-            token.immediate(/[^\$\"`]+/),
++            token.immediate(prec(1, /[^\$\"`]+/)),
+             $.variable,
+             $.sub_expression,
+             token.immediate(/\$(`.{1}|`\r?\n|[\s\\])/),
+@@ -305,13 +305,15 @@
+     braced_variable: ($) => /\$\{[^}]+\}/,
+ 
+     // Commands
+-    generic_token: ($) =>
+-      token(/[^\(\)\$\"\'\-\{\}@\|\[`\&\s][^\&\s\(\)\}\|;,]*/),
++    generic_token: ($) => token(seq(
++      choice(/[^,\(\)\$\"\'\-\{\}@\|\[`\&\s]/, /`[^\r\n]/),
++      repeat(choice(/[^\&\s\(\)\}\|;,`]/, /`[^\n]/, /`\n/)),
++    )),
+ 
+     _command_token: ($) => token(/[^\(\)\{\}\s;\&]+/),
+ 
+     // Parameters
+-    command_parameter: ($) => token(choice(/-+[a-zA-Z_?\-`]+/, '--')),
++    command_parameter: ($) => token(prec(1, choice(/-+[a-zA-Z0-9_?\-`]+/, '--'))),
+ 
+     _verbatim_command_argument_chars: ($) =>
+       repeat1(choice(/"[^"]*"/, /&[^&]*/, /[^\|\r\n]+/)),
+@@ -764,8 +766,8 @@
+     _command_element: ($) =>
+       prec.right(
+         choice(
+-          $.command_parameter,
+-          seq($._command_argument, optional($.argument_list)),
++          seq($.command_argument_sep, $.command_parameter, optional(seq(token.immediate('='), optional($.command_argument_array)))),
++          $._command_argument,
+           $.redirection,
+           $.stop_parsing,
+         ),
+@@ -784,12 +786,18 @@
+       prec.right(
+         PREC.PARAM,
+         choice(
+-          seq($.command_argument_sep, optional($.generic_token)),
+-          seq($.command_argument_sep, $.array_literal_expression),
++          seq($.command_argument_sep, optional($.command_argument_array)),
+           $.parenthesized_expression,
+           $.script_block_expression,
+         ),
+       ),
++
++    command_argument_comma: ($) => token(prec(5, /[ \t]*,/)),
++
++    command_argument_array: ($) => prec.right(seq(
++      choice($.generic_token, $.unary_expression),
++      repeat(seq($.command_argument_comma, choice($.generic_token, $.unary_expression))),
++    )),
+ 
+     verbatim_command_argument: ($) =>
+       seq('--%', $._verbatim_command_argument_chars),

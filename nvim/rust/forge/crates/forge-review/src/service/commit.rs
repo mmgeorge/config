@@ -100,7 +100,7 @@ impl ReviewService {
                     .as_deref()
                     .unwrap_or("Diff unavailable for this file");
                 blocks.push(file_block(&commit, &file.path, file.status.as_str())?);
-                blocks.push(diff_block(&commit, &file.path, patch)?);
+                blocks.extend(diff_blocks(&commit, &file.path, patch)?);
             }
         }
         let previous = document.commit_projected.get(&commit).copied().unwrap_or(0);
@@ -148,18 +148,55 @@ fn file_block(commit: &str, path: &str, status: &str) -> Result<BufferBlock> {
     })
 }
 
-fn diff_block(commit: &str, path: &str, patch: &str) -> Result<BufferBlock> {
-    let rows = patch
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .lines()
-        .map(|row| format!("    {row}"))
-        .collect::<Vec<_>>();
-    Ok(BufferBlock {
-        id: BlockId(format!("commit:{commit}:diff:{path}")),
-        text: BufferText::from_rows(rows)?,
-        metadata: BlockMetadata::default(),
-    })
+fn diff_blocks(commit: &str, path: &str, patch: &str) -> Result<Vec<BufferBlock>> {
+    let normalized = patch.replace("\r\n", "\n").replace('\r', "\n");
+    let prefix = format!("commit:{commit}:diff:{path}");
+    if !normalized.starts_with("@@") {
+        return Ok(vec![BufferBlock {
+            id: BlockId(prefix),
+            text: BufferText::from_rows(normalized.lines())?,
+            metadata: BlockMetadata {
+                layout: Some(forge_buffer::block::ContentLayout {
+                    indent: 6,
+                    marker: None,
+                    source_indent: 0,
+                }),
+                ..Default::default()
+            },
+        }]);
+    }
+    let path = serde_json::to_string(path)?;
+    let source = format!("--- {path}\n+++ {path}\n{normalized}\n");
+    let patch = forge_diff::patch::UnifiedPatch::parse(&source)?;
+    let presenter = forge_diff::presentation::DiffPresenter::new(
+        forge_diff::presentation::PresentationOptions {
+            layout: Some(forge_buffer::block::ContentLayout {
+                indent: 6,
+                marker: None,
+                source_indent: 0,
+            }),
+            ..Default::default()
+        },
+    );
+    let mut blocks = Vec::new();
+    for (index, hunk) in patch.file[0].hunk.iter().enumerate() {
+        let (group, rows) = forge_diff::presentation::patch_rows(hunk);
+        blocks.push(presenter.hunk(
+            BlockId(format!("{prefix}:hunk:{index}")),
+            &group,
+            forge_diff::presentation::HunkHeading::Saved(hunk.header),
+        )?);
+        for (batch, rows) in rows.chunks(128).enumerate() {
+            blocks.push(presenter.rows(
+                BlockId(format!("{prefix}:hunk:{index}:rows:{batch}")),
+                rows,
+                &group,
+                None,
+                None,
+            )?);
+        }
+    }
+    Ok(blocks)
 }
 
 #[cfg(test)]
@@ -181,11 +218,18 @@ mod tests {
         );
 
         let file = file_block(&commit, "src/lib.rs", "modified").unwrap();
-        let diff = diff_block(&commit, "src/lib.rs", "@@ -1 +1 @@\r\n-old\r+new").unwrap();
+        let diff = diff_blocks(&commit, "src/lib.rs", "@@ -1 +1 @@\r\n-old\r+new").unwrap();
         assert_eq!(file.text.wire_rows(), ["  modified: src/lib.rs"]);
+        assert!(
+            diff.iter()
+                .all(|block| block.metadata.layout.as_ref().unwrap().indent == 6)
+        );
+        assert_eq!(diff[1].metadata.gutter.len(), 2);
         assert_eq!(
-            diff.text.wire_rows(),
-            ["    @@ -1 +1 @@", "    -old", "    +new"]
+            diff.iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>(),
+            ["@@ -1 +1 @@", "old", "new"]
         );
     }
 }

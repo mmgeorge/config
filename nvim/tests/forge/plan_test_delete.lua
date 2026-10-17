@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 client.host_generation = function() return 1 end
@@ -42,6 +43,7 @@ local function presentation(document)
     snapshot = { document = document, revision = version - 1, block = blocks } }
 end
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   if method == "plan.tests.delete" or method == "plan.entity.rename" then
     pending = { method = method, params = params, callback = callback } return
   end

@@ -37,11 +37,15 @@ local ok, failure = xpcall(function()
   git({ "add", "tracked.txt" })
   result, error = request("staged")
   assert(not result and error == "unsupported detached generation provider fixture", vim.inspect({ result, error }))
-  result, error = request("staged", "generate", {
+  local generation = {
     backend = { kind = "mock", command = { "mock" } }, model = "fixture-model", data_root = fixture .. "/generation-data",
-  })
-  assert(not result and error:find("text_generation", 1, true), vim.inspect({ result, error }))
-  assert(not error:find("Harness is not initialized", 1, true), error)
+  }
+  for _, comparison in ipairs({ "staged", "head", "latest_commit" }) do
+    result, error = request(comparison, "generate", generation)
+    assert(not error and result and result.state == "ready", vim.inspect({ comparison, result, error }))
+    assert(result.message == "feat: describe repository changes", vim.inspect(result))
+    assert(result.diff_pairs == (comparison == "head" and 2 or 1), vim.inspect(result))
+  end
   assert(not client._client.harness_ready, "standalone generation initialized a conversation")
   result, error = request("head", "fingerprint")
   assert(not result and error:find("unknown detached generation operation", 1, true), "obsolete fingerprint request remains supported")

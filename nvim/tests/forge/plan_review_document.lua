@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local original_request, original_accepting = client.request_for, client.host_accepting
@@ -7,6 +8,7 @@ client.host_generation = function() return generation end
 client.host_accepting = function() return true end
 local requests = {}
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   assert(method == "harness.document")
   requests[#requests + 1] = { params = params, callback = callback }
 end

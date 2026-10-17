@@ -2368,6 +2368,7 @@ mod tests {
             "operation":"plan_open", "document":"checks-review", "view":"checks-view", "plan_id":plan.id,
             "digest":plan.review_digest, "width":{"columns":80,"tabstop":4}
         }))?).await?;
+        projection = crate::plan::reconstruct(None, projection);
         let annotation_line = projection["source_row"].as_array().unwrap().iter().find(|row| row["target"].is_string()).unwrap()["source_line"].clone();
         let (sink, mut output) = forge_protocol::outbound::channel();
         for (index, enabled) in [false, true].into_iter().enumerate() {
@@ -2386,7 +2387,7 @@ mod tests {
                 if value["id"] != 3 { continue; }
                 assert!(value.get("error").is_none(), "{value}");
                 assert!(value["result"].get("review_error").is_none(), "{value}");
-                projection = value["result"]["review"].clone();
+                projection = crate::plan::reconstruct(Some(&projection), value["result"]["review"].clone());
                 break;
             }
             assert_eq!(projection["checks"][0]["enabled"], enabled);
@@ -2437,6 +2438,7 @@ mod tests {
             "width":{"columns":100,"tabstop":4}
         }))?).await?;
         let (sink, mut output) = forge_protocol::outbound::channel();
+        projection = crate::plan::reconstruct(None, projection);
         for (index, name) in ["first", "keep"].into_iter().enumerate() {
             let row = projection["source_row"].as_array().unwrap().iter()
                 .find(|row| row["test"]["name"] == name).unwrap();
@@ -2458,7 +2460,7 @@ mod tests {
                 assert_eq!(value["result"]["plan"]["manual_changes"][index], format!("Removed planned tests: tests/config.rs::{name}"));
                 assert_eq!(value["result"]["plan"]["model_revision"], plan.model_revision);
                 assert_eq!(value["result"]["plan"]["user_revision"], plan.user_revision);
-                projection = value["result"]["review"].clone();
+                projection = crate::plan::reconstruct(Some(&projection), value["result"]["review"].clone());
                 break;
             }
             assert_eq!(projection["snapshot"]["document"], "test-review");
@@ -2491,10 +2493,11 @@ mod tests {
         };
         assert!(renamed.get("error").is_none(), "{renamed}");
         assert!(renamed["result"].get("review_error").is_none(), "{renamed}");
-        assert_eq!(renamed["result"]["review"]["snapshot"]["document"], "test-review");
-        assert_eq!(renamed["result"]["review"]["annotation"][0]["source"]["body"],
+        let renamed_review = crate::plan::reconstruct(Some(&projection), renamed["result"]["review"].clone());
+        assert_eq!(renamed_review["snapshot"]["document"], "test-review");
+        assert_eq!(renamed_review["annotation"][0]["source"]["body"],
             "Keep this comment attached after rename.");
-        assert!(renamed["result"]["review"]["source_row"].as_array().unwrap().iter()
+        assert!(renamed_review["source_row"].as_array().unwrap().iter()
             .any(|row| row["text"].as_str().is_some_and(|text| text.contains("reviewed_name"))));
         let changes = renamed["result"]["plan"]["manual_changes"].clone();
         assert_eq!(changes.as_array().unwrap().len(), 3);

@@ -1,19 +1,18 @@
 use std::path::PathBuf;
-use std::process::Command;
 use std::sync::Arc;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
+use forge_diff::syntax::SyntaxEngine;
 use forge_diff::workers::WorkPriority;
-use forge_git::command::{CommandLimits, read_command};
 use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion};
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, PathState};
 use forge_git::store::RepositoryStore;
 
-use super::{Comparison, GenerationRequest};
+use super::excerpt::ChangedFile;
+use super::{Comparison, GenerationRequest, excerpt};
 
 pub struct CommitContext {
     pub prompt: Option<String>,
@@ -28,27 +27,44 @@ struct ComparisonSource {
 pub async fn collect(
     store: &RepositoryStore,
     diff: &Arc<DiffEngine>,
+    syntax: &Arc<SyntaxEngine>,
     request: &GenerationRequest,
 ) -> Result<CommitContext> {
     let repository = store
         .open(PathBuf::from(&request.workspace))
         .await?
         .context("generation requires a Git worktree")?;
-    if request.comparison == Comparison::LatestCommit {
-        return collect_latest_commit(store, repository).await;
-    }
-    let observation = store
-        .read(Arc::clone(&repository), 0, |local, cancellation| {
-            forge_git::reader::StatusReader::status_comparison(&local, &mut || cancellation.check())
-        })
+    let paths = if request.comparison == Comparison::LatestCommit {
+        forge_git::revision::comparison::observe(
+            store,
+            Arc::clone(&repository),
+            forge_git::revision::comparison::ComparisonRequest {
+                reference: "HEAD".into(),
+                worktree: false,
+                path: None,
+            },
+        )
         .await?
-        .value;
-    let mut summary = String::new();
-    let mut body = String::new();
-    let mut changed = 0;
+        .value
+        .path
+        .into_iter()
+        .map(|observed| observed.change)
+        .collect()
+    } else {
+        store
+            .read(Arc::clone(&repository), 0, |local, cancellation| {
+                forge_git::reader::StatusReader::status_comparison(&local, &mut || {
+                    cancellation.check()
+                })
+            })
+            .await?
+            .value
+            .path
+    };
+    let mut files = Vec::new();
     let mut source_requests = 0;
     let mut diff_pairs = 0;
-    for record in &observation.path {
+    for record in &paths {
         if request
             .ignored_paths
             .iter()
@@ -74,7 +90,7 @@ pub async fn collect(
             "generation cannot describe a changed submodule as a text diff"
         );
         let old_mode = head.map_or(0, |head| head.mode);
-        let new_mode = if request.comparison == Comparison::Staged {
+        let new_mode = if request.comparison != Comparison::Head {
             index.unwrap().mode
         } else if matches!(record.state, PathState::Untracked) {
             let path = forge_git::identity::validate_path(
@@ -122,12 +138,11 @@ pub async fn collect(
             .filter(|index| !index.object.is_null())
             .map(|index| index.object);
         let missing = new_mode == 0;
-        let use_index = request.comparison == Comparison::Staged
+        let use_index = request.comparison != Comparison::Head
             || (record.unstaged == ChangeKind::Unchanged && indexed.is_some());
-        if use_index && old_object == indexed && old_mode == new_mode {
+        if use_index && old_object == indexed && old_mode == new_mode && relocation.is_none() {
             continue;
         }
-        changed += 1;
         source_requests += usize::from(old_object.is_some()) + usize::from(!missing);
         let old = if let Some(head) = head.filter(|head| !head.object.is_null()) {
             source(store, &repository, ContentSource::Object(head.object)).await?
@@ -135,9 +150,12 @@ pub async fn collect(
             empty()?
         };
         let new = match request.comparison {
-            Comparison::LatestCommit => unreachable!("latest commit uses committed sources"),
-            Comparison::Staged if index.is_none_or(|index| index.object.is_null()) => empty()?,
-            Comparison::Staged => {
+            Comparison::Staged | Comparison::LatestCommit
+                if index.is_none_or(|index| index.object.is_null()) =>
+            {
+                empty()?
+            }
+            Comparison::Staged | Comparison::LatestCommit => {
                 source(
                     store,
                     &repository,
@@ -171,12 +189,11 @@ pub async fn collect(
             }
         };
         let (Some(old), Some(new)) = (old.text, new.text) else {
-            summary.push_str(&format!(
-                "{}: binary or unsupported text content changed, mode {:o} -> {:o}\n",
-                String::from_utf8_lossy(record.path.raw()),
-                old_mode,
-                new_mode
-            ));
+            files.push(ChangedFile {
+                path: String::from_utf8_lossy(record.path.raw()).into_owned(),
+                note: format!("binary or unsupported text, mode {old_mode:o} -> {new_mode:o}"),
+                analysis: None,
+            });
             continue;
         };
         diff_pairs += 1;
@@ -188,105 +205,36 @@ pub async fn collect(
             .await
             .map_err(|error| anyhow::anyhow!("commit comparison failed: {error:?}"))?;
         if analysis.hunks().is_empty() && old_mode == new_mode && relocation.is_none() {
-            changed -= 1;
             continue;
         }
-        let label = String::from_utf8_lossy(record.path.raw());
+        let mut note = String::new();
         if let Some(relocation) = relocation {
-            summary.push_str(&format!(
-                "{label}: {:?} from {}\n",
+            note = format!(
+                "{:?} from {}",
                 relocation.kind,
                 String::from_utf8_lossy(relocation.origin.raw())
-            ));
-        }
-        summary.push_str(&format!(
-            "{label}: {} changed hunks, mode {:o} -> {:o}\n",
-            analysis.hunks().len(),
-            old_mode,
-            new_mode
-        ));
-        body.push_str(&format!("diff --git a/{label} b/{label}\n"));
-        for hunk in analysis.hunks() {
-            body.push_str(&format!(
-                "@@ -{},{} +{},{} @@\n",
-                hunk.old_lines.start + 1,
-                hunk.old_lines.len(),
-                hunk.new_lines.start + 1,
-                hunk.new_lines.len()
-            ));
-            append_lines(
-                &mut body,
-                &analysis.source().old.bytes()[hunk.old_bytes.clone()],
-                '-',
-            );
-            append_lines(
-                &mut body,
-                &analysis.source().new.bytes()[hunk.new_bytes.clone()],
-                '+',
             );
         }
+        if old_mode != new_mode {
+            if !note.is_empty() {
+                note.push_str(", ");
+            }
+            note.push_str(&format!("mode {old_mode:o} -> {new_mode:o}"));
+        }
+        files.push(ChangedFile {
+            path: String::from_utf8_lossy(record.path.raw()).into_owned(),
+            note,
+            analysis: Some(analysis),
+        });
     }
-    let prompt = (changed != 0).then(|| format!("Generate a conventional commit message for these changes.\n\nDiff summary:\n{summary}\nDiff:\n{body}"));
+    let prompt = if files.is_empty() {
+        None
+    } else {
+        Some(excerpt::prompt(&mut files, syntax).await)
+    };
     Ok(CommitContext {
         prompt,
         source_requests,
-        diff_pairs,
-    })
-}
-
-async fn collect_latest_commit(
-    store: &RepositoryStore,
-    repository: Arc<RepositoryState>,
-) -> Result<CommitContext> {
-    let root = repository
-        .identity
-        .worktree_root
-        .clone()
-        .context("generation requires a worktree")?;
-    let output = store
-        .read(repository, 0, move |_local, cancellation| {
-            let mut command = Command::new("git");
-            command.arg("-C").arg(root).args([
-                "show",
-                "--format=",
-                "--no-color",
-                "--no-ext-diff",
-                "HEAD",
-            ]);
-            read_command(
-                &mut command,
-                CommandLimits {
-                    stderr_bytes: 4096,
-                    timeout: Duration::from_secs(30),
-                },
-                || cancellation.check(),
-            )
-        })
-        .await?
-        .value;
-    ensure!(
-        output.status.success(),
-        "cannot read latest commit: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let diff = String::from_utf8_lossy(&output.stdout);
-    if diff.trim().is_empty() {
-        return Ok(CommitContext {
-            prompt: None,
-            source_requests: 1,
-            diff_pairs: 0,
-        });
-    }
-    let diff_pairs = diff
-        .lines()
-        .filter(|line| line.starts_with("diff --git "))
-        .count();
-    let prompt = format!(
-        "Generate a conventional commit message for the latest commit.\n\nDiff:\n{diff}"
-    );
-    Ok(CommitContext {
-        prompt: Some(prompt),
-        source_requests: 1,
         diff_pairs,
     })
 }
@@ -333,16 +281,6 @@ fn empty() -> Result<ComparisonSource> {
     Ok(ComparisonSource { text: Some(text) })
 }
 
-fn append_lines(destination: &mut String, source: &[u8], prefix: char) {
-    for line in String::from_utf8_lossy(source).split_inclusive('\n') {
-        destination.push(prefix);
-        destination.push_str(line);
-        if !line.ends_with('\n') {
-            destination.push_str("\n\\ No newline at end of file\n");
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -361,19 +299,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn diff_lines_preserve_complete_multibyte_content_and_terminal_marker() {
-        let source = format!("{}\nlast λ", "α".repeat(180_001));
-        let mut body = String::new();
-        append_lines(&mut body, source.as_bytes(), '+');
-        assert_eq!(
-            body,
-            format!("+{}\n+last λ\n\\ No newline at end of file\n", "α".repeat(180_001))
-        );
-    }
-
     #[tokio::test]
-    async fn commit_context_preserves_large_files_later_files_and_latest_commit() {
+    async fn commit_context_caps_large_files_and_keeps_inventory_for_latest_commit() {
         let directory = tempfile::Builder::new()
             .prefix(".forge-commit-")
             .tempdir_in(std::env::current_dir().unwrap())
@@ -386,11 +313,12 @@ mod tests {
         std::fs::write(root.join("first.txt"), "before\n").unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "--quiet", "-m", "initial"]);
-        let large = format!("{}\nlarge tail λ\n", "complete ".repeat(40_000));
+        let large = format!("{}\nlarge tail λ\n", "complete ".repeat(100_000));
         std::fs::write(root.join("first.txt"), &large).unwrap();
         std::fs::write(root.join("second.txt"), "later file remains present\n").unwrap();
         let store = RepositoryStore::default();
         let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
         let mut request = GenerationRequest {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
@@ -399,23 +327,23 @@ mod tests {
             model: None,
             generation: None,
         };
-        let context = collect(&store, &diff, &request).await.unwrap();
+        let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
-        assert!(prompt.contains(&large[..large.len() - 1].replace('\n', "\n+")));
-        assert!(prompt.contains("+later file remains present"));
-        assert!(!prompt.contains("truncated"));
+        assert!(prompt.len() <= excerpt::MAX_INPUT_BYTES);
+        assert!(prompt.contains("first.txt") && prompt.contains("second.txt"));
+        assert!(!prompt.contains("large tail λ"));
         assert_eq!(context.diff_pairs, 2);
         git(root, &["add", "."]);
         git(root, &["commit", "--quiet", "-m", "complete"]);
         request.comparison = Comparison::LatestCommit;
-        let prompt = collect(&store, &diff, &request)
+        let prompt = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
             .unwrap();
-        assert!(prompt.contains("+large tail λ") && prompt.contains("+later file remains present"));
-        assert!(prompt.len() > 256 * 1024);
-        assert!(!prompt.contains("truncated"));
+        assert!(prompt.len() <= excerpt::MAX_INPUT_BYTES);
+        assert!(prompt.contains("first.txt") && prompt.contains("second.txt"));
+        assert!(!prompt.contains("large tail λ"));
     }
 
     #[tokio::test]
@@ -435,6 +363,7 @@ mod tests {
         std::fs::write(root.join("source.rs"), "fn after() {}\n").unwrap();
         let store = RepositoryStore::default();
         let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
         let pool = diff.analysis_pool();
         let occupied: Vec<_> = (0..4)
             .map(|_| {
@@ -450,7 +379,7 @@ mod tests {
             model: None,
             generation: None,
         };
-        let mut pending = Box::pin(collect(&store, &diff, &request));
+        let mut pending = Box::pin(collect(&store, &diff, &syntax, &request));
         let before_release =
             tokio::time::timeout(std::time::Duration::from_secs(2), &mut pending).await;
         assert_eq!(pool.usage().admitted_jobs, 4);
@@ -465,7 +394,7 @@ mod tests {
             panic!("temporary syntax load permanently failed commit preparation: {error:#}")
         });
         let prompt = context.prompt.unwrap();
-        assert!(prompt.contains("-fn before() {}") && prompt.contains("+fn after() {}"));
+        assert!(prompt.contains("- fn before() {}") && prompt.contains("+ fn after() {}"));
         assert_eq!(pool.usage().admitted_jobs, 0);
     }
 
@@ -491,6 +420,7 @@ mod tests {
         std::fs::write(root.join("git-ignored.txt"), "git ignored value\n").unwrap();
         let store = RepositoryStore::default();
         let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
         let mut request = GenerationRequest {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
@@ -499,41 +429,41 @@ mod tests {
             model: None,
             generation: None,
         };
-        let prompt = collect(&store, &diff, &request)
+        let prompt = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
             .unwrap();
         assert!(
-            prompt.contains("+worktree value")
-                && prompt.contains("+new value")
-                && prompt.contains("-removed")
+            prompt.contains("+ worktree value")
+                && prompt.contains("+ new value")
+                && prompt.contains("- removed")
         );
         assert!(!prompt.contains("staged value") && !prompt.contains("ignored value"));
         request.comparison = Comparison::Staged;
         request.ignored_paths.clear();
-        let staged = collect(&store, &diff, &request)
+        let staged = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
             .unwrap();
-        assert!(staged.contains("+staged value"));
+        assert!(staged.contains("+ staged value"));
         assert!(
             !staged.contains("worktree value")
                 && !staged.contains("new value")
-                && !staged.contains("removed")
+                && !staged.contains("- removed")
         );
         request.comparison = Comparison::LatestCommit;
-        let latest = collect(&store, &diff, &request)
+        let latest = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
             .unwrap();
-        assert!(latest.contains("+before") && latest.contains("+removed"));
+        assert!(latest.contains("+ before") && latest.contains("+ removed"));
         assert!(!latest.contains("staged value") && !latest.contains("worktree value"));
         request.comparison = Comparison::Staged;
         git(root, &["add", "excluded.txt"]);
-        let staged = collect(&store, &diff, &request)
+        let staged = collect(&store, &diff, &syntax, &request)
             .await
             .unwrap()
             .prompt
@@ -541,7 +471,7 @@ mod tests {
         assert!(staged.contains("status ignored value"));
         git(root, &["reset", "--quiet"]);
         assert!(
-            collect(&store, &diff, &request)
+            collect(&store, &diff, &syntax, &request)
                 .await
                 .unwrap()
                 .prompt

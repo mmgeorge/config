@@ -376,10 +376,12 @@ end
 
 local function install_metadata(session, prepared, replace_all)
   local physical_row = prepared.source_projected and session.physical_row or nil
+  local layout_row = prepared.source_projected and session.source_layout_row or physical_row
   node_contract.update(session, prepared, replace_all)
   if replace_all then
     vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
     session.marks = {}
+    session.layout_marks = {}
     session.sentinel = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace, 0, 0, {})
   end
   for _, set in ipairs({ prepared.changed, prepared.retired }) do
@@ -389,13 +391,17 @@ local function install_metadata(session, prepared, replace_all)
         vim.api.nvim_buf_del_extmark(session.buffer, session.namespace, handle)
       end
       session.marks[id] = nil
+      if session.layout_marks then session.layout_marks[id] = nil end
     end
   end
   for id in pairs(prepared.changed) do
       local entry, mark = prepared.block[id], {}
       local start_row = prepared.position[id]
-      vim.list_extend(mark, require("forge.content_layout").install(session.buffer, session.namespace,
-        start_row, entry, physical_row))
+      local layout_marks = require("forge.content_layout").install(session.buffer, session.namespace,
+        start_row, entry, layout_row)
+      session.layout_marks = session.layout_marks or {}
+      session.layout_marks[id] = layout_marks
+      vim.list_extend(mark, layout_marks)
       for _, decoration in ipairs(entry.metadata.decoration) do
         local range = decoration.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
@@ -416,6 +422,30 @@ local function install_metadata(session, prepared, replace_all)
       end
       session.marks[id] = mark
       cooperative.checkpoint()
+  end
+end
+
+---Reanchors source layout after a local projection changes physical rows.
+---@param session table
+---@param locate fun(row: integer): integer? Returns nil for hidden source rows.
+function M.refresh_source_layout(session, locate)
+  session.layout_marks = session.layout_marks or {}
+  for index = 0, session.sequence:count() - 1 do
+    local node = session.sequence:at(index)
+    local previous = {}
+    for _, handle in ipairs(session.layout_marks[node.id] or {}) do
+      previous[handle] = true
+      vim.api.nvim_buf_del_extmark(session.buffer, session.namespace, handle)
+    end
+    local retained = {}
+    for _, handle in ipairs(session.marks[node.id] or {}) do
+      if not previous[handle] then retained[#retained + 1] = handle end
+    end
+    local _, start = session.sequence:position(node.id)
+    local marks = require("forge.content_layout").install(session.buffer, session.namespace, start, node.entry, locate)
+    session.layout_marks[node.id] = marks
+    vim.list_extend(retained, marks)
+    session.marks[node.id] = retained
   end
 end
 

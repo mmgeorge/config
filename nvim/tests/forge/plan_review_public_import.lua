@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 
 local client = require("forge.client")
@@ -12,6 +13,7 @@ local source = { "# Physical plan", "", "# Tasks", "", "# Tests", "", "Preserve 
 vim.fn.writefile(source, path)
 client.host_accepting = function() return true end
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   assert(method == "harness.document")
   if params.operation == "plan_open" then
     local source_row = {}

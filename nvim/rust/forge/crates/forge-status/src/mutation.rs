@@ -1171,7 +1171,7 @@ impl StatusService {
                         file.record.unstaged_stats = stats;
                     }
                     file.cursor = Some(
-                        DisplayCursor::compact(analysis.clone(), 3)
+                        DisplayCursor::new(analysis.clone(), 3)
                             .with_syntax_context(
                                 file.old_syntax.as_ref(),
                                 file.new_syntax.as_ref(),
@@ -1335,7 +1335,7 @@ impl StatusService {
             file.old_syntax = old;
             file.new_syntax = new;
             file.cursor = Some(
-                DisplayCursor::compact(analysis.clone(), 3)
+                DisplayCursor::new(analysis.clone(), 3)
                     .with_syntax_context(file.old_syntax.as_ref(), file.new_syntax.as_ref()),
             );
             file.state = BodyState::Partial;

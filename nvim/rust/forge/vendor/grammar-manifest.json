@@ -1,0 +1,81 @@
+{
+  "version": 1,
+  "grammar": [
+    {
+      "name": "tree-sitter-powershell",
+      "url": "https://github.com/airbus-cert/tree-sitter-powershell",
+      "revision": "d398441825243b00e317e87e1829b9d6a3e54ce0",
+      "generator": {
+        "version": "0.26.8",
+        "abi": 15
+      },
+      "patch": "grammar.patch",
+      "files": [
+        {
+          "path": "bindings/rust/build.rs",
+          "sha256": "3e56bf71b381a7c67ca5ef14b3996ab770204a98611adc9ff7cd1f932c1028e2"
+        },
+        {
+          "path": "bindings/rust/lib.rs",
+          "sha256": "80a362ccaf098d77bd0601da6b5428f5e7ef63a4a4c7ac65a429288f38e27d23"
+        },
+        {
+          "path": "Cargo.toml",
+          "sha256": "3ebab17bce0a9df2b545d06b8e8706bd67dca3cebc65a59bfd7c7025a1d93f29"
+        },
+        {
+          "path": "FORGE-PATCH.md",
+          "sha256": "9d26e1cfbd7a5fa8e530c73a531210cdf46a60073497d4ba8607395f81ceda89"
+        },
+        {
+          "path": "grammar.js",
+          "sha256": "1606d6bf5db46c62c46664bdd327dadad3cb385e9c3d942c4f16a6cbd668b912"
+        },
+        {
+          "path": "grammar.patch",
+          "sha256": "05c5559777ca7a790c83dc3514ae0fed21a1acb9cbe4bde965f9fd1b17eb62ac"
+        },
+        {
+          "path": "LICENSE",
+          "sha256": "1fca8454c0d77a73f9922a52d39e1f7c339f5da5d03f2766eff66b859fa19477"
+        },
+        {
+          "path": "queries/highlights.scm",
+          "sha256": "ca7fbd3725832082793510fd478eefeb8ee1588adbbf8d1ff2dcb066249b35ac"
+        },
+        {
+          "path": "src/grammar.json",
+          "sha256": "742821d7ab4b5ac44c1af0cdedf25e1590a4e2b2c48e16a3ac0beb74bb37bc14"
+        },
+        {
+          "path": "src/node-types.json",
+          "sha256": "55cdc89baabd9d3ac7a3c5a22e0f6f5938a980688c11ccbd10e73a763bd0f2fa"
+        },
+        {
+          "path": "src/parser.c",
+          "sha256": "c7d0ce98cc103aff4ccb34c236ab308f460e106b1b552679640c1105d0864678"
+        },
+        {
+          "path": "src/scanner.c",
+          "sha256": "cf366b70e258a0ac1eb264ac0f4165c8f0c1b943d1a6e9db9d291c6cf178221f"
+        },
+        {
+          "path": "src/tree_sitter/alloc.h",
+          "sha256": "b29c1c9fb7cc82f58c84b376df1297d6e2737a1d655fd356db0859e3c29c2fea"
+        },
+        {
+          "path": "src/tree_sitter/array.h",
+          "sha256": "31e60a1bff6f715afacce03b5b70efe42b58371b4f9595dd4af52a577ff9608c"
+        },
+        {
+          "path": "src/tree_sitter/parser.h",
+          "sha256": "180b893c8734778fd32f372dfbc27bd6ad1cd2221f26150b31256ff6716320d2"
+        },
+        {
+          "path": "tree-sitter.json",
+          "sha256": "4c0ec9a6fc5a75f78c0caf71dc954626da92fc1ba4cffcf4ca8b6ebe240fb51f"
+        }
+      ]
+    }
+  ]
+}

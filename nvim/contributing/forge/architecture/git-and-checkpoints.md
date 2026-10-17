@@ -52,10 +52,14 @@ Native syntax adoption merges adjacent display groups when their scopes are equa
 and the gap between their padded windows is at most six lines on both source sides.
 Each group retains the union of its raw hunk identities, so actions on bridge context stage
 or unstage exactly those edits. Semantic bridging leaves larger gaps and unrelated sibling
-scopes separate. The display summary uses the innermost source declaration's first line
-rather than only its name. Unchanged scope openers appear in the first containing group and closers
+scopes separate. Hunk headers contain change counts. Enclosing declarations appear as
+syntax-highlighted source rows, with their exact old and new coordinates. Unchanged scope openers appear in the first containing group and closers
 in the last, with each source coordinate emitted once across the file's groups. Syntax
 adoption replaces the body generation before publishing the regrouped targets and rows.
+Omitted ranges inside a group render an indented `...` row without a source coordinate
+or mutation target. A single omitted unchanged line renders its actual source text.
+These markers preserve chunk boundaries without consuming a source line. Staging a raw
+hunk recomputes groups and source context independently for the index and worktree.
 Read-only demand accepts an older inventory revision for a still-live file handle and
 serves its current generation. Future revisions, forged handles, and replayed input
 sequences remain invalid. This prevents unrelated context and mutation updates from
@@ -181,6 +185,41 @@ body generation still match. Rust sends semantic `StatusDelta` and `BodyDelivery
 while Lua formats text, highlights, decorations, folds, and cursor preservation. Large
 document events use bounded multipart transport and Lua publishes the update only after
 the complete event has been assembled and validated.
+
+## Commit-message context
+
+`CommitMessageService` owns prompt preparation for automatic About drafts and explicit
+commit-message regeneration. HEAD includes tracked worktree changes and untracked files,
+staged generation compares the index with HEAD, and amend generation reads the latest
+commit's immutable old and new objects. All three routes use the same native diff and
+excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
+an inventory entry without a text excerpt.
+
+The constructed system instructions and user prompt together contain at most 500,000
+UTF-8 bytes. This application limit counts text before JSON escaping, not model tokens
+or provider-added context. The prompt starts with changed paths and full addition/deletion
+counts, followed by excerpts in path order. Paths whose filename contains `test` or `spec`,
+or which lie under a test/spec directory, follow other paths. No lockfile classification
+or dependency summarization runs. Inventory emission stops if the inventory itself reaches
+the byte limit.
+
+The shared syntax engine supplies declaration extents, signature rows, and recognized
+import ranges from exact old and new sources. The formatter assigns a source row to its
+innermost declaration and emits it once. It preserves complete signatures and selects
+the first 20 changed body rows per declaration, counting additions and removals together.
+Two unchanged rows surround selected changes, overlapping context merges, and omitted
+ranges use `... N lines omitted (+A -D)`. Gutter prefixes are `+ `, `- `, and two spaces.
+Imports remain in inventory counts but are excluded from excerpts. Fully omitted files
+receive no detail heading. The global limit stops subsequent emission rather than
+reducing the per-declaration allowance or redistributing it to later files.
+
+Markdown and plain-text paths (`.md` and `.txt`, case-insensitive) retain every changed
+row with two context rows and have no 20-row limit. Unavailable grammars and malformed
+syntax use ordinary diff excerpts with the same byte limit. Python currently follows
+that fallback because this host does not bundle a Python grammar. Optional syntax work
+has a shared two-second deadline, after which remaining files use the diff fallback.
+Repository acquisition and comparison failures remain request failures rather than
+being converted into an empty change set.
 
 ## Exchange checkpoints and change attribution
 

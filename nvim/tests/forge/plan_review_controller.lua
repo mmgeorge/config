@@ -1,3 +1,4 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local original_request, original_accepting = client.request_for, client.host_accepting
@@ -17,6 +18,7 @@ local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
 local pending
 client.request_for = function(session_id, method, params, callback)
+  callback = encode_delivery(callback)
   assert(session_id == "plan-session")
   if method == "plan.acceptance.begin" or method == "plan.request_changes" then
     pending = { method = method, params = params, callback = callback } return

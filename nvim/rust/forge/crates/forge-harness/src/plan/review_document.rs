@@ -161,7 +161,7 @@ impl PlanReviewStore {
 
     pub(crate) fn insert(
         &self,
-        document: PlanReviewDocument,
+        mut document: PlanReviewDocument,
         admission: DocumentAdmission,
     ) -> Result<serde_json::Value> {
         let mut store = self
@@ -169,10 +169,11 @@ impl PlanReviewStore {
             .lock()
             .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
         admission.check()?;
+        let source_edit = document.source_edit();
         let opened = serde_json::json!({"snapshot":document.snapshot(), "saved_source_digest":document.saved_digest(),
             "plan_id":document.source.document.plan_id, "version":document.source.document.version,
             "path":document.source.path, "public_only":document.source.public_only,
-            "annotation":document.annotation.annotation(), "source_row":document.source_rows(),
+            "annotation":document.annotation.annotation(), "source_edit":source_edit,
             "checks":document.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
         store.insert(document.id.clone(), (document, admission));
         Ok(opened)
@@ -388,6 +389,7 @@ pub(crate) struct PlanReviewDocument {
     id: DocumentId,
     source: PlanReviewSource,
     document: BufferDocument,
+    source_anchor: HashMap<String, serde_json::Value>,
     target: HashMap<TargetId, PlanNavigationAnchor>,
     view: HashMap<ViewId, InputSequence>,
 }
@@ -399,7 +401,16 @@ impl PlanReviewDocument {
         ensure!(source.document.plan_id == self.source.document.plan_id
             && source.document.version > self.source.document.version, "plan revision is stale");
         source.public_only = self.source.public_only;
-        source.revealed = self.source.revealed.clone();
+        source.revealed = self.source.revealed.iter().filter(|(path, side, _)| {
+            let (Some(previous), Some(current)) = (&self.source.document.design, &source.document.design) else { return false; };
+            if side == "baseline" {
+                previous.baseline.get(path) == current.baseline.get(path)
+                    && previous.baseline_calls.get(path) == current.baseline_calls.get(path)
+            } else {
+                previous.proposed.get(path) == current.proposed.get(path)
+                    && previous.proposed_calls.get(path) == current.proposed_calls.get(path)
+            }
+        }).cloned().collect();
         source.collapse = self.source.collapse.clone();
         let annotation_stage = trace.map(|trace| trace.stage("review.load_reanchor_annotations"));
         let mut annotation = ReviewAnnotationStore::open(source.path.with_extension("json"), source.saved_digest.clone())?;
@@ -456,7 +467,7 @@ impl PlanReviewDocument {
         if retained.len() != annotation.annotation().len() { annotation.replace(retained)?; }
         if let Some(stage) = reanchor { stage.complete(serde_json::json!({"count":annotation.annotation().len()})); }
         let edit = trace.map(|trace| trace.stage("review.edit_document"));
-        let patch = self.document.edit(0..self.document.block_count(), block)?;
+        let patch = super::review_delivery::replace(&mut self.document, block)?;
         if let Some(stage) = edit { stage.complete(serde_json::json!({})); }
         self.source = source;
         if !tests_only {
@@ -465,8 +476,9 @@ impl PlanReviewDocument {
         }
         self.target = target;
         self.annotation = annotation;
-        let response = trace.map(|trace| trace.stage("review.build_snapshot"));
-        let result = serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(),
+        let response = trace.map(|trace| trace.stage("review.build_delivery"));
+        let source_edit = self.source_edit();
+        let result = serde_json::json!({"patch":patch, "source_edit":source_edit,
             "annotation":self.annotation.annotation(), "public_only":self.source.public_only,
             "saved_source_digest":self.saved_digest(), "version":self.source.document.version,
             "checks":self.source.document.design.as_ref().map(|design| design.check_options()).unwrap_or_default()});
@@ -672,10 +684,23 @@ impl PlanReviewDocument {
             return Ok(serde_json::json!({"jump":jump}));
         }
         self.retain_annotation_revision();
+        let design = self.source.document.design.as_ref().context("reference has no declaration design")?;
+        let (text, calls) = if reference.side == "baseline" {
+            (design.baseline.get(&reference.path).map(|file| file.text.as_str()), design.baseline_calls.get(&reference.path))
+        } else {
+            (design.proposed.get(&reference.path).map(String::as_str), design.proposed_calls.get(&reference.path))
+        };
+        let presentation = super::calls::present(&reference.path, text.context("reference file is missing")?, calls.map(Vec::as_slice).unwrap_or_default())?;
+        let selected_row = if matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value") {
+            presentation.call_row.iter().find_map(|(row, (owner, name, kind))| {
+                (owner == &reference.owner && name == &reference.name && kind.label() == reference.kind).then_some(*row)
+            })
+        } else { None }.or_else(|| presentation.declaration.source.iter().position(|position| position.is_some_and(|position| position.line == reference.line)))
+            .context("reference has no declaration row")?;
         let previous_revealed = self.source.revealed.clone();
         let previous_collapse = self.source.collapse.clone();
-        self.source.revealed.retain(|(path, side)| path != &reference.path || side == &reference.side);
-        self.source.revealed.insert((reference.path.clone(), reference.side.clone()));
+        self.source.revealed.retain(|(path, _, _)| path != &reference.path);
+        self.source.revealed.insert((reference.path.clone(), reference.side.clone(), selected_row as u32));
         let projection = (|| -> Result<_> {
             let (mut blocks, mut targets) = super::design_review::project(
                 &self.source.document, &self.width, &[], &self.annotation_revision, None,
@@ -696,7 +721,7 @@ impl PlanReviewDocument {
             let visible: std::collections::HashSet<_> = blocks.iter().flat_map(|block| &block.metadata.target).map(|range| range.id.clone()).collect();
             targets.retain(|id, _| visible.contains(id));
             ensure!(blocks.iter().any(|block| block.id == jump.block), "reference destination remains collapsed");
-            let patch = self.document.edit(0..self.document.block_count(), blocks)?;
+            let patch = super::review_delivery::replace(&mut self.document, blocks)?;
             Ok((patch, targets, jump))
         })();
         if projection.is_err() {
@@ -706,7 +731,8 @@ impl PlanReviewDocument {
         let (patch, targets, jump) = projection?;
         self.target = targets;
         self.focused_annotation = None;
-        Ok(serde_json::json!({"patch":patch,"snapshot":self.snapshot(),"source_row":self.source_rows(),"annotation":self.annotation.annotation(),"jump":jump}))
+        let source_edit = self.source_edit();
+        Ok(serde_json::json!({"patch":patch,"source_edit":source_edit,"annotation":self.annotation.annotation(),"jump":jump}))
     }
 
     fn describe(
@@ -1200,6 +1226,7 @@ impl PlanReviewDocument {
             id,
             source,
             document,
+            source_anchor: HashMap::new(),
             target,
             annotation,
             width,
@@ -1208,17 +1235,19 @@ impl PlanReviewDocument {
         })
     }
 
-    fn source_rows(&self) -> Vec<serde_json::Value> {
+    fn source_edit(&mut self) -> serde_json::Value {
         let mut row = Vec::new();
-        for block in self.document.snapshot().block {
-            for (position, text) in block.text.wire_rows().iter().enumerate() {
+        let mut current = HashMap::new();
+        let mut row_count = 0;
+        for block in self.document.blocks(self.document.revision(), 0..self.document.block_count()).expect("current document range") {
+            for position in 0..block.text.row_count() {
                 let target = block.metadata.target.iter().find(|target| {
                     target.range.start.row <= position && position < target.range.end.row
                 });
                 let line = target
                     .and_then(|target| self.target.get(&target.id))
                     .map(|anchor| anchor.line)
-                    .unwrap_or(row.len() as u32 + 1);
+                    .unwrap_or(row_count + 1);
                 let test = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
                     match &anchor.target {
                         super::PlanReviewTarget::TestCase { path, name } => Some(super::DesignTestSelection { file: path.clone(), name: name.clone() }),
@@ -1228,14 +1257,17 @@ impl PlanReviewDocument {
                 let check = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
                     if let super::PlanReviewTarget::Check { id } = &anchor.target { Some(id) } else { None }
                 });
-                row.push(
-                    serde_json::json!({"id":format!("{}:{}",block.id.0,position), "text":text,
-                    "source_line":line, "block":block.id, "position":{"row":position,"column":0},
-                    "target":target.map(|target| &target.id), "metadata":block.metadata, "test":test, "check":check}),
-                );
+                let id = format!("{}:{}", block.id.0, position);
+                let anchor = serde_json::json!({"id":id,"source_line":line,"test":test,"check":check});
+                if self.source_anchor.get(&id) != Some(&anchor) { row.push(anchor.clone()); }
+                current.insert(id, anchor);
+                row_count += 1;
             }
         }
-        row
+        let mut removed = self.source_anchor.keys().filter(|id| !current.contains_key(*id)).cloned().collect::<Vec<_>>();
+        removed.sort();
+        self.source_anchor = current;
+        serde_json::json!({"upsert":row,"remove":removed})
     }
 
     pub(crate) fn snapshot(&self) -> BufferSnapshot {
@@ -1323,7 +1355,7 @@ impl PlanReviewDocument {
             &self.annotation_revision,
             None,
         ).and_then(|(block, target)| {
-            let patch = self.document.edit(0..self.document.block_count(), block)?;
+            let patch = super::review_delivery::replace(&mut self.document, block)?;
             Ok((patch, target))
         });
         if projection.is_err() { self.source.public_only = !public_only; }
@@ -1331,8 +1363,9 @@ impl PlanReviewDocument {
         self.source.public_only = public_only;
         self.focused_annotation = None;
         self.target = target;
+        let source_edit = self.source_edit();
         Ok(
-            serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(), "annotation":self.annotation.annotation(), "public_only":public_only}),
+            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation(), "public_only":public_only}),
         )
     }
 
@@ -1345,7 +1378,7 @@ impl PlanReviewDocument {
         let projection = super::review_projection::project(
             &self.source, &self.width, &[], &self.annotation_revision, None,
         ).and_then(|(block, target)| {
-            let patch = self.document.edit(0..self.document.block_count(), block)?;
+            let patch = super::review_delivery::replace(&mut self.document, block)?;
             Ok((patch, target))
         });
         if projection.is_err() {
@@ -1355,7 +1388,8 @@ impl PlanReviewDocument {
         let (patch, target) = projection?;
         self.target = target;
         self.focused_annotation = None;
-        Ok(serde_json::json!({"patch":patch,"snapshot":self.snapshot(),"source_row":self.source_rows(),
+        let source_edit = self.source_edit();
+        Ok(serde_json::json!({"patch":patch,"source_edit":source_edit,
             "annotation":self.annotation.annotation(),"jump":collapse.opening}))
     }
 
@@ -1390,7 +1424,7 @@ impl PlanReviewDocument {
                 &revision,
                 self.focused_annotation.as_deref(),
             )?;
-            let patch = self.document.edit(0..self.document.block_count(), block)?;
+            let patch = super::review_delivery::replace(&mut self.document, block)?;
             self.target = target;
             self.width = profile;
             Some(patch)
@@ -1403,8 +1437,9 @@ impl PlanReviewDocument {
             self.view.remove(&view);
         }
         self.view_width = views;
+        let source_edit = self.source_edit();
         Ok(
-            serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(), "annotation":self.annotation.annotation()}),
+            serde_json::json!({"patch":patch, "source_edit":source_edit, "annotation":self.annotation.annotation()}),
         )
     }
 }
@@ -1412,6 +1447,49 @@ impl PlanReviewDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn updates_send_only_changed_blocks_and_sparse_source_anchors() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        crate::checks::configure_fixture(&store.workspace);
+        let mut canonical = crate::plan::document::test_fixture("plan", "Inspect configuration.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Expose configuration.".into();
+        design.document.background = "Captured declarations.".into();
+        design.document.requirements = vec!["Preserve behavior.".into()];
+        design.document.design = "Change one field.".into();
+        let baseline = (0..1000).map(|index| format!("pub struct State{index:04};\n")).collect::<String>();
+        std::fs::create_dir_all(store.workspace.join("src")).unwrap();
+        std::fs::write(store.workspace.join("src/lib.rs"), &baseline).unwrap();
+        design.baseline.insert("src/lib.rs".into(), crate::plan::DeclarationFile { text: baseline.clone(), source_digest: super::super::digest(baseline.as_bytes()) });
+        design.proposed.insert("src/lib.rs".into(), baseline.replace("State0500;", "State0500 { pub changed: bool }"));
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &digest).unwrap();
+        let mut document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let initial = serde_json::json!({"snapshot":document.snapshot(),"source_edit":document.source_edit()});
+        let encoded = serde_json::to_string(&initial).unwrap();
+        assert!(encoded.len() < 80_000, "compact open grew to {} bytes", encoded.len());
+        assert!(!encoded.contains("State0900"));
+        for row in initial["source_edit"]["upsert"].as_array().unwrap() {
+            assert!(row.get("text").is_none() && row.get("metadata").is_none());
+        }
+        let idle = document.update_view(ViewId("view".into()), Some(WidthProfile::default())).unwrap();
+        assert!(idle.get("snapshot").is_none() && idle.get("source_row").is_none());
+        assert_eq!(idle["source_edit"]["upsert"], serde_json::json!([]));
+        let mut source = store.capture_review_source("session", "plan", Some(1), &digest).unwrap();
+        source.document.version += 1;
+        source.document.design.as_mut().unwrap().document.objective = "Updated objective.".into();
+        source.rendered = super::super::render_plan_at(&source.document, &store.workspace).unwrap();
+        let updated = document.update(source, None).unwrap();
+        assert!(updated.get("snapshot").is_none() && updated.get("source_row").is_none());
+        let encoded = serde_json::to_string(&updated).unwrap();
+        assert!(!encoded.contains("State0500"), "unchanged declaration leaked into update");
+        assert!(encoded.len() < 12_000, "single metadata edit grew to {} bytes", encoded.len());
+        assert_eq!(updated["source_edit"]["upsert"], serde_json::json!([]));
+    }
 
     #[test]
     fn test_inventory_revision_preserves_document_and_declaration_state() {
@@ -2669,7 +2747,7 @@ mod tests {
         assert_eq!(document.document.block(&jump.block).unwrap().text.row(0).unwrap().trim(), "send");
         assert!(!document.document.block(&jump.block).unwrap().metadata.gutter.is_empty());
         assert!(!document.snapshot().block.iter().any(|block| block.id.0.starts_with("plan:reference:")));
-        assert_eq!(document.source_rows().iter().find(|row| row["block"] == jump.block.0).unwrap()["source_line"], 0);
+        assert_eq!(document.source_anchor[&format!("{}:0", jump.block.0)]["source_line"], 0);
         for (id, line) in source_line {
             assert_eq!(document.target.get(&id).unwrap().line, line);
         }

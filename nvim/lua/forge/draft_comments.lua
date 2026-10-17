@@ -45,7 +45,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field source_lines string[]
 ---@field source_provider? fun(width: integer): ForgeDraftSourceRow[]
 ---@field annotation_list ForgeDraftComment[]
----@field source_mark { mark: integer, source_line: integer }[]
+---@field source_mark { mark: integer, source_line: integer, source_index: integer, annotation_anchor?: boolean }[]
 ---@field range_list ForgeDraftCommentRange[]
 ---@field group integer
 ---@field next_id integer

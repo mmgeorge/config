@@ -8969,10 +8969,10 @@ mod test {
         let store = crate::plan::review_document::PlanReviewStore::default();
         let admission = store.admit(forge_buffer::identity::DocumentId("delete-tests".into())).unwrap();
         let opened = store.insert(review, admission).unwrap();
-        assert!(opened["source_row"].as_array().unwrap().iter().any(|row| row["test"]["name"] == "fourth"));
+        assert!(opened["source_edit"]["upsert"].as_array().unwrap().iter().any(|row| row["test"]["name"] == "fourth"));
         let mut annotation = Vec::new();
         for name in ["keep", "fourth"] {
-            let line = opened["source_row"].as_array().unwrap().iter()
+            let line = opened["source_edit"]["upsert"].as_array().unwrap().iter()
                 .find(|row| row["test"]["name"] == name).unwrap()["source_line"].as_u64().unwrap() as u32;
             annotation.push(crate::plan::ReviewAnnotation {
                 id: name.into(), parent_id: None,
@@ -9017,7 +9017,7 @@ mod test {
         assert_eq!(opened["annotation"].as_array().unwrap().len(), 1);
         assert_eq!(opened["annotation"][0]["id"], "keep");
         let line = opened["annotation"][0]["source"]["start_line"].as_u64().unwrap();
-        assert!(opened["source_row"].as_array().unwrap().iter().any(|row| row["source_line"] == line && row["test"]["name"] == "keep"));
+        assert!(opened["source_edit"]["upsert"].as_array().unwrap().iter().any(|row| row["source_line"] == line && row["test"]["name"] == "keep"));
         assert!(!repository.path().join("src/game.rs").exists());
         broker.delete_plan_tests(json!({"plan_id":plan.id,"digest":reopened.review_digest,
             "expected_version":updated.version,"tests":[{"file":"tests/game.rs","name":"keep"}]})).unwrap();

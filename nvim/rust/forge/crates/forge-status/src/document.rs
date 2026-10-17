@@ -66,7 +66,7 @@ pub(crate) struct FileTarget {
     pub loading: Option<Arc<AtomicBool>>,
     pub hunk: HashMap<RawHunkId, TargetId>,
     pub group: HashMap<usize, DisplayGroupTarget>,
-    pub source_row: HashMap<BlockId, Vec<forge_diff::source::SourceCoordinate>>,
+    pub source_row: HashMap<BlockId, Vec<Option<forge_diff::source::SourceCoordinate>>>,
     pub state: BodyState,
     pub analysis: Option<AnalysisHandle>,
     pub cursor: Option<DisplayCursor>,

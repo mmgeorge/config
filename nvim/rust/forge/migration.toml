@@ -3,7 +3,7 @@ hash_policy = "baseline_sha256 hashes exact Git blob bytes; sha256 retains the o
 baseline_revision = "3992f3a7c555536116b554190a29e69e5a122bc2"
 baseline_source_root = ["nvim/lua/diff_review", "nvim/tests/diff_review", "nvim/rust/diff-review-harness", "nvim/rust/github-issue-index", "nvim/lua/github", "nvim/lua/rust_sidecar", "nvim/lua/plugins/diff_review.lua", "nvim/lua/plugins/github.lua"]
 completed_gates = ["name", "host", "remote", "native_ownership", "github_storage"]
-asset_manifest = ["nvim/rust/forge/crates/forge-diff/grammar/manifest.json", "nvim/rust/forge/crates/forge-diff/query/manifest.json"]
+asset_manifest = ["nvim/rust/forge/crates/forge-diff/grammar/manifest.json", "nvim/rust/forge/crates/forge-diff/query/manifest.json", "nvim/rust/forge/vendor/grammar-manifest.json"]
 
 [[source]]
 source = "nvim/lua/diff_review/docs/architecture.md"

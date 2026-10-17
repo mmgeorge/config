@@ -9,7 +9,7 @@ use crate::cache::AnalysisHandle;
 use crate::intraline::{FallbackReason, IntralinePolicy, IntralineResult, compare_replacement};
 use crate::raw::{RawDiff, RawHunkId};
 use crate::source::{SourceCoordinate, SourceSide};
-use crate::syntax::{SyntaxHandle, SyntaxRange};
+use crate::syntax::{HunkContext, SyntaxHandle, SyntaxRange};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DisplayHunk {
@@ -17,6 +17,13 @@ pub struct DisplayHunk {
     pub old_lines: Range<usize>,
     pub new_lines: Range<usize>,
     pub(crate) raw_range: Range<usize>,
+}
+
+impl DisplayHunk {
+    /// Describes caller-supplied context without associating executable raw edits.
+    pub fn context(old_lines: Range<usize>, new_lines: Range<usize>) -> Self {
+        Self { raw_ids: Vec::new(), old_lines, new_lines, raw_range: 0..0 }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -37,6 +44,13 @@ pub struct DisplayRow {
     pub raw_id: Option<RawHunkId>,
     pub emphasis: Vec<Range<usize>>,
     pub emphasis_fallback: Option<FallbackReason>,
+}
+
+impl DisplayRow {
+    /// Identifies an omission marker without source, navigation, or edit coordinates.
+    pub fn is_gap(&self) -> bool {
+        self.old.is_none() && self.new.is_none()
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -71,11 +85,14 @@ pub struct DisplayCursor {
     initialized: bool,
     terminal: Option<DisplayState>,
     emphasis: Option<(RawHunkId, IntralineResult)>,
-    compact_group_edges: bool,
     context: usize,
     structural: Vec<StructuralContext>,
     before_index: usize,
     after_index: usize,
+    previous_group: Option<usize>,
+    previous_old: Option<SourcePosition>,
+    previous_new: Option<SourcePosition>,
+    gap_emitted: bool,
 }
 
 #[derive(Default)]
@@ -97,14 +114,10 @@ impl ContextPlan {
     fn collect(
         diff: &RawDiff,
         group: &DisplayHunk,
-        old: Option<&SyntaxHandle>,
-        new: Option<&SyntaxHandle>,
+        context_at: &impl Fn(SourceSide, usize) -> Option<HunkContext>,
     ) -> Self {
         let mut plan = Self::default();
-        for (index, side, syntax) in [(0, SourceSide::Old, old), (1, SourceSide::New, new)] {
-            let Some(syntax) = syntax else {
-                continue;
-            };
+        for (index, side) in [(0, SourceSide::Old), (1, SourceSide::New)] {
             for hunk in &diff.hunks()[group.raw_range.clone()] {
                 let lines = if side == SourceSide::Old {
                     &hunk.old_lines
@@ -112,13 +125,16 @@ impl ContextPlan {
                     &hunk.new_lines
                 };
                 for row in lines.clone() {
-                    let Some(context) = syntax.hunk_context(row) else {
+                    let Some(context) = context_at(side, row) else {
                         continue;
                     };
                     plan.leading_scope[index].get_or_insert(context.scope);
                     plan.trailing_scope[index] = Some(context.scope);
                     if plan.label.is_none() || side == SourceSide::New {
-                        let source = syntax.source().text();
+                        let source = match side {
+                            SourceSide::Old => diff.source().old.text(),
+                            SourceSide::New => diff.source().new.text(),
+                        };
                         let start = source[..context.scope.start_byte]
                             .rfind('\n')
                             .map_or(0, |position| position + 1);
@@ -165,7 +181,7 @@ impl ContextPlan {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct SourcePosition {
     line: usize,
     byte: usize,
@@ -202,16 +218,25 @@ impl DisplayCursor {
     /// Merges related scopes across at most twice the context radius between padded windows.
     /// Raw identities remain intact. Shared boundaries appear once, outside changed rows.
     pub fn with_syntax_context(
-        mut self,
+        self,
         old: Option<&SyntaxHandle>,
         new: Option<&SyntaxHandle>,
     ) -> Self {
+        self.with_context(|side, row| match side {
+            SourceSide::Old => old?.hunk_context(row),
+            SourceSide::New => new?.hunk_context(row),
+        })
+    }
+
+    /// Groups nearby changes and emits shared scope boundaries once per file.
+    /// Context coordinates and byte ranges must address this cursor's source pair.
+    pub fn with_context(mut self, context_at: impl Fn(SourceSide, usize) -> Option<HunkContext>) -> Self {
         let old_offset = source_offsets(self.diff.source().old.bytes());
         let new_offset = source_offsets(self.diff.source().new.bytes());
         let mut group: Vec<DisplayHunk> = Vec::new();
         let mut plan: Vec<ContextPlan> = Vec::new();
         for next in std::mem::take(&mut self.group) {
-            let context = ContextPlan::collect(&self.diff, &next, old, new);
+            let context = ContextPlan::collect(&self.diff, &next, &context_at);
             if let Some(previous) = group.last_mut()
                 && next.old_lines.start.saturating_sub(previous.old_lines.end)
                     <= self.context.saturating_mul(2)
@@ -240,14 +265,10 @@ impl DisplayCursor {
             .map(|group| {
                 let first = &self.diff.hunks()[group.raw_range.start];
                 let last = &self.diff.hunks()[group.raw_range.end - 1];
-                if self.compact_group_edges {
-                    (
-                        first.old_lines.start..last.old_lines.end,
-                        first.new_lines.start..last.new_lines.end,
-                    )
-                } else {
-                    (group.old_lines.clone(), group.new_lines.clone())
-                }
+                (
+                    first.old_lines.start..last.old_lines.end,
+                    first.new_lines.start..last.new_lines.end,
+                )
             })
             .collect();
         let mut owner = BTreeMap::new();
@@ -323,21 +344,9 @@ impl DisplayCursor {
     pub fn group(&self, index: usize) -> Option<&DisplayHunk> {
         self.group.get(index)
     }
+    /// Groups nearby edits while omitting ordinary context outside each group.
+    /// Structural context and unchanged rows between grouped edits remain visible.
     pub fn new(diff: AnalysisHandle, context: usize) -> Self {
-        Self::with_group_edges(diff, context, false)
-    }
-
-    /// Groups nearby changes with the requested context radius while omitting
-    /// unchanged rows before the first and after the last raw hunk in each group.
-    pub fn compact(diff: AnalysisHandle, context: usize) -> Self {
-        Self::with_group_edges(diff, context, true)
-    }
-
-    fn with_group_edges(
-        diff: AnalysisHandle,
-        context: usize,
-        compact_group_edges: bool,
-    ) -> Self {
         let group = group_hunks(&diff, context);
         Self {
             diff,
@@ -349,11 +358,14 @@ impl DisplayCursor {
             initialized: false,
             terminal: None,
             emphasis: None,
-            compact_group_edges,
             context,
             structural: Vec::new(),
             before_index: 0,
             after_index: 0,
+            previous_group: None,
+            previous_old: None,
+            previous_new: None,
+            gap_emitted: false,
         }
     }
 
@@ -406,6 +418,26 @@ impl DisplayCursor {
                 chunk.state = DisplayState::Complete;
                 return chunk;
             };
+            if let Some(gap) = self.gap_row(&candidate) {
+                let charge = gap.text.len() + 1;
+                if !chunk.rows.is_empty() && charge > byte_limit.saturating_sub(chunk.text_bytes) {
+                    break;
+                }
+                if chunk.decorations == decoration_limit { break; }
+                if let Some(old) = gap.old {
+                    let byte = line_range(self.diff.source().old.bytes(), self.previous_old.unwrap().byte).1;
+                    self.previous_old = Some(SourcePosition { line: old.line, byte });
+                }
+                if let Some(new) = gap.new {
+                    let byte = line_range(self.diff.source().new.bytes(), self.previous_new.unwrap().byte).1;
+                    self.previous_new = Some(SourcePosition { line: new.line, byte });
+                }
+                self.gap_emitted = true;
+                chunk.text_bytes += charge;
+                chunk.decorations += 1;
+                chunk.rows.push(gap);
+                continue;
+            }
             let source = if candidate.kind == RowKind::Added {
                 self.diff.source().new.bytes()
             } else {
@@ -444,6 +476,18 @@ impl DisplayCursor {
             });
             chunk.text_bytes += charge;
             chunk.decorations += decoration_charge;
+            if self.previous_group != Some(self.group_index) {
+                self.previous_old = None;
+                self.previous_new = None;
+            }
+            self.previous_group = Some(self.group_index);
+            if let Some(old) = candidate.old {
+                self.previous_old = Some(SourcePosition { line: old.line, byte: candidate.advance_old });
+            }
+            if let Some(new) = candidate.new {
+                self.previous_new = Some(SourcePosition { line: new.line, byte: candidate.advance_new });
+            }
+            self.gap_emitted = false;
             if let Some(before) = candidate.structural_before {
                 if before {
                     self.before_index += 1;
@@ -462,6 +506,30 @@ impl DisplayCursor {
             }
         }
         chunk
+    }
+
+    fn gap_row(&self, next: &Candidate) -> Option<DisplayRow> {
+        if self.gap_emitted || self.previous_group != Some(self.group_index) { return None; }
+        let distance = |previous: Option<SourcePosition>, next: Option<SourceCoordinate>| {
+            previous.zip(next).map(|(previous, next)| next.line.saturating_sub(previous.line + 1))
+        };
+        let old_gap = distance(self.previous_old, next.old);
+        let new_gap = distance(self.previous_new, next.new);
+        if !old_gap.is_some_and(|gap| gap > 0) && !new_gap.is_some_and(|gap| gap > 0) { return None; }
+        let (text, old, new) = if old_gap == Some(1) && new_gap == Some(1) {
+            let previous = self.previous_old.unwrap();
+            let range = line_range(self.diff.source().old.bytes(), previous.byte).0;
+            (self.diff.source().old.text()[range].to_owned(),
+                Some(SourceCoordinate { side: SourceSide::Old, line: previous.line + 1, byte_column: 0 }),
+                Some(SourceCoordinate { side: SourceSide::New, line: self.previous_new.unwrap().line + 1, byte_column: 0 }))
+        } else {
+            let source = if next.kind == RowKind::Added { self.diff.source().new.text() } else { self.diff.source().old.text() };
+            let text = &source[next.bytes.clone()];
+            let indent = &text[..text.len() - text.trim_start().len()];
+            (format!("{indent}..."), None, None)
+        };
+        Some(DisplayRow { group_index: self.group_index, text, kind: RowKind::Context,
+            old, new, raw_id: None, emphasis: Vec::new(), emphasis_fallback: None })
     }
 
     fn row_emphasis(
@@ -518,16 +586,8 @@ impl DisplayCursor {
             let group = self.group.get(self.group_index)?;
             if !self.initialized {
                 let first = &self.diff.hunks()[group.raw_range.start];
-                let old_start = if self.compact_group_edges {
-                    first.old_lines.start
-                } else {
-                    group.old_lines.start
-                };
-                let new_start = if self.compact_group_edges {
-                    first.new_lines.start
-                } else {
-                    group.new_lines.start
-                };
+                let old_start = first.old_lines.start;
+                let new_start = first.new_lines.start;
                 self.old.skip_to(self.diff.source().old.bytes(), old_start);
                 self.new.skip_to(self.diff.source().new.bytes(), new_start);
                 self.raw_index = group.raw_range.start;
@@ -552,8 +612,6 @@ impl DisplayCursor {
                     self.raw_index += 1;
                     continue;
                 }
-            } else if !self.compact_group_edges && self.old.line < group.old_lines.end {
-                (RowKind::Context, None)
             } else {
                 if let Some(candidate) = self
                     .structural
@@ -669,15 +727,11 @@ mod selected_group_tests {
             rows: 3,
             ..Default::default()
         });
-        assert_eq!(chunk.rows.len(), 3);
-        assert_eq!(chunk.rows[0].new.unwrap().line, 77);
+        assert_eq!(chunk.rows.len(), 2);
+        assert_eq!(chunk.rows[0].old.unwrap().line, 80);
+        assert!(chunk.rows.iter().any(|row| row.text == "selected change" && row.new.unwrap().line == 80));
         let chunk = cursor.next_rows(ChunkLimits::default());
-        assert!(
-            chunk
-                .rows
-                .iter()
-                .any(|row| row.text == "selected change" && row.new.unwrap().line == 80)
-        );
+        assert!(chunk.rows.is_empty());
         assert!(!chunk.rows.iter().any(|row| row.text == "first change"));
         assert_eq!(chunk.state, DisplayState::Complete);
     }
@@ -702,7 +756,7 @@ mod selected_group_tests {
             })
             .await
             .unwrap();
-        let mut cursor = DisplayCursor::compact(analysis, 3);
+        let mut cursor = DisplayCursor::new(analysis, 3);
         let chunk = cursor.next_rows(ChunkLimits::default());
         let rows: Vec<_> = chunk.rows.iter().map(|row| row.text.as_str()).collect();
         assert_eq!(

@@ -75,45 +75,6 @@ pub fn fold_header(
     }];
 }
 
-/// Project a saved patch row through the standard diff gutters and side backgrounds.
-///
-/// Saved patches contain partial sources, so this does not claim full-file syntax or raw edit IDs.
-pub fn append_patch_row(
-    metadata: &mut BlockMetadata,
-    row: usize,
-    source: &crate::patch::PatchRow<'_>,
-    hunk: &crate::patch::PatchHunk<'_>,
-    emphasis: &[std::ops::Range<usize>],
-    indent: usize,
-) -> Result<(), ContractError> {
-    use crate::source::{SourceCoordinate, SourceSide};
-    let display = DisplayRow {
-        group_index: 0,
-        text: source.text.trim_end_matches('\r').into(),
-        kind: source.kind,
-        old: source.old_line.map(|line| SourceCoordinate {
-            side: SourceSide::Old,
-            line,
-            byte_column: 0,
-        }),
-        new: source.new_line.map(|line| SourceCoordinate {
-            side: SourceSide::New,
-            line,
-            byte_column: 0,
-        }),
-        raw_id: None,
-        emphasis: emphasis.to_vec(),
-        emphasis_fallback: None,
-    };
-    let group = DisplayHunk {
-        raw_ids: Vec::new(),
-        old_lines: hunk.old_lines.clone(),
-        new_lines: hunk.new_lines.clone(),
-        raw_range: 0..0,
-    };
-    append_display_row(metadata, row, &display, &group, None, None, indent)
-}
-
 pub fn append_source_syntax_row(
     metadata: &mut BlockMetadata,
     syntax: &SyntaxHandle,
@@ -415,6 +376,12 @@ pub fn append_display_row(
             priority: 90,
         });
     }
+    if display.is_gap() {
+        metadata.visible_decoration.push(Decoration {
+            range: TextRange { start: TextPosition { row, column: 0 }, end: TextPosition { row, column: display.text.len() } },
+            capture: "ForgeHunkBoundary".into(), priority: 100,
+        });
+    }
     let (syntax, coordinate) = if display.kind == RowKind::Removed {
         (old_syntax, display.old)
     } else {
@@ -515,10 +482,12 @@ mod tests {
                 .map(|chunk| chunk.text.as_str())
                 .collect::<String>();
             assert_eq!(prefix, " ".repeat(indent));
-            let mut metadata = BlockMetadata::default();
-            append_patch_row(&mut metadata, 0, &hunk.row[1], hunk, &[0..3], indent).unwrap();
-            let mut baseline = BlockMetadata::default();
-            append_patch_row(&mut baseline, 0, &hunk.row[1], hunk, &[0..3], 0).unwrap();
+            let (group, rows) = crate::presentation::patch_rows(hunk);
+            let mut metadata = crate::presentation::DiffPresenter::new(crate::presentation::PresentationOptions {
+                indent, ..Default::default()
+            }).rows(BlockId("row".into()), &rows[1..2], &group, None, None).unwrap().metadata;
+            let baseline = crate::presentation::DiffPresenter::new(Default::default())
+                .rows(BlockId("row".into()), &rows[1..2], &group, None, None).unwrap().metadata;
             assert_eq!(metadata.decoration, baseline.decoration);
             assert_eq!(metadata.visible_decoration, baseline.visible_decoration);
             if indent > 0 {

@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use forge_buffer::{
     block::{
-        BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk,
+        BlockAnchor, BlockMetadata, BufferBlock, TargetRange,
         TextPosition, TextRange,
     },
     identity::{BlockId, FoldId, TargetId},
@@ -18,7 +18,7 @@ use crate::{
 pub(crate) struct HunkProjection {
     pub block: Vec<BufferBlock>,
     pub edit: Vec<SequenceEdit>,
-    pub source: Vec<(BlockId, Vec<SourceCoordinate>)>,
+    pub source: Vec<(BlockId, Vec<Option<SourceCoordinate>>)>,
     pub retained: usize,
 }
 
@@ -27,7 +27,7 @@ pub(crate) fn project(
     file: &mut FileTarget,
     target: &TargetId,
     body: BufferBlock,
-    source: Vec<SourceCoordinate>,
+    source: Vec<Option<SourceCoordinate>>,
     group: &[usize],
 ) -> Result<HunkProjection> {
     ensure!(
@@ -101,13 +101,6 @@ pub(crate) fn project(
                 .fold((0usize, 0usize), |(added, deleted), hunk| {
                     (added + hunk.new_lines.len(), deleted + hunk.old_lines.len())
                 });
-            let addition = format!("+{added}");
-            let deletion = format!("-{deleted}");
-            let context = file.cursor.as_ref().and_then(|cursor| cursor.context_label(index));
-            let text = match context {
-                Some(context) => format!("@@ {addition} {deletion} {context}"),
-                None => format!("@@ {addition} {deletion}"),
-            };
             let coordinate = if display.new_lines.is_empty() {
                 SourceCoordinate {
                     side: SourceSide::Old,
@@ -121,7 +114,7 @@ pub(crate) fn project(
                     byte_column: 0,
                 }
             };
-            projection.source.push((header.clone(), vec![coordinate]));
+            projection.source.push((header.clone(), vec![Some(coordinate)]));
             file.group.insert(
                 index,
                 DisplayGroupTarget {
@@ -129,11 +122,8 @@ pub(crate) fn project(
                     target: group_target.clone(),
                 },
             );
-            let mut header = forge_diff::projection::header(
-                header,
-                vec![TextChunk { text, capture: "ForgeHunkHeader".into() }],
-                0,
-            )?;
+            let mut header = forge_diff::presentation::DiffPresenter::new(Default::default()).hunk(
+                header, display, forge_diff::presentation::HunkHeading::Counts { added, removed: deleted })?;
             header.metadata.target.push(TargetRange {
                 id: group_target,
                 range: TextRange {
@@ -141,22 +131,6 @@ pub(crate) fn project(
                     end: TextPosition { row: 1, column: 0 },
                 },
             });
-            for (column, value, capture) in [
-                (3, addition.as_str(), "ForgeAddRange"),
-                (4 + addition.len(), deletion.as_str(), "ForgeDeleteRange"),
-            ] {
-                header.metadata.decoration.push(Decoration {
-                    range: TextRange {
-                        start: TextPosition { row: 0, column },
-                        end: TextPosition {
-                            row: 0,
-                            column: column + value.len(),
-                        },
-                    },
-                    capture: capture.into(),
-                    priority: 110,
-                });
-            }
             header
         };
         let group_target = &file.group[&index].target;
@@ -216,7 +190,7 @@ pub(crate) fn project(
         }
         let text = BufferText::from_rows(body.text.slice(range.clone())?)?;
         let fold_id = FoldId(header.id.0.clone());
-        forge_diff::projection::fold_header(
+        forge_diff::presentation::DiffPresenter::fold(
             &mut header,
             fold_id,
             BlockAnchor {
@@ -226,8 +200,10 @@ pub(crate) fn project(
                     column: 0,
                 },
             },
-            document.local_path.is_some() && file.section == StatusSection::Staged,
-            false,
+            forge_diff::presentation::FoldPolicy {
+                closed: document.local_path.is_some() && file.section == StatusSection::Staged,
+                ..Default::default()
+            },
         );
         if let Some(position) = file
             .body

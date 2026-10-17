@@ -1,9 +1,11 @@
+local encode_delivery = dofile("nvim/tests/forge/support/plan_delivery.lua")
 vim.loader.enable(false)
 local client = require("forge.client")
 local pending = {}
 client.host_generation = function() return 1 end
 client.host_accepting = function() return true end
 client.request_for = function(_, method, params, callback)
+  callback = encode_delivery(callback)
   pending[#pending + 1] = { method = method, params = vim.deepcopy(params), callback = callback }
 end
 local buffer = vim.api.nvim_create_buf(false, true)

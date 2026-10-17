@@ -19,8 +19,10 @@ pub use visibility::DeclarationVisibility;
 pub use declaration::{DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;
 mod structure;
+mod outline;
 mod tree;
 pub use structure::SourceDeclaration;
+pub use outline::{SourceOutline, SourceScope};
 
 pub use assets::SyntaxLanguage;
 pub use context::HunkContext;

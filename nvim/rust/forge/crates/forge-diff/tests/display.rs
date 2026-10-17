@@ -92,19 +92,19 @@ fn display_context_merges_without_duplicate_source_lines() {
     );
     assert_eq!(
         rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
-        ["a", "b", "B", "c", "d", "e", "f", "F", "g"]
+        ["b", "B", "c", "d", "e", "f", "F"]
     );
     assert_eq!(
         rows.iter()
             .filter_map(|row| row.old.map(|coordinate| coordinate.line))
             .collect::<Vec<_>>(),
-        (0..7).collect::<Vec<_>>()
+        (1..6).collect::<Vec<_>>()
     );
     assert_eq!(
         rows.iter()
             .filter_map(|row| row.new.map(|coordinate| coordinate.line))
             .collect::<Vec<_>>(),
-        (0..7).collect::<Vec<_>>()
+        (1..6).collect::<Vec<_>>()
     );
 }
 
@@ -123,7 +123,7 @@ fn group_identity_survives_one_row_deliveries_and_context_gaps() {
     );
     assert_eq!(
         rows.iter().map(|row| row.group_index).collect::<Vec<_>>(),
-        [0, 0, 0, 1, 1, 1]
+        [0, 0, 1, 1]
     );
     assert!(cursor.group(2).is_none());
     for row in rows {
@@ -183,7 +183,7 @@ fn separate_context_windows_skip_unchanged_gaps_and_keep_raw_targets() {
     );
     assert_eq!(
         rows.iter().map(|row| row.text.as_str()).collect::<Vec<_>>(),
-        ["a", "b", "B", "c", "g", "h", "H", "i"]
+        ["b", "B", "h", "H"]
     );
     assert_eq!(source.hunks(), original);
     let no_context = drain(
@@ -194,7 +194,7 @@ fn separate_context_windows_skip_unchanged_gaps_and_keep_raw_targets() {
 }
 
 #[test]
-fn full_context_preserves_both_source_coordinate_sequences_across_insertions_and_deletions() {
+fn compact_context_preserves_changed_spans_across_insertions_and_deletions() {
     let fixture = [
         "",
         "a\n",
@@ -211,6 +211,8 @@ fn full_context_preserves_both_source_coordinate_sequences_across_insertions_and
             if source.hunks().is_empty() {
                 continue;
             }
+            let old_range = source.hunks().first().unwrap().old_lines.start..source.hunks().last().unwrap().old_lines.end;
+            let new_range = source.hunks().first().unwrap().new_lines.start..source.hunks().last().unwrap().new_lines.end;
             let rows = drain(
                 &mut DisplayCursor::new(source, usize::MAX),
                 ChunkLimits {
@@ -224,13 +226,13 @@ fn full_context_preserves_both_source_coordinate_sequences_across_insertions_and
                 rows.iter()
                     .filter_map(|row| row.old.map(|coordinate| coordinate.line))
                     .collect::<Vec<_>>(),
-                (0..old_lines.len()).collect::<Vec<_>>()
+                old_range.collect::<Vec<_>>()
             );
             assert_eq!(
                 rows.iter()
                     .filter_map(|row| row.new.map(|coordinate| coordinate.line))
                     .collect::<Vec<_>>(),
-                (0..new_lines.len()).collect::<Vec<_>>()
+                new_range.collect::<Vec<_>>()
             );
             for row in rows {
                 for (coordinate, lines) in [(row.old, &old_lines), (row.new, &new_lines)] {

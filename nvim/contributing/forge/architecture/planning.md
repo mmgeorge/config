@@ -16,6 +16,17 @@ individual deliveries rather than total plan size, and an oversized first record
 progress. Patch confirmations retain the complete applied diff. Cache eviction controls retained
 reuse without rejecting explicit reads, declaration analysis, edits, or reviews.
 
+PlanReview opens with one compact block snapshot. Modified files contribute changed
+chunks and enclosing declaration boundaries with shared compact diff presentation.
+Subsequent revisions send disjoint block patches and sparse source-anchor edits.
+Unchanged declaration text and syntax metadata remain in the Lua source fragment.
+Anchor edits carry only row identity, canonical line, and test or check selection.
+They never duplicate block text or syntax metadata. Rust compares stable block
+identities in linear time before publishing the changed ranges, so distant edits
+do not resend the intervening declarations. Explicit reference navigation adds a
+bounded excerpt around the selected reference, including its enclosing syntax.
+Complete captured declarations remain backend inputs for validation and resolution.
+
 ## Local annotations and recovery
 
 `forge.draft_comments` owns local compact and full-width comment presentation. PlanReview

@@ -10,8 +10,8 @@ use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
-use forge_diff::patch::UnifiedPatch;
-use forge_diff::source::{Representation, SourcePair, SourceVersion};
+#[cfg(test)]
+use forge_diff::source::{Representation, SourceVersion};
 use forge_diff::syntax::DeclarationVisibility;
 
 use super::review_annotation::ReviewAnnotation;
@@ -78,7 +78,7 @@ pub(super) fn project(
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
     public_only: bool,
     trace: Option<&ReviewTrace>,
-    revealed: &HashSet<(String, String)>,
+    revealed: &HashSet<(String, String, u32)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let (source, navigation, hidden, contextual) = rows(document, syntax, public_only, true, trace, revealed)?;
     // Parse the complete generated section so code-fence context survives per-row projection.
@@ -204,20 +204,20 @@ fn rows(
     public_only: bool,
     inspection: bool,
     trace: Option<&ReviewTrace>,
-    revealed: &HashSet<(String, String)>,
+    revealed: &HashSet<(String, String, u32)>,
 ) -> Result<(Vec<BufferBlock>, PlanNavigationIndex, HashSet<BlockId>, HashSet<BlockId>)> {
     let design = document
         .design
         .as_ref()
         .context("declaration review has no design")?;
-    let mut patch = Vec::new();
+    let mut file_diff = Vec::new();
     let mut hidden = HashSet::new();
     let mut contextual_path = HashSet::new();
     let mut contextual_block = HashSet::new();
     let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
     let mut presentation = HashMap::<(String, String), std::sync::Arc<super::calls::CallPresentation>>::new();
     let started = Instant::now();
-    let included = revealed.iter().map(|(path, _)| path.clone()).collect();
+    let included = revealed.iter().map(|(path, _, _)| path.clone()).collect();
     let ordered_files = super::review_file_layout::order(design, &included);
     if let Some(trace) = trace {
         trace.record("plan.review.file_order", started.elapsed(), ordered_files.len());
@@ -237,77 +237,27 @@ fn rows(
             .map(|text| super::calls::present(&destination, text, design.proposed_calls.get(&destination).map(Vec::as_slice).unwrap_or_default()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let diff = forge_diff::raw::compute_hunks(SourcePair {
-            old: SourceVersion::new(
-                before
-                    .as_ref()
-                    .map(|file| file.declaration.text.as_str())
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec(),
-                Representation::DisplayOnly,
-            )?,
-            new: SourceVersion::new(
-                after
-                    .as_ref()
-                    .map(|file| file.declaration.text.as_str())
-                    .unwrap_or_default()
-                    .as_bytes()
-                    .to_vec(),
-                Representation::DisplayOnly,
-            )?,
-        })?;
-        let old_name = format!("a/{path}");
-        let new_name = format!("b/{destination}");
-        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination
-            && !revealed.contains(&(path.clone(), "baseline".into()))
-            && !revealed.contains(&(destination.clone(), "proposed".into())) {
+        let explicitly_revealed = revealed.iter().any(|(file, side, _)| file == &path && side == "baseline")
+            || revealed.iter().any(|(file, side, _)| file == &destination && side == "proposed");
+        let reference_context = revealed.iter().filter_map(|(file, side, line)| {
+            if file == &path && side == "baseline" { Some((forge_diff::source::SourceSide::Old, *line)) }
+            else if file == &destination && side == "proposed" { Some((forge_diff::source::SourceSide::New, *line)) }
+            else { None }
+        }).collect::<Vec<_>>();
+        let diff = super::review_diff::FileDiff::new(&path, &destination, before.as_deref(), after.as_deref(), &reference_context)?;
+        if diff.hunk.is_empty() && before.is_some() && after.is_some() && path == destination {
             continue;
         }
-        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination {
+        if before.as_ref().map(|source| &source.declaration.text) == after.as_ref().map(|source| &source.declaration.text)
+            && path == destination && explicitly_revealed {
             contextual_path.insert(path.clone());
         }
-        forge_diff::unified::write_file_header(&old_name, &new_name, &mut patch)?;
-        if diff.hunks().is_empty() {
-            if before.is_none() {
-                patch.extend_from_slice(b"new file mode 100644\n");
-            } else if after.is_none() {
-                patch.extend_from_slice(b"deleted file mode 100644\n");
-            } else if let Some(after) = &after
-                && (revealed.contains(&(path.clone(), "baseline".into()))
-                    || revealed.contains(&(destination.clone(), "proposed".into()))) {
-                let count = after.declaration.source.len();
-                patch.extend_from_slice(format!("--- {old_name}\n+++ {new_name}\n@@ -1,{count} +1,{count} @@\n").as_bytes());
-                for row in after.declaration.text.lines() {
-                    patch.extend_from_slice(format!(" {row}\n").as_bytes());
-                }
-            }
-        } else {
-            forge_diff::unified::write_unified(
-                &diff,
-                if before.is_some() {
-                    &old_name
-                } else {
-                    "/dev/null"
-                },
-                if after.is_some() {
-                    &new_name
-                } else {
-                    "/dev/null"
-                },
-                before
-                    .as_ref()
-                    .map(|file| file.declaration.source.len())
-                    .unwrap_or(0)
-                    .max(after.as_ref().map(|file| file.declaration.source.len()).unwrap_or(0)),
-                &mut patch,
-            )?;
-        }
+        file_diff.push(diff);
         if let Some(before) = before {
             if inspection {
                 visibility.insert(
                     (path.clone(), "baseline".into()),
-                    super::calls::visibility(&path, &before, public_only && !revealed.contains(&(path.clone(), "baseline".into())))?,
+                    super::calls::visibility(&path, &before, public_only && !revealed.iter().any(|(file, side, _)| file == &path && side == "baseline"))?,
                 );
             }
             presentation.insert((path.clone(), "baseline".into()), before);
@@ -316,14 +266,12 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (destination.clone(), "proposed".into()),
-                    super::calls::visibility(&destination, &after, public_only && !revealed.contains(&(destination.clone(), "proposed".into())))?,
+                    super::calls::visibility(&destination, &after, public_only && !revealed.iter().any(|(file, side, _)| file == &destination && side == "proposed"))?,
                 );
             }
             presentation.insert((destination, "proposed".into()), after);
         }
     }
-    let patch = String::from_utf8(patch)?;
-    let parsed = UnifiedPatch::parse(&patch)?;
     let mut block = Vec::new();
     let mut display_row = HashMap::<(String, String, usize), usize>::new();
     let mut navigation = PlanNavigationIndex {
@@ -331,7 +279,9 @@ fn rows(
         plan_version: document.version,
         anchor: Vec::new(),
     };
-    for file in &parsed.file {
+    for file in &file_diff {
+        let hunks = &file.hunk;
+        let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
         let start = block.len();
         let path = file
             .new_path
@@ -352,25 +302,19 @@ fn rows(
         } else {
             path.clone()
         };
-        let added = file
-            .hunk
+        let added = hunks
             .iter()
             .flat_map(|hunk| &hunk.row)
             .filter(|row| row.kind == RowKind::Added)
             .count() as u64;
-        let removed = file
-            .hunk
+        let removed = hunks
             .iter()
             .flat_map(|hunk| &hunk.row)
             .filter(|row| row.kind == RowKind::Removed)
             .count() as u64;
         let identity = file.old_path.as_deref().unwrap_or(path);
         let id = format!("plan:design:file:{}", super::digest(identity.as_bytes()));
-        block.push(forge_diff::projection::header(
-            BlockId(id.clone()),
-            status.header(&display, Some((added, removed)), false),
-            0,
-        )?);
+        block.push(presenter.file(BlockId(id.clone()), status, &display, Some((added, removed)))?);
         navigation.anchor.push(PlanNavigationAnchor {
             line: block.len() as u32,
             target: PlanReviewTarget::File { path: path.clone() },
@@ -378,48 +322,37 @@ fn rows(
             path: Some(path.clone()),
             label: display,
         });
-        for (hunk_index, hunk) in file.hunk.iter().enumerate() {
+        for (hunk_index, hunk) in hunks.iter().enumerate() {
             let hunk_start = block.len();
             let hunk_id = format!("{id}:hunk:{hunk_index}");
-            block.push(forge_diff::projection::header(
-                BlockId(hunk_id.clone()),
-                vec![TextChunk {
-                    text: hunk.header.into(),
-                    capture: "ForgeHunkHeader".into(),
-                }],
-                0,
-            )?);
-            let emphasis = forge_diff::intraline::patch_emphasis(
-                forge_diff::intraline::IntralinePolicy::default(),
-                &hunk.row,
-            );
+            let counts = forge_diff::presentation::counts(&hunk.row);
+            block.push(presenter.hunk(BlockId(hunk_id.clone()), &hunk.group,
+                forge_diff::presentation::HunkHeading::Counts { added: counts.0 as usize, removed: counts.1 as usize })?);
             for (row_index, row) in hunk.row.iter().enumerate() {
-                let mut metadata = BlockMetadata::default();
-                forge_diff::projection::append_patch_row(
-                    &mut metadata,
-                    0,
-                    row,
-                    hunk,
-                    &emphasis[row_index],
-                    0,
-                )?;
+                let mut metadata = presenter.rows(BlockId(format!("{hunk_id}:row:{row_index}")),
+                    std::slice::from_ref(row), &hunk.group, None, None)?.metadata;
+                if row.old.map(|coordinate| coordinate.line).is_none() && row.new.map(|coordinate| coordinate.line).is_none() {
+                    block.push(BufferBlock {
+                        id: BlockId(format!("{hunk_id}:row:{row_index}")),
+                        text: BufferText::from_rows([row.text.as_str()])?, metadata,
+                    });
+                    continue;
+                }
                 let (side, source_path, line) = if row.kind == RowKind::Removed
-                    || (row.kind == RowKind::Context && file.old_path.as_ref() == file.new_path.as_ref()
-                        && revealed.contains(&(path.clone(), "baseline".into()))
-                        && !revealed.contains(&(path.clone(), "proposed".into()))) {
+                    || row.new.map(|coordinate| coordinate.line).is_none() {
                     (
                         "baseline",
                         file.old_path.as_ref().unwrap(),
-                        row.old_line.unwrap(),
+                        row.old.map(|coordinate| coordinate.line).unwrap(),
                     )
                 } else {
-                    ("proposed", path, row.new_line.unwrap())
+                    ("proposed", path, row.new.map(|coordinate| coordinate.line).unwrap())
                 };
                 let row_text = visibility
                     .get(&(source_path.clone(), side.into()))
                     .and_then(|visibility| visibility.replacement.get(&line))
                     .map(String::as_str)
-                    .unwrap_or(row.text);
+                    .unwrap_or(row.text.as_str());
                 let syntax_row = presentation.get(&(source_path.clone(), side.into())).and_then(|file| {
                     let original = *file.plain_row.get(line)?;
                     (file.declaration_row.get(&original) == Some(&line)).then_some(original)
@@ -443,8 +376,8 @@ fn rows(
                 {
                     hidden.insert(BlockId(format!("{hunk_id}:row:{row_index}")));
                 }
-                if row.kind == RowKind::Context {
-                    display_row.insert((file.old_path.as_ref().unwrap().clone(), "baseline".into(), row.old_line.unwrap()), block.len());
+                if row.kind == RowKind::Context && let Some(old_line) = row.old.map(|coordinate| coordinate.line) {
+                    display_row.insert((file.old_path.as_ref().unwrap().clone(), "baseline".into(), old_line), block.len());
                 }
                 display_row.insert((source_path.clone(), side.into(), line), block.len());
                 block.push(BufferBlock {
@@ -452,14 +385,14 @@ fn rows(
                     text: BufferText::from_rows([row_text])?,
                     metadata,
                 });
-                if row.kind == RowKind::Context {
+                if row.kind == RowKind::Context && row.old.map(|coordinate| coordinate.line).is_some() {
                     let baseline_path = file
                         .old_path
                         .as_ref()
                         .context("context row has no baseline file")?;
                     if let Some(position) = presentation
                         .get(&(baseline_path.clone(), "baseline".into()))
-                        .and_then(|file| row.old_line.and_then(|line| file.declaration.source.get(line)))
+                        .and_then(|file| row.old.map(|coordinate| coordinate.line).and_then(|line| file.declaration.source.get(line)))
                         .copied()
                         .flatten()
                     {
@@ -504,6 +437,9 @@ fn rows(
                 }
             }
             fold(&mut block, hunk_start, &hunk_id)?;
+            if file.hunk[hunk_index].contextual {
+                contextual_block.extend(block[hunk_start..].iter().map(|row| row.id.clone()));
+            }
         }
         if inspection {
             declaration_folds(&mut block, [file.old_path.as_ref(), file.new_path.as_ref()], &presentation, &display_row)?;
@@ -888,6 +824,7 @@ fn public_blocks(
     let mut public_count = vec![0usize];
     for (index, block) in block.iter().enumerate() {
         let declaration = retained[index]
+            && !block.metadata.visible_decoration.iter().any(|decoration| decoration.capture == "ForgeHunkBoundary")
             && (block.metadata.fold.is_empty() || block.metadata.fold.iter().any(|fold| fold.collapsed_suffix.is_some()))
             && !block.id.0.starts_with("plan:annotation:")
             && block
@@ -908,6 +845,30 @@ fn public_blocks(
             let boundary = end + usize::from(fold.end.position.row > 0);
             if public_count[boundary] == public_count[start + 1] {
                 retained[start] = false;
+            }
+        }
+    }
+    for (start, header) in block.iter().enumerate() {
+        if header.id.0.contains(":hunk:") && !header.id.0.contains(":row:") {
+            for fold in &header.metadata.fold {
+                let end = index[&fold.end.block] + usize::from(fold.end.position.row > 0);
+                if !retained[start] {
+                    retained[start..end].fill(false);
+                    continue;
+                }
+                let mut preceding = false;
+                let mut pending = None;
+                for position in start + 1..end {
+                    if !retained[position] { continue; }
+                    if block[position].metadata.visible_decoration.iter().any(|decoration| decoration.capture == "ForgeHunkBoundary") {
+                        if !preceding || pending.is_some() { retained[position] = false; }
+                        else { pending = Some(position); }
+                    } else if block[position].text.wire_rows().iter().any(|text| !text.trim().is_empty()) {
+                        preceding = true;
+                        pending = None;
+                    }
+                }
+                if let Some(position) = pending { retained[position] = false; }
             }
         }
     }
@@ -1068,7 +1029,7 @@ fn fold(block: &mut [BufferBlock], start: usize, id: &str) -> Result<()> {
             column: 0,
         },
     };
-    forge_diff::projection::fold_header(&mut block[start], FoldId(id.into()), end, false, false);
+    forge_diff::presentation::DiffPresenter::fold(&mut block[start], FoldId(id.into()), end, Default::default());
     Ok(())
 }
 
@@ -1238,6 +1199,102 @@ mod tests {
     }
 
     #[test]
+    fn public_filter_removes_hunks_containing_only_private_context_and_gaps() {
+        let mut baseline = String::from("pub fn visible() -> u64;\nstruct Hidden;\nimpl Hidden {\n");
+        for index in 0..40 {
+            baseline.push_str(&format!("  fn method_{index:02}(&self) -> u64;\n"));
+        }
+        baseline.push_str("}\n");
+        let proposed = baseline.replace("visible() -> u64", "visible() -> String")
+            .replace("method_15(&self) -> u64", "method_15(&self) -> String");
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("lib.rs".into(), super::super::DeclarationFile {
+            text: baseline, source_digest: String::new(),
+        });
+        design.proposed.insert("lib.rs".into(), proposed);
+        let mut document = crate::plan::document::test_fixture("private-hunks", "Visibility");
+        document.design = Some(design);
+        let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None,
+            &HashMap::new(), true, None, &HashSet::new()).unwrap();
+        let rows = blocks.iter().filter_map(|block| block.text.row(0)).collect::<Vec<_>>();
+        assert_eq!(rows.iter().filter(|row| row.starts_with("@@")).count(), 1, "{rows:?}");
+        assert!(!rows.iter().any(|row| row.trim() == "..."), "private omission survived: {rows:?}");
+        assert!(rows.iter().any(|row| row.contains("visible")));
+        assert!(!rows.iter().any(|row| row.contains("method_")));
+    }
+
+    #[test]
+    fn modified_files_show_bounded_context_until_reference_navigation() {
+        let mut document = crate::plan::document::test_fixture("context", "Review changes");
+        let mut baseline = String::from("pub struct State {\n");
+        for index in 0..32 {
+            baseline.push_str(&format!("  pub field_{index:02}: u64,\n"));
+        }
+        baseline.push_str("}\n");
+        let proposed = baseline.replace("field_06: u64", "field_06: String")
+            .replace("field_25: u64", "field_25: String");
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("state.rs".into(), super::super::DeclarationFile {
+            text: baseline, source_digest: String::new(),
+        });
+        design.proposed.insert("state.rs".into(), proposed);
+        document.design = Some(design);
+
+        for public_only in [false, true] {
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None,
+                &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            let rows = blocks.iter().filter_map(|block| block.text.row(0)).collect::<Vec<_>>();
+            for index in [6, 25] {
+                assert!(rows.iter().any(|row| row.contains(&format!("field_{index:02}:"))));
+            }
+            for index in [2, 3, 9, 10, 16, 21, 22, 28, 29] {
+                assert!(!rows.iter().any(|row| row.contains(&format!("field_{index:02}:"))));
+            }
+            assert_eq!(rows.iter().filter(|row| row.starts_with("@@")).count(), 2);
+
+            let revealed = HashSet::from([("state.rs".into(), "proposed".into(), 18)]);
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None,
+                &HashMap::new(), public_only, None, &revealed).unwrap();
+            assert!(blocks.iter().any(|block| block.text.row(0).is_some_and(|row| row.contains("field_16:"))));
+        }
+    }
+
+    #[tokio::test]
+    async fn implementation_context_uses_source_syntax_and_omissions_have_no_targets() {
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxRequest};
+        use forge_diff::workers::{AnalysisPool, PoolLimits, WorkPriority};
+        let mut baseline = String::from("pub struct State;\nimpl State {\n");
+        for index in 0..40 { baseline.push_str(&format!("  pub fn method_{index:02}(&self) -> u64;\n")); }
+        baseline.push_str("}\n");
+        let proposed = baseline.replace("method_15(&self) -> u64", "method_15(&self) -> String");
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("state.rs".into(), super::super::DeclarationFile { text: baseline.clone(), source_digest: String::new() });
+        design.proposed.insert("state.rs".into(), proposed.clone());
+        let mut document = crate::plan::document::test_fixture("context-syntax", "Syntax context");
+        document.design = Some(design);
+        let engine = SyntaxEngine::new(std::sync::Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2 })));
+        let mut syntax = HashMap::new();
+        for (side, text) in [("baseline", baseline), ("proposed", proposed)] {
+            let presentation = super::super::calls::present("state.rs", &text, &[]).unwrap();
+            let handle = engine.analyze(SyntaxRequest {
+                source: SourceVersion::new(presentation.plain.as_bytes().to_vec(), Representation::DisplayOnly).unwrap(),
+                language: SyntaxLanguage::Rust, priority: WorkPriority::Foreground, deadline: None,
+            }).await.unwrap();
+            syntax.insert(("state.rs".into(), side.into()), handle);
+        }
+        for public_only in [false, true] {
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &syntax, public_only, None, &HashSet::new()).unwrap();
+            let implementation = blocks.iter().filter(|block| block.text.row(0) == Some("impl State {")).collect::<Vec<_>>();
+            assert_eq!(implementation.len(), 1);
+            assert!(implementation[0].metadata.visible_decoration.iter().any(|capture| capture.capture.starts_with("@keyword") && capture.capture.ends_with(".rust")));
+            let omissions = blocks.iter().filter(|block| block.text.row(0).is_some_and(|text| text.trim() == "...")).collect::<Vec<_>>();
+            assert!(!omissions.is_empty());
+            assert!(omissions.iter().all(|block| block.metadata.target.is_empty()));
+            assert!(!blocks.iter().any(|block| block.text.row(0).is_some_and(|text| text.contains("method_30"))));
+        }
+    }
+
+    #[test]
     fn change_only_edits_have_semantic_targets_and_closed_function_folds() {
         let mut document = crate::plan::document::test_fixture("change", "Behavior change");
         let mut design = super::super::DeclarationDesign::default();
@@ -1294,7 +1351,16 @@ mod tests {
             syntax.insert(("arena.rs".into(), side.into()), handle);
         }
         for public_only in [false, true] {
-            let revealed = if public_only { HashSet::from([("arena.rs".into(), "baseline".into()), ("arena.rs".into(), "proposed".into())]) } else { HashSet::new() };
+            let design = document.design.as_ref().unwrap();
+            let mut revealed = HashSet::new();
+            for (side, text, calls) in [
+                ("baseline", before, design.baseline_calls["arena.rs"].as_slice()),
+                ("proposed", after.as_str(), design.proposed_calls["arena.rs"].as_slice()),
+            ] {
+                let presentation = super::super::calls::present("arena.rs", text, calls).unwrap();
+                let row = presentation.declaration.text.lines().position(|line| line == "impl Plugin for ArenaPlugin {}").unwrap();
+                revealed.insert(("arena.rs".into(), side.into(), row as u32));
+            }
             let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &syntax, public_only, None, &revealed).unwrap();
             let mut comments = 0;
             let mut implementations = 0;
@@ -1321,7 +1387,7 @@ mod tests {
             }
             assert_eq!(comments, 2);
             assert!(implementations > 0);
-            assert!(synthetic_rows >= 4);
+            assert!(synthetic_rows >= 2);
         }
         assert_eq!(document, original);
     }
@@ -1732,13 +1798,13 @@ mod tests {
         document.design = Some(design);
         let saved = serde_json::to_vec(&document).unwrap();
         let rendered = render(&document).unwrap();
-        assert!(rendered.markdown.contains("  first: u64,"));
+        assert!(!rendered.markdown.contains("  first: u64,"));
         assert!(rendered.markdown.contains("  second: String,"));
         let first = rendered
             .navigation
             .anchor
             .iter()
-            .find(|anchor| anchor.label.ends_with("  first: u64,"))
+            .find(|anchor| anchor.label.ends_with("  second: String,"))
             .unwrap();
         let second = rendered.navigation.anchor.iter().find(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { side, .. } if side == "baseline") && anchor.label.ends_with("  second: u64,")).unwrap();
         assert_ne!(first.json_path, second.json_path);

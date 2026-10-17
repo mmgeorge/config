@@ -29,6 +29,10 @@ mod design_review;
 mod deviation;
 mod document;
 mod review_file_layout;
+mod review_diff;
+mod review_delivery;
+#[cfg(test)]
+pub(crate) use review_delivery::reconstruct;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 mod edit;
 pub(crate) mod edit_trace;

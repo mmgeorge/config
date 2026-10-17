@@ -8,6 +8,7 @@ pub mod engine;
 pub mod file_header;
 pub mod intraline;
 pub mod patch;
+pub mod presentation;
 pub mod projection;
 pub mod raw;
 pub mod source;

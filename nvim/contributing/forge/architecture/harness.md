@@ -888,10 +888,17 @@ pipelines intact. This validation also applies to YOLO and mandatory provider ca
 Unsupported string forms such as ANSI-C quoting, PowerShell here-strings, and Nushell raw strings
 return errors. Escaped newlines in Zsh also return errors because the pinned grammar can turn the
 continued word into another executable. These limitations never produce partial approval targets.
-The PowerShell parser accepts the pinned grammar's
-missing-space recovery only between adjacent literal comma-separated arguments, preserving the
-original command spans and checking each executable independently. Every other missing or error
-node rejects the call. Analysis retains complete command text and stops at 8,192 visited nodes, 64 tree
+The PowerShell grammar is a pinned local Cargo patch under `vendor/tree-sitter-powershell`.
+It parses command argument arrays, numeric option names, attached option values, adjacent
+parenthesized expressions, and escaped argument punctuation. Array operands retain nested
+execution nodes. The matcher accepts only complete syntax trees and never suppresses missing
+or error nodes. Original command bytes and ranges remain authoritative for permission rules.
+Range trimming preserves escaped trailing whitespace, including literal carriage returns,
+instead of turning a valid argument into an incomplete escape.
+The patch, upstream revision, generator version, and asset hashes are recorded with the vendored
+grammar. The regression corpus exercises quoting, comments, arrays, pipelines, control flow,
+closures, substitutions, nested shells, and each discovered executable's independent policy
+decision across all four shells. Analysis retains complete command text and stops at 8,192 visited nodes, 64 tree
 levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and returns the same error.
 The picker stages each decision locally and advances to the next unanswered item. Confirming the
 last unanswered item submits all decisions immediately, without a separate review page. Submission

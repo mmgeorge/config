@@ -8,10 +8,11 @@ license = "MIT"
 [workspace]
 resolver = "3"
 members = ["crates/forge-buffer", "crates/forge-protocol", "crates/forge-harness", "crates/forge-git", "crates/forge-diff", "crates/forge-github", "crates/forge-review", "crates/forge-status"]
-exclude = ["vendor/gix-path"]
+exclude = ["vendor/gix-path", "vendor/tree-sitter-powershell"]
 
 [patch.crates-io]
 gix-path = { path = "vendor/gix-path" }
+tree-sitter-powershell = { path = "vendor/tree-sitter-powershell" }
 
 [dependencies]
 anyhow = "1.0"
