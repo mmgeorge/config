@@ -2,6 +2,7 @@ use super::*;
 use forge_diff::cache::CacheLimits;
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair};
+use forge_harness::backend::TextGeneration;
 
 #[path = "excerpt_regression_tests.rs"]
 mod regression;
@@ -41,7 +42,7 @@ impl Fixture {
     }
 
     async fn text(&self, path: &str, old: &str, new: &str) -> String {
-        prompt(&mut [self.file(path, old, new).await], &self.syntax).await
+        prompt(&mut [self.file(path, old, new).await], &self.syntax, MAX_INPUT_BYTES).await
     }
 }
 
@@ -374,7 +375,7 @@ async fn test_and_spec_files_are_last_and_fully_omitted_sections_are_absent() {
         fixture.file("b_spec.ts", "", "function check() {}\n").await,
         fixture.file("source.rs", "", "fn run() {}\n").await,
     ];
-    let full = render(&mut files, &fixture.syntax, 20_000).await;
+    let full = prompt(&mut files, &fixture.syntax, 20_000).await;
     assert_eq!(
         files
             .iter()
@@ -383,7 +384,7 @@ async fn test_and_spec_files_are_last_and_fully_omitted_sections_are_absent() {
         ["source.rs", "a_test.rs", "b_spec.ts", "tests/a.rs"]
     );
     let limit = full.find("\na_test.rs (+1 -0)\n").unwrap();
-    let output = render(&mut files, &fixture.syntax, limit).await;
+    let output = prompt(&mut files, &fixture.syntax, limit).await;
     assert!(output.contains("  a_test.rs (+1 -0)"));
     assert!(output.contains("\nsource.rs (+1 -0)\n"));
     assert!(!output.contains("\na_test.rs (+1 -0)\n"));
@@ -400,9 +401,9 @@ async fn global_limit_stops_without_shrinking_the_twenty_line_allowance_or_split
             .collect::<String>()
     );
     let mut files = vec![fixture.file("source.rs", "fn run() {\n}\n", &source).await];
-    let full = render(&mut files, &fixture.syntax, 20_000).await;
+    let full = prompt(&mut files, &fixture.syntax, 20_000).await;
     for limit in [500, 600, 700, 800, 900, 1000] {
-        let output = render(&mut files, &fixture.syntax, limit).await;
+        let output = prompt(&mut files, &fixture.syntax, limit).await;
         assert!(output.len() <= limit);
         assert!(full.starts_with(&output), "limit {limit}: {output}");
         assert!(output.is_empty() || output.ends_with('\n'));
@@ -425,7 +426,8 @@ async fn oversized_first_line_stops_before_emitting_an_empty_file_section() {
             .await,
         fixture.file("b.txt", "", "later\n").await,
     ];
-    let output = prompt(&mut files, &fixture.syntax).await;
+    let output = prompt(&mut files, &fixture.syntax,
+        MAX_INPUT_BYTES - TextGeneration::CommitMessage.instructions().len()).await;
     assert!(output.len() + TextGeneration::CommitMessage.instructions().len() <= MAX_INPUT_BYTES);
     assert!(output.contains("  a.txt (+1 -0)") && output.contains("  b.txt (+1 -0)"));
     assert!(
@@ -521,9 +523,9 @@ async fn multiline_signatures_are_not_cut_by_the_global_byte_limit() {
     let fixture = Fixture::new();
     let source = "fn run(\n    first: i32,\n    second: i32,\n) -> i32 {\n    first + second\n}\n";
     let mut files = [fixture.file("source.rs", "", source).await];
-    let full = render(&mut files, &fixture.syntax, 20_000).await;
+    let full = prompt(&mut files, &fixture.syntax, 20_000).await;
     let cut = full.find("+     second").unwrap();
-    let output = render(&mut files, &fixture.syntax, cut).await;
+    let output = prompt(&mut files, &fixture.syntax, cut).await;
     assert!(!output.contains("+ fn run("), "{output}");
     assert!(!output.contains("\nsource.rs (+6 -0)\n"), "{output}");
 }
@@ -538,7 +540,7 @@ async fn inventory_itself_cannot_exceed_the_global_byte_limit() {
             analysis: None,
         })
         .collect();
-    let output = render(&mut files, &fixture.syntax, 1024).await;
+    let output = prompt(&mut files, &fixture.syntax, 1024).await;
     assert!(output.len() <= 1024);
     assert!(output.contains("0000-") && !output.contains("0099-"));
     assert!(output.ends_with('\n'));

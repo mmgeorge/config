@@ -6,6 +6,7 @@ use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::syntax::SyntaxEngine;
 use forge_diff::workers::WorkPriority;
+use forge_harness::backend::TextGeneration;
 use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion};
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, PathState};
@@ -34,12 +35,13 @@ pub async fn collect(
         .open(PathBuf::from(&request.workspace))
         .await?
         .context("generation requires a Git worktree")?;
-    let paths = if request.comparison == Comparison::LatestCommit {
+    let paths = if matches!(request.comparison, Comparison::LatestCommit | Comparison::PullRequest) {
         forge_git::revision::comparison::observe(
             store,
             Arc::clone(&repository),
             forge_git::revision::comparison::ComparisonRequest {
-                reference: "HEAD".into(),
+                reference: request.base.clone().unwrap_or_else(|| "HEAD".into()),
+                head: request.head.clone(),
                 worktree: false,
                 path: None,
             },
@@ -163,12 +165,12 @@ pub async fn collect(
             empty()?
         };
         let new = match request.comparison {
-            Comparison::Staged | Comparison::LatestCommit
+            Comparison::Staged | Comparison::LatestCommit | Comparison::PullRequest
                 if index.is_none_or(|index| index.object.is_null()) =>
             {
                 empty()?
             }
-            Comparison::Staged | Comparison::LatestCommit => {
+            Comparison::Staged | Comparison::LatestCommit | Comparison::PullRequest => {
                 source(
                     store,
                     &repository,
@@ -243,7 +245,12 @@ pub async fn collect(
     let prompt = if files.is_empty() {
         None
     } else {
-        Some(excerpt::prompt(&mut files, syntax).await)
+        let header = if request.comparison == Comparison::PullRequest { "" } else {
+            "Generate a conventional commit message for these changes.\n\n"
+        };
+        let limit = request.max_bytes.unwrap_or_else(|| excerpt::MAX_INPUT_BYTES
+            .saturating_sub(TextGeneration::CommitMessage.instructions().len() + header.len()));
+        Some(format!("{header}{}", excerpt::prompt(&mut files, syntax, limit).await))
     };
     Ok(CommitContext {
         prompt,
@@ -313,6 +320,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pull_request_context_uses_selected_merge_base_and_pinned_commits() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet", "--initial-branch=main"]);
+        git(root, &["config", "user.name", "Forge Test"]);
+        git(root, &["config", "user.email", "forge@example.invalid"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join("source.rs"), "fn original() {}\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "initial"]);
+        git(root, &["checkout", "--quiet", "-b", "feature"]);
+        std::fs::write(root.join("feature.rs"), "fn feature_marker() { hidden_body(); }\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "feature"]);
+        git(root, &["branch", "selected-base"]);
+        git(root, &["mv", "source.rs", "renamed.rs"]);
+        git(root, &["commit", "--quiet", "-m", "rename"]);
+        let output = Command::new("git").arg("-C").arg(root).args(["rev-parse", "HEAD"])
+            .output().unwrap();
+        assert!(output.status.success());
+        let head = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        git(root, &["checkout", "--quiet", "main"]);
+        std::fs::write(root.join("base_only.rs"), "fn base_only_marker() {}\n").unwrap();
+        git(root, &["add", "."]);
+        git(root, &["commit", "--quiet", "-m", "advance base"]);
+        std::fs::write(root.join("uncommitted.rs"), "fn uncommitted_marker() {}\n").unwrap();
+        git(root, &["add", "uncommitted.rs"]);
+        let store = RepositoryStore::default();
+        let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let mut request = GenerationRequest {
+            operation: "context".into(), workspace: root.to_string_lossy().into_owned(),
+            comparison: Comparison::PullRequest, base: Some("main".into()), head: Some(head),
+            max_bytes: Some(4000), ignored_paths: vec![], model: None, generation: None,
+        };
+        let context = collect(&store, &diff, &syntax, &request).await.unwrap();
+        let prompt = context.prompt.unwrap();
+        assert!(prompt.contains("+ fn feature_marker() {"), "{prompt}");
+        assert!(prompt.contains("renamed.rs (Renamed from source.rs)"), "{prompt}");
+        assert!(!prompt.contains("base_only") && !prompt.contains("uncommitted"), "{prompt}");
+        assert!(!prompt.contains("conventional commit"));
+        assert!(prompt.len() <= 4000);
+        request.base = Some("selected-base".into());
+        let selected = collect(&store, &diff, &syntax, &request).await.unwrap();
+        let selected = selected.prompt.unwrap();
+        assert!(selected.contains("renamed.rs (Renamed from source.rs)"));
+        assert!(!selected.contains("feature.rs") && !selected.contains("base_only"));
+        request.base = Some("missing-base".into());
+        assert!(collect(&store, &diff, &syntax, &request).await.is_err());
+        request.base = Some("main".into());
+        request.head = Some("missing-head".into());
+        assert!(collect(&store, &diff, &syntax, &request).await.is_err());
+    }
+
+    #[tokio::test]
     async fn renamed_files_remain_inventory_only_in_every_comparison() {
         for (destination, modified, binary) in [
             ("renamed.rs", false, false),
@@ -357,6 +419,9 @@ mod tests {
                 operation: "preview".into(),
                 workspace: root.to_string_lossy().into_owned(),
                 comparison: Comparison::Head,
+                base: None,
+                head: None,
+                max_bytes: None,
                 ignored_paths: vec![],
                 model: None,
                 generation: None,
@@ -409,6 +474,9 @@ mod tests {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
             comparison: Comparison::Head,
+            base: None,
+            head: None,
+            max_bytes: None,
             ignored_paths: vec![],
             model: None,
             generation: None,
@@ -461,6 +529,9 @@ mod tests {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
             comparison: Comparison::Head,
+            base: None,
+            head: None,
+            max_bytes: None,
             ignored_paths: vec![],
             model: None,
             generation: None,
@@ -511,6 +582,9 @@ mod tests {
             operation: "generate".into(),
             workspace: root.to_string_lossy().into_owned(),
             comparison: Comparison::Head,
+            base: None,
+            head: None,
+            max_bytes: None,
             ignored_paths: vec!["excluded.txt".into()],
             model: None,
             generation: None,

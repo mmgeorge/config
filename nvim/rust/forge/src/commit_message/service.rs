@@ -33,6 +33,8 @@ pub enum Comparison {
     Head,
     Staged,
     LatestCommit,
+    /// Committed changes from the selected base's merge base to a pinned head.
+    PullRequest,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -49,6 +51,12 @@ pub struct GenerationRequest {
     pub operation: String,
     pub workspace: String,
     pub comparison: Comparison,
+    /// Base reference required by provider-free pull request context requests.
+    pub base: Option<String>,
+    /// Head reference pinned by the pull request workflow before context collection.
+    pub head: Option<String>,
+    /// Context byte allowance after the caller reserves its own instruction text.
+    pub max_bytes: Option<usize>,
     #[serde(default)]
     pub ignored_paths: Vec<String>,
     pub model: Option<ModelSpec>,
@@ -74,7 +82,8 @@ pub struct GenerationResponse {
     pub prompt: Option<PromptPreview>,
 }
 
-pub struct CommitMessageService {
+/// Owns model generation and provider-free compact comparison context.
+pub struct GenerationService {
     repository: Arc<RepositoryStore>,
     diff: Arc<DiffEngine>,
     syntax: Arc<SyntaxEngine>,
@@ -83,7 +92,7 @@ pub struct CommitMessageService {
     completed: Arc<Notify>,
 }
 
-impl CommitMessageService {
+impl GenerationService {
     pub fn new(
         repository: Arc<RepositoryStore>,
         diff: Arc<DiffEngine>,
@@ -110,18 +119,29 @@ impl CommitMessageService {
     ) -> Result<GenerationResponse> {
         let request: GenerationRequest = serde_json::from_value(params)?;
         let preview = request.operation == "preview";
+        let context_only = request.operation == "context";
         ensure!(
-            request.operation == "generate" || preview,
+            request.operation == "generate" || preview || context_only,
             "unknown detached generation operation"
         );
         ensure!(
-            preview || request.model.is_some() != request.generation.is_some(),
+            preview || context_only || request.model.is_some() != request.generation.is_some(),
             "generation requires exactly one API model or standalone provider configuration"
         );
         ensure!(
-            !preview || request.model.is_none() && request.generation.is_none(),
+            !(preview || context_only) || request.model.is_none() && request.generation.is_none(),
             "prompt preview does not accept provider configuration"
         );
+        ensure!(context_only == (request.comparison == Comparison::PullRequest),
+            "pull request comparison requires the context operation");
+        if context_only {
+            ensure!(request.base.is_some() && request.head.is_some(), "pull request context requires base and head");
+            ensure!(request.max_bytes.is_some_and(|limit| limit > 0 && limit <= super::excerpt::MAX_INPUT_BYTES),
+                "invalid pull request context byte limit");
+        } else {
+            ensure!(request.base.is_none() && request.head.is_none() && request.max_bytes.is_none(),
+                "commit generation does not accept pull request context options");
+        }
         let permit = Arc::new(GenerationPermit {
             permit: Some(
                 Arc::clone(&self.admission)
@@ -133,6 +153,15 @@ impl CommitMessageService {
         let context =
             match context::collect(&self.repository, &self.diff, &self.syntax, &request).await {
                 Ok(context) => context,
+                Err(failure) if context_only && failure.is::<forge_git::revision::comparison::MergeConflict>() => {
+                    return Ok(GenerationResponse {
+                        state: "conflicts".into(),
+                        message: None,
+                        source_requests: 0,
+                        diff_pairs: 0,
+                        prompt: None,
+                    });
+                }
                 Err(failure) if context::generation_was_superseded(&failure) => {
                     return Ok(GenerationResponse {
                         state: "retry".into(),
@@ -160,13 +189,13 @@ impl CommitMessageService {
             return Ok(response);
         }
         let prompt = context.prompt.as_deref().unwrap_or_default();
-        if preview {
-            let system = TextGeneration::CommitMessage.instructions();
+        if preview || context_only {
+            let system = if context_only { "" } else { TextGeneration::CommitMessage.instructions() };
             response.prompt = Some(PromptPreview {
                 system,
                 user: prompt.to_owned(),
                 input_bytes: system.len() + prompt.len(),
-                limit_bytes: super::excerpt::MAX_INPUT_BYTES,
+                limit_bytes: request.max_bytes.unwrap_or(super::excerpt::MAX_INPUT_BYTES),
             });
             return Ok(response);
         }

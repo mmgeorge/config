@@ -4,4 +4,4 @@ mod provider;
 mod service;
 
 use service::{GenerationPermit, ModelSpec};
-pub use service::{CommitMessageService, Comparison, GenerationRequest};
+pub use service::{GenerationService, Comparison, GenerationRequest};

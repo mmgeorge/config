@@ -577,9 +577,9 @@ async fn callbacks_in_default_parameters_remain_in_the_complete_signature() {
         "{output}"
     );
     let mut files = [fixture.file("source.ts", "", &new).await];
-    let full = render(&mut files, &fixture.syntax, 20_000).await;
+    let full = prompt(&mut files, &fixture.syntax, 20_000).await;
     let limit = full.find("+         prepare").unwrap() + 10;
-    let limited = render(&mut files, &fixture.syntax, limit).await;
+    let limited = prompt(&mut files, &fixture.syntax, limit).await;
     assert!(!limited.contains("+ function run("), "{limited}");
 }
 
@@ -1039,7 +1039,7 @@ async fn ignored_lockfile_excerpts_leave_the_byte_budget_for_other_changes() {
         fixture.file("a.lock", "", &"ignored\n".repeat(2000)).await,
         fixture.file("z.txt", "before\n", "retained\n").await,
     ];
-    let output = render(&mut files, &fixture.syntax, 1000).await;
+    let output = prompt(&mut files, &fixture.syntax, 1000).await;
     assert!(output.contains("  a.lock (+2000 -0)\n"), "{output}");
     assert!(!output.contains("+ ignored\n"), "{output}");
     assert!(output.contains("+ retained\n"), "{output}");
@@ -1096,7 +1096,7 @@ async fn single_line_gap_cannot_overflow_the_global_byte_limit() {
         fixture.file("a.unknown", "", &source).await,
         fixture.file("z.txt", "", "later\n").await,
     ];
-    let output = render(&mut files, &fixture.syntax, 1000).await;
+    let output = prompt(&mut files, &fixture.syntax, 1000).await;
     assert!(output.len() <= 1000);
     assert!(!output.contains("large"), "{output}");
     assert!(!output.contains("... 1 lines"), "{output}");
@@ -1186,7 +1186,7 @@ async fn regrouped_signatures_are_atomic_at_the_byte_limit() {
     let old = "fn target(value: i32) -> i32 {\n    value\n}\n";
     let new = "fn helper() {\n    first();\n    second();\n}\nfn target(\n    value: i64,\n) -> i64 {\n    value\n}\n";
     let mut files = [fixture.file("source.rs", old, new).await];
-    let full = render(&mut files, &fixture.syntax, 20_000).await;
+    let full = prompt(&mut files, &fixture.syntax, 20_000).await;
     let old_signature = "- fn target(value: i32) -> i32 {\n";
     let new_signature = "+ fn target(\n+     value: i64,\n+ ) -> i64 {\n";
     assert!(
@@ -1194,7 +1194,7 @@ async fn regrouped_signatures_are_atomic_at_the_byte_limit() {
         "{full}"
     );
     let limit = full.find("+     value: i64,").unwrap() + 5;
-    let limited = render(&mut files, &fixture.syntax, limit).await;
+    let limited = prompt(&mut files, &fixture.syntax, limit).await;
     assert!(limited.contains("+ fn helper() {\n"), "{limited}");
     assert!(
         !limited.contains(old_signature) && !limited.contains("+ fn target("),

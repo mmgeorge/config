@@ -188,7 +188,7 @@ the complete event has been assembled and validated.
 
 ## Commit-message context
 
-`CommitMessageService` owns prompt preparation for automatic About drafts and explicit
+`GenerationService` owns prompt preparation for automatic About drafts and explicit
 commit-message regeneration. HEAD includes tracked worktree changes and untracked files,
 staged generation compares the index with HEAD, and amend generation reads the latest
 commit's immutable old and new objects. All three routes use the same native diff and

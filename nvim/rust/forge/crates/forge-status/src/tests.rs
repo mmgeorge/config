@@ -1243,6 +1243,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
             directory.path().to_owned(),
             forge_git::revision::comparison::ComparisonRequest {
                 reference: "main".into(),
+                head: None,
                 worktree: true,
                 path: None,
             },
@@ -1286,6 +1287,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
             directory.path().to_owned(),
             forge_git::revision::comparison::ComparisonRequest {
                 reference: "HEAD".into(),
+                head: None,
                 worktree: true,
                 path: None,
             },
@@ -1299,6 +1301,7 @@ async fn comparisons_reuse_native_bodies_and_reject_mutations() {
             directory.path().to_owned(),
             forge_git::revision::comparison::ComparisonRequest {
                 reference: "HEAD".into(),
+                head: None,
                 worktree: false,
                 path: None,
             },

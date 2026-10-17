@@ -21,6 +21,13 @@ local generated_model = nil
 local generated_prompt = nil
 local generated_system = nil
 local captured_head = string.rep("1", 40)
+local base_commit = string.rep("2", 40)
+local compact_context = "Changed files:\n  moved.rs (Renamed from original.rs)\n  source.rs (+1 -1)\n\nsource.rs (+1 -1)\n\n- old();\n+ new();\n"
+local context_failure
+local context_conflicts
+local context_calls
+local fetch_failure
+local notices = {}
 local original_write = require("forge.git.write").execute
 local original_forge_open_pr = forge.open_pr
 local original_host_request = require("forge.client").request_host
@@ -47,7 +54,7 @@ end
 
 local function wait_for(predicate, message)
   local ok = vim.wait(1000, predicate, 10)
-  assert_true(ok, message)
+  assert_true(ok, message .. "\n" .. table.concat(notices, "\n"))
 end
 
 local function reset()
@@ -57,6 +64,10 @@ local function reset()
   generated_prompt = nil
   generated_system = nil
   creation_draft, creation_capture = nil, nil
+  context_failure, context_calls = nil, 0
+  context_conflicts = false
+  fetch_failure = nil
+  notices = {}
   opened_pull_request = nil
   branch_list_output = table.concat({
     "main",
@@ -83,7 +94,7 @@ forge.setup({ pr_buffer_name = "ForgePRTest" })
 gh.set_backend({
   system_async = function(command, _, cb)
     local key = command_key(command)
-    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft,state,createdAt,updatedAt,closedAt" then
+    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,baseRefOid,baseRefName,headRepository,headRepositoryOwner,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft,state,createdAt,updatedAt,closedAt" then
       cb({
         code = 0,
         stdout = vim.json.encode({
@@ -136,14 +147,23 @@ package.loaded["ai"] = {
     })
   end,
 }
-vim.notify = function() end
+vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 require("forge.git.write").execute = function(directory, action, callback)
   assert_true(directory == root and action.kind == "publish_branch" and action.name == "feature/current"
     and action.head == captured_head, "publish branch lost captured workspace/head")
   callback({ ok = true, output = "" })
 end
 local function native_request(method, params, callback)
-  if method == "github.creation.context" then
+  if method == "repository.generate" then
+    context_calls = context_calls + 1
+    assert_true(params.operation == "context" and params.comparison == "pull_request", "PR did not request native range context")
+    assert_true(params.workspace == root and params.base == base_commit and params.head == captured_head,
+      "native context lost the selected base or pinned head")
+    assert_true(params.max_bytes > 0 and params.max_bytes < 500000, "PR did not reserve instruction bytes")
+    if context_failure then callback(nil, context_failure) return end
+    if context_conflicts then callback({ state = "conflicts", source_requests = 0, diff_pairs = 0 }) return end
+    callback({ state = "ready", prompt = { system = "", user = compact_context } })
+  elseif method == "github.creation.context" then
     assert_true(params.directory == root, "creation context lost workspace")
     callback({ repository = { hostname = require("github.repo_cache").hostname(), owner = "org", name = "repo" },
       repository_node_id = "R_test", branch = "feature/current", head_commit = captured_head })
@@ -193,31 +213,21 @@ vim.system = function(command, opts, callback)
     callback({ code = 0, stdout = "feature/current\n", stderr = "" })
     return
   end
-  if key == "git\trev-parse\t--verify\torigin/main" then
-    callback({ code = 0, stdout = "abc123456789\n", stderr = "" })
+  if key == "git\tremote\tget-url\torigin" then
+    callback({ code = 0, stdout = "fixture-origin\n", stderr = "" })
     return
   end
-  if key == "git\tlog\t--reverse\t--format=%s%n%b%n---END-COMMIT---\torigin/main.." .. captured_head then
+  if key:match("^git\tfetch\t") then
+    callback({ code = fetch_failure and 1 or 0, stdout = "", stderr = fetch_failure or "" })
+    return
+  end
+  if key == "git\trev-parse\t--verify\trefs/remotes/origin/main^{commit}"
+    or key == "git\trev-parse\t--verify\trefs/remotes/origin/develop^{commit}" then
+    callback({ code = 0, stdout = base_commit .. "\n", stderr = "" })
+    return
+  end
+  if key == "git\tlog\t--reverse\t--format=%s%n%b%n---END-COMMIT---\t" .. base_commit .. ".." .. captured_head then
     callback({ code = 0, stdout = "feat: create draft pr\n---END-COMMIT---\n", stderr = "" })
-    return
-  end
-  if key == "git\tdiff\t--stat\t--summary\torigin/main.." .. captured_head then
-    callback({ code = 0, stdout = " nvim/lua/github/open_pr.lua | 12 +++++++-----\n", stderr = "" })
-    return
-  end
-  if key == "git\tdiff\t--no-ext-diff\t--no-color\torigin/main.." .. captured_head then
-    callback({
-      code = 0,
-      stdout = table.concat({
-        "diff --git a/nvim/lua/github/open_pr.lua b/nvim/lua/github/open_pr.lua",
-        "--- a/nvim/lua/github/open_pr.lua",
-        "+++ b/nvim/lua/github/open_pr.lua",
-        "@@ -1 +1 @@",
-        "-old prompt",
-        "+new prompt",
-      }, "\n"),
-      stderr = "",
-    })
     return
   end
   callback({
@@ -345,21 +355,14 @@ local function run_tests()
   end, "create flow base confirmation did not render")
   press("y")
   wait_for(function() return generated_model == "test-pr-create-model" end, "PR create did not use pr_create adapter")
-  assert_true(
-    generated_system:find("Build the description around one controlling claim", 1, true) ~= nil,
-    "PR prompt should establish a controlling claim"
-  )
-  assert_true(
-    generated_system:find("Use a before/now contrast only when the diff proves", 1, true) ~= nil,
-    "PR prompt should condition before/now framing on evidence"
-  )
+  assert_true(generated_system == open_pr._pr_system_prompt_for_test, "PR generation replaced its own instructions")
   assert_true(
     generated_prompt:find("Compact diff context:", 1, true) ~= nil,
     "PR prompt should include compact diff context"
   )
   assert_true(
-    generated_prompt:find("Synthesize the complete change into one coherent operating story", 1, true) ~= nil,
-    "PR prompt should request a coherent synthesis"
+    generated_prompt:find(compact_context, 1, true) ~= nil,
+    "PR prompt rewrote native compact context"
   )
   wait_for(function()
     return opened_pull_request ~= nil
@@ -367,10 +370,54 @@ local function run_tests()
   assert_true(opened_pull_request.pr.title == "feat: create draft pr", "created PR view missing title")
   assert_true(opened_pull_request.options.cwd == root, "created PR view lost its repository root")
   assert_true(creation_capture and creation_capture.mutation.operation == "pull_request_create", "PR creation bypassed durable native capture")
+  assert_true(context_calls == 1 and creation_capture.mutation.base == "main", "PR base differed from context selection")
+  for _, call in ipairs(system_calls) do
+    assert_true(not call.key:find("git\tdiff\t", 1, true), "PR still used the old raw diff path")
+  end
   assert_true(
     not vim.tbl_contains(vim.tbl_map(function(call) return call.key end, system_calls), "gh\tpr\tview\t" .. created_pr_url .. "\t--web"),
     "create flow still opened the browser"
   )
+
+  reset()
+  open_pr._set_base_branch_for_test("develop", root)
+  open_pr.open()
+  wait_for(function() return vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Base: develop") end,
+    "selected develop base confirmation did not render")
+  press("y")
+  wait_for(function() return creation_capture ~= nil end, "selected-base PR was not created")
+  assert_true(creation_capture.mutation.base == "develop", "PR did not use the selected base")
+  assert_true(generated_prompt:find("Base branch: develop", 1, true), "context named a different base")
+
+  reset()
+  context_failure = "selected base has no merge base"
+  open_pr.open()
+  wait_for(function() return vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Base: develop") end,
+    "failure fixture base confirmation did not render")
+  press("y")
+  wait_for(function() return context_calls == 1 end, "failure fixture did not request native context")
+  assert_true(generated_prompt == nil and creation_capture == nil, "failed context reached generation or PR creation")
+
+  reset()
+  fetch_failure = "origin unavailable"
+  open_pr.open()
+  wait_for(function() return vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Base: develop") end,
+    "fetch failure fixture base confirmation did not render")
+  press("y")
+  wait_for(function() return #notices > 1 end, "fetch failure was not surfaced")
+  assert_true(context_calls == 0 and generated_prompt == nil and creation_capture == nil,
+    "fetch failure silently reused a stale base")
+
+  reset()
+  context_conflicts = true
+  open_pr.open()
+  wait_for(function() return vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Base: develop") end,
+    "conflict fixture base confirmation did not render")
+  press("y")
+  wait_for(function() return context_calls == 1 end, "conflict fixture did not request the merge check")
+  assert_true(generated_prompt == nil and creation_capture == nil, "conflict reached generation or PR creation")
+  assert_true(vim.tbl_contains(notices, "Merge conflicts. Resolve them before creating the PR."),
+    "conflict instruction was not displayed")
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

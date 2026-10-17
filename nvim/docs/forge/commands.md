@@ -101,3 +101,8 @@ for the contributor workflow.
 
 GitHub PR and review views are opened by their integration, rather than by an
 additional standalone Forge PR command.
+
+PR creation checks the selected base and head for merge conflicts before preparing
+the diff or requesting a description. Conflicts stop the workflow with "Merge
+conflicts. Resolve them before creating the PR." The check leaves your branch,
+index, and working files unchanged.

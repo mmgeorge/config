@@ -715,6 +715,7 @@ impl HostRouter {
                                     workspace,
                                     forge_git::revision::comparison::ComparisonRequest {
                                         reference,
+                                        head: None,
                                         worktree,
                                         path,
                                     },

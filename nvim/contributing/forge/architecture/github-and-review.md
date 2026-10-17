@@ -4,6 +4,39 @@ The shared host owns remote operations, durable GitHub data, submitted review st
 
 Read [Buffers and rendering](buffers-and-rendering.md) for editable-region application and [Host and protocol](host-and-protocol.md) for request ownership.
 
+## Pull request creation context
+
+The creation workflow retains the selected base branch and the head commit captured
+by `github.creation.context`. When `origin` is configured, it fetches only the
+selected base branch into its tracking ref and pins that commit before collecting
+the title and diff. Git reads and the fetch have a 30-second deadline. Fetch failures
+stop creation without reusing stale refs. Without
+`origin`, it resolves the local base branch. The first head-only commit supplies the title.
+
+The `context` operation on `repository.generate` compares the merge base of those
+two pinned commits with the captured head. It reads committed objects only, so
+base-only changes and staged, unstaged, or untracked work do not enter the prompt.
+Before reading diff metadata or source excerpts, the native comparison runs
+`git merge-tree --write-tree --quiet` on the pinned base and head. Exit status 1
+returns `conflicts` without prompt text, and Lua stops with "Merge conflicts.
+Resolve them before creating the PR." No model request, branch push, or PR
+creation follows. Other command failures remain errors. This check changes no
+branch, index, or working file, though Git can write unreferenced merge objects.
+Missing refs, unrelated histories, and context failures stop generation and publication.
+Transient invalidation retries retain the same commits and stop after three attempts.
+
+PR descriptions use the same native compact formatter as commit messages. Renames,
+license changes, and lockfiles remain in the file list, and declaration excerpts
+retain the shared context and omission rules. The formatter receives the remainder
+of the 500,000-byte allowance after the PR instructions and comparison metadata.
+The PR prompt uses its own description instructions without the commit-message header.
+
+Descriptions lead with the concrete problem and resulting behavior, or the new
+capability when the evidence establishes no prior failure. One paragraph is the
+default. A second requires a separate compatibility impact, failure boundary, or
+supplied verification result. Changes to tests do not establish that checks ran.
+Branch publication retains the same captured head used for generation.
+
 ## Repository storage and deletion leases
 
 `forge-github::RepositoryLease` uses shared filesystem locks for issue operations and an exclusive

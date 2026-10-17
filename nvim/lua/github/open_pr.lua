@@ -5,28 +5,24 @@ local popup_window = require("forge.infra.popup_window")
 local default_base_branch = "main"
 local state_cache = nil
 local state_path_for_test = nil
-local pr_context_limit = {
-  stat = 12000,
-  diff = 120000,
-}
+local max_input_bytes = 500000
 
-local compact_diff_options = {
-  max_hunks = 30,
-  max_changed_lines = 800,
-  min_hunk_changed_lines = 8,
-  hunk_head_lines = 12,
-}
+---@class ForgePullRequestContextResponse
+---@field state 'ready'|'none'|'retry'|'conflicts'
+---@field prompt? ForgeCommitPromptInput
+---@field source_requests integer
+---@field diff_pairs integer
 
 local pr_system_prompt = [[You write concise GitHub pull request descriptions for code reviewers.
-Return ONLY 2-4 sentences across one or two short prose paragraphs. Do not include a title, markdown headings, checklist, code fences, explanation, alternatives, or preface.
+Write for a reviewer who has not seen the conversation. Return only the description body in plain paragraphs, without a title, headings, lists, code fences, or preface.
 
-Build the description around one controlling claim about what changed and what the reviewer should understand:
-- Lead with the feature, fix, or capability and its reviewer-visible outcome.
-- Explain the relevant pressure or prior limitation only when the supplied evidence establishes it.
-- Describe the operative mechanism through accurate ownership, data flow, contracts, or lifecycle boundaries.
-- State the concrete consequence that follows from that mechanism when the relationship is not self-evident.
+Lead with the concrete problem and resulting behavior. For a new capability, state what it enables without inventing a prior failure. Explain the mechanism, ownership, or lifecycle boundary only when it helps the reviewer assess that behavior.
 
-Use a before/now contrast only when the diff proves a change to existing behavior. Ground every claim in the supplied repository evidence. Use active voice, stable domain terms, and concrete actors, operations, and values. Do not invent motivations, guarantees, architectural terms, or user benefits. Do not enumerate files, commits, hunks, or tests. Avoid generic claims such as "improves", "enhances", "simplifies", "robust", or "flexible" unless the evidence states the exact work removed, behavior changed, or boundary enforced.]]
+Use one short paragraph by default. Add a second only for a separate compatibility impact, failure boundary, or supplied verification result. Scale detail to the change rather than filling a sentence quota.
+
+Use active voice, familiar terms, and concrete operations. Support claims about performance, reliability, or correctness with explicit bounds or failure handling visible in the evidence. Do not invent motivations, benefits, guarantees, or architectural terms. Do not enumerate files, commits, hunks, or tests. Avoid promotional adjectives, metaphors, semicolons, and concluding recaps.
+
+Treat the file list and compact excerpts as the evidence boundary. Do not guess the contents of omitted lines. Mention executed checks only when execution results are explicitly supplied. Added or modified test code does not prove that a test ran or passed.]]
 
 local pr_header = [[Related #]]
 
@@ -203,19 +199,6 @@ local function set_base_branch(cwd, branch)
   end
 end
 
-local function truncate_at_line(text, limit)
-  if #text <= limit then
-    return text, false
-  end
-
-  local truncated = text:sub(1, limit)
-  local last_newline = truncated:match(".*()\n")
-  if last_newline and last_newline > 1 then
-    truncated = truncated:sub(1, last_newline - 1)
-  end
-  return truncated, true
-end
-
 local function command_error(result)
   local message = result.stderr
   if not message or vim.trim(message) == "" then
@@ -228,21 +211,23 @@ local function command_error(result)
 end
 
 local function run(args, opts, callback)
-  vim.system(args, {
+  local started, failure = pcall(vim.system, args, {
     cwd = opts and opts.cwd or nil,
+    timeout = 30000,
     text = true,
     stdout = true,
     stderr = true,
   }, function(result)
     vim.schedule(function()
       if result.code ~= 0 then
-        callback(nil, command_error(result))
+        callback(nil, result.code == 124 and "Git command exceeded the 30-second deadline" or command_error(result))
         return
       end
 
       callback(result.stdout or "")
     end)
   end)
+  if not started then vim.schedule(function() callback(nil, tostring(failure)) end) end
 end
 
 local function git(args, cwd, callback)
@@ -293,38 +278,59 @@ local function build_pr_body(description)
   }, "\n\n")
 end
 
-local function build_context(branch, base_ref, diff_stat, raw_diff)
-  local compacted_diff, diff_compacted, diff_metrics = require("git.diff").compact(raw_diff, compact_diff_options)
-  local truncated_stat, stat_truncated = truncate_at_line(diff_stat, pr_context_limit.stat)
-  local truncated_diff, diff_truncated = truncate_at_line(compacted_diff, pr_context_limit.diff)
-  local truncated = stat_truncated or diff_truncated
+local function build_context(branch, base_ref, head_commit, compact_diff)
   local sections = {
     "Write the draft PR description from the repository evidence below.",
-    "Base branch: " .. base_ref:gsub("^origin/", ""),
+    "Base branch: " .. base_ref:gsub("^refs/remotes/origin/", ""):gsub("^refs/heads/", ""),
     "Comparison ref used for the diff: " .. base_ref,
     "Head branch: " .. branch,
+    "Head commit: " .. head_commit,
+    "The diff compares the selected base's merge base with this pinned head commit.",
   }
-
-  if diff_compacted then
-    table.insert(sections, (
-      "Large diff compacted after counting %d hunks and %d changed lines. "
-      .. "The compact diff starts with an overall summary and only includes large hunks."
-    ):format(diff_metrics.hunks, diff_metrics.changed))
-  end
-
-  if truncated then
-    table.insert(sections, "Some context is truncated to avoid exceeding the model request size. "
-      .. "Use the diff summary for overall scope, and visible hunks for details.")
-  end
-
-  if vim.trim(truncated_stat) ~= "" then
-    table.insert(sections, "Diff summary:\n```text\n" .. truncated_stat .. "\n```")
-  end
-
-  table.insert(sections, "Compact diff context:\n```diff\n" .. truncated_diff .. "\n```")
-  table.insert(sections, "Treat the summary and diff as evidence. Synthesize the complete change into one coherent "
-    .. "operating story instead of enumerating files, commits, or hunks.")
+  table.insert(sections, "Compact diff context:\n" .. compact_diff)
+  table.insert(sections, "Explain the concrete change supported by this file list and compact diff. "
+    .. "Omitted content and test execution are not additional evidence.")
   return table.concat(sections, "\n\n")
+end
+
+---@param cwd string
+---@param branch string
+---@param base_ref string
+---@param base_commit string
+---@param head_commit string
+---@param callback fun(prompt: string?, failure: string?)
+local function collect_diff_context(cwd, branch, base_ref, base_commit, head_commit, callback)
+  local limit = max_input_bytes - #pr_system_prompt - #build_context(branch, base_ref, head_commit, "")
+  local attempts = 0
+  local request
+  request = function()
+    attempts = attempts + 1
+    require("forge.client").request_host("repository.generate", {
+      operation = "context", workspace = cwd, comparison = "pull_request",
+      base = base_commit, head = head_commit, max_bytes = limit,
+    }, function(result, failure)
+      if failure then callback(nil, failure) return end
+      if type(result) ~= "table" then callback(nil, "Missing native PR diff context") return end
+      ---@cast result ForgePullRequestContextResponse
+      if result.state == "conflicts" then
+        callback(nil, "Merge conflicts. Resolve them before creating the PR.") return
+      end
+      if result.state == "retry" then
+        if attempts < 3 then vim.defer_fn(request, 120)
+        else callback(nil, "Repository changed while preparing PR context. Run the command again.") end
+        return
+      end
+      if result.state == "none" then callback(nil, "No changes between the selected base and head") return end
+      if result.state ~= "ready" or type(result.prompt) ~= "table"
+        or result.prompt.system ~= "" or type(result.prompt.user) ~= "string" then
+        callback(nil, "Invalid native PR diff context") return
+      end
+      local prompt = build_context(branch, base_ref, head_commit, result.prompt.user)
+      if #pr_system_prompt + #prompt > max_input_bytes then callback(nil, "PR prompt exceeds the input byte limit") return end
+      callback(prompt)
+    end)
+  end
+  request()
 end
 
 ---@param raw_branch string
@@ -529,6 +535,53 @@ local function generate_description(context, callback)
   end)
 end
 
+---@param cwd string
+---@param branch string
+---@param base_ref string
+---@param base_commit string
+---@param head_commit string
+---@param callback fun(metadata: { title: string, body: string }?, failure: string?)
+local function prepare_description(cwd, branch, base_ref, base_commit, head_commit, callback)
+  git({ "log", "--reverse", "--format=%s%n%b%n---END-COMMIT---", base_commit .. ".." .. head_commit }, cwd,
+    function(commits, failure)
+      if failure then callback(nil, "Could not read PR commit messages: " .. failure) return end
+      local title = first_commit_subject(commits)
+      if not title then callback(nil, "No commits found on " .. branch .. " compared with " .. base_ref) return end
+      collect_diff_context(cwd, branch, base_ref, base_commit, head_commit, function(prompt, context_failure)
+        if context_failure then callback(nil, context_failure) return end
+        generate_description(prompt, function(description, generation_failure)
+          if generation_failure then callback(nil, "Failed to generate PR description: " .. generation_failure) return end
+          callback({ title = title, body = build_pr_body(description) })
+        end)
+      end)
+    end)
+end
+
+---@param cwd string
+---@param branch string
+---@param callback fun(reference: string?, commit: string?, failure: string?)
+local function resolve_base(cwd, branch, callback)
+  local function resolve(reference)
+    git({ "rev-parse", "--verify", reference .. "^{commit}" }, cwd, function(commit, failure)
+      if failure then callback(nil, nil, "Could not resolve PR base: " .. failure) return end
+      commit = vim.trim(commit)
+      if not commit:match("^%x+$") or (#commit ~= 40 and #commit ~= 64) then
+        callback(nil, nil, "Invalid PR base commit") return
+      end
+      callback(reference, commit)
+    end)
+  end
+  git({ "remote", "get-url", "origin" }, cwd, function(_, remote_failure)
+    if remote_failure then resolve("refs/heads/" .. branch) return end
+    local reference = "refs/remotes/origin/" .. branch
+    show_progress("Refreshing PR base " .. branch .. "...")
+    git({ "fetch", "--no-tags", "origin", "+refs/heads/" .. branch .. ":" .. reference }, cwd, function(_, failure)
+      if failure then callback(nil, nil, "Could not refresh PR base: " .. failure) return end
+      resolve(reference)
+    end)
+  end)
+end
+
 local function push_branch(cwd, branch, head, callback)
   show_progress("Pushing current branch...")
   require("forge.git.write").execute(cwd, { kind = "publish_branch", name = branch, head = head }, function(result)
@@ -594,62 +647,15 @@ function M.open(options)
           return
         end
 
-        git({ "rev-parse", "--verify", "origin/" .. selected_base_branch }, cwd, function(_, origin_err)
-          local base_ref = origin_err and selected_base_branch or "origin/" .. selected_base_branch
-          git({ "log", "--reverse", "--format=%s%n%b%n---END-COMMIT---", base_ref .. ".." .. context.head_commit }, cwd,
-            function(commits, commits_err)
-              if commits_err then
-                fail_progress("Could not read PR commit messages: " .. commits_err)
-                return
-              end
-
-              if vim.trim(commits) == "" then
-                stop_progress()
-                notify("No commits found on " .. branch .. " compared with " .. base_ref, "warn")
-                return
-              end
-
-              local title = first_commit_subject(commits)
-              if not title then
-                fail_progress("Could not determine PR title from the first commit")
-                return
-              end
-
-              git({ "diff", "--stat", "--summary", base_ref .. ".." .. context.head_commit }, cwd, function(diff_stat, stat_err)
-                if stat_err then
-                  fail_progress("Could not read PR diff summary: " .. stat_err)
-                  return
-                end
-
-                git({ "diff", "--no-ext-diff", "--no-color", base_ref .. ".." .. context.head_commit }, cwd, function(raw_diff, diff_err)
-                  if diff_err then
-                    fail_progress("Could not read PR diff context: " .. diff_err)
-                    return
-                  end
-
-                  generate_description(build_context(branch, base_ref, diff_stat, raw_diff), function(description, description_err)
-                    if description_err then
-                      fail_progress("Failed to generate PR description: " .. description_err)
-                      return
-                    end
-
-                    local metadata = {
-                      title = title,
-                      body = build_pr_body(description),
-                    }
-
-                    push_branch(cwd, branch, context.head_commit, function(_, push_err)
-                      if push_err then
-                        fail_progress("Failed to push branch: " .. push_err)
-                        return
-                      end
-
-                      create_pr(cwd, context, selected_base_branch, metadata)
-                    end)
-                  end)
-                end)
-              end)
+        resolve_base(cwd, selected_base_branch, function(base_ref, base_commit, base_failure)
+          if base_failure then fail_progress(base_failure) return end
+          prepare_description(cwd, branch, base_ref, base_commit, context.head_commit, function(metadata, failure)
+            if failure then fail_progress(failure) return end
+            push_branch(cwd, branch, context.head_commit, function(_, push_err)
+              if push_err then fail_progress("Failed to push branch: " .. push_err) return end
+              create_pr(cwd, context, selected_base_branch, metadata)
             end)
+          end)
         end)
       end)
     end)

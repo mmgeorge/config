@@ -7,14 +7,12 @@ use forge_diff::raw::RawDiff;
 use forge_diff::source::SourceVersion;
 use forge_diff::syntax::{SourceOutline, SyntaxEngine, SyntaxLanguage, SyntaxRequest};
 use forge_diff::workers::WorkPriority;
-use forge_harness::backend::TextGeneration;
 
 /// Maximum combined UTF-8 size of constructed system instructions and prompt text.
 pub(super) const MAX_INPUT_BYTES: usize = 500_000;
 const BODY_CHANGED_LINES: usize = 20;
 const CONTEXT_LINES: usize = 2;
-const INSTRUCTIONS: &str = "Generate a conventional commit message for these changes.\n\n\
-The diff is compacted. '+ ' marks added lines, '- ' removed lines, and '  ' unchanged lines. \
+const INSTRUCTIONS: &str = "The diff is compacted. '+ ' marks added lines, '- ' removed lines, and '  ' unchanged lines. \
 Signatures are retained. Omission markers include added and removed line counts. \
 Added and removed functions include signatures only. \
 Renamed files, license changes, and lockfile changes appear only in the file list. \
@@ -99,16 +97,7 @@ struct ObjectRows {
 }
 
 /// Construct one bounded prompt for every comparison and provider route.
-pub(super) async fn prompt(files: &mut [ChangedFile], syntax: &Arc<SyntaxEngine>) -> String {
-    render(
-        files,
-        syntax,
-        MAX_INPUT_BYTES.saturating_sub(TextGeneration::CommitMessage.instructions().len()),
-    )
-    .await
-}
-
-async fn render(files: &mut [ChangedFile], syntax: &Arc<SyntaxEngine>, limit: usize) -> String {
+pub(super) async fn prompt(files: &mut [ChangedFile], syntax: &Arc<SyntaxEngine>, limit: usize) -> String {
     files.sort_by(|left, right| {
         test_path(&left.path)
             .cmp(&test_path(&right.path))

@@ -18,7 +18,7 @@ pub(crate) mod repository_write;
 /// Owns shared repository resources for one host without opening a repository at construction.
 pub struct ForgeRuntime {
     pub(crate) writes: repository_write::RepositoryWriteGateway,
-    pub(crate) generation: commit_message::CommitMessageService,
+    pub(crate) generation: commit_message::GenerationService,
     pub(crate) syntax: Arc<forge_diff::syntax::SyntaxEngine>,
     pub(crate) status: forge_status::StatusService,
     pub(crate) sources: forge_status::source_document::SourceDocumentService,
@@ -50,7 +50,7 @@ impl ForgeRuntime {
             Arc::clone(&repositories),
             Arc::clone(&syntax),
         );
-        let generation = commit_message::CommitMessageService::new(
+        let generation = commit_message::GenerationService::new(
             Arc::clone(&repositories),
             Arc::clone(&diff),
             Arc::clone(&syntax),

@@ -19,9 +19,23 @@ use crate::{
     store::RepositoryStore,
 };
 
+/// Stops pull request preparation when the selected commits cannot merge cleanly.
+#[derive(Debug)]
+pub struct MergeConflict;
+
+impl std::fmt::Display for MergeConflict {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("Merge conflicts. Resolve them before creating the PR.")
+    }
+}
+
+impl std::error::Error for MergeConflict {}
+
 #[derive(Clone, Debug)]
 pub struct ComparisonRequest {
     pub reference: String,
+    /// Pinned head for a merge-base comparison, or absent for existing comparison modes.
+    pub head: Option<String>,
     pub worktree: bool,
     pub path: Option<RepositoryPath>,
 }
@@ -43,8 +57,13 @@ pub async fn observe(
             && !request.reference.chars().any(char::is_control),
         "invalid comparison reference"
     );
+    ensure!(
+        request.head.as_ref().is_none_or(|head| !request.worktree
+            && !head.is_empty() && !head.chars().any(char::is_control)),
+        "invalid comparison head"
+    );
     let path = request.path.as_ref().map(resolve_argument).transpose()?;
-    let retained = request.reference.capacity()
+    let retained = request.reference.capacity() + request.head.as_ref().map_or(0, String::capacity)
         + request
             .path
             .as_ref()
@@ -77,7 +96,20 @@ pub async fn observe(
                 .rev_parse_single(spec.as_str())
                 .context("comparison reference unavailable")?
                 .detach();
+            let head = request.head.as_ref().map(|head| {
+                local.rev_parse_single(format!("{head}^{{commit}}").as_str())
+                    .map(|resolved| resolved.detach())
+                    .context("comparison head unavailable")
+            }).transpose()?;
+            let baseline = if let Some(head) = head {
+                local.merge_base(commit, head).context("comparison branches have no merge base")?.detach()
+            } else {
+                commit
+            };
             check()?;
+            if let Some(head) = head {
+                ensure_mergeable(root, commit, head, &mut check)?;
+            }
             let mut command = Command::new("git");
             command
                 .args([
@@ -108,8 +140,11 @@ pub async fn observe(
                     "--no-ext-diff",
                     "--no-textconv",
                 ])
-                .arg(commit.to_string())
-                .arg("--");
+                .arg(baseline.to_string());
+            if let Some(head) = head {
+                command.arg(head.to_string());
+            }
+            command.arg("--");
             if let Some(path) = path {
                 command.arg(path);
             }
@@ -144,7 +179,8 @@ pub async fn observe(
                     origin,
                 });
             }
-            crate::snapshot::collect_line_stats(
+            if head.is_none() {
+                crate::snapshot::collect_line_stats(
                 &local,
                 &worker.identity,
                 &mut path,
@@ -152,7 +188,8 @@ pub async fn observe(
                 Some(&worker.line_stats),
                 skip_line_stats,
                 &mut check,
-            )?;
+                )?;
+            }
             for observed in &mut path {
                 for prepared in observed.analysis.iter_mut().flatten() {
                     prepared.generation = Some(generation);
@@ -171,6 +208,35 @@ pub async fn observe(
             })
         })
         .await
+}
+
+fn ensure_mergeable(
+    root: &std::path::Path,
+    base: gix::ObjectId,
+    head: gix::ObjectId,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<()> {
+    let output = read_command(
+        Command::new("git")
+            .args(["--no-pager", "--no-optional-locks", "-C"])
+            .arg(root)
+            .args(["merge-tree", "--write-tree", "--quiet"])
+            .arg(base.to_string())
+            .arg(head.to_string()),
+        CommandLimits {
+            stderr_bytes: 4096,
+            timeout: Duration::from_secs(30),
+        },
+        check,
+    )?;
+    match output.status.code() {
+        Some(0) => Ok(()),
+        Some(1) => Err(MergeConflict.into()),
+        _ => anyhow::bail!(
+            "merge conflict check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    }
 }
 
 fn parse(bytes: &[u8], worktree: bool) -> Result<Vec<PathRecord>> {
@@ -264,6 +330,57 @@ fn parse(bytes: &[u8], worktree: bool) -> Result<Vec<PathRecord>> {
 mod tests {
     use super::*;
     #[tokio::test]
+    async fn conflicting_ranges_stop_without_changing_checkout_state() {
+        for scenario in ["text", "binary", "rename"] {
+            let directory = tempfile::tempdir().unwrap();
+            let root = directory.path();
+            let git = |arguments: &[&str]| crate::test_support::git(root, arguments);
+            git(&["init", "--quiet", "--initial-branch=main"]);
+            git(&["config", "user.name", "Forge"]);
+            git(&["config", "user.email", "forge@example.invalid"]);
+            git(&["config", "core.autocrlf", "false"]);
+            let binary = scenario == "binary";
+            let original: &[u8] = if binary { b"original\0bytes" } else { b"original\n" };
+            std::fs::write(root.join("shared.txt"), original).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "--quiet", "-m", "initial"]);
+            git(&["checkout", "--quiet", "-b", "feature"]);
+            if scenario == "rename" {
+                git(&["mv", "shared.txt", "feature.txt"]);
+            } else {
+                let content: &[u8] = if binary { b"head\0bytes" } else { b"head\n" };
+                std::fs::write(root.join("shared.txt"), content).unwrap();
+            }
+            git(&["commit", "--quiet", "-am", "head"]);
+            git(&["checkout", "--quiet", "main"]);
+            if scenario == "rename" {
+                git(&["mv", "shared.txt", "base.txt"]);
+            } else {
+                let content: &[u8] = if binary { b"base\0bytes" } else { b"base\n" };
+                std::fs::write(root.join("shared.txt"), content).unwrap();
+            }
+            git(&["commit", "--quiet", "-am", "base"]);
+            std::fs::write(root.join("staged.txt"), "staged contents\n").unwrap();
+            git(&["add", "staged.txt"]);
+            std::fs::write(root.join("untracked.txt"), "untracked contents\n").unwrap();
+            let head_before = git(&["rev-parse", "HEAD"]);
+            let status_before = git(&["status", "--porcelain=v2"]);
+            let index_before = std::fs::read(root.join(".git/index")).unwrap();
+            let store = RepositoryStore::default();
+            let repository = store.open(root.to_owned()).await.unwrap().unwrap();
+            let failure = observe(&store, repository, ComparisonRequest {
+                reference: "main".into(), head: Some("feature".into()), worktree: false, path: None,
+            }).await.err().expect("conflicting range was accepted");
+            assert!(failure.is::<MergeConflict>(), "{scenario}: {failure:#}");
+            assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
+            assert_eq!(git(&["status", "--porcelain=v2"]), status_before);
+            assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index_before);
+            assert_eq!(std::fs::read(root.join("staged.txt")).unwrap(), b"staged contents\n");
+            assert_eq!(std::fs::read(root.join("untracked.txt")).unwrap(), b"untracked contents\n");
+        }
+    }
+
+    #[tokio::test]
     async fn native_comparison_pins_commit_and_reads_worktree_or_commit_sources() {
         let directory = tempfile::tempdir().unwrap();
         let git = |args: &[&str]| crate::test_support::git(directory.path(), args);
@@ -285,6 +402,7 @@ mod tests {
             Arc::clone(&repository),
             ComparisonRequest {
                 reference: "HEAD".into(),
+                head: None,
                 worktree: false,
                 path: None,
             },
@@ -307,6 +425,7 @@ mod tests {
             repository,
             ComparisonRequest {
                 reference: historical.commit.to_string(),
+                head: None,
                 worktree: true,
                 path: Some(RepositoryPath::new(b"literal [path].txt".to_vec()).unwrap()),
             },
