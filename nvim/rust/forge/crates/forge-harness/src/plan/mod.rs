@@ -52,6 +52,7 @@ pub(crate) use review_annotation::resolve_annotations;
 pub use review_annotation::{ReviewAnnotation, ReviewAnnotationAnchor, ReviewAnnotationKind, ReviewQuestionReply};
 pub(crate) mod review_document;
 mod review_projection;
+mod review_symbols;
 pub(crate) mod review_source;
 mod scheduler;
 pub(crate) mod execution;

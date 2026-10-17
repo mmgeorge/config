@@ -85,6 +85,25 @@ Uncaptured and removed files cannot enter this resolver through filesystem disco
 
 ## Source-backed LSP navigation
 
+Narrative inline-code identifiers resolve against the complete proposed declaration index,
+including declarations hidden by the Public filter. Exact names and qualified names share
+one target identity for syntax coloring and definition navigation. Unique matches receive
+their declaration-kind color. Ambiguous names retain Markdown styling and open a chooser.
+Inline expressions, ordinary prose, and fenced code do not acquire narrative symbol targets.
+The same captured declaration index supplies type highlights for named value references
+under `Accesses`. The owning file takes precedence over other captured files. Ambiguous
+cross-file names retain their value highlight, and classification does not change plan data.
+
+An unmatched narrative name can query `workspace/symbol` on existing project clients when
+the reviewer requests its definition. The request filters exact names and excludes files
+captured by the plan, so deleted declarations cannot reappear through workspace fallback.
+It admits at most four clients and 256 results per client, with a five-second deadline.
+Cursor movement, revision changes, and closing the review cancel pending navigation. Missing
+clients and zero matches produce informational messages. Failed or incomplete lookups report
+their error instead of selecting from partial results. A successful workspace lookup colors
+the selected inline reference using the returned symbol kind. This transient decoration is
+cleared when the review projection changes. Unresolved references retain Markdown styling.
+
 Source-backed definition jumps use the existing project LSP on demand. Rust projects the real
 source path, captured digest, identifier position, and filetype through `workspace_definition`.
 Lua loads that real file into a hidden buffer without triggering server autostart, selects an
@@ -101,6 +120,13 @@ Multiple destinations use a chooser. Missing clients and empty results remain di
 request failures. Lua releases only temporary buffers created by the request and never stops the
 shared client. Neither Rust nor Lua caches jump results. Each jump issues a fresh request, while
 the language server retains ownership of its own analysis state.
+
+Definition destinations in captured plan files reveal the exact declaration inside PlanReview.
+The shared reveal transaction restores omitted context, opens enclosing folds, and preserves the
+Public filter and canonical plan bytes. Definition jumps never fall back to a declaration popup.
+Targets outside the captured plan open in normal source buffers. Lua applies any reveal patch
+before moving the cursor and records the originating position for jump-back. Unsaved annotations
+must be saved before a definition jump can change the source projection.
 
 Tree-sitter still owns extraction, formatting, syntax presentation, and source-token mapping.
 Captured references retain the exact source expression independently of their inferred name and
@@ -180,6 +206,10 @@ Plan review places Tests after proposed declaration changes and before Verificat
 retains its own fold boundary and navigation targets in both full and public-only views.
 The blank row before Tests stays outside the Changes fold in both views.
 Public filtering preserves that unhighlighted section spacer even after an empty diff row.
+Changed function versions retain separate fold ranges when shared diff context
+would otherwise join their bodies. The comparison duplicates that context with
+one source side per row, preserving source coordinates and added/removed counts.
+Collapsing a baseline function therefore cannot hide proposed declarations.
 
 `plan/prompts/planning.md` owns the virtual file procedure, metadata roles, declaration syntax,
 validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedback, revision, and

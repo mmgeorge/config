@@ -87,6 +87,11 @@ impl FileDiff {
                 break;
             }
         }
+        if let Some(before) = before {
+            for hunk in &mut result.hunk {
+                hunk.separate_function_sides(before, after);
+            }
+        }
         for (side, source, context) in [
             (SourceSide::Old, before, old_context.as_ref()),
             (SourceSide::New, after, new_context.as_ref()),
@@ -183,6 +188,71 @@ pub(super) struct ReviewHunk {
     pub group: DisplayHunk,
     /// Display rows with shared intraline emphasis and absolute source coordinates.
     pub row: Vec<DisplayRow>,
+}
+
+impl ReviewHunk {
+    fn separate_function_sides(&mut self, before: &CallPresentation, after: Option<&CallPresentation>) {
+        // Shared context can align bodies from different functions. Separate their
+        // source coordinates before folds consume contiguous display rows.
+        let baseline = before.declaration.text.lines().collect::<Vec<_>>();
+        for (&start, body) in &before.body {
+            let first = body.heading;
+            let end = body.end;
+            let Some(opening) = self.row.iter().position(|row|
+                row.old.is_some_and(|coordinate| coordinate.line == first)) else {
+                continue;
+            };
+            let Some(closing) = self.row.iter().position(|row|
+                row.old.is_some_and(|coordinate| coordinate.line == end)) else {
+                continue;
+            };
+            if closing <= opening {
+                continue;
+            }
+            let proposed = after.and_then(|after| after.body.iter().find(|(_, candidate)| candidate.owner == body.owner));
+            let shares_boundaries = proposed.is_some_and(|(&proposed_start, proposed_body)| {
+                self.row.iter().any(|row| row.old.is_some_and(|coordinate| coordinate.line == start)
+                    && row.new.is_some_and(|coordinate| coordinate.line == proposed_start))
+                    && self.row[closing].new.is_some_and(|coordinate| coordinate.line == proposed_body.end)
+            });
+            let crosses_declaration = self.row[opening..=closing].iter().any(|row| row.new.is_some_and(|coordinate|
+                proposed.is_none_or(|(_, candidate)| !(candidate.heading..=candidate.end).contains(&coordinate.line))));
+            if shares_boundaries && !crosses_declaration {
+                continue;
+            }
+            if !self.row[opening..=closing].iter().any(|row| row.new.is_some()) {
+                continue;
+            }
+            let insertion = self.row[..opening].iter().rposition(|row| row.old.is_some())
+                .map_or(opening, |previous| previous + 1);
+            let group_index = self.row[opening].group_index;
+            let mut removed = std::collections::BTreeMap::new();
+            let mut following = Vec::new();
+            for mut row in self.row.drain(opening..=closing) {
+                if row.old.is_some_and(|coordinate| (first..=end).contains(&coordinate.line)) {
+                    let line = row.old.unwrap().line;
+                    if row.new.is_some() {
+                        let mut old = row.clone();
+                        old.new = None;
+                        removed.insert(line, old);
+                        row.old = None;
+                        following.push(row);
+                    } else {
+                        removed.insert(line, row);
+                    }
+                } else {
+                    following.push(row);
+                }
+            }
+            self.row.splice(opening..opening, following);
+            let removed = (first..=end).map(|line| removed.remove(&line).unwrap_or_else(|| DisplayRow {
+                group_index, text: baseline[line].into(), kind: RowKind::Context,
+                old: Some(SourceCoordinate { side: SourceSide::Old, line, byte_column: 0 }),
+                new: None, raw_id: None, emphasis: Vec::new(), emphasis_fallback: None,
+            })).collect::<Vec<_>>();
+            self.row.splice(insertion..insertion, removed);
+        }
+    }
 }
 
 struct DeclarationContext {

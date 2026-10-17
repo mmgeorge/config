@@ -20,6 +20,7 @@ local perf = require("forge.infra.perf")
 ---@return table
 function M.attach(options, callback)
   local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {} }
+  local symbol_namespace = vim.api.nvim_create_namespace("forge.plan_review.symbols")
   local delivery = {}
   local function alive()
     return not owner.closed and owner.generation == client.host_generation() and client.host_accepting()
@@ -50,6 +51,23 @@ function M.attach(options, callback)
       and view.changedtick == vim.api.nvim_buf_get_changedtick(options.buffer)
       and view.sequence == captured.sequence
       and (cursor_bound == false or vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor))
+  end
+  ---@param captured ForgeDocumentInput
+  ---@param capture string?
+  function owner.highlight_symbol(captured, capture)
+    if not capture or not owner.is_current(captured) then return end
+    local _, row = owner.replica.sequence:position(captured.block)
+    local node = owner.replica.sequence.node[captured.block]
+    if not node or not row then return end
+    for _, target in ipairs(node.entry.metadata.target or {}) do
+      if target.id == captured.target then
+        vim.api.nvim_buf_set_extmark(options.buffer, symbol_namespace, buffer.physical_row(owner.replica, row + target.range.start.row), target.range.start.column, {
+          end_row = buffer.physical_row(owner.replica, row + target.range["end"].row), end_col = target.range["end"].column,
+          hl_group = capture, priority = 130,
+        })
+        return
+      end
+    end
   end
   function owner.sync_editability()
     if not owner.ready or not owner.comment_state then return end
@@ -345,6 +363,7 @@ function M.attach(options, callback)
     return settle
   end
   local function apply_projection(opened, source)
+    vim.api.nvim_buf_clear_namespace(options.buffer, symbol_namespace, 0, -1)
     if not source then
       local snapshot, rows, fragment = require("forge.views.plan_review.delivery").apply(delivery, opened)
       opened = vim.tbl_extend("force", opened, { snapshot = snapshot, source_row = rows })
@@ -517,10 +536,36 @@ function M.attach(options, callback)
   ---@param source ForgeWorkspaceDefinition
   ---@param target ForgeDefinitionLocation
   ---@param receive fun(result: table?, failure: string?, captured: table)
+  ---@param result table
+  ---@param captured ForgeDocumentInput
+  ---@param view table?
+  ---@return ForgeDocumentInput?, string?
+  local function apply_action_projection(result, captured, view)
+    if not result.patch or result.patch == vim.NIL then return captured end
+    local applied = apply_projection(result)
+    if applied.kind ~= "Applied" then return nil, applied.kind end
+    captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
+    if view and view.id == captured.view then
+      view.cursor = vim.api.nvim_win_get_cursor(view.window)
+      view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
+    end
+    return captured
+  end
+
   function owner.definition(captured, source, target, receive)
     if not owner.is_current(captured) then return end
+    if vim.bo[options.buffer].modified then
+      if options.notice then options.notice("Save plan annotations before jumping to a definition") end
+      return
+    end
     request({ operation = "plan_definition", input = captured, source = source, target = target }, function(result, failure)
-      if owner.is_current(captured) then receive(result, failure, captured) end
+      if not owner.is_current(captured) then return end
+      if not failure then
+        local applied, projection_failure = apply_action_projection(result, captured, owner.current_view())
+        if not applied then receive(nil, projection_failure, captured) return end
+        captured = applied
+      end
+      receive(result, failure, captured)
     end)
   end
 
@@ -536,7 +581,7 @@ function M.attach(options, callback)
       if options.notice then options.notice("Wait for the planned test deletion to finish") end
       return false
     end
-    if (action == "toggle_public" or action == "toggle_declaration" or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
+    if (action == "toggle_public" or action == "toggle_declaration" or action == "jump_entity" or action:find("jump_symbol:", 1, true) == 1 or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end
@@ -568,13 +613,9 @@ function M.attach(options, callback)
               view.window, collapse.opening)
           end
         end
-        local applied = apply_projection(result)
-        if applied.kind ~= "Applied" then receive(nil, applied.kind, captured) return end
-        captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
-        if view and view.id == captured.view then
-          view.cursor = vim.api.nvim_win_get_cursor(view.window)
-          view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
-        end
+        local applied, projection_failure = apply_action_projection(result, captured, view)
+        if not applied then receive(nil, projection_failure, captured) return end
+        captured = applied
       end
       receive(result, error, captured)
     end)

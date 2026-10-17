@@ -81,6 +81,13 @@ struct RenderState<'profile> {
 }
 
 impl MarkdownRenderer {
+    /// Return inline code spans and their byte ranges in the original Markdown.
+    pub fn inline_code(source: &str) -> Vec<(Range<usize>, String)> {
+        Parser::new_ext(source, Options::all()).into_offset_iter().filter_map(|(event, range)| {
+            if let Event::Code(text) = event { Some((range, text.into_string())) } else { None }
+        }).collect()
+    }
+
     /// Preserves physical source rows and delimiters while decorating Markdown spans.
     ///
     /// Views retain responsibility for soft wrapping. Source and output row identities

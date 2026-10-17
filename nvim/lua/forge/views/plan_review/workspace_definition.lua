@@ -12,6 +12,7 @@ local M = {}
 ---@field line integer
 ---@field column integer
 ---@field modified? boolean
+---@field capture? string
 
 local source_buffer = require("forge.lsp.source")
 local canonical, read, rows = source_buffer.canonical, source_buffer.read, source_buffer.rows

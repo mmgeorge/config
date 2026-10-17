@@ -5,19 +5,24 @@ if not vim.g.forge_plan_calls_grid then
   assert(child > 0)
   local success, failure = xpcall(function()
     vim.rpcrequest(child, "nvim_ui_attach", 160, 48, { rgb = true })
-    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
+    vim.rpcrequest(child, "nvim_exec_lua", "vim.g.forge_plan_calls_grid = true; vim.g.forge_plan_definition_only = " .. tostring(vim.g.forge_plan_definition_only == true) .. "; vim.opt.runtimepath:prepend(vim.fn.getcwd() .. '/nvim'); dofile(...)", { test_path })
   end, debug.traceback)
   vim.fn.jobstop(child)
   if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
-  print("plan_review_calls_host: passed at 160x48")
+  print(vim.g.forge_plan_definition_only and "plan_review_definition_host: passed at 160x48" or "plan_review_calls_host: passed at 160x48")
   vim.cmd("qa!")
   return
 end
+local definition_only = vim.g.forge_plan_definition_only == true
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 vim.fn.writefile({vim.json.encode({checks={version=2,definitions={}}})},workspace .. "/.forge.json")
 local source = { "pub fn leaf() {}", "pub fn run() { leaf(); leaf(); }", "pub struct Client { pub count: usize }", "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; }", "/// Describes the following declaration.", "pub struct Following;" }
+if definition_only then
+  source[3] = "pub struct Client { pub count: usize, secret: usize }"
+  source[4] = "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; client.secret += 1; }"
+end
 vim.fn.writefile(source, workspace .. "/src/change.rs")
 vim.fn.writefile({ "[package]", 'name = "call_navigation"', 'version = "0.1.0"', 'edition = "2021"', "[lib]", 'path = "src/change.rs"' }, workspace .. "/Cargo.toml")
 vim.fn.writefile({ "invalid Rust {" }, workspace .. "/unrelated.rs")
@@ -42,7 +47,7 @@ require("forge.views.plan_review.references").show_caller = true
 local definition = require("forge.views.plan_review.workspace_definition")
 definition.request = function(query, current, receive)
   local name = source[query.line]:sub(query.column + 1):match("^[%w_]+")
-  local line = assert(({ count = 3, leaf = 1 })[name], "unexpected fixture definition: " .. tostring(name))
+  local line = assert(({ count = 3, secret = 3, leaf = 1 })[name], "unexpected fixture definition: " .. tostring(name))
   local cancelled = false
   vim.schedule(function()
     if not cancelled and current() then receive({ path = query.path, line = line, column = assert(source[line]:find(name, 1, true)) - 1 }) end
@@ -81,17 +86,55 @@ local success, failure = xpcall(function()
   local properties
   for _, callable in ipairs(document.design.baseline_calls["src/change.rs"]) do
     if callable.owner == "update" then
-      assert(#callable.call == 3 and callable.call[1].name == "leaf")
+      assert(#callable.call == (definition_only and 4 or 3) and callable.call[1].name == "leaf")
       properties = vim.tbl_filter(function(occurrence) return occurrence.kind == "property" end, callable.call)
     end
   end
-  assert(properties and #properties == 2 and properties[1].kind == "property" and properties[2].kind == "property")
+  assert(properties and #properties == (definition_only and 3 or 2) and properties[1].kind == "property" and properties[2].kind == "property")
   assert(properties[1].name == "Client::count" and properties[2].name == "Client::count")
   local original_columns = vim.o.columns
   vim.o.columns = 48
   require("forge.views.plan_review").open(state.active_plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "PlanReview did not open")
   local review = state.plan_review
+  if definition_only then
+  assert(not table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("secret: usize", 1, true),
+    "private property leaked into the initial Public view")
+  local update_row
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row:find("pub fn update", 1, true) then update_row = index break end
+  end
+  vim.api.nvim_win_set_cursor(review.win, { assert(update_row), 0 })
+  review.command_set.action_by_id.toggle.run({})
+  await(function()
+    return table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("Client::secret", 1, true)
+  end, "private property use did not expand")
+  local secret_row, secret_column
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if vim.trim(row) == "Client::secret" then secret_row, secret_column = index, row:find("secret", 1, true) - 1 end
+  end
+  assert(secret_row, "private property reference is missing")
+  vim.api.nvim_win_set_cursor(review.win, { secret_row, secret_column })
+  local window_count = #vim.api.nvim_list_wins()
+  review.command_set.action_by_id.jump_entity.run({})
+  await(function()
+    return vim.api.nvim_get_current_buf() == review.buf and vim.api.nvim_get_current_line():find("secret: usize", 1, true)
+  end, "private property definition did not reveal in the plan")
+  assert(vim.api.nvim_get_current_win() == review.win and #vim.api.nvim_list_wins() == window_count,
+    "private property definition opened a popup")
+  assert(vim.api.nvim_get_current_line():sub(vim.api.nvim_win_get_cursor(review.win)[2] + 1):match("^secret"),
+    "private property definition selected the wrong column")
+  assert(review.public_only, "private property jump changed the Public filter")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+  assert(vim.trim(vim.api.nvim_get_current_line()) == "Client::secret", "jump-back lost the private property origin")
+  review.command_set.action_by_id.toggle.run({})
+  await(function()
+    return not table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("Client::secret", 1, true)
+  end, "private property function did not collapse")
+    review.command_set.action_by_id.close.run({})
+    require("forge.views.harness.controller").command_set().action_by_id.close.run({})
+    return
+  end
   assert(not vim.wo[review.win].number and not vim.wo[review.win].relativenumber and vim.wo[review.win].statuscolumn == "",
     "PlanReview displayed editor line numbers")
   local description_row

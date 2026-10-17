@@ -74,6 +74,21 @@ groups without repeating that `impl` header. Explicit reference navigation can
 reveal nearby context around a declaration outside the displayed changes.
 Regular diffs and PlanReview render enclosing declarations as syntax-highlighted
 source lines. An indented `...` marks omitted source between visible regions.
+Old and new function versions expand independently. Collapsing an old function
+keeps added declarations outside its body visible.
+
+Inline-code names in plan prose use declaration-kind colors when the proposed
+plan resolves them. Go to definition opens that proposed declaration, including
+private declarations hidden by the Public filter. Ambiguous names open a picker.
+Definition jumps reveal omitted declarations and open their enclosing folds in
+PlanReview. Definitions outside the plan open in normal source buffers.
+Save pending annotations before a definition jump that changes the projection.
+Type references under `Accesses` use green type highlighting.
+Test names use function highlighting and omit the leading `tests::` in the file
+list. Navigation and test selection retain the full qualified name.
+Names absent from the plan fall back to exact workspace symbol lookup through
+running project language servers. Removed declarations do not fall back to old
+source definitions.
 
 Inside PlanReview, `oc` opens plan-specific check selection. Space toggles a
 check, with `●` for enabled and `○` for disabled. Visual `j` deletes selected

@@ -88,6 +88,9 @@ pub(super) fn project(
     )?;
     let check_rows = review_checks(document.design.as_ref(), Some(width))?;
     let mut target = HashMap::new();
+    let design = document.design.as_ref().context("declaration review has no design")?;
+    let narrative_symbols = super::review_symbols::NarrativeSymbols::new(design, std::path::Path::new(""));
+    let narrative_spans = super::review_symbols::spans(design);
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     let mut omitted = 0;
@@ -126,6 +129,12 @@ pub(super) fn project(
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
             if matches!(anchor.target, PlanReviewTarget::Call { .. } | PlanReviewTarget::Change { .. }) {
                 super::review_projection::append_semantic_style(&mut row.metadata, &anchor.target, row.text.row(0).unwrap_or_default());
+                if let PlanReviewTarget::Call { path, side, name, kind: super::CallKind::Value, .. } = &anchor.target
+                    && narrative_symbols.is_type(path, side, name)
+                    && let Some(reference) = row.metadata.visible_decoration.last_mut()
+                {
+                    reference.capture = "ForgeWalkthroughType".into();
+                }
             }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
             row.metadata.target.push(TargetRange {
@@ -140,6 +149,7 @@ pub(super) fn project(
             });
             let mut anchor = anchor.clone();
             anchor.line = if context { 0 } else { anchor.line - omitted };
+            super::review_symbols::decorate(&mut row, &anchor, &narrative_spans, &narrative_symbols, &mut target);
             target.insert(id, anchor);
         }
         let row_id = row.id.clone();
@@ -729,7 +739,7 @@ pub(super) fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> R
             block.push(forge_diff::projection::header(
                 BlockId(case_id.clone()),
                 vec![TextChunk { text: format!("    {marker}"), capture: capture.into() },
-                    TextChunk { text: case.name.clone(), capture: "Normal".into() }], 0,
+                    TextChunk { text: case.name.strip_prefix("tests::").unwrap_or(&case.name).into(), capture: "@function".into() }], 0,
             )?);
             for (line_index, line) in case.description.lines().enumerate() {
                 block.push(BufferBlock {
@@ -1393,10 +1403,75 @@ mod tests {
     }
 
     #[test]
+    fn replaced_function_folds_keep_added_declarations_outside_the_removed_body() {
+        let mut document = crate::plan::document::test_fixture("replacement", "Replace main");
+        let mut design = super::super::DeclarationDesign::default();
+        design.baseline.insert("main.rs".into(), super::super::DeclarationFile {
+            text: "/// Creates the original application.\nfn main();\n\nfn setup();\n".into(),
+            source_digest: String::new(),
+        });
+        design.proposed.insert("main.rs".into(),
+            "pub struct PlayerAbilities { pub health: u32 }\n\n/// Creates the configured application.\nfn main();\n\nfn configure_game();\n\nfn setup();\n".into());
+        let body = |owner: &str, target: &str, change: Option<&str>| super::super::FunctionBody {
+            evidence: None, owner: owner.into(), change: change.map(str::to_owned),
+            call: Some(vec![super::super::CallSite {
+                kind: super::super::CallKind::Call, name: target.into(), source: None, unresolved: false,
+            }]),
+        };
+        let mut original = body("main", "setup", None);
+        for name in ["restart_round", "move_player", "chase_player", "resolve_collisions", "update_hud"] {
+            original.call.as_mut().unwrap().push(super::super::CallSite {
+                kind: super::super::CallKind::Call, name: name.into(), source: None, unresolved: false,
+            });
+        }
+        design.baseline_calls.insert("main.rs".into(), vec![original.clone()]);
+        original.owner = "configure_game".into();
+        design.proposed_calls.insert("main.rs".into(), vec![
+            body("main", "configure_game", Some("Use the shared gameplay configuration.")),
+            original,
+        ]);
+        document.design = Some(design);
+        for public_only in [false, true] {
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None,
+                &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            let collapsed = forge_buffer::collapse::project(blocks.clone(), &HashMap::new()).unwrap();
+            let text = collapsed.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("pub struct PlayerAbilities"), "{text}");
+            assert!(text.contains("Creates the original application"), "{text}");
+            assert!(text.contains("Creates the configured application"), "{text}");
+            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
+            let old = blocks.iter().find(|block| block.metadata.fold.iter()
+                .any(|fold| fold.id.0.contains(":baseline:") && block.text.row(0) == Some("fn main() {"))).unwrap();
+            let old_fold = old.metadata.fold.iter().find(|fold| fold.id.0.contains(":baseline:")).unwrap().id.clone();
+            let new = blocks.iter().find(|block| block.metadata.fold.iter()
+                .any(|fold| fold.id.0.contains(":proposed:") && block.text.row(0) == Some("fn main() {"))).unwrap();
+            let new_fold = new.metadata.fold.iter().find(|fold| fold.id.0.contains(":proposed:")).unwrap().id.clone();
+            let expanded = forge_buffer::collapse::project(blocks.clone(),
+                &HashMap::from([(old_fold, false)])).unwrap();
+            let text = expanded.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
+            assert!(text.contains("pub struct PlayerAbilities"), "{text}");
+            assert!(text.contains("restart_round"), "{text}");
+            assert!(!text.contains("Use the shared gameplay configuration."), "{text}");
+            let proposed = forge_buffer::collapse::project(blocks,
+                &HashMap::from([(new_fold, false)])).unwrap();
+            let text = proposed.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert_eq!(text.matches("fn main()").count(), 2, "{text}");
+            assert!(text.contains("Use the shared gameplay configuration."), "{text}");
+            assert!(!text.contains("restart_round"), "{text}");
+            if !public_only {
+                println!("PLAN_REPLACEMENT_FIXTURE:{}", serde_json::json!({
+                    "collapsed": collapsed, "baseline": expanded, "proposed": proposed,
+                }));
+            }
+        }
+    }
+
+    #[test]
     fn call_rows_highlight_qualified_types_methods_and_properties() {
         let mut document = crate::plan::document::test_fixture("call-colors", "Call colors");
         let mut design = super::super::DeclarationDesign::default();
-        design.proposed.insert("lib.rs".into(), "pub fn main();\n".into());
+        design.proposed.insert("lib.rs".into(), "pub fn main();\npub struct Projectile;\npub type projectile_alias = Projectile;\npub const MAX_SHOTS: u32;\n".into());
         let cases = [
             ("App::add_plugins", super::super::CallKind::Call, vec![("App", "@type"), ("add_plugins", "@function.method.call")]),
             ("std::time::Instant::now", super::super::CallKind::Call, vec![("std", "@module"), ("time", "@module"), ("Instant", "@type"), ("now", "@function.method.call")]),
@@ -1404,6 +1479,9 @@ mod tests {
             ("client.send", super::super::CallKind::Call, vec![("client", "@variable"), ("send", "@function.method.call")]),
             ("État::更新", super::super::CallKind::Call, vec![("État", "@type"), ("更新", "@function.method.call")]),
             ("Client::count", super::super::CallKind::Property, vec![("Client", "@type"), ("count", "@variable.member")]),
+            ("Projectile", super::super::CallKind::Value, vec![("Projectile", "ForgeWalkthroughType")]),
+            ("projectile_alias", super::super::CallKind::Value, vec![("projectile_alias", "ForgeWalkthroughType")]),
+            ("MAX_SHOTS", super::super::CallKind::Value, vec![("MAX_SHOTS", "@variable")]),
         ];
         design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionBody { evidence: None,
             owner: "main".into(),
@@ -1416,6 +1494,9 @@ mod tests {
         let original = document.clone();
         for public_only in [false, true] {
             let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            if !public_only {
+                println!("TYPE_ACCESS_FIXTURE:{}", serde_json::json!({"document":"type-accesses","revision":0,"block":blocks}));
+            }
             for (name, _, expected) in &cases {
                 let row = blocks.iter().find(|block| block.text.row(0).is_some_and(|text| text.trim() == *name)).unwrap();
                 let text = row.text.row(0).unwrap();
@@ -1457,8 +1538,17 @@ mod tests {
             let endpoint = &changes.metadata.fold[0].end;
             let end_index = block.iter().position(|block| block.id == endpoint.block).unwrap();
             assert!(end_index + usize::from(endpoint.position.row > 0) <= tests_start - 1);
-            for expected in ["    + tests::new_case", "    ~ tests::changed_case", "    − tests::old_case", "    existing_case"] {
+            for expected in ["    + new_case", "    ~ changed_case", "    − old_case", "    existing_case"] {
                 assert!(rows.contains(&expected));
+            }
+            let case = block.iter().find(|block| block.text.row(0) == Some("    ~ changed_case")).unwrap();
+            let name = case.metadata.decoration.iter().find(|decoration| decoration.capture == "@function").unwrap();
+            assert_eq!(&case.text.row(0).unwrap()[name.range.start.column..name.range.end.column], "changed_case");
+            assert!(case.metadata.target.iter().any(|range| matches!(&target[&range.id].target,
+                PlanReviewTarget::TestCase { name, .. } if name == "tests::changed_case")));
+            assert_eq!(document.design.as_ref().unwrap().document.tests[0].cases[1].name, "tests::changed_case");
+            if !public_only {
+                println!("TEST_NAME_FIXTURE:{}", serde_json::json!({"document":"test-names","revision":0,"block":block}));
             }
             assert!(!rows.iter().any(|row| row.contains("= existing_case")));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/tests/1/cases/0"));

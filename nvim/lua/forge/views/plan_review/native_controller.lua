@@ -113,10 +113,9 @@ local function action(review, name)
   if review.plan.historical_revision and (name == "comment" or name == "question" or name == "delete") then return end
   local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
   local function receive(result, failure, captured)
-    if (name == "rename_entity" or name == "jump_entity" or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
+    if (name == "rename_entity" or name == "jump_entity" or name:find("jump_symbol:", 1, true) == 1 or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
         or not vim.api.nvim_win_is_valid(review.win)
-        or vim.api.nvim_win_get_buf(review.win) ~= review.buf
-        or not vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor)) then return end
+        or vim.api.nvim_win_get_buf(review.win) ~= review.buf) then return end
     if failure then notice(failure) return end
     if name == "toggle_declaration" then
       effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
@@ -156,6 +155,26 @@ local function action(review, name)
       end)
     elseif name == "references" and type(result.references) == "table" then
       require("forge.views.plan_review.references").open(review, result.references, captured)
+    elseif type(result.symbol_choices) == "table" then
+      vim.ui.select(result.symbol_choices, { prompt = "Planned definition", format_item = function(choice) return choice.label end }, function(choice)
+        if choice and review.owner.is_current(captured) and vim.api.nvim_win_is_valid(review.win)
+          and vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor) then
+          action(review, "jump_symbol:" .. choice.index)
+        end
+      end)
+    elseif type(result.workspace_symbol) == "table" then
+      review.cancel_definition = require("forge.views.plan_review.workspace_symbol").request(result.workspace_symbol,
+        function() return review.owner.is_current(captured) and vim.api.nvim_win_is_valid(review.win)
+          and vim.api.nvim_win_get_buf(review.win) == review.buf
+          and vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor) end,
+        function(target, lookup_failure, message)
+          review.cancel_definition = nil
+          if lookup_failure then notice(lookup_failure)
+          elseif target then
+            review.owner.highlight_symbol(captured, target.capture)
+            effect(review, captured, { kind = "open_file", path = target.path, row = target.line - 1, column = target.column })
+          elseif message and message ~= "cancelled" then notifications.info(message, "ForgePlanReview") end
+        end)
     elseif type(result.workspace_definition) == "table" then
       review.cancel_definition = require("forge.views.plan_review.workspace_definition").request(result.workspace_definition,
         function() return review.owner.is_current(captured)
@@ -172,7 +191,7 @@ local function action(review, name)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else notifications.info("External references are unchecked during planning", "ForgePlanReview") end
-    elseif (name == "jump_entity" or name:find("reveal_reference:", 1, true) == 1) and type(result.jump) == "table" then
+    elseif (name == "jump_entity" or name == "open" or name:find("jump_symbol:", 1, true) == 1 or name:find("reveal_reference:", 1, true) == 1) and type(result.jump) == "table" then
       effect(review, captured, { kind = "cursor", jump = true, block = result.jump.block, position = result.jump.position })
     elseif name == "open" and type(result.anchor) == "table" and type(result.anchor.target) == "table"
       and result.anchor.target.target_type == "dependency" then

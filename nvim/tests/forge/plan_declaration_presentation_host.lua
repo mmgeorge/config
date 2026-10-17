@@ -353,17 +353,22 @@ local success, failure = xpcall(function()
   original_request(unpack(held_jump))
   vim.wait(100)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), retained_cursor), "late navigation moved the cursor")
-  local function jump_to_snapshot(needle, name)
+  local function jump_to_plan(needle, name)
     local row = declaration_row(needle)
     local line = vim.api.nvim_buf_get_lines(review.buf, row - 1, row, false)[1]
     local reference = name == "RemoteState" and "SharedState" or name
     local column = assert(line:find(reference, 1, true), "missing reference: " .. reference) - 1
     vim.api.nvim_win_set_cursor(review.win, { row, column })
     vim.api.nvim_feedkeys(".", "xt", false)
-    await(function() return vim.api.nvim_get_current_win() ~= review.win end, "declaration snapshot did not open: " .. name)
-    assert(vim.api.nvim_get_current_line():find("struct " .. name, 1, true), "snapshot selected the wrong declaration: " .. name)
-    vim.api.nvim_feedkeys("q", "xt", false)
-    assert(vim.api.nvim_get_current_win() == review.win, "snapshot did not return to review")
+    local original_windows = #vim.api.nvim_list_wins()
+    await(function() return vim.api.nvim_get_current_buf() == review.buf
+      and vim.api.nvim_get_current_line():find("struct " .. name, 1, true) end, "hidden definition did not reveal in the plan: " .. name)
+    assert(vim.api.nvim_get_current_win() == review.win and #vim.api.nvim_list_wins() == original_windows,
+      "definition jump opened a declaration popup")
+    assert(review.public_only, "definition jump changed the Public filter")
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+    await(function() return vim.api.nvim_get_current_buf() == review.buf
+      and vim.api.nvim_get_current_line():find(needle, 1, true) end, "jump-back did not restore the originating declaration")
   end
   local remote_row = declaration_row("pub(crate) fn inspect_remote")
   local remote_text = vim.api.nvim_buf_get_lines(review.buf, remote_row - 1, remote_row, false)[1]
@@ -377,7 +382,7 @@ local success, failure = xpcall(function()
     "returning from uncaptured source lost the review attachment")
   public_key()
   await(function() return review.public_only == true end, "hidden-type test did not filter")
-  jump_to_snapshot("pub fn inspect_hidden", "HiddenState")
+  jump_to_plan("pub fn inspect_hidden", "HiddenState")
   public_key()
   await(function() return review.public_only == false end, "hidden-type test did not restore")
   local trace_status
