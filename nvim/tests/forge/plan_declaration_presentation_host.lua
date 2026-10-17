@@ -548,15 +548,14 @@ local success, failure = xpcall(function()
     if vim.api.nvim_buf_get_lines(review.buf, row, row + 1, false)[1]:find("pub second:", 1, true) then selected = row break end
   end
   assert(selected, "second member is missing")
-  vim.api.nvim_win_set_cursor(review.win, { selected + 1, 0 })
+  vim.api.nvim_win_set_cursor(review.win, { file_row, 0 })
   local opened
   review.owner.action("open", function(value, error_message) assert(not error_message, error_message) opened = value end)
-  await(function() return opened end, "declaration snapshot did not open")
-  local declaration_rows = {}
-  for _, block in ipairs(opened.declarations.block) do
-    for _, row in ipairs(block.text) do declaration_rows[#declaration_rows + 1] = row end
-  end
-  assert(table.concat(declaration_rows, "\n"):find("  pub second: u64,", 1, true), "snapshot used saved spacing")
+  await(function() return opened end, "source file navigation did not resolve")
+  assert(opened.source and vim.fs.normalize(opened.source.path) == vim.fs.normalize(workspace .. "/src/change.rs"),
+    "opening the declaration file did not select its actual source buffer")
+  assert(not opened.declarations, "opening the file returned a declaration popup")
+  vim.api.nvim_win_set_cursor(review.win, { selected + 1, 0 })
   local comment
   review.owner.action("comment", function(value, error_message) assert(not error_message, error_message) comment = value end)
   await(function() return comment end, "comment did not attach")

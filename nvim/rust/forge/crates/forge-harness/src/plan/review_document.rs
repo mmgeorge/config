@@ -249,7 +249,7 @@ impl PlanReviewStore {
         let mut store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
         let (document, admission) = store.get_mut(&input.document).context("plan review document is closed")?;
         admission.check()?;
-        ensure!(input.action == "jump_entity" && document.view.get(&input.view) == Some(&input.sequence), "definition action was superseded");
+        ensure!(matches!(input.action.as_str(), "jump_entity" | "open") && document.view.get(&input.view) == Some(&input.sequence), "definition action was superseded");
         let identity = document.input_target(input)?.context("definition action has no target")?;
         let anchor = document.target.get(&identity).context("definition target is unavailable")?.clone();
         let row = document.document.block(&input.block).and_then(|block| block.text.row(input.position.row)).context("definition row is unavailable")?;
@@ -787,38 +787,12 @@ impl PlanReviewDocument {
             }
             return Ok(serde_json::json!({"message":"Use go to definition on this inline reference"}));
         }
-        if let Some(design) = &self.source.document.design {
-            if action == "jump_entity" {
-                return self.jump_declaration(&anchor, row, column);
+        if self.source.document.design.is_some() {
+            ensure!(matches!(action, "jump_entity" | "open"), "this design action is unavailable");
+            if let PlanReviewTarget::File { path } = &anchor.target {
+                return Ok(serde_json::json!({"source":{"path":self.source.workspace.join(path),"line":1,"column":0}}));
             }
-            ensure!(action == "open", "this design action is unavailable");
-            let (path, side) = match &anchor.target {
-                PlanReviewTarget::Declaration { path, side, .. } | PlanReviewTarget::Call { path, side, .. } | PlanReviewTarget::Behavior { path, side, .. } => (path, side.as_str()),
-                PlanReviewTarget::File { path } => (path, "proposed"),
-                _ => anyhow::bail!("select a declaration file or line"),
-            };
-            let text = if side == "baseline" {
-                design.baseline.get(path).map(|file| &file.text)
-            } else {
-                design
-                    .proposed
-                    .get(path)
-                    .or_else(|| design.baseline.get(path).map(|file| &file.text))
-            }
-            .context("declaration file is unavailable")?;
-            let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
-            let presentation = super::calls::present(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default())?;
-            let snapshot = BufferDocument::new(
-                DocumentId(format!("plan:declarations:{}", uuid::Uuid::new_v4())),
-                vec![forge_buffer::block::BufferBlock {
-                    id: forge_buffer::identity::BlockId("declarations".into()),
-                    text: forge_buffer::text::BufferText::from_rows(presentation.declaration.text.lines())?,
-                    metadata: Default::default(),
-                }],
-            )?
-            .snapshot();
-            let filetype = forge_diff::syntax::DeclarationOverview::filetype(path);
-            return Ok(serde_json::json!({"declarations":snapshot,"filetype":filetype}));
+            return self.jump_declaration(&anchor, row, column);
         }
         let callable = match &anchor.target {
             PlanReviewTarget::FlowEdge {
@@ -2119,11 +2093,18 @@ mod tests {
         document.toggle_public().unwrap();
         let (anchor, row) = select(&document, "hidden: Hidden");
         let result = document
-            .describe(anchor, "jump_entity", &row, row.find("Hidden").unwrap())
+            .describe(anchor, "open", &row, row.find("Hidden").unwrap())
             .unwrap();
         assert!(result["jump"].is_object() && result["patch"].is_object(), "{result}");
         assert!(result.get("declarations").is_none());
         assert!(document.source.public_only);
+        let anchor = document.target.values().find(|anchor| {
+            matches!(&anchor.target, super::super::PlanReviewTarget::File { path } if path == "api.ts")
+        }).unwrap().clone();
+        let result = document.describe(anchor, "open", "", 0).unwrap();
+        assert!(result["source"].is_object(), "{result}");
+        assert_eq!(result["source"]["line"], 1);
+        assert!(result.get("declarations").is_none());
     }
 
     #[test]

@@ -246,7 +246,7 @@ impl HarnessService {
                     &json!({"operation_id":format!("preview:{}:{}", input.document.0, input.sequence.0),
                         "document":input.document,"expected_version":input.revision})));
                 let preview = preview_trace.as_ref().map(|trace| trace.stage("preview.total"));
-                let trace = if input.action == "jump_entity" {
+                let trace = if matches!(input.action.as_str(), "jump_entity" | "open") {
                     crate::declaration::trace::DeclarationTrace::new(
                         registry.runtime.trace(),
                         &session_id,
@@ -256,7 +256,7 @@ impl HarnessService {
                     None
                 };
                 let total = trace.as_ref().map(|trace| trace.stage("total", None));
-                if input.action == "jump_entity" {
+                if matches!(input.action.as_str(), "jump_entity" | "open") {
                     controller
                         .plan_review
                         .prepare_declaration_jump(input, trace.as_ref())

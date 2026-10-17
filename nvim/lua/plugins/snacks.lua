@@ -741,6 +741,7 @@ return {
       },
       styles = {
         notification = {
+          focusable = false,
           wo = {
             wrap = true,
             linebreak = true,

@@ -141,7 +141,7 @@ M.view_specs = {
     { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration, call, or property definition", modes = "n", pinned = true },
     { id = "toggle_public", label = "public", desc = "Toggle public-only declarations", modes = "n", pinned = true },
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = true },
-    { id = "open", label = "open", desc = "Open the declaration snapshot for this diff line", modes = "n", pinned = true },
+    { id = "open", label = "open", desc = "Jump to the selected definition or open the source file", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
     { id = "question", label = "ask", desc = "Ask about the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
     { id = "save", label = "save / ask", desc = "Save feedback and answer new plan questions", modes = { "n", "i" }, pinned = true },

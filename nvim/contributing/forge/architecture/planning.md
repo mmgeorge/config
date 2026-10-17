@@ -197,9 +197,10 @@ freezing it. `DeclarationDesign.validation` stores generated location-bearing di
 snapshot fingerprint. Patches invalidate that evidence. Review displays a collapsible Validation
 section. Proven invalid or ambiguous references reject submission. Unverified references warn.
 
-`.` resolves the selected token through saved Tree-sitter token coordinates. It jumps to a visible
-plan declaration and opens containing folds, opens a declaration snapshot when the target is hidden
-or outside the diff, or opens the exact existing project/dependency/standard-library source location.
+`.` and `open` resolve the selected token through saved Tree-sitter token coordinates. They jump to
+the plan declaration, revealing hidden context and opening containing folds, or open the exact
+existing project/dependency/standard-library source buffer when the target is outside the plan.
+Opening a file heading selects its actual source buffer. Declaration navigation has no popup path.
 Re-export navigation follows the defining declaration. Filtering remains unchanged. Native input
 revision, view, and cursor guards discard stale responses. Lua owns key binding and presentation,
 while Rust owns resolution and source coordinates.

@@ -122,7 +122,7 @@ All `crates/...` paths above are relative to `nvim/rust/forge/`.
 | Existing source | A real project server resolves both local and relative-dependency definitions |
 | Unavailable analysis | Missing clients, empty results, timeouts, and unavailable external dependencies do not block plan saving |
 | Stale results | A changed source, plan revision, view, or client cannot apply an obsolete definition result |
-| Editor behavior | Navigation selects the expected file/token or declaration popup and preserves return navigation |
+| Editor behavior | Navigation selects the expected plan token or actual source buffer without a popup and preserves return navigation |
 
 ## Troubleshooting
 

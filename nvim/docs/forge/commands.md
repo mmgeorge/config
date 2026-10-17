@@ -107,6 +107,8 @@ plan resolves them. Go to definition opens that proposed declaration, including
 private declarations hidden by the Public filter. Ambiguous names open a picker.
 Definition jumps reveal omitted declarations and open their enclosing folds in
 PlanReview. Definitions outside the plan open in normal source buffers.
+The `open` action uses the same definition navigation, or opens the source file from a file heading.
+Declaration navigation never opens a popup.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

@@ -113,7 +113,13 @@ local success, failure = xpcall(function()
     if method == "textDocument/definition" then requests = requests + 1 end
     return original_definition(server, method, ...)
   end
+  local navigation_checks = {}
   for _, check in ipairs(spec.checks) do
+    for _, action in ipairs({ "jump_entity", "open" }) do
+      navigation_checks[#navigation_checks + 1] = { check[1], check[2], check[3], action }
+    end
+  end
+  for _, check in ipairs(navigation_checks) do
     local name
     for _, body in ipairs(canonical.design.proposed_calls[spec.file]) do
       if body.owner == check[1] then
@@ -150,7 +156,7 @@ local success, failure = xpcall(function()
       notices = {}
       vim.api.nvim_set_current_win(review.win)
       vim.api.nvim_win_set_cursor(review.win, { call_row, #row_text - #name })
-      review.command_set.action_by_id.jump_entity.run({})
+      review.command_set.action_by_id[check[4]].run({})
       await(function() return #receipts > completed or #notices > 0 end, "definition did not settle")
       if #receipts == completed then vim.wait(100) end
     until #receipts > completed or attempts == 15
@@ -158,20 +164,15 @@ local success, failure = xpcall(function()
       .. "\n" .. table.concat(notices, "\n") .. "\nrequests=" .. requests .. " lookups=" .. #lookups)
     local receipt = receipts[#receipts]
     assert(not receipt.failure, receipt.failure)
-    assert(receipt.result.jump or receipt.result.source or receipt.result.declarations, "no navigation effect returned")
+    assert(receipt.result.jump or receipt.result.source, "no navigation destination returned")
+    assert(not receipt.result.declarations, "definition returned a declaration popup")
+    for _, window in ipairs(vim.api.nvim_list_wins()) do
+      assert(vim.api.nvim_win_get_config(window).relative == "", "definition opened a floating window")
+    end
     local target = vim.fs.normalize(vim.uv.fs_realpath(completions[#completions].target.path))
     assert(target:sub(-#check[3]) == check[3], check[2] .. " resolved to " .. target)
-    print(language .. ": " .. check[2] .. " -> " .. check[3])
+    print(language .. " " .. check[4] .. ": " .. check[2] .. " -> " .. check[3])
     await(function() return not review.cancel_definition end, "definition request did not release")
-    if receipt.result.declarations then
-      local selection = assert(receipt.result.selection, "declaration popup has no selected token")
-      assert(vim.api.nvim_get_current_win() ~= review.win, "declaration popup did not open")
-      assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { selection.row + 1, selection.column }),
-        "declaration popup did not select the definition token")
-      local close = vim.fn.maparg("q", "n", false, true).callback
-      assert(type(close) == "function", "declaration popup has no close action")
-      close()
-    end
     vim.api.nvim_set_current_win(review.win)
     if receipt.result.source then
       assert(vim.fs.normalize(vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(review.win)))

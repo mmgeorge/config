@@ -149,7 +149,7 @@ Use `nvim --headless -u NONE --cmd 'set rtp^=./nvim'` for a minimal host, or run
 the fixture from an interactive Terminal MCP session for visual inspection.
 The test copies a tiny project, starts a mock Harness session and one real project
 LSP, seeds a saved plan, and verifies definitions through PlanReview. It checks the
-selected source or popup token, return navigation, and that no extra LSP starts.
+selected plan token or source buffer, absence of declaration popups, return navigation, and that no extra LSP starts.
 Rust and npm dependencies are relative local packages. The temporary Rust bootstrap
 used by the test is not a production requirement for TypeScript or Lua projects.
 

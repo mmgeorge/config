@@ -586,7 +586,7 @@ function M.attach(options, callback)
       if options.notice then options.notice("Wait for the planned test deletion to finish") end
       return false
     end
-    if (action == "toggle_public" or action == "toggle_declaration" or action == "jump_entity" or action:find("jump_symbol:", 1, true) == 1 or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
+    if (action == "toggle_public" or action == "toggle_declaration" or action == "jump_entity" or action == "open" or action:find("jump_symbol:", 1, true) == 1 or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end

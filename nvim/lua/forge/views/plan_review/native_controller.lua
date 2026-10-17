@@ -50,7 +50,7 @@ local function discard_failed_attachment(review)
   end
 end
 
-local function show_document(review, snapshot, title, filetype, selection)
+local function show_document(review, snapshot, title, filetype)
   if type(snapshot) ~= "table" then return end
   local view = review.owner.current_view()
   if not view then return end
@@ -61,10 +61,6 @@ local function show_document(review, snapshot, title, filetype, selection)
   local replica = buffer.open(snapshot.document, { buffer = native_buffer, generated = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(native_buffer), filetype = filetype or "markdown", notice = notice })
   if buffer.apply_snapshot(replica, snapshot).kind ~= "Applied" then buffer.close(replica) return end
-  if selection then
-    vim.api.nvim_win_set_cursor(window, { selection.row + 1, selection.column })
-
-  end
   local closed = false
   local function close()
     if closed then return end
@@ -113,7 +109,7 @@ local function action(review, name)
   if review.plan.historical_revision and (name == "comment" or name == "question" or name == "delete") then return end
   local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
   local function receive(result, failure, captured)
-    if (name == "rename_entity" or name == "jump_entity" or name:find("jump_symbol:", 1, true) == 1 or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
+    if (name == "rename_entity" or name == "jump_entity" or name == "open" or name:find("jump_symbol:", 1, true) == 1 or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf) then return end
     if failure then notice(failure) return end
@@ -187,7 +183,6 @@ local function action(review, name)
           elseif message and message ~= "cancelled" then notifications.info(message, "ForgePlanReview") end
         end)
     elseif type(result.message) == "string" then notifications.info(result.message, "ForgePlanReview")
-    elseif type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype, result.selection)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else notifications.info("External references are unchecked during planning", "ForgePlanReview") end
