@@ -56,6 +56,13 @@ local function transcript()
   return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
 end
 
+local function assert_status_region()
+  local height = vim.api.nvim_win_get_height(state.transcript_win)
+    - (vim.wo[state.transcript_win].winbar ~= "" and 1 or 0)
+  local used = vim.api.nvim_win_text_height(state.transcript_win, { start_row = 0 }).all
+  assert(used == height, ("status occupied %d rows in a %d-row viewport"):format(used, height))
+end
+
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
@@ -80,7 +87,8 @@ local succeeded, failure = xpcall(function()
   local running = transcript()
   assert(running:find("Idle", 1, true) < running:find("Checks running", 1, true))
   assert(not running:find("retained check output", 1, true), "running status exposed check output")
-  if hold > 0 then vim.cmd("redraw") vim.wait(hold, function() return false end, 20) end
+  assert_status_region()
+  if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
   local result
   assert(vim.wait(10000, function()
     result = request("checks.status", { run_id = run_id })
@@ -97,8 +105,11 @@ local succeeded, failure = xpcall(function()
   local _, count = transcript():gsub("Checks finished", "")
   assert(count == 1, "result history was duplicated")
   assert(not transcript():find("retained check output", 1, true), "result output was not collapsed")
+  assert(vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == "Idle",
+    "idle retained unused rows below the phase")
+  assert_status_region()
   assert(#errors == 0, table.concat(errors, "\n"))
-  if hold > 0 then vim.cmd("redraw") vim.wait(hold, function() return false end, 20) end
+  if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

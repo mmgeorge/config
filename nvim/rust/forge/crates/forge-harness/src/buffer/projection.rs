@@ -162,18 +162,16 @@ fn reported_changes(exchange: &Exchange, agents: &HashMap<&str, &TimelineEntry>)
 }
 
 fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
-    now_ms: i64) -> String {
+    lifecycle: NodeLifecycle, now_ms: i64) -> String {
     let mut count = 0;
     let mut failed = 0;
     let mut elapsed = Some(0_u64);
-    let mut running = false;
     for tool in calls {
         count += 1;
         failed += usize::from(tool.failed);
-        running |= tool.state() == crate::turn::ToolState::Running;
         elapsed = elapsed.zip(tool.elapsed_ms(now_ms)).map(|(total, duration)| total.saturating_add(duration));
     }
-    let mut label = format!("▸ {} {count} {}", if running { "Running" } else { "Ran" },
+    let mut label = format!("▸ {} {count} {}", if lifecycle == NodeLifecycle::Live { "Running" } else { "Ran" },
         if count == 1 { "tool" } else { "tools" });
     if failed > 0 { label.push_str(&format!(" ({failed} failed)")); }
     if let Some(elapsed) = elapsed {
@@ -260,12 +258,13 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
             TranscriptRenderer::resolve_marker(&mut block)?;
             blocks.push(block);
         }
-        for turn in exchange.turn.iter().filter(|turn|turn.state() == crate::turn::TurnState::Running) {
-            let mut groups: BTreeMap<&str, Vec<&crate::turn::ToolCall>> = BTreeMap::new();
+        let mut groups: BTreeMap<&str, Vec<_>> = BTreeMap::new();
+        for turn in &exchange.turn {
             for tool in turn.tools() {
                 let call_id = format!("{}:{}",turn.id(),tool.id);
                 if let Some(output) = tools.get(&call_id) {
                     if output.group.is_empty() {
+                        if tool.state() != crate::turn::ToolState::Running { continue; }
                         if let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) {
                             let mut profile = width.clone();
                             profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
@@ -274,33 +273,34 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
                                 previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, false)?);
                         }
                     } else {
-                        groups.entry(&output.group).or_default().push(tool);
+                        groups.entry(&output.group).or_default().push((turn, tool));
                     }
                 }
             }
-            for (id, calls) in groups {
-                if !calls.iter().any(|tool| tool.state() == crate::turn::ToolState::Running) { continue; }
-                for tool in &calls {
-                    let call_id = format!("{}:{}", turn.id(), tool.id);
-                    let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) else { continue; };
-                    let mut profile = width.clone();
-                    profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
-                        .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
-                    blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
-                        previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, expanded.get(&format!("{call_id}:tool")) == Some(&true))?);
-                }
-                let Some(previous) = document.block(&BlockId(id.into())) else { continue; };
+        }
+        for (id, calls) in groups {
+            if !calls.iter().any(|(_, tool)| tool.state() == crate::turn::ToolState::Running) { continue; }
+            for (turn, tool) in &calls {
+                let call_id = format!("{}:{}", turn.id(), tool.id);
+                let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) else { continue; };
                 let mut profile = width.clone();
                 profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
-                    .map_or(0, |layout| layout.indent.saturating_sub(2))).max(1);
-                let mut block = TranscriptRenderer::new(&profile)?.literal(previous.id.clone(),
-                    &tool_group_label(calls.iter().copied(), now_ms), 2)?;
-                block.metadata = previous.metadata.clone();
-                for span in &mut block.metadata.decoration {
-                    if span.range.end.row == previous.text.row_count() { span.range.end.row = block.text.row_count(); }
-                }
-                blocks.push(block);
+                    .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+                blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
+                    previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, expanded.get(&format!("{call_id}:tool")) == Some(&true))?);
             }
+            let Some(previous) = document.block(&BlockId(id.into())) else { continue; };
+            let lifecycle = previous.metadata.node.as_ref().context("tool group lifecycle is missing")?.lifecycle;
+            let mut profile = width.clone();
+            profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+                .map_or(0, |layout| layout.indent.saturating_sub(2))).max(1);
+            let mut block = TranscriptRenderer::new(&profile)?.literal(previous.id.clone(),
+                &tool_group_label(calls.iter().map(|(_, tool)| *tool), lifecycle, now_ms), 2)?;
+            block.metadata = previous.metadata.clone();
+            for span in &mut block.metadata.decoration {
+                if span.range.end.row == previous.text.row_count() { span.range.end.row = block.text.row_count(); }
+            }
+            blocks.push(block);
         }
     }
     Ok(blocks)
@@ -1050,7 +1050,9 @@ impl TimelineRenderer<'_> {
                                 _ => false,
                             });
                             let mut calls = Vec::new();
+                            let mut group_end = position;
                             for node in group {
+                                group_end += 1;
                                 let ExchangeNode::TurnContent {
                                     id,
                                     turn_id: owner,
@@ -1085,18 +1087,15 @@ impl TimelineRenderer<'_> {
                             self.margin += 2;
                             let count = calls.len();
                             let live_exchange = interaction.completed_at_ms.is_none();
-                            let (_, last_turn, last_tool) = calls.last().expect("nonempty tool group");
-                            let last_tool_id = &last_tool.id;
-                            let followed_in_turn = last_turn.items().iter().rposition(|item| matches!(item,
-                                crate::turn::TurnItem::Tool { id } if id == last_tool_id
-                            )).is_some_and(|position| position + 1 < last_turn.items().len());
+                            // Provider turns can end between adjacent calls. Only a visible successor
+                            // or the completed exchange prevents more tools from joining this group.
                             let settled = interaction.completed_at_ms.is_some() || calls
                                 .iter()
                                 .all(|(_, _, tool)| tool.state() != crate::turn::ToolState::Running)
-                                && (followed_in_turn
-                                    || last_turn.state() != crate::turn::TurnState::Running);
+                                && group_end < visible.len();
+                            let lifecycle = if settled { NodeLifecycle::Settled } else { NodeLifecycle::Live };
                             let group_id = format!("{id}:tools");
-                            let label = tool_group_label(calls.iter().map(|(_, _, tool)| *tool), self.now_ms);
+                            let label = tool_group_label(calls.iter().map(|(_, _, tool)| *tool), lifecycle, self.now_ms);
                             self.literal(&group_id, &label, None)?;
                             for (index, (_, turn, tool)) in calls.into_iter().enumerate() {
                                 let tool_start = self.block.len();
@@ -1117,7 +1116,7 @@ impl TimelineRenderer<'_> {
                             self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
                             if live_exchange {
                                 let node = self.block[start].metadata.node.as_mut().expect("tool group node");
-                                node.lifecycle = if settled { NodeLifecycle::Settled } else { NodeLifecycle::Live };
+                                node.lifecycle = lifecycle;
                                 node.default_display = NodeDisplay::Preview;
                                 node.resolve(self.expansion.get(&group_id).copied());
                             }
@@ -2278,7 +2277,7 @@ mod tests {
         project_at, project_at_with_separator, session_event_text,
     };
     use forge_buffer::width::WidthProfile;
-    use forge_buffer::node::NodeDisplay;
+    use forge_buffer::node::{NodeDisplay, NodeLifecycle};
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -2919,20 +2918,21 @@ mod tests {
         second.id = "second".into();
         second.completed_at_ms = None;
         second.status = "running".into();
-        assert_eq!(super::tool_group_label([&first, &second], 1500),
+        assert_eq!(super::tool_group_label([&first, &second], NodeLifecycle::Live, 1500),
             "▸ Running 2 tools · 2.6s");
         second.completed_at_ms = Some(2000);
         second.status = "failed".into();
         second.failed = true;
-        assert_eq!(super::tool_group_label([&first, &second], 90_000),
+        assert_eq!(super::tool_group_label([&first, &second], NodeLifecycle::Settled, 90_000),
             "▸ Ran 2 tools (1 failed) · 3.1s");
         first.started_at_ms = None;
-        assert_eq!(super::tool_group_label([&first, &second], 90_000),
+        assert_eq!(super::tool_group_label([&first, &second], NodeLifecycle::Settled, 90_000),
             "▸ Ran 2 tools (1 failed)");
     }
 
     #[test]
     fn adjacent_tools_share_one_group_across_turns_and_hidden_reasoning() -> anyhow::Result<()> {
+        use crate::exchange::ExchangeState;
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
         };
@@ -2989,18 +2989,37 @@ mod tests {
                 assert!(projected.tool.contains_key(&format!("{}:shared-call", exchange.turn[owner as usize - 1].id())),
                     "grouping replaced a tool's provider-turn identity");
             }
-            event.activity.as_mut().unwrap().status = Some("completed".into());
+            let document = forge_buffer::document::BufferDocument::new(
+                forge_buffer::identity::DocumentId("cross-turn-clock".into()), projected.entry.block.clone())?;
+            let refreshed = super::timing_blocks(&TimelineEntry::Exchange {
+                id: exchange.id.clone(), created_at_ms: 0,
+                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+            }, &WidthProfile::default(), &document, &Default::default(), &projected.tool)?;
+            let refreshed_group = refreshed.iter().find(|block| block.id == groups[0].id).unwrap();
+            assert!(refreshed_group.text.row(0).unwrap().starts_with(&format!("▸ Running {ordinal} tool")),
+                "timer refresh counted only the newest provider turn");
+            assert_eq!(refreshed_group.metadata.node, groups[0].metadata.node);
+            event.activity.as_mut().unwrap().status = Some(if ordinal == 2 { "failed" } else { "completed" }.into());
             exchange.observe_turn(&event, ordinal * 10 + 3)?;
+            let completed_call = render(&exchange)?;
+            let group = completed_call.entry.block.iter().find(|block| block.id.0.ends_with(":tools")).unwrap();
+            assert!(group.text.row(0).unwrap().starts_with(&format!("▸ Running {ordinal} tool")),
+                "individual tool completion settled an open group");
+            assert_eq!(group.metadata.node.as_ref().unwrap().lifecycle, NodeLifecycle::Live);
             event.activity = None;
             event.turn_boundary = Some(TurnBoundary::Finished {
                 outcome: crate::turn::TurnOutcome::Completed,
             });
             exchange.observe_turn(&event, ordinal * 10 + 4)?;
+            let completed_turn = render(&exchange)?;
+            let group = completed_turn.entry.block.iter().find(|block| block.id.0.ends_with(":tools")).unwrap();
+            assert!(group.text.row(0).unwrap().starts_with(&format!("▸ Running {ordinal} tool")));
+            assert!(!group.metadata.fold[0].closed);
         }
         let projected = render(&exchange)?;
         let group = projected.entry.block.iter().find(|block| block.id.0.ends_with(":tools")).unwrap();
-        assert!(group.text.row(0).unwrap().contains("Ran 3 tools"));
-        assert!(group.metadata.fold[0].closed);
+        assert!(group.text.row(0).unwrap().contains("Running 3 tools"));
+        assert!(!group.metadata.fold[0].closed, "provider turn completion closed a group that can receive more tools");
 
         event.address.as_mut().unwrap().turn_id = "turn-4".into();
         event.turn_boundary = Some(TurnBoundary::Started);
@@ -3022,6 +3041,24 @@ mod tests {
         let projected = render(&exchange)?;
         assert_eq!(projected.entry.block.iter().filter(|block| block.id.0.ends_with(":tools")).count(), 2,
             "visible commentary must separate tool groups");
+        let groups = projected.entry.block.iter().filter(|block| block.id.0.ends_with(":tools")).collect::<Vec<_>>();
+        assert!(groups[0].text.row(0).unwrap().starts_with("▸ Ran 3 tools"));
+        assert!(groups[1].text.row(0).unwrap().starts_with("▸ Running 1 tool"));
+        event.activity = None;
+        event.turn_boundary = Some(TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
+        exchange.observe_turn(&event, 43)?;
+        for outcome in [ExchangeState::Complete, ExchangeState::Cancelled, ExchangeState::Interrupted, ExchangeState::Failed] {
+            let mut finished = exchange.clone();
+            finished.finish(outcome, 50)?;
+            let projected = render(&finished)?;
+            for group in projected.entry.block.iter().filter(|block| block.id.0.ends_with(":tools")) {
+                assert!(group.text.row(0).unwrap().starts_with("▸ Ran "));
+                assert_eq!(group.metadata.node.as_ref().unwrap().lifecycle, NodeLifecycle::Settled);
+                assert!(group.metadata.fold[0].closed);
+            }
+        }
         Ok(())
     }
 
@@ -3133,7 +3170,7 @@ mod tests {
         });
         finished.observe_turn(&event, 11).unwrap();
         assert!(
-            render(&finished)
+            !render(&finished)
                 .entry
                 .block
                 .iter()
@@ -3142,7 +3179,7 @@ mod tests {
                 .metadata
                 .fold[0]
                 .closed,
-            "turn completion must close the final group"
+            "turn completion must keep the final group open for more provider calls"
         );
         event.turn_boundary = None;
         event.kind = "assistant_message".into();
@@ -3808,7 +3845,7 @@ mod tests {
             },
         }, &WidthProfile::default(), 133_000).unwrap();
         let initial = render(execution.clone());
-        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention", "Checking files", ""]);
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention", "Checking files"]);
         assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
         assert!(initial.entry.block[1].metadata.fold[0].closed);
         let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
@@ -3824,7 +3861,7 @@ mod tests {
         execution.progress.unverified.clear();
         execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
-        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched", "Checking files", ""]);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched", "Checking files"]);
         assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
     }
 
@@ -3847,7 +3884,7 @@ mod tests {
         for (phase, expected, animated, hint) in cases {
             let projection = project_at(&TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
             let block = &projection.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", expected, "", ""]);
+            assert_eq!(block.text.wire_rows(), vec!["", expected]);
             assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
             block.validate().unwrap();
             let encoded = serde_json::to_vec(block).unwrap();
@@ -3876,7 +3913,7 @@ mod tests {
 
         assert_eq!(
             projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working · 3s", "", ""]
+            vec!["", "Working · 3s"]
         );
         let status = &projection.entry.block[0].metadata;
         assert!(status.gutter.is_empty(), "status text must not be split into the sign column");
@@ -3939,7 +3976,7 @@ mod tests {
             let rows = projection.entry.block[0].text.wire_rows();
             assert_eq!(rows[1], "Planning · 37s");
             if summary.trim().is_empty() {
-                assert_eq!(rows, vec!["", "Planning · 37s", "", ""]);
+                assert_eq!(rows, vec!["", "Planning · 37s"]);
             } else {
                 assert_eq!(rows.len(), 4);
                 assert!(rows[2..].iter().all(|row| width.cells(row, 0).unwrap() <= 32));
@@ -3992,7 +4029,7 @@ mod tests {
             )
             .unwrap();
             let block = &projected.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer", "", ""]);
+            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer"]);
             assert_eq!(block.metadata.target[0].id.0, "session:status:question");
             assert_eq!(block.metadata.target[0].range.start.row, 1);
             assert!(block.metadata.fold.is_empty());
@@ -4018,7 +4055,7 @@ mod tests {
         let block = &projected.entry.block[0];
         assert_eq!(
             block.text.wire_rows(),
-            vec!["", "Waiting for plan review · revision 1", "", ""]
+            vec!["", "Waiting for plan review · revision 1"]
         );
         let target = &block.metadata.target[0];
         assert_eq!(target.range.start.row, 1);

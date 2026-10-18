@@ -322,6 +322,7 @@ render_status_hint = function(state)
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       require("forge.views.harness.status_hint").render(state.presentation.transcript,
         M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
+      require("forge.views.harness.status_region").align(state.presentation.transcript, state.transcript_win)
     end
   end
 end

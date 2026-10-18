@@ -108,11 +108,13 @@ active execution before changing history and leaves the task paused. An unfinish
 restore requires recovery first.
 
 The status area stays present between responses and shows **Idle** when no work is running.
-It reserves two rows below the phase label, so starting and finishing a response does not add
-or remove that space. Live tool output similarly occupies four rows, including blank padding.
+Idle uses the same static icon as a question wait. At the live transcript tail, the status area
+aligns with the bottom of the pane. Check activity, queued messages, and other current details
+add rows below the phase label only while present. Scrolling through history remains available.
+Live tool output occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
 Enable **Status thoughts** in `/config` to show the latest thought below it in
-italics, aligned with the phase label and wrapped into the two reserved rows. The option
+italics, aligned with the phase label and wrapped into at most two preview rows. The option
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thought messages remain available in the timeline either way.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.

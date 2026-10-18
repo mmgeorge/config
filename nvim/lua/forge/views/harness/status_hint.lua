@@ -69,26 +69,6 @@ function M.clear(target_buffer)
   end
 end
 
-local function status_location(transcript)
-  local cached = transcript.status_hint_location
-  if not cached or cached.revision ~= transcript.revision or cached.sequence ~= transcript.sequence then
-    cached = { revision = transcript.revision, sequence = transcript.sequence }
-    transcript.status_hint_location = cached
-    for index = transcript.sequence:count() - 1, 0, -1 do
-      local node = transcript.sequence:at(index)
-      local status = node.entry.metadata.status
-      if status and status ~= vim.NIL then
-        cached.block, cached.offset, cached.status = node.id, status.row, status
-        break
-      end
-      if node.id ~= "harness:staging" and not node.id:find(":implementation:", 1, true) then break end
-    end
-  end
-  if not cached.status then return nil end
-  local _, source_row = transcript.sequence:position(cached.block)
-  return buffer.physical_row(transcript, source_row + cached.offset), cached.status
-end
-
 local function animate(transcript, row, options)
   local target_buffer = transcript.buffer
   stop_animation(target_buffer)
@@ -146,7 +126,7 @@ function M.render(transcript, commands, width)
   local last_row = vim.api.nvim_buf_line_count(target_buffer) - 1
   local row, status
   if transcript.status == "Applied" and not transcript.applying then
-    row, status = status_location(transcript)
+    row, status = require("forge.views.harness.status_region").location(transcript)
   end
   if row and (row < 0 or row > last_row) then
     buffer.fail_apply(transcript, "Harness status target is outside the committed buffer")
@@ -198,7 +178,7 @@ function M.render(transcript, commands, width)
       end_row = row, end_col = #text, hl_group = capture, priority = 110,
     })
   end
-  if row and status and not status.animated and (context == "question" or context == "review" or context == "permission") then
+  if row and status and not status.animated then
     vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
       id = 1, sign_text = "◷", sign_hl_group = "ForgeStatusHint", priority = 110,
     })

@@ -240,6 +240,7 @@ function M.open(options, callback)
       owner.save_timeline = nil
     end,
     after_commit = function()
+      require("forge.views.harness.status_region").align(owner.transcript, options.transcript_window)
       for window in pairs(owner.views) do
         if owner.restore_timeline or not owner.ready then tail.reset(window)
         else tail.publish(window) end
@@ -820,6 +821,7 @@ function M.open(options, callback)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end
     require("forge.views.harness.status_hint").clear(options.transcript_buffer)
+    require("forge.views.harness.status_region").clear(options.transcript_buffer)
     owner.output = {}
     for _, view in pairs(owner.views) do input.close(view) end
     owner.views = {}

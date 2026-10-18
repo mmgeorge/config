@@ -151,7 +151,10 @@ Action-target snapshots remain separate and only validate whether a response sti
 
 The timeline projects ordered exchange items into separate message, tool-group, and change
 nodes. Consecutive ordinary tools share a group. Commentary, steering, or a file edit ends that
-group. An active group shows its count, latest tool heading, and a preview of that tool's last
+group. Individual tool completion and provider-turn boundaries keep the trailing group live
+while its exchange can append more tools. Its label and fold use that same lifecycle. Timer
+refreshes aggregate every call in the group across provider turns. An active group shows its
+count, latest tool heading, and a preview of that tool's last
 four display rows. The live output body pads unused rows and keeps its overflow count out of the
 layout, so empty, short, and long outputs occupy the same four rows. Full output remains retained
 for expansion. Earlier tool headings stay out of the live preview even when the group is
@@ -165,9 +168,11 @@ rows. Explicit group expansion persists while new calls arrive, but its live bod
 to the latest tool until exchange completion.
 
 The status entry persists through idle, running, and waiting phases under one identity. It renders
-an initial separator, the phase label, and two reserved detail rows. Optional thought previews
-occupy those detail rows instead of increasing the status height. Idle status has no animation
-or action hint. Complete thoughts remain in the conversation timeline.
+an initial separator and the phase label, followed by current check activity and optional thought
+previews. It reserves no empty detail rows. Lua fills unused transcript-window space above status
+with virtual rows, so the live tail ends at the bottom without changing native text or row identities.
+Queued prompts and other footer details add only their visible rows below status. Idle uses the same
+static icon as waiting states and has no action hint. Complete thoughts remain in the conversation timeline.
 
 Tool output deltas update the existing output cache. File edits have no generic tool-output
 cache, so their deltas reconcile the change node instead. Both paths retain the same provider

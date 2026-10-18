@@ -276,6 +276,24 @@ assert(vim.trim(vim.api.nvim_buf_get_extmark_by_id(question_transcript.buffer, n
 config.options.keymaps.harness.reopen_question = original_question_key
 hint.clear(question_transcript.buffer)
 buffer.close(question_transcript)
+local resting = buffer.open("resting-status-hint", {})
+assert(buffer.apply_snapshot(resting, {
+  document = resting.document, revision = 0, block = { {
+    id = "status", text = { "", "Idle" }, metadata = {
+      status = { row = 1, animated = false }, target = {}, decoration = {}, editable_region = {},
+    },
+  } },
+}).kind == "Applied")
+hint.render(resting, command_set, 120)
+local idle_mark = vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 1, { details = true })
+assert(vim.trim(idle_mark[3].sign_text) == "◷", "idle lost the static waiting icon")
+assert(#vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 2, {}) == 0,
+  "idle advertised an unrelated question or review action")
+vim.wait(150, function() return false end, 25)
+assert(vim.deep_equal(idle_mark, vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 1, { details = true })),
+  "idle icon animated")
+hint.clear(resting.buffer)
+buffer.close(resting)
 local details = buffer.open("implementation-details-hint", {})
 assert(buffer.apply_snapshot(details, {
   document = details.document, revision = 0, block = {

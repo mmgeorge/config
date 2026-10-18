@@ -76,9 +76,6 @@ impl StatusView<'_> {
         {
             append_reasoning_preview(&mut block, width, summary)?;
         }
-        let mut rows = block.text.wire_rows();
-        rows.resize(rows.len().max(4), "");
-        block.text = forge_buffer::text::BufferText::from_rows(rows)?;
         Ok(RenderedStatus { block, action })
     }
 }
