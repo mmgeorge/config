@@ -31,7 +31,10 @@ request does not stream thought summaries.
 When commit generation uses Harness, it creates an isolated, tool-free provider
 session. Codex and Copilot default to `gpt-6-luna` with low reasoning effort,
 independently of the active chat model. Configure those defaults through Forge
-setup. The Gemini API selection in `ai.adapters` takes precedence when available.
+setup. `require("ai.adapters").use_gemini_for_commits` defaults to `false`, so
+commit generation uses Harness even when a Gemini API key is present. Set the
+flag to `true` to select Gemini when its key is available. Other AI adapters
+retain their own Gemini selection.
 
 ```lua
 require("forge").setup({

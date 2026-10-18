@@ -9,19 +9,29 @@ local function assert_eq(actual, expected, message)
   end
 end
 
-local function load_with_gemini_key(value)
+local function load_with_gemini_key(value, enabled)
   os.getenv = function(name)
     if name == "GEMINI_API_KEY" then return value end
     return original_getenv(name)
   end
   package.loaded["ai.adapters"] = nil
-  return require("ai.adapters").get()
+  local adapters = require("ai.adapters")
+  if enabled ~= nil then adapters.use_gemini_for_commits = enabled end
+  return adapters.get()
 end
 
 local ok, err = xpcall(function()
   local gemini = load_with_gemini_key("test-key")
-  assert_eq(gemini.commit, "gemini3-lite,thinking=minimal", "gemini commit default")
+  assert_eq(gemini.commit, "harness", "Gemini commit generation must default to disabled")
   assert_eq(gemini.pr_create, "gemini3,thinking=low", "gemini PR create default")
+  assert_eq(gemini.chat.name, "gemini", "commit flag changed the chat adapter")
+
+  assert_eq(load_with_gemini_key("test-key", true).commit,
+    "gemini3-lite,thinking=minimal", "enabled Gemini commit adapter")
+  assert_eq(load_with_gemini_key("test-key", false).commit,
+    "harness", "disabled Gemini commit adapter")
+  assert_eq(load_with_gemini_key(nil, true).commit,
+    "harness", "Gemini commit flag bypassed missing credentials")
 
   local fallback = load_with_gemini_key(nil)
   assert_eq(fallback.commit, "harness", "fallback commit default")

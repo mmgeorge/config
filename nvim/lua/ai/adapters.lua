@@ -1,4 +1,6 @@
-local M = {}
+---@class AIAdapters
+---@field use_gemini_for_commits boolean Allow Gemini commit generation when its API key is available.
+local M = { use_gemini_for_commits = false }
 
 --- Adapter selection for AI features. `chat`, `inline`, and `cmd` are
 --- CodeCompanion adapter configs (the chat UI still runs on CodeCompanion).
@@ -17,7 +19,7 @@ function M.get()
         model = "gemini-3.8-flash",
       },
       cmd = "gemini",
-      commit = "gemini3-lite,thinking=minimal",
+      commit = M.use_gemini_for_commits and "gemini3-lite,thinking=minimal" or "harness",
       pr_create = "gemini3,thinking=low",
       inline_edit = "gemini3,thinking=low",
     }

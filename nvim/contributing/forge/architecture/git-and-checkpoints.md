@@ -210,6 +210,9 @@ The Lua client resolves the provider separately from these generation settings,
 and the native service forwards the explicit effort into the temporary provider
 session. Generation never attaches to the active conversation or changes its
 model. Providers without an override retain the configured Harness model.
+`ai.adapters.use_gemini_for_commits` gates the direct Gemini commit path and
+defaults to `false`. Enabling it still requires a Gemini API key. The flag does
+not change chat, PR creation, or inline-edit adapter selection.
 
 The shared prompt requests fast generation with minimal reasoning while retaining
 factual accuracy. Generated messages default to a title only. Small changes generally do not justify
