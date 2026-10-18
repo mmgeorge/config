@@ -204,6 +204,13 @@ preserves the prior draft. Empty or malformed successful responses fail explicit
 The current request returns a completed response, so the notification does not
 receive streaming provider thought summaries.
 
+`commit_generation` selects an independent model and optional `reasoning_effort`
+for each Harness provider. Codex and Copilot default to `gpt-6-luna` and `low`.
+The Lua client resolves the provider separately from these generation settings,
+and the native service forwards the explicit effort into the temporary provider
+session. Generation never attaches to the active conversation or changes its
+model. Providers without an override retain the configured Harness model.
+
 The shared prompt requests fast generation with minimal reasoning while retaining
 factual accuracy. Generated messages default to a title only. Small changes generally do not justify
 a body. A short body is used sparingly, for any

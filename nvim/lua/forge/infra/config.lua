@@ -16,6 +16,7 @@
 ---@field status_diff_viewport_threshold integer
 ---@field status_diff_viewport_overscan integer
 ---@field about_auto_generate boolean
+---@field commit_generation table<string, {model: string, reasoning_effort?: string}> Per-provider settings for isolated commit generation.
 ---@field walkthrough_inventory "sem"|false compute inventory with Sem or disable it
 ---@field branch_prefix string default prefix for branches created with `bc`; a repo's .forge.json may override it
 ---@field harness ForgeHarnessConfig
@@ -183,6 +184,10 @@ M.defaults = {
   status_diff_viewport_threshold = 1200,
   status_diff_viewport_overscan = 80,
   about_auto_generate = true,
+  commit_generation = {
+    codex = { model = "gpt-6-luna", reasoning_effort = "low" },
+    copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
+  },
   walkthrough_inventory = "sem",
   branch_prefix = "matt9222/",
   harness = {

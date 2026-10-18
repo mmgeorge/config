@@ -66,6 +66,8 @@ local succeeded, failure = xpcall(function()
       config.options.harness.backends[generation.backend.kind].command or {}),
       "generation lost the configured provider command")
     assert(preference_reads == 1, "explicit backend configuration read the saved preference")
+    assert(generation.model == "gpt-6-luna" and generation.reasoning_effort == "low",
+      "commit generation did not select Luna with low thinking")
 
     assert(generated_session == nil, "cold generation attached a conversation")
     assert(not client._client.harness_ready and session.harness.session == nil,
@@ -79,8 +81,23 @@ local succeeded, failure = xpcall(function()
       end)
     assert(vim.wait(1000, function() return completed end, 5), "selected session generation timed out")
     assert(generated_session == nil, "generation attached the active conversation")
-    assert(generation.model == "selected-model", "generation lost the selected model")
+    assert(generation.model == "gpt-6-luna" and generation.reasoning_effort == "low",
+      "commit generation inherited the active conversation model")
     assert(preference_reads == 1, "ready Harness reloaded the provider preference")
+
+    config.options.commit_generation[generation.backend.kind] = { model = "custom-commit-model", reasoning_effort = "medium" }
+    local label
+    completed = false
+    client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+      function(_, request_error)
+        assert(not request_error, request_error)
+        completed = true
+      end, function(model) label = model end)
+    assert(vim.wait(1000, function() return completed end, 5), "configured model generation timed out")
+    assert(generation.model == "custom-commit-model" and generation.reasoning_effort == "medium",
+      "generation ignored its model and effort configuration")
+    assert(label:find("custom-commit-model · thinking medium", 1, true), "notification reported a different model")
+    assert(session.harness.session.model == "selected-model", "generation changed the active conversation model")
 
     client._reset_for_test()
     client._set_launcher_for_test(launch_fixture)
@@ -96,6 +113,13 @@ local succeeded, failure = xpcall(function()
     assert(generation.backend.kind == "codex" and preference_reads == 1,
       "host restart replaced the selected backend with its older saved preference")
   end
+  session.harness.session = { id = "selected-session", backend = "codex", model = "selected-model" }
+  config.options.commit_generation.codex = { model = "" }
+  local invalid_model
+  client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
+    function(_, failure) invalid_model = failure end)
+  assert(invalid_model == "Invalid commit-generation model for backend: codex",
+    "invalid model silently inherited the active conversation model")
   session.harness.session = { id = "foreign-session", backend = "missing-provider" }
   local request_error
   client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },

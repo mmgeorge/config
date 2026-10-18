@@ -174,7 +174,8 @@ function M.sign()
   if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end
   local icon = marker.text
   if icon == "▸" then
-    icon = M.display(node.entry).display == "heading" and "▸" or "▾"
+    local display = M.display(node.entry)
+    icon = (display.display == "heading" or display.kind == "message" and display.display == "preview") and "▸" or "▾"
   end
   return "%#" .. marker.capture .. "#" .. icon .. " %*"
 end

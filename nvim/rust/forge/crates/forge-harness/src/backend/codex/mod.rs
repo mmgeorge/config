@@ -976,11 +976,13 @@ impl Backend for CodexBackend {
         request: BackendCatalogRequest,
         purpose: super::TextGeneration,
         model: &str,
+        reasoning_effort: Option<&str>,
         history: &str,
     ) -> Result<String> {
         self.trace.record(&request.harness_session_id, "codex.generation.request", json!({
             "purpose": purpose.name(),
             "model":model,
+            "reasoning_effort":reasoning_effort,
         }));
         let (mut process, mut output) = self.catalog_process(&request).await?;
         text_generation::generate(
@@ -989,6 +991,7 @@ impl Backend for CodexBackend {
             &request.workspace,
             purpose,
             model,
+            reasoning_effort,
             history,
         )
         .await

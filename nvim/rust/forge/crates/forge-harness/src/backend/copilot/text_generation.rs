@@ -12,6 +12,7 @@ pub(super) async fn generate(
     workspace: &str,
     purpose: TextGeneration,
     model: &str,
+    reasoning_effort: Option<&str>,
     history: &str,
 ) -> Result<String> {
     let mut options = ClientOptions::new().with_cwd(workspace);
@@ -23,7 +24,7 @@ pub(super) async fn generate(
     let client = tokio::time::timeout(Duration::from_secs(20), Client::start(options))
         .await
         .context("Isolated provider startup timed out")??;
-    let result = summarize(&client, workspace, purpose, model, history).await;
+    let result = summarize(&client, workspace, purpose, model, reasoning_effort, history).await;
     tokio::time::timeout(Duration::from_secs(8), client.stop())
         .await
         .context("Isolated provider shutdown timed out")?
@@ -37,11 +38,14 @@ async fn summarize(
     workspace: &str,
     purpose: TextGeneration,
     model: &str,
+    reasoning_effort: Option<&str>,
     history: &str,
 ) -> Result<String> {
     let mut config = SessionConfig::default();
     config.model = (model != "default").then(|| model.to_owned());
-    if purpose == TextGeneration::SessionName && model != "default" && model != "auto" {
+    if let Some(effort) = reasoning_effort {
+        config.reasoning_effort = Some(effort.to_owned());
+    } else if purpose == TextGeneration::SessionName && model != "default" && model != "auto" {
         let catalog = tokio::time::timeout(Duration::from_secs(20), client.list_models())
             .await
             .context("Isolated model discovery timed out")??;

@@ -28,6 +28,20 @@ and elapsed seconds until generation completes. Failures display the error and
 preserve the existing draft, including edits made while waiting. The current
 request does not stream thought summaries.
 
+When commit generation uses Harness, it creates an isolated, tool-free provider
+session. Codex and Copilot default to `gpt-6-luna` with low reasoning effort,
+independently of the active chat model. Configure those defaults through Forge
+setup. The Gemini API selection in `ai.adapters` takes precedence when available.
+
+```lua
+require("forge").setup({
+  commit_generation = {
+    codex = { model = "gpt-6-luna", reasoning_effort = "low" },
+    copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
+  },
+})
+```
+
 The context starts with changed files and added/deleted line counts.
 Source excerpts retain function signatures. Modified functions include the first 20
 changed body lines and two nearby unchanged lines. Added and removed functions retain
@@ -53,6 +67,10 @@ file list but have no excerpts, including license files with Markdown or text ex
 A file-write request in Read mode offers **Switch to Write mode** or **Stay in Read mode**.
 Switching resumes the task under the configured directory limits and permission rules.
 Staying in Read mode rejects that request.
+
+Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
+previous response folds when a new exchange starts. Use the normal expansion command on
+the caret or message body to show or hide the complete text.
 
 | Command | Arguments | Behavior |
 | --- | --- | --- |

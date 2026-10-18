@@ -520,11 +520,11 @@ impl Backend for CopilotBackend {
         Ok(())
     }
 
-    async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, history: &str) -> Result<String> {
+    async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, reasoning_effort: Option<&str>, history: &str) -> Result<String> {
         self.trace.record(&request.harness_session_id, "copilot.generation.request", json!({
             "purpose": purpose.name(),
-            "model":model,"instructions":purpose.instructions(),"history":history}));
-        let result = text_generation::generate(&self.command, &request.workspace, purpose, model, history).await;
+            "model":model,"reasoning_effort":reasoning_effort,"instructions":purpose.instructions(),"history":history}));
+        let result = text_generation::generate(&self.command, &request.workspace, purpose, model, reasoning_effort, history).await;
         self.trace.record(&request.harness_session_id, "copilot.generation.result", match &result {
             Ok(text) => json!({"text":text}), Err(error) => json!({"error":error.to_string()}),
         });

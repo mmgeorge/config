@@ -31,6 +31,7 @@ local RESERVED_METHOD = {
 ---@class ForgeTextGenerationConfig
 ---@field backend {kind: string, command: string[]}
 ---@field model string
+---@field reasoning_effort? string
 ---@field data_root string
 
 ---@class ForgeClient
@@ -837,14 +838,22 @@ function M.request_generation(params, callback, on_model)
   end
   local configured = harness_config.backends[backend]
   if not configured then callback(nil, "Unknown Harness backend: " .. tostring(backend)) return end
+  local selection = (config.options.commit_generation or {})[backend]
+  if selection and (type(selection) ~= "table" or type(selection.model) ~= "string" or vim.trim(selection.model) == "") then
+    callback(nil, "Invalid commit-generation model for backend: " .. backend)
+    return
+  end
   ---@type ForgeTextGenerationConfig
   local generation = {
     backend = { kind = backend, command = vim.deepcopy(configured.command or {}) },
-    model = selected and selected.model or harness_config.model,
+    model = selection and selection.model or (selected and selected.model or harness_config.model),
+    reasoning_effort = selection and selection.reasoning_effort,
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
   }
   if on_model then
-    on_model((selected and selected.resolved_model or generation.model) .. " (" .. backend .. ")")
+    local model = generation.model == "default" and selected and selected.resolved_model or generation.model
+    local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
+    on_model(model .. effort .. " (" .. backend .. ")")
   end
   M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback)
 end

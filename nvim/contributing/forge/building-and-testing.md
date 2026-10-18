@@ -57,7 +57,11 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_workspa
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_review_document.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_selection.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_checks_host.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_message_folds_host.lua
 ```
+
+The message-fold fixture checks three-line previews, caret rendering, prompt submission,
+automatic response folding on the next exchange, and retained manual expansion in a fresh host.
 
 Enforce an external execution deadline when running these commands through an
 automation tool. A fixture that prints success but remains alive does not pass.

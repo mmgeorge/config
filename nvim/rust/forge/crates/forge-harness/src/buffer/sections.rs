@@ -168,6 +168,17 @@ impl SectionProjection {
                 continue;
             }
             let Some(current) = source.document.block(&id) else { continue; };
+            if current.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message) {
+                if current.metadata.fold.is_empty() != previous.metadata.fold.is_empty() {
+                    source.dirty.insert(owner.to_owned());
+                    continue;
+                }
+                if !current.metadata.fold.is_empty() {
+                    self.nodes.register(current)?;
+                    self.pending.insert(current.metadata.node.as_ref().unwrap().id.0.clone());
+                    continue;
+                }
+            }
             if let (Some(node), Some(prior)) = (&current.metadata.node, &previous.metadata.node)
                 && node.kind == forge_buffer::node::NodeKind::Tool && node.more && !prior.more {
                 self.nodes.register(current)?;
@@ -673,6 +684,15 @@ fn render(
             return Ok(true);
         }
         let source_block = source[cursor];
+        if source_block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
+            && !source_block.metadata.fold.is_empty() {
+            let id = &source_block.metadata.node.as_ref().unwrap().id.0;
+            let block = super::message::project(source_block, intent.get(id).copied())?;
+            budget.consume(std::slice::from_ref(&block))?;
+            output.push(block);
+            cursor += 1;
+            continue;
+        }
         let selected = source_block
             .metadata
             .fold

@@ -332,13 +332,15 @@ pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Messa
     block.metadata.layout = previous.metadata.layout.clone();
     if let Some(layout) = &mut block.metadata.layout { layout.source_indent = 0; }
     super::layout::materialize(block)?;
-    block.metadata.fold = previous.metadata.fold.clone();
     block.metadata.node = previous.metadata.node.clone();
-    for fold in &mut block.metadata.fold {
-        if fold.end.block == block.id && fold.end.position.row == previous.text.row_count() {
-            fold.end.position.row = block.text.row_count();
-        }
+    if message.delivery() == crate::turn::MessageDelivery::Final
+        && previous.metadata.layout.as_ref().and_then(|layout| layout.marker.as_ref())
+            .is_some_and(|marker| marker.capture == "ForgeHarnessCommentary")
+        && let Some(node) = &mut block.metadata.node {
+        node.lifecycle = NodeLifecycle::Live;
+        node.default_display = NodeDisplay::Full;
     }
+    super::message::prepare(block, width)?;
     Ok(ProjectedEntry { entry:TranscriptEntry { id:previous.id.0.clone(),block:renderer.block },
         prompt:renderer.prompt,action:renderer.action,tool:renderer.tool,syntax:renderer.syntax })
 }
@@ -384,6 +386,7 @@ fn project_at_with_separator(
     for block in &mut projection.block {
         TranscriptRenderer::resolve_marker(block)?;
         super::layout::materialize(block)?;
+        super::message::prepare(block, width)?;
     }
     ensure!(projection.margin == 0, "timeline section was not finished");
     if projection.block.is_empty() {
@@ -1800,6 +1803,9 @@ impl TimelineRenderer<'_> {
             );
         }
         rendered.block.metadata.node = Some(NodeState::new(FoldId(id.into()), NodeKind::Message, NodeDisplay::Full));
+        if matches!(role, MarkdownRole::Response) {
+            rendered.block.metadata.node.as_mut().expect("message node").lifecycle = NodeLifecycle::Live;
+        }
         for link in rendered.link {
             self.action.insert(
                 link.target,

@@ -109,6 +109,10 @@ impl<'profile> TranscriptRenderer<'profile> {
             priority: 100,
         });
         Self::heading_marker(&mut block, "ForgeHarnessPrompt");
+        block.metadata.node = Some(forge_buffer::node::NodeState::new(
+            forge_buffer::identity::FoldId(block.id.0.clone()), forge_buffer::node::NodeKind::Message,
+            forge_buffer::node::NodeDisplay::Preview,
+        ));
         Ok(block)
     }
 

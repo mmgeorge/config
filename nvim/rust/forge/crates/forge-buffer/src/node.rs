@@ -8,7 +8,7 @@ use crate::identity::FoldId;
 pub enum NodeKind {
     /// One admitted interaction and its activity.
     Exchange,
-    /// Assistant text without an expansion control.
+    /// Prompt or assistant text, optionally retaining a folded preview.
     Message,
     /// Consecutive tool calls in one provider turn.
     ToolGroup,
@@ -102,6 +102,7 @@ impl NodeState {
         self.expansion = expansion;
         self.display = match expansion {
             Some(true) => NodeDisplay::Full,
+            Some(false) if self.kind == NodeKind::Message => NodeDisplay::Preview,
             Some(false) => NodeDisplay::Heading,
             None => self.default_display,
         };

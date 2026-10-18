@@ -583,7 +583,7 @@ pub trait Backend: Send + Sync {
     }
 
     /// Generate text independently of the main provider conversation.
-    async fn generate_text(&self, _request: BackendCatalogRequest, _purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
+    async fn generate_text(&self, _request: BackendCatalogRequest, _purpose: TextGeneration, _model: &str, _reasoning_effort: Option<&str>, _history: &str) -> Result<String> {
         Err(UnsupportedCapability("text_generation").into())
     }
 
@@ -793,7 +793,7 @@ impl Backend for MockBackend {
     async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
-    async fn generate_text(&self, _request: BackendCatalogRequest, purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
+    async fn generate_text(&self, _request: BackendCatalogRequest, purpose: TextGeneration, _model: &str, _reasoning_effort: Option<&str>, _history: &str) -> Result<String> {
         if let Some(delay) = self.delay { tokio::time::sleep(delay).await; }
         purpose.validate(match purpose {
             TextGeneration::Recap => "The current request is recorded. Review the next proposed change.",

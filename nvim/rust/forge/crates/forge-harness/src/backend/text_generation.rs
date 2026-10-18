@@ -166,7 +166,7 @@ mod tests {
         let backend =
             crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
                 .unwrap();
-        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol",
+        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol", None,
             "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         let name = result.unwrap();
@@ -178,7 +178,7 @@ mod tests {
     #[ignore = "requires authenticated Copilot and makes one isolated naming request"]
     async fn live_copilot_session_name() {
         let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
-        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol",
+        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol", None,
             "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         let name = result.unwrap();
@@ -229,7 +229,7 @@ mod tests {
         let backend =
             crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
                 .unwrap();
-        let result = backend.generate_text(request(), TextGeneration::Recap, "default", "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
+        let result = backend.generate_text(request(), TextGeneration::Recap, "default", None, "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         assert!(!result.unwrap().is_empty());
     }
@@ -238,7 +238,7 @@ mod tests {
     #[ignore = "requires authenticated Copilot and makes one isolated recap request"]
     async fn live_copilot_recap() {
         let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
-        let result = backend.generate_text(request(), TextGeneration::Recap, "gpt-5.6-sol", "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
+        let result = backend.generate_text(request(), TextGeneration::Recap, "gpt-5.6-sol", None, "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         assert!(!result.unwrap().is_empty());
     }

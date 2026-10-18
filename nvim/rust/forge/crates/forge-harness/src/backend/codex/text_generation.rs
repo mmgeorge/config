@@ -11,6 +11,7 @@ pub(super) async fn generate(
     workspace: &str,
     purpose: TextGeneration,
     model: &str,
+    reasoning_effort: Option<&str>,
     history: &str,
 ) -> Result<String> {
     let mut config = json!({"web_search":"disabled", "skills.include_instructions":false,
@@ -61,7 +62,9 @@ pub(super) async fn generate(
             }
         }
         config["mcp_servers"] = Value::Object(servers);
-        if purpose == TextGeneration::SessionName {
+        if let Some(effort) = reasoning_effort {
+            config["model_reasoning_effort"] = json!(effort);
+        } else if purpose == TextGeneration::SessionName {
             let selected = if model == "default" {
                 effective.get("model").and_then(Value::as_str)
             } else {
@@ -167,6 +170,8 @@ mod tests {
                         assert_eq!(request["params"]["model"], "selected-model");
                         if purpose == TextGeneration::SessionName {
                             assert_eq!(request["params"]["config"]["model_reasoning_effort"], "minimal");
+                        } else {
+                            assert_eq!(request["params"]["config"]["model_reasoning_effort"], "low");
                         }
                         assert_eq!(request["params"]["baseInstructions"], purpose.instructions());
                         assert_eq!(request["params"]["ephemeral"], true);
@@ -226,6 +231,7 @@ mod tests {
             &workspace,
             purpose,
             "selected-model",
+            (purpose == TextGeneration::CommitMessage).then_some("low"),
             input,
         )
         .await?;

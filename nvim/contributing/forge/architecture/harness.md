@@ -53,6 +53,14 @@ Harness expansion preference. After a body splice repairs fold endpoints, subseq
 heading updates preserve the current loaded ranges at application time. They cannot restore
 fold metadata captured before the splice.
 
+Prompts and final responses longer than three display rows support message folds. Prompts
+start folded when submitted. The latest response stays expanded until the next exchange
+begins, which folds that response even after an explicit expansion. Older explicit choices
+remain stable. Folded messages show their first three display rows with a right-pointing
+caret, while expanded messages retain their complete Markdown, links, and text. The canonical
+block keeps the full message and the preview boundary. Resize recomputes that boundary without
+changing the expansion choice. Commentary and reasoning keep their existing presentation.
+
 Tool activation binds to the captured document, view, block, and target identity. A later
 transcript revision can still activate that same retained tool target, so streaming output
 or timer updates cannot invalidate an unrelated click. Future revisions, removed targets,

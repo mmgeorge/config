@@ -44,6 +44,38 @@ impl Default for WidthProfile {
 }
 
 impl WidthProfile {
+    /// Returns the retained byte count and display rows for a word-wrapped single-line preview.
+    /// The limit bounds only the preview, leaving the complete source available to its owner.
+    pub fn wrapped_prefix(&self, text: &str, rows: usize, continuation_indent: usize) -> Result<(usize, usize), ContractError> {
+        self.validate()?;
+        if text.contains(['\n', '\0']) { return Err(ContractError("wrapped preview requires one text row")); }
+        if rows == 0 { return Ok((0, 0)); }
+        let indent = continuation_indent.min(self.columns.saturating_sub(1));
+        let mut display_rows = 1;
+        let mut column = 0;
+        let mut offset = 0;
+        for part in text.split_inclusive(char::is_whitespace) {
+            let base = if display_rows == 1 { 0 } else { indent };
+            if column > base && column + self.cells(part, column)? > self.columns {
+                if display_rows == rows { return Ok((offset, display_rows)); }
+                display_rows += 1;
+                column = indent;
+            }
+            for cluster in part.graphemes(true) {
+                let cells = self.cells(cluster, column)?;
+                let base = if display_rows == 1 { 0 } else { indent };
+                if column > base && column + cells > self.columns {
+                    if display_rows == rows { return Ok((offset, display_rows)); }
+                    display_rows += 1;
+                    column = indent;
+                }
+                column += self.cells(cluster, column)?;
+                offset += cluster.len();
+            }
+        }
+        Ok((offset, display_rows))
+    }
+
     /// Wraps literal presentation text without interpreting Markdown punctuation.
     pub fn wrap_plain(
         &self,

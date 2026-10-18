@@ -28,6 +28,8 @@ use crate::storage::SqliteStore;
 pub struct TextGenerationConfig {
     pub backend: crate::backend::BackendLaunch,
     pub model: String,
+    /// Explicit effort for the isolated request, independent of the active conversation.
+    pub reasoning_effort: Option<String>,
     pub data_root: PathBuf,
 }
 
@@ -59,6 +61,10 @@ impl HarnessService {
             }
         }
         ensure!(!model.is_empty() && model.len() <= 256, "invalid generation model identity");
+        if let Some(effort) = config.reasoning_effort.as_deref() {
+            ensure!(["none", "minimal", "low", "medium", "high", "xhigh", "max"].contains(&effort),
+                "invalid generation reasoning effort: {effort}");
+        }
         let temporary = tempfile::tempdir()?;
         let permission_store = crate::permissions::store::PermissionStore::load(
             temporary.path().join("permissions.json"), workspace)?;
@@ -74,7 +80,7 @@ impl HarnessService {
             execution_mode: crate::session::PermissionMode::Read,
             backend_session_id: None,
         };
-        generate_isolated_text(backend.as_ref(), request, purpose, &model, input).await
+        generate_isolated_text(backend.as_ref(), request, purpose, &model, config.reasoning_effort.as_deref(), input).await
     }
 
     pub async fn saved_diff(
@@ -125,7 +131,7 @@ impl HarnessService {
                 let request = controller.catalog_request.read().await.clone();
                 let text = controller
                     .backend
-                    .generate_text(request, purpose, model, &history)
+                    .generate_text(request, purpose, model, None, &history)
                     .await?;
                 return Ok(json!({"text": purpose.validate(&text)?}));
             }
@@ -922,10 +928,11 @@ async fn generate_isolated_text(
     request: crate::backend::BackendCatalogRequest,
     purpose: crate::backend::TextGeneration,
     model: &str,
+    reasoning_effort: Option<&str>,
     input: &str,
 ) -> Result<String> {
     let provider = backend.descriptor().label;
-    let result = backend.generate_text(request, purpose, model, input).await
+    let result = backend.generate_text(request, purpose, model, reasoning_effort, input).await
         .with_context(|| format!("{provider} {} generation failed", purpose.name()));
     let cleanup = tokio::time::timeout(Duration::from_secs(8), backend.shutdown()).await
         .context("Isolated provider shutdown timed out").and_then(|result| result);
@@ -2257,23 +2264,24 @@ mod tests {
             execution_mode: crate::session::PermissionMode::Read, backend_session_id: None,
         };
         let text = generate_isolated_text(&backend, request.clone(), TextGeneration::CommitMessage,
-            "selected-model", "Staged diff:\n+change").await?;
+            "selected-model", Some("low"), "Staged diff:\n+change").await?;
         assert_eq!(text, "fix: preserve drafts\n\nKeep existing text.");
         assert!(backend.shutdown.load(Ordering::Acquire));
         let requests = backend.request.lock().unwrap();
         assert_eq!(requests.len(), 1);
-        for (request, purpose, model, input) in requests.iter() {
+        for (request, purpose, model, effort, input) in requests.iter() {
             assert_eq!(request.harness_session_id, "generation-fixture");
             assert_eq!(request.workspace, "commit-workspace");
             assert!(request.backend_session_id.is_none());
             assert_eq!(*purpose, TextGeneration::CommitMessage);
             assert_eq!(model, "selected-model");
+            assert_eq!(effort.as_deref(), Some("low"));
             assert_eq!(input, "Staged diff:\n+change");
         }
         drop(requests);
         let unsupported = SteeringBackend { request: Mutex::new(Vec::new()) };
         let error = generate_isolated_text(&unsupported, request,
-            TextGeneration::CommitMessage, "selected-model", "Staged diff:\n+change").await.unwrap_err();
+            TextGeneration::CommitMessage, "selected-model", Some("low"), "Staged diff:\n+change").await.unwrap_err();
         let diagnostic = format!("{error:#}");
         assert!(diagnostic.contains("commit_message generation failed"), "{diagnostic}");
         assert!(diagnostic.contains("text_generation"), "{diagnostic}");
@@ -2286,7 +2294,7 @@ mod tests {
             execution_mode: crate::session::PermissionMode::Read, backend_session_id: None,
         };
         let failure = generate_isolated_text(&failing, request, TextGeneration::CommitMessage,
-            "selected-model", "Staged diff:\n+change").await.unwrap_err();
+            "selected-model", Some("low"), "Staged diff:\n+change").await.unwrap_err();
         assert!(format!("{failure:#}").contains("fixture generation failure"));
         assert!(failing.shutdown.load(Ordering::Acquire));
         Ok(())
@@ -2308,7 +2316,7 @@ mod tests {
         let text = tokio::time::timeout(Duration::from_secs(1), generator.generate_text(
             TextGenerationConfig {
                 backend: crate::backend::BackendLaunch { kind: "mock".into(), command: vec![] },
-                model: "default".into(), data_root,
+                model: "default".into(), reasoning_effort: Some("low".into()), data_root,
             },
             &before.workspace, TextGeneration::CommitMessage, "Staged diff:\n+change",
         )).await??;
@@ -2325,7 +2333,7 @@ mod tests {
     }
 
     struct GenerationBackend {
-        request: std::sync::Mutex<Vec<(BackendCatalogRequest, TextGeneration, String, String)>>,
+        request: std::sync::Mutex<Vec<(BackendCatalogRequest, TextGeneration, String, Option<String>, String)>>,
         shutdown: AtomicBool,
         fail: bool,
     }
@@ -2333,8 +2341,8 @@ mod tests {
     #[async_trait::async_trait]
     impl Backend for GenerationBackend {
         async fn generate_text(&self, request: BackendCatalogRequest, purpose: TextGeneration,
-            model: &str, input: &str) -> Result<String> {
-            self.request.lock().unwrap().push((request, purpose, model.into(), input.into()));
+            model: &str, reasoning_effort: Option<&str>, input: &str) -> Result<String> {
+            self.request.lock().unwrap().push((request, purpose, model.into(), reasoning_effort.map(str::to_owned), input.into()));
             ensure!(!self.fail, "fixture generation failure");
             Ok("```text\nfix: preserve drafts\n\nKeep existing text.\n```".into())
         }

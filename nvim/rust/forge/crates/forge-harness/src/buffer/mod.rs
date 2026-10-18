@@ -2,6 +2,7 @@ mod changes;
 mod duration;
 mod markdown_math;
 mod layout;
+mod message;
 mod nodes;
 mod syntax;
 pub mod document;

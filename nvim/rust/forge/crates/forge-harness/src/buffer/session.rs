@@ -28,6 +28,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    latest_exchange: Option<String>,
     syntax_done: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
@@ -49,6 +50,7 @@ struct OpenPresentation {
 
 struct EntryPresentation {
     prompt: Vec<forge_buffer::identity::BlockId>,
+    response: Vec<forge_buffer::identity::BlockId>,
     target: Vec<TargetId>,
     syntax: Vec<TargetId>,
     tool: Vec<String>,
@@ -427,8 +429,10 @@ impl SessionPresentation {
             });
         }
         let mut projected = Vec::new();
+        let latest = latest_exchange(self.timeline.entry_list());
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
-            let entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashMap::new(), &HashMap::new())?;
+            let mut entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashMap::new(), &HashMap::new())?;
+            if Some(entry.entry.id.as_str()) != latest { settle_responses(&mut entry); }
             projected.push(entry);
         }
         let mut entry = HashMap::new();
@@ -462,6 +466,7 @@ impl SessionPresentation {
             transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
+            latest_exchange: latest.map(str::to_owned),
             syntax_done: HashSet::new(),
             syntax,
             agent_scope: None,
@@ -868,12 +873,14 @@ impl SessionPresentation {
         if patch.is_empty() {
             return;
         }
+        let latest = latest_exchange(self.timeline.entry_list());
         let Some(open) = self.open.as_mut() else {
             return;
         };
         if open.failure.is_some() {
             return;
         }
+        let latest = if open.agent_scope.is_some() { open.latest_exchange.clone() } else { latest.map(str::to_owned) };
         let applied = if open.agent_scope.is_some() {
             if patch.operation.iter().all(|operation|matches!(operation,
                 TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. })
@@ -884,7 +891,7 @@ impl SessionPresentation {
                         || open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_some(),
                     _ => false,
                 }).collect();
-                apply_projection(open,patch,filtered.iter().copied())
+                apply_projection(open,patch,filtered.iter().copied(),latest.as_deref())
             } else { reflow(open, self.timeline.entry_list(), self.timeline.revision()) }
         } else if patch.operation.iter().any(|operation|match operation {
             TimelineOperation::ToolOutput { call_id,.. } => !open.sections.nodes.tool.contains_key(call_id),
@@ -894,7 +901,7 @@ impl SessionPresentation {
         }) {
             reflow(open,self.timeline.entry_list(),self.timeline.revision())
         } else {
-            apply_projection(open, patch, patch.operation.iter())
+            apply_projection(open, patch, patch.operation.iter(),latest.as_deref())
         };
         if let Err(error) = applied {
             open.failure = Some(format!("{error:#}"));
@@ -917,10 +924,24 @@ fn syntax_pending(open: &OpenPresentation) -> bool {
 fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
     EntryPresentation {
         prompt: projected.prompt.clone(),
+        response: projected.entry.block.iter().filter(|block| block.metadata.node.as_ref().is_some_and(|node|
+            node.kind == forge_buffer::node::NodeKind::Message && node.lifecycle == forge_buffer::node::NodeLifecycle::Live))
+            .map(|block| block.id.clone()).collect(),
         target: projected.action.keys().cloned().collect(),
         syntax: projected.syntax.keys().cloned().collect(),
         tool: projected.tool.keys().cloned().collect(),
     }
+}
+
+fn latest_exchange(source: &[TimelineEntry]) -> Option<&str> {
+    source.iter().rev().find_map(|entry| match entry {
+        TimelineEntry::Exchange { id, .. } => Some(id.as_str()),
+        _ => None,
+    })
+}
+
+fn settle_responses(projected: &mut ProjectedEntry) {
+    for block in &mut projected.entry.block { super::message::settle(block); }
 }
 
 fn find_agent<'source>(
@@ -1073,8 +1094,14 @@ fn reflow(
         .unwrap_or(&open.last_width)
         .clone();
     let mut projected = Vec::new();
+    let latest = source.iter().rev().find_map(|entry| match entry {
+        ProjectionSource::Entry(TimelineEntry::Exchange { id, .. }) => Some(id.clone()),
+        ProjectionSource::Exchange(exchange) => Some(exchange.id.clone()),
+        _ => None,
+    });
     for (index, entry) in source.into_iter().enumerate() {
-        let entry = project(entry, &width, index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
+        let mut entry = project(entry, &width, index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
+        if Some(entry.entry.id.as_str()) != latest.as_deref() { settle_responses(&mut entry); }
         projected.push(entry);
     }
     let mut entry = HashMap::new();
@@ -1104,21 +1131,35 @@ fn reflow(
     open.syntax = syntax;
     open.sections.nodes.tool = tool;
     open.last_width = width;
+    open.latest_exchange = latest;
     retain_patches(open, patch)
 }
 
 fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePatch,
-    operations: impl Iterator<Item = &'operation TimelineOperation> + Clone) -> Result<()> {
+    operations: impl Iterator<Item = &'operation TimelineOperation> + Clone, latest: Option<&str>) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
     let mut changed = Vec::new();
+    if open.latest_exchange.as_deref() != latest {
+        if let Some(entry) = open.latest_exchange.as_ref().and_then(|id| open.entry.get_mut(id)) {
+            for response in entry.response.drain(..) {
+                if let Some(previous) = open.transcript.document.block(&response) {
+                    let mut block = previous.clone();
+                    super::message::settle(&mut block);
+                    changed.push(TranscriptChange::Block { block });
+                }
+            }
+        }
+        open.latest_exchange = latest.map(str::to_owned);
+    }
     for operation in operations.clone() {
         match operation {
             TimelineOperation::Message { entry_id, exchange_id, block_id, message, .. } => {
                 if message.kind() != crate::turn::MessageKind::Assistant { continue; }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
                 let previous = open.transcript.document.block(&block_id).context("streamed message block is missing")?;
-                let replacement = super::projection::message_block(previous,message,width)?;
+                let mut replacement = super::projection::message_block(previous,message,width)?;
+                if Some(entry_id.as_str()) != latest { settle_responses(&mut replacement); }
                 let previous_targets = previous.metadata.target.iter().map(|target|target.id.clone()).collect::<Vec<_>>();
                 for target in &previous_targets {
                     open.action.remove(target);
@@ -1133,6 +1174,8 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                     entry.target.extend(replacement.action.keys().cloned());
                     entry.syntax.retain(|target|target != &syntax_target);
                     entry.syntax.extend(replacement.syntax.keys().cloned());
+                    entry.response.retain(|response| response != &block_id);
+                    entry.response.extend(entry_presentation(&replacement).response);
                 }
                 open.action.extend(replacement.action);
                 open.syntax.extend(replacement.syntax);
@@ -1209,7 +1252,8 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
             }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
-                let entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
+                let mut entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
+                if Some(entry.entry.id.as_str()) != latest { settle_responses(&mut entry); }
                 let info = entry_presentation(&entry);
                 projected.push((
                     entry.entry.id.clone(),
@@ -1316,6 +1360,60 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn long_messages_fold_on_submission_and_the_next_exchange_and_reopen_after_resize() -> anyhow::Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+        use forge_buffer::node::{NodeDisplay, NodeLifecycle};
+        let mut entry = interaction_entry("first");
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else { unreachable!() };
+        exchange.prompt = "first\nsecond\nthird\nfourth\nfifth".into();
+        exchange.state = crate::exchange::ExchangeState::Running;
+        exchange.completed_at_ms = None;
+        let mut event = BackendEvent { received_at_ms: None,
+            address: Some(ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "reply".into() }),
+            turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(), text: None,
+            data: serde_json::Value::Null, activity: None, summary: None, task_update: None };
+        exchange.observe_turn(&event, 2)?;
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("response one\nresponse two\nresponse three\nresponse four\nresponse five".into());
+        event.data = serde_json::json!({"phase":"final_answer", "provider_message_id":"reply"});
+        exchange.observe_turn(&event, 3)?;
+        let mut owner = super::SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let document = forge_buffer::identity::DocumentId("message-folds".into());
+        let view = forge_buffer::identity::ViewId("view".into());
+        owner.open(document.clone(), view.clone(), forge_buffer::width::WidthProfile::default())?;
+        let response = owner.open.as_ref().unwrap().entry["first"].response[0].clone();
+        let snapshot = owner.snapshot(&document)?;
+        assert_eq!(snapshot.block.iter().find(|block| block.id.0 == "first:prompt").unwrap().text.row_count(), 3);
+        assert_eq!(snapshot.block.iter().find(|block| block.id == response).unwrap().text.row_count(), 5);
+        let expand = |owner: &mut super::SessionPresentation, id: &str, sequence| -> anyhow::Result<()> {
+            let generation = owner.open.as_ref().unwrap().sections.nodes.generation(id).unwrap();
+            owner.dispatch(super::PresentationRequest::Node { request: NodeRequest {
+                document: document.clone(), view: view.clone(), sequence, node: id.into(), generation,
+                action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: Default::default(),
+            } })?;
+            Ok(())
+        };
+        expand(&mut owner, "first:prompt", 10)?;
+        expand(&mut owner, &response.0, 11)?;
+        owner.reconcile(vec![entry.clone(), interaction_entry("second")])?;
+        let snapshot = owner.snapshot(&document)?;
+        let collapsed = snapshot.block.iter().find(|block| block.id == response).unwrap();
+        assert_eq!(collapsed.text.row_count(), 3);
+        assert_eq!(collapsed.metadata.node.as_ref().unwrap().display, NodeDisplay::Preview);
+        assert_eq!(collapsed.metadata.node.as_ref().unwrap().lifecycle, NodeLifecycle::Settled);
+        assert_eq!(owner.open.as_ref().unwrap().transcript.document.block(&response).unwrap().text.row_count(), 5);
+        expand(&mut owner, &response.0, 12)?;
+        owner.dispatch(super::PresentationRequest::Resize { document: document.clone(), view: view.clone(),
+            width: forge_buffer::width::WidthProfile { columns: 30, ..Default::default() } })?;
+        assert_eq!(owner.snapshot(&document)?.block.iter().find(|block| block.id == response).unwrap().text.row_count(), 5);
+        assert!(owner.snapshot(&document)?.block.iter().find(|block| block.id.0 == "first:prompt").unwrap().text.row_count() > 3);
+        Ok(())
+    }
+
     use super::*;
 
     #[test]

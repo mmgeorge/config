@@ -21,7 +21,7 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
         backend_session_id: None,
     };
     let message = tokio::time::timeout(Duration::from_secs(120), backend.generate_text(
-        request.clone(), TextGeneration::CommitMessage, "default",
+        request.clone(), TextGeneration::CommitMessage, "gpt-6-luna", Some("low"),
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-# Instalattion\n+# Installation\n",
     )).await.expect("Isolated commit generation timed out").unwrap();
     assert!(!message.is_empty());

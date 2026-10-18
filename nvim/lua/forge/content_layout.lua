@@ -194,7 +194,7 @@ end
 function M.draw_fold(window, buffer, namespace, row, layout, state)
   local marker = layout and layout.marker
   if not marker or marker == vim.NIL or marker.text ~= "▸" or layout.indent == 2 then return end
-  local icon = state and state.display == "heading" and "▸" or "▾"
+  local icon = state and (state.display == "heading" or state.kind == "message" and state.display == "preview") and "▸" or "▾"
   vim.api.nvim_buf_set_extmark(buffer, namespace, row, 0, {
     ephemeral = true, priority = 201,
     virt_text = { { icon, marker.capture } }, virt_text_win_col = layout.indent - 4,
