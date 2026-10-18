@@ -74,6 +74,13 @@ impl AutomaticChecks {
             return Ok(None);
         }
         self.pending = true;
+        if run.cancelled_run_id.is_some() {
+            self.blocked = Some("Automatic checks remain stopped after cancellation. Run checks explicitly to retry unchanged inputs.".into());
+            self.repair_prompt = None;
+            self.repair_exchange = None;
+            self.save()?;
+            return Ok(None);
+        }
         let identities = failures
             .iter()
             .map(|command| -> Result<String> {

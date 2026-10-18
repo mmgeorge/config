@@ -13,8 +13,7 @@ pub(crate) struct BrokerObserver {
     pub(super) permission_coordinator: Arc<PermissionCoordinator>,
     pub(super) permission_store: Arc<RwLock<PermissionStore>>,
     pub(super) agent_coordinator: Arc<crate::agent::AgentCoordinator>,
-    pub(super) check_runner: Arc<crate::checks::CheckRunner>,
-    pub(super) presentation: Arc<std::sync::Mutex<SessionPresentation>>,
+    pub(super) check_runner: Arc<crate::checks::CheckSupervisor>,
     pub(super) trace: Arc<TraceStore>,
 }
 
@@ -162,8 +161,9 @@ impl BrokerObserver {
             session_event_list,
             plan_file: &self.plan_file,
         })?;
-        let check_history = self.check_runner.history()?;
-        let active_check_run = self.check_runner.active()?;
+        let check_snapshot = self.check_runner.snapshot()?;
+        let check_history = check_snapshot.history;
+        let active_check_run = check_snapshot.active_run;
         let checks = active_check_run.as_ref().and_then(|id| check_history.iter().find(|run| &run.id == id))
             .and_then(crate::checks::CheckActivity::from_run);
         let checks_running = checks.is_some();
@@ -215,11 +215,7 @@ impl BrokerObserver {
                 .collect(),
             timeline,
             status,
-            timeline_revision: self
-                .presentation
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .revision(),
+            timeline_revision: check_snapshot.revision,
             goal_execution,
             active_wait,
             prompt_history: store.list_prompt_history()?,
@@ -334,7 +330,7 @@ impl BrokerObserver {
             session_event_list: store.list_session_event(&session_id)?,
             plan_file: &self.plan_file,
         })?;
-        let timeline = TimelineProjector::with_checks(timeline,crate::checks::CheckRunner::saved_history(&self.data_root.join(&session_id).join("checks"))?);
+        let timeline = TimelineProjector::with_checks(timeline,crate::checks::CheckSupervisor::saved_history(&self.data_root.join(&session_id).join("checks"))?);
         let preview = SessionPreview {
             lines: preview_lines(&timeline)?,
             session: preview_session,

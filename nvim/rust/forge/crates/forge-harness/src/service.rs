@@ -688,7 +688,7 @@ struct SessionController {
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
-    checks: Arc<crate::checks::CheckRunner>,
+    checks: Arc<crate::checks::CheckSupervisor>,
     agent_backend_factory: crate::agent::AgentBackendFactory,
     parent_input: crate::backend::SteeringLane,
     compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -1106,11 +1106,10 @@ async fn analyze_plan_source(
     Ok(())
 }
 
-/// Forwards check lifecycle patches while retaining source-work exclusion until runner collection.
-fn checks_event_sink(output: MessageSender, session_id: String, admission: Option<OwnedSemaphorePermit>) -> crate::backend::BackendEventSink {
+/// Forwards check observations without owning execution admission.
+fn checks_event_sink(output: MessageSender, session_id: String) -> crate::backend::BackendEventSink {
     let (sink, mut stream) = crate::backend::events::channel();
     tokio::spawn(async move {
-        let _admission = admission;
         while let Ok(Some(event)) = stream.recv().await {
             let (event_name,payload) = if event.kind == "document_changed" {("document_changed".into(),event.data)}
                 else {("backend_event".into(),serde_json::to_value(event).unwrap_or(Value::Null))};
@@ -1485,11 +1484,11 @@ async fn route_request(
                     && controller.agent_coordinator.active_count() == 0, "checks cannot race planning or writing agents");
                 let admission = Arc::clone(&controller.execution_admission).try_acquire_owned().context("finish active source work before checks")?;
                 let run = controller.checks.prepare_request(serde_json::from_value(request.params.clone())?,task_id.map(str::to_owned),session.shell,"User requested".into())?;
-                let sink = checks_event_sink(message_sink.clone(),session_id.clone(),Some(admission));
-                json!({"run_id":controller.checks.start(run,Some(sink),None).await?})
+                let sink = checks_event_sink(message_sink.clone(),session_id.clone());
+                json!({"run_id":controller.checks.start(run,Some(sink),None,Some(admission)).await?})
             },
             HarnessMethod::ChecksSaveDefaults => {
-                let sink = checks_event_sink(message_sink.clone(),session_id.clone(),None);
+                let sink = checks_event_sink(message_sink.clone(),session_id.clone());
                 controller.checks.save_defaults(task_id,Some(&sink)).await?
             },
             _ => unreachable!(),
@@ -3636,7 +3635,8 @@ mod tests {
             assert!(!backend.completed.load(Ordering::Acquire));
             assert!(futures_util::poll!(preparation.as_mut()).is_pending());
             backend.release.notify_one();
-            let admission = tokio::time::timeout(Duration::from_secs(5), preparation).await??;
+            let admission = tokio::time::timeout(Duration::from_secs(5), preparation)
+                .await.context("checked prompt admission did not finish after provider cleanup")??;
             assert!(backend.completed.load(Ordering::Acquire));
             assert!(admission.is_some());
             assert!(controller.checks.active()?.is_none());

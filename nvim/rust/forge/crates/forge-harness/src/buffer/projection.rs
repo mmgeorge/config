@@ -4226,7 +4226,7 @@ mod tests {
     fn running_checks_are_status_activity_until_result_published() -> anyhow::Result<()> {
         let commands = ["passed", "running", "pending", "skipped", "failed", "configuration_error"]
             .into_iter().map(|state| json!({
-                "id": state, "command": format!("cargo test {state}"), "state": state,
+                "id": state, "command": format!("cargo test {state}"), "state": state, "selected": true,
                 "started_at_ms": 0, "completed_at_ms": null, "exit_code": null,
                 "error": null, "stdout": "absent", "stderr": "absent",
                 "output": "absent", "output_bytes": 100,
@@ -4288,6 +4288,9 @@ mod tests {
         };
         let profile = WidthProfile::default();
         let projected = project_at(&entry, &profile, 1000)?;
+        assert_eq!(projected.entry.block[0].text.row(1), Some("Checking"));
+        assert!(projected.entry.block[0].metadata.status.as_ref().unwrap().animated);
+        assert!(projected.entry.block[0].text.wire_rows().iter().any(|row| row.contains("Plan verification")));
         let document = forge_buffer::document::BufferDocument::new(
             forge_buffer::identity::DocumentId("check-clock".into()), projected.entry.block)?;
         let refreshed = super::timing_blocks(&entry, &profile, &document, &Default::default(), &projected.tool)?;

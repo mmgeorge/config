@@ -55,7 +55,8 @@ Rust paths in this table are relative to
 | Trigger matching | `checks/applicability.rs` |
 | Package inventories, manifests, and ownership | `checks/packages.rs` |
 | Binding expansion and invocation deduplication | `checks/invocation.rs` |
-| Preparation, dependencies, execution, and evidence | `checks/runner.rs` |
+| Preparation, dependencies, execution, and evidence | `checks/supervisor.rs` |
+| Record persistence and coalesced UI delivery | `checks/publication.rs` |
 | Current coverage and repair delivery | `checks/evidence.rs`, `checks/automatic.rs` |
 | Shared catalog and plan previews | `checks/preview.rs`, `checks/tools.rs` |
 | Accepted-plan case inventory | `broker/checks.rs`, `plan/design_tests.rs` |

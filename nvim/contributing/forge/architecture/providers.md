@@ -244,6 +244,10 @@ missing recovery anchors, and failed history reads remain explicit errors.
 `CapabilityManifest` records required and optional operations, support, ownership, application boundary,
 and runtime availability. The `Backend` trait requires explicit identity, streaming, shutdown,
 session cancellation, execution cleanup, active-turn inspection, and retained conversation identity.
+The broker persists the root conversation ID when it accepts a provider turn-start boundary,
+before that turn finishes. Interrupting the first turn therefore retains the conversation even
+when the adapter has already settled its active-turn state. Synthetic display addresses and
+rejected child events cannot replace the root conversation ID.
 Adapters cannot inherit a synthetic provider identity or silently omit lifecycle ownership. Unsupported
 optional operations return typed unsupported-capability errors. Cancellation and identity queries carry
 the Harness session ID, preventing unscoped operations from affecting a different conversation.

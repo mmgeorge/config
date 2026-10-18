@@ -111,7 +111,7 @@ pub(super) async fn resolve(
             .get(&definition.id)
             .cloned()
             .unwrap_or(CheckSelection::All);
-        let operation = super::runner::operation(definition, &scope).unwrap_or(&definition.all);
+        let operation = super::supervisor::operation(definition, &scope).unwrap_or(&definition.all);
         let mut preview = CheckPreview {
             id: definition.id.clone(),
             category: definition.category,

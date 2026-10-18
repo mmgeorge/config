@@ -128,7 +128,10 @@ Queued prompts and pending steering appear below the status in the upper timelin
 pane. The lower prompt buffer contains only the draft being edited.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
-Use `Alt-Up` and `Alt-Down` for prompt history. Timeline folding, navigation, help,
+Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` and
+`Down` browse history, and `Down` past the newest entry restores your unfinished
+draft and attachments. Inside a multiline draft, the arrows move between lines.
+`Alt-Up` and `Alt-Down` also browse history. Timeline folding, navigation, help,
 and close shortcuts remain in the upper pane.
 
 `M-s` edits the newest queued prompt in place. Repeating it moves backward through

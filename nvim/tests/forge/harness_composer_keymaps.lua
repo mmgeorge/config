@@ -10,7 +10,7 @@ for _, id in ipairs({ "help", "close", "toggle_activity", "open_timeline", "open
   "previous_prompt", "next_prompt", "sessions", "background" }) do
   assert(commands.action_by_id[id] == nil, "composer inherited transcript command: " .. id)
 end
-for _, key in ipairs({ "d", "c", "x", "p", "P", "q", "?", "<Tab>", "<CR>", "<Up>", "<Down>" }) do
+for _, key in ipairs({ "d", "c", "x", "p", "P", "q", "?", "<Tab>", "<CR>" }) do
   local mapping = vim.fn.maparg(key, "n", false, true)
   assert(mapping.buffer ~= 1, "composer shadowed ordinary editing key: " .. key)
 end

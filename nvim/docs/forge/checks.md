@@ -15,6 +15,12 @@ does not transfer the earlier setup's approval to that task.
 While a check run is active, the status area shows executing checks and their latest
 nonempty output line. The line updates as output arrives, and complete logs remain
 available in the saved result.
+The completion counter includes only selected checks and their required prerequisites.
+Unselected catalog entries do not count as finished work or increase the total.
+Selected checks that finish with a skip, failure, or configuration error still count
+toward progress.
+A check expanded across several packages counts once and finishes when all its
+commands have settled.
 Submitting a new message during checks stops the previous execution and collects
 its running checks before starting the message. The composer retains newer drafts
 while that interruption finishes.
@@ -174,3 +180,12 @@ Submitting a prompt while checks run interrupts those checks and starts the prom
 after their processes stop. Explicitly queueing a prompt leaves checks running and
 waits for completion. A directly submitted prompt takes precedence over queued
 prompts, and edits made to the composer during cancellation remain unsent.
+
+
+Cancelling a check stops its owned process tree. Automatic completion does not retry
+the same cancelled checks against unchanged inputs. Run those checks explicitly to
+retry, or change their relevant inputs before automatic verification resumes.
+If cancellation precedes the first input snapshot, retry explicitly.
+Active check status names the run trigger, and an otherwise idle session shows
+Checking until the run settles. Result summaries include a single failure as well
+as interrupted and blocked checks.

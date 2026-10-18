@@ -30,6 +30,9 @@ pub enum CheckState {
 /// Owns one exact accepted command and its durable output identities.
 pub struct CommandCheck {
     #[serde(default)]
+    /// Membership in this run's selection, independent of execution outcome.
+    pub selected: bool,
+    #[serde(default)]
     /// Stable inputs and selection certified by this attempt.
     pub evidence: Option<super::evidence::CheckEvidence>,
     #[serde(default)]
@@ -99,6 +102,12 @@ pub struct CheckRun {
     pub environment_digest: String,
     pub started_at_ms: i64,
     pub completed_at_ms: Option<i64>,
+    #[serde(default)]
+    /// Inputs of the cancelled attempt, used to prevent an automatic retry of unchanged work.
+    pub cancelled_inputs: Option<crate::checkpoint::CheckpointRecord>,
+    #[serde(default)]
+    /// Interrupted run that prevents automatic execution of unchanged inputs.
+    pub cancelled_run_id: Option<String>,
     pub state: CheckState,
     pub progress: SemanticProgress,
     pub workspace_identity: Option<String>,
@@ -107,6 +116,14 @@ pub struct CheckRun {
 }
 
 impl CheckRun {
+    /// Ends an interrupted run once, including cancellation during check preparation.
+    pub(crate) fn interrupt(&mut self) {
+        if self.state == CheckState::Interrupted { return; }
+        self.state = CheckState::Interrupted;
+        self.completed_at_ms = Some(super::supervisor::now_ms());
+        self.record(CheckEventKind::Interrupted, None, "Checks interrupted".into());
+    }
+
     /// Select the gate result from recorded failures rather than model interpretation.
     pub fn outcome(&self) -> VerificationOutcome {
         if self.commands.iter().any(|check| {
@@ -207,7 +224,7 @@ impl CheckRun {
     pub(crate) fn record(&mut self, kind: CheckEventKind, check_id: Option<String>, text: String) {
         self.lifecycle.push(CheckEvent {
             id: format!("{}:event:{}", self.id, self.lifecycle.len()),
-            created_at_ms: super::runner::now_ms(),
+            created_at_ms: super::supervisor::now_ms(),
             kind,
             check_id,
             text,
@@ -224,12 +241,17 @@ impl CheckRun {
         };
         let mut summary = vec![format!("{} passed", count(CheckState::Passed))];
         let failed = count(CheckState::Failed);
-        if failed > 1 {
+        if failed > 0 {
             summary.push(format!("{failed} failed"));
         }
-        let skipped = count(CheckState::Skipped);
+        let skipped = count(CheckState::Skipped) + count(CheckState::Pending);
         if skipped > 0 {
             summary.push(format!("{skipped} not run"));
+        }
+        for (state, label) in [(CheckState::Interrupted, "interrupted"),
+            (CheckState::Blocked, "blocked"), (CheckState::ConfigurationError, "configuration errors")] {
+            let total = count(state);
+            if total > 0 { summary.push(format!("{total} {label}")); }
         }
         summary.join(" · ")
     }
@@ -238,7 +260,7 @@ impl CheckRun {
     pub(crate) fn duration_ms(&self) -> u64 {
         self.commands
             .iter()
-            .filter_map(|check| check.elapsed_ms(super::runner::now_ms()))
+            .filter_map(|check| check.elapsed_ms(super::supervisor::now_ms()))
             .fold(0, u64::saturating_add)
     }
 }

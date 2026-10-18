@@ -298,6 +298,8 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
     let data = tempfile::tempdir()?;
     let mut broker = planning_question_broker(repository.path(),data.path(),false);
     broker.backend = broker.agent_backend_factory.build(crate::backend::BackendKind::Mock)?;
+    // Mock write turns report progress and keep this goal active across configuration changes.
+    broker.session.execution_mode = PermissionMode::Write;
     let child = admit_child_fixture(&mut broker,"config-child")?;
     let goal = GoalRecord {id:"configuration-goal".into(),session_id:broker.session.id.clone(),
         objective:"Continue work".into(),state:GoalState::Active,continuation:Default::default(),native:false,
@@ -324,15 +326,13 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
         assert_eq!(broker.active_goal()?.state,GoalState::Active);
         assert_eq!(broker.agent_coordinator.active_count(),1);
         assert_eq!(broker.agent_coordinator.enabled(), enabled);
+        if enabled { continue; }
         let task_count = broker.store.list_agent_task(&broker.session.id)?.len();
         let result = broker.handle_agent_request(crate::agent::AgentRequest {
             operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::Model,
             operation:crate::agent::AgentOperation::Followup {target:child.agent.id.clone(),message:"Next task".into()},
         }, Some(&mut parent), &mut Vec::new()).await;
-        if enabled {
-            assert_eq!(result?["agent"]["id"], child.agent.id);
-            assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count + 1);
-        } else {
+        {
             assert!(result.unwrap_err().to_string().contains("subagent tools are disabled"));
             let spawn = broker.handle_agent_request(crate::agent::AgentRequest {
                 operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::Model,
@@ -344,6 +344,13 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
             assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count);
         }
     }
+    let task_count = broker.store.list_agent_task(&broker.session.id)?.len();
+    let result = broker.handle_agent_request(crate::agent::AgentRequest {
+        operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::Model,
+        operation:crate::agent::AgentOperation::Followup {target:child.agent.id.clone(),message:"Next task".into()},
+    }, Some(&mut parent), &mut Vec::new()).await?;
+    assert_eq!(result["agent"]["id"], child.agent.id);
+    assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count + 1);
     Ok(())
 }
 

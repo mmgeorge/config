@@ -708,9 +708,9 @@ configuration-saved event. Active checks appear below the primary workflow statu
 not in timeline history. `CheckActivity` retains command labels, completion counts,
 execution intervals, and the latest nonempty output line for each running command.
 It removes terminal escape sequences from that line and updates the status through
-the runner's 250 ms publication interval. Complete output remains in the check store.
+the supervisor's 250 ms publication interval. Complete output remains in the check store.
 Check activity never replaces Working, a user-decision wait, or another primary phase.
-The status timer refreshes the active intervals even while the primary phase is idle.
+An otherwise idle primary status shows Checking while the check timer advances.
 
 Completion clears that run's side activity and inserts one expandable result group at
 its completion timestamp in the same revision. Repeated updates retain the same group
@@ -718,7 +718,7 @@ identity, and a late result cannot clear a different active run. Result details 
 commands, selections, failure diagnostics, and lazy access to complete saved output.
 Intermediate lifecycle events remain in the check record rather than producing timeline
 rows. Reopening reconstructs the same final results and current independent activity.
-`CheckRunner` owns publication for both plan gates and on-demand runs. The broker does
+`CheckSupervisor` owns publication for both plan gates and on-demand runs. The broker does
 not publish a second check projection or replace the primary phase from a check update.
 `checks_status` supports `wait_for_completion` through both the control tool and
 service route. The runner subscribes before reading state, ignores intermediate
@@ -729,6 +729,13 @@ Recorded declaration or command failures enter Resolve. Configuration errors blo
 and notify the user to fix the definitions. Disabled checks and empty task selections remain
 Not run, never Passed. Source changes during the gate invalidate its result. Interruption
 terminates owned processes and preserves outputs. Recovery marks detached work interrupted.
+Interrupted runs retain their input checkpoint. Automatic completion compares the
+same task, command contract, selection, and relevant inputs before scheduling a
+retry. Unchanged cancelled work becomes Blocked and does not start another process
+or automatic repair. An explicit check run or changed relevant inputs permits a new
+attempt. A later completed explicit attempt supersedes the cancellation for that
+coverage without granting coverage to other checks.
+
 Direct prompt submission interrupts active checks and waits for process collection and
 execution release before admitting the new prompt. Snapshots and check document updates
 publish the active run identity so the composer keeps this action separate from explicit

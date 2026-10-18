@@ -12,22 +12,108 @@ use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use super::publication::{CheckNotification, CheckPublication};
 
 /// Owns project check admission, durable run history, and process cancellation for one session.
-pub struct CheckRunner {
+pub struct CheckSupervisor {
     pub(crate) workspace: PathBuf,
     pub(crate) root: PathBuf,
     pub(super) changes: super::changes::CheckChanges,
     presentation: Arc<Mutex<SessionPresentation>>,
-    records: Mutex<BTreeMap<String, CheckRun>>,
-    active: Mutex<Option<(String, Arc<AtomicBool>)>>,
+    state: Mutex<CheckStateStore>,
+    notification: OnceLock<CheckNotification>,
     changed: tokio::sync::Notify,
-    notified: Mutex<std::collections::BTreeSet<String>>,
+
+}
+
+/// Check state and its matching presentation revision captured under one lock.
+pub(crate) struct CheckSnapshot {
+    /// Complete retained run history in start order.
+    pub history: Vec<CheckRun>,
+    /// Run that still owns process execution.
+    pub active_run: Option<String>,
+    /// Presentation revision corresponding to this check state.
+    pub revision: u64,
+}
+
+
+struct CheckStateStore {
+    records: BTreeMap<String, CheckRun>,
+    active: Option<ActiveCheck>,
+    task: BTreeMap<String, tokio::task::JoinHandle<()>>,
+    notified: std::collections::BTreeSet<String>,
+}
+
+struct ActiveCheck {
+    run_id: String,
+    cancellation: Arc<CheckCancellation>,
+    _admission: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+struct CheckCancellation {
+    requested: Arc<AtomicBool>,
+    changed: tokio::sync::Notify,
+}
+
+impl CheckCancellation {
+    fn cancel(&self) {
+        self.requested.store(true, Ordering::Release);
+        self.changed.notify_waiters();
+    }
+
+    async fn wait(&self, external: Option<&AtomicBool>) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.requested.load(Ordering::Acquire)
+                || external.is_some_and(|flag| flag.load(Ordering::Acquire)) { return; }
+            tokio::select! {
+                _ = changed => {},
+                _ = tokio::time::sleep(std::time::Duration::from_millis(25)), if external.is_some() => {},
+            }
+        }
+    }
+
+    async fn read<Output>(&self, external: Option<&Arc<AtomicBool>>,
+        read: impl std::future::Future<Output = Result<Output>>) -> Result<Option<Output>> {
+        tokio::select! {
+            biased;
+            _ = self.wait(external.map(AsRef::as_ref)) => Ok(None),
+            result = read => result.map(Some),
+        }
+    }
+}
+
+struct CheckProcess {
+    worker: tokio::task::JoinHandle<Result<(std::process::ExitStatus, bool)>>,
+    stop: Option<tokio::sync::oneshot::Sender<()>>,
+    collected: bool,
+}
+
+impl CheckProcess {
+    async fn wait(&mut self) -> Result<(std::process::ExitStatus, bool)> {
+        let result = (&mut self.worker).await.context("check process supervisor failed");
+        self.collected = true;
+        result?
+    }
+
+    async fn stop(&mut self) -> Result<()> {
+        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
+        if !self.collected { self.wait().await?; }
+        Ok(())
+    }
+}
+
+impl Drop for CheckProcess {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() { let _ = stop.send(()); }
+    }
 }
 
 /// Captures task authority and concrete selectors before command admission.
@@ -47,7 +133,7 @@ pub(crate) struct CheckAdmission {
     pub revision: u32,
 }
 
-impl CheckRunner {
+impl CheckSupervisor {
     /// Reopens current-format history and marks detached execution interrupted without replaying commands.
     pub fn open(
         workspace: PathBuf,
@@ -73,6 +159,7 @@ impl CheckRunner {
                     None,
                     "Checks interrupted: previous process detached".into(),
                 );
+                run.completed_at_ms = Some(now_ms());
                 write_record(&path, &run)?;
             }
             records.insert(run.id.clone(), run);
@@ -82,10 +169,10 @@ impl CheckRunner {
             root,
             changes,
             presentation,
-            records: Mutex::new(records),
-            active: Mutex::new(None),
+            state: Mutex::new(CheckStateStore { records, active: None, task: BTreeMap::new(), notified: Default::default() }),
+            notification: OnceLock::new(),
             changed: Default::default(),
-            notified: Default::default(),
+
         }))
     }
 
@@ -139,32 +226,38 @@ impl CheckRunner {
     /// Lists persisted runs chronologically, including settled results from earlier hosts.
     pub fn history(&self) -> Result<Vec<CheckRun>> {
         let mut records: Vec<_> = self
-            .records
+            .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("check history lock poisoned"))?
-            .values()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
+            .records.values()
             .cloned()
             .collect();
         records.sort_by_key(|run| run.started_at_ms);
         Ok(records)
     }
 
+    /// Returns the process-owning run without inferring activity from saved history.
     pub(crate) fn active(&self) -> Result<Option<String>> {
-        Ok(self
-            .active
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check admission lock poisoned"))?
-            .as_ref()
-            .map(|(id, _)| id.clone()))
+        Ok(self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
+            .active.as_ref().map(|active| active.run_id.clone()))
+    }
+
+    /// Reads admission and its current record under one state lock.
+    pub(crate) fn snapshot(&self) -> Result<CheckSnapshot> {
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        let mut history: Vec<_> = state.records.values().cloned().collect();
+        history.sort_by_key(|run| run.started_at_ms);
+        let revision = self.presentation.lock().map_err(|_| anyhow::anyhow!("check presentation lock poisoned"))?.revision();
+        Ok(CheckSnapshot { history, active_run: state.active.as_ref().map(|active| active.run_id.clone()), revision })
     }
 
     /// Reads one owned run, waiting for an update or completion within one fixed deadline.
     pub async fn status(&self, id: &str, wait_ms: u64, wait_for_completion: bool) -> Result<CheckRun> {
         let read = || {
-            self.records
+            self.state
                 .lock()
-                .map_err(|_| anyhow::anyhow!("check history lock poisoned"))?
-                .get(id)
+                .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
+                .records.get(id)
                 .cloned()
                 .context("unknown check run")
         };
@@ -187,16 +280,13 @@ impl CheckRunner {
 
     /// Requests cancellation without releasing process ownership before collection finishes.
     pub fn cancel(&self, id: &str) -> Result<()> {
-        let active = self
-            .active
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check admission lock poisoned"))?;
-        let (active_id, cancelled) = active.as_ref().context("no check run is active")?;
+        let state = self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        let active = state.active.as_ref().context("no check run is active")?;
         ensure!(
-            active_id == id,
+            active.run_id == id,
             "check run is not owned by this active request"
         );
-        cancelled.store(true, Ordering::Release);
+        active.cancellation.cancel();
         Ok(())
     }
 
@@ -254,6 +344,8 @@ impl CheckRunner {
             )?),
             started_at_ms: now_ms(),
             completed_at_ms: None,
+            cancelled_inputs: None,
+            cancelled_run_id: None,
             state: CheckState::Running,
             progress: Default::default(),
             workspace_identity: None,
@@ -324,6 +416,7 @@ impl CheckRunner {
             };
             let position = run.commands.len();
             run.commands.push(CommandCheck {
+                selected: applicability.selected,
                 evidence: None,
                 reused_from: None,
                 id: format!("{id}:{position}"),
@@ -424,11 +517,9 @@ impl CheckRunner {
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
     ) -> Result<CheckRun> {
-        let run = self.resolve(run).await?;
-        std::fs::create_dir_all(self.root.join(&run.id))?;
-        let cancelled = self.admit(&run.id)?;
-        self.run_admitted(run, sink, external_cancelled, cancelled)
-            .await
+        let (_, completed) = self.launch(run, sink, external_cancelled, None).await?;
+        completed.await.context("check worker did not report completion")?
+            .map_err(anyhow::Error::msg)
     }
 
     /// Finds current evidence in this task without consuming or mutating prior runs.
@@ -446,15 +537,53 @@ impl CheckRunner {
         Ok(None)
     }
 
-    fn admit(&self, id: &str) -> Result<Arc<AtomicBool>> {
-        let mut active = self
-            .active
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check admission lock poisoned"))?;
-        ensure!(active.is_none(), "another check run is already active");
-        let cancelled = Arc::new(AtomicBool::new(false));
-        *active = Some((id.into(), Arc::clone(&cancelled)));
+    fn admit(&self, run: &CheckRun, admission: Option<tokio::sync::OwnedSemaphorePermit>) -> Result<Arc<CheckCancellation>> {
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        ensure!(state.active.is_none(), "another check run is already active");
+        ensure!(!state.task.contains_key(&run.id), "previous check run is still saving");
+        let cancelled = Arc::new(CheckCancellation {
+            requested: Arc::new(AtomicBool::new(false)), changed: Default::default(),
+        });
+        state.records.insert(run.id.clone(), run.clone());
+        state.active = Some(ActiveCheck { run_id: run.id.clone(), cancellation: Arc::clone(&cancelled), _admission: admission });
         Ok(cancelled)
+    }
+
+    fn cancelled_attempt(&self, run: &CheckRun, check: &CommandCheck,
+        checkpoint: Option<&crate::checkpoint::CheckpointRecord>) -> Result<Option<String>> {
+        let owner = run.context.as_ref().and_then(|context| context.task_id.as_ref());
+        for previous in self.history()?.into_iter().rev() {
+            if previous.id == run.id || previous.context.as_ref().and_then(|context| context.task_id.as_ref()) != owner {
+                continue;
+            }
+            for command in &previous.commands {
+                if previous.state != CheckState::Interrupted
+                    && previous.context.as_ref().is_some_and(|context| !context.automatic)
+                    && matches!(command.state, CheckState::Passed | CheckState::Failed)
+                    && command.context.as_ref().map(|context| &context.selection)
+                        == check.context.as_ref().map(|context| &context.selection)
+                    && super::evidence::signature(&previous, command)? == super::evidence::signature(run, check)? {
+                    return Ok(None);
+                }
+                if matches!(command.state, CheckState::Passed | CheckState::Failed)
+                    && let Some(evidence) = &command.evidence
+                    && let Some(checkpoint) = checkpoint
+                    && evidence.covers(command, run, check, checkpoint)? { return Ok(None); }
+                if previous.state == CheckState::Interrupted
+                    && command.state != CheckState::Skipped
+                {
+                    if let (Some(cancelled), Some(checkpoint)) = (&previous.cancelled_inputs, checkpoint) {
+                        if let Some(evidence) = super::evidence::CheckEvidence::capture(&previous, command, cancelled.clone(), cancelled)?
+                            && evidence.covers(command, run, check, checkpoint)? { return Ok(Some(previous.id.clone())); }
+                    } else if command.context.as_ref().map(|context| &context.selection)
+                        == check.context.as_ref().map(|context| &context.selection)
+                        && super::evidence::signature(&previous, command)? == super::evidence::signature(run, check)? {
+                        return Ok(Some(previous.id.clone()));
+                    }
+                }
+            }
+        }
+        Ok(None)
     }
 
     async fn run_admitted(
@@ -462,31 +591,33 @@ impl CheckRunner {
         mut run: CheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
-        cancelled: Arc<AtomicBool>,
+        cancelled: Arc<CheckCancellation>,
     ) -> Result<CheckRun> {
-        let result = self
-            .run_inner(
-                &mut run,
-                sink.as_ref(),
-                &cancelled,
-                external_cancelled.as_deref(),
-            )
-            .await;
+        let publication = CheckPublication::new(self.root.join(&run.id).join("record.json"), &run);
+        use futures_util::FutureExt;
+        let result = std::panic::AssertUnwindSafe(self.run_inner(
+            &mut run, sink.as_ref(), &publication, &cancelled, external_cancelled.as_ref(),
+        )).catch_unwind().await.unwrap_or_else(|_| Err(anyhow::anyhow!("check worker panicked")));
         if let Err(error) = &result {
             run.state = CheckState::ConfigurationError;
-            run.record(
-                CheckEventKind::ConfigurationError,
-                None,
-                format!("Check configuration error: {error:#}"),
-            );
-            run.completed_at_ms = Some(now_ms());
+            for command in &mut run.commands {
+                if command.state == CheckState::Running {
+                    command.state = CheckState::ConfigurationError;
+                    command.completed_at_ms = Some(now_ms());
+                    command.error = Some(format!("{error:#}"));
+                }
+            }
+            run.record(CheckEventKind::ConfigurationError, None, format!("Check execution error: {error:#}"));
         }
-        let publication = self.publish(&run, sink.as_ref()).await;
-        *self
-            .active
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check admission lock poisoned"))? = None;
-        publication?;
+        if run.state != CheckState::Interrupted { run.cancelled_inputs = None; }
+        run.completed_at_ms = Some(now_ms());
+        self.update(&run, sink.as_ref())?;
+        if let Err(error) = publication.finish(&run).await {
+            run.state = CheckState::ConfigurationError;
+            run.record(CheckEventKind::ConfigurationError, None, format!("Check history could not be saved: {error:#}"));
+            self.update(&run, sink.as_ref())?;
+            return Err(error);
+        }
         result?;
         Ok(run)
     }
@@ -495,20 +626,17 @@ impl CheckRunner {
         &self,
         run: &mut CheckRun,
         sink: Option<&BackendEventSink>,
-        cancelled: &AtomicBool,
-        external_cancelled: Option<&AtomicBool>,
+        publication: &CheckPublication,
+        cancelled: &Arc<CheckCancellation>,
+        external_cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
-        self.publish(run, sink).await?;
+        self.update(run, sink)?;
+        publication.update(run);
         for index in 0..run.commands.len() {
-            if cancelled.load(Ordering::Acquire)
+            if cancelled.requested.load(Ordering::Acquire)
                 || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
             {
-                run.state = CheckState::Interrupted;
-                run.record(
-                    CheckEventKind::Interrupted,
-                    None,
-                    "Checks interrupted".into(),
-                );
+                run.interrupt();
                 return Ok(());
             }
             let context = run.commands[index].context.as_ref().unwrap().clone();
@@ -555,13 +683,28 @@ impl CheckRunner {
                             run.commands[index].error.as_deref().unwrap_or("")
                         ),
                     );
-                    self.publish(run, sink).await?;
+                    self.update(run, sink)?;
+                    publication.update(run);
                     continue;
                 }
                 CheckState::Passed | CheckState::Failed => continue,
                 _ => {}
             }
-            let before = self.changes.snapshot().await?;
+            let Some(before) = cancelled.read(external_cancelled, self.changes.snapshot()).await? else {
+                run.interrupt();
+                return Ok(());
+            };
+            run.cancelled_inputs = before.clone();
+            if run.context.as_ref().is_some_and(|context| context.automatic)
+                && let Some(previous) = self.cancelled_attempt(run, &run.commands[index], before.as_ref())?
+            {
+                run.commands[index].state = CheckState::Blocked;
+                run.cancelled_run_id = Some(previous.clone());
+                run.commands[index].error = Some(format!("Cancelled in run {previous}. Run this check explicitly to retry unchanged inputs."));
+                run.record(CheckEventKind::CheckSkipped, Some(context.definition_id),
+                    "Automatic retry suppressed after cancellation".into());
+                continue;
+            }
             if run.context.as_ref().is_some_and(|context| context.automatic)
                 && let Some(checkpoint) = before.as_ref()
                 && let Some((run_id, previous)) = self.evidence(run, &run.commands[index], checkpoint)?
@@ -579,7 +722,8 @@ impl CheckRunner {
                 command.preview = previous.preview;
                 command.context.as_mut().unwrap().resolved = previous.context.and_then(|context| context.resolved);
                 run.record(CheckEventKind::CheckFinished, Some(context.definition_id), format!("Reused current check evidence from {run_id}"));
-                self.publish(run, sink).await?;
+                self.update(run, sink)?;
+                publication.update(run);
                 continue;
             }
             run.commands[index].state = CheckState::Running;
@@ -589,24 +733,29 @@ impl CheckRunner {
                 Some(context.definition_id.clone()),
                 format!("Check started · {}", context.name),
             );
-            self.publish(run, sink).await?;
+            self.update(run, sink)?;
+            publication.update(run);
             if let Err(error) = self
-                .execute(run, index, sink, cancelled, external_cancelled)
+                .execute(run, index, sink, publication, cancelled, external_cancelled)
                 .await
             {
-                run.commands[index].state = if cancelled.load(Ordering::Acquire)
+                run.commands[index].state = if cancelled.requested.load(Ordering::Acquire)
                     || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))
                 { CheckState::Interrupted } else { CheckState::ConfigurationError };
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
-            if matches!(run.commands[index].state, CheckState::Passed | CheckState::Failed)
-                && let (Some(before), Some(after)) = (before, self.changes.snapshot().await?)
-            {
-                run.commands[index].evidence = super::evidence::CheckEvidence::capture(run, &run.commands[index], before, &after)?;
-                if run.commands[index].state == CheckState::Passed && run.commands[index].evidence.is_none() {
-                    run.commands[index].state = CheckState::Failed;
-                    run.commands[index].error = Some("Check inputs changed during execution. Verify again after source changes settle.".into());
+            if matches!(run.commands[index].state, CheckState::Passed | CheckState::Failed) {
+                let Some(after) = cancelled.read(external_cancelled, self.changes.snapshot()).await? else {
+                    run.interrupt();
+                    return Ok(());
+                };
+                if let (Some(before), Some(after)) = (before, after) {
+                    run.commands[index].evidence = super::evidence::CheckEvidence::capture(run, &run.commands[index], before, &after)?;
+                    if run.commands[index].state == CheckState::Passed && run.commands[index].evidence.is_none() {
+                        run.commands[index].state = CheckState::Failed;
+                        run.commands[index].error = Some("Check inputs changed during execution. Verify again after source changes settle.".into());
+                    }
                 }
             }
             let check = &run.commands[index];
@@ -627,14 +776,10 @@ impl CheckRunner {
                     .unwrap_or_default()
             );
             run.record(kind, Some(context.definition_id), text);
-            self.publish(run, sink).await?;
+            self.update(run, sink)?;
+            publication.update(run);
             if run.commands[index].state == CheckState::Interrupted {
-                run.state = CheckState::Interrupted;
-                run.record(
-                    CheckEventKind::Interrupted,
-                    None,
-                    "Checks interrupted".into(),
-                );
+                run.interrupt();
                 return Ok(());
             }
         }
@@ -645,6 +790,8 @@ impl CheckRunner {
             .any(|check| check.state == CheckState::ConfigurationError)
         {
             CheckState::ConfigurationError
+        } else if run.commands.iter().any(|check| check.state == CheckState::Blocked) {
+            CheckState::Blocked
         } else if run
             .commands
             .iter()
@@ -677,8 +824,9 @@ impl CheckRunner {
         run: &mut CheckRun,
         index: usize,
         sink: Option<&BackendEventSink>,
-        cancelled: &AtomicBool,
-        external_cancelled: Option<&AtomicBool>,
+        publication: &CheckPublication,
+        cancelled: &Arc<CheckCancellation>,
+        external_cancelled: Option<&Arc<AtomicBool>>,
     ) -> Result<()> {
         let context = run.commands[index].context.as_ref().unwrap().clone();
         let directory = self
@@ -698,7 +846,7 @@ impl CheckRunner {
             }
         }
         if let Some(invocation) = native && let Some(discovery) = &invocation.discovery {
-            let output = super::invocation::capture(&invocation.program, discovery, &directory, Some(cancelled), external_cancelled, 120).await?;
+            let output = super::invocation::capture(&invocation.program, discovery, &directory, Some(&cancelled.requested), external_cancelled.map(AsRef::as_ref), 120).await?;
             let output = String::from_utf8(output).context("Cargo test inventory is not UTF-8")?;
             let names: std::collections::BTreeSet<_> = output.lines().filter_map(|line| line.strip_suffix(": test")).collect();
             for case in &invocation.cases {
@@ -748,6 +896,27 @@ impl CheckRunner {
         tokio::pin!(input_delivery);
         let mut stdout = child.stdout().take().context("check stdout unavailable")?;
         let mut stderr = child.stderr().take().context("check stderr unavailable")?;
+        let process_cancelled = Arc::clone(cancelled);
+        let process_external = external_cancelled.cloned();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let worker = tokio::spawn(async move {
+            let cancelled = async {
+                tokio::select! {
+                    _ = process_cancelled.wait(process_external.as_deref()) => {},
+                    _ = stopped => {},
+                }
+            };
+            tokio::select! {
+                biased;
+                _ = cancelled => {
+                    child.start_kill()?;
+                    Ok((child.wait().await?, true))
+                }
+                status = child.wait() => Ok((status?, false)),
+            }
+        });
+        let mut process = CheckProcess { worker, stop: Some(stop), collected: false };
+        let result: Result<()> = async {
         let mut output = tokio::fs::File::create(&run.commands[index].output).await?;
         let mut stdout_file = tokio::fs::File::create(&run.commands[index].stdout).await?;
         let mut stderr_file = tokio::fs::File::create(&run.commands[index].stderr).await?;
@@ -775,13 +944,15 @@ impl CheckRunner {
                     if bytes > 0 { stderr_file.write_all(&stderr_buffer[..bytes]).await?; output.write_all(&stderr_buffer[..bytes]).await?;
                         run.commands[index].output_bytes += bytes as u64; append_preview(&mut run.commands[index].preview, &stderr_buffer[..bytes]); }
                 },
-                result = child.wait(), if status.is_none() => { status = Some(result?); },
+                result = process.wait(), if status.is_none() => {
+                    let (completed, interrupted) = result?;
+                    status = Some(completed);
+                    killed = interrupted;
+                },
                 _ = ticker.tick() => {
-                    if !killed && (cancelled.load(Ordering::Acquire) || external_cancelled.is_some_and(|value| value.load(Ordering::Acquire))) {
-                        child.start_kill()?; killed = true;
-                    }
                     output.flush().await?;
-                    self.publish(run, sink).await?;
+                    self.update(run, sink)?;
+                    publication.update(run);
                 },
             }
         }
@@ -814,89 +985,92 @@ impl CheckRunner {
             run.commands[index].context.as_mut().unwrap().resolved = Some(receipt.selection);
         }
         Ok(())
+        }.await;
+        if result.is_err() { process.stop().await?; }
+        result
     }
 
-    pub(crate) async fn publish(
-        &self,
-        run: &CheckRun,
-        sink: Option<&BackendEventSink>,
-    ) -> Result<()> {
+    /// Persists a completed external update before publishing its live state.
+    pub(crate) async fn publish(&self, run: &CheckRun, sink: Option<&BackendEventSink>) -> Result<()> {
         let path = self.root.join(&run.id).join("record.json");
-        std::fs::create_dir_all(path.parent().unwrap())?;
-        write_record(&path, run)?;
-        self.records
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check history lock poisoned"))?
-            .insert(run.id.clone(), run.clone());
-        self.changed.notify_waiters();
-        let patch = self
-            .presentation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("check presentation lock poisoned"))?
+        let record = run.clone();
+        tokio::task::spawn_blocking(move || write_record(&path, &record))
+            .await.context("check persistence worker failed")??;
+        self.update(run, sink)
+    }
+
+    fn update(&self, run: &CheckRun, sink: Option<&BackendEventSink>) -> Result<()> {
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        if run.state == CheckState::Running && state.records.get(&run.id).is_some_and(|previous|
+            previous.state != CheckState::Running && previous.lifecycle.len() >= run.lifecycle.len()) {
+            return Ok(());
+        }
+        state.records.insert(run.id.clone(), run.clone());
+        if run.state != CheckState::Running && state.active.as_ref().is_some_and(|active| active.run_id == run.id) {
+            state.active = None;
+        }
+        let patch = self.presentation.lock().map_err(|_| anyhow::anyhow!("check presentation lock poisoned"))?
             .update_checks(run)?;
-        if let Some(sink) = sink {
-            if !patch.is_empty() {
-                let notification = patch.notification();
-                let _ = sink
-                    .send_wait(BackendEvent {
-                        received_at_ms: None,
-                        address: None,
-                        turn_boundary: None,
-                        kind: "document_changed".into(),
-                        text: None,
-                        data: notification,
-                        activity: None,
-                        summary: None,
-                        task_update: None,
-                    })
-                    .await;
-            }
-            let notification = run
-                .lifecycle
-                .last()
-                .filter(|event| matches!(event.kind, CheckEventKind::ConfigurationError));
-            let notify = if let Some(event) = notification {
-                self.notified
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("check notification lock poisoned"))?
-                    .insert(event.id.clone())
-            } else {
-                false
-            };
-            if notify {
-                let _ = sink.send_wait(BackendEvent { received_at_ms:None,address:None,turn_boundary:None,kind:"checks_configuration_error".into(),text:None,
-                    data:serde_json::json!({"run_id":run.id,"error":run.lifecycle.last().unwrap().text}),activity:None,summary:None,task_update:None }).await;
-            }
+        let error = run.lifecycle.last().filter(|event| matches!(event.kind, CheckEventKind::ConfigurationError))
+            .filter(|event| state.notified.insert(event.id.clone())).cloned();
+        drop(state);
+        self.changed.notify_waiters();
+        if !patch.is_empty() && let Some(sink) = sink {
+            self.notification.get_or_init(CheckNotification::new).publish(sink, patch.notification());
+        }
+        if let (Some(error), Some(sink)) = (error, sink) {
+            self.notification.get_or_init(CheckNotification::new).error(sink, BackendEvent {
+                received_at_ms: None, address: None, turn_boundary: None,
+                kind: "checks_configuration_error".into(), text: None,
+                data: serde_json::json!({"run_id":run.id,"error":error.text}),
+                activity: None, summary: None, task_update: None,
+            });
         }
         Ok(())
     }
 
-    /// Starts a durable background run without keeping the provider tool call open for compilation.
+    /// Starts an owned check task without waiting for progress delivery.
+    /// Retains an optional source-work permit until the process is collected.
     pub(crate) async fn start(
         self: &Arc<Self>,
         run: CheckRun,
         sink: Option<BackendEventSink>,
         external_cancelled: Option<Arc<AtomicBool>>,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<String> {
-        let run = self.resolve(run).await?;
-        std::fs::create_dir_all(self.root.join(&run.id))?;
-        let cancelled = self.admit(&run.id)?;
-        let id = run.id.clone();
-        if let Err(error) = self.publish(&run, sink.as_ref()).await {
-            *self
-                .active
-                .lock()
-                .map_err(|_| anyhow::anyhow!("check admission lock poisoned"))? = None;
-            return Err(error);
-        }
-        let runner = Arc::clone(self);
-        tokio::spawn(async move {
-            let _ = runner
-                .run_admitted(run, sink, external_cancelled, cancelled)
-                .await;
-        });
+        let (id, _) = self.launch(run, sink, external_cancelled, admission).await?;
         Ok(id)
     }
+
+    async fn launch(
+        self: &Arc<Self>, run: CheckRun, sink: Option<BackendEventSink>,
+        external_cancelled: Option<Arc<AtomicBool>>,
+        admission: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Result<(String, tokio::sync::oneshot::Receiver<std::result::Result<CheckRun, String>>)> {
+        let run = self.resolve(run).await?;
+        std::fs::create_dir_all(self.root.join(&run.id))?;
+        let cancelled = self.admit(&run, admission)?;
+        let id = run.id.clone();
+        if let Err(error) = self.update(&run, sink.as_ref()) {
+            self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?.active = None;
+            return Err(error);
+        }
+        let supervisor = Arc::clone(self);
+        let task_id = id.clone();
+        let (completed, receiver) = tokio::sync::oneshot::channel();
+        let mut state = self.state.lock().map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        state.task.retain(|_, task| !task.is_finished());
+        let task = tokio::spawn(async move {
+            let result = supervisor.run_admitted(run, sink, external_cancelled, cancelled).await
+                .map_err(|error| format!("{error:#}"));
+            if let Err(error) = &result { eprintln!("check execution failed: {error}"); }
+            let _ = completed.send(result);
+            if let Ok(mut state) = supervisor.state.lock() { state.task.remove(&task_id); }
+        });
+        state.task.insert(id.clone(), task);
+        Ok((id, receiver))
+    }
+
 }
 
 pub(super) fn operation<'definition>(
@@ -910,7 +1084,9 @@ pub(super) fn operation<'definition>(
     }
 }
 
-fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
+/// Atomically replaces one run record on a blocking persistence worker.
+pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
+    std::fs::create_dir_all(path.parent().context("check history path has no parent")?)?;
     let temporary = path.with_extension("tmp");
     std::fs::write(
         &temporary,
@@ -944,4 +1120,22 @@ pub(crate) fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancellation_releases_a_pending_checkpoint_read() -> Result<()> {
+        let cancellation = CheckCancellation {
+            requested: Arc::new(AtomicBool::new(false)), changed: Default::default(),
+        };
+        let read = cancellation.read(None, std::future::pending::<Result<()>>());
+        tokio::pin!(read);
+        assert!(futures_util::poll!(read.as_mut()).is_pending());
+        cancellation.cancel();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), read).await??.is_none());
+        Ok(())
+    }
 }

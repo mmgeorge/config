@@ -35,7 +35,8 @@ impl StatusView<'_> {
             status_thoughts,
             checks,
         } = *self;
-        let text = primary_text(status, now_ms);
+        let checking = checks.is_some() && matches!(status, SessionPhase::Idle);
+        let text = if checking { "Checking".into() } else { primary_text(status, now_ms) };
         let text = if agent_count > 0 && !matches!(status, SessionPhase::WaitingForAgent { .. }) {
             format!(
                 "{text} · {agent_count} agent{} running",
@@ -53,8 +54,8 @@ impl StatusView<'_> {
             TranscriptRenderer::new(width)?.literal(BlockId(id.to_owned()), &text, 0)?;
         block.metadata.status = Some(StatusPresentation {
             row: 1,
-            animated: status.animated(),
-            hint: match status {
+            animated: checking || status.animated(),
+            hint: if checking { Some(StatusHint::Working) } else { match status {
                 SessionPhase::Working { .. }
                 | SessionPhase::RetryingPlanGeneration { .. }
                 | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
@@ -62,7 +63,7 @@ impl StatusView<'_> {
                 SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
                 SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
                 _ => None,
-            },
+            } },
         });
         let action = bind_primary_action(&mut block, id, status);
         if let Some(checks) = checks {
@@ -195,7 +196,8 @@ fn append_checks(
     now_ms: i64,
 ) -> Result<()> {
     let mut lines = vec![format!(
-        "Checks running · {}/{} finished · {}s",
+        "Checks running · {} · {}/{} finished · {}s",
+        checks.trigger,
         checks.completed_count,
         checks.total_count,
         checks.elapsed_ms(now_ms) / 1000

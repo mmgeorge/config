@@ -9,13 +9,32 @@ Provider-specific transport behavior is described in [Providers](providers.md). 
 The status entry combines the primary `SessionPhase` with an optional `CheckActivity`.
 `buffer/status.rs` owns their layout. The primary label and action keep their own
 row, and check progress appears directly below it before the reasoning preview.
-Check updates preserve the primary phase and its hints. The Rust projection owns
-both timers, while Lua animates only the committed primary status marker.
+Check updates preserve an active provider phase or user-decision wait. When the
+provider is idle and checks remain active, the primary label is Checking and the
+check row names its trigger. Rust owns both timers, while Lua animates only the
+committed primary status marker.
 
 Active checks never become historical entries. `TimelineStream::update_checks`
 publishes a lightweight status replacement during execution and atomically removes
 the matching activity when it inserts the final result. Normal status updates retain
 independent check activity. Full snapshot reconstruction applies the same boundary.
+
+`CheckSupervisor` owns run admission, cancellation, records, and worker lifetimes.
+Admission and the corresponding record share one state lock, as do terminal
+publication and release of active ownership. Observer snapshots read both together.
+The active run also owns the service's source-work permit, which is released when
+its processes are collected rather than when the UI drains its event stream.
+Dropping a caller's wait does not abandon the owned worker. Process cancellation
+uses an independent task that owns the process tree, so blocked output writing,
+record persistence, or UI delivery cannot delay the termination request.
+
+`CheckPublication` coalesces intermediate snapshots per run in a separate persistence
+worker and flushes the terminal snapshot before the run result returns. Notification
+delivery coalesces view invalidations separately from persistence. Complete process
+output stays in its stdout, stderr, and combined files. Persistence failures become
+explicit configuration errors in the live record, with the previous disk record
+available for recovery. The UI does not own execution or infer completion.
+
 
 `NodeMap` owns the shared expansion choices, node incarnations, and tool output sources for
 one open Harness presentation. Emitted nodes identify exchanges, messages, tool groups,
@@ -251,8 +270,12 @@ Typing a label or an attachment-shaped string creates ordinary text.
 
 The composer binds only submission, queueing, steering, cancellation, mode, effort, and prompt
 history controls. It inherits ordinary text editing and navigation mappings. Timeline navigation,
-folding, help, and close shortcuts belong to the transcript. Prompt history defaults to Alt-Up
-and Alt-Down so the arrow keys retain their editor behavior.
+folding, help, and close shortcuts belong to the transcript. Up starts prompt history at the
+first draft line and otherwise moves within the draft. Down advances through recalled prompts
+and restores the unsent draft with its attachments. Alt-Up and Alt-Down remain aliases.
+Snapshot refreshes and history-record responses preserve the selected occurrence and unsent
+draft while adopting new history entries. Each composer owns its history-edit listener.
+The shared history store retains all submitted entries across sessions and host restarts.
 
 Request admission resolves only the explicit attachment list. `BackendInput` carries
 the resolved objects through provider requests and user steering. Provider adapters
@@ -1495,6 +1518,11 @@ awaiting review still requires explicit acceptance before execution.
 Changing permission while paused does not restart execution. Model changes during execution
 use the same stop-and-resume coordinator. Shared MCP and skill selection changes immediately
 stop active work, apply the selected revision, and resume through that coordinator.
+Permission-driven resumption supplies the previous and effective approval modes to the model,
+preserves the original request, and directs it to inspect interrupted operations before retrying.
+The notice does not widen filesystem access or bypass saved approval rules. Task resumptions
+keep this notice separate from user-authored text and retain their lifecycle heading. Native
+goal resumption delivers the notice to the resumed provider turn without starting another goal.
 
 `task.transition` persists an operation ID on the ordered host input lane before concurrent
 dispatch or acknowledgement. A compare-and-set claim permits one execution of each intent.

@@ -1,4 +1,4 @@
-use super::{CheckConfig, CheckRunner, ConfigSnapshot, RunRequest};
+use super::{CheckConfig, CheckSupervisor, ConfigSnapshot, RunRequest};
 use crate::{
     backend::{BackendEventSink, PromptMode},
     session::{CheckShell, PermissionMode},
@@ -50,7 +50,7 @@ pub(crate) struct ConfigureChecks {
 
 /// Restricts provider check tools to one authenticated root interaction and captured task.
 pub(crate) struct CheckToolScope {
-    runner: Arc<CheckRunner>,
+    runner: Arc<CheckSupervisor>,
     task_id: Option<String>,
     shell: CheckShell,
     mode: PromptMode,
@@ -108,7 +108,7 @@ impl CheckToolScope {
     }
 
     pub(crate) fn open(
-        runner: Arc<CheckRunner>,
+        runner: Arc<CheckSupervisor>,
         authority: CheckAuthority,
     ) -> (Arc<Self>, CheckToolLease) {
         let CheckAuthority {
@@ -249,7 +249,7 @@ impl CheckToolScope {
                     self.agent.active_count() == 0,
                     "an agent started during check authorization"
                 );
-                json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled))).await?})
+                json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),None).await?})
             }
             "checks_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
@@ -315,7 +315,7 @@ impl CheckToolScope {
     }
 }
 
-impl CheckRunner {
+impl CheckSupervisor {
     /// Adds concrete task commands without starting checks or publishing run history.
     pub(crate) async fn catalog_preview(&self, task_id: Option<&str>, shell: CheckShell) -> Result<Value> {
         let mut catalog = self.catalog(task_id)?;
@@ -675,7 +675,7 @@ impl CheckRunner {
         run.commands.clear();
         run.lifecycle.clear();
         run.state = super::CheckState::Skipped;
-        run.completed_at_ms = Some(super::runner::now_ms());
+        run.completed_at_ms = Some(super::supervisor::now_ms());
         run.record(
             super::CheckEventKind::ConfigurationSaved,
             None,

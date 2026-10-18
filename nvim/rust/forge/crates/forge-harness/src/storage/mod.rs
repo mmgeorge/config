@@ -982,11 +982,6 @@ impl SqliteStore {
             "INSERT INTO prompt_attachment_record(history_id,payload) VALUES(?1,?2)",
             params![transaction.last_insert_rowid(), serde_json::to_string(&draft.attachments)?],
         )?;
-        transaction.execute(
-            "DELETE FROM prompt_history_record WHERE id NOT IN \
-             (SELECT id FROM prompt_history_record ORDER BY id DESC LIMIT 100)",
-            [],
-        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -995,7 +990,7 @@ impl SqliteStore {
     pub fn list_prompt_history(&self) -> Result<Vec<crate::attachment::PromptDraft>> {
         let mut statement = self
             .connection
-            .prepare("SELECT h.text, COALESCE(a.payload, '[]') FROM prompt_history_record h LEFT JOIN prompt_attachment_record a ON a.history_id=h.id ORDER BY h.id DESC LIMIT 100")?;
+            .prepare("SELECT h.text, COALESCE(a.payload, '[]') FROM prompt_history_record h LEFT JOIN prompt_attachment_record a ON a.history_id=h.id ORDER BY h.id DESC")?;
         let row_list = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
         row_list.map(|row| {
             let (text, attachments) = row?;
@@ -1403,7 +1398,7 @@ mod test {
     }
 
     #[test]
-    fn shares_only_the_newest_hundred_prompts() {
+    fn preserves_prompt_history_beyond_one_hundred_entries() {
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         for index in 0..105 {
@@ -1413,9 +1408,9 @@ mod test {
         }
 
         let history = store.list_prompt_history().unwrap();
-        assert_eq!(history.len(), 100);
+        assert_eq!(history.len(), 105);
         assert_eq!(history.first().map(|draft| draft.text.as_str()), Some("prompt-104"));
-        assert_eq!(history.last().map(|draft| draft.text.as_str()), Some("prompt-5"));
+        assert_eq!(history.last().map(|draft| draft.text.as_str()), Some("prompt-0"));
 
         let reopened = SqliteStore::open(temporary.path()).unwrap();
         assert_eq!(reopened.list_prompt_history().unwrap(), history);

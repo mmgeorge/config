@@ -1238,6 +1238,7 @@ impl Backend for CodexBackend {
         let native_resume = request.mode == PromptMode::GoalContinuation
             && request_text.lines().next() == Some("/goal resume");
         let resume_message = native_resume.then(|| request_text.split_once("\n\nAdditional user instructions:\n")
+            .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
             .map(|(_, text)| text.to_owned())).flatten();
         let admission = if native_resume {
             self.resume_native_goal_turn(process, &mut output, &request, &thread_id)
@@ -2280,9 +2281,11 @@ mod test {
     #[tokio::test]
     async fn native_resume_adopts_auto_started_turn_without_explicit_start() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        for (before_ack, starts_turn, with_message) in
-            [(true, true, false), (false, true, false), (true, false, false), (false, false, false), (false, true, true)]
+        for (before_ack, starts_turn, message_header) in
+            [(true, true, None), (false, true, None), (true, false, None), (false, false, None),
+             (false, true, Some("Additional user instructions")), (false, true, Some("Harness transition"))]
         {
+            let with_message = message_header.is_some();
             let fixture = tempfile::tempdir()?;
             let workspace = fixture.path().to_string_lossy().into_owned();
             let permission = PermissionCoordinator::transient(&workspace)?;
@@ -2401,7 +2404,8 @@ mod test {
                         execution_owner: None,
                         harness_session_id: "session".into(),
                         workspace,
-                        input: BackendInput::from_text(if with_message { "/goal resume\n\nAdditional user instructions:\nKeep the original objective and add tests" } else { "/goal resume" }),
+                        input: BackendInput::from_text(message_header.map_or_else(|| "/goal resume".into(), |header|
+                            format!("/goal resume\n\n{header}:\nKeep the original objective and add tests"))),
                         mode: PromptMode::GoalContinuation,
                         model: "gpt-5.6-terra".into(),
                         effort: "medium".into(),

@@ -65,10 +65,10 @@ fn large_check_configuration_and_helpers_preserve_complete_content() -> Result<(
     Ok(())
 }
 
-fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<CheckRunner> {
+fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<CheckSupervisor> {
     let mut presentation = crate::buffer::session::SessionPresentation::new("checks-test".into());
     presentation.initialize(Vec::new()).unwrap();
-    CheckRunner::open(
+    CheckSupervisor::open(
         workspace.into(),
         data.into(),
         Arc::new(Mutex::new(presentation)),
@@ -76,6 +76,39 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
         Arc::new(forge_git::store::RepositoryStore::default()),
     )
     .unwrap()
+}
+
+#[test]
+fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), (0..33).map(|index| definition(&format!("check-{index}"), "print done")).collect());
+    let runner = make_runner(workspace.path(), data.path());
+    let mut run = runner.prepare_request(RunRequest {
+        ids: (0..4).map(|index| format!("check-{index}")).collect(),
+        ..Default::default()
+    }, None, crate::session::CheckShell::Nushell, "User requested".into())?;
+    assert_eq!(run.commands.len(), 33);
+    let activity = CheckActivity::from_run(&run).unwrap();
+    assert_eq!((activity.completed_count, activity.total_count), (0, 4));
+    let states = [CheckState::Passed, CheckState::Failed, CheckState::Running, CheckState::Pending];
+    for (command, state) in run.commands.iter_mut().filter(|command| command.selected).zip(states) {
+        command.state = state;
+    }
+    let activity = CheckActivity::from_run(&run).unwrap();
+    assert_eq!((activity.completed_count, activity.total_count), (2, 4));
+    let mut package_command = run.commands.iter().find(|command| command.state == CheckState::Passed).unwrap().clone();
+    package_command.id = "expanded-package".into();
+    package_command.state = CheckState::Pending;
+    run.commands.push(package_command);
+    let activity = CheckActivity::from_run(&run).unwrap();
+    assert_eq!((activity.completed_count, activity.total_count), (1, 4));
+    run.commands.last_mut().unwrap().state = CheckState::Passed;
+    run.commands.iter_mut().find(|command| command.selected && command.state == CheckState::Pending).unwrap().state = CheckState::Skipped;
+    let restored: CheckRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+    let activity = CheckActivity::from_run(&restored).unwrap();
+    assert_eq!((activity.completed_count, activity.total_count), (3, 4));
+    Ok(())
 }
 
 fn direct_operation(command: &str, args: &[&str], manager: Option<PackageManager>) -> CheckOperation {
@@ -126,7 +159,7 @@ async fn completion_wait_returns_running_when_deadline_expires() -> Result<()> {
     Ok(())
 }
 
-async fn begin_recorded_task(workspace: &std::path::Path, data: &std::path::Path, runner: &CheckRunner) -> Result<()> {
+async fn begin_recorded_task(workspace: &std::path::Path, data: &std::path::Path, runner: &CheckSupervisor) -> Result<()> {
     assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(workspace).status()?.success());
     let checkpoint = crate::checkpoint::GitCheckpoint::new(workspace).capture(
         &crate::storage::objects::ObjectStore::open(data)?,
@@ -1193,8 +1226,8 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         crate::session::CheckShell::Nushell,
         "Test".into(),
     )?;
-    let id = runner.start(first, None, None).await?;
-    assert!(runner.start(second, None, None).await.is_err());
+    let id = runner.start(first, None, None, None).await?;
+    assert!(runner.start(second, None, None, None).await.is_err());
     runner.cancel(&id)?;
     assert_eq!(runner.active()?.as_deref(), Some(id.as_str()));
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1205,6 +1238,14 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     })
     .await??;
     assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
+    let mut automatic = runner.prepare_request(
+        RunRequest { all: true, ..Default::default() }, None,
+        crate::session::CheckShell::Nushell, "Automatic".into())?;
+    automatic.context.as_mut().unwrap().automatic = true;
+    let stopped = tokio::time::timeout(std::time::Duration::from_secs(1),
+        runner.run(automatic, None, None)).await??;
+    assert_eq!(stopped.state, CheckState::Blocked);
+    assert!(stopped.commands[0].started_at_ms.is_none());
     Ok(())
 }
 
@@ -1225,7 +1266,7 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     )?;
     let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let id = runner
-        .start(run, None, Some(Arc::clone(&cancelled)))
+        .start(run, None, Some(Arc::clone(&cancelled)), None)
         .await?;
     cancelled.store(true, std::sync::atomic::Ordering::Release);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
@@ -1236,5 +1277,140 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     })
     .await??;
     assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> Result<()> {
+    use std::time::Duration;
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    let ready = data.path().join("ready");
+    save(workspace.path(), vec![definition("slow", &format!(
+        "'ready' | save --force '{}'; sleep 30sec; 'orphan' | save orphan.txt", ready.display()))]);
+    let runner = make_runner(workspace.path(), data.path());
+    let (sink, mut stream) = crate::backend::events::channel();
+    let filler = crate::backend::BackendEvent { received_at_ms: None, address: None, turn_boundary: None,
+        kind: "assistant_message".into(), text: Some("x".repeat(16_384)), data: serde_json::Value::Null,
+        activity: None, summary: None, task_update: None };
+    while let Ok(result) = tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await {
+        result?;
+    }
+    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
+        crate::session::CheckShell::Nushell, "Backpressure test".into())?;
+    let admission = Arc::new(tokio::sync::Semaphore::new(1));
+    let permit = Arc::clone(&admission).acquire_owned().await?;
+    let id = tokio::time::timeout(Duration::from_secs(1), runner.start(run, Some(sink), None, Some(permit))).await??;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await?;
+    runner.cancel(&id)?;
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while runner.active()?.is_some() { runner.status(&id, 50, false).await?; }
+        Ok::<_, anyhow::Error>(())
+    }).await??;
+    let snapshot = runner.snapshot()?;
+    assert!(snapshot.active_run.is_none());
+    assert!(Arc::clone(&admission).try_acquire_owned().is_ok(), "presentation retained execution admission");
+    let finished = snapshot.history.iter().find(|run| run.id == id).unwrap();
+    assert_eq!(finished.state, CheckState::Interrupted);
+    assert!(finished.completed_at_ms.is_some());
+    assert!(!workspace.path().join("orphan.txt").exists());
+    // Drain the same transport to prove that the final invalidation survives coalescing.
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let event = stream.recv().await.unwrap().unwrap();
+            if event.kind == "document_changed" && event.data["checks_running"] == false { break; }
+        }
+    }).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<()> {
+    use std::time::Duration;
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    let ready = data.path().join("ready");
+    let allow = data.path().join("allow");
+    save(workspace.path(), vec![definition("controlled", &format!(
+        "if not ('{}' | path exists) {{ 'ready' | save --force '{}'; sleep 30sec }}; print done",
+        allow.display(), ready.display()))]);
+    std::fs::write(workspace.path().join("source.txt"), "before")?;
+    let runner = make_runner(workspace.path(), data.path());
+    begin_recorded_task(workspace.path(), data.path(), &runner).await?;
+    std::fs::write(workspace.path().join("source.txt"), "after")?;
+    runner.refresh_changes().await?;
+    let prepare = || runner.prepare_request(RunRequest { all: true, ..Default::default() },
+        Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Cancellation test".into());
+    let first = runner.start(prepare()?, None, None, None).await?;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !ready.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await?;
+    runner.cancel(&first)?;
+    let cancelled = runner.status(&first, 5000, true).await?;
+    assert_eq!(cancelled.state, CheckState::Interrupted);
+    assert!(cancelled.cancelled_inputs.is_some());
+    let mut automatic = prepare()?;
+    automatic.context.as_mut().unwrap().automatic = true;
+    let blocked = tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
+    assert_eq!(blocked.commands[0].state, CheckState::Blocked);
+    assert!(blocked.commands[0].started_at_ms.is_none());
+    let mut policy = AutomaticChecks::open(data.path(), "recorded-task")?;
+    assert!(policy.observe(&blocked)?.is_none());
+    assert!(policy.pending && policy.blocked.is_some());
+    let reopened = make_runner(workspace.path(), data.path());
+    let mut recovered = reopened.prepare_request(RunRequest { all: true, ..Default::default() },
+        Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Recovered automatic run".into())?;
+    recovered.context.as_mut().unwrap().automatic = true;
+    assert_eq!(reopened.run(recovered, None, None).await?.state, CheckState::Blocked);
+    std::fs::write(&allow, "allow")?;
+    let retry = runner.run(prepare()?, None, None).await?;
+    assert_eq!(retry.state, CheckState::Passed);
+    let mut automatic = prepare()?;
+    automatic.context.as_mut().unwrap().automatic = true;
+    let repeated = runner.run(automatic, None, None).await?;
+    assert_eq!(repeated.state, CheckState::Passed);
+    assert!(repeated.commands[0].reused_from.is_some());
+    std::fs::write(workspace.path().join("source.txt"), "new inputs")?;
+    let mut automatic = prepare()?;
+    automatic.context.as_mut().unwrap().automatic = true;
+    let changed = runner.run(automatic, None, None).await?;
+    assert_eq!(changed.state, CheckState::Passed);
+    assert!(changed.commands[0].reused_from.is_none());
+    Ok(())
+}
+
+#[test]
+fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("failure", "exit 1"), definition("cancelled", "exit 0"),
+        definition("pending", "exit 0")]);
+    let runner = make_runner(workspace.path(), data.path());
+    let mut run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
+        crate::session::CheckShell::Nushell, "Summary".into())?;
+    run.commands[0].state = CheckState::Failed;
+    run.commands[1].state = CheckState::Interrupted;
+    assert!(run.summary().contains("1 failed"));
+    assert!(run.summary().contains("1 interrupted"));
+    assert!(run.summary().contains("1 not run"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn output_failure_collects_the_process_before_releasing_admission() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("output", "sleep 250ms; 'orphan' | save orphan.txt")]);
+    let runner = make_runner(workspace.path(), data.path());
+    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
+        crate::session::CheckShell::Nushell, "Output failure".into())?;
+    std::fs::create_dir_all(&run.commands[0].output)?;
+    let run = tokio::time::timeout(std::time::Duration::from_secs(2), runner.run(run, None, None)).await??;
+    assert_eq!(run.state, CheckState::ConfigurationError);
+    assert!(runner.active()?.is_none());
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!workspace.path().join("orphan.txt").exists());
     Ok(())
 }

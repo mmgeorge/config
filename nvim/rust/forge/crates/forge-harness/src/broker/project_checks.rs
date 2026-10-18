@@ -228,7 +228,7 @@ impl HarnessBroker {
                     self.session.shell,
                     "User requested".into(),
                 )?;
-                json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None).await?})
+                json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
             }
             HarnessMethod::ChecksStatus => {
                 let wait_for_completion = params["wait_for_completion"].as_bool().unwrap_or(false);

@@ -8,7 +8,8 @@ mod model;
 mod invocation;
 mod packages;
 mod preview;
-mod runner;
+mod supervisor;
+mod publication;
 mod selection;
 #[cfg(test)]
 mod tests;
@@ -22,8 +23,8 @@ pub use config::{
     CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckScope, ConfigSnapshot,
 };
 pub use model::{CheckEvent, CheckEventKind, CheckRun, CheckSetupState, CheckState, CommandCheck};
-pub(crate) use runner::CheckAdmission;
-pub use runner::CheckRunner;
+pub(crate) use supervisor::CheckAdmission;
+pub use supervisor::CheckSupervisor;
 pub use selection::{CheckCase, CheckReceipt, CheckSelection, RunRequest};
 pub use packages::PackageManager;
 pub use preview::CheckPreview;

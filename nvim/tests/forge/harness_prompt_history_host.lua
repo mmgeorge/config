@@ -1,4 +1,4 @@
-vim.opt.runtimepath:prepend("nvim")
+vim.opt.runtimepath:prepend(vim.fs.normalize(vim.fn.getcwd()) .. "/nvim")
 vim.loader.enable(false)
 
 local stage = arg[1]
@@ -28,11 +28,20 @@ package.loaded["forge.builder"] = { ensure = function(callback)
 end }
 local client = require("forge.client")
 client._set_launcher_for_test(vim.system)
+local request = client.request
+local pending_history = 0
+client.request = function(method, params, callback)
+  if method ~= "history.record" then return request(method, params, callback) end
+  pending_history = pending_history + 1
+  return request(method, params, function(result, failure)
+    pending_history = pending_history - 1
+    callback(result, failure)
+  end)
+end
 local errors = {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
-local history = require("forge.views.harness.prompt_history")
 local plan = "/plan Demonstrate persisted prompt recall"
 
 local function await(predicate, message)
@@ -46,12 +55,18 @@ local function submit(text)
   await(function()
     return not state.busy and not state.task_operation and not state.state_sync_pending
       and not state.configuring and not state.configuration_debounce
-      and state.prompt_history[1] == text
+      and pending_history == 0 and state.prompt_history[1] and state.prompt_history[1].text == text
   end, "submission or history did not settle: " .. text)
 end
 
 local function composer_text()
   return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
+end
+
+---@param keys string
+local function press(keys)
+  vim.api.nvim_set_current_win(state.composer_win)
+  vim.api.nvim_feedkeys(vim.keycode(keys), "xt", false)
 end
 
 local success, failure = xpcall(function()
@@ -60,24 +75,35 @@ local success, failure = xpcall(function()
   require("forge").open_harness()
   await(function() return state.ready and state.session ~= nil end, "Harness did not open")
   if stage == "seed" then
+    for index = 1, 105 do
+      local recorded = false
+      client.request("history.record", { text = "persisted prompt " .. index, attachments = {} }, function(_, problem)
+        assert(not problem, problem)
+        recorded = true
+      end)
+      await(function() return recorded end, "history write was not acknowledged")
+    end
     submit(plan)
     submit("/fast")
     submit("/ultrafast")
   elseif stage == "resubmit" then
-    assert(state.prompt_history[1] == "/ultrafast", "latest command was not restored")
-    assert(state.prompt_history[3] == plan, "older plan command was not persisted")
-    for _ = 1, 3 do history.previous() end
+    assert(state.prompt_history[1].text == "/ultrafast", "latest command was not restored: " .. vim.inspect(state.prompt_history))
+    assert(state.prompt_history[3].text == plan, "older plan command was not persisted")
+    press("<Up><Up><Up>")
     assert(composer_text() == plan, "Up did not recall the older plan command")
     controller.submit()
     await(function()
       return not state.busy and not state.task_operation and not state.state_sync_pending
-        and state.prompt_history[1] == plan
+        and pending_history == 0 and state.prompt_history[1].text == plan
     end, "recalled plan was not promoted to newest history")
     assert(state.prompt_history_index == 0, "resubmission retained its old navigation index")
   elseif stage == "verify" then
-    assert(state.prompt_history[1] == plan, "restart lost the resubmitted plan's history order")
-    history.previous()
+    assert(state.prompt_history[1].text == plan, "restart lost the resubmitted plan's history order")
+    press("i<Up><Esc>")
     assert(composer_text() == plan, "first Up after restart did not recall the resubmitted plan")
+    assert(#state.prompt_history == 109, "host truncated persisted prompt history")
+    for _ = 2, #state.prompt_history do press("<Up>") end
+    assert(composer_text() == "persisted prompt 1", "oldest prompt was not reachable after restart")
   else
     error("unknown stage: " .. stage)
   end

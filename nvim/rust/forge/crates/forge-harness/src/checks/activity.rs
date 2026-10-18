@@ -6,13 +6,15 @@ use serde::Serialize;
 pub struct CheckActivity {
     /// Durable run whose progress is currently visible.
     pub run_id: String,
+    /// Explains whether the run was requested explicitly or scheduled at completion.
+    pub trigger: String,
     /// Execution time accumulated by completed commands.
     pub duration_ms: u64,
     /// Current execution interval, absent while an interrupted run is suspended.
     pub started_at_ms: Option<i64>,
-    /// Commands with a recorded terminal state, including skips and failures.
+    /// Selected checks whose commands all reached a terminal state, including skips and failures.
     pub completed_count: usize,
-    /// Commands selected for this run.
+    /// Check definitions selected for this run, including required prerequisites.
     pub total_count: usize,
     /// Running command labels, timers, and latest output lines.
     pub command_list: Vec<CheckCommandActivity>,
@@ -23,6 +25,12 @@ impl CheckActivity {
     pub(crate) fn from_run(run: &CheckRun) -> Option<Self> {
         if run.state != CheckState::Running {
             return None;
+        }
+        let mut selected = std::collections::BTreeMap::new();
+        for command in run.commands.iter().filter(|command| command.selected) {
+            let id = command.context.as_ref().map_or(command.id.as_str(), |context| context.definition_id.as_str());
+            let completed = !matches!(command.state, CheckState::Pending | CheckState::Running);
+            selected.entry(id).and_modify(|finished| *finished &= completed).or_insert(completed);
         }
         let duration_ms = run
             .commands
@@ -73,8 +81,7 @@ impl CheckActivity {
                 output_line: String::from_utf8_lossy(&strip_ansi_escapes::strip(
                     command.preview.as_bytes(),
                 ))
-                .split(['\n', '\r'])
-                .rev()
+                .rsplit(['\n', '\r'])
                 .map(str::trim)
                 .find(|line| !line.is_empty())
                 .map(str::to_owned),
@@ -82,16 +89,14 @@ impl CheckActivity {
             .collect();
         Some(Self {
             run_id: run.id.clone(),
+            trigger: run.context.as_ref().map_or_else(
+                || "Plan verification".into(),
+                |context| context.trigger.clone(),
+            ),
             duration_ms,
             started_at_ms,
-            completed_count: run
-                .commands
-                .iter()
-                .filter(|command| {
-                    !matches!(command.state, CheckState::Pending | CheckState::Running)
-                })
-                .count(),
-            total_count: run.commands.len(),
+            completed_count: selected.values().filter(|completed| **completed).count(),
+            total_count: selected.len(),
             command_list,
         })
     }

@@ -24,7 +24,8 @@ client.subscribe(function(event, payload)
 end)
 local function await(predicate, message)
   assert(vim.wait(10000, function() return #errors > 0 or predicate() end, 10),
-    message .. (state.configuration_error and (": " .. state.configuration_error) or ""))
+    message .. ": " .. vim.inspect({ starts = starts, mode = state.session and state.session.execution_mode,
+      task = task.current(state), operation = state.task_operation, error = state.configuration_error }))
   assert(#errors == 0, table.concat(errors, "\n"))
 end
 local success, failure = xpcall(function()
@@ -49,6 +50,18 @@ local success, failure = xpcall(function()
   assert(task.current(state).id == task_id, "configuration replaced the running task")
   assert(not state.configuration_error, state.configuration_error)
 
+  controller.set_mode("read")
+  await(function() return starts == 3 and state.session.execution_mode == "read" end,
+    "Read mode did not resume active work")
+  controller.set_mode("write")
+  await(function() return starts == 4 and state.session.execution_mode == "write" end,
+    "Write mode did not resume active work")
+  assert(task.current(state).id == task_id, "permission change replaced the running task")
+  await(function()
+    local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    return transcript:find("Permission changed to Write", 1, true) ~= nil
+  end, "permission notice replaced the task lifecycle heading")
+
   controller.task_transition({ action = "pause" })
   await(function() return not state.busy and not state.task_operation and not state.state_sync_pending end,
     "pause did not settle")
@@ -58,7 +71,7 @@ local success, failure = xpcall(function()
   await(function() return paused_applied ~= nil and not state.task_operation and not state.state_sync_pending end,
     "paused configuration did not settle")
   assert(paused_applied and state.session.effort == "low")
-  assert(starts == 2 and task.current(state).status == "paused", "configuration restarted a paused task")
+  assert(starts == 4 and task.current(state).status == "paused", "configuration restarted a paused task")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

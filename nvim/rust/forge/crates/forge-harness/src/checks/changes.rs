@@ -29,7 +29,7 @@ impl CheckChanges {
     pub(super) async fn snapshot(&self) -> Result<Option<CheckpointRecord>> {
         let baseline = self.baseline.lock().map_err(|_| anyhow::anyhow!("check baseline lock poisoned"))?.clone();
         let Some(baseline) = baseline else { return Ok(None); };
-        Ok(Some(self.checkpoint.capture(&self.objects, &self.repositories, &baseline.checkpoint.session_id, super::runner::now_ms()).await?))
+        Ok(Some(self.checkpoint.capture(&self.objects, &self.repositories, &baseline.checkpoint.session_id, super::supervisor::now_ms()).await?))
     }
 
     /// Restores the exact task baseline without substituting the Git index or HEAD.
@@ -98,7 +98,7 @@ impl CheckChanges {
                 &self.objects,
                 &self.repositories,
                 &baseline.checkpoint.session_id,
-                super::runner::now_ms(),
+                super::supervisor::now_ms(),
             )
             .await?;
         let files = baseline.checkpoint.changed_paths(&current)?;

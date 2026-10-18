@@ -79,6 +79,8 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_checks_
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_message_folds_host.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_markdown_folds.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_configuration_host.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_prompt_history.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_prompt_history_host.lua
 ```
 
 The message-fold fixture checks three-line previews, caret rendering, prompt submission,
@@ -88,6 +90,9 @@ checks repeated list folding beside a status row and cursor refreshes for stale 
 The configuration fixture applies thinking changes while idle, while a blocking provider owns
 execution but Lua reports idle, and while the task is paused. It verifies resumption preserves
 the task identity and paused changes do not restart provider work.
+The prompt-history fixtures dispatch the installed Up/Down mappings in normal and
+insert mode, preserve multiline drafts and attachments across snapshot refreshes,
+and resubmit persisted prompts across three fresh host processes.
 
 Enforce an external execution deadline when running these commands through an
 automation tool. A fixture that prints success but remains alive does not pass.
@@ -135,6 +140,7 @@ the repository root in a fresh Neovim, with an external 30-second deadline:
 ```nu
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_package_checks.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_automatic_checks.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_check_lifecycle_host.lua
 ```
 
 The fixture creates a temporary npm workspace and invokes the actual host through
@@ -149,6 +155,9 @@ The automatic-check fixture exercises the completion gate through a fresh host.
 It verifies one executed failure, one reused failure, a repair turn stopping
 without progress, and explicit multi-check execution including a nonautomatic
 check. It uses a three-second mock provider and a temporary Git repository.
+The check-lifecycle fixture selects four of 33 definitions and verifies that the live
+counter excludes the other 29, output continues streaming, and cancellation clears
+the active status before a subsequent failing run.
 
 When contributing from inside Harness, configure these commands as project checks
 and invoke the checks interface. The commands document the required targets and

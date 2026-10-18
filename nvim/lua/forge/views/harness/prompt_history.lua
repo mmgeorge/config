@@ -5,8 +5,6 @@ local notifications = require("forge.infra.notifications")
 local session = require("forge.session")
 local attachment = require("forge.views.harness.attachment")
 
-local LIMIT = 100
-
 ---@return ForgeHarnessPresentationState
 local function state() return session.harness end
 
@@ -36,19 +34,38 @@ end
 
 ---@param key string
 local function replay_native(key)
-  vim.api.nvim_feedkeys(vim.keycode(key), "n", false)
+  vim.api.nvim_feedkeys(vim.keycode(key), "ni", false)
+end
+
+---@param harness ForgeHarnessPresentationState
+---@param prompt_list (string|ForgePromptDraft)[]
+local function adopt_history(harness, prompt_list)
+  local selected = harness.prompt_history[harness.prompt_history_index]
+  local occurrence = 0
+  if selected then
+    for index = harness.prompt_history_index, #harness.prompt_history do
+      if vim.deep_equal(selected, harness.prompt_history[index]) then occurrence = occurrence + 1 end
+    end
+  end
+  harness.prompt_history = vim.deepcopy(prompt_list)
+  if not selected then return end
+  for index = #harness.prompt_history, 1, -1 do
+    if vim.deep_equal(selected, harness.prompt_history[index]) then
+      occurrence = occurrence - 1
+      if occurrence == 0 then
+        harness.prompt_history_index = index
+        return
+      end
+    end
+  end
+  harness.prompt_history_index = 0
+  harness.prompt_history_draft = nil
 end
 
 ---@param prompt_list (string|ForgePromptDraft)[]?
 ---@return nil
 function M.replace(prompt_list)
-  local harness = state()
-  local normalized_prompt_list = prompt_list or {}
-  harness.prompt_history = {}
-  for index = 1, math.min(#normalized_prompt_list, LIMIT) do
-    harness.prompt_history[index] = normalized_prompt_list[index]
-  end
-  M.reset_navigation()
+  adopt_history(state(), prompt_list or {})
 end
 
 ---@return nil
@@ -65,14 +82,13 @@ function M.record(text)
   local draft = attachment.capture(harness.composer_buf)
   if draft.text ~= text then draft = { text = text, attachments = {} } end
   table.insert(harness.prompt_history, 1, draft)
-  while #harness.prompt_history > LIMIT do table.remove(harness.prompt_history) end
   M.reset_navigation()
   client.request("history.record", draft, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness prompt history")
       return
     end
-    harness.prompt_history = vim.deepcopy(result or harness.prompt_history)
+    if result then adopt_history(harness, result) end
   end)
 end
 
@@ -80,11 +96,12 @@ end
 function M.previous()
   local harness = state()
   if harness.prompt_history_index == 0 then
-    local current = buffer_text(harness.composer_buf)
-    if current ~= "" then
+    local win = harness.composer_win
+    if win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_cursor(win)[1] > 1 then
       replay_native("<Up>")
       return
     end
+    if #harness.prompt_history == 0 then return end
     harness.prompt_history_draft = attachment.capture(harness.composer_buf)
   end
   if harness.prompt_history_index >= #harness.prompt_history then return end
@@ -109,15 +126,18 @@ end
 ---@param buf integer
 ---@return nil
 function M.attach(buf)
-  local group = vim.api.nvim_create_augroup("ForgeHarnessPromptHistory", { clear = true })
+  local harness = state()
+  local group = vim.api.nvim_create_augroup("ForgeHarnessPromptHistory" .. buf, { clear = true })
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     group = group,
     buffer = buf,
     callback = function()
-      local harness = state()
       local selected = harness.prompt_history[harness.prompt_history_index]
       if type(selected) == "table" then selected = selected.text end
-      if harness.prompt_history_index > 0 and buffer_text(buf) ~= selected then M.reset_navigation() end
+      if harness.prompt_history_index > 0 and buffer_text(buf) ~= selected then
+        harness.prompt_history_index = 0
+        harness.prompt_history_draft = nil
+      end
     end,
   })
 end

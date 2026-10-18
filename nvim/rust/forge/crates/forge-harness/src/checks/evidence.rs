@@ -80,7 +80,8 @@ impl CheckEvidence {
     }
 }
 
-fn signature(run: &CheckRun, command: &CommandCheck) -> Result<String> {
+/// Identifies the execution contract independently of whether the attempt completed.
+pub(super) fn signature(run: &CheckRun, command: &CommandCheck) -> Result<String> {
     let context = run.context.as_ref().expect("configured check run");
     let selected = command.context.as_ref().expect("configured command");
     let definition = context
