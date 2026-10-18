@@ -46,6 +46,7 @@ local success, failure = xpcall(function()
   assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == third_entry
     and #state.queue == 3 and state.queue[1] == prior_entry and state.queue[2] == second_entry
     and state.queue[3] == third_entry, "editing the tail changed queue order or chose the wrong barrier")
+  assert(composer_text() == "third original", "entering queue edit did not load the selected prompt")
   compose("/model rejected impossible prompt")
   controller.edit_queued(-1)
   assert(state.queue_edit.entry == second_entry and state.queue_edit.drafts[third_entry] == "/model rejected impossible prompt"

@@ -65,7 +65,7 @@ Rust paths in this table are relative to
 
 ## Integration sequence
 
-Use the pinned Rust toolchain and release target described in
+Use the pinned Rust toolchain and development target described in
 [Building and testing](building-and-testing.md). Discovery fixtures must be local
 and must not install project dependencies.
 

@@ -1,6 +1,6 @@
 # Building and testing Forge
 
-Forge contributors use the release profile and the same Cargo target directory
+Forge contributors use the development profile and the same Cargo target directory
 as the executable Neovim launches. Tests do not replace rebuilding that executable
 after compiled inputs change. Documentation-only changes need link and instruction
 checks, not a Rust rebuild.
@@ -19,14 +19,35 @@ Cargo selects its pinned toolchain:
 ```nu
 let target = (^nvim --headless -u NONE --cmd 'set rtp^=./nvim' -c "lua io.write(require('forge.builder').artifact_root() .. '/build')" -c 'qa!' | str trim)
 cd nvim/rust/forge
+cargo build --profile dev --locked --target-dir $target --bin forge
+```
+
+Neovim's `:ForgeBuild` always builds the development executable in `build/debug`.
+`:ForgeBuildRelease` builds the release executable in `build/release`. Both commands
+are available before the Forge plugin loads. Contributors still own the rebuild
+after source changes. Do not use the existence of an older executable, `cargo check`,
+or a passing test binary as proof that the editor runs the changed code.
+
+The workspace leaves its own development code unoptimized, enables incremental
+compilation, uses limited debug information, and disables LTO. External packages
+use optimization level 3 without debug information through
+`[profile.dev.package."*"]`. Cargo excludes workspace members from that override,
+and the test profile inherits dev. These dependencies belong to the development
+cache. Cargo does not reuse artifacts from `build/release` for development builds.
+The first development build compiles any missing dependency artifacts.
+
+For an explicit release or performance check, use the same target directory:
+
+```nu
 cargo build --release --locked --target-dir $target --bin forge
 ```
 
-Neovim's `:ForgeBuild` runs the configured builder explicitly. Contributors still
-own the rebuild after source changes. Do not use the existence of an older
-executable, `cargo check`, or a passing test binary as proof that the editor runs
-the changed code. Keep `profile.release.debug = 0`, incremental compilation enabled,
-and LTO disabled as specified by the workspace and local rules.
+Forge continues to launch the development executable after a release build. To
+verify the release runtime, set `vim.g.forge_build_profile = "release"` before
+loading Forge in a fresh host. `require("forge.builder").for_profile("release")`
+resolves the release command and artifact without changing runtime selection.
+Routine Cargo tests and Clippy use `--profile dev --locked` and the shared target
+directory. Release profile checks remain explicit.
 
 The builder's current `ensure()` path can build a missing executable, but it does
 not detect stale source. Runtime verification must use the explicit build above.
@@ -36,13 +57,13 @@ fresh test host after rebuilding.
 ## Select targeted checks
 
 Run the affected test target first. From the Rust workspace, these examples reuse
-the same release target:
+the same development target:
 
 ```nu
-cargo test --release --locked --target-dir $target -p forge-diff --lib declaration_calls::tests
-cargo test --release --locked --target-dir $target -p forge-harness --lib plan::
-cargo test --release --locked --target-dir $target -p forge-harness --lib declaration::tests
-cargo test --release --locked --target-dir $target -p forge-harness --lib control_tools::
+cargo test --profile dev --locked --target-dir $target -p forge-diff --lib declaration_calls::tests
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib plan::
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib declaration::tests
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib control_tools::
 ```
 
 Add `--offline` only when all dependencies are already available. Broaden to the
@@ -92,13 +113,13 @@ use the direct commands above and record the actual exit status and deadline.
 
 Check resolution changes affect package ownership, concrete commands, and evidence
 accepted by the automatic gate. Run the targeted Rust tests from the Rust workspace
-with the release target resolved above:
+with the development target resolved above:
 
 ```nu
-cargo test --release --locked --target-dir $target -p forge-harness --lib checks:: -- --test-threads=1
-cargo test --release --locked --target-dir $target -p forge-harness --lib plan::design_review::tests
-cargo test --release --locked --target-dir $target -p forge-harness --lib automatic_checks_repair_once
-cargo test --release --locked --target-dir $target -p forge-harness --lib selected_plan_checks_are_versioned
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib checks:: -- --test-threads=1
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib plan::design_review::tests
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib automatic_checks_repair_once
+cargo test --profile dev --locked --target-dir $target -p forge-harness --lib selected_plan_checks_are_versioned
 ```
 
 The check tests cover package discovery, argument expansion, deduplication,
@@ -133,10 +154,10 @@ arguments rather than granting agents a separate terminal-validation path.
 
 ## Verify real language navigation
 
-Build the fixture generator with the same release target:
+Build the fixture generator with the same development target:
 
 ```nu
-cargo build --release --locked --target-dir $target -p forge-harness --example plan_navigation_fixture
+cargo build --profile dev --locked --target-dir $target -p forge-harness --example plan_navigation_fixture
 ```
 
 Start a fresh Neovim from the repository root with `nvim` on its runtimepath. Set
@@ -148,8 +169,8 @@ vim.g.forge_test_language = "typescript" -- Repeat with "rust" and "lua".
 local builder = require("forge.builder")
 local suffix = vim.fn.has("win32") == 1 and ".exe" or ""
 vim.g.forge_test_executable = builder.binary_path()
-vim.g.forge_test_fixture_generator = builder.artifact_root()
-  .. "/build/release/examples/plan_navigation_fixture" .. suffix
+vim.g.forge_test_fixture_generator = vim.fs.dirname(builder.binary_path())
+  .. "/examples/plan_navigation_fixture" .. suffix
 vim.g.forge_test_tsgo = vim.fn.exepath("tsgo")
 -- Set forge_test_tsgo to the configured native server path if it is not on PATH.
 -- Set forge_test_rust_analyzer when rustup cannot locate the installed analyzer.
@@ -181,7 +202,7 @@ nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/lsp_startup_
 nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/plan_workspace_definition.lua
 ```
 
-After rebuilding the release host, run `nvim/tests/forge/lsp_tools_host.lua` in
+After rebuilding the development host, run `nvim/tests/forge/lsp_tools_host.lua` in
 a fresh Neovim with the plugin on its runtimepath. Set `forge_test_language` to
 `lua`, `typescript`, or `rust`. The TypeScript case uses `forge_test_tsgo` or
 the `tsgo` executable. The Rust case accepts `forge_test_rust_analyzer` or asks
@@ -218,7 +239,7 @@ provide different evidence and should be reported separately.
 
 ## Background generation verification
 
-Run `nvim/tests/forge/background_host.lua` against the rebuilt release executable. It checks
+Run `nvim/tests/forge/background_host.lua` against the rebuilt development executable. It checks
 persistent generation without interactive Harness initialization, branch-aware rotation,
 session compaction overrides, and the read-only native timeline. The existing
 `commit_settings_host.lua` fixture checks Background defaults across fresh host processes.

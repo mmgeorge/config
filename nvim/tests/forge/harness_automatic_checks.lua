@@ -10,6 +10,8 @@ vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
     trigger = { kind = "files_changed", include = { "source.txt" } }, all = { command = "exit 7" } },
   { id = "optional", name = "Optional", category = "test", area = "Fixture", enabled = true, auto = false,
     trigger = { kind = "any_change" }, all = { command = "print optional" } },
+  { id = "waiting", name = "Waiting", category = "test", area = "Fixture", enabled = true, auto = false,
+    trigger = { kind = "manual" }, all = { command = "sleep 30sec" } },
 } } }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
@@ -67,7 +69,28 @@ local succeeded, failure = xpcall(function()
     run = request("checks.status", { run_id = selected })
     return run.state ~= "running"
   end, 20), "explicit checks did not settle")
-  assert(#run.commands == 2 and run.commands[1].state == "failed" and run.commands[2].state == "passed")
+  assert(run.commands[1].state == "failed" and run.commands[2].state == "passed")
+  local waiting = request("checks.run", { ids = { "waiting" } }).run_id
+  assert(vim.wait(5000, function() return state.checks_running and state.active_check_run == waiting end, 10),
+    "check activity did not reach the composer")
+  local controller = require("forge.views.harness.controller")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "queued after checking" })
+  controller.queue_submit()
+  assert(#state.queue == 1 and request("checks.status", { run_id = waiting }).state == "running",
+    "queueing interrupted checks")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "interrupt checking now" })
+  controller.submit()
+  assert(vim.wait(5000, function()
+    return request("checks.status", { run_id = waiting }).state == "interrupted"
+  end, 10), "direct submission did not interrupt checks")
+  assert(vim.wait(5000, function()
+    local snapshot = request("state.get")
+    for _, prompt in ipairs(snapshot.prompt_history or {}) do
+      if prompt.text == "interrupt checking now" then return true end
+    end
+    return false
+  end, 10), "direct submission was not admitted after check interruption")
+  assert(#state.queue == 1, "queued prompt overtook the direct prompt")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

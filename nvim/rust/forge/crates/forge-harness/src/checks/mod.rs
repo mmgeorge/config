@@ -1,4 +1,5 @@
 mod applicability;
+mod activity;
 mod automatic;
 mod changes;
 mod config;
@@ -16,6 +17,7 @@ mod tools;
 #[cfg(test)]
 pub(crate) use config::configure_fixture;
 pub use applicability::{CheckApplicability, CheckTrigger};
+pub use activity::{CheckActivity, CheckCommandActivity};
 pub use config::{
     CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckScope, ConfigSnapshot,
 };

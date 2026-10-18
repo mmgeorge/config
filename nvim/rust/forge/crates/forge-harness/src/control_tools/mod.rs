@@ -234,9 +234,9 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "checks_status",
-                description: "Read recorded results for a check run, optionally waiting wait_ms milliseconds for progress.",
+                description: "Read recorded check results. Set wait_for_completion to wait through progress updates until completion or the deadline (default 60000 ms, maximum 60000). Without it, wait_ms waits for the next update (maximum 30000 ms).",
                 input_schema: strict_object_input_schema(
-                    vec![("run_id", string_schema()), ("wait_ms", json!({"type":"integer", "minimum":0}))],
+                    vec![("run_id", string_schema()), ("wait_ms", json!({"type":"integer", "minimum":0})), ("wait_for_completion", json!({"type":"boolean"}))],
                     &["run_id"],
                 ),
             },
@@ -715,7 +715,7 @@ mod test {
             ("checks_list", json!({})),
             ("checks_configure", json!({"expected_revision":"revision","config":{"version":2,"definitions":[]}})),
             ("checks_run", json!({"ids":["unit"],"selections":{"unit":{"kind":"cases","cases":[{"file":"src/lib.rs","name":"tests::example","target":"lib"}]}}})),
-            ("checks_status", json!({"run_id":"run","wait_ms":100})),
+            ("checks_status", json!({"run_id":"run","wait_ms":100,"wait_for_completion":true})),
             ("checks_cancel", json!({"run_id":"run"})),
         ];
         let catalog = ControlToolRegistry.mcp_tool_list();

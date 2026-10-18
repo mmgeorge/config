@@ -162,11 +162,13 @@ impl BrokerObserver {
             session_event_list,
             plan_file: &self.plan_file,
         })?;
-        let mut timeline = TimelineProjector::with_checks(timeline,self.check_runner.history()?);
-        if let Some(run) = self.check_runner.active()?.and_then(|id|self.check_runner.history().ok()?.into_iter().find(|run|run.id == id)) {
-            status = run.status();
-        }
-        timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
+        let check_history = self.check_runner.history()?;
+        let active_check_run = self.check_runner.active()?;
+        let checks = active_check_run.as_ref().and_then(|id| check_history.iter().find(|run| &run.id == id))
+            .and_then(crate::checks::CheckActivity::from_run);
+        let checks_running = checks.is_some();
+        let mut timeline = TimelineProjector::with_checks(timeline, check_history);
+        timeline.push(TimelineEntry::Status { checks, agent_count: self.agent_coordinator.active_count(),
                 status_thoughts,
                 id: format!("{}:status", source_session.id),
                 created_at_ms: 0,
@@ -189,6 +191,8 @@ impl BrokerObserver {
             status_thoughts,
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: revision,
+            checks_running,
+            active_check_run,
             task_operation: store.latest_task_operation(&source_session.id)?
                 .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
                     || operation.exchange_id.as_deref() == interaction.last().map(|exchange| exchange.id.as_str()))

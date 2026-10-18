@@ -1,6 +1,42 @@
 use super::*;
 
 impl HarnessBroker {
+    /// Preserves unfinished setup decisions across ordinary follow-ups without extending them to another task.
+    pub(super) fn continued_check_setup(
+        &self,
+        admission: &ExchangeAdmission,
+    ) -> Result<Option<crate::checks::CheckSetupState>> {
+        if admission.kind != ExchangeKind::Chat
+            || admission.execution_id.is_some()
+            || admission.goal_id.is_some()
+            || admission.agent_run_id.is_some()
+        {
+            return Ok(None);
+        }
+        let Some(previous) = self.store.list_exchange(&self.session.id)?.pop() else {
+            return Ok(None);
+        };
+        if previous.kind != ExchangeKind::Chat
+            || previous.plan_id != admission.plan_id
+            || previous.goal_id.is_some()
+            || previous.execution_id.is_some()
+            || previous.state == ExchangeState::Cancelled
+            || previous.disposition != crate::exchange::HistoryDisposition::Current
+        {
+            return Ok(None);
+        }
+        let Some(setup) = previous.check_setup else {
+            return Ok(None);
+        };
+        let published = self.check_runner.history()?.iter().any(|run| {
+            run.lifecycle.iter().any(|event| {
+                matches!(event.kind, crate::checks::CheckEventKind::ConfigurationSaved)
+                    && event.created_at_ms >= previous.created_at_ms
+            })
+        });
+        Ok((!published).then_some(setup))
+    }
+
     /// Runs check discovery while retaining the original plan request and its task identity.
     pub(super) async fn configure_plan_checks(
         &mut self,
@@ -194,14 +230,13 @@ impl HarnessBroker {
                 )?;
                 json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None).await?})
             }
-            HarnessMethod::ChecksStatus => serde_json::to_value(
-                self.check_runner
-                    .status(
-                        &required_text(&params, "run_id")?,
-                        params["wait_ms"].as_u64().unwrap_or(0),
-                    )
-                    .await?,
-            )?,
+            HarnessMethod::ChecksStatus => {
+                let wait_for_completion = params["wait_for_completion"].as_bool().unwrap_or(false);
+                let wait_ms = params["wait_ms"].as_u64().unwrap_or(if wait_for_completion { 60000 } else { 0 });
+                serde_json::to_value(self.check_runner.status(
+                    &required_text(&params, "run_id")?, wait_ms, wait_for_completion,
+                ).await?)?
+            },
             HarnessMethod::ChecksCancel => {
                 let id = required_text(&params, "run_id")?;
                 self.check_runner.cancel(&id)?;

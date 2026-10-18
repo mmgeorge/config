@@ -51,42 +51,50 @@ protocol definitions, or other compiled inputs under `nvim/rust/forge`, rebuild
 before runtime verification and before reporting the task complete. `cargo check`
 and `cargo test` do not replace building the executable Neovim launches.
 
-Use `require("forge.builder").build_command()` to resolve the manual Cargo command
+Use `require("forge.builder").build_command()` to resolve the runtime Cargo command
 and `require("forge.builder").binary_path()` to identify the runtime artifact.
-Use the release configuration for development, tests, runtime verification, and
-profiling. Run Cargo tests with `--release --locked` and the same target directory
-as the release executable. Keep the toolchain, inherited Cargo configuration,
-compiler flags, and profile settings consistent across these commands so shared
-artifacts remain reusable. Do not introduce a separate development profile or
-switch to debug builds unless the user explicitly requests it.
-This prevents separate debug and release dependency builds, duplicated
-compilation work, and cache churn from inconsistent build settings. Test
-executables remain distinct artifacts, but tests must reuse the release
-configuration rather than create a second profile's dependency artifacts.
-Keep `profile.release.debug = 0`, `profile.release.incremental = true`, and
-`profile.release.lto = "off"` in the workspace manifest. Keep the executable
-entry point limited to argument parsing and the non-generic library entry call.
-The library owns async host orchestration and executor shutdown.
-Do not change profile settings, compiler flags, or
-feature selection between build and test commands to pursue an isolated speedup.
+Forge defaults to the development profile, whose executable is under `build/debug`.
+`:ForgeBuild` always builds that profile. `:ForgeBuildRelease` explicitly builds the
+release profile without changing which executable the next host selects.
+Use `require("forge.builder").for_profile("dev")` or `for_profile("release")` to
+resolve the corresponding builder independently of runtime selection.
+
+Use development builds for routine tests, Clippy, and runtime verification.
+Pass `--profile dev --locked` and the same target directory as the development
+executable. Keep the toolchain, inherited Cargo configuration, compiler flags,
+and dependency features consistent so shared artifacts remain reusable.
+Keep workspace code at `profile.dev.opt-level = 0`, `profile.dev.debug = 1`,
+`profile.dev.incremental = true`, and `profile.dev.lto = "off"`. Keep external
+packages at `profile.dev.package."*".opt-level = 3` and `debug = 0`. Cargo excludes
+workspace members from that wildcard override. The test profile inherits dev.
+Dependencies are optimized inside the development cache, not reused from the
+release cache. A new profile, dependency version, feature set, or compiler flag
+can require another dependency build.
+
+Reserve `--release` for explicit release or performance checks. Keep
+`profile.release.debug = 0`, `profile.release.incremental = true`, and
+`profile.release.lto = "off"`. Set `vim.g.forge_build_profile = "release"` before
+Forge loads only when explicitly selecting that runtime for verification.
+The default runtime remains development. Keep the executable entry point limited
+to argument parsing and the non-generic library entry call. The library owns
+async host orchestration and executor shutdown.
+
 Reuse compiled dependencies and run only the affected tests. A filtered test
 still compiles its complete test target, so prefer the existing Neovim host
-fixtures when they directly cover the changed runtime behavior.
+fixtures when they directly cover the changed runtime behavior. Test executables
+remain distinct artifacts and may enable additional dependency features.
 Measure edit iteration with `--timings` after a source change. Report which
 crates compiled and distinguish that result from a no-change cache check.
 Do not promise a ten-second rebuild from an unchanged Cargo invocation.
-Changes to a library crate can recompile its consumers as well as relink the
-executable. Tests require separate test executables and may enable additional
-dependency features even when they share the release profile.
-Set `vim.g.forge_build_profile` before Forge loads only when explicitly testing a
-user-requested different profile. Cargo output belongs under
-`stdpath("cache")/rust-sidecar/forge/build`, not the crate's default `target`
-directory. Pass `--bin forge --locked` and the selected profile. Invoke Cargo
-with `nvim/rust/forge` as its working directory so Cargo selects that directory's
-`rust-toolchain.toml`. In this Windows checkout the default command is:
+Changes to a library crate can recompile its consumers and relink the executable.
+Cargo output belongs under `stdpath("cache")/rust-sidecar/forge/build`, not the
+crate's default `target` directory. Pass `--bin forge --locked` and the selected
+profile. Invoke Cargo with `nvim/rust/forge` as its working directory so Cargo
+selects that directory's `rust-toolchain.toml`. In this Windows checkout the
+default command is:
 
 ```text
-cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile release --bin forge --locked
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile dev --bin forge --locked
 ```
 
 Resolve the cache directory from Neovim on other machines. Run the build with the

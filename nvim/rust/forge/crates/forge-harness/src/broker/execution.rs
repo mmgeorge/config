@@ -110,10 +110,16 @@ impl HarnessBroker {
             | crate::session::state_machine::SessionPhase::Idle) {
             return;
         }
-        if execution.phase == crate::plan::PlanPhase::Checking && execution.state == crate::plan::PlanExecutionState::Active {
-            if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::checks::CheckState::Running) {
-                *status = run.status();
-            }
+        if matches!(status, crate::session::state_machine::SessionPhase::Idle)
+            && execution.phase == crate::plan::PlanPhase::Checking
+            && execution.state == crate::plan::PlanExecutionState::Active
+            && let Some(activity) = execution.check_runs.last().and_then(crate::checks::CheckActivity::from_run)
+        {
+            *status = crate::session::state_machine::SessionPhase::Working {
+                duration_ms: activity.duration_ms, started_at_ms: activity.started_at_ms,
+                activity: crate::session::state_machine::WorkflowActivity::Checking,
+                reasoning_summary: None, execution: None,
+            };
         }
         if let crate::session::state_machine::SessionPhase::Working {
             execution: progress, ..

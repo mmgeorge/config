@@ -72,7 +72,7 @@ The remaining shell grammars retain their Cargo or native grammar manifest pins.
    migration inventory, so investigate that diagnostic separately if an unrelated
    source-ownership record fails.
 
-6. **Run targeted native regression tests.** Use the release target from the build
+6. **Run targeted native regression tests.** Use the development target from the build
    guide. Exercise syntax, injection/highlight cases, extraction, declaration
    formatting, and source mapping for the affected language. Add a regression
    fixture for every intentional query or node-shape change.

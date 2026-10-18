@@ -64,6 +64,54 @@ complete_snapshot()
 assert(not state.busy and not state.prompt_submission, "queue never returned to idle")
 assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft in the replacement composer")
 
+current = true
+state.presentation = { capture_prompt = function()
+  return { buffer = state.composer_buf, document = "original", is_current = function() return current end }
+end }
+state.checks_running, state.active_check_run = true, "manual-check"
+compose("queued during checks")
+local before_queue = #requests
+controller.queue_submit()
+assert(#requests == before_queue and #state.queue == 1, "queueing interrupted a check or started a prompt")
+compose("interrupt manual check")
+controller.submit()
+local cancel = requests[#requests]
+assert(cancel.method == "checks.cancel" and cancel.params.run_id == "manual-check")
+compose("newer unsent draft")
+cancel.callback({ cancellation_requested = true })
+local replacement = requests[#requests]
+assert(replacement.method == "prompt.submit" and replacement.params.text == "interrupt manual check")
+assert(#state.queue == 1, "queued work overtook the direct prompt")
+submission.receive(state, { kind = "prompt_submission", data = {
+  document = "original", token = replacement.params.submission.token, state = "accepted",
+} })
+assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "newer unsent draft",
+  "accepting the captured prompt erased a newer draft")
+state.checks_running, state.active_check_run = false, nil
+replacement.callback({})
+state.queue = {}
+complete_snapshot()
+
+for _, cancellation_first in ipairs({ true, false }) do
+  compose("original provider prompt")
+  controller.submit()
+  local original = requests[#requests]
+  state.checks_running, state.active_check_run = true, "automatic-check"
+  compose("replace automatic check")
+  controller.submit()
+  local cancellation = requests[#requests]
+  local count = #requests
+  if cancellation_first then cancellation.callback({}) else original.callback(nil, "cancelled", { code = "turn_cancelled" }) end
+  assert(#requests == count and state.check_interrupt_pending, "replacement started before both owners released")
+  if cancellation_first then original.callback(nil, "cancelled", { code = "turn_cancelled" }) else cancellation.callback({}) end
+  local next_prompt = requests[#requests]
+  assert(next_prompt.method == "prompt.submit" and next_prompt.params.text == "replace automatic check")
+  assert(not state.execution_notice and not state.check_interrupt_pending, "expected cancellation surfaced as a paused failure")
+  state.checks_running, state.active_check_run = false, nil
+  next_prompt.callback({})
+  complete_snapshot()
+end
+
 local failures = { { message = "cancelled", detail = { code = "turn_cancelled" } },
   { message = "host stopped", detail = { code = "outcome_unknown" } } }
 for _, failure in ipairs(failures) do

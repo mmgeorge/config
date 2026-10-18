@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 local executable = require("forge.builder").binary_path()
-assert(vim.fn.executable(executable) == 1, "build the release host before running this fixture")
+assert(vim.fn.executable(executable) == 1, "build the selected host before running this fixture")
 local workspace = vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1)
 local initialized = vim.system({ "git", "-C", workspace, "init", "--quiet" },
@@ -37,4 +37,4 @@ client._reset_for_test()
 vim.fn.chdir(original_directory)
 vim.fn.delete(workspace, "rf")
 assert(success, failure)
-print("per_edit_routes_host: release host rejects issue and review per-edit transports")
+print("per_edit_routes_host: selected host rejects issue and review per-edit transports")

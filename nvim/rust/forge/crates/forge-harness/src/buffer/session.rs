@@ -1549,7 +1549,7 @@ mod tests {
     #[test]
     fn staging_uses_a_stable_physical_block_and_clears_without_entering_timeline() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status {
+        owner.initialize(vec![TimelineEntry::Status { checks: None,
             status_thoughts: true,
             agent_count: 0,
             id: "status".into(),
@@ -1643,7 +1643,7 @@ mod tests {
         owner.reconcile(vec![
             interaction_entry("main"),
             interaction_entry("followup"),
-            TimelineEntry::Status {
+            TimelineEntry::Status { checks: None,
                 status_thoughts: true,
                 agent_count: 0,
                 id: "status".into(),
@@ -1930,7 +1930,7 @@ mod tests {
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![
                 TimelineEntry::Exchange { id: "active".into(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new() },
-                TimelineEntry::Status {
+                TimelineEntry::Status { checks: None,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     agent_count: 0,
@@ -2943,7 +2943,7 @@ mod tests {
         let started_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Compacting { started_at_ms },
         }])?;
@@ -2972,7 +2972,7 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![
             interaction_entry("completed"),
-            TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+            TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
                 id: "status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -3064,7 +3064,7 @@ mod tests {
     #[test]
     fn active_projection_preserves_pending_submission() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::Idle,
@@ -3076,7 +3076,7 @@ mod tests {
             WidthProfile::default(),
         )?;
         owner.begin_submission(&document, 1, "draft")?;
-        owner.reconcile(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -3096,7 +3096,7 @@ mod tests {
     #[test]
     fn hidden_transcript_keeps_streaming_until_a_new_width_owner_attaches() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -3111,7 +3111,7 @@ mod tests {
             document: document.clone(),
             view: ViewId("view:old".into()),
         })?;
-        owner.reconcile(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 3 },
@@ -3160,7 +3160,7 @@ mod tests {
     #[test]
     fn layout_follows_the_oldest_live_view_without_changing_timeline_revision() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },

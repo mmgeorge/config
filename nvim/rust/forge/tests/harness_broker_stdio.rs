@@ -401,6 +401,54 @@ fn serial_test() -> MutexGuard<'static, ()> {
 }
 
 #[test]
+fn chat_reports_provider_start_failure_without_stopping_host() {
+    let _serial_guard = serial_test();
+    let repository = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let mut broker = BrokerProcess::start();
+    broker.request(json!({
+        "id": 1, "method": "harness.initialize", "params": {
+            "data_root": data.path(), "workspace": repository.path(),
+            "client_id": "chat-provider-stack-test",
+            "backend": { "kind": "codex", "command": ["forge-unavailable-provider-fixture"] },
+            "model": "fixture", "effort": "medium"
+        }
+    }));
+    assert!(
+        broker
+            .read_response(1)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    broker.request(json!({
+        "id": 2, "method": "prompt.submit", "params": { "text": "Answer the fixture" }
+    }));
+    let response = broker.read_response(2).pop().unwrap();
+    assert!(
+        response["error"]
+            .to_string()
+            .contains("forge-unavailable-provider-fixture"),
+        "{response}"
+    );
+    broker.request(json!({ "id": 3, "method": "state.get", "params": {} }));
+    assert!(
+        broker
+            .read_response(3)
+            .last()
+            .unwrap()
+            .get("error")
+            .is_none()
+    );
+    broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
+    assert_eq!(
+        broker.read_response(4).last().unwrap()["result"]["shutdown"],
+        true
+    );
+}
+
+#[test]
 fn planning_task_reports_provider_start_failure_without_stopping_host() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();

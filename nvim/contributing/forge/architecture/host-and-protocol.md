@@ -10,7 +10,10 @@ The `forge` package builds a library and a thin executable. `src/main.rs` parses
 arguments and calls the synchronous, non-inlined `forge::run` entry point.
 `src/lib.rs` owns the host, router, runtime, and shutdown modules, keeping their
 generated async code in the library compilation unit. Both targets use the same
-release profile with incremental compilation, no debug symbols, and LTO disabled.
+development profile with incremental compilation, limited debug information, and
+LTO disabled. Workspace code remains unoptimized. External packages use optimization
+level 3 without debug information, and routine tests inherit the development profile.
+Release compilation is an explicit build and verification choice.
 
 Executable acquisition depends on the host OS. Windows launches a process-owned copy
 so Cargo can replace the build output while an editor runs. macOS and Linux launch
@@ -238,7 +241,17 @@ successful handshake.
 
 ## Executable ownership
 
-`forge.builder` delegates to `rust_sidecar`. Contributors build the release executable explicitly before runtime verification. The current `ensure()` implementation reuses an existing artifact and invokes `build()` when it is absent. Explicit `:ForgeBuild` requests also invoke the shared builder. No source-freshness or executable-fingerprint check selects a build.
+`forge.builder` delegates to independent `rust_sidecar` builders for development
+and release profiles. The default runtime uses `build/debug`, and `:ForgeBuild`
+always builds that development executable. `:ForgeBuildRelease` explicitly builds
+`build/release` without changing runtime selection. Setting
+`vim.g.forge_build_profile = "release"` before loading Forge selects that runtime.
+`for_profile()` returns a stable builder for explicit profile operations, so
+concurrent requests for different profiles retain separate completion callbacks
+and artifact paths. Contributors rebuild the selected executable before runtime
+verification. The current `ensure()` implementation reuses an existing artifact
+and invokes `build()` when it is absent. No source-freshness or
+executable-fingerprint check selects a build.
 
 Windows hosts launch process-owned copies under the sidecar lease directory so Cargo can replace the build output. Other platforms launch the selected artifact directly. Existing hosts keep their executable until shutdown. See [Building and testing](../building-and-testing.md) for the contributor workflow.
 

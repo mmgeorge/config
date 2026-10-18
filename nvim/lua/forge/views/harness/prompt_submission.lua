@@ -19,7 +19,7 @@ local attachment = require("forge.views.harness.attachment")
 
 ---Retain request completion in the session even when its composer presentation closes.
 ---@param state ForgeHarnessPresentationState
----@param prompt {text: string, attachments?: table[], context?: ForgePromptContext}
+---@param prompt {text: string, attachments?: table[], context?: ForgePromptContext, source?: string[], changedtick?: integer}
 ---@param completed fun(result?: any, failure?: string, detail?: table)
 function PromptSubmission.start(state, prompt, completed)
   if state.prompt_submission then
@@ -29,14 +29,14 @@ function PromptSubmission.start(state, prompt, completed)
   local session_id = state.session and state.session.id
   if not session_id then completed(nil, "Harness session is not ready") return end
   local context = prompt.context
-  local source = context and vim.api.nvim_buf_get_lines(context.buffer, 0, -1, false) or nil
+  local source = context and (prompt.source or vim.api.nvim_buf_get_lines(context.buffer, 0, -1, false)) or nil
   local text = source and table.concat(source, "\n") or prompt.text
   if not text:find("%S") then completed(nil, "Prompt requires nonempty text") return end
   state.prompt_sequence = (state.prompt_sequence or 0) + 1
   local submission = {
     token = state.prompt_sequence, context = context, source = source,
-    changedtick = context and vim.api.nvim_buf_get_changedtick(context.buffer) or nil,
-    attachments = context and attachment.capture(context.buffer).attachments or prompt.attachments or {},
+    changedtick = context and (prompt.changedtick or vim.api.nvim_buf_get_changedtick(context.buffer)) or nil,
+    attachments = prompt.attachments or (context and attachment.capture(context.buffer).attachments) or {},
   }
   state.prompt_submission = submission
   local function settle(result, failure, detail)

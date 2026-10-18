@@ -253,9 +253,11 @@ impl CheckToolScope {
             }
             "checks_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
+                let wait_for_completion = arguments["wait_for_completion"].as_bool().unwrap_or(false);
+                let wait_ms = arguments["wait_ms"].as_u64().unwrap_or(if wait_for_completion { 60000 } else { 0 });
                 serde_json::to_value(
                     self.runner
-                        .status(id, arguments["wait_ms"].as_u64().unwrap_or(0))
+                        .status(id, wait_ms, wait_for_completion)
                         .await?,
                 )?
             }

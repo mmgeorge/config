@@ -367,7 +367,8 @@ impl HarnessService {
 
     /// Arm provider work in input order before concurrent dispatch can admit a later cancellation.
     /// Keep the permit until execution finalization, then release it before publishing completion. Overlapping execution and
-    /// pending cleanup reject admission without resetting the current cancellation state.
+    /// pending cleanup reject admission without resetting the current cancellation state. Direct prompts
+    /// interrupt active checks and collect their execution before acquiring admission.
     pub async fn prepare(&self, session_id: Option<&str>, method: HarnessMethod) -> Result<Option<OwnedSemaphorePermit>> {
         let _activity = self.admit().await?;
         if method.requires_provider_fork() {
@@ -377,9 +378,28 @@ impl HarnessService {
             let _control = Arc::clone(&controller.control_admission)
                 .try_acquire_owned()
                 .context("Harness cleanup is still running")?;
-            let execution = Arc::clone(&controller.execution_admission)
-                .try_acquire_owned()
-                .context("a Harness execution request is already running")?;
+            let interrupted_checks = if method == HarnessMethod::PromptSubmit {
+                if let Some(run_id) = controller.checks.active()? {
+                    controller.checks.cancel(&run_id)?;
+                    controller.cancellation.request(false);
+                    tokio::time::timeout(Duration::from_secs(10), async {
+                        while controller.checks.active()?.is_some() {
+                            controller.checks.status(&run_id, 250, false).await?;
+                            tokio::task::yield_now().await;
+                        }
+                        Ok::<(), anyhow::Error>(())
+                    }).await.context("check processes did not stop within 10 seconds")??;
+                    true
+                } else { false }
+            } else { false };
+            let execution = if interrupted_checks {
+                tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
+                    .await.context("interrupted checks did not release execution within 10 seconds")??
+            } else {
+                Arc::clone(&controller.execution_admission)
+                    .try_acquire_owned()
+                    .context("a Harness execution request is already running")?
+            };
             controller.cancellation.arm(method == HarnessMethod::PromptSubmit);
             return Ok(Some(execution));
         }
@@ -566,7 +586,7 @@ impl HarnessService {
                     if let Some(id) = controller.checks.active()? {
                         controller.checks.cancel(&id)?;
                         while controller.checks.active()?.is_some() {
-                            controller.checks.status(&id,250).await?;
+                            controller.checks.status(&id,250,false).await?;
                         }
                     }
                     let approval_owner = crate::backend::ExecutionOwner::root(&controller.catalog_request.read().await.harness_session_id);
@@ -1422,7 +1442,11 @@ async fn route_request(
         let task_id = task.as_ref().map(|task|task.id.as_str());
         let result = match method {
             HarnessMethod::ChecksList => controller.checks.catalog_preview(task_id, session.shell).await?,
-            HarnessMethod::ChecksStatus => serde_json::to_value(controller.checks.status(request.params["run_id"].as_str().context("run_id required")?,request.params["wait_ms"].as_u64().unwrap_or(0)).await?)?,
+            HarnessMethod::ChecksStatus => {
+                let wait_for_completion = request.params["wait_for_completion"].as_bool().unwrap_or(false);
+                let wait_ms = request.params["wait_ms"].as_u64().unwrap_or(if wait_for_completion { 60000 } else { 0 });
+                serde_json::to_value(controller.checks.status(request.params["run_id"].as_str().context("run_id required")?, wait_ms, wait_for_completion).await?)?
+            },
             HarnessMethod::ChecksCancel => {
                 let id = request.params["run_id"].as_str().context("run_id required")?;
                 controller.checks.cancel(id)?; json!({"run_id":id,"cancellation_requested":true})
@@ -3054,8 +3078,9 @@ mod tests {
                 assert_eq!(params, request.params);
                 response.send(Ok((json!({"reviewed":true}), Vec::new()))).unwrap();
             };
+            let mut control_state = None;
             let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::join!(route_control_request(&controller, &request, method, &sink, &service.syntax, None, &mut None), respond)
+                tokio::join!(route_control_request(&controller, &request, method, &sink, &service.syntax, None, &mut control_state), respond)
             }).await.expect("review controls must not acquire the provider's broker lock");
             assert!(routed.unwrap());
             let frame = output.recv().await.unwrap().unwrap();
@@ -3494,6 +3519,54 @@ mod tests {
         drop(cleanup);
         drop(setup);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn direct_prompt_collects_active_checks_before_admission() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        std::fs::write(fixture.path().join(".forge.json"), serde_json::to_vec(&json!({
+            "checks":{"version":2,"definitions":[{
+                "id":"waiting", "name":"Waiting check", "category":"test", "area":"Fixture",
+                "enabled":true, "auto":false, "trigger":{"kind":"manual"}, "scope":"all",
+                "all":{"command":"nu", "args":["--no-config-file","-c","sleep 30sec"]}
+            }]}
+        }))?)?;
+        let service = service();
+        assert!(service.open_session(1, initialize(&fixture, "mock")).await?.error().is_none());
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let drain = tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
+        service.dispatch(None, Request {
+            id: 2, method: "checks.run".into(), params: json!({"ids":["waiting"]}),
+        }, &sink).await?;
+        let run_id = controller.checks.active()?.context("check did not start")?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let run = controller.checks.status(&run_id, 100, false).await?;
+                if run.commands.iter().any(|command| command.state == crate::checks::CheckState::Running) {
+                    break Ok::<(), anyhow::Error>(());
+                }
+                ensure!(run.state == crate::checks::CheckState::Running, "check failed before cancellation: {:?}", run.state);
+            }
+        }).await??;
+        let snapshot = controller.observer.snapshot()?;
+        assert!(snapshot.checks_running);
+        assert_eq!(snapshot.active_check_run.as_deref(), Some(run_id.as_str()));
+        assert!(service.prepare(None, HarnessMethod::StateGet).await?.is_none());
+        assert!(service.prepare(None, HarnessMethod::GoalResume).await.is_err());
+        assert_eq!(controller.checks.active()?.as_deref(), Some(run_id.as_str()));
+        let admission = tokio::time::timeout(Duration::from_secs(5),
+            service.prepare(None, HarnessMethod::PromptSubmit)).await??;
+        assert!(admission.is_some());
+        assert!(controller.checks.active()?.is_none());
+        assert_eq!(controller.checks.status(&run_id, 0, false).await?.state, crate::checks::CheckState::Interrupted);
+        assert!(!controller.observer.snapshot()?.checks_running);
+        drop(admission);
+        service.shutdown(Duration::from_secs(1)).await?;
+        drop(sink);
+        drain.abort();
+        Ok(())
     }
 
     #[tokio::test]

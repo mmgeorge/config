@@ -656,7 +656,7 @@ function M.open(options)
   local state = { document = document, replica = {}, view = {}, active = true,
     pending = false, scheduled = false, done = {}, group = 0 }
   state.finish_open = require("forge.startup_log").span("status.open", { document = document,
-    workspace = options.workspace or vim.fn.getcwd(), profile = vim.g.forge_build_profile or "release",
+    workspace = options.workspace or vim.fn.getcwd(), profile = vim.g.forge_build_profile or "dev",
     command_started_us = math.floor(open_started / 1000),
     entry_to_open_us = math.floor((vim.uv.hrtime() - open_started) / 1000) })
   state.replica = buffer.open(document, { filetype = options.filetype or "forge", notice = notice, recover = function() recover(state) end })

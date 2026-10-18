@@ -30,6 +30,7 @@ local begin_request
 local submit_immediate
 local configure_now
 local finish_execution
+local resume_check_interrupted_prompt
 local render_status_hint
 local queue_only_commands = { ["/plan"] = true }
 
@@ -552,6 +553,7 @@ local function on_event(event, payload)
   local state = harness_state()
   if event == "task_operation" then task_control.receive(state, payload) return end
   if event == "host_stopped" then
+    state.check_interrupt_pending = nil
     state.host_error = payload.message
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
     state.pending_mode = nil
@@ -581,6 +583,15 @@ local function on_event(event, payload)
     if payload.revision < (state.timeline_revision or 0) then return end
     state.timeline_revision = payload.revision
     if payload.status then state.status = payload.status end
+    if type(payload.checks_running) == "boolean" then
+      local checks_finished = state.checks_running and not payload.checks_running
+      state.checks_running = payload.checks_running
+      if checks_finished then vim.schedule(M.drain) end
+    end
+    if payload.active_check_run ~= nil then
+      if payload.active_check_run == vim.NIL then state.active_check_run = nil
+      else state.active_check_run = payload.active_check_run end
+    end
     if state.status.kind ~= "awaiting_input" and state.plan_question_open then
       require("forge.views.harness.plan_question").close()
       state.plan_question_open = false
@@ -943,12 +954,15 @@ finish_execution = function(request_error, error_detail)
 end
 
 ---@param text string
-begin_request = function(text, from_composer, attachments)
+begin_request = function(text, from_composer, attachments, captured_prompt)
   local state = harness_state()
+  local request_session_id = state.session and state.session.id
+  local request_epoch = state.runtime_epoch
   local context
   if from_composer then
     local failure
-    if state.presentation then context, failure = state.presentation.capture_prompt()
+    if captured_prompt then context = captured_prompt.context
+    elseif state.presentation then context, failure = state.presentation.capture_prompt()
     else failure = "Harness composer is not ready" end
     if not context then notifications.error(failure, "ForgeHarness") return end
   end
@@ -962,6 +976,18 @@ begin_request = function(text, from_composer, attachments)
   end
   M.render()
   local function receive(result, request_error, error_detail)
+    if not state.session or state.session.id ~= request_session_id or state.runtime_epoch ~= request_epoch then return end
+    local interrupted = state.check_interrupt_pending
+    if interrupted and interrupted.old_prompt_sequence == state.prompt_sequence then
+      if result then
+        state.session = result.session or (result.id and result) or state.session
+        state.capability = result.capability or state.capability
+      end
+      finish_execution(nil)
+      interrupted.old_prompt_pending = false
+      resume_check_interrupted_prompt(state, interrupted)
+      return
+    end
     if finish_execution(request_error, error_detail) then return end
     state.cancel_requested = false
     if request_error then
@@ -984,7 +1010,19 @@ begin_request = function(text, from_composer, attachments)
     end
     synchronize_state(M.drain)
   end
-  prompt_submission.start(state, { text = text, attachments = attachments, context = context }, receive)
+  prompt_submission.start(state, {
+    text = text, attachments = attachments, context = context,
+    source = captured_prompt and captured_prompt.source,
+    changedtick = captured_prompt and captured_prompt.changedtick,
+  }, receive)
+end
+
+resume_check_interrupted_prompt = function(state, interrupted)
+  if state.check_interrupt_pending ~= interrupted or not state.session
+    or state.session.id ~= interrupted.session_id or state.runtime_epoch ~= interrupted.runtime_epoch
+    or not interrupted.cancel_complete or interrupted.old_prompt_pending then return end
+  state.check_interrupt_pending = nil
+  begin_request(interrupted.text, true, interrupted.attachments, interrupted.prompt)
 end
 
 ---@return nil
@@ -1015,6 +1053,7 @@ end
 
 function M.drain()
   local state = harness_state()
+  if state.check_interrupt_pending or state.checks_running then return end
   if state.host_error or state.execution_notice or state.task_operation or state.sync_error or state.connection_error then return end
   if state.aborting_plan then return end
   if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
@@ -1869,7 +1908,7 @@ function M.submit()
     M.refresh_winbar()
     return
   end
-  if state.busy and queue_only_commands[text:match("^%s*(%S+)")] then
+  if state.busy and not state.checks_running and queue_only_commands[text:match("^%s*(%S+)")] then
     M.queue_submit()
     return
   end
@@ -1887,6 +1926,58 @@ function M.submit()
   end
   if state.task_operation and state.task_operation.state ~= "running" then
     M.refresh_winbar()
+    return
+  end
+  if state.check_interrupt_pending then
+    local attachments = attachment.capture(state.composer_buf).attachments
+    set_composer_text(state.composer_buf, "")
+    state.queue[#state.queue + 1] = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
+    M.refresh_winbar()
+    return
+  end
+  if state.checks_running then
+    local attachments = attachment.capture(state.composer_buf).attachments
+    local context, failure
+    if state.presentation then context, failure = state.presentation.capture_prompt()
+    else failure = "Harness composer is not ready" end
+    if not context then notifications.error(failure, "ForgeHarness") return end
+    local source = vim.api.nvim_buf_get_lines(context.buffer, 0, -1, false)
+    local interrupted = {
+      text = text,
+      attachments = attachments,
+      prompt = { context = context, source = source },
+      session_id = state.session.id,
+      runtime_epoch = state.runtime_epoch,
+      old_prompt_pending = state.prompt_submission ~= nil,
+      old_prompt_sequence = state.prompt_sequence,
+      was_busy = state.busy,
+      cancel_complete = false,
+    }
+    state.check_interrupt_pending = interrupted
+    set_composer_text(state.composer_buf, "")
+    interrupted.prompt.changedtick = vim.api.nvim_buf_get_changedtick(context.buffer)
+    set_busy(true)
+    local run_id = state.active_check_run
+    if type(run_id) ~= "string" then
+      interrupted.cancel_complete = true
+      resume_check_interrupted_prompt(state, interrupted)
+      return
+    end
+    local function cancelled(_, failure)
+      if state.check_interrupt_pending ~= interrupted or not state.session
+        or state.session.id ~= interrupted.session_id then return end
+      if failure and state.checks_running then
+        state.check_interrupt_pending = nil
+        set_busy(interrupted.was_busy)
+        restore_retracted_prompt(interrupted.text, interrupted.attachments)
+        notifications.error(failure, "Interrupt checks")
+        return
+      end
+      interrupted.cancel_complete = true
+      resume_check_interrupted_prompt(state, interrupted)
+    end
+    local sent, failure = pcall(client.request_for, state.session.id, "checks.cancel", { run_id = run_id }, cancelled)
+    if not sent then cancelled(nil, tostring(failure)) end
     return
   end
   if state.busy or state.configuring then

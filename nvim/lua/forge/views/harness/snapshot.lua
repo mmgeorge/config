@@ -20,6 +20,7 @@ function HarnessSnapshot.apply(state, result)
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
   if state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
     state.task_operation, state.busy, state.restore_applying = nil, false, nil
+    state.check_interrupt_pending = nil
     if state.presentation and state.presentation.transcript then
       require("forge.views.harness.status_hint").clear(state.presentation.transcript.buffer)
     end
@@ -46,6 +47,7 @@ function HarnessSnapshot.apply(state, result)
     state.session.context_usage = previous_context_usage
   end
   if previous_session_id ~= (result.session and result.session.id or nil) then
+    state.check_interrupt_pending = nil
     state.restore_applying = nil
     state.activity_expanded = {}
     require("forge.views.harness.recap").clear(state)
@@ -54,6 +56,8 @@ function HarnessSnapshot.apply(state, result)
   state.subagent_tools = result.subagent_tools == true
   state.lsp_tools = result.lsp_tools == true
   state.status_thoughts = result.status_thoughts == true
+  state.checks_running = result.checks_running == true
+  state.active_check_run = result.active_check_run
   state.timeline_revision = result.timeline_revision or 0
   state.status = result.status or { kind = "idle" }
   state.artifact = vim.deepcopy(result.artifact or {})

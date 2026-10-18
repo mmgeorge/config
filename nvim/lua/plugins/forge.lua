@@ -11,18 +11,27 @@ return {
       "ForgeDebugBackgroundTimeline",
     },
     init = function()
-      vim.api.nvim_create_user_command("ForgeBuild", function()
-        local builder = require("forge.builder")
-        builder.build(function(result)
-          if not result.ok then
-            vim.notify(result.message or "Forge build failed", vim.log.levels.ERROR, { title = "ForgeBuild" })
-            return
-          end
-          local artifact_path = result.path or builder.binary_path()
-          vim.notify("Forge executable built: " .. artifact_path .. "\nRestart Neovim to load the rebuilt host.",
-            vim.log.levels.INFO, { title = "ForgeBuild" })
-        end)
-      end, { desc = "Build the Forge executable with Cargo" })
+      for _, build in ipairs({
+        { name = "ForgeBuild", profile = "dev", description = "Build the Forge debug executable with Cargo" },
+        { name = "ForgeBuildRelease", profile = "release", description = "Build the Forge release executable with Cargo" },
+      }) do
+        vim.api.nvim_create_user_command(build.name, function()
+          local builder = require("forge.builder").for_profile(build.profile)
+          builder.build(function(result)
+            if not result.ok then
+              vim.notify(result.message or "Forge build failed", vim.log.levels.ERROR, { title = build.name })
+              return
+            end
+            local artifact_path = result.path or builder.binary_path()
+            local runtime_instruction = "Restart Neovim to load the rebuilt host."
+            if (vim.g.forge_build_profile or "dev") ~= build.profile then
+              runtime_instruction = ('Set vim.g.forge_build_profile = "%s". %s'):format(build.profile, runtime_instruction)
+            end
+            vim.notify("Forge executable built: " .. artifact_path .. "\n" .. runtime_instruction,
+              vim.log.levels.INFO, { title = build.name })
+          end)
+        end, { desc = build.description })
+      end
       vim.api.nvim_create_user_command("ForgeStatus", function()
         local started_at = vim.uv.hrtime()
         local log = require("forge.startup_log")

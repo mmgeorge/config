@@ -40,7 +40,7 @@ impl HarnessBroker {
                 self.store
                     .save_execution_transition(&execution, &goal, None, None, None)?;
                 if let Some(run) = execution.check_runs.last().cloned() {
-                    self.publish_check_run(&mut execution, &run, &mut Vec::new())
+                    self.publish_check_run(&mut execution, &run)
                         .await?;
                 }
             }
@@ -283,7 +283,7 @@ impl HarnessBroker {
         self.store
             .save_execution_transition(&execution, &goal, None, None, None)?;
         self.settle_task(None)?;
-        self.publish_check_run(&mut execution, &run, &mut events)
+        self.publish_check_run(&mut execution, &run)
             .await?;
         events.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
         Ok(events)
@@ -330,23 +330,9 @@ impl HarnessBroker {
         &mut self,
         execution: &mut PlanExecutionRecord,
         run: &CheckRun,
-        events: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         Self::save_run(execution, run);
         self.store.save_plan_execution(execution)?;
-        self.check_runner
-            .publish(run, self.event_sink.as_ref())
-            .await?;
-        let (patch, status_patch) = {
-            let mut presentation = self
-                .presentation
-                .lock()
-                .map_err(|_| anyhow::anyhow!("presentation lock poisoned"))?;
-            let patch = presentation.update_checks(run)?;
-            let status = run.status();
-            (patch, presentation.update_live(None, None, status, self.observer.status_thoughts.load(Ordering::Relaxed))?)
-        };
-        self.emit_timeline_patch(patch, events).await?;
-        self.emit_timeline_patch(status_patch, events).await
+        self.check_runner.publish(run, self.event_sink.as_ref()).await
     }
 }

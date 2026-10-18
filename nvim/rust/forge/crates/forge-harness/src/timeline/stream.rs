@@ -32,12 +32,17 @@ impl TimelinePatch {
         let mut notification = serde_json::json!({"session_id":self.session_id,"revision":self.revision});
         for operation in &self.operation {
             match operation {
-                TimelineOperation::Insert { entry: TimelineEntry::Status { status, .. }, .. }
-                | TimelineOperation::Replace { entry: TimelineEntry::Status { status, .. }, .. } => {
+                TimelineOperation::Insert { entry: TimelineEntry::Status { status, checks, .. }, .. }
+                | TimelineOperation::Replace { entry: TimelineEntry::Status { status, checks, .. }, .. } => {
                     notification["status"] = serde_json::to_value(status).expect("serializable status");
+                    notification["checks_running"] = Value::Bool(checks.is_some());
+                    notification["active_check_run"] = checks.as_ref().map_or(Value::Null,
+                        |activity| Value::String(activity.run_id.clone()));
                 }
                 TimelineOperation::Remove { id, .. } if id == &format!("{}:status", self.session_id) => {
                     notification["status"] = serde_json::json!({"kind":"idle"});
+                    notification["checks_running"] = Value::Bool(false);
+                    notification["active_check_run"] = Value::Null;
                 }
                 _ => {}
             }
@@ -224,7 +229,11 @@ impl TimelineStream {
         let agent_count = self.entry_list.iter().find_map(|entry|match entry {
             TimelineEntry::Status {agent_count,..} => Some(*agent_count),_=>None,
         }).unwrap_or(0);
-        let next_status = TimelineEntry::Status { agent_count, status_thoughts,
+        let checks = self.entry_index.get(&status_id).and_then(|index| match &self.entry_list[*index] {
+            TimelineEntry::Status { checks, .. } => checks.clone(),
+            _ => None,
+        });
+        let next_status = TimelineEntry::Status { checks, agent_count, status_thoughts,
             id: status_id.clone(),
             created_at_ms: 0,
             status,
@@ -310,16 +319,39 @@ impl TimelineStream {
         }
     }
 
-    /// Reconcile one canonical projection into ordered top-level operations.
+    /// Publish live checks under status and insert one history result after completion.
     pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
-        let base_revision=self.revision;
-        let mut operation=Vec::new();
-        let entry=TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run:run.clone() };
-        let insertion=self.entry_list.iter().position(|entry|matches!(entry,TimelineEntry::Status {..})).unwrap_or(self.entry_list.len());
-        let value=serde_json::to_value(&entry)?;
-        self.upsert(entry,value,insertion,&mut operation);
-        if !operation.is_empty() { self.revision+=1; }
-        Ok(TimelinePatch {session_id:self.session_id.clone(),base_revision,revision:self.revision,operation})
+        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+        let base_revision = self.revision;
+        let mut operation = Vec::new();
+        let activity = crate::checks::CheckActivity::from_run(run);
+        let status_id = format!("{}:status", self.session_id);
+        if activity.is_none() {
+            let entry = TimelineEntry::Checks {
+                id: run.id.clone(), created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms), run: run.clone(),
+            };
+            let insertion = self.entry_index.get(&status_id).copied().unwrap_or(self.entry_list.len());
+            let value = serde_json::to_value(&entry)?;
+            self.upsert(entry, value, insertion, &mut operation);
+        }
+        let previous = self.entry_index.get(&status_id).map(|index| self.entry_list[*index].clone());
+        if previous.is_some() || activity.is_some() {
+            let mut entry = previous.unwrap_or_else(|| TimelineEntry::Status {
+                id: status_id, created_at_ms: 0, status: crate::session::state_machine::SessionPhase::Idle,
+                status_thoughts: true, agent_count: 0, checks: None,
+            });
+            if let TimelineEntry::Status { checks, .. } = &mut entry {
+                if let Some(activity) = activity {
+                    *checks = Some(activity);
+                } else if checks.as_ref().is_some_and(|checks| checks.run_id == run.id) {
+                    *checks = None;
+                }
+            }
+            let value = serde_json::to_value(&entry)?;
+            self.upsert(entry, value, self.entry_list.len(), &mut operation);
+        }
+        if !operation.is_empty() { self.revision += 1; }
+        Ok(TimelinePatch { session_id: self.session_id.clone(), base_revision, revision: self.revision, operation })
     }
 
     pub fn reconcile(&mut self, next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
@@ -410,10 +442,8 @@ fn ticking(entry: &TimelineEntry) -> bool {
                     && (exchange.execution_started_at_ms.is_some()
                         || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running))))
                 || agent.iter().any(ticking),
-        TimelineEntry::Status { status,.. } => status.ticking(),
-        TimelineEntry::Checks { run, .. } => run.state == crate::checks::CheckState::Running
-            && run.commands.iter().any(|check| check.state == crate::checks::CheckState::Running
-                && check.started_at_ms.is_some() && check.completed_at_ms.is_none()),
+        TimelineEntry::Status { status, checks, .. } => status.ticking() || checks.is_some(),
+        TimelineEntry::Checks { .. } => false,
         _ => false,
     }
 }
@@ -435,12 +465,62 @@ mod test {
     };
 
     fn status(kind: SessionPhase) -> TimelineEntry {
-        TimelineEntry::Status { agent_count: 0,
+        TimelineEntry::Status { checks: None, agent_count: 0,
             status_thoughts: true,
             id: "session:status".into(),
             created_at_ms: 0,
             status: kind,
         }
+    }
+
+    #[test]
+    fn check_progress_preserves_primary_status_and_publishes_one_result() -> anyhow::Result<()> {
+        let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"checks","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
+            "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"command","command":"cargo test","state":"running","started_at_ms":0,
+                "completed_at_ms":null,"exit_code":null,"error":null,"stdout":"absent","stderr":"absent",
+                "output":"absent","output_bytes":0,"preview":""
+            }]
+        }))?;
+        let primary = SessionPhase::Working {
+            duration_ms: 10, started_at_ms: Some(1), activity: WorkflowActivity::Working,
+            reasoning_summary: Some("Provider thought".into()), execution: None,
+        };
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![status(primary.clone())])?;
+        let patch = stream.update_checks(&run)?;
+        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { entry: TimelineEntry::Status { status, checks: Some(_), .. }, .. }] if *status == primary));
+        assert_eq!(stream.entry_list().len(), 1);
+        assert_eq!(stream.ticking_entries().count(), 1);
+        run.commands[0].preview = "Output remains in the check store".into();
+        run.commands[0].output_bytes = 9000;
+        assert!(stream.update_checks(&run)?.is_empty(), "output-only updates changed the timeline");
+        stream.update_live(None, None, SessionPhase::Idle, false)?;
+        assert!(matches!(&stream.entry_list()[0], TimelineEntry::Status { status: SessionPhase::Idle, checks: Some(_), .. }));
+        assert_eq!(stream.ticking_entries().count(), 1, "independent checks stopped ticking while primary became idle");
+        run.state = crate::checks::CheckState::Passed;
+        run.completed_at_ms = Some(2000);
+        run.commands[0].state = crate::checks::CheckState::Passed;
+        run.commands[0].completed_at_ms = Some(2000);
+        let patch = stream.update_checks(&run)?;
+        assert_eq!(patch.operation.len(), 2);
+        assert!(matches!(stream.entry_list(), [TimelineEntry::Checks { .. }, TimelineEntry::Status { checks: None, .. }]));
+        assert_eq!(stream.ticking_entries().count(), 0);
+        assert!(stream.update_checks(&run)?.is_empty(), "completion added duplicate history");
+        let mut next = run.clone();
+        next.id = "next-checks".into();
+        next.state = crate::checks::CheckState::Running;
+        stream.update_checks(&next)?;
+        stream.update_checks(&run)?;
+        assert!(matches!(stream.entry_list().last(), Some(TimelineEntry::Status { checks: Some(activity), .. }) if activity.run_id == next.id));
+        next.state = crate::checks::CheckState::Interrupted;
+        stream.update_checks(&next)?;
+        assert!(matches!(stream.entry_list().last(), Some(TimelineEntry::Status { checks: None, .. })));
+        assert_eq!(stream.entry_list().iter().filter(|entry| matches!(entry, TimelineEntry::Checks { .. })).count(), 2);
+        Ok(())
     }
 
     #[test]

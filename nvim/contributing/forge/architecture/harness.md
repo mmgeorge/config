@@ -6,6 +6,17 @@ Provider-specific transport behavior is described in [Providers](providers.md). 
 
 ## Timeline storage and incremental projection
 
+The status entry combines the primary `SessionPhase` with an optional `CheckActivity`.
+`buffer/status.rs` owns their layout. The primary label and action keep their own
+row, and check progress appears directly below it before the reasoning preview.
+Check updates preserve the primary phase and its hints. The Rust projection owns
+both timers, while Lua animates only the committed primary status marker.
+
+Active checks never become historical entries. `TimelineStream::update_checks`
+publishes a lightweight status replacement during execution and atomically removes
+the matching activity when it inserts the final result. Normal status updates retain
+independent check activity. Full snapshot reconstruction applies the same boundary.
+
 `NodeMap` owns the shared expansion choices, node incarnations, and tool output sources for
 one open Harness presentation. Emitted nodes identify exchanges, messages, tool groups,
 tools, changes, files, and hunks. Each node separates its source lifecycle, automatic display,
@@ -546,6 +557,14 @@ Session creation commits the primary Agent together with the session. A fork ass
 Agent identity. Delegation admission similarly commits the parent reference and queued child Exchange
 together, before provider start evidence activates the child. A Delegation always projects its named
 child Exchange, so later reuse of the Agent cannot change historical status.
+
+Provider execution runs as one task owned by the broker's `JoinSet` on the existing
+Tokio executor. The broker observes its result alongside checkpoint, control, and event
+lanes. Every exit aborts and joins any remaining provider task before transport cleanup,
+so cancellation cannot detach work. This task boundary keeps provider polling outside
+the host dispatch stack. Task transitions select a separate operation future before
+polling, so unrelated actions do not enlarge the running action's state machine.
+Development and release use the executor's default worker stack settings.
 
 Mode restart interrupts provider Turns and pauses the existing Exchange. Resumption preserves its
 request, plan and goal associations, and initial checkpoint. If baseline acquisition remains pending,
@@ -1600,15 +1619,15 @@ hint context. The buffer contract validates that the row exists. Lua reads this
 metadata from the committed sequence, never from label text or target suffixes.
 Active labels are Working, Planning, Revising plan, Compacting, Implementing, Verifying,
 Resolving, Stopping, and Saving exchange. Completed headings retain Planned, Implemented,
-Verified, and Resolved. Idle has no status row.
+Verified, and Resolved. Idle remains the primary label when only independent checks run.
 Active status headings show the phase and elapsed time. The portable
 `status_thoughts` preference controls whether the latest reasoning preview appears
-directly below in italics, aligned with the phase label and wrapped within the
-content width. It defaults to false and leaves timeline message retention and
+below independent check progress in italics, aligned with the phase label and
+wrapped within the content width. It defaults to false and leaves timeline message retention and
 rendering unchanged. A presentation-only `session.configure` request persists the
 preference and updates the observer and status entry without acquiring the provider
-execution owner or interrupting its response. The preview parses Markdown from at most 4096
-characters without retaining its emphasis markers. Execution comparisons may
+execution owner or interrupting its response. The preview renders at most two
+rows of the complete normalized summary without retaining its emphasis markers. Execution comparisons may
 add their file-attention summary. Lua appends the interrupt hint to the heading.
 
 `health.notice` resolves local failures before user approval waits and otherwise preserves the

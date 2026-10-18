@@ -83,6 +83,8 @@ pub enum TimelineEntry {
         status_thoughts: bool,
         /// Active child executions across the root session, independent of its phase.
         agent_count: usize,
+        /// Active checks independent of the main workflow phase.
+        checks: Option<crate::checks::CheckActivity>,
     },
 }
 
@@ -229,9 +231,9 @@ pub struct TimelineProjection<'a> {
 impl TimelineProjector {
     /// Merges durable check groups with plan-owned groups while preserving one identity per run.
     pub(crate) fn with_checks(mut timeline: Vec<TimelineEntry>, runs: Vec<crate::checks::CheckRun>) -> Vec<TimelineEntry> {
-        for run in runs {
+        for run in runs.into_iter().filter(|run| run.state != crate::checks::CheckState::Running) {
             if !timeline.iter().any(|entry|entry.id() == run.id) {
-                timeline.push(TimelineEntry::Checks {id:run.id.clone(),created_at_ms:run.started_at_ms,run});
+                timeline.push(TimelineEntry::Checks {id:run.id.clone(),created_at_ms:run.completed_at_ms.unwrap_or(run.started_at_ms),run});
             }
         }
         timeline.sort_by_key(TimelineEntry::created_at_ms);
@@ -279,7 +281,7 @@ impl TimelineProjector {
                 event,
             });
         }
-        for run in checks { result.push(TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run }); }
+        for run in checks.into_iter().filter(|run| run.state != crate::checks::CheckState::Running) { result.push(TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.completed_at_ms.unwrap_or(run.started_at_ms),run }); }
         result.retain(|entry| !matches!(entry, TimelineEntry::Exchange { exchange, .. }
             if exchange.disposition != crate::exchange::HistoryDisposition::Current));
         result.sort_by_key(TimelineEntry::created_at_ms);

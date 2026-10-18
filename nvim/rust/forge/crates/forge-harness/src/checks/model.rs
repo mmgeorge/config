@@ -107,54 +107,6 @@ pub struct CheckRun {
 }
 
 impl CheckRun {
-    /// Projects check ownership and elapsed command work without including interrupted offline intervals.
-    pub(crate) fn status(&self) -> crate::session::state_machine::SessionPhase {
-        use crate::session::state_machine::{SessionPhase, WorkflowActivity};
-        if self.state == CheckState::Interrupted {
-            return SessionPhase::Paused;
-        }
-        if self.state != CheckState::Running {
-            return SessionPhase::Idle;
-        }
-        let duration_ms = self
-            .commands
-            .iter()
-            .filter(|check| {
-                matches!(
-                    check.state,
-                    CheckState::Passed | CheckState::Failed | CheckState::Blocked
-                )
-            })
-            .filter_map(|check| check.elapsed_ms(0))
-            .fold(0_u64, u64::saturating_add);
-        let started_at_ms = if let Some(check) = self
-            .commands
-            .iter()
-            .find(|check| check.state == CheckState::Running)
-        {
-            check.started_at_ms
-        } else if self
-            .commands
-            .iter()
-            .any(|check| check.state == CheckState::Interrupted)
-        {
-            None
-        } else {
-            self.commands
-                .iter()
-                .filter_map(|check| check.completed_at_ms)
-                .max()
-                .or(Some(self.started_at_ms))
-        };
-        SessionPhase::Working {
-            duration_ms,
-            started_at_ms,
-            activity: WorkflowActivity::Checking,
-            reasoning_summary: None,
-            execution: None,
-        }
-    }
-
     /// Select the gate result from recorded failures rather than model interpretation.
     pub fn outcome(&self) -> VerificationOutcome {
         if self.commands.iter().any(|check| {
@@ -270,14 +222,16 @@ impl CheckRun {
                 .filter(|check| check.state == state)
                 .count()
         };
-        format!(
-            "{} passed · {} failed · {} not run · {} configuration errors",
-            count(CheckState::Passed),
-            count(CheckState::Failed),
-            count(CheckState::Skipped),
-            count(CheckState::ConfigurationError)
-                .max(usize::from(self.state == CheckState::ConfigurationError))
-        )
+        let mut summary = vec![format!("{} passed", count(CheckState::Passed))];
+        let failed = count(CheckState::Failed);
+        if failed > 1 {
+            summary.push(format!("{failed} failed"));
+        }
+        let skipped = count(CheckState::Skipped);
+        if skipped > 0 {
+            summary.push(format!("{skipped} not run"));
+        }
+        summary.join(" · ")
     }
 
     /// Counts recorded execution time while excluding paused intervals.

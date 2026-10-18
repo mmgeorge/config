@@ -82,6 +82,50 @@ fn direct_operation(command: &str, args: &[&str], manager: Option<PackageManager
     CheckOperation { command: command.into(), args: Some(args.iter().map(|argument| (*argument).into()).collect()), package_manager: manager }
 }
 
+#[tokio::test]
+async fn completion_wait_ignores_progress_and_observes_terminal_states() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("wait", "print done")]);
+    let runner = make_runner(workspace.path(), data.path());
+    for state in [CheckState::Passed, CheckState::Failed, CheckState::Interrupted, CheckState::ConfigurationError] {
+        let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
+            crate::session::CheckShell::Nushell, "wait test".into())?;
+        runner.publish(&run, None).await?;
+        let waiting = runner.status(&run.id, 1000, true);
+        tokio::pin!(waiting);
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+        runner.publish(&run, None).await?;
+        assert!(futures_util::poll!(waiting.as_mut()).is_pending(), "progress completed a terminal wait");
+        let progress = runner.status(&run.id, 1000, false);
+        tokio::pin!(progress);
+        assert!(futures_util::poll!(progress.as_mut()).is_pending());
+        runner.publish(&run, None).await?;
+        assert_eq!(progress.await?.state, CheckState::Running);
+        let mut completed = run.clone();
+        completed.state = state;
+        runner.publish(&completed, None).await?;
+        assert_eq!(waiting.await?.state, state);
+        assert_eq!(runner.status(&run.id, 1000, true).await?.state, state);
+    }
+    assert!(runner.status("missing", 1000, true).await.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn completion_wait_returns_running_when_deadline_expires() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("wait", "print done")]);
+    let runner = make_runner(workspace.path(), data.path());
+    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
+        crate::session::CheckShell::Nushell, "wait test".into())?;
+    runner.publish(&run, None).await?;
+    assert_eq!(runner.status(&run.id, 0, true).await?.state, CheckState::Running);
+    assert_eq!(runner.status(&run.id, 1, true).await?.state, CheckState::Running);
+    Ok(())
+}
+
 async fn begin_recorded_task(workspace: &std::path::Path, data: &std::path::Path, runner: &CheckRunner) -> Result<()> {
     assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(workspace).status()?.success());
     let checkpoint = crate::checkpoint::GitCheckpoint::new(workspace).capture(
@@ -1155,12 +1199,12 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     assert_eq!(runner.active()?.as_deref(), Some(id.as_str()));
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while runner.active()?.is_some() {
-            runner.status(&id, 500).await?;
+            runner.status(&id, 500, false).await?;
         }
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(runner.status(&id, 0).await?.state, CheckState::Interrupted);
+    assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
     Ok(())
 }
 
@@ -1186,11 +1230,11 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     cancelled.store(true, std::sync::atomic::Ordering::Release);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         while runner.active()?.is_some() {
-            runner.status(&id, 500).await?;
+            runner.status(&id, 500, false).await?;
         }
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(runner.status(&id, 0).await?.state, CheckState::Interrupted);
+    assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
     Ok(())
 }

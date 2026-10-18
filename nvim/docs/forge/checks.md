@@ -5,7 +5,16 @@
 Definitions live in the `checks` section of `.forge.json`. Setup preserves other
 repository settings and asks for your choices before saving.
 
+Follow-up messages and interrupted setup retain your recorded choices. Setup still
+requires a user answer before saving. After configuration is saved, subsequent
+messages return to ordinary chat. Cancellation, rollback, or starting another task
+does not transfer the earlier setup's approval to that task.
+
 ## Automatic and explicit checks
+
+While a check run is active, its timeline group shows only executing checks.
+Completed runs retain the full details. Result summaries omit configuration-error
+counts and show a failed count only when more than one check failed.
 
 `enabled` controls whether a check can run. `auto` controls automatic selection
 and defaults to `true` when omitted. An enabled check with `auto: false` remains
@@ -140,7 +149,23 @@ Plans that change package manifests show pending validation until their metadata
 exists on disk. Editing selection inputs invalidates an earlier plan preview.
 Previews never count as execution evidence.
 
+Agents can call `checks_status` with `wait_for_completion: true` to wait through
+progress updates until the run finishes. The default wait is 60 seconds. An
+optional `wait_ms` shortens that deadline, and a run still in progress at the
+deadline returns its current state. Omitting this option preserves immediate
+status reads or waits for the next update.
+
 Execution checks the captured manifests again. A changed manifest requires a new
 resolution. A dependent check runs only after every expanded prerequisite passes.
 History records each concrete command, its output, and its selected package or
 cases. Interruption retains completed output and stops owned processes.
+
+Running checks appear below the main status, alongside ongoing work. The status area
+shows the current check names, completion count, and elapsed time. It does not replace
+Working or a waiting state. The timeline receives one expandable result when the run
+finishes or is interrupted. Open that result for command details and saved output.
+
+Submitting a prompt while checks run interrupts those checks and starts the prompt
+after their processes stop. Explicitly queueing a prompt leaves checks running and
+waits for completion. A directly submitted prompt takes precedence over queued
+prompts, and edits made to the composer during cancellation remain unsent.

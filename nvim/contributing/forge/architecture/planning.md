@@ -647,8 +647,11 @@ Nushell receives `--stdin` before `-c` when scoped selectors are piped into a ch
 construction owns both argument order and stdin configuration.
 
 Setup first discovers commands and then asks the user about areas, automatic suites, coverage,
-and cost through the shared question flow. The setup exchange retains its decision state across
-question continuations. The configuration tool rejects publication before a user answer.
+and cost through the shared question flow. Setup retains its decision state across question
+continuations, interrupted exchanges, and subsequent chat follow-ups in the same task context.
+Follow-ups inherit discovery or reviewed state from the latest persisted exchange. A recorded
+configuration publication ends that inheritance, as do cancellation, rollback, and a change of
+task context. The configuration tool rejects publication before a user answer.
 Missing-configuration bootstrap during planning uses the same question requirement before
 publishing checks. Explicit setup never runs configured checks or modifies active-plan questions.
 Setup rejected before exchange admission returns `not_admitted` and preserves the existing task's
@@ -701,16 +704,33 @@ exit status, timestamps, stdout, stderr, combined output, and requested/resolved
 
 Each run owns stable structured events for start, individual check start and completion,
 skips, configuration errors, interruption, resumption, and completion. Setup records a
-configuration-saved event. The timeline keeps one expandable group per run with a visible
-result-count and duration summary. Child rows retain lifecycle events and lazy output nodes.
-Timer and output refreshes update the existing group without appending events. Reopening a
-session reconstructs the same identities, ordering, and completed output. Running previews
-retain at most four lines, and expanded nodes page output from saved files.
+configuration-saved event. Active checks appear below the primary workflow status,
+not in timeline history. `CheckActivity` retains only command labels, completion counts,
+and execution intervals. It never replaces Working, a user-decision wait, or another
+primary phase. Output-only updates remain in the check store without mutating the status.
+The status timer refreshes the active intervals even while the primary phase is idle.
+
+Completion clears that run's side activity and inserts one expandable result group at
+its completion timestamp in the same revision. Repeated updates retain the same group
+identity, and a late result cannot clear a different active run. Result details retain
+commands, selections, failure diagnostics, and lazy access to complete saved output.
+Intermediate lifecycle events remain in the check record rather than producing timeline
+rows. Reopening reconstructs the same final results and current independent activity.
+`CheckRunner` owns publication for both plan gates and on-demand runs. The broker does
+not publish a second check projection or replace the primary phase from a check update.
+`checks_status` supports `wait_for_completion` through both the control tool and
+service route. The runner subscribes before reading state, ignores intermediate
+updates, and retains one deadline across wakeups. Completion waits default to at
+most 60 seconds and return the current state when that deadline expires.
 
 Recorded declaration or command failures enter Resolve. Configuration errors block completion
 and notify the user to fix the definitions. Disabled checks and empty task selections remain
 Not run, never Passed. Source changes during the gate invalidate its result. Interruption
 terminates owned processes and preserves outputs. Recovery marks detached work interrupted.
+Direct prompt submission interrupts active checks and waits for process collection and
+execution release before admitting the new prompt. Snapshots and check document updates
+publish the active run identity so the composer keeps this action separate from explicit
+queueing. Queued prompts wait for check completion without cancelling the run.
 Resume reuses completed results only when configuration, scope, environment, and workspace
 identities still match. Passing gates enter manual Verify when actions exist, otherwise
 complete the plan. Manual defects return to Resolve and manual blockers preserve Verify.

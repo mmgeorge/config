@@ -5,6 +5,7 @@ mod layout;
 mod message;
 mod nodes;
 mod syntax;
+mod status;
 pub mod document;
 pub mod output;
 pub mod projection;

@@ -167,7 +167,7 @@ current. Its budget, gutter, import, Unicode, and malformed-source tests cover t
 shared formatter. `excerpt_regression_tests.rs` also checks source order, callback
 ownership, same-named methods, and import filtering across languages. Use
 [Building and testing](building-and-testing.md) to run the
-focused `commit_message::` tests and rebuild the release host. See
+focused `commit_message::` tests and rebuild the development host. See
 [Commit-message context](architecture/git-and-checkpoints.md#commit-message-context)
 for comparison scope and provider ownership.
 

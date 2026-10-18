@@ -246,7 +246,8 @@ case removes its empty file group without deleting project source files.
 
 | Command | Arguments | Behavior |
 | --- | --- | --- |
-| `:ForgeBuild` | None | Explicitly build Forge and report the selected executable |
+| `:ForgeBuild` | None | Build the debug executable with optimized external dependencies |
+| `:ForgeBuildRelease` | None | Explicitly build the release executable |
 | `:ForgeStartupLog` | None | Open the startup diagnostic log |
 | `:ForgeGitConfigCacheReset` | None | Clear the cached Git configuration location |
 | `:ForgeDebugBackgroundTimeline [session_id]` | Optional saved Background session ID | Inspect generation history, provider status, failures, and compaction |
@@ -261,6 +262,11 @@ Each invocation collects current repository state. Empty comparisons appear in
 the buffer, and failed requests produce an error notification.
 Renamed files appear once in the compact file list with their original path and
 have no detailed content excerpt, including when the rename also contains edits.
+
+Forge launches the debug executable by default. `:ForgeBuildRelease` does not
+switch the runtime profile. Set `vim.g.forge_build_profile = "release"` before
+loading Forge to select the release executable explicitly. `:ForgeBuild` always
+builds debug, including when the current runtime selects release.
 
 A successful build does not replace an executable already loaded by a running
 host. Restart Neovim to use the rebuilt host. Compilation errors appear as build

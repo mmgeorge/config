@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
     BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TargetRange, TextChunk, TextPosition,
-    TextRange, StatusPresentation, StatusHint,
+    TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::width::WidthProfile;
@@ -221,19 +221,8 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
         return Ok(project(ProjectionSource::Entry(entry),width,false,expanded,&HashMap::new())?.entry.block);
     }
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-    if let TimelineEntry::Checks { run, .. } = entry {
-        let mut blocks = Vec::new();
-        if run.state == crate::checks::CheckState::Running {
-            for check in run.commands.iter().filter(|check| check.state == crate::checks::CheckState::Running) {
-                let Some(previous) = document.block(&BlockId(format!("{}:tool",check.id))) else { continue; };
-                let mut profile = width.clone();
-                profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
-                    .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
-                blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(previous,"check",
-                    check.elapsed_ms(now_ms),false,&check.heading(),expanded.get(&format!("{}:tool",check.id))==Some(&true))?);
-            }
-        }
-        return Ok(blocks);
+    if matches!(entry, TimelineEntry::Checks { .. }) {
+        return Ok(Vec::new());
     }
     let mut source = Vec::new();
     let mut headings = Vec::new();
@@ -433,132 +422,15 @@ impl TimelineRenderer<'_> {
                 };
                 self.literal(id, &text, action)?;
             }
-            TimelineEntry::Status { id, status, agent_count, status_thoughts, .. } => {
-                let text = match status {
-                    SessionPhase::Idle => "Idle".into(),
-                    SessionPhase::Paused => "Paused".into(),
-                    SessionPhase::Compacting { .. } => {
-                        let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
-                        format!("Compacting · {elapsed_seconds}s")
-                    }
-                    SessionPhase::Finalizing { outcome, error, .. } => {
-                        let label = finalization_label(*outcome);
-                        error.as_ref().map_or_else(
-                            || label.into(),
-                            |error| format!("{label} failed · {error}"),
-                        )
-                    },
-                    SessionPhase::Working {
-                        activity,
-                        execution,
-                        ..
-                    } => {
-                        let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
-                        working_status_text(
-                            elapsed_seconds,
-                            *activity,
-                            execution.as_ref(),
-                        )
-                    }
-                    SessionPhase::AwaitingInput { .. } => "Waiting for your answer".into(),
-                    SessionPhase::AwaitingApproval { .. } => "Waiting for your approval".into(),
-                    SessionPhase::AwaitingPlanReview { revision, .. } => {
-                        format!("Waiting for plan review · revision {revision}")
-                    }
-                    SessionPhase::RetryingPlanGeneration { activity, .. } => {
-                        let elapsed = status.elapsed_ms(self.now_ms) / 1_000;
-                        format!("{} · {elapsed}s", activity.active_label())
-                    }
-                    SessionPhase::PlanningFailed { reason, .. } => {
-                        format!("Planning stopped · {reason}")
-                    }
-                    SessionPhase::WaitingForAgent { agent_count: 0 } => "Waiting for agents".into(),
-                    SessionPhase::WaitingForAgent { agent_count } => {
-                        format!("Waiting for agents · {agent_count} running")
-                    }
-                };
-                let text = if *agent_count > 0 && !matches!(status,SessionPhase::WaitingForAgent {..}) {
-                    format!("{text} · {agent_count} agent{} running",if *agent_count == 1 {""} else {"s"})
-                } else {text};
-                let text = if text.is_empty() {
-                    text
-                } else {
-                    format!("\n{text}")
-                };
-                let mut block = TranscriptRenderer::new(&self.content_width())?.literal(
-                    BlockId(id.clone()),
-                    &text,
-                    0,
-                )?;
-                block.metadata.status = Some(StatusPresentation {
-                        row: 1,
-                        animated: status.animated(),
-                        hint: match status {
-                            SessionPhase::Working { .. } | SessionPhase::RetryingPlanGeneration { .. }
-                                | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
-                            SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
-                            SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
-                            SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
-                            _ => None,
-                        },
-                });
-                if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
-                    block.metadata.decoration.push(Decoration {
-                        range: TextRange {
-                            start: TextPosition { row: 1, column: 0 },
-                            end: TextPosition {
-                                row: block.text.row_count(),
-                                column: 0,
-                            },
-                        },
-                        capture: "ForgeHarnessPlan".into(),
-                        priority: 100,
-                    });
-                    let target = TargetId(format!("{id}:review-plan"));
-                    block.metadata.target.push(TargetRange {
-                        id: target.clone(),
-                        range: TextRange {
-                            start: TextPosition { row: 1, column: 0 },
-                            end: TextPosition {
-                                row: block.text.row_count(),
-                                column: 0,
-                            },
-                        },
-                    });
-                    self.action.insert(
-                        target,
-                        TranscriptAction::Plan {
-                            plan_id: plan_id.clone(),
-                            revision: None,
-                        },
-                    );
-                } else if matches!(
-                    status,
-                    SessionPhase::Working { .. } | SessionPhase::AwaitingInput { .. }
-                ) {
-                    let role = if matches!(status, SessionPhase::Working { .. }) {
-                        "working"
-                    } else {
-                        "question"
-                    };
-                    block.metadata.target.push(TargetRange {
-                        id: TargetId(format!("{id}:{role}")),
-                        range: TextRange {
-                            start: TextPosition { row: 1, column: 0 },
-                            end: TextPosition {
-                                row: block.text.row_count(),
-                                column: 0,
-                            },
-                        },
-                    });
+            TimelineEntry::Status { id, status, agent_count, status_thoughts, checks, .. } => {
+                let rendered = super::status::StatusView {
+                    id, status, agent_count: *agent_count, status_thoughts: *status_thoughts,
+                    checks: checks.as_ref(),
+                }.render(&self.content_width(), self.now_ms)?;
+                if let Some((target, action)) = rendered.action {
+                    self.action.insert(target, action);
                 }
-                if *status_thoughts && let SessionPhase::Working { reasoning_summary: Some(summary), .. } = status {
-                    append_reasoning_preview(&mut block, &self.content_width(), summary)?;
-                }
-                let mut rows = block.text.wire_rows();
-                rows.resize(rows.len().max(4), "");
-                block.text = forge_buffer::text::BufferText::from_rows(rows)?;
-                self.push(block)?;
+                self.push(rendered.block)?;
                 if let SessionPhase::Working { execution: Some(execution), activity, .. } = status
                     && WorkflowActivity::from(execution.phase) == *activity && execution.has_comparison() {
                     self.declaration_comparison(id, execution)?;
@@ -1605,14 +1477,13 @@ impl TimelineRenderer<'_> {
     }
 
     fn checks(&mut self, run: &crate::checks::CheckRun) -> Result<()> {
+        ensure!(run.state != crate::checks::CheckState::Running, "active checks belong to session status");
         if self.leading_separator {
             self.literal(&format!("{}:separator", run.id), "", None)?;
         }
         let heading = if run.context.is_some() {
             if run.lifecycle.iter().any(|event|matches!(event.kind,crate::checks::CheckEventKind::ConfigurationSaved)) {
                 run.lifecycle.last().map(|event|event.text.clone()).unwrap_or_else(||"Check configuration saved".into())
-            } else if run.state == crate::checks::CheckState::Running {
-                format!("Checks started · {} · {} selected",run.context.as_ref().unwrap().trigger,run.commands.len())
             } else {
                 format!("Checks {} · {} · {:.1}s",if run.state == crate::checks::CheckState::Interrupted {"interrupted"} else {"finished"},run.summary(),
                     run.duration_ms() as f64 / 1000.0)
@@ -1620,7 +1491,6 @@ impl TimelineRenderer<'_> {
         } else {format!("Checks · {:?}",run.state)};
         self.literal(&format!("{}:checks", run.id), &heading, None)?;
         let checks = self.begin_section(2);
-        for event in &run.lifecycle { self.literal(&event.id,&event.text,None)?; }
         if run.context.as_ref().is_none_or(|context|context.trigger == "Plan execution") {
         self.literal(&format!("{}:declarations", run.id),
             &format!("Declarations · {}", if run.progress.conforms() { "match" } else { "differ" }), None)?;
@@ -1660,25 +1530,17 @@ impl TimelineRenderer<'_> {
                 for chunk in 0..output.inline_prefix_chunks(limit)? { self.push(renderer.tool_body(&call_id,&output,true,chunk)?)?; }
                 self.push(renderer.tool_hidden(&call_id,&output,true)?)?;
             } else {
-                let preview=run.state==crate::checks::CheckState::Running && check.state==crate::checks::CheckState::Running
-                    && self.expansion.get(&format!("{call_id}:tool"))!=Some(&false);
-                if preview {
-                    let visible=ToolOutputView::new(call_id.clone(),&check.preview)?;
-                    self.push(renderer.tool_body(&call_id,&visible,false,0)?)?;
-                } else { self.push(BufferBlock { id:BlockId(format!("{call_id}:preview")),text:Default::default(),metadata:Default::default() })?; }
+                self.push(BufferBlock { id:BlockId(format!("{call_id}:preview")),text:Default::default(),metadata:Default::default() })?;
                 self.push(BufferBlock { id:BlockId(format!("{call_id}:hidden")),text:Default::default(),metadata:Default::default() })?;
             }
             if let Some(error)=&check.error { self.literal(&format!("{call_id}:error"),error,None)?; }
             self.fold(command_start,&format!("{call_id}:tool"),true,NodeKind::Tool);
-            if let Some(node)=&mut self.block[command_start].metadata.node { node.more=expanded && output.has_unloaded_output();
-                if check.state==crate::checks::CheckState::Running {
-                    node.lifecycle=NodeLifecycle::Live;
-                    node.default_display=NodeDisplay::Preview;
-                    node.resolve(self.expansion.get(&node.id.0).copied());
-                } }
+            if let Some(node) = &mut self.block[command_start].metadata.node {
+                node.more = expanded && output.has_unloaded_output();
+            }
             self.tool.insert(call_id,output);
         }
-        self.finish_section(checks,&format!("{}:checks",run.id),run.state != crate::checks::CheckState::Running);
+        self.finish_section(checks,&format!("{}:checks",run.id),true);
         if let Some(title)=&run.completed_plan { self.literal(&format!("{}:complete",run.id), &format!("◇ Plan complete: {title}"),None)?; }
         Ok(())
     }
@@ -1990,50 +1852,6 @@ fn history_prefix(disposition: crate::exchange::HistoryDisposition) -> &'static 
         crate::exchange::HistoryDisposition::RolledBack => "Rolled back · ",
         crate::exchange::HistoryDisposition::Superseded => "Superseded · ",
     }
-}
-
-fn append_reasoning_preview(block: &mut BufferBlock, width: &WidthProfile, summary: &str) -> Result<()> {
-    let bounded = summary.chars().take(4_096).collect::<String>();
-    let normalized = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
-    if normalized.is_empty() {
-        return Ok(());
-    }
-    let rendered = forge_buffer::markdown::MarkdownRenderer::render(
-        BlockId(format!("{}:reasoning", block.id.0)), &normalized, width,
-    )?;
-    let start = block.text.row_count();
-    let mut rows = block.text.wire_rows();
-    rows.extend(rendered.block.text.wire_rows().into_iter().take(2));
-    block.text = forge_buffer::text::BufferText::from_rows(rows)?;
-    block.metadata.decoration.push(Decoration {
-        range: TextRange {
-            start: TextPosition { row: start, column: 0 },
-            end: TextPosition { row: block.text.row_count(), column: 0 },
-        },
-        capture: "ForgeHarnessCommentary".into(),
-        priority: 100,
-    });
-    Ok(())
-}
-
-fn working_status_text(
-    elapsed_seconds: u64,
-    activity: WorkflowActivity,
-    execution: Option<&ExecutionStatus>,
-) -> String {
-    let phase = activity.active_label();
-    if let Some(execution) = execution.filter(|execution|
-        WorkflowActivity::from(execution.phase) == activity && execution.has_comparison()) {
-        let progress = &execution.progress;
-        let count = progress.missing.iter().chain(&progress.different).chain(&progress.unverified)
-            .map(|finding| finding.split_once(": ").map_or(finding.as_str(), |(path, _)| path))
-            .collect::<std::collections::BTreeSet<_>>().len();
-        let attention = if count == 1 { "1 file needs attention".into() }
-            else if count > 1 { format!("{count} files need attention") }
-            else { "all files matched".into() };
-        return format!("{phase} · {elapsed_seconds}s · {attention}");
-    }
-    format!("{phase} · {elapsed_seconds}s")
 }
 
 fn token_display(tokens: u64) -> String {
@@ -3982,7 +3800,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let render = |execution: crate::session::state_machine::ExecutionStatus| project_at(&TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+        let render = |execution: crate::session::state_machine::ExecutionStatus| project_at(&TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Working {
                 duration_ms: 0, started_at_ms: Some(0), activity: execution.phase.into(),
@@ -4027,7 +3845,7 @@ mod tests {
             (SessionPhase::PlanningFailed { plan_id: "plan".into(), turn_count: 2, reason: "no progress limit reached".into() }, "Planning stopped · no progress limit reached", false, None),
         ];
         for (phase, expected, animated, hint) in cases {
-            let projection = project_at(&TimelineEntry::Status { status_thoughts: true, agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
+            let projection = project_at(&TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
             let block = &projection.entry.block[0];
             assert_eq!(block.text.wire_rows(), vec!["", expected, "", ""]);
             assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
@@ -4041,7 +3859,7 @@ mod tests {
     #[test]
     fn working_status_reports_elapsed_seconds_without_persisting_a_timer_value() {
         let projection = project_at(
-            &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+            &TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -4073,7 +3891,7 @@ mod tests {
             WorkflowActivity::Resolving, WorkflowActivity::Goal,
         ] {
             let projection = project_at(
-                &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+                &TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     status: SessionPhase::Working {
@@ -4110,7 +3928,7 @@ mod tests {
     fn working_status_wraps_reasoning_and_omits_empty_previews() {
         for summary in ["", " \n\t ", "**Considering new ECS components** with Unicode 界 and enough detail to wrap"] {
             let width = WidthProfile { columns: 32, ..Default::default() };
-            let projection = project_at(&TimelineEntry::Status {
+            let projection = project_at(&TimelineEntry::Status { checks: None,
                 id: "session:status".into(), created_at_ms: 0, status_thoughts: true, agent_count: 0,
                 status: SessionPhase::Working {
                     duration_ms: 37_000, started_at_ms: None,
@@ -4134,7 +3952,7 @@ mod tests {
     #[test]
     fn status_thoughts_can_be_hidden_without_hiding_the_status() {
         for status_thoughts in [false, true] {
-            let projected = project_at(&TimelineEntry::Status {
+            let projected = project_at(&TimelineEntry::Status { checks: None,
                 id: "session:status".into(), created_at_ms: 0, agent_count: 0, status_thoughts,
                 status: SessionPhase::Working {
                     duration_ms: 3_000, started_at_ms: None,
@@ -4160,7 +3978,7 @@ mod tests {
             crate::broker::ElicitationOwner::PlanAcceptance,
         ] {
             let projected = project_at(
-                &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+                &TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     status: SessionPhase::AwaitingInput {
@@ -4185,7 +4003,7 @@ mod tests {
     #[test]
     fn review_status_has_a_separate_unindented_action_row() {
         let projected = project_at(
-            &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
+            &TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::AwaitingPlanReview {
@@ -4326,7 +4144,7 @@ mod tests {
             let assert_working = |exchange: &Exchange, now_ms, seconds| -> anyhow::Result<()> {
                 let status = SessionPhase::resolve(None, None, Some(exchange));
                 assert!(matches!(status, SessionPhase::Working { .. }));
-                let projection = project_at(&TimelineEntry::Status {
+                let projection = project_at(&TimelineEntry::Status { checks: None,
                     id:"status".into(), created_at_ms:1000, status, status_thoughts: true, agent_count:0,
                 }, &WidthProfile::default(), now_ms)?;
                 assert_eq!(projection.entry.block[0].text.row(1),
@@ -4368,53 +4186,100 @@ mod tests {
     }
 
     #[test]
-    fn silent_checks_refresh_only_the_live_heading_without_reading_output() -> anyhow::Result<()> {
-        let mut run:crate::checks::CheckRun=serde_json::from_value(json!({
+    fn running_checks_are_status_activity_until_result_published() -> anyhow::Result<()> {
+        let commands = ["passed", "running", "pending", "skipped", "failed", "configuration_error"]
+            .into_iter().map(|state| json!({
+                "id": state, "command": format!("cargo test {state}"), "state": state,
+                "started_at_ms": 0, "completed_at_ms": null, "exit_code": null,
+                "error": null, "stdout": "absent", "stderr": "absent",
+                "output": "absent", "output_bytes": 100, "preview": "must stay out of status"
+            })).collect::<Vec<_>>();
+        let mut run: crate::checks::CheckRun = serde_json::from_value(json!({
+            "id": "check-run", "revision": 1, "completed_plan": null,
+            "shell": "system", "executable": null, "workspace": ".",
+            "environment_digest": "environment", "started_at_ms": 0,
+            "completed_at_ms": null, "state": "running",
+            "progress": crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity": null, "workspace_digest": {}, "commands": commands,
+            "lifecycle": [{"id": "old-event", "created_at_ms": 0,
+                "kind": "check_skipped", "check_id": "skipped", "text": "Previous check skipped"}]
+        }))?;
+        let history = crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run.clone()]);
+        assert!(history.is_empty(), "live checks entered durable timeline history");
+        let status = TimelineEntry::Status {
+            id: "status".into(), created_at_ms: 0, agent_count: 0, status_thoughts: true,
+            status: SessionPhase::Working {
+                duration_ms: 0, started_at_ms: Some(0), activity: WorkflowActivity::Working,
+                reasoning_summary: Some("Independent provider work".into()), execution: None,
+            },
+            checks: crate::checks::CheckActivity::from_run(&run),
+        };
+        let projected = project_at(&status, &WidthProfile::default(), 1000)?;
+        let rows = projected.entry.block[0].text.wire_rows();
+        assert_eq!(rows[1], "Working · 1s");
+        assert!(rows[2].starts_with("Checks running"));
+        assert!(rows.iter().any(|row| row.contains("cargo test running")));
+        assert!(rows.iter().any(|row| row.contains("Independent provider work")));
+        assert!(!rows.iter().any(|row| row.contains("cargo test pending") || row.contains("must stay") || row.contains("Previous check")));
+        assert!(projected.tool.is_empty());
+        run.state = crate::checks::CheckState::Failed;
+        let history = crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]);
+        assert_eq!(history.len(), 1);
+        let finished = project_at(&history[0], &WidthProfile::default(), 2000)?;
+        assert_eq!(finished.tool.len(), 6);
+        assert!(!finished.entry.block.iter().any(|block| block.id.0 == "old-event"));
+        Ok(())
+    }
+
+    #[test]
+    fn check_activity_clocks_do_not_read_output_or_tick_finished_history() -> anyhow::Result<()> {
+        let mut run: crate::checks::CheckRun = serde_json::from_value(json!({
             "id":"check-run","revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
             "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
             "workspace_identity":null,"workspace_digest":{},"commands":[{
                 "id":"check-command","command":"cargo test --locked","state":"running","started_at_ms":0,
                 "completed_at_ms":null,"exit_code":null,"error":null,"stdout":"absent","stderr":"absent",
-                "output":"absent","output_bytes":0,"preview":""
+                "output":"absent","output_bytes":100,"preview":"unread output"
             }]
         }))?;
-        let entry=TimelineEntry::Checks {id:run.id.clone(),created_at_ms:0,run:run.clone()};
-        let profile=WidthProfile::default();
-        let projected=project_at(&entry,&profile,1000)?;
-        let document=forge_buffer::document::BufferDocument::new(
-            forge_buffer::identity::DocumentId("check-clock".into()),projected.entry.block)?;
-        let refreshed=super::timing_blocks(&entry,&profile,&document,&Default::default(),&projected.tool)?;
-        assert_eq!(refreshed.len(),1);
-        assert_eq!(refreshed[0].id.0,"check-command:tool");
-        assert_ne!(refreshed[0].text,document.block(&refreshed[0].id).unwrap().text);
-        assert_eq!(projected.tool["check-command"].snapshot()?.retained_bytes(),0);
-        run.state=crate::checks::CheckState::Passed;
-        run.commands[0].state=crate::checks::CheckState::Passed;
-        run.commands[0].completed_at_ms=Some(2000);
-        let mut previous=run.commands[0].clone();
-        previous.id="previous-command".into();
-        run.commands.insert(0,previous);
-        run.state=crate::checks::CheckState::Running;
-        run.commands[1].state=crate::checks::CheckState::Interrupted;
-        assert_eq!(run.status().elapsed_ms(90_000),2000);
-        run.state=crate::checks::CheckState::Interrupted;
-        assert_eq!(run.status(),SessionPhase::Paused);
-        run.state=crate::checks::CheckState::Running;
-        run.commands[1].state=crate::checks::CheckState::Running;
-        run.commands[1].started_at_ms=Some(90_000);
-        run.commands[1].completed_at_ms=None;
-        assert_eq!(run.status().elapsed_ms(93_000),5000);
-        run.state=crate::checks::CheckState::Passed;
-        let finished=TimelineEntry::Checks {id:run.id.clone(),created_at_ms:0,run};
-        assert!(super::timing_blocks(&finished,&profile,&document,&Default::default(),&projected.tool)?.is_empty());
+        let entry = TimelineEntry::Status {
+            id: "status".into(), created_at_ms: 0, status: SessionPhase::Idle,
+            status_thoughts: false, agent_count: 0, checks: crate::checks::CheckActivity::from_run(&run),
+        };
+        let profile = WidthProfile::default();
+        let projected = project_at(&entry, &profile, 1000)?;
+        let document = forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("check-clock".into()), projected.entry.block)?;
+        let refreshed = super::timing_blocks(&entry, &profile, &document, &Default::default(), &projected.tool)?;
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].id.0, "status");
+        assert_ne!(refreshed[0].text, document.block(&refreshed[0].id).unwrap().text);
+        assert!(projected.tool.is_empty());
+        run.commands[0].state = crate::checks::CheckState::Passed;
+        run.commands[0].completed_at_ms = Some(2000);
+        let mut previous = run.commands[0].clone();
+        previous.id = "previous-command".into();
+        run.commands.insert(0, previous);
+        run.commands[1].state = crate::checks::CheckState::Interrupted;
+        assert_eq!(crate::checks::CheckActivity::from_run(&run).unwrap().elapsed_ms(90_000), 2000);
+        run.state = crate::checks::CheckState::Interrupted;
+        assert!(crate::checks::CheckActivity::from_run(&run).is_none());
+        run.state = crate::checks::CheckState::Running;
+        run.commands[1].state = crate::checks::CheckState::Running;
+        run.commands[1].started_at_ms = Some(90_000);
+        run.commands[1].completed_at_ms = None;
+        assert_eq!(crate::checks::CheckActivity::from_run(&run).unwrap().elapsed_ms(93_000), 5000);
+        run.state = crate::checks::CheckState::Passed;
+        let finished = TimelineEntry::Checks { id: run.id.clone(), created_at_ms: 0, run };
+        assert!(super::timing_blocks(&finished, &profile, &document, &Default::default(), &projected.tool)?.is_empty());
         Ok(())
     }
 
     #[test]
     fn empty_or_stale_comparison_does_not_claim_live_work() -> anyhow::Result<()> {
         for phase in [crate::plan::PlanPhase::Implement, crate::plan::PlanPhase::Verify] {
-            let projection = project_at(&TimelineEntry::Status {
+            let projection = project_at(&TimelineEntry::Status { checks: None,
                 id:"status".into(), created_at_ms:1000, status_thoughts: true, agent_count:0,
                 status:SessionPhase::Working {
                     duration_ms:3000, started_at_ms:None, activity:WorkflowActivity::Implementing,
@@ -4831,7 +4696,7 @@ fn agent_counts_preserve_the_primary_status_and_spinner() -> anyhow::Result<()> 
         (SessionPhase::Paused,"Paused",false),
         (SessionPhase::AwaitingPlanReview {plan_id:"plan".into(),revision:1},"Waiting for plan review",false),
     ] {
-        let projection=project_at(&TimelineEntry::Status { status_thoughts: true,id:"status".into(),created_at_ms:0,status,agent_count:2},
+        let projection=project_at(&TimelineEntry::Status { checks: None, status_thoughts: true,id:"status".into(),created_at_ms:0,status,agent_count:2},
             &WidthProfile::default(),1000)?;
         let text=projection.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.contains(label) && text.contains("2 agents running"),"{text}");

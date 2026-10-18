@@ -35,6 +35,16 @@ tokio = { version = "1.48", features = ["io-std", "io-util", "macros", "net", "p
 tempfile = "3.23"
 toml = "0.9"
 
+[profile.dev]
+opt-level = 0
+debug = 1
+incremental = true
+lto = "off"
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = 0
+
 [profile.release]
 debug = 0
 incremental = true

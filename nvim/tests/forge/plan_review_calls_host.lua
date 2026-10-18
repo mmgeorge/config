@@ -61,7 +61,7 @@ assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local behavior_generator = (vim.g.forge_test_plan_behavior or vim.g.forge_test_plan_tests or vim.g.forge_test_plan_flows) and (vim.g.forge_test_fixture_generator
-  or require("forge.builder").artifact_root() .. "/build/release/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
+  or vim.fs.dirname(require("forge.builder").binary_path()) .. "/examples/plan_navigation_fixture" .. (vim.fn.has("win32") == 1 and ".exe" or ""))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
 local errors, warnings = {}, {}

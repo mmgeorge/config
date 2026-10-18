@@ -158,8 +158,8 @@ impl CheckRunner {
             .map(|(id, _)| id.clone()))
     }
 
-    /// Reads one owned run, optionally waiting up to thirty seconds for a state update.
-    pub async fn status(&self, id: &str, wait_ms: u64) -> Result<CheckRun> {
+    /// Reads one owned run, waiting for an update or completion within one fixed deadline.
+    pub async fn status(&self, id: &str, wait_ms: u64, wait_for_completion: bool) -> Result<CheckRun> {
         let read = || {
             self.records
                 .lock()
@@ -168,19 +168,21 @@ impl CheckRunner {
                 .cloned()
                 .context("unknown check run")
         };
-        let waiting = self.changed.notified();
-        tokio::pin!(waiting);
-        waiting.as_mut().enable();
-        let run = read()?;
-        if run.state == CheckState::Running && wait_ms > 0 {
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_millis(wait_ms.min(30000)),
-                waiting,
-            )
-            .await;
-            return read();
+        let maximum_wait = if wait_for_completion { 60000 } else { 30000 };
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_millis(wait_ms.min(maximum_wait));
+        loop {
+            let waiting = self.changed.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            let run = read()?;
+            if run.state != CheckState::Running || wait_ms == 0 {
+                return Ok(run);
+            }
+            if tokio::time::timeout_at(deadline, waiting).await.is_err() || !wait_for_completion {
+                return read();
+            }
         }
-        Ok(run)
     }
 
     /// Requests cancellation without releasing process ownership before collection finishes.
@@ -834,6 +836,7 @@ impl CheckRunner {
             .update_checks(run)?;
         if let Some(sink) = sink {
             if !patch.is_empty() {
+                let notification = patch.notification();
                 let _ = sink
                     .send_wait(BackendEvent {
                         received_at_ms: None,
@@ -841,7 +844,7 @@ impl CheckRunner {
                         turn_boundary: None,
                         kind: "document_changed".into(),
                         text: None,
-                        data: patch.notification(),
+                        data: notification,
                         activity: None,
                         summary: None,
                         task_update: None,
