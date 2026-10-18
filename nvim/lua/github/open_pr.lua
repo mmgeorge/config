@@ -515,23 +515,32 @@ local function choose_base_branch(cwd, current_branch, callback)
   end)
 end
 
-local function generate_description(context, callback)
-  local ok_adapters, adapters = pcall(require, "ai.adapters")
-  local selected = ok_adapters and adapters.get() or {}
-  local model = selected.pr_create or selected.commit or "copilot-cli,model=gpt-5.6-luna,thinking=low"
-
-  show_progress("Generating PR description with " .. model .. "...")
-  require("ai").generate({
-    model = model,
-    system = pr_system_prompt,
-    prompt = context,
-  }, function(result)
-    if not result.ok then
-      callback(nil, result.error or "Unable to generate PR description")
-      return
-    end
-    local description, err = decode_pr_description(result.content)
-    callback(description, err)
+local function generate_description(cwd, head_commit, context, callback)
+  show_progress("Resolving Harness model for PR description...")
+  local client = require("forge.client")
+  local settings = require("forge.integrations.background_settings")
+  local function resolved(snapshot, failure)
+    if not snapshot then callback(nil, failure or "Missing Background settings") return end
+    local generation, configuration_failure = client.generation_config()
+    if not generation then callback(nil, configuration_failure) return end
+    local choice = settings.model(snapshot, generation.backend.kind)
+    client.request_generation({
+      operation = "pull_request", workspace = cwd, comparison = "pull_request", head = head_commit,
+      input = pr_system_prompt .. "\n\n" .. context,
+    }, function(result, request_failure)
+      if request_failure then callback(nil, request_failure) return end
+      if type(result) ~= "table" or result.state ~= "ready" or type(result.message) ~= "string" then
+        callback(nil, "Invalid Harness PR description response") return
+      end
+      local description, decode_failure = decode_pr_description(result.message)
+      callback(description, decode_failure)
+    end, function(model)
+      show_progress("Generating PR description with " .. model .. "...")
+    end, { model = choice.model, reasoning_effort = choice.thinking, auto_compaction = snapshot.settings.auto_compaction })
+  end
+  settings.request(nil, nil, function(...)
+    local ok, failure = pcall(resolved, ...)
+    if not ok then callback(nil, tostring(failure)) end
   end)
 end
 
@@ -549,7 +558,7 @@ local function prepare_description(cwd, branch, base_ref, base_commit, head_comm
       if not title then callback(nil, "No commits found on " .. branch .. " compared with " .. base_ref) return end
       collect_diff_context(cwd, branch, base_ref, base_commit, head_commit, function(prompt, context_failure)
         if context_failure then callback(nil, context_failure) return end
-        generate_description(prompt, function(description, generation_failure)
+        generate_description(cwd, head_commit, prompt, function(description, generation_failure)
           if generation_failure then callback(nil, "Failed to generate PR description: " .. generation_failure) return end
           callback({ title = title, body = build_pr_body(description) })
         end)

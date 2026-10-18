@@ -17,6 +17,7 @@ fn manager() -> Arc<BackgroundManager> {
 async fn generate(manager: &Arc<BackgroundManager>, root: &Path, data: &Path) -> Result<BackgroundResult> {
     let context = BackgroundContext::read(&manager.repositories, root.to_str().unwrap()).await?;
     manager.generate(BackgroundRequest {
+        purpose: crate::backend::TextGeneration::CommitMessage,
         config: crate::service::TextGenerationConfig { backend: BackendLaunch {kind:"mock".into(),command:vec![]},
             model:"mock-model".into(),reasoning_effort:Some("low".into()),data_root:data.into(),auto_compaction:Default::default() },
         context, input:"Describe the current test change".into(), delivery:None,
@@ -76,6 +77,47 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
     let store = SqliteStore::open(&data)?;
     assert_eq!(store.list_exchange(&first.session_id)?.len(),6);
     assert!(store.load_session(&first.session_id)?.context("session missing")?.backend_session_id.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -> Result<()> {
+    let fixture = tempfile::tempdir()?;
+    let root = fixture.path().join("repository");
+    std::fs::create_dir(&root)?;
+    let data = fixture.path().join("state");
+    git(&root, &["init", "-q", "-b", "main"]);
+    git(&root, &["config", "user.name", "Fixture"]);
+    git(&root, &["config", "user.email", "fixture@example.test"]);
+    git(&root, &["commit", "-q", "--allow-empty", "-m", "feat: initial"]);
+    let mut identity = None;
+    let purposes = [crate::backend::TextGeneration::CommitMessage,
+        crate::backend::TextGeneration::PullRequestDescription,
+        crate::backend::TextGeneration::CommitMessage];
+    for purpose in purposes {
+        let owner = manager();
+        let context = BackgroundContext::read(&owner.repositories, root.to_str().unwrap()).await?;
+        let result = owner.generate(BackgroundRequest {
+            purpose, context, input: "Current fixture evidence".into(), delivery: None,
+            config: crate::service::TextGenerationConfig {
+                backend: BackendLaunch { kind: "mock".into(), command: vec![] },
+                model: "mock-model".into(), reasoning_effort: Some("low".into()),
+                data_root: data.clone(), auto_compaction: Default::default(),
+            },
+        }).await?;
+        owner.shutdown().await;
+        let store = SqliteStore::open(&data)?;
+        let session = store.load_session(&result.session_id)?.context("shared session missing")?;
+        let current = (result.session_id.clone(), session.backend_session_id);
+        if let Some(previous) = &identity { assert_eq!(&current, previous); }
+        identity = Some(current);
+        assert_eq!(store.list_session(None)?.len(), 1);
+        let exchanges = store.list_exchange(&result.session_id)?;
+        let prompt = &exchanges.last().context("task exchange missing")?.prompt;
+        assert_eq!(prompt, &purpose.background_input("Current fixture evidence"));
+    }
+    let session_id = identity.context("shared identity missing")?.0;
+    assert_eq!(SqliteStore::open(&data)?.list_exchange(&session_id)?.len(), 3);
     Ok(())
 }
 

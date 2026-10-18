@@ -3,7 +3,7 @@ use super::{BackendRequest, HARNESS_SYSTEM_MESSAGE, PromptMode};
 impl BackendRequest {
     /// Bind shared provider instructions to the permission and purpose of this turn.
     pub(crate) fn system_message(&self) -> String {
-        if self.mode == PromptMode::Background { return super::TextGeneration::CommitMessage.instructions().to_owned(); }
+        if self.mode == PromptMode::Background { return super::BACKGROUND_SYSTEM_MESSAGE.to_owned(); }
         format!(
             "{HARNESS_SYSTEM_MESSAGE}\n\n{}",
             self.interaction_contract()
@@ -13,7 +13,7 @@ impl BackendRequest {
     /// Supply current interaction context even when a provider reuses a live session.
     pub(crate) fn interaction_contract(&self) -> String {
         let purpose = match self.mode {
-            PromptMode::Background => return super::TextGeneration::CommitMessage.instructions().to_owned(),
+            PromptMode::Background => return super::BACKGROUND_SYSTEM_MESSAGE.to_owned(),
             PromptMode::Chat => {
                 "Answer the current user request. This interaction does not itself start, clear, or complete a Harness task."
             }
@@ -139,5 +139,9 @@ mod test {
             request.mode = mode;
             assert!(request.system_message().contains(expected));
         }
+        request.mode = PromptMode::Background;
+        assert_eq!(request.system_message(), super::super::BACKGROUND_SYSTEM_MESSAGE);
+        assert_eq!(request.interaction_contract(), super::super::BACKGROUND_SYSTEM_MESSAGE);
+        assert!(!request.system_message().contains("Conventional Commit"));
     }
 }

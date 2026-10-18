@@ -212,3 +212,10 @@ PR creation checks the selected base and head for merge conflicts before prepari
 the diff or requesting a description. Conflicts stop the workflow with "Merge
 conflicts. Resolve them before creating the PR." The check leaves your branch,
 index, and working files unchanged.
+
+PR descriptions use Harness with the same **Background model** and **Background thinking**
+settings in `/config` as commits. Codex and Copilot both default to `gpt-6-luna` with
+low thinking. PR descriptions and commits share one persistent, branch-aware Background
+session and its compaction policy. Each request supplies its own output instructions.
+Both appear in `:ForgeDebugBackgroundTimeline`. Provider failures stop PR creation and
+appear in a notification.

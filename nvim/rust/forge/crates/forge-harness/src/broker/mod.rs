@@ -961,7 +961,7 @@ impl HarnessBroker {
         let text = exchange.turn.iter().flat_map(|turn| turn.messages())
             .filter(|message| message.kind() == crate::turn::MessageKind::Assistant && message.delivery() == crate::turn::MessageDelivery::Final)
             .map(|message| message.text()).collect::<Vec<_>>().join("\n");
-        crate::backend::TextGeneration::CommitMessage.validate(&text)
+        Ok(text)
     }
 
     /// Retain a Background failure even when no assistant response can be published.

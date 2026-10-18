@@ -41,11 +41,40 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ "fn uncommitted_marker() {}" }, fixture .. "/uncommitted.rs")
   git({ "add", "uncommitted.rs" })
 
-  package.loaded["ai"] = { generate = function(options, callback)
-    generated = options
-    callback({ ok = true, content = "Introduces the feature." })
-  end }
-  package.loaded["ai.adapters"] = { get = function() return { pr_create = "fixture" } end }
+  package.loaded["ai"] = { generate = function() error("PR generation bypassed Harness") end }
+  local original_stdpath = vim.fn.stdpath
+  vim.fn.stdpath = function(kind)
+    return kind == "data" and fixture .. "/data" or original_stdpath(kind)
+  end
+  require("forge").setup({ harness = { backend = "mock", model = "mock-model" },
+    background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
+  local request_generation = client.request_generation
+  local function generate_commit()
+    local result, failure, done
+    request_generation({ operation = "generate", workspace = fixture, comparison = "latest_commit" },
+      function(value, error) result, failure, done = value, error, true end)
+    assert(vim.wait(15000, function() return done end, 10), "shared commit generation timed out")
+    assert(not failure, failure)
+    return result
+  end
+  local first_commit = generate_commit()
+  local stale_failure, stale_done
+  request_generation({ operation = "pull_request", comparison = "pull_request", workspace = fixture,
+    head = string.rep("0", 40), input = "Stale PR evidence" }, function(_, failure)
+      stale_failure, stale_done = failure, true
+    end)
+  assert(vim.wait(10000, function() return stale_done end, 10), "stale PR check timed out")
+  assert(stale_failure and stale_failure:find("HEAD changed", 1, true), "stale PR HEAD was accepted")
+  notices = {}
+  local pr_session
+  client.request_generation = function(params, callback, on_model, selection)
+    generated = params
+    assert(selection.model == "mock-model" and selection.reasoning_effort == "low")
+    return request_generation(params, function(result, failure)
+      pr_session = result and result.session_id
+      callback(result, failure)
+    end, on_model, selection)
+  end
   local creation = require("github.pr_creation")
   creation.context = function(_, callback) callback({ branch = "feature", head_commit = head }) end
   creation.create = function(_, context, base, metadata, callback)
@@ -72,14 +101,19 @@ local success, failure = xpcall(function()
   assert(#notices == 0, table.concat(notices, "\n"))
   assert(created and created.base == "release" and created.metadata.title == "feat: introduce feature")
   assert(published.head == head and created.context.head_commit == head)
-  assert(generated.prompt:find("Base branch: release", 1, true))
-  assert(generated.prompt:find("+ fn feature_marker() {", 1, true), generated.prompt)
-  assert(generated.prompt:find("renamed.rs (Renamed from original.rs)", 1, true), generated.prompt)
+  assert(generated.input:find("Base branch: release", 1, true))
+  assert(generated.input:find("+ fn feature_marker() {", 1, true), generated.input)
+  assert(generated.input:find("renamed.rs (Renamed from original.rs)", 1, true), generated.input)
   for _, excluded in ipairs({ "main_only", "release_only", "uncommitted", "hidden_body", "conventional commit" }) do
-    assert(not generated.prompt:find(excluded, 1, true), "unexpected context: " .. excluded)
+    assert(not generated.input:find(excluded, 1, true), "unexpected context: " .. excluded)
   end
-  assert(#generated.system + #generated.prompt <= 500000)
-  assert(not client._client.harness_ready, "PR context opened a Harness conversation")
+  assert(#generated.input <= 500000)
+  assert(not client._client.harness_ready, "PR generation initialized interactive Harness")
+  assert(created.metadata.body:find("Current Background task: pull_request_description", 1, true), "PR did not use its current task contract")
+  assert(pr_session == first_commit.session_id, "PR created a different Background session")
+  local following_commit = generate_commit()
+  assert(following_commit.session_id == pr_session, "commit after PR created a different session")
+  assert(following_commit.message:find("Current Background task: commit_message", 1, true), "commit retained the PR task contract")
 
   git({ "checkout", "--quiet", "release" })
   vim.fn.writefile({ "base change" }, fixture .. "/shared.txt")
@@ -124,4 +158,4 @@ assert(vim.wait(10000, function() return client._client.process == nil end, 20))
 vim.notify = original_notify
 vim.fn.delete(fixture, "rf")
 assert(success, failure)
-print("PR creation: selected base, compact context, and conflict rejection before generation/publication passed")
+print("PR creation: shared commit session, current task contracts, selected base, and conflict rejection passed")

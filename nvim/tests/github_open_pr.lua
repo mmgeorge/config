@@ -15,11 +15,11 @@ local original_notify = vim.notify
 local original_snacks = _G.Snacks
 local original_picker_pick = original_snacks and original_snacks.picker and original_snacks.picker.pick
 local original_ai = package.loaded["ai"]
-local original_ai_adapters = package.loaded["ai.adapters"]
+local original_background = package.loaded["forge.integrations.background_settings"]
 local created_pr_url = "https://github.example.test/org/repo/pull/42"
 local generated_model = nil
 local generated_prompt = nil
-local generated_system = nil
+local generation_failure = nil
 local captured_head = string.rep("1", 40)
 local base_commit = string.rep("2", 40)
 local compact_context = "Changed files:\n  moved.rs (Renamed from original.rs)\n  source.rs (+1 -1)\n\nsource.rs (+1 -1)\n\n- old();\n+ new();\n"
@@ -62,7 +62,7 @@ local function reset()
   system_calls = {}
   generated_model = nil
   generated_prompt = nil
-  generated_system = nil
+  generation_failure = nil
   creation_draft, creation_capture = nil, nil
   context_failure, context_calls = nil, 0
   context_conflicts = false
@@ -128,24 +128,10 @@ gh.set_backend({
     cb({ code = 1, stdout = "", stderr = "unexpected gh command: " .. key, output = "unexpected gh command: " .. key })
   end,
 })
-package.loaded["ai.adapters"] = {
-  get = function()
-    return {
-      commit = "test-commit-model",
-      pr_create = "test-pr-create-model",
-    }
-  end,
-}
-package.loaded["ai"] = {
-  generate = function(opts, cb)
-    generated_model = opts.model
-    generated_prompt = opts.prompt
-    generated_system = opts.system
-    cb({
-      ok = true,
-      content = "Created by ForgeGithubPRCreate.",
-    })
-  end,
+package.loaded["ai"] = { generate = function() error("PR generation bypassed Harness") end }
+package.loaded["forge.integrations.background_settings"] = {
+  request = function(_, _, callback) callback({ settings = {} }) end,
+  model = function() return { model = "test-background-model", thinking = "low" } end,
 }
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 require("forge.git.write").execute = function(directory, action, callback)
@@ -155,6 +141,16 @@ require("forge.git.write").execute = function(directory, action, callback)
 end
 local function native_request(method, params, callback)
   if method == "repository.generate" then
+    if params.operation == "pull_request" then
+      assert_true(params.workspace == root and params.comparison == "pull_request", "PR generation lost workspace")
+      assert_true(params.head == captured_head, "PR generation lost its captured HEAD")
+      assert_true(params.generation ~= nil and params.generation.reasoning_effort == "low", "PR generation lost Harness configuration")
+      generated_model = params.generation.model
+      generated_prompt = params.input
+      if generation_failure then callback(nil, generation_failure) return end
+      callback({ state = "ready", message = "Created by ForgeGithubPRCreate." })
+      return
+    end
     context_calls = context_calls + 1
     assert_true(params.operation == "context" and params.comparison == "pull_request", "PR did not request native range context")
     assert_true(params.workspace == root and params.base == base_commit and params.head == captured_head,
@@ -247,7 +243,7 @@ local function cleanup()
   gh.reset_backend()
   forge.reset_git_backend()
   package.loaded["ai"] = original_ai
-  package.loaded["ai.adapters"] = original_ai_adapters
+  package.loaded["forge.integrations.background_settings"] = original_background
   pcall(vim.fn.delete, state_path)
   if original_snacks then
     _G.Snacks = original_snacks
@@ -354,8 +350,8 @@ local function run_tests()
     return vim.tbl_contains(vim.api.nvim_buf_get_lines(vim.api.nvim_get_current_buf(), 0, -1, false), "Base: main")
   end, "create flow base confirmation did not render")
   press("y")
-  wait_for(function() return generated_model == "test-pr-create-model" end, "PR create did not use pr_create adapter")
-  assert_true(generated_system == open_pr._pr_system_prompt_for_test, "PR generation replaced its own instructions")
+  wait_for(function() return generated_model == "test-background-model" end, "PR create did not use saved Background model")
+  assert_true(generated_prompt:find(open_pr._pr_system_prompt_for_test, 1, true), "PR generation lost its response instructions")
   assert_true(
     generated_prompt:find("Compact diff context:", 1, true) ~= nil,
     "PR prompt should include compact diff context"
@@ -397,6 +393,16 @@ local function run_tests()
   press("y")
   wait_for(function() return context_calls == 1 end, "failure fixture did not request native context")
   assert_true(generated_prompt == nil and creation_capture == nil, "failed context reached generation or PR creation")
+
+  reset()
+  generation_failure = "Harness provider unavailable"
+  open_pr.open()
+  wait_for(function() return vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Base: develop") end,
+    "generation failure confirmation missing")
+  press("y")
+  wait_for(function() return vim.tbl_contains(notices, "Failed to generate PR description: Harness provider unavailable") end,
+    "Harness failure was not surfaced")
+  assert_true(creation_capture == nil, "failed Harness generation reached PR creation")
 
   reset()
   fetch_failure = "origin unavailable"

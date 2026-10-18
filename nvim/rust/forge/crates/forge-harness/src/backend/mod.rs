@@ -14,7 +14,7 @@ mod steering;
 mod service_tier;
 pub use service_tier::ServiceTier;
 pub(crate) mod text_generation;
-pub use text_generation::TextGeneration;
+pub use text_generation::{BACKGROUND_SYSTEM_MESSAGE, TextGeneration};
 pub mod terminal;
 pub mod usage;
 pub use catalog::{

@@ -136,12 +136,13 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
 
     #[tokio::test]
-    async fn session_name_and_commit_use_selected_model_in_an_isolated_thread()
+    async fn text_generation_uses_selected_model_in_an_isolated_thread()
     -> Result<()> {
-        for purpose in [TextGeneration::SessionName, TextGeneration::CommitMessage] {
+        for purpose in [TextGeneration::SessionName, TextGeneration::CommitMessage, TextGeneration::PullRequestDescription] {
         let (input, expected) = match purpose {
             TextGeneration::SessionName => ("User: Fix terminal status", "Terminal status fixes"),
             TextGeneration::CommitMessage => ("Staged diff:\n+change", "fix: preserve commit drafts\n\nKeep existing text."),
+            TextGeneration::PullRequestDescription => ("PR evidence: +change", "Preserves the requested change.\n\nKeeps the supplied failure boundary."),
             _ => unreachable!(),
         };
         let fixture = tempfile::tempdir()?;
@@ -236,7 +237,7 @@ mod tests {
             &workspace,
             purpose,
             "selected-model",
-            (purpose == TextGeneration::CommitMessage).then_some("low"),
+            matches!(purpose, TextGeneration::CommitMessage | TextGeneration::PullRequestDescription).then_some("low"),
             input,
         )
         .await?;

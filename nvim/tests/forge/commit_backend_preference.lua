@@ -85,7 +85,7 @@ local succeeded, failure = xpcall(function()
       "commit generation inherited the active conversation model")
     assert(preference_reads == 1, "ready Harness reloaded the provider preference")
 
-    config.options.commit_generation[generation.backend.kind] = { model = "custom-commit-model", reasoning_effort = "medium" }
+    config.options.background_generation[generation.backend.kind] = { model = "custom-commit-model", reasoning_effort = "medium" }
     local label
     completed = false
     client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
@@ -114,11 +114,11 @@ local succeeded, failure = xpcall(function()
       "host restart replaced the selected backend with its older saved preference")
   end
   session.harness.session = { id = "selected-session", backend = "codex", model = "selected-model" }
-  config.options.commit_generation.codex = { model = "" }
+  config.options.background_generation.codex = { model = "" }
   local invalid_model
   client.request_generation({ operation = "generate", workspace = "fixture", comparison = "staged" },
     function(_, failure) invalid_model = failure end)
-  assert(invalid_model == "Invalid commit-generation model for backend: codex",
+  assert(invalid_model == "Invalid Background-generation model for backend: codex",
     "invalid model silently inherited the active conversation model")
   session.harness.session = { id = "foreign-session", backend = "missing-provider" }
   local request_error

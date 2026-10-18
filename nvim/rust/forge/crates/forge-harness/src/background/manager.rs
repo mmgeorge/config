@@ -14,6 +14,8 @@ use super::{BackgroundContext, BackgroundIdentity};
 
 /// Captures all immutable inputs for a single Background exchange.
 pub struct BackgroundRequest {
+    /// Current response contract, independent of the conversation's preceding task.
+    pub purpose: crate::backend::TextGeneration,
     /// Explicit provider settings, independent of the selected chat.
     pub config: TextGenerationConfig,
     /// Repository and history captured with the current diff.
@@ -100,8 +102,10 @@ impl BackgroundManager {
             reason: broker.snapshot().expect("prepared Background snapshot").session.background.expect("Background identity").reason };
         let cancellation = broker.turn_cancellation();
         let timeout = tokio::spawn(async move { tokio::time::sleep(Duration::from_secs(120)).await; cancellation.request(false); });
-        let result = broker.generate_background(request.input, identity, request.config.model,
-            request.config.reasoning_effort.unwrap_or_else(|| "low".into()), policy, sink).await;
+        let input = request.purpose.background_input(&request.input);
+        let result = broker.generate_background(input, identity, request.config.model,
+            request.config.reasoning_effort.unwrap_or_else(|| "low".into()), policy, sink).await
+            .and_then(|text| request.purpose.validate(&text));
         timeout.abort();
         let _ = forward.await;
         if let Err(error) = &result {

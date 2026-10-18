@@ -33,6 +33,11 @@ local function call(method, params)
   return result
 end
 local generation = assert(client.generation_config())
+local preview = call("repository.generate", { operation = "preview", workspace = workspace, comparison = "head" })
+assert(preview.prompt.user:find("Current Background task: commit_message", 1, true))
+assert(preview.prompt.user:find("Conventional Commit", 1, true))
+assert(not preview.prompt.system:find("Conventional Commit", 1, true))
+assert(preview.prompt.input_bytes == #preview.prompt.user + #preview.prompt.system)
 local params = { operation = "generate", workspace = workspace, comparison = "head", generation = generation }
 local first = call("repository.generate", params)
 assert(first.session_id and first.message and first.message ~= "")

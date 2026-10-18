@@ -801,6 +801,7 @@ impl Backend for MockBackend {
             TextGeneration::Recap => "The current request is recorded. Review the next proposed change.",
             TextGeneration::SessionName => "Review proposed changes",
             TextGeneration::CommitMessage => "feat: describe repository changes",
+            TextGeneration::PullRequestDescription => "Describes the repository changes for reviewers.",
         })
     }
     fn descriptor(&self) -> BackendDescriptor {

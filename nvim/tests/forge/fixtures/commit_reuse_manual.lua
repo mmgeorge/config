@@ -27,8 +27,6 @@ vim.fn.writefile({ "new content" }, fixture .. "/untracked.txt")
 vim.fn.writefile({ "ignored content" }, fixture .. "/ignored.txt")
 vim.fn.chdir(fixture)
 _G.forge_reuse = { fixture = fixture, model_calls = 0, message = "refactor: rename source and update fixtures" }
-package.loaded.ai = { resolve = function() return { provider = { name = "fixture" }, model = "fixture-model" } end }
-package.loaded["ai.adapters"] = { get = function() return { commit = "fixture-model" } end }
 local client = require("forge.client")
 local ai_commit = require("forge.integrations.ai_commit")
 ai_commit.set_backend({ request_async = function(params, callback)

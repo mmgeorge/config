@@ -1,8 +1,6 @@
 vim.loader.enable(false)
 
 local ai_commit = require("forge.integrations.ai_commit")
-local original_ai = package.loaded.ai
-local original_adapters = package.loaded["ai.adapters"]
 local original_backend = ai_commit._backend
 local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
@@ -25,8 +23,6 @@ end
 
 local function run()
   local requests, generated = {}, 0
-  package.loaded.ai = { resolve = function() return { provider = { name = "fixture" }, model = "fixture-model" } end }
-  package.loaded["ai.adapters"] = { get = function() return { commit = "fixture-model" } end }
   ai_commit.reset_backend()
   ai_commit.set_backend({ request_async = function(params, callback)
     if params.operation == "generate" then generated = generated + 1 end
@@ -158,8 +154,6 @@ local function run()
   assert_equal(notices[#notices].level, vim.log.levels.ERROR)
 
   ai_commit.reset_backend()
-  package.loaded["ai.adapters"] = { get = function() return { commit = "harness" } end }
-  package.loaded.ai = { resolve = function() error("Harness fallback resolved an API model") end }
   package.loaded["forge.client"] = {
     request = function() error("Commit generation initialized a conversation") end,
     generation_config = generation_config,
@@ -182,8 +176,6 @@ end
 local ok, failure = xpcall(run, debug.traceback)
 ai_commit.reset_backend()
 ai_commit.set_backend(original_backend)
-package.loaded.ai = original_ai
-package.loaded["ai.adapters"] = original_adapters
 package.loaded["forge.client"] = original_client
 package.loaded["forge.integrations.background_settings"] = original_settings
 vim.notify = original_notify

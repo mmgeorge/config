@@ -19,7 +19,7 @@ local original_request = client.request_for
 local commit_settings = require("forge.integrations.background_settings")
 local original_commit_request = commit_settings.request
 commit_settings.request = function(_, _, callback)
-  callback({ revision = 0, gemini_available = false, effective_source = "harness",
+  callback({ revision = 0,
     settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { codex = { model = "mock-model", thinking = "low" },
       copilot = { model = "mock-model", thinking = "low" } } } })
 end

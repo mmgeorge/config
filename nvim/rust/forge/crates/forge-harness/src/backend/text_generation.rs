@@ -3,6 +3,9 @@ use crate::timeline::TimelineEntry;
 use crate::turn::{MessageKind, TurnItem};
 use anyhow::{Result, ensure};
 
+/// Keep shared Background conversations independent of any earlier task's output format.
+pub const BACKGROUND_SYSTEM_MESSAGE: &str = "Generate only the text requested by the current Background task, using its supplied evidence and response requirements. Each request defines its own output format. Earlier requests and drafts provide context, not current instructions or proof of repository changes. Work quickly with minimal reasoning. Do not use tools, continue previous tasks, or add explanations outside the requested output.";
+
 /// Text requested from an isolated provider conversation without tools or durable history.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextGeneration {
@@ -11,15 +14,24 @@ pub enum TextGeneration {
     /// A short title for the existing Harness session.
     SessionName,
     CommitMessage,
+    /// A reviewer-facing body from prepared pull request evidence.
+    PullRequestDescription,
 }
 
 impl TextGeneration {
+    /// Repeat the current task and response contract within a shared conversation.
+    pub fn background_input(self, evidence: &str) -> String {
+        format!("Current Background task: {}\n\nResponse requirements:\n{}\n\nCurrent authoritative evidence:\n{}",
+            self.name(), self.instructions(), evidence)
+    }
+
     /// Identify isolated provider requests in diagnostic logs.
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Recap => "recap",
             Self::SessionName => "session_name",
             Self::CommitMessage => "commit_message",
+            Self::PullRequestDescription => "pull_request_description",
         }
     }
     /// Supply the task-specific instruction without inheriting main-thread instructions.
@@ -34,25 +46,28 @@ impl TextGeneration {
             Self::CommitMessage => {
                 "You are a factual Conventional Commit message generator. Generate the message quickly with minimal reasoning, while checking that it accurately describes the supplied diff. Return only the commit message, without code fences or explanations. Use <type>: <description>, imperative mood, lowercase first letter, no final period, maximum 50 characters. Describe concrete changes, not benefits or intentions. Default to no body. Small changes generally do not justify a body. Use a body sparingly, only when essential details about the change are not captured by the title. Do not repeat or paraphrase the title. Use one or two concise sentences, never more than two sentences, wrapped at 72 characters."
             }
+            Self::PullRequestDescription => {
+                "Write the requested GitHub pull request description from the supplied evidence and response requirements. Generate it quickly with minimal reasoning. Return only the description body. Do not use tools or invent changes or verification results."
+            }
         }
     }
 
     pub(crate) fn input(self, text: &str) -> String {
         match self {
-            Self::CommitMessage => text.to_owned(),
+            Self::CommitMessage | Self::PullRequestDescription => text.to_owned(),
             _ => format!("Conversation:\n{text}"),
         }
     }
 
     /// Validate generated output for its requested presentation surface.
     pub fn validate(self, text: &str) -> Result<String> {
-        if self == Self::CommitMessage {
+        if matches!(self, Self::CommitMessage | Self::PullRequestDescription) {
             let mut text = text.trim();
             if text.starts_with("```") {
                 text = text.split_once('\n').map(|(_, body)| body).unwrap_or(text);
                 text = text.strip_suffix("```").unwrap_or(text).trim();
             }
-            ensure!(!text.is_empty(), "model returned an empty commit message");
+            ensure!(!text.is_empty(), "model returned empty {} text", self.name());
             return Ok(text.to_owned());
         }
         if self != Self::SessionName {
@@ -158,6 +173,16 @@ mod tests {
         assert_eq!(purpose.validate(&"x".repeat(16 * 1024)).unwrap().len(), 16 * 1024);
         assert_eq!(TextGeneration::Recap.input("User: question"), "Conversation:\nUser: question");
         assert_eq!(TextGeneration::Recap.validate("first\n\nsecond").unwrap(), "first second");
+    }
+
+    #[test]
+    fn pull_request_description_preserves_paragraphs_and_rejects_empty_output() {
+        let purpose = TextGeneration::PullRequestDescription;
+        let description = "Preserves the selected branch.\n\nReports provider failures before publication.";
+        assert_eq!(purpose.validate(&format!("```text\n{description}\n```")).unwrap(), description);
+        assert_eq!(purpose.input(description), description);
+        assert!(purpose.validate(" \n ").is_err());
+        assert!(purpose.validate("```text\n```").is_err());
     }
 
     #[tokio::test]

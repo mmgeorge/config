@@ -15,8 +15,14 @@ assert(vim.fn.mkdir(repository, "p") == 1)
 
 local original_execute = git_write.execute
 local original_backend = ai_commit._backend
-local original_ai = package.loaded.ai
-local original_adapters = package.loaded["ai.adapters"]
+local background_settings = require("forge.integrations.background_settings")
+local original_settings_request = background_settings.request
+background_settings.request = function(_, _, callback)
+  callback({ settings = { models = {
+    codex = { model = "fixture-model", thinking = "low" },
+    copilot = { model = "fixture-model", thinking = "low" },
+  }, auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
+end
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -30,8 +36,6 @@ end
 
 local function run()
   local request_list, receipt_list = {}, {}
-  package.loaded.ai = { resolve = function() return { provider = { name = "fixture" }, model = "fixture-model" } end }
-  package.loaded["ai.adapters"] = { get = function() return { commit = "fixture-model" } end }
   ai_commit.reset_backend()
   ai_commit.set_backend({ request_async = function(params, callback)
     request_list[#request_list + 1] = { params = params, callback = callback }
@@ -156,8 +160,7 @@ perf.event = original_event
 git_write.execute = original_execute
 ai_commit.reset_backend()
 ai_commit.set_backend(original_backend)
-package.loaded.ai = original_ai
-package.loaded["ai.adapters"] = original_adapters
+background_settings.request = original_settings_request
 if commit._active then commit._active.aborted = true end
 vim.fn.delete(repository, "rf")
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end

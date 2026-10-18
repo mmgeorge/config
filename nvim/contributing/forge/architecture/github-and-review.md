@@ -31,6 +31,16 @@ retain the shared context and omission rules. The formatter receives the remaind
 of the 500,000-byte allowance after the PR instructions and comparison metadata.
 The PR prompt uses its own description instructions without the commit-message header.
 
+The `pull_request` operation on `repository.generate` sends the prepared evidence to
+`HarnessService.background`. Lua reads the same saved Background model and thinking
+settings used by commit generation. Both Codex and Copilot default to `gpt-6-luna`
+with `low` thinking. PR descriptions and commits reuse the same persistent provider
+conversation and compaction policy. Every exchange carries its own output requirements,
+and generation rejects a HEAD that differs from the captured PR revision. The shared
+Background owner serializes requests and retains provider cleanup independently of chat.
+The request returns provider failures to the creation workflow before publication.
+Lua never launches Copilot CLI or calls a model HTTP API for PR generation.
+
 Descriptions lead with the concrete problem and resulting behavior, or the new
 capability when the evidence establishes no prior failure. One paragraph is the
 default. A second requires a separate compatibility impact, failure boundary, or

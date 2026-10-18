@@ -253,7 +253,8 @@ pub async fn collect(
             "Generate a conventional commit message for these changes.\n\n"
         };
         let limit = request.max_bytes.unwrap_or_else(|| excerpt::MAX_INPUT_BYTES
-            .saturating_sub(TextGeneration::CommitMessage.instructions().len() + header.len()));
+            .saturating_sub(forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE.len()
+                + TextGeneration::CommitMessage.background_input("").len() + header.len()));
         Some(format!("{header}{}", excerpt::prompt(&mut files, syntax, limit).await))
     };
     let prompt = if let Some(background) = &background {
@@ -363,7 +364,7 @@ mod tests {
         let mut request = GenerationRequest {
             operation: "context".into(), workspace: root.to_string_lossy().into_owned(),
             comparison: Comparison::PullRequest, base: Some("main".into()), head: Some(head),
-            max_bytes: Some(4000), ignored_paths: vec![], generation: None,
+            max_bytes: Some(4000), ignored_paths: vec![], generation: None, input: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
@@ -433,7 +434,7 @@ mod tests {
                 head: None,
                 max_bytes: None,
                 ignored_paths: vec![],
-                                generation: None,
+                                generation: None, input: None,
             };
             for (label, comparison) in [
                 ("head", Comparison::Head),
@@ -487,7 +488,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-                        generation: None,
+                        generation: None, input: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
@@ -541,7 +542,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-                        generation: None,
+                        generation: None, input: None,
         };
         let mut pending = Box::pin(collect(&store, &diff, &syntax, &request));
         let before_release =
@@ -593,7 +594,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec!["excluded.txt".into()],
-                        generation: None,
+                        generation: None, input: None,
         };
         let prompt = collect(&store, &diff, &syntax, &request)
             .await

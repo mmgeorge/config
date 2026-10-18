@@ -4,6 +4,12 @@ Provider adapters normalize transport-specific identities, capabilities, activit
 
 Harness lifecycle and permission ownership remain in [Harness](harness.md). Transport admission and framing are described in [Host and protocol](host-and-protocol.md).
 
+Model requests run through Harness provider adapters. Commit messages and PR descriptions
+share the same persistent, branch-aware Background session, provider thread, and
+Background model and thinking settings. Each exchange repeats its own task and output
+requirements under a shared system message. Neovim owns request presentation and generated
+text application, without a separate model HTTP client or CLI generation adapter.
+
 ## Backend contracts and ACP runtime
 
 The feature-first Rust crate lives at `nvim/rust/forge/crates/forge-harness`. Its directories
