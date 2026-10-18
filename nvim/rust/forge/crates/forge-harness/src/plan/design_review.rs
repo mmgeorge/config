@@ -1842,7 +1842,7 @@ mod tests {
             "title":"Cancel pending work", "description":"Retain the published value.",
             "trigger":"cancellation requested", "steps":[
                 {"action":"cancel_request"},
-                {"action":"PendingWork::stop", "reads":["active handle"],
+                {"action":"PendingWork::stop",
                  "effects":[{"target":"*literal* published_value", "change":"preserve"}]}
             ]
         }])).unwrap();

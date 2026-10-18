@@ -126,10 +126,22 @@ function M.resize_composer(composer_buf, composer_win)
   local options = config.options.harness
   local count = vim.api.nvim_buf_line_count(composer_buf)
   local queue_rows = vim.b[composer_buf].forge_queue_rows or 0
-  vim.api.nvim_win_set_height(
-    composer_win,
-    math.max(options.composer_min_height, math.min(options.composer_max_height, count + queue_rows + 1))
-  )
+  local height = math.max(options.composer_min_height, math.min(options.composer_max_height, count + queue_rows + 1))
+  local view = vim.api.nvim_win_call(composer_win, vim.fn.winsaveview)
+  local restore = vim.api.nvim_win_get_height(composer_win) ~= height
+  if restore then vim.api.nvim_win_set_height(composer_win, height) end
+  local text_rows = vim.api.nvim_win_get_height(composer_win) - (vim.wo[composer_win].winbar ~= "" and 1 or 0)
+  if count + queue_rows <= text_rows then
+    local measured = vim.api.nvim_win_text_height(composer_win, { start_row = 0, max_height = text_rows + 1 })
+    -- Insert-mode scrolling can precede window growth and leave the first row hidden.
+    if measured.all <= text_rows and (view.topline > 1 or view.skipcol > 0 or view.topfill > 0) then
+      view.topline, view.skipcol, view.topfill = 1, 0, 0
+      restore = true
+    end
+  end
+  if restore then
+    vim.api.nvim_win_call(composer_win, function() vim.fn.winrestview(view) end)
+  end
 end
 
 ---@param transcript_buf integer

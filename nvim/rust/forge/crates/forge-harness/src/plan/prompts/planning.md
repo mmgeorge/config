@@ -106,6 +106,22 @@ Identify the 2–4 key requirements: requested outcomes and essential acceptance
 Write them as a JSON array of nonempty strings. For bug fixes, this section can be omitted by
 leaving `requirements` empty when the objective and design already capture the acceptance criteria.
 
+Start each entry with a short, bold sentence stating an observable guarantee. Add one plain-text
+sentence only when it supplies necessary conditions or scope. Store the Markdown bold markers
+inside the requirement string. The bold sentence must communicate the guarantee on its own.
+Use direct behavior statements rather than repeating a feature name with "Provide", "Support",
+or "Implement". Do not repeat the objective or explain why a design choice was selected.
+
+These examples show the format. Derive each guarantee from the current task rather than copying
+an unrelated example:
+
+- **Cancellation preserves saved data.** Cancelling before publication leaves previously saved
+  records unchanged.
+- **Failed imports leave stored records unchanged.** Report invalid rows without committing
+  any part of the import.
+- **Existing callers remain compatible.** Preserve public signatures and documented error
+  behavior.
+
 Keep entries at a consistent level of abstraction. Group closely related behaviors without
 combining unrelated requirements merely to reduce the count. Put ownership and lifecycle mechanisms
 in Design, exact defaults and local behavioral contracts in declarations, consequential choices in
@@ -318,7 +334,7 @@ Do not connect these actions into one execution merely because one uses the othe
 
 - `trigger` names the event that starts this execution.
 - `steps` is an ordered array. Each step has a required `action` naming a function or concrete
-  operation, optional `reads` naming its inputs, optional `effects`, and optional `branches`.
+  operation, optional `effects`, and optional `branches`.
 - Each effect has exactly `target` and `change`. It is terminal data describing an observable
   change, such as create, update, remove, or preserve. Effects cannot have steps, actions,
   children, branches, or triggers. Put subsequent execution in the enclosing `steps` array.
@@ -327,8 +343,9 @@ Do not connect these actions into one execution merely because one uses the othe
   Each applicable branch runs its steps before the next enclosing step. When alternatives are
   exclusive, write mutually exclusive conditions explicitly. Branches do not mean parallel work.
 
-Use plain, single-line labels and the exact declaration names where available. Keep input state
-in `reads` and resulting state in `effects`, rather than treating data as executable steps.
+Use plain, single-line labels and the exact declaration names where available. Keep resulting
+state in `effects`, rather than treating data as executable steps. Express conditions that govern
+execution in branch conditions or action labels instead of adding separate input inventories.
 Flow titles must be unique. There are no total flow, step-count, or nesting-depth limits.
 Keep diagrams focused for readability without omitting meaningful execution or effects.
 
@@ -342,7 +359,6 @@ For example, collection and contact are independent triggers:
     "trigger": "player overlaps a shield pickup",
     "steps": [{
       "action": "collect_shield_pickups",
-      "reads": ["ShieldPickup", "PlayerAbilities"],
       "effects": [{"target": "PlayerAbilities", "change": "grant shield charges to"}]
     }]
   },
@@ -352,7 +368,6 @@ For example, collection and contact are independent triggers:
     "trigger": "accepted enemy contact",
     "steps": [{
       "action": "PlayerAbilities.take_hit",
-      "reads": ["shield charges"],
       "branches": [{
         "condition": "shield charges remain",
         "steps": [{"action": "absorb hit", "effects": [
@@ -365,8 +380,8 @@ For example, collection and contact are independent triggers:
 ]
 ```
 
-The renderer uses `→` for the first action, `↓` for subsequent execution, `←` for inputs, and
-`┄▶` for effects. Conditions introduce branch steps. Effects never acquire execution arrows.
+The renderer uses `→` for the first action, `↓` for subsequent execution, and `┄▶` for effects.
+Conditions introduce branch steps. Effects never acquire execution arrows.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings.
@@ -389,8 +404,8 @@ A plan's metadata can use this shape:
   "objective": "Support observable, cancellable texture replacement.",
   "usage": "Start a replacement, cancel it before publication, and confirm the existing texture remains visible.",
   "requirements": [
-    "Cancelling before publication preserves the current texture.",
-    "Submitted frames retain valid texture allocations until completion."
+    "**Cancellation preserves the current texture.** Cancelling before publication leaves the visible texture unchanged.",
+    "**Submitted frames retain valid textures.** Allocations remain valid until every submitted frame using them completes."
   ],
   "background": "The existing renderer obtains published handles from `TextureRegistry`. Submitted frames can outlive the frame in which a replacement is requested.",
   "decisions": [
@@ -408,9 +423,6 @@ A plan's metadata can use this shape:
       "steps": [
         {
           "action": "TextureRegistry.publish",
-          "reads": [
-            "PreparedTexture"
-          ],
           "effects": [
             {
               "target": "published handle",
@@ -419,10 +431,7 @@ A plan's metadata can use this shape:
           ]
         },
         {
-          "action": "Renderer",
-          "reads": [
-            "published handle"
-          ]
+          "action": "Renderer"
         }
       ]
     },

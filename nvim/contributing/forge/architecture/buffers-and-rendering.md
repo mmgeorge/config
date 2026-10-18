@@ -41,6 +41,13 @@ composer buffer. Shared document commands resolve configured bindings,
 help, selections, and gutters from native metadata. Physical source rows contain source
 text, while decorations provide gutters and selection presentation without changing text.
 
+Composer resizing captures the current cursor and viewport immediately before changing
+window height. If the complete draft fits after accounting for wrapping, queued rows,
+and the winbar, the viewport starts at the first line. Otherwise it retains the current
+scroll position. The height query stops after the visible-row budget, without limiting
+draft content. This prevents Insert-mode scrolling before window growth from hiding
+the first line of a short draft.
+
 `forge.window_presentation` retains the ordinary source-window options before a native
 view applies document settings. Native documents use a fixed one-cell margin, while
 Status and Harness request zero cells. Width capture stays exact before Neovim refreshes its

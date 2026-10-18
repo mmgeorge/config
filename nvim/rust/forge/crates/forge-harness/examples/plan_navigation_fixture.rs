@@ -134,7 +134,7 @@ fn main() -> Result<()> {
             {"title":"Restart input","description":"Restore the base and combat state.",
              "trigger":"Fresh R input","steps":[
                  {"action":"restart_round","effects":[{"target":"base state","change":"restore"}]},
-                 {"action":"reset_combat","reads":["WaveDirector"],
+                 {"action":"reset_combat",
                   "effects":[{"target":"WaveDirector and Weapon state","change":"reset"},{"target":"starting enemy","change":"create"}],
                   "branches":[{"condition":"old combat entities exist","steps":[{"action":"remove old entities","effects":[{"target":"*literal* cleanup","change":"perform"}]}]}]}
              ]}

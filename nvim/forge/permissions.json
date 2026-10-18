@@ -266,6 +266,7 @@
       "networksetup": "allow",
       "networksetup *": "allow",
       "node --version": "allow",
+      "npm --version": "allow",
       "npm audit": "allow",
       "npm audit *": "allow",
       "npm config get": "allow",

@@ -18,21 +18,41 @@ pub struct DesignFlow {
     pub steps: Vec<DesignFlowStep>,
 }
 
-#[derive(Debug, Deserialize, JsonSchema, Serialize)]
+#[derive(Debug, JsonSchema, Serialize)]
 #[serde(deny_unknown_fields)]
 /// Executes an action, records its effects, and conditionally executes branch steps.
 pub struct DesignFlowStep {
     /// Names a function or an explicit operation.
     pub action: String,
-    /// Identifies state or values read by the action without implying execution.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reads: Vec<String>,
     /// Records terminal changes to data or state.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effects: Vec<DesignFlowEffect>,
     /// Executes each applicable conditional path before the next enclosing step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub branches: Vec<DesignFlowBranch>,
+}
+
+impl<'de> Deserialize<'de> for DesignFlowStep {
+    /// Loads saved steps without retaining their retired input lists.
+    fn deserialize<Decoder>(decoder: Decoder) -> std::result::Result<Self, Decoder::Error>
+    where
+        Decoder: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct SavedStep {
+            action: String,
+            #[serde(default)]
+            effects: Vec<DesignFlowEffect>,
+            #[serde(default)]
+            branches: Vec<DesignFlowBranch>,
+            #[serde(default, rename = "reads")]
+            _retired_inputs: Option<serde::de::IgnoredAny>,
+        }
+
+        let saved = SavedStep::deserialize(decoder)?;
+        Ok(Self { action: saved.action, effects: saved.effects, branches: saved.branches })
+    }
 }
 
 impl Clone for DesignFlowStep {
@@ -49,7 +69,7 @@ impl Clone for DesignFlowStep {
                 let branches = step.branches.iter().map(|branch| DesignFlowBranch {
                     condition: branch.condition.clone(), steps: children.by_ref().take(branch.steps.len()).collect(),
                 }).collect();
-                finished.push(Self { action: step.action.clone(), reads: step.reads.clone(), effects: step.effects.clone(), branches });
+                finished.push(Self { action: step.action.clone(), effects: step.effects.clone(), branches });
             }
         }
         finished.pop().unwrap()
@@ -60,7 +80,7 @@ impl PartialEq for DesignFlowStep {
     fn eq(&self, other: &Self) -> bool {
         let mut pending = vec![(self, other)];
         while let Some((left, right)) = pending.pop() {
-            if left.action != right.action || left.reads != right.reads || left.effects != right.effects || left.branches.len() != right.branches.len() { return false; }
+            if left.action != right.action || left.effects != right.effects || left.branches.len() != right.branches.len() { return false; }
             for (left, right) in left.branches.iter().zip(&right.branches) {
                 if left.condition != right.condition || left.steps.len() != right.steps.len() { return false; }
                 pending.extend(left.steps.iter().zip(&right.steps));
@@ -147,7 +167,6 @@ pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
         let mut pending = flow.steps.iter().collect::<Vec<_>>();
         while let Some(step) = pending.pop() {
             validate_label(&step.action)?;
-            for input in &step.reads { validate_label(input)?; }
             for effect in &step.effects {
                 validate_label(&effect.target)?;
                 validate_label(&effect.change)?;
@@ -188,7 +207,6 @@ fn append_steps(steps: &[DesignFlowStep], rows: &mut Vec<String>) {
                 let mut line = format!("{prefix}{marker}{}", step.action);
                 if let [effect] = step.effects.as_slice() { line.push_str(&format!(" ┄▶ {} {}", effect.change, effect.target)); }
                 rows.push(line);
-                if !step.reads.is_empty() { rows.push(format!("{prefix}  ← {}", step.reads.join(" + "))); }
                 if step.effects.len() != 1 {
                     for effect in &step.effects { rows.push(format!("{prefix}  ┄▶ {} {}", effect.change, effect.target)); }
                 }
@@ -215,7 +233,7 @@ mod tests {
         serde_json::from_value(serde_json::json!({
             "title":"Collect shields", "description":"Collection precedes contact processing.",
             "trigger":"pickup collected", "steps":[{
-                "action":"collect_shield_pickups", "reads":["ShieldPickup"],
+                "action":"collect_shield_pickups",
                 "effects":[{"target":"PlayerAbilities", "change":"grant shield charges to"}]
             }]
         })).unwrap()
@@ -236,14 +254,43 @@ mod tests {
     #[test]
     fn independent_triggers_and_ordered_steps_render_distinctly() {
         let mut collected = flow();
-        collected.steps.push(DesignFlowStep { action:"update_hud".into(), reads:vec![], effects:vec![], branches:vec![] });
+        collected.steps.push(DesignFlowStep { action:"update_hud".into(), effects:vec![], branches:vec![] });
         let mut contact = flow();
         contact.title = "Absorb contact".into();
         contact.trigger = "accepted enemy contact".into();
         contact.steps[0].action = "PlayerAbilities.take_hit".into();
         let rendered = text(&[collected, contact]);
-        assert!(rendered.contains("On pickup collected\n  → collect_shield_pickups ┄▶ grant shield charges to PlayerAbilities\n    ← ShieldPickup\n  ↓ update_hud"));
+        assert!(rendered.contains("On pickup collected\n  → collect_shield_pickups ┄▶ grant shield charges to PlayerAbilities\n  ↓ update_hud"));
         assert!(rendered.contains("On accepted enemy contact\n  → PlayerAbilities.take_hit"));
+    }
+
+    #[test]
+    fn retired_inputs_are_absent_from_the_schema_and_saved_output() {
+        let schema = serde_json::to_value(schemars::schema_for!(DesignFlowStep)).unwrap();
+        let properties = schema["properties"].as_object().unwrap();
+        assert_eq!(properties.len(), 3);
+        for field in ["action", "effects", "branches"] {
+            assert!(properties.contains_key(field), "missing {field}");
+        }
+        assert_eq!(schema["additionalProperties"], false);
+
+        let mut saved = serde_json::to_value(flow()).unwrap();
+        saved["steps"][0]["reads"] = serde_json::json!(["ShieldPickup"]);
+        saved["steps"][0]["branches"] = serde_json::json!([{
+            "condition": "shield is available",
+            "steps": [{"action": "collect_shield", "reads": ["PlayerAbilities"]}]
+        }]);
+        let restored: DesignFlow = serde_json::from_value(saved).unwrap();
+        validate(std::slice::from_ref(&restored)).unwrap();
+        let serialized = serde_json::to_value(&restored).unwrap();
+        assert!(serialized["steps"][0].get("reads").is_none());
+        assert!(serialized["steps"][0]["branches"][0]["steps"][0].get("reads").is_none());
+        assert!(!text(std::slice::from_ref(&restored)).contains('←'));
+        assert_eq!(restored, serde_json::from_value::<DesignFlow>(serialized.clone()).unwrap());
+
+        let mut invalid = serialized;
+        invalid["steps"][0]["unexpected"] = serde_json::json!([]);
+        assert!(serde_json::from_value::<DesignFlow>(invalid).is_err());
     }
 
     #[test]
@@ -261,7 +308,7 @@ mod tests {
     fn complete_collections_and_nested_branches_have_no_content_cap() {
         let mut nested = flow().steps.remove(0);
         for _ in 0..40 {
-            nested = DesignFlowStep { action:"inspect".into(), reads:vec![], effects:vec![],
+            nested = DesignFlowStep { action:"inspect".into(), effects:vec![],
                 branches:vec![DesignFlowBranch { condition:"ready".into(), steps:vec![nested] }] };
         }
         let mut deep = flow(); deep.steps = vec![nested];

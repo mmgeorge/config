@@ -254,16 +254,18 @@ resumption. Copilot appends shared instructions when creating or resuming a sess
 interaction context with every message, including messages to an already-live session.
 
 Plan metadata stores execution flows separately from Design prose. `design_flows.rs` owns
-the typed `trigger` and ordered `steps` schema. Steps contain actions, reads, terminal effects,
+the typed `trigger` and ordered `steps` schema. Steps contain actions, terminal effects,
 and conditional branches with their own steps. Effects contain only `target` and `change` and
 cannot nest execution. The validator requires triggers, nonempty step lists, branch conditions,
 and plain labels. Later independent events require separate flows even when they share state.
 Rendering and validation traverse nested branches iteratively without flow-count, step-count,
-or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, `←` for
-inputs, and `┄▶` for effects. Branch rails retain their conditions and nesting. Text exports
+or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, and `┄▶`
+for effects. Branch rails retain their conditions and nesting. Text exports
 retain fences while PlanReview renders the same diagram rows as native buffer text.
 Section reads, review, and revision diffs use the same canonical projection. Plan schema 13
 replaces the generic node tree without converting older persisted plan formats.
+Retired step input lists are discarded when loading saved flows and are absent from the schema,
+serialized steps, and diagrams. Other unknown step fields remain errors.
 Native diagram rows keep literal punctuation and receive neutral prose styling, with exact
 identifier tokens colored through the proposed declaration index. Those tokens reuse narrative
 symbol targets, including definition reveal, ambiguity choices, removed-symbol checks, and
