@@ -306,7 +306,8 @@ impl ObjectStore {
         Ok(())
     }
 
-    fn path(&self, object_id: &str) -> Result<PathBuf> {
+    /// Locate an immutable object for internal streaming reads after validating its identity.
+    pub(crate) fn path(&self, object_id: &str) -> Result<PathBuf> {
         ensure!(
             object_id.len() == 64 && object_id.bytes().all(|byte| byte.is_ascii_hexdigit()),
             "invalid Harness object identifier"

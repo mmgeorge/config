@@ -5,7 +5,7 @@ local controller = require("forge.views.harness.controller")
 local model_picker = require("forge.views.harness.model_picker")
 local history = require("forge.views.harness.prompt_history")
 local notifications = require("forge.infra.notifications")
-local requests, rejected, selection = {}, {}, nil
+local requests, rejected, warnings, selection = {}, {}, {}, nil
 client.request = function(method, params, callback)
   if method == "backend.model_pins" then callback({}) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
@@ -13,6 +13,7 @@ end
 history.record = function() end
 notifications.info = function() end
 notifications.error = function(message) rejected[#rejected + 1] = message end
+notifications.warn = function(message) warnings[#warnings + 1] = message end
 controller.render = function() end
 controller.refresh_winbar = function() end
 model_picker.open = function(options) selection = options.on_confirm end
@@ -75,15 +76,22 @@ local success, failure = xpcall(function()
 
   compose("/model invalid xhigh never run")
   controller.queue_submit()
+  local invalid_model_entry = state.queue[1]
+  controller.edit_last_queued()
+  assert(state.configuring and #state.queue == 1 and state.queue[1] == invalid_model_entry and not state.queue_edit
+    and #warnings == 1, "the configuring queue front became editable")
   requests[5].callback(nil, "unavailable model")
   assert(#rejected == 1 and #state.queue == 1 and #requests == 5 and not state.configuring)
   assert(state.session.model == "picked", "rejected configuration changed the active model")
   controller.edit_last_queued()
-  assert(#state.queue == 0 and table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
-    == "/model invalid xhigh never run", "failed command could not be edited")
+  assert(#state.queue == 1 and state.queue[1] == invalid_model_entry and state.queue_edit.entry == invalid_model_entry
+    and table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
+      == "/model invalid xhigh never run", "failed configuration was removed or lost its queued identity")
   compose("/model next impossible prompt")
-  controller.queue_submit()
-  assert(#requests == 5 and #state.queue == 0 and #rejected == 2, "invalid effort reached the provider")
+  controller.submit()
+  assert(#requests == 5 and #state.queue == 1 and state.queue[1] == invalid_model_entry
+    and state.queue_edit.entry == invalid_model_entry and #rejected == 1 and #warnings == 2,
+    "invalid edited model effort changed or submitted the reserved entry")
   compose("/model next high submitted prompt")
   controller.submit()
   assert(requests[6].method == "session.configure")

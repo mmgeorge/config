@@ -1,5 +1,6 @@
 ---@class ForgeConfig
 ---@field status_buffer_name string
+---@field status_open_target "tab"|"buffer" Destination for files opened from ForgeStatus.
 ---@field pr_buffer_name string
 ---@field debug_notifications boolean
 ---@field diff_logging boolean
@@ -166,6 +167,7 @@ local M = {}
 ---@type ForgeConfig
 M.defaults = {
   status_buffer_name = "ForgeStatus",
+  status_open_target = "tab",
   pr_buffer_name = "ForgePR",
   debug_notifications = false,
   -- Gate non-Harness tracing (ForgeStatus, diffs, PRs, and shared UI work).
@@ -364,6 +366,9 @@ function M.setup(opts)
     return result
   end
   local options = (opts == nil or vim.tbl_isempty(opts)) and vim.deepcopy(M.defaults) or merge(M.defaults, opts)
+  if options.status_open_target ~= "tab" and options.status_open_target ~= "buffer" then
+    error('status_open_target must be "tab" or "buffer"')
+  end
   if options.walkthrough_inventory ~= "sem" and options.walkthrough_inventory ~= false then
     error('walkthrough_inventory must be "sem" or false')
   end

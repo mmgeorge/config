@@ -3,6 +3,7 @@ local M = {}
 local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local session = require("forge.session")
+local attachment = require("forge.views.harness.attachment")
 
 local LIMIT = 100
 
@@ -17,12 +18,15 @@ local function buffer_text(buf)
 end
 
 ---@param buf integer?
----@param text string
-local function replace_buffer(buf, text)
+---@param draft string|ForgePromptDraft
+local function replace_buffer(buf, draft)
+  if type(draft) == "string" then draft = { text = draft, attachments = {} } end
+  local text = draft.text
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local last_row = vim.api.nvim_buf_line_count(buf) - 1
   local last = vim.api.nvim_buf_get_lines(buf, last_row, last_row + 1, false)[1]
   vim.api.nvim_buf_set_text(buf, 0, 0, last_row, #last, vim.split(text, "\n", { plain = true }))
+  attachment.restore(buf, draft.attachments)
   local win = state().composer_win
   if win and vim.api.nvim_win_is_valid(win) then
     local line_list = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
@@ -35,7 +39,7 @@ local function replay_native(key)
   vim.api.nvim_feedkeys(vim.keycode(key), "n", false)
 end
 
----@param prompt_list string[]?
+---@param prompt_list (string|ForgePromptDraft)[]?
 ---@return nil
 function M.replace(prompt_list)
   local harness = state()
@@ -58,10 +62,12 @@ end
 ---@return nil
 function M.record(text)
   local harness = state()
-  table.insert(harness.prompt_history, 1, text)
+  local draft = attachment.capture(harness.composer_buf)
+  if draft.text ~= text then draft = { text = text, attachments = {} } end
+  table.insert(harness.prompt_history, 1, draft)
   while #harness.prompt_history > LIMIT do table.remove(harness.prompt_history) end
   M.reset_navigation()
-  client.request("history.record", { text = text }, function(result, request_error)
+  client.request("history.record", draft, function(result, request_error)
     if request_error then
       notifications.error(request_error, "Harness prompt history")
       return
@@ -79,7 +85,7 @@ function M.previous()
       replay_native("<Up>")
       return
     end
-    harness.prompt_history_draft = current
+    harness.prompt_history_draft = attachment.capture(harness.composer_buf)
   end
   if harness.prompt_history_index >= #harness.prompt_history then return end
   harness.prompt_history_index = harness.prompt_history_index + 1
@@ -95,7 +101,7 @@ function M.next()
   end
   harness.prompt_history_index = harness.prompt_history_index - 1
   local text = harness.prompt_history_index == 0
-      and (harness.prompt_history_draft or "")
+      and (harness.prompt_history_draft or { text = "", attachments = {} })
       or harness.prompt_history[harness.prompt_history_index]
   replace_buffer(harness.composer_buf, text)
 end
@@ -110,6 +116,7 @@ function M.attach(buf)
     callback = function()
       local harness = state()
       local selected = harness.prompt_history[harness.prompt_history_index]
+      if type(selected) == "table" then selected = selected.text end
       if harness.prompt_history_index > 0 and buffer_text(buf) ~= selected then M.reset_navigation() end
     end,
   })

@@ -3,6 +3,7 @@ use super::*;
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
     pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
+    pub(crate) status_thoughts: AtomicBool,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
     pub(super) runtime_epoch: String,
@@ -54,6 +55,7 @@ impl BrokerObserver {
         Ok(result)
     }
     fn build(&self, store: &SqliteStore, source_session: &HarnessSession, metadata: &ObservationMetadata, agent_run_list: Vec<Agent>, revision: u64) -> Result<BrokerSnapshot> {
+        let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
         (session.approval_timeout, session.answer_timeout) = self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = source_session
@@ -166,6 +168,7 @@ impl BrokerObserver {
         }
         if status.visible() {
             timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
+                status_thoughts,
                 id: format!("{}:status", source_session.id),
                 created_at_ms: 0,
                 status: status.clone(),
@@ -185,6 +188,7 @@ impl BrokerObserver {
         Ok(BrokerSnapshot {
             subagent_tools:self.agent_coordinator.enabled(),
             lsp_tools:self.lsp.enabled(&source_session.id),
+            status_thoughts,
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: revision,
             task_operation: store.latest_task_operation(&source_session.id)?
@@ -355,8 +359,8 @@ impl BrokerObserver {
 
     pub(super) fn record_prompt_history(&self, params: Value, now_ms: i64) -> Result<(Value, Vec<SessionEvent>)> {
         let mut store = SqliteStore::open(&self.data_root)?;
-        let text = required_text(&params,"text")?;
-        store.record_prompt_history(&text, now_ms)?;
+        let draft: crate::attachment::PromptDraft = serde_json::from_value(params)?;
+        store.record_prompt_history(&draft, now_ms)?;
         Ok((serde_json::to_value(store.list_prompt_history()?)?,Vec::new()))
     }
 

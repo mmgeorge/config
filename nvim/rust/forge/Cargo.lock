@@ -955,6 +955,7 @@ dependencies = [
  "agent-client-protocol",
  "anyhow",
  "async-trait",
+ "base64 0.22.1",
  "clap",
  "dunce",
  "forge-buffer",

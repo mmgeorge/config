@@ -124,9 +124,9 @@ M.empty_diff_rows = {}
 ---@field timeline_status_line integer?
 ---@field timeline_status_animated boolean?
 ---@field timeline_status_trace_fingerprint string?
----@field prompt_history string[]
+---@field prompt_history (string|ForgePromptDraft)[]
 ---@field prompt_history_index integer
----@field prompt_history_draft string?
+---@field prompt_history_draft ForgePromptDraft?
 ---@field agent table
 ---@field selected_agent_run_id string?
 

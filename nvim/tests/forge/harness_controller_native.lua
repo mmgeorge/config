@@ -12,9 +12,13 @@ local state = session.harness
 local generation, submitted, receive, navigated, sync_count = 1, nil, nil, nil, 0
 local initial = {}
 local goal_request = {}
+local status_thought_request = {}
+local timeline_source = { "Native transcript" }
+local staged_response, staged_request
+local hold_staging, staging_reply, staging_count, fail_selection = false, nil, 0, false
 local submitted_callback
 local function snapshot(document, text, composer)
-  return { document = document, revision = 0, block = { { id = "body", text = { text },
+  return { document = document, revision = 0, block = { { id = "body", text = type(text) == "table" and text or { text },
     metadata = { target = {}, decoration = {}, editable_region = composer and { { id = "composer", revision = 0,
       range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = #text } } } } or {} } } } }
 end
@@ -23,6 +27,11 @@ client.subscribe = function(callback) receive = callback return function() end e
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "native-controller")
   if method == "prompt.submit" then submitted = params submitted_callback = callback return end
+  if method == "session.configure" then
+    assert(type(params.status_thoughts) == "boolean")
+    status_thought_request[#status_thought_request + 1] = { params = params, callback = callback }
+    return
+  end
   if method == "task.transition" then
     goal_request[#goal_request + 1] = { method = method, params = params, callback = callback }
     return
@@ -38,9 +47,34 @@ client.request_for = function(session_id, method, params, callback)
   elseif params.operation == "navigate_prompt" then
     navigated = params.input
     vim.schedule(function() callback({ anchor = { block = "body", position = { row = 0, column = 0 } } }) end)
+  elseif params.operation == "staging" then
+    staging_count = staging_count + 1
+    staged_request = vim.deepcopy(params)
+    staged_response = snapshot(params.document, timeline_source)
+    staged_response.revision = state.presentation.transcript.revision + 1
+    local lines = {}
+    if #params.steering > 0 then
+      lines[#lines + 1] = "Steering active turn"
+      vim.list_extend(lines, params.steering)
+    end
+    if #params.queue > 0 then
+      lines[#lines + 1] = "Queued follow-up inputs"
+      vim.list_extend(lines, params.queue)
+    end
+    if #lines > 0 then
+      staged_response.block[#staged_response.block + 1] = { id = "harness:staging", text = lines,
+        metadata = { target = {}, decoration = {}, editable_region = {} } }
+    end
+    if hold_staging then staging_reply = callback
+    else vim.schedule(function() callback({ updated = true }) end) end
+  elseif params.operation == "select_agent" and fail_selection then
+    fail_selection = false
+    vim.schedule(function() callback(nil, "selection unavailable") end)
   elseif params.operation == "sync" then
     sync_count = sync_count + 1
-    vim.schedule(function() callback({ patch = {} }) end)
+    local result = staged_response and { snapshot = staged_response } or { patch = {} }
+    staged_response = nil
+    vim.schedule(function() callback(result) end)
   else vim.schedule(function() callback({ patch = {} }) end) end
 end
 local success, failure = xpcall(function()
@@ -110,7 +144,7 @@ local success, failure = xpcall(function()
   assert(#state.approval == 0 and not state.dismissed_approval_id)
   client.request_for = snapshot_request
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
-  assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
+  assert(vim.wo[state.composer_win].winbar == "", "composer still displays key hints")
   state.session.name = "Parser 100% coverage"
   controller.refresh_winbar()
   local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
@@ -134,6 +168,71 @@ local success, failure = xpcall(function()
   assert(tab_title:find("123456789012345678901234567890", 1, true) and not tab_title:find("extra", 1, true),
     "tab must show only the first 30 session-name characters")
   state.busy = true
+  local long_timeline = { "Native transcript" }
+  for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 80 do
+    long_timeline[#long_timeline + 1] = "Earlier response " .. index
+  end
+  local transcript = state.presentation.transcript
+  timeline_source = long_timeline
+  assert(require("forge.buffer").apply_snapshot(transcript, {
+    document = transcript.document, revision = transcript.revision + 1,
+    block = { { id = "body", text = long_timeline,
+      metadata = { target = {}, decoration = {}, editable_region = {} } } },
+  }).kind == "Applied")
+  vim.api.nvim_set_current_win(state.composer_win)
+  state.presentation.follow_tail()
+  state.queue = { { text = "queued follow-up" } }
+  for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 5 do
+    state.queue[#state.queue + 1] = { text = "queued extra " .. index }
+  end
+  state.pending_steer = { { text = "steering update" } }
+  hold_staging = true
+  controller.refresh_winbar()
+  assert(vim.wait(1000, function() return staging_reply ~= nil end))
+  local composer_height = vim.api.nvim_win_get_height(state.composer_win)
+  local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
+  assert(#vim.api.nvim_buf_get_extmarks(state.composer_buf, queue_namespace, 0, -1, {}) == 0,
+    "staging remained in the editable composer")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "typing draft" })
+  state.queue[#state.queue].text = "latest queued update"
+  controller.refresh_winbar()
+  assert(staging_count == 1, "staging changes were not coalesced during an active request")
+  fail_selection = true
+  state.presentation.select_agent("missing-child")
+  hold_staging = false
+  staging_reply({ updated = true })
+  assert(vim.api.nvim_win_get_height(state.composer_win) == composer_height,
+    "refreshing staging resized the composer")
+  assert(vim.wait(1000, function()
+    return vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == state.queue[#state.queue].text
+  end), "timeline staging is missing")
+  assert(staged_request.queue[1] == "queued follow-up" and staged_request.steering[1] == "steering update",
+    "staging request lost its messages")
+  assert(staging_count == 2, "selection failure did not flush the latest staged messages")
+  local timeline_view = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
+  local visible_height = vim.api.nvim_win_get_height(state.transcript_win)
+    - (vim.wo[state.transcript_win].winbar ~= "" and 1 or 0)
+  assert(vim.api.nvim_win_text_height(state.transcript_win, { start_row = timeline_view.topline - 1 }).all <= visible_height,
+    "queue-only refresh left staging below the viewport")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
+  controller.refresh_winbar()
+  assert(vim.api.nvim_win_get_cursor(state.transcript_win)[1] == 1,
+    "staging refresh displaced intentional transcript browsing")
+  state.queue, state.pending_steer = {}, {}
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
+  controller.refresh_winbar()
+  assert(vim.wait(1000, function()
+    return vim.api.nvim_buf_line_count(state.transcript_buf) == #timeline_source
+  end), "cleared messages remained staged")
+  controller.configure({ status_thoughts = true })
+  controller.configure({ status_thoughts = false })
+  assert(#status_thought_request == 2 and #goal_request == 0,
+    "status thought configuration entered the task-transition path")
+  status_thought_request[2].callback({ status_thoughts = false })
+  status_thought_request[1].callback({ status_thoughts = true })
+  assert(state.status_thoughts == false and state.busy,
+    "a superseded status thought response changed the preference or interrupted work")
   state.session.model, state.session.resolved_model = "default", nil
   receive("backend_event", { kind = "runtime_resolved", data = {
     session_id = "native-controller", provider = "Mock CLI", model = "resolved-model",
@@ -151,7 +250,7 @@ local success, failure = xpcall(function()
   receive("backend_event", { kind = "turn_started" }, "native-controller")
   assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")
   controller.refresh_winbar()
-  assert(vim.wo[state.composer_win].winbar:find("queue", 1, true), "busy composer has no queue hint")
+  assert(vim.wo[state.composer_win].winbar == "", "busy composer restored key hints")
   state.goal = { state = "paused", created_at_ms = 1000 }
   receive("backend_event", { kind = "execution_state", data = {
     session = { id = "native-controller", backend = "mock", model = "mock", execution_mode = "write", current_task_id = "execution" },

@@ -54,6 +54,7 @@ end
 controller.configure = function(params, _, completed)
   client.request_for("settings-session", "session.configure", params, function(result)
     state.session = result
+    if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
     completed(true)
   end)
 end
@@ -68,6 +69,14 @@ local success, failure = xpcall(function()
   assert(not text:find("[←", 1, true), text)
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
+  local status_thoughts = options["status-thoughts"]
+  assert(status_thoughts.label == "Status thoughts")
+  assert(status_thoughts.columns[1] == "Status thoughts" and status_thoughts.columns[2]:find("Off", 1, true))
+  assert(status_thoughts.columns[3]:find("latest thought under live status", 1, true)
+    and status_thoughts.columns[3]:find("timeline unchanged", 1, true))
+  instance.spec.action_list[2].callback({ option = status_thoughts })
+  assert(state.status_thoughts == true, "Status thoughts did not configure through the existing setting handler")
+  assert(configured_session.status_thoughts == nil, "Status thoughts is not session-scoped")
   assert(options.logging.columns[1] == "Logging" and options.logging.columns[2]:find("Off", 1, true))
   for index, option in ipairs(instance.spec.page_list[1].option_list) do
     if option.id == "logging" then instance.state.selected_index_by_page[instance.spec.page_list[1].id] = index end

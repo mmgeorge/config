@@ -93,13 +93,16 @@ impl TimelineStream {
                 turn_id:source.id().to_owned(), block_id:format!("{}:content:{}",source.id(),message.id()),
                 message:message.clone() }];
         if main_exchange && let Some(status_index) = self.entry_index.get(&format!("{}:status",self.session_id)).copied()
-            && let TimelineEntry::Status { status:crate::session::state_machine::SessionPhase::Working { reasoning_summary,.. },.. }
+            && let TimelineEntry::Status { status_thoughts, status:crate::session::state_machine::SessionPhase::Working { reasoning_summary,.. },.. }
                 = &mut self.entry_list[status_index] {
             let summary = exchange.latest_reasoning_summary().map(str::to_owned);
             if *reasoning_summary != summary {
                 *reasoning_summary = summary;
+                let visible = *status_thoughts;
                 self.value_list[status_index] = serde_json::to_value(&self.entry_list[status_index])?;
-                operation.push(TimelineOperation::Replace { index:status_index,entry:self.entry_list[status_index].clone() });
+                if visible {
+                    operation.push(TimelineOperation::Replace { index:status_index,entry:self.entry_list[status_index].clone() });
+                }
             }
         }
         Ok(Some(TimelinePatch { session_id:self.session_id.clone(),base_revision,revision:self.revision,operation }))
@@ -165,12 +168,30 @@ impl TimelineStream {
         self.ticking.iter().map(|index|&self.entry_list[*index])
     }
 
+    /// Toggles the current status preview while retaining streamed messages and phase state.
+    pub(crate) fn set_status_thoughts(&mut self, enabled: bool) -> Result<TimelinePatch> {
+        let base_revision = self.revision;
+        let mut operation = Vec::new();
+        if let Some(index) = self.entry_index.get(&format!("{}:status", self.session_id)).copied()
+            && let TimelineEntry::Status { status_thoughts, .. } = &mut self.entry_list[index]
+            && *status_thoughts != enabled
+        {
+            ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+            *status_thoughts = enabled;
+            self.value_list[index] = serde_json::to_value(&self.entry_list[index])?;
+            operation.push(TimelineOperation::Replace { index, entry: self.entry_list[index].clone() });
+            self.revision += 1;
+        }
+        Ok(TimelinePatch { session_id: self.session_id.clone(), base_revision, revision: self.revision, operation })
+    }
+
     /// Updates only the active interaction and transient status without copying settled history.
     pub fn update_live(
         &mut self,
         interaction: Option<&crate::exchange::Exchange>,
         removed: Option<&str>,
         status: crate::session::state_machine::SessionPhase,
+        status_thoughts: bool,
     ) -> Result<TimelinePatch> {
         ensure!(
             self.revision < forge_buffer::MAX_COUNTER,
@@ -203,7 +224,7 @@ impl TimelineStream {
         let agent_count = self.entry_list.iter().find_map(|entry|match entry {
             TimelineEntry::Status {agent_count,..} => Some(*agent_count),_=>None,
         }).unwrap_or(0);
-        let next_status = status.visible().then(|| TimelineEntry::Status { agent_count,
+        let next_status = status.visible().then(|| TimelineEntry::Status { agent_count, status_thoughts,
             id: status_id.clone(),
             created_at_ms: 0,
             status,
@@ -427,6 +448,7 @@ mod test {
 
     fn status(kind: SessionPhase) -> TimelineEntry {
         TimelineEntry::Status { agent_count: 0,
+            status_thoughts: true,
             id: "session:status".into(),
             created_at_ms: 0,
             status: kind,
@@ -464,7 +486,7 @@ mod test {
         exchange.observe_turn(&event, 2)?;
         assert!(stream.append_tool_output(&exchange, &event)?.is_none());
         assert_eq!(stream.revision(), 1);
-        let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle)?;
+        let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
         assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { .. }]));
         let TimelineEntry::Exchange { exchange:updated, .. } = &stream.entry_list()[0] else {
             panic!("expected reconciled exchange");
@@ -500,6 +522,26 @@ mod test {
             patch.operation.as_slice(),
             [TimelineOperation::Replace { index: 0, .. }]
         ));
+    }
+
+    #[test]
+    fn first_live_status_uses_the_current_thought_preference() -> anyhow::Result<()> {
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(Vec::new())?;
+        let phase = || SessionPhase::Working {
+            duration_ms: 0,
+            started_at_ms: Some(10),
+            activity: WorkflowActivity::Working,
+            execution: None,
+            reasoning_summary: Some("Inspect the configuration".into()),
+        };
+        stream.update_live(None, None, phase(), true)?;
+        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: true, .. }]));
+        stream.update_live(None, None, SessionPhase::Idle, true)?;
+        assert!(stream.entry_list().is_empty());
+        stream.update_live(None, None, phase(), false)?;
+        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: false, .. }]));
+        Ok(())
     }
 
     #[test]
@@ -616,6 +658,7 @@ mod test {
                     execution: None,
                     reasoning_summary: None,
                 },
+                true,
             )
             .unwrap();
         assert!(matches!(
@@ -639,7 +682,8 @@ mod test {
                         activity: WorkflowActivity::Working,
                         execution: None,
                         reasoning_summary: None,
-                    }
+                    },
+                    true,
                 )
                 .unwrap()
                 .is_empty()

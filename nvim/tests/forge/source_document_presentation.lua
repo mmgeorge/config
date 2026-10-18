@@ -81,6 +81,21 @@ local success, failure = xpcall(function()
   assert(not vim.wo.number and vim.wo.signcolumn == "no" and vim.wo.foldcolumn == "0", "source close leaked source columns")
   assert(vim.wo.foldmethod == "expr" and vim.wo.foldexpr == "0", "source close leaked source folding")
   assert(vim.wo.conceallevel == 0, "source close leaked source conceal")
+  local origin_window = vim.api.nvim_get_current_win()
+  local tab_count = #vim.api.nvim_list_tabpages()
+  local tab_source = source.open({ workspace = vim.fn.getcwd(), path = "history.md", revision = revision,
+    line = 4, layout = "tab" })
+  assert(vim.wait(1000, function() return vim.api.nvim_get_current_buf() == tab_source.replica.buffer end))
+  assert(#vim.api.nvim_list_tabpages() == tab_count + 1, "historical source did not open a tab")
+  assert(vim.api.nvim_win_get_buf(origin_window) == origin, "historical source replaced its origin")
+  assert(vim.api.nvim_win_get_cursor(0)[1] == 4 and vim.wo.number,
+    "historical tab lost its source position or presentation")
+  local tab_origin = tab_source.return_view[vim.api.nvim_get_current_win()].buffer
+  assert(tab_origin ~= origin, "source tab did not retain its own placeholder")
+  vim.api.nvim_buf_delete(tab_origin, { force = true })
+  source.close(tab_source)
+  assert(#vim.api.nvim_list_tabpages() == tab_count, "closing historical source retained its empty tab")
+  assert(vim.api.nvim_get_current_win() == origin_window)
   vim.wo.winbar = "%f"
   vim.wo.number = true
   local commit = source.open_commit({ workspace = vim.fn.getcwd(), oid = revision })

@@ -1,4 +1,6 @@
 pub mod background;
+/// Typed file attachments captured independently of prompt text.
+pub mod attachment;
 pub(crate) mod process;
 pub mod agent;
 pub mod backend;

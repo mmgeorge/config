@@ -50,7 +50,9 @@ pub struct BackendCatalogRequest {
 
 impl BackendCatalogRequest {
     /// Resolve the independent catalog runtime without changing portable preference scope.
-    pub fn runtime_key(&self) -> anyhow::Result<String> {Ok(self.owner()?.runtime_key())}
+    pub fn runtime_key(&self) -> anyhow::Result<String> {
+        Ok(self.owner()?.runtime_key())
+    }
     /// Validate the connection owner independently of the settings session identity.
     pub fn owner(&self) -> anyhow::Result<super::ExecutionOwner> {
         super::ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
@@ -61,14 +63,53 @@ impl BackendCatalogRequest {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum BackendInput {
-    Text { text: String },
-    Skill { name: String, arguments: String },
+    Text {
+        text: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// Files explicitly admitted with this text, never discovered from its contents.
+        attachments: Vec<crate::attachment::InputAttachment>,
+    },
+    Skill {
+        name: String,
+        arguments: String,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        /// Files explicitly admitted with the skill invocation.
+        attachments: Vec<crate::attachment::InputAttachment>,
+    },
 }
 
 impl BackendInput {
     /// Build ordinary provider input from admitted user text.
     pub fn from_text(text: impl Into<String>) -> Self {
-        Self::Text { text: text.into() }
+        Self::Text {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    /// Carry files selected at user-input admission without discovering files in prompt text.
+    pub(crate) fn with_attachments(
+        mut self,
+        attachments: Vec<crate::attachment::InputAttachment>,
+    ) -> Self {
+        match &mut self {
+            Self::Text {
+                attachments: selected,
+                ..
+            }
+            | Self::Skill {
+                attachments: selected,
+                ..
+            } => *selected = attachments,
+        }
+        self
+    }
+
+    /// Return only the files already admitted alongside this input.
+    pub(crate) fn attachments(&self) -> &[crate::attachment::InputAttachment] {
+        match self {
+            Self::Text { attachments, .. } | Self::Skill { attachments, .. } => attachments,
+        }
     }
 
     /// Parse a skill selector only when `$` starts the first non-whitespace token.
@@ -89,15 +130,20 @@ impl BackendInput {
         Self::Skill {
             name: name.to_owned(),
             arguments: selector[name_length..].trim_start().to_owned(),
+            attachments: Vec::new(),
         }
     }
 
     /// Return the provider-visible text corresponding to this admitted input.
     pub fn text(&self) -> String {
         match self {
-            Self::Text { text } => text.clone(),
-            Self::Skill { name, arguments } if arguments.is_empty() => format!("${name}"),
-            Self::Skill { name, arguments } => format!("${name} {arguments}"),
+            Self::Text { text, .. } => text.clone(),
+            Self::Skill {
+                name, arguments, ..
+            } if arguments.is_empty() => format!("${name}"),
+            Self::Skill {
+                name, arguments, ..
+            } => format!("${name} {arguments}"),
         }
     }
 }
@@ -182,6 +228,7 @@ mod test {
             BackendInput::Skill {
                 name: "walkthrough".into(),
                 arguments: "explain this".into(),
+                attachments: Vec::new(),
             }
         );
         assert_eq!(

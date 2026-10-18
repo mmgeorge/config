@@ -146,6 +146,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 pub struct BrokerSnapshot {
     pub subagent_tools:bool,
     pub lsp_tools:bool,
+    pub status_thoughts: bool,
     pub runtime_epoch: String,
     pub snapshot_revision: u64,
     pub task_operation: Option<Value>,
@@ -166,7 +167,7 @@ pub struct BrokerSnapshot {
     pub status: crate::session::state_machine::SessionPhase,
     pub goal_execution: Option<PlanExecutionRecord>,
     pub active_wait: Option<ActiveWait>,
-    pub prompt_history: Vec<String>,
+    pub prompt_history: Vec<crate::attachment::PromptDraft>,
     pub agent: AgentSnapshot,
     pub approval: Vec<ApprovalRequestView>,
 }
@@ -546,7 +547,7 @@ pub struct HarnessBroker {
     pub(crate) plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     pub(crate) revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     workspace_kind: WorkspaceKind,
-    data_root: PathBuf,
+    pub(crate) data_root: PathBuf,
     client_id: String,
     backend_launch: BackendLaunch,
     backend: Arc<dyn Backend>,
@@ -568,6 +569,7 @@ pub struct HarnessBroker {
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
+    submitted_attachments: Vec<crate::attachment::InputAttachment>,
     active_wait_projection: Option<ActiveWait>,
     pub(crate) parent_input: crate::backend::SteeringLane,
     timeline_reconciled_after_dispatch: bool,
@@ -773,6 +775,7 @@ impl HarnessBroker {
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
             lsp: runtime.lsp.clone(),
+            status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
             data_root: data_root.clone(), session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(), snapshot_revision: AtomicU64::new(0),
             metadata: RwLock::new(observation::ObservationMetadata {
@@ -823,6 +826,7 @@ impl HarnessBroker {
             prompt_admission: None,
             active_wait_projection: None,
             parent_input: Default::default(),
+            submitted_attachments: Vec::new(),
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
         };
@@ -1040,7 +1044,15 @@ impl HarnessBroker {
             self.active_operation_id = None;
         }
         let mutation_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.mutation"));
-        let mut outcome = Box::pin(self.dispatch_inner(method, request.params)).await;
+        let mut outcome = match crate::attachment::resolve_input(&self.data_root, &request.params).await {
+            Ok(attachments) => {
+                self.submitted_attachments = attachments;
+                let outcome = Box::pin(self.dispatch_inner(method, request.params)).await;
+                self.submitted_attachments.clear();
+                outcome
+            }
+            Err(error) => Err(error),
+        };
         if let Some(stage) = mutation_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
         let settle_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.settle_task"));
         if method.settles_task()
@@ -1185,6 +1197,7 @@ impl HarnessBroker {
             HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
             HarnessMethod::TaskTransition => self.transition_task(params).await,
             HarnessMethod::LspAuthorize
+            | HarnessMethod::AttachmentImport
             | HarnessMethod::LspRespond
             | HarnessMethod::LspAnalyze
             | HarnessMethod::TaskOperation
@@ -1919,7 +1932,7 @@ impl HarnessBroker {
             kind:"agent_updated".into(),text:None,data:serde_json::to_value(snapshot.agent)?,
             activity:None,summary:None,task_update:None},event).await?;
         let patch = self.presentation.lock().map_err(|_|anyhow::anyhow!("session presentation lock poisoned"))?
-            .reconcile(snapshot.timeline)?;
+                .reconcile_with_status_thoughts(snapshot.timeline, self.observer.status_thoughts.load(Ordering::Relaxed))?;
         self.emit_timeline_patch(patch,event).await
     }
 
@@ -2482,6 +2495,7 @@ impl HarnessBroker {
             BackendInput::Skill {
                 name,
                 mut arguments,
+                attachments,
             } => {
                 if let Some(context) = prompt
                     .strip_suffix(&text)
@@ -2489,7 +2503,7 @@ impl HarnessBroker {
                 {
                     arguments = format!("{context}{arguments}");
                 }
-                BackendInput::Skill { name, arguments }
+                BackendInput::Skill { name, arguments, attachments }
             }
             BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
         };
@@ -3645,9 +3659,9 @@ Planning continuation: turn {} of {}.",
 
         if mode == PromptMode::PlanDiscussion {
             input = match input {
-                BackendInput::Text { text } => BackendInput::from_text(PlanPrompt::discussion(&text)),
-                BackendInput::Skill { name, arguments } => BackendInput::Skill {
-                    name, arguments: PlanPrompt::discussion(&arguments),
+                BackendInput::Text { text, attachments } => BackendInput::from_text(PlanPrompt::discussion(&text)).with_attachments(attachments),
+                BackendInput::Skill { name, arguments, attachments } => BackendInput::Skill {
+                    name, arguments: PlanPrompt::discussion(&arguments), attachments,
                 },
             };
         }
@@ -3662,10 +3676,11 @@ Planning continuation: turn {} of {}.",
                 .read_working_document(&self.session.id, &plan_id)?;
             let context = PlanPrompt::with_active_document(String::new(), &document.model_json()?);
             input = match input {
-                BackendInput::Text { text } => BackendInput::from_text(format!("{context}{text}")),
-                BackendInput::Skill { name, arguments } => BackendInput::Skill {
+                BackendInput::Text { text, attachments } => BackendInput::from_text(format!("{context}{text}")).with_attachments(attachments),
+                BackendInput::Skill { name, arguments, attachments } => BackendInput::Skill {
                     name,
                     arguments: format!("{context}{arguments}"),
+                    attachments,
                 },
             };
         }
@@ -3674,7 +3689,7 @@ Planning continuation: turn {} of {}.",
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
             match &mut backend_request.input {
-                BackendInput::Text { text } => *text = format!("{feedback}\n\n{text}"),
+                BackendInput::Text { text, .. } => *text = format!("{feedback}\n\n{text}"),
                 BackendInput::Skill { arguments, .. } => *arguments = format!("{feedback}\n\n{arguments}"),
             }
         }
@@ -4455,7 +4470,7 @@ Planning continuation: turn {} of {}.",
                 .collect::<Result<Vec<_>>>()?
                 .join("\n\n");
             match &mut request.input {
-                BackendInput::Text { text } => {
+                BackendInput::Text { text, .. } => {
                     text.push_str("\n\n");
                     text.push_str(&message);
                 }
@@ -4571,10 +4586,10 @@ Planning continuation: turn {} of {}.",
                 if let Some(input) = deferred_input.pop_front() {
                     self.resume_parent_input(interaction, &input.text, event)
                         .await?;
-                    continuation_input = Some(BackendInput::from_text(input.text.clone()));
+                    continuation_input = Some(BackendInput::from_text(input.text.clone()).with_attachments(input.attachments.clone()));
                     input.complete(Ok(())).await;
                     continuation_result = self.agent_coordinator.unreported_result();
-                    if let Some(BackendInput::Text { text }) = &mut continuation_input {
+                    if let Some(BackendInput::Text { text, .. }) = &mut continuation_input {
                         for task in &continuation_result {
                             text.push_str("\n\n");
                             text.push_str(&self.agent_result_message(task)?);
@@ -4803,7 +4818,7 @@ Planning continuation: turn {} of {}.",
                             let session_id = self.session.id.clone();
                             user_delivery.spawn(async move {
                                 let result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User(input.text.clone())))
+                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User { text: input.text.clone(), attachments: input.attachments.clone() }))
                                     .await.context("parent input delivery exceeded 30 seconds").and_then(|result|result);
                                 (input,result)
                             });
@@ -5717,7 +5732,7 @@ Planning continuation: turn {} of {}.",
             let status = self.live_interaction_status(Some(current))?;
             let patch = self.presentation.lock()
                 .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .update_live(Some(&owner), None, status)?;
+                .update_live(Some(&owner), None, status, self.observer.status_thoughts.load(Ordering::Relaxed))?;
             self.emit_backend_event(backend_event.clone(), event).await?;
             self.emit_timeline_patch(patch, event).await?;
         }
@@ -5917,7 +5932,7 @@ Planning continuation: turn {} of {}.",
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .reconcile(timeline)
+            .reconcile_with_status_thoughts(timeline, self.observer.status_thoughts.load(Ordering::Relaxed))
     }
 
     fn reconcile_after_dispatch(&mut self) -> Result<TimelinePatch> {
@@ -5947,7 +5962,7 @@ Planning continuation: turn {} of {}.",
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .update_live(interaction, removed_exchange_id, status)
+            .update_live(interaction, removed_exchange_id, status, self.observer.status_thoughts.load(Ordering::Relaxed))
     }
 
     fn live_interaction_status(
@@ -7729,6 +7744,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
+        let status_thoughts = params.get("status_thoughts")
+            .map(|value| serde_json::from_value::<bool>(value.clone())).transpose()?;
         let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled())
             || lsp_tools.is_some_and(|enabled|enabled != self.lsp.enabled(&self.session.id));
         if let Some(access) = access { configured.access = access; }
@@ -7768,6 +7785,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             if params.get("answer_timeout").is_some() { portable.answer_timeout = Some(self.session.answer_timeout); changed = true; }
             if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
             if let Some(enabled) = lsp_tools {portable.lsp_tools = Some(enabled);changed = true;}
+            if let Some(enabled) = status_thoughts {portable.status_thoughts = Some(enabled);changed = true;}
             let revision = if changed { settings.update(snapshot.revision,scope,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
             if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
                 settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
@@ -7776,6 +7794,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         if let Some(enabled) = subagent_tools {self.agent_coordinator.set_enabled(enabled);}
         if let Some(enabled) = lsp_tools {self.lsp.set_enabled(&self.session.id, enabled);}
+        if let Some(enabled) = status_thoughts {self.observer.status_thoughts.store(enabled, Ordering::Relaxed);}
         if delegation_registry_changed && params.get("settings_revision").is_none() {
             self.backend.cleanup_execution(&self.session.id).await?;
         }
@@ -7985,7 +8004,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
-            input,
+            input: if self.submitted_attachments.is_empty() { input } else { input.with_attachments(self.submitted_attachments.clone()) },
             mode: if self.session.background.is_some() { PromptMode::Background } else { mode },
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
@@ -8684,7 +8703,7 @@ mod test {
             } else {
                 anyhow::ensure!(turn == 1,"parent continuation duplicated");
                 anyhow::ensure!(request.backend_session_id.as_deref() == Some("parent-history"),"parent lost its conversation");
-                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),"parent continuation omitted child result");
+                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),"parent continuation omitted child result");
             }
             if let Some(sink) = sink {sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,kind:"assistant_message".into(),
                 text:Some(if turn == 0 {"Waiting for child"} else {"SYNTHESIZED_RESULT"}.into()),data:Value::Null,activity:None,summary:None,task_update:None}).await?;}
@@ -12392,7 +12411,7 @@ mod test {
         let second = planning_question_broker(second_repository.path(), data.path(), false);
         assert_eq!(
             second.snapshot().unwrap().prompt_history,
-            vec!["inspect the architecture"]
+            vec![crate::attachment::PromptDraft { text: "inspect the architecture".into(), attachments: Vec::new() }]
         );
     }
 

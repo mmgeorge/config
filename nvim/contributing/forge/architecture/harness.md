@@ -189,12 +189,12 @@ Controller renders and
 presentation callbacks share status-hint selection so updates cannot alternate between a
 wait notice and the underlying activity. Connection and execution failures retain precedence.
 
-Transcript presentation follows the final row after updates whenever the current buffer is not
-the transcript. Focus, rather than the previous cursor row or row-count growth, controls automatic
-following. Leaving the transcript resumes following immediately. Focused transcript readers retain
-their cursor and viewport through the shared buffer view preservation, including snapshot recovery.
-Tail positioning reveals the end of wrapped final lines in every attached transcript window without
-changing focus. Explicit prompt submission and agent actions can request tail positioning directly.
+Transcript presentation follows updates only in windows showing the bottom immediately before
+publication. Native viewport and cursor movement suspend following for 500 milliseconds, independently
+of mouse input or configured navigation keys. Following resumes only when that grace period has elapsed
+and the bottom is visible. Changing focus does not resume following. Each attached window tracks its
+own viewport, including wrapped final lines, and retains historical reading positions through snapshot
+recovery. Explicit prompt submission and agent actions can request tail positioning directly.
 
 
 `client.lua` owns one persistent Forge JSONL process. Repository requests do not require Harness
@@ -204,8 +204,9 @@ independent turns without treating one session as globally active.
 buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab.
 
 Lua owns the complete unsent Harness draft. Opening a transcript and typing in HarnessInput never
-transmit draft text or local edit revisions to Rust. Ctrl-s captures the complete draft,
-then sends one `prompt.submit` request with its text and a monotonically increasing token
+transmit draft text or local edit revisions to Rust. Explicit file-path pastes import the selected
+file through `attachment.import`, independently of prompt submission. Ctrl-s captures the complete draft,
+then sends one `prompt.submit` request with separate text and typed attachment fields and a monotonically increasing token
 bound to the transcript document lifetime. Rust tracks submission admission without retaining a
 composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
 Retraction restores its exact rows only while the cleared buffer retains its changedtick.
@@ -213,6 +214,27 @@ Newer typing survives both transitions. Rejection retains the draft, and closing
 the presentation invalidates late transitions. Plan preparation precedes acceptance. Git checkpoint
 acquisition starts asynchronously when the exchange is admitted and does not delay acceptance or
 the initial timeline projection.
+
+`views/harness/attachment.lua` scopes terminal and register-paste handling to composer
+buffers. It retains the pasted path during asynchronous capture and tracks that exact
+range with extmarks. Edits before or after the range move its anchors. A replaced or
+deleted range invalidates the response instead of overwriting newer text. Imports run
+one at a time per composer through the shared native read pool, without owning the
+active provider broker. Pending imports block submission and queued-edit navigation.
+
+`attachment.rs` captures complete files in the existing content-addressed object store
+and publishes a named copy and metadata under the data root's `attachments` directory.
+The import returns a typed object with its retained identity, filename, media type,
+and visible label. The composer keeps these objects separately from its plain text and
+anchors their label spans with extmarks. Text never contains a hidden attachment URL.
+The `iA` and `aA` text objects and register metadata preserve the objects when copied or
+moved. Queue drafts and prompt history retain the text and attachment list together.
+Typing a label or an attachment-shaped string creates ordinary text.
+
+Request admission resolves only the explicit attachment list. `BackendInput` carries
+the resolved objects through provider requests and user steering. Provider adapters
+do not scan text for paths or references. Generated Background prompts and child-result
+text have no attachments unless a caller explicitly supplies an attachment object.
 
 Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
 `ExchangeLayout` keeps provider activity in the summary fold and renders generated artifacts,
@@ -605,8 +627,20 @@ Reopening Harness explicitly reconnects the presentation.
 
 ## Steering and task tracking
 
-`turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
-clears HarnessInput only after admitting the text into a pending steering record, then the backend
+Queued editing retains entry identity, task ownership, and configuration while the
+composer displays the draft. `queue_editor.lua` owns the reservation and drafts retained
+when navigating backward. Drain may consume earlier entries but stops at the reserved
+entry, including before queued model configuration. Saving validates every retained draft
+before changing the queue, then commits edits without reordering entries, removes cleared entries,
+and releases the reservation. A validation failure focuses the invalid draft while the earliest
+unfinished edit remains reserved. While editing, submit,
+queue, and steering bindings save the reserved message instead of sending it out of order.
+The timeline marks the active reservation with `[editing]`. Same-session snapshots and
+composer recreation retain the edit. Changing sessions clears it with the queue.
+
+`turn.steer` uses the same out-of-band broker lane without creating another interaction. Explicit steering
+preserves queued follow-ups and delegates active-turn admission to the backend even while a task
+transition is pending. It clears HarnessInput only after admitting the text into a pending steering record, then the backend
 delivers it to the active provider turn and acknowledges the request. The Codex backend maps that
 operation to app-server `turn/steer` with the active thread and expected turn IDs. A provider
 acknowledgement closes the current thought boundary and appends a durable `SteeringPrompt` node to
@@ -646,9 +680,10 @@ supports fixture validation rather than live Harness presentation. Native node p
 overlapping editor fold ranges, which cannot reliably represent wrapped thought and command headings.
 When a planning-feedback lifecycle answer exactly matches its durable continuation prompt, the
 projection keeps the interaction as the single visible owner and omits the redundant lifecycle row.
-`display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
-ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
-two-column indent without depending on window-local soft-wrap behavior.
+The native transcript renderer wraps prompts into real rows before row ownership, highlights,
+and folds are assigned. Prompt continuations add no text padding because the concealed first-row
+marker appears in the sign column, which supplies the same margin on every row. Explicit source
+indentation remains intact. Nested structural indentation applies uniformly to the complete block.
 Markdown responses retain each source line and rely on Neovim soft-wrap so window resizing can
 reflow prose without rebuilding the timeline. Assistant responses and commentary project local
 file links as their labels, with the original destinations retained in navigation metadata.
@@ -1063,7 +1098,9 @@ their existing generated permission outputs.
 
 Only the transcript window owns the Harness winbar. The composer clears its window-local
 winbar so the split presents session identity once. The transcript winbar begins directly
-with the active execution mode and resolved runtime model. `/config` displays
+with the active execution mode and resolved runtime model. Its right side shows remaining
+context followed by the sole command hint, `? help`, using the configured help binding.
+The composer displays no key hints. `/config` displays
 the underlying CLI provider.
 The model picker and `/config` share `views/picker/field.lua` for field rendering.
 The active field uses arrows, while inactive fields retain equal-width padding.
@@ -1504,9 +1541,13 @@ metadata from the committed sequence, never from label text or target suffixes.
 Active labels are Working, Planning, Revising plan, Compacting, Implementing, Verifying,
 Resolving, Stopping, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
-Active status headings show the phase and elapsed time. The latest reasoning
-preview appears directly below in italics, aligned with the phase label, and
-wraps within the content width. The preview parses Markdown from at most 4096
+Active status headings show the phase and elapsed time. The portable
+`status_thoughts` preference controls whether the latest reasoning preview appears
+directly below in italics, aligned with the phase label and wrapped within the
+content width. It defaults to false and leaves timeline message retention and
+rendering unchanged. A presentation-only `session.configure` request persists the
+preference and updates the observer and status entry without acquiring the provider
+execution owner or interrupting its response. The preview parses Markdown from at most 4096
 characters without retaining its emphasis markers. Execution comparisons may
 add their file-attention summary. Lua appends the interrupt hint to the heading.
 

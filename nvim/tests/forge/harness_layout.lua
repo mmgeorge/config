@@ -37,10 +37,11 @@ assert(vim.api.nvim_win_get_height(composer_window) > prompt_height
   and vim.api.nvim_win_get_height(composer_window) <= config.options.harness.composer_max_height,
   "fixed prompt height prevented bounded content-driven growth")
 vim.b[composer_buffer].forge_queue_rows = config.options.harness.composer_max_height
+local draft_height = vim.api.nvim_win_get_height(composer_window)
 layout.resize_composer(composer_buffer, composer_window)
-assert(vim.api.nvim_win_get_height(composer_window) == config.options.harness.composer_max_height,
-  "queued prompts did not respect the configured maximum height")
-vim.b[composer_buffer].forge_queue_rows = 0
+assert(vim.api.nvim_win_get_height(composer_window) == draft_height,
+  "legacy queue rows changed the draft-only composer height")
+vim.b[composer_buffer].forge_queue_rows = nil
 vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { "" })
 vim.api.nvim_exec_autocmds("TextChanged", { buffer = composer_buffer })
 assert(vim.api.nvim_win_get_height(composer_window) == prompt_height,

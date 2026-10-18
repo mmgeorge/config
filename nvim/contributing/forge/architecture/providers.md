@@ -12,6 +12,19 @@ text application, without a separate model HTTP client or CLI generation adapter
 
 ## Backend contracts and ACP runtime
 
+Attachment objects resolve against the Harness data root during request admission and
+remain separate from `BackendInput` text. Provider adapters never discover attachments
+from text. Initial prompts, queued follow-ups, and steering use the same typed objects.
+Images receive textual `<image name=[Image #N] path="...">` framing generated from their
+metadata. Codex receives that framing and native `localImage` items. Copilot receives the
+same framing and its native file attachment list with matching display names.
+ACP receives framing and base64 image content only
+when the negotiated agent advertises `promptCapabilities.image`. Unsupported image input
+fails before ACP activates the prompt. Text-only prompts bypass attachment worker setup.
+PDFs and other files use explicit retained-file context in Codex and ACP, which directs
+the agent to inspect the complete file through tools. These adapters do not claim native
+PDF ingestion or silently substitute extracted text for the original file.
+
 The feature-first Rust crate lives at `nvim/rust/forge/crates/forge-harness`. Its directories
 name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`,
 `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. `Backend` defines

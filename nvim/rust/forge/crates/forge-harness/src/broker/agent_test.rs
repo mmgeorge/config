@@ -47,7 +47,7 @@ async fn profile_selection_captures_tuning_and_instructions_without_widening_per
     let request = broker.agent_backend_factory.request(&root,&child,"follow-up".into())?;
     assert_eq!(request.model,"fixture-model");
     assert_eq!(request.execution_mode,PermissionMode::Read);
-    assert!(matches!(request.input,BackendInput::Text {text} if text.contains("First instructions")
+    assert!(matches!(request.input,BackendInput::Text {text, ..} if text.contains("First instructions")
         && !text.contains("Changed instructions") && !text.contains("parent secret")));
     assert!(request.backend_session_id.is_none());
     assert!(request.control_context.is_none());
@@ -490,13 +490,13 @@ impl Backend for RoutingBackend {
             } else {
                 anyhow::ensure!(ordinal == 1,"root continuation duplicated");
                 anyhow::ensure!(request.backend_session_id.as_deref() == Some("root-history"),"root history changed");
-                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.contains("CHILD_RESULT")),"missing child result");
+                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text, ..} if text.contains("CHILD_RESULT")),"missing child result");
                 "SYNTHESIZED_RESULT"
             }
         } else {
             anyhow::ensure!(request.control_context.is_none(),"child inherited root workflow authority");
             anyhow::ensure!(request.backend_session_id.is_none(),"fresh child inherited provider history");
-            anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.ends_with("CHILD_RESULT")),"child inherited parent transcript");
+            anyhow::ensure!(matches!(&request.input,BackendInput::Text {text, ..} if text.ends_with("CHILD_RESULT")),"child inherited parent transcript");
             self.request.lock().unwrap().push(request.clone());
             "CHILD_RESULT"
         };

@@ -71,7 +71,7 @@ function M.apply(session, view, effect)
       assert(#path > 0 and not path:find("%z"), "invalid source path")
       view.effect[effect.id] = true
       require("forge.source_document").open({ workspace = effect.workspace, path = path,
-        revision = effect.source_revision, line = row + 1, window = view.window,
+        revision = effect.source_revision, line = row + 1, window = view.window, layout = effect.layout,
         is_current = function()
           return view.active and view.sequence == effect.sequence and session.revision == effect.revision
             and session.status == "Applied" and vim.api.nvim_win_is_valid(view.window)
@@ -101,8 +101,10 @@ function M.apply(session, view, effect)
       local command = ({ current = "edit", split = "split", vsplit = "vsplit", tab = "tabedit" })[effect.layout or "current"]
       assert(command, "invalid file opening layout")
       view.effect[effect.id] = true
+      local destination
       vim.api.nvim_win_call(view.window, function()
         vim.api.nvim_cmd({ cmd = command, args = { effect.path } }, {})
+        destination = vim.api.nvim_get_current_win()
         require("forge.nodes").restore_inherited(view.window, vim.api.nvim_get_current_win())
         local target = vim.api.nvim_get_current_buf()
         row = math.min(row, vim.api.nvim_buf_line_count(target) - 1)
@@ -113,6 +115,7 @@ function M.apply(session, view, effect)
         end
         vim.api.nvim_win_set_cursor(0, { row + 1, column })
       end)
+      if command == "tabedit" then vim.api.nvim_set_current_win(destination) end
     elseif effect.kind == "browser" then
       assert(type(effect.url) == "string" and #effect.url <= 65536 and not effect.url:find("%c")
         and (effect.url:match("^https://[^/]+") or effect.url:match("^http://[^/]+")), "invalid browser URL")

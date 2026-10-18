@@ -190,6 +190,35 @@ local success, failure = xpcall(function()
     assert(rejected and pending.selection.closed, "rejected startup retained selection owner")
     assert(vim.fn.exists("#ForgeGutterSelection" .. state.transcript_buf) == 0,
       "rejected startup retained selection callbacks")
+    local replica = require("forge.buffer")
+    local input = require("forge.input")
+    for _, indent in ipairs({ 2, 4, 6 }) do
+      local prompt = replica.open("prompt-alignment-" .. indent)
+      vim.api.nvim_set_current_win(state.transcript_win)
+      vim.api.nvim_win_set_buf(state.transcript_win, prompt.buffer)
+      assert(replica.apply_snapshot(prompt, { document = prompt.document, revision = 0, block = {
+        { id = "prompt", text = { "● first prompt line", "second prompt line", "third prompt line" },
+          metadata = { target = {}, decoration = {}, editable_region = {},
+            layout = { indent = indent, marker = { text = "●", capture = "Normal" } },
+            conceal = { { range = { start = { row = 0, column = 0 },
+              ["end"] = { row = 0, column = #"● " } }, replacement = "", line = false, priority = 100 } },
+          } },
+      } }).kind == "Applied")
+      local view = input.open(prompt, state.transcript_win, { margin = 0,
+        columns = { signcolumn = "yes:1", statuscolumn = "%s" },
+        conceal = { level = 3, cursor = "nvic" },
+      })
+      vim.cmd("normal! ggzt")
+      vim.cmd("redraw!")
+      local first = vim.fn.screenpos(state.transcript_win, 1, #"● " + 1)
+      for row = 2, 3 do
+        local continuation = vim.fn.screenpos(state.transcript_win, row, 1)
+        assert(first.col > 0 and continuation.col == first.col,
+          "prompt continuation does not align with first-line text at indent " .. indent)
+      end
+      input.close(view)
+      replica.close(prompt)
+    end
   ]])
 end, debug.traceback)
 vim.fn.jobstop(host)

@@ -193,6 +193,7 @@ impl Fixture {
             harness_session_id: "mcp-failure".into(),
             workspace: self.directory.path().to_string_lossy().into_owned(),
             input: BackendInput::Text {
+                attachments: Vec::new(),
                 text: "what is this repo?".into(),
             },
             mode: PromptMode::Chat,

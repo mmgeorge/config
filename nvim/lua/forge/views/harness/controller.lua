@@ -6,7 +6,6 @@ local config = require("forge.infra.config")
 local keymaps = require("forge.shared.keymaps")
 local notifications = require("forge.infra.notifications")
 local perf = require("forge.infra.perf")
-local queue_renderer = require("forge.render.harness.queue")
 local layout = require("forge.views.harness.layout")
 local session = require("forge.session")
 local prompt_history = require("forge.views.harness.prompt_history")
@@ -20,6 +19,8 @@ local question_presentation = require("forge.views.harness.question_presentation
 local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
 local task_control = require("forge.views.harness.task")
+local queue_editor = require("forge.views.harness.queue_editor")
+local attachment = require("forge.views.harness.attachment")
 local tabline = require("forge.views.harness.tabline")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
@@ -28,6 +29,7 @@ local begin_request
 local submit_immediate
 local configure_now
 local finish_execution
+local render_status_hint
 local queue_only_commands = { ["/plan"] = true }
 
 ---@param state table
@@ -144,37 +146,19 @@ local function selected_agent_run(state)
   return nil
 end
 
-local function render_queue()
-  local state = harness_state()
-  local buf = state.composer_buf
-  local win = state.composer_win
-  if not (buf and vim.api.nvim_buf_is_valid(buf) and win and vim.api.nvim_win_is_valid(win)) then return end
-  vim.api.nvim_buf_clear_namespace(buf, queue_namespace, 0, -1)
-  local virtual_line_list, row_count = queue_renderer.build(
-    state.queue,
-    vim.api.nvim_win_get_width(win),
-    state.pending_steer
-  )
-  if row_count > 0 then
-    vim.api.nvim_buf_set_extmark(buf, queue_namespace, 0, 0, {
-      virt_lines = virtual_line_list,
-      virt_lines_above = true,
-    })
-  end
-  vim.b[buf].forge_queue_rows = row_count
-  layout.resize_composer(buf, win)
-  vim.api.nvim_win_call(win, function()
-    local view = vim.fn.winsaveview()
-    view.topfill = row_count
-    vim.fn.winrestview(view)
-  end)
-end
-
 ---@param buf integer
 ---@return string
 local function composer_text(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return "" end
   return vim.trim(table.concat(vim.api.nvim_buf_get_lines(buf, 0, -1, false), "\n"))
+end
+
+---@param buffer integer?
+---@return boolean
+local function attachments_ready(buffer)
+  if not attachment.pending(buffer) then return true end
+  notifications.warn("Wait for the attachment import to finish", "ForgeHarness")
+  return false
 end
 
 ---@param buf integer
@@ -185,24 +169,25 @@ end
 
 ---@param buf integer
 ---@param text string
-local function set_composer_text(buf, text)
+local function set_composer_text(buf, text, attachments)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   dismiss_composer_completion(buf)
   vim.bo[buf].modifiable = true
   local last_row = vim.api.nvim_buf_line_count(buf) - 1
   local last = vim.api.nvim_buf_get_lines(buf, last_row, last_row + 1, false)[1]
   vim.api.nvim_buf_set_text(buf, 0, 0, last_row, #last, vim.split(text, "\n", { plain = true }))
+  attachment.restore(buf, attachments)
 end
 
-local function restore_retracted_prompt(text)
+local function restore_retracted_prompt(text, attachments)
   local state = harness_state()
-  if composer_text(state.composer_buf) ~= "" then
-    table.insert(state.queue, 1, text)
+  if state.queue_edit or composer_text(state.composer_buf) ~= "" then
+    table.insert(state.queue, 1, { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id })
     notifications.warn("The retracted prompt was queued because the composer already contains a newer draft", "ForgeHarness")
-    render_queue()
+    render_status_hint(state)
     return
   end
-  set_composer_text(state.composer_buf, text)
+  set_composer_text(state.composer_buf, text, attachments)
   layout.resize_composer(state.composer_buf, state.composer_win)
   vim.schedule(function()
     if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
@@ -297,11 +282,9 @@ function M.refresh_winbar()
     context_status.segment(state.session and state.session.context_usage)
   )
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-    vim.wo[state.composer_win].winbar = keymaps.render_hintbar(
-      keymaps.view_hint_entries("harness", state.command_set, state, "composer"),
-      vim.api.nvim_win_get_width(state.composer_win))
+    vim.wo[state.composer_win].winbar = ""
   end
-  render_queue()
+  render_status_hint(state)
 end
 
 ---@return integer?
@@ -311,12 +294,23 @@ local function working_seconds()
   return math.floor((vim.uv.hrtime() - state.working_started_ns) / 1000000000)
 end
 
-local function render_status_hint(state)
+render_status_hint = function(state)
+  if state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
+    and vim.b[state.composer_buf].forge_queue_rows ~= nil then
+    vim.api.nvim_buf_clear_namespace(state.composer_buf, queue_namespace, 0, -1)
+    vim.b[state.composer_buf].forge_queue_rows = nil
+    if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+      layout.resize_composer(state.composer_buf, state.composer_win)
+    end
+  end
   if state.presentation and state.presentation.transcript then
     state.presentation.transcript.restore_recovery = state.restore_recovery
     state.presentation.transcript.recap = state.recap
     state.presentation.transcript.rename_status = state.rename_status
     state.presentation.transcript.status_notice = require("forge.views.harness.health").notice(state)
+    if state.presentation.set_staging then
+      state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf)), state.pending_steer)
+    end
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       require("forge.views.harness.status_hint").render(state.presentation.transcript,
         M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
@@ -714,6 +708,7 @@ local function on_event(event, payload)
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
       recap.clear(state)
       state.queue = {}
+      state.queue_edit = nil
       state.goal = nil
       state.goal_execution = nil
       state.active_plan = nil
@@ -941,8 +936,9 @@ finish_execution = function(request_error, error_detail)
 end
 
 ---@param text string
-begin_request = function(text, from_composer)
+begin_request = function(text, from_composer, attachments)
   local state = harness_state()
+  if from_composer then attachments = attachment.capture(state.composer_buf).attachments end
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
@@ -953,14 +949,14 @@ begin_request = function(text, from_composer)
   end
   M.render()
   local method = "prompt.submit"
-  local params = { text = text }
+  local params = { text = text, attachments = attachments or {} }
   local function receive(result, request_error, error_detail)
     if finish_execution(request_error, error_detail) then return end
     state.cancel_requested = false
     if request_error then
       if error_detail and error_detail.code == "turn_retracted" then
         local prompt = error_detail.data and error_detail.data.prompt or text
-        if not from_composer then restore_retracted_prompt(prompt) end
+        if not from_composer then restore_retracted_prompt(prompt, attachments) end
         synchronize_state()
         return
       end
@@ -1047,6 +1043,7 @@ function M.drain()
     return
   end
   local entry = state.queue[1]
+  if state.queue_edit and state.queue_edit.barrier == entry then return end
   local text = type(entry) == "table" and entry.text or entry
   if text and not state.queue_suspended then
     local next_config, prompt, failure = model_command(text)
@@ -1056,13 +1053,14 @@ function M.drain()
       M.configure(next_config, true, function(applied)
         if not applied then return end
         if state.queue[1] ~= entry then return end
+        if state.queue_edit and state.queue_edit.barrier == entry then return end
         table.remove(state.queue, 1)
-        if prompt ~= "" then begin_request(prompt) else M.drain() end
+        if prompt ~= "" then begin_request(prompt, false, type(entry) == "table" and entry.attachments or {}) else M.drain() end
       end)
       return
     end
     table.remove(state.queue, 1)
-    if text == "/compact" then M.compact() else begin_request(text) end
+    if text == "/compact" then M.compact() else begin_request(text, false, type(entry) == "table" and entry.attachments or {}) end
     return
   end
 
@@ -1439,7 +1437,9 @@ function M.agent_action(action, run_id, message)
   end
   client.request("agent." .. action, params, function(_, failure)
     if failure then notifications.error(failure, "Harness child " .. action) return end
-    if message and composer_text(state.composer_buf) == message then set_composer_text(state.composer_buf, "") end
+    if message and not state.queue_edit and composer_text(state.composer_buf) == message then
+      set_composer_text(state.composer_buf, "")
+    end
     synchronize_state()
   end)
 end
@@ -1504,12 +1504,42 @@ function M.open_background_picker()
   end)
 end
 
+local function finish_queue_edit(state, text)
+  local edit = state.queue_edit
+  queue_editor.remember(state, text)
+  local source = require("forge.views.harness.completion.command_source")
+  for index, entry in ipairs(state.queue) do
+    local draft = edit.drafts[entry]
+    if draft and draft ~= "" then
+      local _, _, failure = model_command(draft)
+      if not source.accepts_prompt(draft) or not source.queues_execution(draft) then
+        failure = "Use a prompt, or clear the text to delete this queued message"
+      end
+      if failure then
+        edit.entry = entry
+        set_composer_text(state.composer_buf, draft)
+        notifications.warn("Queued message " .. index .. ": " .. failure, "ForgeHarness")
+        M.refresh_winbar()
+        return
+      end
+    end
+  end
+  local original, failure, attachments = queue_editor.finish(state, text)
+  if failure then notifications.warn(failure, "ForgeHarness") return end
+  if text ~= "" then prompt_history.record(text) end
+  set_composer_text(state.composer_buf, original, attachments)
+  M.refresh_winbar()
+  M.drain()
+end
+
 function M.submit()
+  if not attachments_ready(harness_state().composer_buf) then return end
   if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
   harness_state().execution_notice = nil
   local state = harness_state()
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
+  if state.queue_edit then finish_queue_edit(state, text) return end
   if text == "/task refresh" then
     state.state_sync_retry = nil
     synchronize_state()
@@ -1813,14 +1843,15 @@ function M.submit()
     return
   end
   if state.busy or state.configuring then
+    local attachments = attachment.capture(state.composer_buf).attachments
     set_composer_text(state.composer_buf, "")
     if state.busy and not selected_agent_run(state)
       and ((state.capability and state.capability.native_steer) or (state.status and state.status.kind == "waiting_for_agent"))
     then
-      submit_immediate(state, text)
+      submit_immediate(state, text, attachments)
       return
     end
-    state.queue[#state.queue + 1] = { text = text, task_id = state.session and state.session.current_task_id }
+    state.queue[#state.queue + 1] = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
     M.refresh_winbar()
     return
   end
@@ -1836,21 +1867,22 @@ local function remove_pending_steer(state, target)
   end
 end
 
-submit_immediate = function(state, text)
+submit_immediate = function(state, text, attachments)
+  attachments = attachments or attachment.capture(state.composer_buf).attachments
   if state.selected_agent_run_id then
     M.agent_action("message", state.selected_agent_run_id, text)
     return
   end
   set_composer_text(state.composer_buf, "")
-  local pending = { text = text }
+  local pending = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
   recap.clear(state)
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
-  client.request("turn.steer", { text = text }, function(_, request_error)
+  client.request("turn.steer", pending, function(_, request_error)
     if request_error then
       remove_pending_steer(state, pending)
-      state.queue[#state.queue + 1] = text
+      state.queue[#state.queue + 1] = pending
       notifications.warn("Steering missed the active turn. Queued as a follow-up", "ForgeHarness")
     end
     M.refresh_winbar()
@@ -1861,6 +1893,8 @@ end
 ---Send the composer into the active provider turn without creating a new interaction.
 function M.steer_submit()
   local state = harness_state()
+  if not attachments_ready(state.composer_buf) then return end
+  if state.queue_edit then M.submit() return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if state.selected_agent_run_id then
@@ -1876,19 +1910,17 @@ function M.steer_submit()
     notifications.warn("The current backend does not support active-turn steering", "ForgeHarness")
     return
   end
-  if state.task_operation and state.task_operation.state ~= "running" then
-    M.refresh_winbar()
-    return
-  end
   prompt_history.record(text)
   submit_immediate(state, text)
 end
 
 ---Queue a follow-up independently of active waits and the selected child timeline.
 function M.queue_submit()
+  if not attachments_ready(harness_state().composer_buf) then return end
   if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
   harness_state().execution_notice = nil
   local state = harness_state()
+  if state.queue_edit then M.submit() return end
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
@@ -1900,7 +1932,7 @@ function M.queue_submit()
   local _, _, failure = model_command(text)
   if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
-  state.queue[#state.queue + 1] = { text = text, task_id = state.session and state.session.current_task_id }
+  state.queue[#state.queue + 1] = { text = text, attachments = attachment.capture(state.composer_buf).attachments, task_id = state.session and state.session.current_task_id }
   set_composer_text(state.composer_buf, "")
   M.refresh_winbar()
   M.drain()
@@ -1908,15 +1940,11 @@ end
 
 function M.edit_last_queued()
   local state = harness_state()
-  if state.configuring and #state.queue == 1 then return end
-  local queued = table.remove(state.queue)
-  if not queued then
-    notifications.warn("No queued prompt to edit", "ForgeHarness")
-    return
-  end
+  if not attachments_ready(state.composer_buf) then return end
   local draft = composer_text(state.composer_buf)
-  if draft ~= "" then state.queue[#state.queue + 1] = draft end
-  set_composer_text(state.composer_buf, type(queued) == "table" and queued.text or queued)
+  local text, failure, attachments = queue_editor.previous(state, draft)
+  if failure then notifications.warn(failure, "ForgeHarness") return end
+  set_composer_text(state.composer_buf, text, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
   end
@@ -2200,6 +2228,7 @@ end
 ---@param mode string
 function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
+  if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
   if action.action ~= "configure" then
@@ -2324,6 +2353,30 @@ end
 ---@param completed? fun(applied: boolean)
 function M.configure(next_config, validate_selection, completed)
   local state = harness_state()
+  local only_field = next(next_config)
+  if only_field == "status_thoughts" and next(next_config, only_field) == nil then
+    local session_id = state.session.id
+    local generation = client.host_generation()
+    state.status_thoughts_request = (state.status_thoughts_request or 0) + 1
+    local request_revision = state.status_thoughts_request
+    client.request_for(session_id, "session.configure", next_config, function(result, failure)
+      if harness_state() ~= state or not state.session or state.session.id ~= session_id
+        or client.host_generation() ~= generation then return end
+      if state.status_thoughts_request ~= request_revision then
+        if completed then completed(false) end
+        return
+      end
+      if failure then
+        report_configuration_error(failure)
+        if completed then completed(false) end
+        return
+      end
+      state.status_thoughts = result.status_thoughts == true
+      M.render()
+      if completed then completed(true) end
+    end)
+    return
+  end
   local timeout_only = next(next_config) ~= nil
   for field in pairs(next_config) do
     if field ~= "approval_timeout" and field ~= "answer_timeout" then timeout_only = false end
@@ -2410,6 +2463,7 @@ end
 
 local function close()
   local state = harness_state()
+  queue_editor.remember(state, composer_text(state.composer_buf))
   local workspace = require("forge.views.harness.workspace")
   workspace.release(state)
   if state.presentation then
@@ -2444,7 +2498,7 @@ function M.activate_snapshot(result)
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)
-  if previous_session ~= state.session.id then state.queue = {} end
+  if previous_session ~= state.session.id then state.queue, state.queue_edit = {}, nil end
   M.render()
   M.resolve_runtime_model()
   if state.active_elicitation and state.active_elicitation.elicitation then
@@ -2501,6 +2555,24 @@ end
 
 function M.attach()
   local state = harness_state()
+  local composer_buffer = state.composer_buf
+  attachment.attach(composer_buffer, state.session and state.session.id)
+  attachment.decorate(state.transcript_buf)
+  local edit = state.queue_edit
+  if edit and edit.buffer ~= composer_buffer then
+    set_composer_text(composer_buffer, edit.drafts[edit.entry] or edit.entry.text)
+    edit.buffer = composer_buffer
+  end
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI", "BufLeave", "BufWipeout" }, {
+    group = vim.api.nvim_create_augroup("ForgeQueueEdit" .. composer_buffer, { clear = true }),
+    buffer = composer_buffer,
+    callback = function(event)
+      if state.composer_buf ~= composer_buffer or not state.queue_edit
+        or not vim.api.nvim_buf_is_valid(composer_buffer) then return end
+      queue_editor.remember(state, composer_text(composer_buffer))
+      if event.event == "TextChanged" or event.event == "TextChangedI" then render_status_hint(state) end
+    end,
+  })
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)

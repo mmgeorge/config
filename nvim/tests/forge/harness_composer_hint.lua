@@ -5,6 +5,23 @@ local commands = require("forge.views.harness.controller").command_set()
 local original = vim.deepcopy(config.options.keymaps.harness)
 local buffer = vim.api.nvim_create_buf(false, true)
 local ok, failure = xpcall(function()
+  local pinned = keymaps.view_hint_entries("harness", commands)
+  assert(#pinned == 1 and pinned[1].id == "help", "top bar must advertise only help")
+  local context = { { text = "75% left (200K)", group = "ForgeStatusHint" } }
+  local function top_bar(status)
+    keymaps.apply_view_winbar(0, "", "harness", commands, status, nil, context)
+    return vim.api.nvim_eval_statusline(vim.wo.winbar, { use_winbar = true, maxwidth = 2000 }).str
+  end
+  for _, status in ipairs({ "Read", string.rep("Read ", vim.api.nvim_win_get_width(0)) }) do
+    local text = top_bar(status)
+    assert(text:find("75% left (200K) • ? help", 1, true), "context must precede help in wide and compact bars")
+    assert(not text:find("submit", 1, true), "top bar contains additional command hints")
+  end
+  config.options.keymaps.harness.help = "<F1>"
+  assert(top_bar("Read"):find("<F1> help", 1, true), "help hint must use the configured binding")
+  config.options.keymaps.harness.help = false
+  assert(not top_bar("Read"):find("help", 1, true), "disabled help must not be advertised")
+  config.options.keymaps.harness.help = original.help
   local function display(state, width)
     return vim.api.nvim_eval_statusline(keymaps.render_hintbar(
       keymaps.view_hint_entries("harness", commands, state, "composer"), width or 140),

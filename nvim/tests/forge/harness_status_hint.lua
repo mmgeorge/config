@@ -327,5 +327,27 @@ assert(#vim.api.nvim_buf_get_extmarks(compacting.buffer, namespace, 0, -1, {}) =
   "completed compaction retained a spinner")
 hint.clear(compacting.buffer)
 buffer.close(compacting)
+local staged_transcript = buffer.open("staged-status", {})
+assert(buffer.apply_snapshot(staged_transcript, {
+  document = staged_transcript.document, revision = 0, block = {
+    { id = "phase", text = { "", "Working" }, metadata = {
+      status = { row = 1, animated = true, hint = "working" },
+      target = {}, decoration = {}, editable_region = {},
+    } },
+    { id = "harness:staging", text = { "Queued follow-up inputs", "Keep this queued" }, metadata = {
+      target = {}, decoration = {}, editable_region = {},
+    } },
+  },
+}).kind == "Applied")
+hint.render(staged_transcript, command_set, 120)
+local staged_spinner = vim.api.nvim_buf_get_extmark_by_id(staged_transcript.buffer, namespace, 1, { details = true })
+assert(staged_spinner[1] == 1 and staged_spinner[3].sign_text,
+  "staged messages hid the native status location")
+staged_transcript.status_notice = { text = "Reconnecting", animated = false }
+hint.render(staged_transcript, command_set, 120)
+assert(vim.api.nvim_buf_get_lines(staged_transcript.buffer, 3, 4, false)[1] == "Keep this queued",
+  "status notice hid staged messages")
+hint.clear(staged_transcript.buffer)
+buffer.close(staged_transcript)
 print("harness status hint passed")
 vim.cmd("qa!")

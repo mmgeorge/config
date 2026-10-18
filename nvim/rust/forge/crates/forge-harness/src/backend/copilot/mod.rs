@@ -38,7 +38,7 @@ use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::session_events::ReasoningSummary;
 use github_copilot_sdk::types::{ContextTier, ToolSearchConfig};
 use github_copilot_sdk::{
-    CliProgram, Client, ClientOptions, DeliveryMode, MessageOptions, Model, PermissionRequestData,
+    CliProgram, Client, ClientOptions, DeliveryMode, Model, PermissionRequestData,
     PermissionRequestKind, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
     SetModelOptions, SystemMessageConfig, Tool, ToolInvocation, ToolResult,
 };
@@ -700,8 +700,8 @@ impl Backend for CopilotBackend {
                 .await;
         }
         let provider_text = match &request.input {
-            BackendInput::Text { text } => text.clone(),
-            BackendInput::Skill { name, arguments } => {
+            BackendInput::Text { text, .. } => text.clone(),
+            BackendInput::Skill { name, arguments, .. } => {
                 let skill_available = session
                     .rpc()
                     .skills()
@@ -736,9 +736,10 @@ impl Backend for CopilotBackend {
         );
         let history = session.rpc().event_log().tail().await.context("capture Copilot pre-submit history boundary")?;
         turn_event.set_history_cursor(history.cursor)?;
+        let message = crate::attachment::copilot_input(&prompt, request.input.attachments())?;
         turn_event.send(async {
             self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
-            session.send(MessageOptions::new(prompt)).await.context("send Copilot prompt")
+            session.send(message).await.context("send Copilot prompt")
         }).await?;
         let mut execution_control_call = std::collections::HashSet::new();
         let mut execution_turn_stopped = false;
@@ -1216,16 +1217,18 @@ impl Backend for CopilotBackend {
 
     async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
         let text = input.text().to_owned();
+        let message = crate::attachment::copilot_input(&text, input.attachments())?
+            .with_mode(DeliveryMode::Immediate);
         self.trace.record(session_id, "copilot.session.steer", json!({"text":text}));
         let session = self
             .active_session(session_id)
             .await
             .context("Copilot session has not started")?;
         self.turn_event(session_id).await.send(async {
-            session.send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
+            session.send(message)
                 .await.context("steer active Copilot turn")
         }).await?;
-        if matches!(input, super::SteeringInput::User(_)) {
+        if matches!(input, super::SteeringInput::User { .. }) {
             self.turn_event(session_id).await.publish_steering(text).await?;
         }
         Ok(())

@@ -13,6 +13,7 @@ local transcript_options = {
 }
 
 function M.open(options, callback)
+  local tail = require("forge.views.harness.tail_follow").new(options.transcript_buffer)
   local loading_namespace = vim.api.nvim_create_namespace("ForgeHarnessLoading" .. options.transcript_buffer)
   local loading_mark = {}
   local function clear_loading()
@@ -24,7 +25,8 @@ function M.open(options, callback)
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
   local owner = { document = identity, submission_sequence = 0, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
-    timeline_key = "main", timeline_view = {}, epoch = 0 }
+    timeline_key = "main", timeline_view = {}, epoch = 0,
+    staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
   local function alive()
     return not owner.closed and owner.host_generation == client.host_generation()
       and client.host_accepting() and options.is_alive()
@@ -33,6 +35,7 @@ function M.open(options, callback)
     if options.notice then options.notice(message) end
   end
   local queued, active = {}, false
+  local flush_staging
   local function fail(message)
     local previous = owner.failure
     owner.failure = tostring(message) .. ". Reopen Harness to retry."
@@ -202,8 +205,9 @@ function M.open(options, callback)
         if not alive() then return end
         if result.kind ~= "Applied" then
           fail("Harness snapshot could not be adopted: " .. tostring(result.kind))
-        elseif vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
-          owner.follow_tail()
+        else
+          flush_staging()
+          if options.on_update then options.on_update() end
         end
         dispatch_next()
         if owner.next_timeline then owner.sync() end
@@ -224,6 +228,9 @@ function M.open(options, callback)
   owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
     before_commit = function()
+      if not owner.restore_timeline then
+        for window in pairs(owner.views) do tail.capture(window) end
+      end
       if not owner.save_timeline then return end
       local saved = {}
       for _, window in ipairs(vim.fn.win_findbuf(options.transcript_buffer)) do
@@ -232,11 +239,49 @@ function M.open(options, callback)
       owner.timeline_view[owner.save_timeline] = saved
       owner.save_timeline = nil
     end,
+    after_commit = function()
+      for window in pairs(owner.views) do
+        if owner.restore_timeline or not owner.ready then tail.reset(window)
+        else tail.publish(window) end
+      end
+    end,
     recover = function() recovery(owner.transcript) end })
   owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
   owner.transcript.fold_loading = {}
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
   owner.views[options.transcript_window] = owner.view
+  flush_staging = function()
+    if not alive() or not owner.ready or owner.failure or owner.selecting or owner.applying
+      or owner.staging_inflight or vim.deep_equal(owner.staging, owner.applied_staging) then return end
+    local pending = vim.deepcopy(owner.staging)
+    owner.staging_inflight = true
+    request({ operation = "staging", document = identity, queue = pending.queue, steering = pending.steering }, function(_, failure)
+      owner.staging_inflight = false
+      if failure then fail("Staging update failed: " .. tostring(failure)) return end
+      owner.applied_staging = pending
+      flush_staging()
+      owner.sync()
+    end, nil, function()
+      owner.staging_inflight = false
+      owner.applied_staging = nil
+    end)
+  end
+
+  ---Replace transient staged messages without changing the composer or durable history.
+  ---@param queue (string|{text: string})[]?
+  ---@param steering {text: string}[]?
+  function owner.set_staging(queue, steering)
+    local staged = { queue = {}, steering = {} }
+    for _, entry in ipairs(queue or {}) do
+      staged.queue[#staged.queue + 1] = type(entry) == "table" and entry.text or entry
+    end
+    for _, entry in ipairs(steering or {}) do
+      staged.steering[#staged.steering + 1] = entry.text or ""
+    end
+    owner.staging = staged
+    flush_staging()
+  end
+
   request({ operation = "open", document = identity, view = owner.view.id,
     width = require("forge.width").capture(options.transcript_window) }, function(opened, failure)
     if not alive() then
@@ -257,6 +302,7 @@ function M.open(options, callback)
       return
     end
     owner.ready = true
+    flush_staging()
     render_markdown()
     vim.schedule(function() if alive() then owner.observe_sections() end end)
     if not options.read_only then owner.terminals = require("forge.views.harness.terminals").watch({
@@ -409,11 +455,11 @@ function M.open(options, callback)
           for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
             if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
               vim.api.nvim_win_call(window, function() vim.fn.winrestview(saved) end)
+              tail.reset(window)
             end
           end
           owner.restore_timeline = nil
         end
-        if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
         render_markdown(switched_timeline)
         owner.observe_sections()
         if options.on_update then options.on_update() end
@@ -629,6 +675,7 @@ function M.open(options, callback)
     for window, view in pairs(owner.views) do
       if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= owner.transcript.buffer then
         input.close(view)
+        tail.remove(window)
         owner.views[window] = nil
         owner.transcript.fold_loading[window] = nil
         if owner.section_intent then owner.section_intent[view.id] = nil end
@@ -725,7 +772,7 @@ function M.open(options, callback)
     request({ operation = "select_agent", document = identity, run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
       owner.selecting = false
       if not alive() then return end
-      if failure then notice(failure) return end
+      if failure then notice(failure) flush_staging() return end
       owner.save_timeline = owner.timeline_key
       owner.timeline_key, owner.restore_timeline = target, target
       owner.sync()
@@ -735,11 +782,9 @@ function M.open(options, callback)
   ---Resume transcript tail following for an explicit user action without changing focus.
   function owner.follow_tail()
     if not alive() or not owner.ready then return end
-    local last_row = vim.api.nvim_buf_line_count(owner.transcript.buffer)
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
-        vim.api.nvim_win_set_cursor(window, { last_row, 0 })
-        vim.api.nvim_win_call(window, function() vim.cmd("normal! $zb") end)
+        tail.follow(window)
       end
     end
   end
@@ -757,11 +802,13 @@ function M.open(options, callback)
     end
     owner.submission_sequence = owner.submission_sequence + 1
     local submission = { token = owner.submission_sequence, source = source,
-      changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer) }
+      changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer),
+      attachments = require("forge.views.harness.attachment").capture(options.composer_buffer).attachments }
     owner.submission = submission
     owner.follow_tail()
     client.request_for(options.session_id, "prompt.submit", {
       text = text, submission = { document = identity, token = submission.token },
+      attachments = submission.attachments,
     }, function(result, failure, error_detail)
       if owner.closed or owner.host_generation ~= client.host_generation() or owner.submission ~= submission then return end
       owner.submission = nil
@@ -780,11 +827,13 @@ function M.open(options, callback)
       submission.accepted = true
       if changedtick == submission.changedtick then
         vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, { "" })
+        require("forge.views.harness.attachment").restore(options.composer_buffer, {})
         submission.cleared_tick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
       end
     elseif transition.state == "retracted" and submission.cleared_tick then
       if changedtick == submission.cleared_tick then
         vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, submission.source)
+        require("forge.views.harness.attachment").restore(options.composer_buffer, submission.attachments)
       end
       submission.cleared_tick = nil
     end
@@ -828,6 +877,7 @@ function M.open(options, callback)
   local markdown_scheduled = false
   vim.api.nvim_create_autocmd({ "WinScrolled", "CursorMoved", "CursorMovedI", "BufWinEnter", "WinClosed" }, {
     group = owner.group, callback = function()
+      for window in pairs(owner.views) do tail.observe(window) end
       if markdown_scheduled then return end
       markdown_scheduled = true
       vim.schedule(function() markdown_scheduled = false render_markdown(false) owner.observe_sections() end)
@@ -835,15 +885,6 @@ function M.open(options, callback)
   })
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, {
     group = owner.group, callback = function() vim.schedule(owner.refresh_views) end,
-  })
-  vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
-    group = owner.group, callback = function()
-      vim.schedule(function()
-        if alive() and owner.ready and vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
-          owner.follow_tail()
-        end
-      end)
-    end,
   })
   for _, buffer in ipairs({ options.transcript_buffer, options.composer_buffer }) do
     vim.api.nvim_create_autocmd("BufWipeout", { group = owner.group, buffer = buffer, once = true,

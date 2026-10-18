@@ -41,10 +41,11 @@ local ok, failure = xpcall(function()
   owner.sync()
   assert(#requests == 1, "refresh bypassed the publication interval")
   assert(vim.wait(500, function() return #requests == 2 end, 1))
+  vim.api.nvim_win_set_cursor(window, { 1, 0 })
   requests[2].callback({ snapshot = vim.NIL, patch = {} })
   assert(owner.transcript.status == "Applied", "null snapshot desynchronized incremental transcript updates")
   assert(#requests == 2, "one burst dispatched redundant refreshes")
-  assert(vim.api.nvim_win_get_cursor(window)[1] == 1, "background sync moved a reader away from history")
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 1, "native patch publication moved a reader away from history")
   vim.api.nvim_buf_set_text(composer, 0, 0, 0, 5, { "first typed prompt" })
   assert(#requests == 2, "typing sent a composer request")
   owner.follow_tail()
@@ -137,7 +138,11 @@ local ok, failure = xpcall(function()
     is_alive = function() return true end, notice = function(message) notices[#notices + 1] = message end,
   }, function(value, error_message) assert(value and not error_message) end)
   local initial = requests[#requests]
-  initial.callback({ transcript = snapshot(initial.params.document, "retained history") })
+  local stream = snapshot(initial.params.document, "retained history")
+  for row = 1, vim.api.nvim_win_get_height(window) * 2 do
+    stream.block[1].text[#stream.block[1].text + 1] = "history row " .. row
+  end
+  initial.callback({ transcript = stream })
   local function refresh()
     local count = #requests
     owner.sync()
@@ -146,6 +151,26 @@ local ok, failure = xpcall(function()
     end, 1))
     return requests[#requests]
   end
+  owner.follow_tail()
+  stream.revision = 1
+  stream.block[1].text[#stream.block[1].text + 1] = "streamed at bottom"
+  refresh().callback({ snapshot = vim.deepcopy(stream) })
+  assert(vim.api.nvim_win_get_cursor(window)[1] == #stream.block[1].text,
+    "snapshot publication did not follow a window already at the bottom")
+  local delayed = refresh()
+  vim.api.nvim_win_call(window, function() vim.cmd("normal! ggzt") end)
+  local reading_view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+  local composer_window = vim.api.nvim_open_win(composer, true, {
+    relative = "editor", row = 0, col = 0, width = 20, height = 3, style = "minimal",
+  })
+  stream.revision = 2
+  stream.block[1].text[#stream.block[1].text + 1] = "streamed while reading"
+  delayed.callback({ snapshot = vim.deepcopy(stream) })
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 1,
+    "an in-flight snapshot ignored navigation before publication")
+  assert(vim.api.nvim_win_call(window, vim.fn.winsaveview).topline == reading_view.topline,
+    "composer focus resumed following while the transcript was scrolled up")
+  vim.api.nvim_win_close(composer_window, true)
   refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
   local failed_count = #requests
   for _ = 1, 3 do owner.sync() end

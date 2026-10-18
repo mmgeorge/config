@@ -433,7 +433,7 @@ impl TimelineRenderer<'_> {
                 };
                 self.literal(id, &text, action)?;
             }
-            TimelineEntry::Status { id, status, agent_count, .. } => {
+            TimelineEntry::Status { id, status, agent_count, status_thoughts, .. } => {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
@@ -554,7 +554,7 @@ impl TimelineRenderer<'_> {
                         },
                     });
                 }
-                if let SessionPhase::Working { reasoning_summary: Some(summary), .. } = status {
+                if *status_thoughts && let SessionPhase::Working { reasoning_summary: Some(summary), .. } = status {
                     append_reasoning_preview(&mut block, &self.content_width(), summary)?;
                 }
                 self.push(block)?;
@@ -3973,7 +3973,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let render = |execution: crate::session::state_machine::ExecutionStatus| project_at(&TimelineEntry::Status { agent_count: 0,
+        let render = |execution: crate::session::state_machine::ExecutionStatus| project_at(&TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Working {
                 duration_ms: 0, started_at_ms: Some(0), activity: execution.phase.into(),
@@ -4017,7 +4017,7 @@ mod tests {
             (SessionPhase::PlanningFailed { plan_id: "plan".into(), turn_count: 2, reason: "no progress limit reached".into() }, "Planning stopped · no progress limit reached", false, None),
         ];
         for (phase, expected, animated, hint) in cases {
-            let projection = project_at(&TimelineEntry::Status { agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
+            let projection = project_at(&TimelineEntry::Status { status_thoughts: true, agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
             let block = &projection.entry.block[0];
             assert_eq!(block.text.wire_rows(), vec!["", expected]);
             assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
@@ -4031,7 +4031,7 @@ mod tests {
     #[test]
     fn working_status_reports_elapsed_seconds_without_persisting_a_timer_value() {
         let projection = project_at(
-            &TimelineEntry::Status { agent_count: 0,
+            &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -4063,7 +4063,7 @@ mod tests {
             WorkflowActivity::Resolving, WorkflowActivity::Goal,
         ] {
             let projection = project_at(
-                &TimelineEntry::Status { agent_count: 0,
+                &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     status: SessionPhase::Working {
@@ -4101,7 +4101,7 @@ mod tests {
         for summary in ["", " \n\t ", "**Considering new ECS components** with Unicode 界 and enough detail to wrap"] {
             let width = WidthProfile { columns: 32, ..Default::default() };
             let projection = project_at(&TimelineEntry::Status {
-                id: "session:status".into(), created_at_ms: 0, agent_count: 0,
+                id: "session:status".into(), created_at_ms: 0, status_thoughts: true, agent_count: 0,
                 status: SessionPhase::Working {
                     duration_ms: 37_000, started_at_ms: None,
                     activity: WorkflowActivity::Planning, execution: None,
@@ -4122,6 +4122,27 @@ mod tests {
     }
 
     #[test]
+    fn status_thoughts_can_be_hidden_without_hiding_the_status() {
+        for status_thoughts in [false, true] {
+            let projected = project_at(&TimelineEntry::Status {
+                id: "session:status".into(), created_at_ms: 0, agent_count: 0, status_thoughts,
+                status: SessionPhase::Working {
+                    duration_ms: 3_000, started_at_ms: None,
+                    activity: WorkflowActivity::Working, execution: None,
+                    reasoning_summary: Some("Inspecting the selected files".into()),
+                },
+            }, &WidthProfile::default(), 0).unwrap();
+            let block = &projected.entry.block[0];
+            let rows = block.text.wire_rows();
+            assert_eq!(rows[1], "Working · 3s");
+            assert_eq!(rows.iter().any(|row| row.contains("Inspecting the selected files")), status_thoughts);
+            assert_eq!(block.metadata.decoration.iter().any(|decoration|
+                decoration.capture == "ForgeHarnessCommentary"), status_thoughts);
+            assert!(block.metadata.status.as_ref().unwrap().animated);
+        }
+    }
+
+    #[test]
     fn awaiting_input_status_exposes_question_hint_target() {
         for owner in [
             crate::broker::ElicitationOwner::Plan,
@@ -4129,7 +4150,7 @@ mod tests {
             crate::broker::ElicitationOwner::PlanAcceptance,
         ] {
             let projected = project_at(
-                &TimelineEntry::Status { agent_count: 0,
+                &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     status: SessionPhase::AwaitingInput {
@@ -4154,7 +4175,7 @@ mod tests {
     #[test]
     fn review_status_has_a_separate_unindented_action_row() {
         let projected = project_at(
-            &TimelineEntry::Status { agent_count: 0,
+            &TimelineEntry::Status { status_thoughts: true, agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::AwaitingPlanReview {
@@ -4296,7 +4317,7 @@ mod tests {
                 let status = SessionPhase::resolve(None, None, Some(exchange));
                 assert!(matches!(status, SessionPhase::Working { .. }));
                 let projection = project_at(&TimelineEntry::Status {
-                    id:"status".into(), created_at_ms:1000, status, agent_count:0,
+                    id:"status".into(), created_at_ms:1000, status, status_thoughts: true, agent_count:0,
                 }, &WidthProfile::default(), now_ms)?;
                 assert_eq!(projection.entry.block[0].text.row(1),
                     Some(format!("{} · {seconds}s", activity.active_label()).as_str()));
@@ -4384,7 +4405,7 @@ mod tests {
     fn empty_or_stale_comparison_does_not_claim_live_work() -> anyhow::Result<()> {
         for phase in [crate::plan::PlanPhase::Implement, crate::plan::PlanPhase::Verify] {
             let projection = project_at(&TimelineEntry::Status {
-                id:"status".into(), created_at_ms:1000, agent_count:0,
+                id:"status".into(), created_at_ms:1000, status_thoughts: true, agent_count:0,
                 status:SessionPhase::Working {
                     duration_ms:3000, started_at_ms:None, activity:WorkflowActivity::Implementing,
                     reasoning_summary:None, execution:Some(crate::session::state_machine::ExecutionStatus {
@@ -4800,7 +4821,7 @@ fn agent_counts_preserve_the_primary_status_and_spinner() -> anyhow::Result<()> 
         (SessionPhase::Paused,"Paused",false),
         (SessionPhase::AwaitingPlanReview {plan_id:"plan".into(),revision:1},"Waiting for plan review",false),
     ] {
-        let projection=project_at(&TimelineEntry::Status {id:"status".into(),created_at_ms:0,status,agent_count:2},
+        let projection=project_at(&TimelineEntry::Status { status_thoughts: true,id:"status".into(),created_at_ms:0,status,agent_count:2},
             &WidthProfile::default(),1000)?;
         let text=projection.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.contains(label) && text.contains("2 agents running"),"{text}");

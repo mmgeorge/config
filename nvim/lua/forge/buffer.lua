@@ -160,10 +160,11 @@ local function validate_order(order, block, row_count, read_row)
   return region_seen
 end
 
---- Creates a native replica. before_commit runs after preparation, without yielding,
---- immediately before view capture and native mutation. It must not schedule work.
+--- Creates a native replica. before_commit runs immediately before view capture and mutation,
+--- after preparation. after_commit runs after view restoration. Both callbacks run without yielding
+--- inside the same publication and must not schedule work.
 ---@param document string
----@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, retain_removed_position?: boolean, before_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
+---@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, retain_removed_position?: boolean, before_commit?: fun(), after_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
 function M.open(document, options)
   options = options or {}
   identity(document)
@@ -192,6 +193,7 @@ function M.open(document, options)
     preserve_view = options.preserve_view == true,
     retain_removed_position = options.retain_removed_position == true,
     before_commit = options.before_commit,
+    after_commit = options.after_commit,
     expected_changedtick = generated and options.expected_changedtick or nil,
     generated_filetype = options.filetype or "forge",
     document = document, buffer = buffer, namespace = vim.api.nvim_create_namespace(""),
@@ -584,6 +586,7 @@ local function commit_patch(session, patch)
       decorations.attach(session)
       checkpoint("decorations")
       buffer_view.restore(session, retained_view)
+      if session.after_commit then session.after_commit() end
       checkpoint("view_restore")
     end)
     if not ok then finish("presentation_failed") return M.fail_apply(session, prepared.failure) end
@@ -689,6 +692,7 @@ function M.apply_projected_snapshot(session, snapshot, render_source)
     ok, prepared.failure = pcall(function()
       decorations.attach(session)
       buffer_view.restore(session, retained_view)
+      if session.after_commit then session.after_commit() end
     end)
     if not ok then return M.fail_apply(session, prepared.failure) end
     return { kind = "Applied", revision = session.revision }

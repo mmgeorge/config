@@ -96,7 +96,8 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     pub fn prompt(&self, id: BlockId, source: &str) -> Result<BufferBlock> {
-        let mut block = self.literal(id, &format!("● {source}"), 2)?;
+        // The concealed marker moves into the sign column, which indents every display row.
+        let mut block = self.literal(id, &format!("● {source}"), 0)?;
         block.metadata.decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition { row: 0, column: 0 },
@@ -592,6 +593,16 @@ mod test {
     }
 
     #[test]
+    fn attachment_prompt_wraps_only_the_visible_label() -> Result<()> {
+        let profile = WidthProfile { columns: 40, ..WidthProfile::default() };
+        let source = "Inspect [Image #1]";
+        let block = TranscriptRenderer::new(&profile)?.prompt(BlockId("attachment".into()), &source)?;
+        assert_eq!(block.text.row_count(), 1);
+        assert_eq!(block.text.row(0), Some("● Inspect [Image #1]"));
+        Ok(())
+    }
+
+    #[test]
     fn expanded_mcp_keeps_one_heading_above_response() -> Result<()> {
         let profile = WidthProfile { columns: 70, ..WidthProfile::default() };
         let renderer = TranscriptRenderer::new(&profile)?;
@@ -941,7 +952,7 @@ mod test {
     }
 
     #[test]
-    fn wrapped_prompt_uses_two_space_continuations() -> Result<()> {
+    fn wrapped_prompt_keeps_continuations_aligned_with_concealed_marker() -> Result<()> {
         let profile = WidthProfile {
             columns: 12,
             ..WidthProfile::default()
@@ -949,8 +960,18 @@ mod test {
         let block = TranscriptRenderer::new(&profile)?
             .prompt(BlockId("prompt:wrapped".into()), "alpha beta gamma")?;
 
-        assert_eq!(block.text.wire_rows(), vec!["● alpha ", "  beta gamma"]);
+        assert_eq!(block.text.wire_rows(), vec!["● alpha ", "beta gamma"]);
         assert_eq!(block.metadata.decoration[0].range.end.row, 2);
+        block.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn multiline_prompt_preserves_source_indentation_without_extra_padding() -> Result<()> {
+        let profile = WidthProfile::default();
+        let block = TranscriptRenderer::new(&profile)?
+            .prompt(BlockId("prompt:multiline".into()), "first\n  indented\n\nlast")?;
+        assert_eq!(block.text.wire_rows(), vec!["● first", "  indented", "", "last"]);
         block.validate()?;
         Ok(())
     }

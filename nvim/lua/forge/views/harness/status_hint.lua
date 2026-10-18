@@ -81,7 +81,7 @@ local function status_location(transcript)
         cached.block, cached.offset, cached.status = node.id, status.row, status
         break
       end
-      if not node.id:find(":implementation:", 1, true) then break end
+      if node.id ~= "harness:staging" and not node.id:find(":implementation:", 1, true) then break end
     end
   end
   if not cached.status then return nil end

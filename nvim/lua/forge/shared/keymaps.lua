@@ -229,8 +229,12 @@ function M.apply_view_winbar(win, title, group, command_set, status, context, ri
   local help_key = help_action and M.view_keys_for(group, "help")[1] or nil
   local help_hint = help_key and M.render_hintbar({ { id = "help", key = help_key, label = "help" } },
     vim.api.nvim_win_get_width(win), { inline = true }) or ""
-  local compact_right = right_status_rendered ~= "" and ("%%=%s"):format(right_status_rendered)
-    or (help_hint ~= "" and ("%%=%%#ForgeStatusHint#%s%%*"):format(help_hint) or "")
+  local compact_content = right_status_rendered
+  if help_hint ~= "" then
+    if compact_content ~= "" then compact_content = compact_content .. " • " end
+    compact_content = compact_content .. ("%%#ForgeStatusHint#%s%%*"):format(help_hint)
+  end
+  local compact_right = compact_content ~= "" and ("%%=%s"):format(compact_content) or ""
   if status_rendered then
     local rendered_left = title_text ~= "" and ("%%#ForgeStatusLabel#%s%%*"):format(left) or status_rendered
     local rendered_center = title_text ~= "" and status_rendered or ""

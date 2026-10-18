@@ -43,6 +43,8 @@ pub struct PortableSettings {
     pub subagent_tools: Option<bool>,
     /// Enables read-only tools backed by the connected editor language servers.
     pub lsp_tools: Option<bool>,
+    /// Shows the latest thought beneath live status without changing timeline messages.
+    pub status_thoughts: Option<bool>,
     #[serde(default)]
     /// Records selection by source identity, independent of provider display names.
     pub skill: BTreeMap<String, bool>,
@@ -62,6 +64,7 @@ impl PortableSettings {
         if overriding.plan_auto_approve_revisions.is_some() { self.plan_auto_approve_revisions = overriding.plan_auto_approve_revisions; }
         if overriding.subagent_tools.is_some() { self.subagent_tools = overriding.subagent_tools; }
         if overriding.lsp_tools.is_some() { self.lsp_tools = overriding.lsp_tools; }
+        if overriding.status_thoughts.is_some() { self.status_thoughts = overriding.status_thoughts; }
         if overriding.approval_timeout.is_some() { self.approval_timeout = overriding.approval_timeout; }
         if overriding.answer_timeout.is_some() { self.answer_timeout = overriding.answer_timeout; }
         self.skill.extend(overriding.skill);
@@ -510,6 +513,22 @@ impl SettingsStore {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn status_thoughts_inherit_and_survive_reopening_the_store() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let mut store = SettingsStore::open(fixture.path())?;
+        assert_eq!(store.get("workspace", "session", "mock")?.desired.status_thoughts, None);
+        store.update(0, SettingScope::Global, "workspace", "session",
+            &PortableSettings { status_thoughts: Some(true), ..Default::default() })?;
+        store.update(1, SettingScope::Workspace, "workspace", "session",
+            &PortableSettings { status_thoughts: Some(false), ..Default::default() })?;
+        drop(store);
+        let store = SettingsStore::open(fixture.path())?;
+        assert_eq!(store.get("other", "session", "mock")?.desired.status_thoughts, Some(true));
+        assert_eq!(store.get("workspace", "session", "mock")?.desired.status_thoughts, Some(false));
+        Ok(())
+    }
 
     #[test]
     fn fork_preserves_explicit_selection_without_freezing_inheritance() -> Result<()> {

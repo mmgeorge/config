@@ -544,6 +544,9 @@ function M.action(state, action, visual)
   if action == "open" then
     request(state, { operation = "open_target", input = captured }, function(effect, request_failure)
       if request_failure or not effect then notice(request_failure or "Missing file target") return end
+      if effect.kind == "open_file" or effect.kind == "open_source" then
+        effect.layout = require("forge.infra.config").options.status_open_target == "buffer" and "current" or "tab"
+      end
       buffer.apply_effect(state.replica, view, effect)
     end)
     return

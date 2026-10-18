@@ -344,7 +344,7 @@ impl HarnessBroker {
                 .map_err(|_| anyhow::anyhow!("presentation lock poisoned"))?;
             let patch = presentation.update_checks(run)?;
             let status = run.status();
-            (patch, presentation.update_live(None, None, status)?)
+            (patch, presentation.update_live(None, None, status, self.observer.status_thoughts.load(Ordering::Relaxed))?)
         };
         self.emit_timeline_patch(patch, events).await?;
         self.emit_timeline_patch(status_patch, events).await

@@ -42,11 +42,17 @@ help, selections, and gutters from native metadata. Physical source rows contain
 text, while decorations provide gutters and selection presentation without changing text.
 
 Composer resizing captures the current cursor and viewport immediately before changing
-window height. If the complete draft fits after accounting for wrapping, queued rows,
-and the winbar, the viewport starts at the first line. Otherwise it retains the current
+window height. If the complete draft fits after accounting for wrapping and the winbar,
+the viewport starts at the first line. Otherwise it retains the current
 scroll position. The height query stops after the visible-row budget, without limiting
 draft content. This prevents Insert-mode scrolling before window growth from hiding
 the first line of a short draft.
+
+Queued prompts and pending steering are physical, read-only rows below status in
+the timeline. Lua coalesces changes through the presentation's `staging` operation.
+Rust keeps them in a presentation-local block, separate from durable exchange
+history. These rows use normal timeline scrolling and never enter composer text
+or its height calculation. Refreshing staging preserves intentional transcript browsing.
 
 `forge.window_presentation` retains the ordinary source-window options before a native
 view applies document settings. Native documents use a fixed one-cell margin, while
@@ -99,6 +105,11 @@ from a desynchronized body, and reports request failures through the existing no
 Review buffers retain canonical source rows and draft comments separately. A collapsed source row is
 omitted from presentation without deleting its comment or changing its source anchor.
 
+Status applies the configured `status_open_target` to admitted file-opening effects.
+The default `tab` preserves the Status window, while `buffer` reuses it. Historical
+source creates its destination tab only after source loading and view validation
+succeed. Its close action removes an owned single-window tab while preserving other tabs.
+
 Updates validate source identities, ranges, and revisions before publication. The buffer
 writer captures every displayed window's cursor immediately before its synchronous commit.
 It restores surviving block identities afterward, or selects the enclosing heading when
@@ -125,7 +136,10 @@ included in the capture and never suppresses restoration. Cursor snapshots do no
 asynchronous preparation boundaries.
 
 The replica's `before_commit` callback runs at that same boundary. Timeline switches use it
-to save the outgoing view after backend requests and local preparation finish. Declaration
+to save the outgoing view after backend requests and local preparation finish. Its optional
+`after_commit` callback runs after viewport restoration in the same atomic patch or snapshot commit.
+Harness uses these callbacks to capture bottom visibility and apply per-window tail following
+without retaining stale scroll decisions across asynchronous preparation. Declaration
 expansion captures its viewport after the response, immediately before publication. Rejected
 editable-text changes capture cursors inside the scheduled rollback, not when queuing it.
 Action-target snapshots remain separate and only validate whether a response still applies.

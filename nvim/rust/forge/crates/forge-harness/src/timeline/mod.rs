@@ -79,6 +79,8 @@ pub enum TimelineEntry {
         id: String,
         created_at_ms: i64,
         status: SessionPhase,
+        /// Controls the status preview independently of retained thought messages.
+        status_thoughts: bool,
         /// Active child executions across the root session, independent of its phase.
         agent_count: usize,
     },

@@ -356,15 +356,18 @@ impl Backend for AcpBackend {
         let session = self.session(catalog_request(&request), Some(tools)).await?;
         let _turn = session.turn.try_lock().context("ACP session already owns active work")?;
         self.configure(&session, &request).await?;
-        session.state.begin(&request, &session.id, sink).await;
-        self.conversation.lock().await.insert(request.runtime_key()?, session.id.clone());
         let text = match &request.input {
-            BackendInput::Text { text } => text.clone(),
-            BackendInput::Skill { name, arguments } => format!("/{name} {arguments}"),
+            BackendInput::Text { text, .. } => text.clone(),
+            BackendInput::Skill { name, arguments, .. } => format!("/{name} {arguments}"),
         };
         let prompt = if text == "/compact" { text } else { format!("{}\n\n{}", request.system_message(), text) };
+        let image_supported = session.initialized.pointer("/agentCapabilities/promptCapabilities/image")
+            .and_then(Value::as_bool) == Some(true);
+        let prompt = crate::attachment::acp_input(prompt, request.input.attachments(), image_supported).await?;
+        session.state.begin(&request, &session.id, sink).await;
+        self.conversation.lock().await.insert(request.runtime_key()?, session.id.clone());
         let response = session.transport.request("session/prompt", json!({"sessionId":session.id,
-            "prompt":[{"type":"text","text":prompt}]})).await;
+            "prompt":prompt})).await;
         session.state.finish().await?;
         response.context("ACP prompt failed")?;
         let mut output = std::mem::take(&mut *session.state.output.lock().await);
@@ -435,8 +438,11 @@ impl Backend for AcpBackend {
         let session = self.session.lock().await.get(id).cloned().context("ACP conversation is not active")?;
         ensure!(self.kind == BackendKind::Claude && session.initialized.pointer("/_meta/steering/supported").and_then(Value::as_bool) == Some(true),
             "ACP agent did not advertise steering support");
+        let image_supported = session.initialized.pointer("/agentCapabilities/promptCapabilities/image")
+            .and_then(Value::as_bool) == Some(true);
+        let prompt = crate::attachment::acp_input(text.to_owned(), input.attachments(), image_supported).await?;
         let response = session.transport.request("_session/steering", json!({"sessionId":session.id,
-            "prompt":[{"type":"text","text":text}],"_meta":{"steering":{"idleBehavior":"promptRequired"}}})).await?;
+            "prompt":prompt,"_meta":{"steering":{"idleBehavior":"promptRequired"}}})).await?;
         ensure!(response["outcome"] != "promptRequired", "Active work finished before steering. Queue this prompt instead");
         Ok(())
     }

@@ -1194,7 +1194,7 @@ impl Backend for CodexBackend {
                 prompt = "Continue working toward the active goal.".into();
             }
         }
-        let mut input = vec![json!({ "type": "text", "text": prompt })];
+        let mut input = crate::attachment::codex_input(prompt, request.input.attachments()).await?;
         if let BackendInput::Skill { name, .. } = &request.input {
             let catalog = if let Some(resources) = self.resources(&Self::catalog_from_request(&request)).await? {
                 resources.catalog.skill.clone()

@@ -4,6 +4,10 @@ vim.opt.runtimepath:prepend(cwd .. "/nvim")
 package.path = cwd .. "/nvim/lua/?.lua;" .. cwd .. "/nvim/lua/?/init.lua;" .. package.path
 
 local status = require("forge.status")
+local config = require("forge.infra.config")
+local original_open_target = config.options.status_open_target
+local source_path = vim.fn.tempname() .. " source.txt"
+vim.fn.writefile({ "first", "second" }, source_path)
 local requests, notices, deliveries = {}, {}, 0
 local selected, selected_input, confirmation, demand_sequence
 local original_notify = vim.notify
@@ -41,6 +45,11 @@ status._set_runner_for_test(function(method, params, callback)
           block_edit = { { start_block = 1, removed_blocks = 0, inserted = { "body2" } } },
           metadata_edit = { { block = "body2", row_count = 1, metadata = fixture.metadata("hunk:2", 1) } }, removed_block = {} } })
     end
+  elseif params.operation == "open_target" then
+    callback({ id = "source-" .. params.input.sequence, kind = "open_file",
+      document = params.input.document, revision = params.input.revision,
+      view = params.input.view, sequence = params.input.sequence,
+      path = vim.fs.normalize(source_path), row = 1, column = 2 })
   elseif params.operation == "input" then
     selected = params.selection
     selected_input = params.input
@@ -108,6 +117,28 @@ assert(selected_input.sequence > demand_sequence, "confirmation reused a sequenc
 assert(selected_input.location.kind == "file" and selected_input.location.id == 1, "confirmation retargeted the moved cursor")
 assert(selected_input.revision == captured_revision, "confirmation replaced its captured revision")
 confirm.open = original_confirm
+local status_window = vim.api.nvim_get_current_win()
+local status_tab = vim.api.nvim_get_current_tabpage()
+assert(config.options.status_open_target == "tab", "file opening no longer defaults to a tab")
+for _, target in ipairs({ "tab", "buffer" }) do
+  config.options.status_open_target = target
+  vim.api.nvim_set_current_win(status_window)
+  vim.api.nvim_win_set_buf(status_window, state.replica.buffer)
+  vim.api.nvim_win_set_cursor(status_window, { 4, 0 })
+  local tab_count = #vim.api.nvim_list_tabpages()
+  status.action(state, "open", false)
+  assert(vim.wait(1000, function() return vim.api.nvim_buf_get_name(0) == vim.fs.normalize(source_path) end))
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 2 }))
+  assert(#vim.api.nvim_list_tabpages() == tab_count + (target == "tab" and 1 or 0))
+  if target == "tab" then
+    assert(vim.api.nvim_win_get_buf(status_window) == state.replica.buffer,
+      "opening a file replaced the Status buffer")
+    vim.cmd("tabclose")
+    assert(vim.api.nvim_get_current_tabpage() == status_tab)
+  end
+end
+config.options.status_open_target = original_open_target
+vim.api.nvim_win_set_buf(status_window, state.replica.buffer)
 status.close(state)
 assert(not state.active and state.replica.status == "Closed")
 assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo.foldcolumn == "1", "Status close did not restore window presentation")
@@ -135,6 +166,8 @@ print("native status demand continuation and cleanup passed")
 end, debug.traceback)
 vim.notify = original_notify
 confirm.open = original_confirm
+config.options.status_open_target = original_open_target
+vim.fn.delete(source_path)
 if not ok then
   io.stderr:write(tostring(failure), "\n")
   vim.cmd("cquit 1")

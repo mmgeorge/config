@@ -14,7 +14,7 @@ use crate::timeline::{
     stream::{TimelineOperation, TimelinePatch, TimelineStream},
 };
 
-use super::document::{TranscriptChange, TranscriptDocument};
+use super::document::{TranscriptChange, TranscriptDocument, TranscriptEntry};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
 
@@ -39,6 +39,7 @@ struct OpenPresentation {
     submission_sequence: u64,
     pending_submission: Option<u64>,
     accepted_submission: Option<u64>,
+    staging: Option<StagingContent>,
     entry: HashMap<String, EntryPresentation>,
     action: HashMap<TargetId, TranscriptAction>,
     output: HashMap<DocumentId, OutputDocument>,
@@ -46,6 +47,12 @@ struct OpenPresentation {
     pending_bytes: usize,
     input: HashMap<ViewId, InputSequence>,
     failure: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct StagingContent {
+    queue: Vec<String>,
+    steering: Vec<String>,
 }
 
 struct EntryPresentation {
@@ -129,6 +136,13 @@ pub enum PresentationRequest {
     Sync {
         document: DocumentId,
         revision: DocumentRevision,
+    },
+    Staging {
+        document: DocumentId,
+        #[serde(default)]
+        queue: Vec<String>,
+        #[serde(default)]
+        steering: Vec<String>,
     },
     Snapshot {
         document: DocumentId,
@@ -332,6 +346,10 @@ impl SessionPresentation {
             PresentationRequest::Sync { document, revision } => {
                 Ok(to_value(self.sync(&document, revision)?)?)
             }
+            PresentationRequest::Staging { document, queue, steering } => {
+                self.set_staging(&document, queue, steering)?;
+                Ok(json!({"updated":true}))
+            }
             PresentationRequest::Snapshot { document } => Ok(to_value(self.snapshot(&document)?)?),
             PresentationRequest::Input { input } => match self.action(input)? {
                 TranscriptAction::Diff { .. } => Ok(json!({"kind":"diff"})),
@@ -395,13 +413,34 @@ impl SessionPresentation {
         Ok(patch)
     }
 
+    /// Applies the current visibility preference to snapshots captured before a toggle.
+    pub(crate) fn reconcile_with_status_thoughts(
+        &mut self,
+        mut entry: Vec<TimelineEntry>,
+        enabled: bool,
+    ) -> Result<TimelinePatch> {
+        for entry in &mut entry {
+            if let TimelineEntry::Status { status_thoughts, .. } = entry {
+                *status_thoughts = enabled;
+            }
+        }
+        self.reconcile(entry)
+    }
+
+    pub(crate) fn set_status_thoughts(&mut self, enabled: bool) -> Result<TimelinePatch> {
+        let patch = self.timeline.set_status_thoughts(enabled)?;
+        self.project_patch(&patch);
+        Ok(patch)
+    }
+
     pub fn update_live(
         &mut self,
         interaction: Option<&Exchange>,
         removed: Option<&str>,
         status: SessionPhase,
+        status_thoughts: bool,
     ) -> Result<TimelinePatch> {
-        let patch = self.timeline.update_live(interaction, removed, status)?;
+        let patch = self.timeline.update_live(interaction, removed, status, status_thoughts)?;
         self.project_patch(&patch);
         Ok(patch)
     }
@@ -477,6 +516,7 @@ impl SessionPresentation {
             submission_sequence: 0,
             pending_submission: None,
             accepted_submission: None,
+            staging: None,
             entry,
             action,
             output: HashMap::new(),
@@ -536,6 +576,26 @@ impl SessionPresentation {
                 snapshot: Some(open.sections.document.snapshot()?),
             })
         }
+    }
+
+    fn set_staging(
+        &mut self,
+        document: &DocumentId,
+        queue: Vec<String>,
+        steering: Vec<String>,
+    ) -> Result<()> {
+        let open = self.open.as_mut().context("session presentation is not open")?;
+        ensure!(open.transcript_id == *document, "transcript document identity changed");
+        let staging = StagingContent { queue, steering };
+        if open.staging.as_ref() == Some(&staging) {
+            return Ok(());
+        }
+        open.staging = if staging.queue.is_empty() && staging.steering.is_empty() {
+            None
+        } else {
+            Some(staging)
+        };
+        update_staging_block(open)
     }
 
     /// Capture one syntax source while keeping asynchronous work outside the presentation lock.
@@ -1328,6 +1388,79 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
     retain_patches(open, patches)
 }
 
+fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
+    use forge_buffer::identity::BlockId;
+
+    let block_id = BlockId("harness:staging".into());
+    let mut patch = None;
+    let entry_ids = open.sections.document.entry_ids();
+    let existing = entry_ids.iter().position(|id| id == "harness:staging");
+    if let Some(staging) = &open.staging {
+        let mut source = String::new();
+        append_staging_section(&mut source, "Steering active turn", &staging.steering);
+        append_staging_section(&mut source, "Queued follow-up inputs", &staging.queue);
+        let width = open.transcript.views.profile().unwrap_or(&open.last_width);
+        let block = super::transcript::TranscriptRenderer::new(width)?
+            .literal(block_id.clone(), &source, 0)?;
+        let entry = TranscriptEntry {
+            id: "harness:staging".into(),
+            block: vec![block],
+        };
+        patch = if let Some(index) = existing {
+            open.sections.document.tool_layout(vec![TranscriptChange::Replace { index, entry }])?
+                .into_iter().last()
+        } else {
+            open.sections.document.tool_layout(vec![TranscriptChange::Insert {
+                index: entry_ids.len(),
+                entry,
+            }])?.into_iter().last()
+        };
+    } else if let Some(index) = existing {
+        patch = open.sections.document.tool_layout(vec![TranscriptChange::Remove {
+            index,
+            id: "harness:staging".into(),
+        }])?.into_iter().last();
+    }
+    if let Some(patch) = patch {
+        retain_patch(open, patch)?;
+    }
+    Ok(())
+}
+
+fn append_staging_section(source: &mut String, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    if !source.is_empty() {
+        source.push('\n');
+    }
+    source.push_str(label);
+    source.push('\n');
+    for value in values {
+        source.push_str("• ");
+        source.push_str(value);
+        source.push('\n');
+    }
+}
+
+fn retain_patch(open: &mut OpenPresentation, patch: BufferPatch) -> Result<()> {
+    let bytes = crate::limits::serialized_size(&patch)?;
+    while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
+        let Some((_, removed)) = open.pending.pop_front() else {
+            break;
+        };
+        open.pending_bytes -= removed;
+    }
+    if bytes <= MAX_PENDING_BYTES {
+        open.pending_bytes += bytes;
+        open.pending.push_back((patch, bytes));
+    } else {
+        open.pending.clear();
+        open.pending_bytes = 0;
+    }
+    Ok(())
+}
+
 fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>) -> Result<()> {
     if let Some(failure) = &open.failure {
         anyhow::bail!("transcript projection requires reopening: {failure}");
@@ -1340,21 +1473,9 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
         }
     };
     for patch in patches {
-        let bytes = crate::limits::serialized_size(&patch)?;
-        while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
-            let Some((_, removed)) = open.pending.pop_front() else {
-                break;
-            };
-            open.pending_bytes -= removed;
-        }
-        if bytes <= MAX_PENDING_BYTES {
-            open.pending_bytes += bytes;
-            open.pending.push_back((patch, bytes));
-        } else {
-            open.pending.clear();
-            open.pending_bytes = 0;
-        }
+        retain_patch(open, patch)?;
     }
+    update_staging_block(open)?;
     Ok(())
 }
 
@@ -1415,6 +1536,102 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn staging_uses_a_stable_physical_block_and_clears_without_entering_timeline() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Status {
+            status_thoughts: true,
+            agent_count: 0,
+            id: "status".into(),
+            created_at_ms: 0,
+            status: SessionPhase::Idle,
+        }])?;
+        let document = DocumentId("staging".into());
+        let opened = owner.open(document.clone(), ViewId("staging-view".into()), WidthProfile::default())?;
+        let request: PresentationRequest = serde_json::from_value(serde_json::json!({
+            "operation": "staging",
+            "document": document,
+            "queue": ["queued first", "queued second"],
+            "steering": ["active direction"]
+        }))?;
+        assert_eq!(owner.dispatch(request)?, serde_json::json!({"updated":true}));
+        let snapshot = owner.snapshot(&document)?;
+        let staging_index = snapshot.block.iter().position(|block| block.id.0 == "harness:staging").unwrap();
+        assert_eq!(snapshot.block[staging_index - 1].id.0, "status");
+        let rows = snapshot.block[staging_index].text.wire_rows().join("\n");
+        assert!(rows.contains("Steering active turn"));
+        assert!(rows.contains("active direction"));
+        assert!(rows.contains("Queued follow-up inputs"));
+        assert!(rows.find("queued first").unwrap() < rows.find("queued second").unwrap());
+        assert!(!owner.timeline.entry_list().iter().any(|entry| matches!(entry, TimelineEntry::Status { id, .. } if id == "harness:staging")));
+
+        owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(),
+            queue: Vec::new(),
+            steering: Vec::new(),
+        })?;
+        assert!(!owner.snapshot(&document)?.block.iter().any(|block| block.id.0 == "harness:staging"));
+        assert!(!owner.sync(&document, opened.transcript.revision)?.patch.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn staging_preserves_complete_large_payloads_across_reflow() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("main")])?;
+        let document = DocumentId("large-staging".into());
+        let view = ViewId("large-staging-view".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let queue: Vec<_> = (0..1200).map(|index| format!("queue-{index}-{}", "x".repeat(96))).collect();
+        let last = queue.last().unwrap().clone();
+        let steering = "steering-λ".repeat(256);
+        owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(),
+            queue,
+            steering: vec![steering.clone()],
+        })?;
+        let rows = owner.snapshot(&document)?.block.iter()
+            .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
+        assert!(rows.contains("queue-0-"));
+        assert!(rows.contains(&last));
+        assert!(rows.find("queue-0-").unwrap() < rows.find(&last).unwrap());
+        assert!(rows.contains(&steering));
+        owner.reconcile(vec![
+            interaction_entry("main"),
+            interaction_entry("followup"),
+            TimelineEntry::Status {
+                status_thoughts: true,
+                agent_count: 0,
+                id: "status".into(),
+                created_at_ms: 0,
+                status: SessionPhase::Working {
+                    duration_ms: 0,
+                    started_at_ms: Some(0),
+                    activity: crate::session::state_machine::WorkflowActivity::Working,
+                    execution: None,
+                    reasoning_summary: None,
+                },
+            },
+        ])?;
+        assert_eq!(owner.snapshot(&document)?.block.last().unwrap().id.0, "harness:staging");
+        owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(),
+            queue: vec![last.clone()],
+            steering: vec![steering.clone()],
+        })?;
+        assert_eq!(owner.snapshot(&document)?.block.last().unwrap().id.0, "harness:staging");
+        owner.dispatch(PresentationRequest::Resize {
+            document: document.clone(),
+            view,
+            width: WidthProfile { columns: 32, ..WidthProfile::default() },
+        })?;
+        let rows = owner.snapshot(&document)?.block.iter()
+            .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
+        assert!(rows.contains(&last));
+        assert_eq!(owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue.len(), 1);
+        Ok(())
+    }
 
     #[test]
     fn accepted_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
@@ -1642,6 +1859,77 @@ mod tests {
             && patch.metadata_edit.iter().all(|edit|!edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool"))));
         assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row,tool);
         assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("More **text**"))));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_thoughts_remain_in_the_timeline_when_status_thoughts_are_hidden() -> Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress};
+        for status_thoughts in [false, true] {
+            let mut active = serde_json::to_value(interaction_entry("active"))?;
+            active["exchange"]["state"] = serde_json::json!("running");
+            active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+            active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+            active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
+            let mut event = BackendEvent {
+                received_at_ms: None,
+                address: Some(ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "active".into() }),
+                turn_boundary: None,
+                kind: "reasoning_summary".into(),
+                text: Some("Inspect settings.".into()),
+                data: serde_json::json!({"provider_message_id":"thought"}),
+                summary: None,
+                task_update: None,
+                activity: None,
+            };
+            exchange.observe_turn(&event, 2)?;
+            let mut owner = SessionPresentation::new("session".into());
+            owner.initialize(vec![
+                TimelineEntry::Exchange { id: "active".into(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new() },
+                TimelineEntry::Status {
+                    id: "session:status".into(),
+                    created_at_ms: 0,
+                    agent_count: 0,
+                    status_thoughts,
+                    status: SessionPhase::Working {
+                        duration_ms: 0,
+                        started_at_ms: Some(1),
+                        activity: crate::session::state_machine::WorkflowActivity::Working,
+                        execution: None,
+                        reasoning_summary: exchange.latest_reasoning_summary().map(str::to_owned),
+                    },
+                },
+            ])?;
+            let document = DocumentId("streamed-thought".into());
+            owner.open(document.clone(), ViewId("view".into()), WidthProfile::default())?;
+            event.text = Some(" Next step.".into());
+            exchange.observe_turn(&event, 3)?;
+            let patch = owner.update_message(&exchange, &event)?.expect("owned thought");
+            assert!(matches!(patch.operation.first(), Some(TimelineOperation::Message { .. })));
+            assert_eq!(patch.operation.len(), if status_thoughts { 2 } else { 1 });
+            let snapshot = owner.snapshot(&document)?;
+            assert!(snapshot.block.iter().filter(|block| block.id.0 != "session:status")
+                .any(|block| block.text.wire_rows().iter().any(|row| row.contains("Next step."))));
+            let status = snapshot.block.iter().find(|block| block.id.0 == "session:status").unwrap();
+            assert_eq!(status.text.wire_rows().iter().any(|row| row.contains("Next step.")), status_thoughts);
+            let toggle = owner.set_status_thoughts(!status_thoughts)?;
+            assert!(matches!(toggle.operation.as_slice(), [TimelineOperation::Replace {
+                entry: TimelineEntry::Status { .. }, ..
+            }]));
+            let toggled = owner.snapshot(&document)?;
+            let status = toggled.block.iter().find(|block| block.id.0 == "session:status").unwrap();
+            assert_eq!(status.text.wire_rows().iter().any(|row| row.contains("Next step.")), !status_thoughts);
+            assert!(toggled.block.iter().filter(|block| block.id.0 != "session:status")
+                .any(|block| block.text.wire_rows().iter().any(|row| row.contains("Next step."))));
+            let mut stale = owner.timeline.entry_list().to_vec();
+            for entry in &mut stale {
+                if let TimelineEntry::Status { status_thoughts: preference, .. } = entry {
+                    *preference = status_thoughts;
+                }
+            }
+            assert!(owner.reconcile_with_status_thoughts(stale, !status_thoughts)?.is_empty());
+        }
         Ok(())
     }
 
@@ -2272,7 +2560,7 @@ mod tests {
             event.kind = "assistant_message".into();
             event.text = Some("Second task is running".into());
             exchange.observe_turn(&event, 3)?;
-            let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle)?;
+            let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
             assert_eq!(
                 owner.timeline.entry_list().len(),
                 1,
@@ -2307,7 +2595,7 @@ mod tests {
                 );
             }
 
-            owner.update_live(None, Some(&exchange.id), SessionPhase::Idle)?;
+            owner.update_live(None, Some(&exchange.id), SessionPhase::Idle, true)?;
             owner.sync(&document, snapshot.revision)?;
             assert_eq!(
                 owner.timeline.entry_list().len(),
@@ -2467,6 +2755,11 @@ mod tests {
             WidthProfile::default(),
         )?;
         owner.begin_submission(&document, 1, "retained submission")?;
+        owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(),
+            queue: vec!["queued while selecting agent".into()],
+            steering: vec!["keep active guidance".into()],
+        })?;
         owner.dispatch(PresentationRequest::SelectAgent {
             document: document.clone(),
             run_id: Some("child-run".into()),
@@ -2485,6 +2778,9 @@ mod tests {
                 .iter()
                 .any(|block| block.id.0 == "main:prompt")
         );
+        assert_eq!(selected.block.last().unwrap().id.0, "harness:staging");
+        assert!(selected.block.last().unwrap().text.wire_rows().iter()
+            .any(|row| row.contains("queued while selecting agent")));
         let event = crate::backend::BackendEvent {
             received_at_ms: None, address:Some(interaction.turn[0].provider().clone()),
             turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":2}),
@@ -2519,7 +2815,7 @@ mod tests {
         let started_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Compacting { started_at_ms },
         }])?;
@@ -2538,7 +2834,7 @@ mod tests {
         assert!(after > before, "compaction counter did not advance");
         assert_eq!(owner.revision(), timeline_revision, "timer changed durable timeline state");
         assert!(refreshed.block[0].metadata.status.as_ref().unwrap().animated);
-        owner.update_live(None, None, SessionPhase::Idle)?;
+        owner.update_live(None, None, SessionPhase::Idle, true)?;
         assert!(!owner.snapshot(&document)?.block.iter().any(|block| block.id.0 == "session:status"));
         Ok(())
     }
@@ -2548,7 +2844,7 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![
             interaction_entry("completed"),
-            TimelineEntry::Status { agent_count: 0,
+            TimelineEntry::Status { status_thoughts: true, agent_count: 0,
                 id: "status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -2640,7 +2936,7 @@ mod tests {
     #[test]
     fn active_projection_preserves_pending_submission() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::Idle,
@@ -2652,7 +2948,7 @@ mod tests {
             WidthProfile::default(),
         )?;
         owner.begin_submission(&document, 1, "draft")?;
-        owner.reconcile(vec![TimelineEntry::Status { agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -2672,7 +2968,7 @@ mod tests {
     #[test]
     fn hidden_transcript_keeps_streaming_until_a_new_width_owner_attaches() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -2687,7 +2983,7 @@ mod tests {
             document: document.clone(),
             view: ViewId("view:old".into()),
         })?;
-        owner.reconcile(vec![TimelineEntry::Status { agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 3 },
@@ -2736,7 +3032,7 @@ mod tests {
     #[test]
     fn layout_follows_the_oldest_live_view_without_changing_timeline_revision() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status { status_thoughts: true, agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },

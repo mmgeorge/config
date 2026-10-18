@@ -85,11 +85,23 @@ local function position_requested(state)
   state.requested_row = nil
 end
 
-local function display_source(state, window)
+local function display_source(state, window, layout)
+  local baseline = window_presentation.capture(window)
+  local created_tab
+  if layout == "tab" then
+    vim.api.nvim_win_call(window, function()
+      vim.cmd("tabnew")
+      window = vim.api.nvim_get_current_win()
+      created_tab = vim.api.nvim_get_current_tabpage()
+    end)
+    vim.api.nvim_set_current_win(window)
+    state.window = window
+  end
   local origin = vim.api.nvim_win_get_buf(window)
   if origin ~= state.replica.buffer then
-    state.presentation[window] = window_presentation.capture(window)
+    state.presentation[window] = baseline
     state.return_view[window] = { buffer = origin,
+      created_tab = created_tab,
       view = vim.api.nvim_win_call(window, function() return vim.fn.winsaveview() end) }
     vim.api.nvim_win_set_buf(window, state.replica.buffer)
   end
@@ -191,7 +203,7 @@ function M.open(options)
       existing.window, existing.requested_row = state.window, state.requested_row
       existing.used = next_document
       if (not options.is_current or options.is_current()) and vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.origin then
-        display_source(existing, state.window)
+        display_source(existing, state.window, options.layout)
       end
       M.close(state)
       M.demand(existing)
@@ -221,7 +233,7 @@ function M.open(options)
       vim.treesitter.stop(state.replica.buffer)
     end
     if (not options.is_current or options.is_current()) and vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.origin then
-      display_source(state, state.window)
+      display_source(state, state.window, options.layout)
     end
     if opened.state and (opened.state.state == "failed" or opened.state.state == "unavailable") then state.notice(opened.state.diagnostic) end
     M.demand(state)
@@ -264,10 +276,14 @@ function M.close(state, on_closed)
   for window, view in pairs(state.view) do close_view(state, window, view) end
   vim.api.nvim_del_augroup_by_id(state.group)
   for window, origin in pairs(state.return_view) do
-    if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == state.replica.buffer
-      and vim.api.nvim_buf_is_valid(origin.buffer) then
-      vim.api.nvim_win_set_buf(window, origin.buffer)
-      vim.api.nvim_win_call(window, function() vim.fn.winrestview(origin.view) end)
+    if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == state.replica.buffer then
+      if origin.created_tab and vim.api.nvim_tabpage_is_valid(origin.created_tab)
+        and #vim.api.nvim_tabpage_list_wins(origin.created_tab) == 1 and #vim.api.nvim_list_tabpages() > 1 then
+        vim.api.nvim_win_close(window, true)
+      elseif vim.api.nvim_buf_is_valid(origin.buffer) then
+        vim.api.nvim_win_set_buf(window, origin.buffer)
+        vim.api.nvim_win_call(window, function() vim.fn.winrestview(origin.view) end)
+      end
     end
   end
   state.return_view = {}

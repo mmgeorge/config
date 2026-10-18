@@ -267,6 +267,11 @@ impl SqliteStore {
                 text TEXT NOT NULL,
                 created_at_ms INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS prompt_attachment_record (
+                history_id INTEGER PRIMARY KEY,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(history_id) REFERENCES prompt_history_record(id) ON DELETE CASCADE
+            );
             CREATE TABLE IF NOT EXISTS agent_run_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -959,13 +964,17 @@ impl SqliteStore {
     }
 
     /// Record one globally shared prompt and retain only the newest bounded history.
-    pub fn record_prompt_history(&mut self, text: &str, created_at_ms: i64) -> Result<()> {
+    pub fn record_prompt_history(&mut self, draft: &crate::attachment::PromptDraft, created_at_ms: i64) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO prompt_history_record(text, created_at_ms) VALUES(?1, ?2)",
-            params![text, created_at_ms],
+            params![draft.text, created_at_ms],
+        )?;
+        transaction.execute(
+            "INSERT INTO prompt_attachment_record(history_id,payload) VALUES(?1,?2)",
+            params![transaction.last_insert_rowid(), serde_json::to_string(&draft.attachments)?],
         )?;
         transaction.execute(
             "DELETE FROM prompt_history_record WHERE id NOT IN \
@@ -977,14 +986,15 @@ impl SqliteStore {
     }
 
     /// Load globally shared prompts from newest to oldest.
-    pub fn list_prompt_history(&self) -> Result<Vec<String>> {
+    pub fn list_prompt_history(&self) -> Result<Vec<crate::attachment::PromptDraft>> {
         let mut statement = self
             .connection
-            .prepare("SELECT text FROM prompt_history_record ORDER BY id DESC LIMIT 100")?;
-        let row_list = statement.query_map([], |row| row.get::<_, String>(0))?;
-        row_list
-            .collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+            .prepare("SELECT h.text, COALESCE(a.payload, '[]') FROM prompt_history_record h LEFT JOIN prompt_attachment_record a ON a.history_id=h.id ORDER BY h.id DESC LIMIT 100")?;
+        let row_list = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+        row_list.map(|row| {
+            let (text, attachments) = row?;
+            Ok(crate::attachment::PromptDraft { text, attachments: serde_json::from_str(&attachments)? })
+        }).collect()
     }
 
     /// Write one concrete child-agent run into its owning Harness session.
@@ -1392,14 +1402,14 @@ mod test {
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         for index in 0..105 {
             store
-                .record_prompt_history(&format!("prompt-{index}"), index)
+                .record_prompt_history(&crate::attachment::PromptDraft { text: format!("prompt-{index}"), attachments: Vec::new() }, index)
                 .unwrap();
         }
 
         let history = store.list_prompt_history().unwrap();
         assert_eq!(history.len(), 100);
-        assert_eq!(history.first().map(String::as_str), Some("prompt-104"));
-        assert_eq!(history.last().map(String::as_str), Some("prompt-5"));
+        assert_eq!(history.first().map(|draft| draft.text.as_str()), Some("prompt-104"));
+        assert_eq!(history.last().map(|draft| draft.text.as_str()), Some("prompt-5"));
 
         let reopened = SqliteStore::open(temporary.path()).unwrap();
         assert_eq!(reopened.list_prompt_history().unwrap(), history);

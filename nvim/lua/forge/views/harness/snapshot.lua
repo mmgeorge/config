@@ -53,6 +53,7 @@ function HarnessSnapshot.apply(state, result)
   state.capability = result.capability or {}
   state.subagent_tools = result.subagent_tools == true
   state.lsp_tools = result.lsp_tools == true
+  state.status_thoughts = result.status_thoughts == true
   state.timeline_revision = result.timeline_revision or 0
   state.status = result.status or { kind = "idle" }
   state.artifact = vim.deepcopy(result.artifact or {})

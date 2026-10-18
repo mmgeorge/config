@@ -10,7 +10,7 @@ use super::{BackendEvent, BackendEventSink};
 /// Distinguishes user steering from child results delivered without user-prompt rendering.
 pub enum SteeringInput {
     /// Records an explicit user addition in the parent timeline.
-    User(String),
+    User { text: String, attachments: Vec<crate::attachment::InputAttachment> },
     /// Adds an attributed child result while its transcript remains under the child.
     AgentResult(String),
 }
@@ -18,16 +18,21 @@ pub enum SteeringInput {
 impl SteeringInput {
     /// Returns the provider-visible message without its presentation origin.
     pub fn text(&self) -> &str {
-        match self { Self::User(text) | Self::AgentResult(text) => text }
+        match self { Self::User { text, .. } | Self::AgentResult(text) => text }
+    }
+
+    /// Return explicit files carried by user steering, excluding generated child reports.
+    pub(crate) fn attachments(&self) -> &[crate::attachment::InputAttachment] {
+        match self { Self::User { attachments, .. } => attachments, Self::AgentResult(_) => &[] }
     }
 }
 
 impl From<String> for SteeringInput {
-    fn from(text: String) -> Self { Self::User(text) }
+    fn from(text: String) -> Self { Self::User { text, attachments: Vec::new() } }
 }
 
 impl From<&str> for SteeringInput {
-    fn from(text: &str) -> Self { Self::User(text.into()) }
+    fn from(text: &str) -> Self { text.to_owned().into() }
 }
 
 /// Routes input into the provider turn that currently owns the backend transport.
@@ -61,6 +66,7 @@ pub struct ActiveSteering {
 pub struct SteerCommand {
     _admission: OwnedSemaphorePermit,
     pub text: String,
+    pub attachments: Vec<crate::attachment::InputAttachment>,
     pub target: Option<SteerTarget>,
     pub operation: ActiveTurnOperation,
     completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -102,6 +108,7 @@ impl SteeringLane {
             String::new(),
             None,
             false,
+            Vec::new(),
         )
         .await
     }
@@ -127,13 +134,13 @@ impl SteeringLane {
 
     /// Delivers input to the active turn and publishes only acknowledged user additions.
     pub async fn steer(&self, input: SteeringInput) -> Result<()> {
-        let publish_input = matches!(input, SteeringInput::User(_));
-        self.submit(ActiveTurnOperation::Steer, input.text().to_owned(), None, publish_input).await
+        let publish_input = matches!(input, SteeringInput::User { .. });
+        self.submit(ActiveTurnOperation::Steer, input.text().to_owned(), None, publish_input, input.attachments().to_vec()).await
     }
 
     /// Interrupt the parent and descendants and wait for terminal provider evidence.
     pub async fn cleanup_execution(&self) -> Result<()> {
-        self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None, false)
+        self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None, false, Vec::new())
             .await
     }
 
@@ -143,6 +150,7 @@ impl SteeringLane {
         text: String,
         target: Option<SteerTarget>,
         publish_input: bool,
+        attachments: Vec<crate::attachment::InputAttachment>,
     ) -> Result<()> {
         let sender = self
             .state
@@ -171,6 +179,7 @@ impl SteeringLane {
             .try_send(SteerCommand {
                 _admission: admission,
                 text,
+                attachments,
                 target,
                 operation,
                 completion: Some(completion),
@@ -277,9 +286,9 @@ mod test {
         );
         let first = active.receive().await.unwrap();
         assert!(lane.steer("still full".into()).await.is_err());
-        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false));
+        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false,Vec::new()));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
-        assert!(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false).await.is_err());
+        assert!(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false,Vec::new()).await.is_err());
         for sequence in 1..super::MAX_STEERING_REQUESTS {
             let command = active.receive().await.unwrap();
             assert_eq!(command.text, sequence.to_string());
@@ -314,6 +323,7 @@ mod test {
                     turn_id: "turn".into(),
                 }),
                 true,
+                Vec::new(),
             ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
         let command = active.receive().await.unwrap();

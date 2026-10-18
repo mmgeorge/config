@@ -20,6 +20,11 @@ For example, `:ForgeFileRevision README.md HEAD` opens the committed README.
 Revision arguments use the shared revision completion source. File-specific
 commands complete the file argument before the revision argument.
 
+Opening a file from ForgeStatus uses a new tab by default, including historical
+source for deleted files. Set `status_open_target = "buffer"` in
+`require("forge").setup({ ... })` to open files in the Status window instead.
+The default is `status_open_target = "tab"`.
+
 ## Generated commit messages
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
@@ -98,11 +103,46 @@ the caret or message body to show or hide the complete text.
 opens durable session search and `/undo` opens checkpoint rollback.
 
 The live status line shows the current phase, elapsed time, and interrupt key.
-The latest thought appears below in italics, aligned with the phase label, and
-wraps to the window width.
+Enable **Status thoughts** in `/config` to show the latest thought below it in
+italics, aligned with the phase label and wrapped to the window width. The option
+defaults to Off, persists across sessions, and applies without interrupting an
+active response. Thought messages remain available in the timeline either way.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
+
+Explicit steering sends the current composer text to the active response while
+preserving queued follow-ups. If the active turn cannot accept it, the text joins
+the follow-up queue and Harness shows a warning.
+Queued prompts and pending steering appear below the status in the upper timeline
+pane. The lower prompt buffer contains only the draft being edited.
+
+`M-s` edits the newest queued prompt in place. Repeating it moves backward through
+the queue without changing message order. Earlier messages may execute, but the
+message being edited and all later messages wait. `Ctrl-S` saves the edit in its
+reserved position. Submitting an empty edit deletes that message. Finishing restores
+any unqueued draft that was in the composer before editing began.
+
+Paste an absolute file path into the Harness composer to attach the file. Terminal
+drag-and-drop works when the terminal pastes the dropped paths. Quoted paths,
+paths containing spaces, file URIs, and multiple dropped files are supported.
+Normal-mode `p` and `P` also import pasted file paths. Ordinary text pastes keep
+their existing behavior. Clipboard image pixels are not read.
+
+An import keeps the path visible while copying the file asynchronously, then
+replaces it with `[Image #1]`, `[PDF #2]`, or `[File #3]`. The marker retains a
+separate typed file object. `yiA` copies the entire attachment and `diA` cuts it.
+Paste that object elsewhere in the draft with `p` or `P`. Full-line and visual
+copies that include the complete label also retain its attachment state. Typing
+the visible label creates ordinary text. Undo, prompt history, and queued-message
+editing preserve complete references. Moving or deleting the original file after
+import does not change the captured attachment.
+
+Codex and image-capable ACP agents receive image inputs directly. Copilot receives
+native file attachments. PDFs and other files sent to Codex or ACP are retained
+file references for the agent to inspect with tools, rather than native document
+inputs. Import errors keep the original path and report the failure. Finish pending
+imports before submitting. Attempts during import retain the draft and show a notice.
 
 `/config` includes an **LSP tools** toggle. It enables the read-only
 [`lsp` tool](lsp-tools.md) for model-driven code exploration without

@@ -423,6 +423,7 @@ impl<'a> CodexTurnCoordinator<'a> {
     }
 
     async fn start_parent_turn(&mut self, text: String) -> Result<ParentTurn> {
+        let input = crate::attachment::codex_input(text, self.request.input.attachments()).await?;
         let (turn, provider_started, observed_message_list) = self.backend.start_turn(
             self.process,
             self.output,
@@ -431,7 +432,7 @@ impl<'a> CodexTurnCoordinator<'a> {
             true,
             CodexBackend::with_model(CodexBackend::secure(json!({
                 "threadId": self.thread_id,
-                "input": [{ "type": "text", "text": text }],
+                "input": input,
                 "cwd": self.request.workspace,
                 "effort": self.request.effort,
                 "serviceTier": self.request.service_tier
@@ -499,6 +500,12 @@ impl<'a> CodexTurnCoordinator<'a> {
         turn_id: &str,
         pending_command: &mut HashMap<u64, SteerCommand>,
     ) {
+        let input = if command.operation == ActiveTurnOperation::Steer {
+            match crate::attachment::codex_input(steering_prompt(&command), &command.attachments).await {
+                Ok(input) => Some(input),
+                Err(error) => { command.complete(Err(error)).await; return; }
+            }
+        } else { None };
         let (method, params) = match command.operation {
             ActiveTurnOperation::PauseGoal | ActiveTurnOperation::ClearGoal => {
                 if self.native_goal == NativeGoalLifetime::Disabled {
@@ -518,7 +525,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                 "turn/steer",
                 json!({
                     "threadId": thread_id,
-                    "input": [{ "type": "text", "text": steering_prompt(&command) }],
+                    "input": input,
                     "expectedTurnId": turn_id,
                 }),
             ),

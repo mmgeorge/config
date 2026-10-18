@@ -6,6 +6,7 @@ license = "MIT"
 
 [dependencies]
 anyhow = "1.0"
+base64 = "0.22"
 async-trait = "0.1"
 agent-client-protocol = { version = "=3.3.0", features = ["unstable_session_fork"] }
 tokio-util = { version = "0.7", features = ["compat"] }

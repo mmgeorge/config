@@ -175,6 +175,7 @@ function M.open(state, host)
     local pending = false
     local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
       state.pending_config or {}, state.task_config or {})
+    active.status_thoughts = state.status_thoughts == true
     local configuration_revision = 0
     local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
@@ -197,6 +198,7 @@ function M.open(state, host)
         configuration_pending = false
         active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
           state.pending_config or {}, state.task_config or {})
+        active.status_thoughts = state.status_thoughts == true
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -275,6 +277,8 @@ function M.open(state, host)
         configure({ subagent_tools = (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) ~= true })
       elseif id == "lsp-tools" then
         configure({ lsp_tools = (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) ~= true })
+      elseif id == "status-thoughts" then
+        configure({ status_thoughts = active.status_thoughts ~= true })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -312,6 +316,7 @@ function M.open(state, host)
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
             { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
             { id = "lsp-tools", label = "LSP tools", columns = { "LSP tools", picker_field.render((active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true and "On" or "Off", true), "Read-only agent queries through editor language servers" } },
+            { id = "status-thoughts", label = "Status thoughts", columns = { "Status thoughts", picker_field.render(active.status_thoughts and "On" or "Off", true), "Show the latest thought under live status · timeline unchanged" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
               or "Disabled (unsupported)", "OS isolation, independent of approval mode" } },
             { id = "read-access", label = "Read access", columns = { "Read access", picker_field.render(policy.read_access, true), "Approval scope for reported file reads · not OS confinement" } },

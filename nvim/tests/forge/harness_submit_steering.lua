@@ -84,4 +84,19 @@ draft("")
 controller.cancel_turn()
 assert(transition.action == "pause" and transition.restore_prompt_if_no_output == true and #calls == 5,
   "empty Ctrl-C must retract an output-free submission instead of only pausing")
+local task_operation = { state = "accepted", id = "transition-in-progress" }
+local queued_prompt_list = { { text = "first queued prompt" }, { text = "second queued prompt" } }
+state.task_operation = task_operation
+state.queue = vim.deepcopy(queued_prompt_list)
+draft("steer while task transition is being admitted")
+controller.steer_submit()
+assert(#calls == 6 and calls[6].method == "turn.steer", "explicit steering was blocked by cached task operation state")
+assert(calls[6].params.text == "steer while task transition is being admitted")
+assert(state.task_operation == task_operation, "steering cleared the task operation")
+assert(vim.deep_equal(state.queue, queued_prompt_list), "steering changed queued prompts or their FIFO order")
+reply({})
+draft("plain submit during task transition")
+controller.submit()
+assert(#calls == 6 and state.task_operation == task_operation and vim.deep_equal(state.queue, queued_prompt_list),
+  "plain submit bypassed task transition admission")
 print("harness_submit_steering: passed")

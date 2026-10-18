@@ -422,6 +422,23 @@ impl HarnessService {
         let registry = self.registry().await?;
         registry.runtime.lsp.attach(sink.clone());
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
+        if method == HarnessMethod::AttachmentImport {
+            registry.resolve(&session_id).await?;
+            let root = PathBuf::from(&registry.initialize.data_root);
+            let path = PathBuf::from(request.params.get("path").and_then(Value::as_str)
+                .context("attachment path is required")?);
+            ensure!(path.is_absolute(), "attachment path must be absolute");
+            let number = request.params.get("number").and_then(Value::as_u64).unwrap_or(1);
+            let input_bytes = path.as_os_str().len() + root.as_os_str().len();
+            let result = self.repositories.reads.submit_wait(input_bytes, move |cancellation| {
+                cancellation.check()?;
+                let attachment = crate::attachment::Attachment::import(&root, &path)?;
+                cancellation.check()?;
+                Ok(serde_json::to_value(attachment.selection(number)?)?)
+            }).await?.finish().await?;
+            sink.send_response(Response::success(request.id, result)?).await?;
+            return Ok(());
+        }
         let mut prompt_admission = None;
         let edit_trace = if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate) {
             let params = request.params.as_object_mut().context("plan edit requires an object")?;
@@ -643,6 +660,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -684,6 +702,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            data_root: broker.data_root.clone(),
             observer: broker.observer(),
             timeout_task: Mutex::new(None),
             agent_task: Mutex::new(None),
@@ -1213,6 +1232,34 @@ async fn route_request(
         };
         for event in event { message_sink.send_event(event).await?; }
         message_sink.send_response(Response::success(request.id, model_list)?).await?;
+        return Ok(());
+    }
+    if method == HarnessMethod::SessionConfigure
+        && request.params.as_object().is_some_and(|fields|
+            fields.len() == 1 && fields.contains_key("status_thoughts"))
+    {
+        let enabled: bool = serde_json::from_value(request.params["status_thoughts"].clone())?;
+        let catalog = controller.catalog_request.read().await.clone();
+        let (enabled, patch) = {
+            let mut presentation = controller.presentation.lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?;
+            let mut settings = crate::settings::SettingsStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+            let snapshot = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?;
+            let mut desired = settings.layer_settings(crate::settings::SettingScope::Global, &catalog.workspace, &session_id)?;
+            desired.status_thoughts = Some(enabled);
+            settings.update(snapshot.revision, crate::settings::SettingScope::Global, &catalog.workspace, &session_id, &desired)?;
+            let effective = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?.desired;
+            let enabled = effective.status_thoughts.unwrap_or(false);
+            let patch = presentation.set_status_thoughts(enabled)?;
+            controller.observer.status_thoughts.store(enabled, Ordering::Relaxed);
+            (enabled, patch)
+        };
+        if !patch.is_empty() {
+            message_sink.send_event(SessionEvent {
+                session_id: session_id.clone(), event: "document_changed".into(), payload: patch.notification(),
+            }).await?;
+        }
+        message_sink.send_response(Response::success(request.id, json!({"status_thoughts": enabled}))?).await?;
         return Ok(());
     }
     if method == HarnessMethod::InputTimeoutConfigure {
@@ -2148,10 +2195,12 @@ async fn route_control_request(
                 .context("turn.steer requires non-empty text")?
                 .to_owned();
             validate_root_control(request.params.get("target"))?;
+            let attachments = crate::attachment::resolve_input(&controller.data_root, &request.params).await?;
+            let input = crate::backend::SteeringInput::User { text, attachments };
             if controller.parent_input.is_active() {
-                controller.parent_input.steer(text.into()).await?;
+                controller.parent_input.steer(input).await?;
             } else {
-                controller.backend.steer_session(&catalog_request.harness_session_id,text.into()).await?;
+                controller.backend.steer_session(&catalog_request.harness_session_id,input).await?;
             }
             Some(Response::success(
                 request.id,
@@ -2591,6 +2640,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn status_thought_settings_apply_and_persist_without_interrupting_a_busy_session() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(opened.result().unwrap()["status_thoughts"], false);
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let execution = controller.execution_admission.acquire().await?;
+        let broker = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        for (index, enabled) in [true, false].into_iter().enumerate() {
+            tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
+                id: index as u64 + 2, method: "session.configure".into(),
+                params: json!({"status_thoughts": enabled}),
+            }, &sink)).await??;
+            assert_eq!(controller.observer.snapshot()?.status_thoughts, enabled);
+            assert!(controller.execution_admission.try_acquire().is_err());
+            let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
+            assert_eq!(settings.get(&fixture.path().to_string_lossy(), &session_id, "mock")?.desired.status_thoughts,
+                Some(enabled));
+        }
+        drop(broker);
+        drop(execution);
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn settings_application_orders_progress_and_retains_value_free_timeline() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
@@ -2752,7 +2830,8 @@ mod tests {
             assert_eq!(value["id"], 2, "{method}: {value}");
             assert!(value["error"].is_null(), "{method}: {value}");
             if method == "state.get" {
-                assert_eq!(value["result"]["prompt_history"][0], "prompt recorded during execution");
+                assert_eq!(value["result"]["prompt_history"][0]["text"], "prompt recorded during execution");
+                assert_eq!(value["result"]["prompt_history"][0]["attachments"], json!([]));
             }
         }
         let error = tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()),
@@ -2762,6 +2841,38 @@ mod tests {
         drop(broker);
         drop(_execution);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn attachment_import_bypasses_active_execution_and_retains_source_bytes() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let source = fixture.path().join("screen shot.png");
+        let bytes = b"\x89PNG\r\n\x1a\nretained image";
+        std::fs::write(&source, bytes)?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id), Request {
+            id: 2, method: "attachment.import".into(), params: json!({"path":source, "number":3}),
+        }, &sink)).await??;
+        let frame = output.recv().await?.context("attachment response channel closed")?;
+        assert!(!frame.is_terminal(), "attachment reply must keep the host connection open");
+        let response: Value = serde_json::from_slice(frame.bytes())?;
+        let selection = response["result"].clone();
+        assert_eq!(selection["label"], "[Image #3]");
+        std::fs::remove_file(source)?;
+        let selected = crate::attachment::resolve_input(&fixture.path().join("data"), &json!({"attachments":[selection]})).await?;
+        let input = crate::attachment::codex_input("Inspect [Image #3]".into(), &selected).await?;
+        assert_eq!(input[1]["type"], "localImage");
+        assert_eq!(std::fs::read(input[1]["path"].as_str().unwrap())?, bytes);
+        assert!(controller.broker.try_lock().is_err());
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
     }
 
     #[tokio::test]
