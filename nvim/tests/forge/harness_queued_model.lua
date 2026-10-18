@@ -28,9 +28,18 @@ state.composer_buf = vim.api.nvim_create_buf(false, true)
 local function compose(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
 end
-local function configured(request)
-  request.callback({ id = "queue-model", backend = "mock", model = request.params.model,
-    resolved_model = request.params.model, effort = request.params.effort })
+controller.task_transition = function(action, _, callback)
+  assert(action.action == "configure")
+  requests[#requests + 1] = { method = "task.transition", params = action.config,
+    callback = function(applied, failure)
+      if applied then
+        state.session.model, state.session.resolved_model = action.config.model, action.config.model
+        state.session.effort = action.config.effort
+      elseif failure then
+        notifications.error(failure)
+      end
+      callback(applied)
+    end }
 end
 local success, failure = xpcall(function()
   local opened_mcp = false
@@ -50,22 +59,14 @@ local success, failure = xpcall(function()
   assert(requests[1].method == "prompt.submit" and requests[1].params.text == "earlier prompt")
   state.busy = false
   controller.drain()
-  assert(requests[2].method == "session.configure" and requests[2].params.model == "gpt-5.6-sol"
+  assert(requests[2].method == "task.transition" and requests[2].params.model == "gpt-5.6-sol"
     and requests[2].params.effort == "xhigh" and requests[2].params.validate)
   controller.drain()
   assert(#requests == 2, "queue advanced before configuration acknowledgement")
-  configured(requests[2])
+  requests[2].callback(true)
   assert(requests[3].method == "prompt.submit" and requests[3].params.text == "explain this\nand this")
   assert(state.session.model == "gpt-5.6-sol" and #state.queue == 0)
 
-  local original_transition = controller.task_transition
-  controller.task_transition = function(action, _, callback)
-    requests[#requests + 1] = { method = "task.transition", params = action.config,
-      callback = function()
-        state.session.model, state.session.effort = action.config.model, action.config.effort
-        callback(true)
-      end }
-  end
   compose("/model")
   controller.queue_submit()
   assert(selection and #requests == 3, "/model did not open the picker immediately")
@@ -73,9 +74,8 @@ local success, failure = xpcall(function()
   assert(#requests == 4 and #state.queue == 0, "model-only configuration waited behind active work")
   assert(requests[4].method == "task.transition" and requests[4].params.model == "picked"
     and requests[4].params.context_window == 64000)
-  configured(requests[4])
+  requests[4].callback(true)
   assert(#requests == 4 and #state.queue == 0, "model-only entry submitted an empty prompt")
-  controller.task_transition = original_transition
   state.busy = false
 
   compose("/model invalid xhigh never run")
@@ -98,8 +98,8 @@ local success, failure = xpcall(function()
     "invalid edited model effort changed or submitted the reserved entry")
   compose("/model next high submitted prompt")
   controller.submit()
-  assert(requests[6].method == "session.configure")
-  configured(requests[6])
+  assert(requests[6].method == "task.transition")
+  requests[6].callback(true)
   assert(requests[7].method == "prompt.submit" and requests[7].params.text == "submitted prompt")
   controller.command_set().action_by_id.model.run({})
   assert(type(selection) == "function", "shared model binding passed command context as the picker callback")

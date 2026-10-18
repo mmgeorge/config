@@ -10,13 +10,17 @@ use std::sync::OnceLock;
 use tokio::io::{AsyncWriteExt, BufReader};
 
 mod failure;
+mod executor;
 pub(crate) mod lsp;
 pub mod repository;
-pub mod runtime;
+mod runtime;
 pub(crate) use failure::{
     ControlToolArgumentError, control_tool_failure_json, schema_violation_list,
 };
-pub use runtime::{ControlToolResult, ControlToolRuntime, ControlTurnContext};
+pub use runtime::{ControlToolResult, ControlTurnContext};
+pub(crate) use executor::ControlToolExecutor;
+#[cfg(test)]
+pub(crate) use runtime::ControlToolRuntime;
 
 pub(crate) fn is_agent_tool(name: &str) -> bool {
     matches!(name,"agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt"

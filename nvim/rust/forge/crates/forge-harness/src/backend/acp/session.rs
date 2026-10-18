@@ -1,7 +1,7 @@
 use super::transport::AcpHandler;
 use crate::backend::*;
 use crate::backend::approval::{ApprovalResolution, PermissionCoordinator};
-use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, ControlTurnContext};
+use crate::control_tools::{ControlToolExecutor, ControlToolInvocation, ControlTurnContext};
 use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
 use crate::session::PermissionMode;
 use anyhow::{Context, Result, bail, ensure};
@@ -17,7 +17,7 @@ pub(super) struct AcpSessionState {
     pub(super) permission: Arc<PermissionCoordinator>,
     pub(super) active: RwLock<Option<ActiveTurn>>,
     pub(super) output: Mutex<BackendOutput>,
-    pub(super) control: Mutex<Option<ControlToolRuntime>>,
+    pub(super) control: Mutex<Option<Arc<ControlToolExecutor>>>,
     pub(super) catalog: RwLock<Value>,
     pub(super) tool_definition: RwLock<Vec<crate::control_tools::ControlToolDefinition>>,
     tool: Mutex<HashMap<String, Value>>,
@@ -46,8 +46,8 @@ impl AcpSessionState {
         *self.output.lock().await = BackendOutput::default();
         self.tool.lock().await.clear();
         *self.children.lock().await = super::children::AcpChildren::new(session_id.into());
-        *self.control.lock().await = Some(ControlToolRuntime::new(request.control_context.clone()
-            .unwrap_or_else(|| ControlTurnContext::inactive(request.mode))));
+        *self.control.lock().await = Some(Arc::new(ControlToolExecutor::new(request.control_context.clone()
+            .unwrap_or_else(|| ControlTurnContext::inactive(request.mode)))));
         *self.active.write().await = Some(ActiveTurn { owner: request.owner().expect("validated ACP request owner"), mode: request.execution_mode, sink });
     }
 
@@ -71,9 +71,28 @@ impl AcpSessionState {
             for event in events { self.emit(event).await?; }
             Ok(())
         }.await;
+        self.close_control().await;
         *self.active.write().await = None;
-        *self.control.lock().await = None;
         result
+    }
+
+    /// Revoke callback authority before collecting an active tool without its runtime lock.
+    pub(super) async fn close_control(&self) {
+        let executor = self.cancel_control().await;
+        if let Some(executor) = executor {
+            executor.close().await;
+            let mut current = self.control.lock().await;
+            if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, &executor)) {
+                *current = None;
+            }
+        }
+    }
+
+    /// Removes callback authority without waiting for an in-flight tool or transport operation.
+    pub(super) async fn cancel_control(&self) -> Option<Arc<ControlToolExecutor>> {
+        let executor = self.control.lock().await.clone();
+        if let Some(executor) = &executor { executor.cancel(); }
+        executor
     }
 
     async fn authorize(&self, parameter: Value) -> Result<Value> {
@@ -295,16 +314,20 @@ impl AcpHandler for AcpSessionState {
                     name: parameter["name"].as_str().context("control tool name missing")?.into(),
                     arguments: parameter.get("arguments").cloned().unwrap_or(json!({})),
                 };
-                let mut control = self.control.lock().await;
+                let executor = self.control.lock().await.clone()
+                    .context("Harness control called outside an active turn")?;
                 let name = invocation.name.clone();
-                let runtime = control.as_mut().context("Harness control called outside an active turn")?;
-                let result = runtime.invoke(invocation.clone()).await;
+                let outcome = executor.execute(invocation.clone()).await?;
+                let result = outcome.result;
                 let failure = result.as_ref().err().map(|error|
-                    crate::control_tools::control_tool_failure_json(&invocation,error,runtime.plan_document()));
-                drop(control);
+                    crate::control_tools::control_tool_failure_json(&invocation,error,outcome.plan_document.as_ref()));
+                let control = self.control.lock().await;
+                ensure!(control.as_ref().is_some_and(|current| Arc::ptr_eq(current, &executor)),
+                    "Harness control result belongs to a collected turn");
                 let result = match result {
                     Ok(result) => result,
                     Err(_) => {
+                        drop(control);
                         let failure = failure.expect("failed control invocation retains diagnostics");
                         self.emit(event("error",Some(format!("Harness tool {name} failed: {failure}")),Value::Null)).await?;
                         return Err(anyhow::anyhow!("{failure}"));
@@ -390,13 +413,45 @@ mod test {
     use super::*;
 
     #[tokio::test]
+    async fn cleanup_cancels_tool_waits_for_both_acp_providers() -> Result<()> {
+        for kind in [BackendKind::Claude, BackendKind::Antigravity] {
+            let fixture = tempfile::tempdir()?;
+            let state = AcpSessionState::new(kind, PermissionCoordinator::transient(fixture.path())?);
+            *state.active.write().await = Some(ActiveTurn {
+                owner: crate::backend::ExecutionOwner::root("root"), mode: PermissionMode::Read, sink: None,
+            });
+            let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+            context.has_active_goal = true;
+            context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
+            *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(context)));
+            let mut pending = Box::pin(state.request("forge/control", json!({
+                "name":"goal_complete", "arguments":{"summary":"old turn"}
+            })));
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+            let (outcome, ()) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                tokio::join!(pending, state.close_control())
+            }).await?;
+            assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
+            assert!(!state.output.lock().await.evidence.structured_complete);
+            let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+            context.has_active_goal = true;
+            *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(context)));
+            state.request("forge/control", json!({
+                "name":"goal_complete", "arguments":{"summary":"replacement turn"}
+            })).await?;
+            assert!(state.output.lock().await.evidence.structured_complete);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn malformed_agent_tool_returns_field_diagnostics_to_the_model_and_timeline() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let state = AcpSessionState::new(BackendKind::Antigravity,PermissionCoordinator::transient(fixture.path())?);
         *state.active.write().await = Some(ActiveTurn {
             owner:crate::backend::ExecutionOwner::root("root"),mode:PermissionMode::Read,sink:None,
         });
-        *state.control.lock().await = Some(ControlToolRuntime::new(ControlTurnContext::inactive(crate::backend::PromptMode::Chat)));
+        *state.control.lock().await = Some(Arc::new(ControlToolExecutor::new(ControlTurnContext::inactive(crate::backend::PromptMode::Chat))));
         let failure = state.request("forge/control",json!({"name":"agent_spawn",
             "arguments":{"provider":"incorrect"}})).await.unwrap_err();
         let diagnostic:Value = serde_json::from_str(&failure.to_string())?;

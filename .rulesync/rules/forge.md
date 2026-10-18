@@ -53,7 +53,7 @@ and `cargo test` do not replace building the executable Neovim launches.
 
 Use `require("forge.builder").build_command()` to resolve the runtime Cargo command
 and `require("forge.builder").binary_path()` to identify the runtime artifact.
-Forge defaults to the development profile, whose executable is under `build/debug`.
+Forge defaults to the development profile, whose executable is under `target/debug`.
 `:ForgeBuild` always builds that profile. `:ForgeBuildRelease` explicitly builds the
 release profile without changing which executable the next host selects.
 Use `require("forge.builder").for_profile("dev")` or `for_profile("release")` to
@@ -87,18 +87,19 @@ Measure edit iteration with `--timings` after a source change. Report which
 crates compiled and distinguish that result from a no-change cache check.
 Do not promise a ten-second rebuild from an unchanged Cargo invocation.
 Changes to a library crate can recompile its consumers and relink the executable.
-Cargo output belongs under `stdpath("cache")/rust-sidecar/forge/build`, not the
-crate's default `target` directory. Pass `--bin forge --locked` and the selected
+Cargo output belongs under the crate's default `target` directory. Do not pass a
+custom `--target-dir`. Pass `--bin forge --locked` and the selected
 profile. Invoke Cargo with `nvim/rust/forge` as its working directory so Cargo
 selects that directory's `rust-toolchain.toml`. In this Windows checkout the
 default command is:
 
 ```text
-cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile dev --bin forge --locked
+cargo build --manifest-path Cargo.toml --profile dev --bin forge --locked
 ```
 
-Resolve the cache directory from Neovim on other machines. Run the build with the
-same inherited Cargo configuration used for that artifact directory. Verify the
+Keep executable leases and diagnostics under Neovim's cache directory, separate
+from Cargo output. Run the build with the same inherited Cargo configuration used
+for that artifact directory. Verify the
 rebuilt executable in a fresh test host and report the command, timeout, exit
 status, and artifact path. Existing hosts retain their process-owned executable
 copy until shutdown, so they do not adopt a rebuild automatically.

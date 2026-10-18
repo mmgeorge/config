@@ -206,6 +206,9 @@ fn append_checks(
             |elapsed| format!("{}s", elapsed / 1000),
         );
         lines.push(format!("  {} · {elapsed}", command.title));
+        if let Some(output_line) = &command.output_line {
+            lines.push(format!("    {output_line}"));
+        }
     }
     if checks.command_list.is_empty() {
         lines.push("  Preparing next check".to_owned());
@@ -236,8 +239,8 @@ fn append_checks(
     Ok(())
 }
 
-fn finalization_label(outcome: Option<crate::exchange::ExchangeState>) -> &'static str {
-    if outcome == Some(crate::exchange::ExchangeState::Cancelled) {
+fn finalization_label(exchange_outcome: Option<crate::exchange::ExchangeState>) -> &'static str {
+    if exchange_outcome == Some(crate::exchange::ExchangeState::Cancelled) {
         "Stopping"
     } else {
         "Saving exchange"

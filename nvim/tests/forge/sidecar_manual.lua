@@ -2,7 +2,7 @@ vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local root = vim.fn.tempname()
 vim.fn.mkdir(root, "p")
 local builder = require("rust_sidecar").new({ crate_name = "fixture", binary_target = "fixture", locked = true,
-  crate_dir = function() error("startup inspected compiler inputs") end,
+  crate_dir = function() return root end,
   artifact_root = function() return root end,
 })
 local original_system, original_hash = vim.system, vim.fn.sha256

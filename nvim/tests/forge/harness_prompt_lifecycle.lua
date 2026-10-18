@@ -77,6 +77,7 @@ compose("interrupt manual check")
 controller.submit()
 local cancel = requests[#requests]
 assert(cancel.method == "checks.cancel" and cancel.params.run_id == "manual-check")
+assert(cancel.params.interrupt_execution == true, "Replacement prompt must collect its provider execution")
 compose("newer unsent draft")
 cancel.callback({ cancellation_requested = true })
 local replacement = requests[#requests]

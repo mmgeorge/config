@@ -4229,7 +4229,8 @@ mod tests {
                 "id": state, "command": format!("cargo test {state}"), "state": state,
                 "started_at_ms": 0, "completed_at_ms": null, "exit_code": null,
                 "error": null, "stdout": "absent", "stderr": "absent",
-                "output": "absent", "output_bytes": 100, "preview": "must stay out of status"
+                "output": "absent", "output_bytes": 100,
+                "preview": "older output\n\u{1b}[32mCompiling forge-harness\u{1b}[0m\r\n\n"
             })).collect::<Vec<_>>();
         let mut run: crate::checks::CheckRun = serde_json::from_value(json!({
             "id": "check-run", "revision": 1, "completed_plan": null,
@@ -4257,7 +4258,8 @@ mod tests {
         assert!(rows[2].starts_with("Checks running"));
         assert!(rows.iter().any(|row| row.contains("cargo test running")));
         assert!(rows.iter().any(|row| row.contains("Independent provider work")));
-        assert!(!rows.iter().any(|row| row.contains("cargo test pending") || row.contains("must stay") || row.contains("Previous check")));
+        assert!(rows.iter().any(|row| *row == "    Compiling forge-harness"));
+        assert!(!rows.iter().any(|row| row.contains("cargo test pending") || row.contains("older output") || row.contains("Previous check") || row.contains('\u{1b}')));
         assert!(projected.tool.is_empty());
         run.state = crate::checks::CheckState::Failed;
         let history = crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]);

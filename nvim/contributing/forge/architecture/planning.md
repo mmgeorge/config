@@ -705,9 +705,11 @@ exit status, timestamps, stdout, stderr, combined output, and requested/resolved
 Each run owns stable structured events for start, individual check start and completion,
 skips, configuration errors, interruption, resumption, and completion. Setup records a
 configuration-saved event. Active checks appear below the primary workflow status,
-not in timeline history. `CheckActivity` retains only command labels, completion counts,
-and execution intervals. It never replaces Working, a user-decision wait, or another
-primary phase. Output-only updates remain in the check store without mutating the status.
+not in timeline history. `CheckActivity` retains command labels, completion counts,
+execution intervals, and the latest nonempty output line for each running command.
+It removes terminal escape sequences from that line and updates the status through
+the runner's 250 ms publication interval. Complete output remains in the check store.
+Check activity never replaces Working, a user-decision wait, or another primary phase.
 The status timer refreshes the active intervals even while the primary phase is idle.
 
 Completion clears that run's side activity and inserts one expandable result group at

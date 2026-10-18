@@ -78,11 +78,6 @@ impl AcpTransport {
         }
     }
 
-    /// Send cancellation independently of the active prompt response.
-    pub(super) fn notify(&self, method: &str, parameter: Value) -> Result<()> {
-        Ok(self.connection.send_notification(UntypedMessage::new(method, parameter)?)?)
-    }
-
     /// Kill and reap all provider descendants before acknowledging cleanup.
     pub(super) async fn shutdown(&self) -> Result<()> {
         let mut process = self.process.lock().await;

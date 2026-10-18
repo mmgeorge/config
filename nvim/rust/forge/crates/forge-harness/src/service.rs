@@ -380,15 +380,7 @@ impl HarnessService {
                 .context("Harness cleanup is still running")?;
             let interrupted_checks = if method == HarnessMethod::PromptSubmit {
                 if let Some(run_id) = controller.checks.active()? {
-                    controller.checks.cancel(&run_id)?;
-                    controller.cancellation.request(false);
-                    tokio::time::timeout(Duration::from_secs(10), async {
-                        while controller.checks.active()?.is_some() {
-                            controller.checks.status(&run_id, 250, false).await?;
-                            tokio::task::yield_now().await;
-                        }
-                        Ok::<(), anyhow::Error>(())
-                    }).await.context("check processes did not stop within 10 seconds")??;
+                    controller.interrupt_checks(session_id, &run_id).await?;
                     true
                 } else { false }
             } else { false };
@@ -729,6 +721,34 @@ impl Drop for PromptAdmission {
 }
 
 impl SessionController {
+    /// Collects the native execution before a replacement prompt can release its owner.
+    async fn interrupt_checks(&self, session_id: &str, run_id: &str) -> Result<()> {
+        let active = self.checks.active()?;
+        ensure!(active.as_deref().is_none_or(|id| id == run_id),
+            "check run is not owned by this active request");
+        self.cancellation.begin_cleanup(false, false)?;
+        let cleanup = async {
+            if active.is_some() && let Err(error) = self.checks.cancel(run_id)
+                && self.checks.active()?.is_some() { return Err(error); }
+            let owner = crate::backend::ExecutionOwner::root(session_id);
+            self.permission.cancel_owner(&owner, None).await?;
+            self.backend.cleanup_execution(session_id).await
+        }.await;
+        if let Err(error) = cleanup {
+            self.cancellation.fail_cleanup(&error);
+            return Err(error.context("collect provider execution before replacing a checked prompt"));
+        }
+        self.cancellation.request(false);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while self.checks.active()?.as_deref() == Some(run_id) {
+                self.checks.status(run_id, 250, false).await?;
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        }).await.context("check processes did not stop within 10 seconds")??;
+        Ok(())
+    }
+
     /// Build one independently serialized controller from a durable broker session.
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
@@ -1449,7 +1469,15 @@ async fn route_request(
             },
             HarnessMethod::ChecksCancel => {
                 let id = request.params["run_id"].as_str().context("run_id required")?;
-                controller.checks.cancel(id)?; json!({"run_id":id,"cancellation_requested":true})
+                if request.params["interrupt_execution"].as_bool() == Some(true)
+                    || controller.backend.has_active_turn(&session_id).await {
+                    let _control = Arc::clone(&controller.control_admission).try_acquire_owned()
+                        .context("Harness cleanup is still running")?;
+                    controller.interrupt_checks(&session_id, id).await?;
+                } else {
+                    controller.checks.cancel(id)?;
+                }
+                json!({"run_id":id,"cancellation_requested":true})
             },
             HarnessMethod::ChecksOverride => controller.checks.set_overrides(task_id,serde_json::from_value(request.params.clone())?)?,
             HarnessMethod::ChecksRun => {
@@ -3521,51 +3549,104 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
+    struct CheckCleanupBackend {
+        started: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+        completed: AtomicBool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::backend::Backend for CheckCleanupBackend {
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn cleanup_execution(&self, _: &str) -> Result<()> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.completed.store(true, Ordering::Release);
+            Ok(())
+        }
+        async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn has_active_turn(&self, _: &str) -> bool { !self.completed.load(Ordering::Acquire) }
+        async fn active_session_id_for(&self, _: &str) -> Option<String> { Some("old-provider-turn".into()) }
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock, label: "Cleanup test".into(), capability: Default::default(),
+            }
+        }
+        async fn prompt_stream(&self, _: crate::backend::BackendRequest,
+            _: Option<crate::backend::BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            anyhow::bail!("cleanup must finish before another provider turn")
+        }
+    }
+
     #[tokio::test]
     async fn direct_prompt_collects_active_checks_before_admission() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        std::fs::write(fixture.path().join(".forge.json"), serde_json::to_vec(&json!({
-            "checks":{"version":2,"definitions":[{
-                "id":"waiting", "name":"Waiting check", "category":"test", "area":"Fixture",
-                "enabled":true, "auto":false, "trigger":{"kind":"manual"}, "scope":"all",
-                "all":{"command":"nu", "args":["--no-config-file","-c","sleep 30sec"]}
-            }]}
-        }))?)?;
-        let service = service();
-        assert!(service.open_session(1, initialize(&fixture, "mock")).await?.error().is_none());
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&registry.initial_session_id).await?;
-        let (sink, mut output) = forge_protocol::outbound::channel();
-        let drain = tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
-        service.dispatch(None, Request {
-            id: 2, method: "checks.run".into(), params: json!({"ids":["waiting"]}),
-        }, &sink).await?;
-        let run_id = controller.checks.active()?.context("check did not start")?;
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let run = controller.checks.status(&run_id, 100, false).await?;
-                if run.commands.iter().any(|command| command.state == crate::checks::CheckState::Running) {
-                    break Ok::<(), anyhow::Error>(());
+        for interrupt_execution in [None, Some(false), Some(true)] {
+            let fixture = tempfile::tempdir()?;
+            std::fs::write(fixture.path().join(".forge.json"), serde_json::to_vec(&json!({
+                "checks":{"version":2,"definitions":[{
+                    "id":"waiting", "name":"Waiting check", "category":"test", "area":"Fixture",
+                    "enabled":true, "auto":false, "trigger":{"kind":"manual"}, "scope":"all",
+                    "all":{"command":"nu", "args":["--no-config-file","-c","sleep 30sec"]}
+                }]}
+            }))?)?;
+            let service = service();
+            assert!(service.open_session(1, initialize(&fixture, "mock")).await?.error().is_none());
+            let registry = service.registry().await?;
+            let mut controller = registry.controller_by_id.write().await.remove(&registry.initial_session_id).unwrap();
+            let backend = Arc::new(CheckCleanupBackend {
+                started: tokio::sync::Notify::new(), release: tokio::sync::Notify::new(), completed: AtomicBool::new(false),
+            });
+            Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+            registry.controller_by_id.write().await.insert(registry.initial_session_id.clone(), controller.clone());
+            let (sink, mut output) = forge_protocol::outbound::channel();
+            let drain = tokio::spawn(async move { while output.recv().await.ok().flatten().is_some() {} });
+            service.dispatch(None, Request {
+                id: 2, method: "checks.run".into(), params: json!({"ids":["waiting"]}),
+            }, &sink).await?;
+            let run_id = controller.checks.active()?.context("check did not start")?;
+            tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    let run = controller.checks.status(&run_id, 100, false).await?;
+                    if run.commands.iter().any(|command| command.state == crate::checks::CheckState::Running) {
+                        break Ok::<(), anyhow::Error>(());
+                    }
+                    ensure!(run.state == crate::checks::CheckState::Running, "check failed before cancellation: {:?}", run.state);
                 }
-                ensure!(run.state == crate::checks::CheckState::Running, "check failed before cancellation: {:?}", run.state);
+            }).await??;
+            let snapshot = controller.observer.snapshot()?;
+            assert!(snapshot.checks_running);
+            assert_eq!(snapshot.active_check_run.as_deref(), Some(run_id.as_str()));
+            assert!(service.prepare(None, HarnessMethod::StateGet).await?.is_none());
+            assert!(service.prepare(None, HarnessMethod::GoalResume).await.is_err());
+            assert_eq!(controller.checks.active()?.as_deref(), Some(run_id.as_str()));
+            let mut preparation = Box::pin(async {
+                if let Some(interrupt_execution) = interrupt_execution {
+                    service.dispatch(None, Request {
+                        id: 3, method: "checks.cancel".into(),
+                        params: json!({"run_id":run_id,"interrupt_execution":interrupt_execution}),
+                    }, &sink).await?;
+                }
+                service.prepare(None, HarnessMethod::PromptSubmit).await
+            });
+            tokio::select! {
+                result = &mut preparation => panic!("prompt admitted before provider cleanup: {result:?}"),
+                _ = backend.started.notified() => {}
+                _ = tokio::time::sleep(Duration::from_secs(2)) => panic!("provider cleanup did not start"),
             }
-        }).await??;
-        let snapshot = controller.observer.snapshot()?;
-        assert!(snapshot.checks_running);
-        assert_eq!(snapshot.active_check_run.as_deref(), Some(run_id.as_str()));
-        assert!(service.prepare(None, HarnessMethod::StateGet).await?.is_none());
-        assert!(service.prepare(None, HarnessMethod::GoalResume).await.is_err());
-        assert_eq!(controller.checks.active()?.as_deref(), Some(run_id.as_str()));
-        let admission = tokio::time::timeout(Duration::from_secs(5),
-            service.prepare(None, HarnessMethod::PromptSubmit)).await??;
-        assert!(admission.is_some());
-        assert!(controller.checks.active()?.is_none());
-        assert_eq!(controller.checks.status(&run_id, 0, false).await?.state, crate::checks::CheckState::Interrupted);
-        assert!(!controller.observer.snapshot()?.checks_running);
-        drop(admission);
-        service.shutdown(Duration::from_secs(1)).await?;
-        drop(sink);
-        drain.abort();
+            assert!(!backend.completed.load(Ordering::Acquire));
+            assert!(futures_util::poll!(preparation.as_mut()).is_pending());
+            backend.release.notify_one();
+            let admission = tokio::time::timeout(Duration::from_secs(5), preparation).await??;
+            assert!(backend.completed.load(Ordering::Acquire));
+            assert!(admission.is_some());
+            assert!(controller.checks.active()?.is_none());
+            assert_eq!(controller.checks.status(&run_id, 0, false).await?.state, crate::checks::CheckState::Interrupted);
+            assert!(!controller.observer.snapshot()?.checks_running);
+            drop(admission);
+            service.shutdown(Duration::from_secs(1)).await?;
+            drop(sink);
+            drain.abort();
+        }
         Ok(())
     }
 

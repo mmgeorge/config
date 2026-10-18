@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 
 /// Owns ACP root-session processes and adapts provider-specific configuration.
@@ -19,6 +20,8 @@ pub(crate) struct AcpBackend {
     runtime: AcpRuntime,
     permission: Arc<PermissionCoordinator>,
     session: Mutex<HashMap<String, Arc<AcpSession>>>,
+    preparation: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    cancellation: Mutex<HashMap<String, Arc<AtomicBool>>>,
     conversation: Mutex<HashMap<String, String>>,
     settings_root: std::path::PathBuf,
 }
@@ -40,7 +43,9 @@ impl AcpBackend {
     pub(crate) fn new(kind: BackendKind, command: Vec<String>, permission: Arc<PermissionCoordinator>, settings_root: std::path::PathBuf) -> Result<Self> {
         ensure!(!command.is_empty(), "ACP command is required");
         let runtime = AcpRuntime::new(kind, command, &settings_root);
-        Ok(Self { kind, runtime, permission, session: Mutex::new(HashMap::new()), conversation: Mutex::new(HashMap::new()), settings_root })
+        Ok(Self { kind, runtime, permission, session: Mutex::new(HashMap::new()),
+            preparation: Mutex::new(HashMap::new()), cancellation: Mutex::new(HashMap::new()),
+            conversation: Mutex::new(HashMap::new()), settings_root })
     }
 
     async fn runtime_capability(&self, session: &AcpSession) -> BackendCapability {
@@ -53,11 +58,21 @@ impl AcpBackend {
         capability
     }
 
-    async fn session(&self, mut request: BackendCatalogRequest, tools: Option<Vec<crate::control_tools::ControlToolDefinition>>) -> Result<Arc<AcpSession>> {
+    async fn session(&self, mut request: BackendCatalogRequest, tools: Option<Vec<crate::control_tools::ControlToolDefinition>>,
+        cancelled: Option<&AtomicBool>) -> Result<Arc<AcpSession>> {
         self.kind.validate_access(&request.access)?;
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(crate::broker::TurnCancelled.into());
+        }
         let runtime_key = request.runtime_key()?;
-        let mut session_map = self.session.lock().await;
-        if let Some(session) = session_map.get(&runtime_key).cloned() {
+        let preparation = self.preparation.lock().await.entry(runtime_key.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(()))).clone();
+        let _preparation = preparation.lock().await;
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        let existing = self.session.lock().await.get(&runtime_key).cloned();
+        if let Some(session) = existing {
             let changed = if let Some(tools) = &tools {
                 let previous = session.state.tool_definition.read().await;
                 tools.iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>()
@@ -67,7 +82,7 @@ impl AcpBackend {
             ensure!(session.state.active.read().await.is_none(), "Tool profile changes require active execution cleanup");
             request.backend_session_id = Some(session.id.clone());
             session.transport.shutdown().await?;
-            session_map.remove(&runtime_key);
+            self.session.lock().await.remove(&runtime_key);
         }
         if request.backend_session_id.is_none() {
             request.backend_session_id = self.conversation.lock().await.get(&request.runtime_key()?).cloned();
@@ -145,7 +160,11 @@ impl AcpBackend {
         if has_history {
             self.conversation.lock().await.insert(runtime_key.clone(), session.id.clone());
         }
-        session_map.insert(runtime_key, session.clone());
+        let mut published = self.session.lock().await;
+        if cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        published.insert(runtime_key, session.clone());
         Ok(session)
     }
 
@@ -217,7 +236,7 @@ impl Backend for AcpBackend {
 
     async fn reconcile_settings(&self, request: BackendCatalogRequest, _setting: &crate::settings::PortableSettings) -> Result<()> {
         self.cleanup_execution(&request.runtime_key()?).await?;
-        self.session(request, None).await?;
+        self.session(request, None, None).await?;
         Ok(())
     }
 
@@ -341,6 +360,8 @@ impl Backend for AcpBackend {
     }
 
     async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<BackendOutput> {
+        let cancelled = request.control_context.as_ref().and_then(|context| context.submission_cancelled.clone())
+            .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
         let skills = self.permission.skills(Some(&self.settings_root), &request, self.kind)?;
         let _directories = self.permission.directories(Some(&self.settings_root), &request)?;
         let sink = skills.sink(sink);
@@ -352,10 +373,12 @@ impl Backend for AcpBackend {
                 self.cleanup_execution(&request.runtime_key()?).await?;
             }
         }
+        self.cancellation.lock().await.insert(request.runtime_key()?, cancelled.clone());
         let tools = crate::control_tools::ControlToolRegistry.definition_list_for_context(request.control_context.as_ref(),request.owner()?.is_root());
-        let session = self.session(catalog_request(&request), Some(tools)).await?;
+        let session = self.session(catalog_request(&request), Some(tools), Some(&cancelled)).await?;
         let _turn = session.turn.try_lock().context("ACP session already owns active work")?;
         self.configure(&session, &request).await?;
+        if cancelled.load(Ordering::Acquire) { return Err(crate::broker::TurnCancelled.into()); }
         let text = match &request.input {
             BackendInput::Text { text, .. } => text.clone(),
             BackendInput::Skill { name, arguments, .. } => format!("/{name} {arguments}"),
@@ -382,7 +405,7 @@ impl Backend for AcpBackend {
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
-        let session = self.session(catalog_request(&request), None).await?;
+        let session = self.session(catalog_request(&request), None, None).await?;
         let catalog = session.state.catalog.read().await;
         let model_list = catalog.pointer("/models/availableModels").and_then(Value::as_array)
             .or_else(|| find_option(&catalog, "model").and_then(|option|option["options"].as_array()));
@@ -403,7 +426,7 @@ impl Backend for AcpBackend {
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
         ensure!(self.kind == BackendKind::Claude, "Antigravity does not implement native session fork");
-        let session = self.session(catalog_request(&request.source), None).await?;
+        let session = self.session(catalog_request(&request.source), None, None).await?;
         ensure!(session.initialized.pointer("/agentCapabilities/sessionCapabilities/fork").is_some(), "Claude ACP did not advertise fork");
         let mut configuration = session.configuration.clone();
         configuration["sessionId"] = json!(session.id);
@@ -426,13 +449,6 @@ impl Backend for AcpBackend {
         match session { Some(session) => session.state.active.read().await.is_some(), None => false }
     }
 
-    async fn cancel_session(&self, id: &str) -> Result<()> {
-        if let Some(session) = self.session.lock().await.get(id).cloned() {
-            session.transport.notify("session/cancel", json!({"sessionId":session.id}))?;
-        }
-        Ok(())
-    }
-
     async fn steer_session(&self, id: &str, input: crate::backend::SteeringInput) -> Result<()> {
         let text = input.text();
         let session = self.session.lock().await.get(id).cloned().context("ACP conversation is not active")?;
@@ -448,10 +464,16 @@ impl Backend for AcpBackend {
     }
 
     async fn cleanup_execution(&self, id: &str) -> Result<()> {
-        if let Some(session) = self.session.lock().await.remove(id) {
+        if let Some(cancelled) = self.cancellation.lock().await.get(id) {
+            cancelled.store(true, Ordering::Release);
+        }
+        let session = self.session.lock().await.remove(id);
+        if let Some(session) = session {
+            session.state.cancel_control().await;
             *session.state.active.write().await = None;
-            *session.state.control.lock().await = None;
-            session.transport.shutdown().await?;
+            let result = session.transport.shutdown().await;
+            session.state.close_control().await;
+            result?;
         }
         Ok(())
     }
@@ -475,6 +497,30 @@ mod test {
     use super::*;
     use crate::settings::{ImportKind, SettingScope, SettingsStore};
 
+    #[tokio::test]
+    async fn cleanup_does_not_wait_for_session_preparation() -> Result<()> {
+        for kind in [BackendKind::Claude, BackendKind::Antigravity] {
+            let fixture = tempfile::tempdir()?;
+            let backend = AcpBackend::new(kind, vec!["unused".into()],
+                PermissionCoordinator::transient(fixture.path())?, fixture.path().join("settings"))?;
+            let preparation = Arc::new(Mutex::new(()));
+            backend.preparation.lock().await.insert("preparing".into(), preparation.clone());
+            let cancelled = Arc::new(AtomicBool::new(false));
+            backend.cancellation.lock().await.insert("preparing".into(), cancelled.clone());
+            let _preparation = preparation.lock().await;
+            tokio::time::timeout(std::time::Duration::from_millis(100),
+                backend.cleanup_execution("preparing")).await??;
+            assert!(cancelled.load(Ordering::Acquire));
+            let request = BackendCatalogRequest {
+                execution_owner:None, harness_session_id:"preparing".into(),
+                workspace:fixture.path().to_string_lossy().into_owned(), access:kind.resolve_access(Default::default()),
+                execution_mode:PermissionMode::Read, backend_session_id:None,
+            };
+            let failed = backend.session(request, None, Some(&cancelled)).await;
+            assert!(failed.err().unwrap().is::<crate::broker::TurnCancelled>());
+        }
+        Ok(())
+    }
     #[tokio::test]
     async fn catalog_includes_disabled_imports_and_refreshes_selection_without_provider_startup() -> Result<()> {
         let fixture = tempfile::tempdir()?;

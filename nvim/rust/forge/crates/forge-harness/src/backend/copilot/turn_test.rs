@@ -135,6 +135,8 @@ async fn copilot_cleanup_waits_for_committed_send_and_blocks_late_steering() -> 
         Ok("send-response-id".into())
     }));
     assert!(futures_util::poll!(sending.as_mut()).is_pending());
+    let request = turn.request_stop()?;
+    assert!(request.submitted && request.sending, "native abort must be available before send collection");
     let mut stopping = Box::pin(turn.stop());
     assert!(futures_util::poll!(stopping.as_mut()).is_pending());
     release.send(()).unwrap();
@@ -151,6 +153,54 @@ async fn copilot_cleanup_waits_for_committed_send_and_blocks_late_steering() -> 
         turn.retraction_target().is_err(),
         "missing native event identity was silently accepted"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_cleanup_sends_abort_before_a_pending_send_response() -> Result<()> {
+    let (_fixture, backend, request) = fixture()?;
+    let session_id = request.runtime_key()?;
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read, client_write, PathBuf::from(&request.workspace),
+    )?);
+    let create = async {
+        let message = read_request(&mut server_read).await?;
+        assert_eq!(message["method"], "session.create");
+        respond(&mut server_write, &message, json!({"result":{
+            "sessionId":message["params"]["sessionId"],"workspacePath":"."
+        }})).await
+    };
+    let (session, ()) = tokio::try_join!(backend.session(&request), create)?;
+    let turn = backend.turn_event(&session_id).await;
+    let active = turn.activate(None, None)?;
+    let (submitted, submission) = tokio::sync::oneshot::channel();
+    let sending = turn.send(async {
+        session.send(github_copilot_sdk::types::MessageOptions::new("pending send")).await
+            .context("fixture send failed")
+    });
+    let stopping = async {
+        submission.await?;
+        backend.cleanup_execution(&session_id).await
+    };
+    let server = async {
+        let send = read_request(&mut server_read).await?;
+        assert_eq!(send["method"], "session.send");
+        submitted.send(()).unwrap();
+        let abort = read_request(&mut server_read).await?;
+        assert_eq!(abort["method"], "session.abort", "native interrupt waited for send completion");
+        respond(&mut server_write, &abort, json!({"result":{}})).await?;
+        respond(&mut server_write, &send, json!({"result":{"messageId":"pending-message"}})).await?;
+        let collected_abort = read_request(&mut server_read).await?;
+        assert_eq!(collected_abort["method"], "session.abort");
+        respond(&mut server_write, &collected_abort, json!({"result":{}})).await?;
+        drop(active);
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        tokio::try_join!(sending, stopping, server)
+    }).await??;
     Ok(())
 }
 

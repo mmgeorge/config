@@ -14,7 +14,7 @@ pub struct CheckActivity {
     pub completed_count: usize,
     /// Commands selected for this run.
     pub total_count: usize,
-    /// Running command labels and timers, without retained output.
+    /// Running command labels, timers, and latest output lines.
     pub command_list: Vec<CheckCommandActivity>,
 }
 
@@ -70,6 +70,14 @@ impl CheckActivity {
                     |context| context.name.clone(),
                 ),
                 started_at_ms: command.started_at_ms,
+                output_line: String::from_utf8_lossy(&strip_ansi_escapes::strip(
+                    command.preview.as_bytes(),
+                ))
+                .split(['\n', '\r'])
+                .rev()
+                .map(str::trim)
+                .find(|line| !line.is_empty())
+                .map(str::to_owned),
             })
             .collect();
         Some(Self {
@@ -104,6 +112,8 @@ pub struct CheckCommandActivity {
     pub title: String,
     /// Command execution interval used by the status timer.
     pub started_at_ms: Option<i64>,
+    /// Latest nonempty output line with terminal escape sequences removed.
+    pub output_line: Option<String>,
 }
 
 impl CheckCommandActivity {

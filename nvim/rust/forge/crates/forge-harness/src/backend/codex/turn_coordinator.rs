@@ -244,6 +244,21 @@ impl<'a> CodexTurnCoordinator<'a> {
         provider_started: bool,
         observed_message_list: Vec<Value>,
     ) -> Result<Value> {
+        let result = self.run_inner(turn_id, provider_started, observed_message_list).await;
+        let cleanup = self.process.cancel_requests(self.output).await;
+        match (result, cleanup) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), Err(cleanup)) => Err(error.context(format!("provider request cleanup failed: {cleanup:#}"))),
+        }
+    }
+
+    async fn run_inner(
+        &mut self,
+        turn_id: String,
+        provider_started: bool,
+        observed_message_list: Vec<Value>,
+    ) -> Result<Value> {
         let mut last_completion = Value::Null;
         let mut parent_turn = Some(ParentTurn {
             id: turn_id,
@@ -301,14 +316,14 @@ impl<'a> CodexTurnCoordinator<'a> {
                     }
                     message = self.process.receive_message() => {
                         let message = message?;
-                        if message_thread_id(&message) == Some(self.thread_id)
-                            && message_turn_id(&message).is_some_and(|turn_id| turn_id != active.id) {
+                        if message_thread_id(message.message()) == Some(self.thread_id)
+                            && message_turn_id(message.message()).is_some_and(|turn_id| turn_id != active.id) {
                             self.process.set_activity_publication(false);
-                            self.process.publish_message(message, self.output).await?;
+                            self.process.publish_received(message, self.output).await?;
                             self.process.set_activity_publication(true);
                             continue;
                         }
-                        let message = self.process.publish_message(message, self.output).await?;
+                        let message = self.process.publish_received(message, self.output).await?;
                         self.observe_goal(&message);
                         self.descendant.observe(&message, self.thread_id);
                         self.admit_cleanup_targets().await;
@@ -377,7 +392,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                     }
                 }
                 message = self.process.receive_message() => {
-                    let message = self.process.publish_message(message?, self.output).await?;
+                    let message = self.process.publish_received(message?, self.output).await?;
                     self.observe_goal(&message);
                     let had_active = self.descendant.active_count() > 0;
                     self.descendant.observe(&message, self.thread_id);
@@ -612,8 +627,9 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
         let thread = self.descendant.active_thread_list();
         self.stopping = true;
+        self.process.cancel_request_work();
         if thread.is_empty() && parent_turn_id.is_none() && !self.provider_goal_active {
-            command.complete(Ok(())).await;
+            command.complete(self.process.collect_requests(self.output).await).await;
             return;
         }
         self.cleanup = Some(DescendantCleanup {
@@ -641,6 +657,10 @@ impl<'a> CodexTurnCoordinator<'a> {
             }
         }
         self.admit_cleanup_targets().await;
+        if let Err(error) = self.process.collect_requests(self.output).await
+            && let Some(cleanup) = self.cleanup.take() {
+            cleanup.command.complete(Err(error)).await;
+        }
     }
 
     fn observe_goal(&mut self, message: &Value) {
@@ -807,6 +827,110 @@ async fn settle_interruptions(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn pending_lsp_request_keeps_events_and_cleanup_responsive() -> Result<()> {
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::backend::{BackendInput, PromptMode};
+        use crate::control_tools::{ControlTurnContext, lsp::LspService};
+        use crate::session::PermissionMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::{Arc, atomic::AtomicBool};
+        use std::time::{Duration, Instant};
+
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().to_string_lossy().into_owned();
+        std::fs::write(directory.path().join("source.rs"), "pub fn source() {}\n")?;
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()], permission.clone(), trace.clone(), None,
+        )?;
+        let lsp = Arc::new(LspService::default());
+        let (sender, mut editor) = forge_protocol::outbound::channel();
+        lsp.attach(sender);
+        lsp.set_enabled("session", true);
+        let policy = Arc::new(crate::permissions::matcher::CompiledPermissionDocument::compile(
+            crate::permissions::document::default_permission_document(), directory.path(),
+        ));
+        let (scope, _lease) = lsp.scope("session".into(), "exchange".into(), directory.path().into(),
+            policy, PermissionMode::Read, Arc::new(AtomicBool::new(false)));
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.lsp = Some(scope);
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await?;
+            let mut socket = tokio_tungstenite::accept_async(stream).await?;
+            for message in [
+                json!({"id":99,"method":"item/tool/call","params":{"threadId":"thread","turnId":"turn",
+                    "callId":"pending-lsp","tool":"lsp_context","arguments":{"path":"source.rs","line":1,"column":1}}}),
+                json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn",
+                    "itemId":"progress","delta":"Provider events continue while LSP is pending."}}),
+            ] { socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await?; }
+            let mut cancelled = false;
+            let mut interrupted = false;
+            loop {
+                let frame = tokio::time::timeout(Duration::from_secs(2), socket.next()).await?
+                    .context("provider connection closed before interrupt")??;
+                let message: Value = serde_json::from_str(frame.to_text()?)?;
+                if message["id"] == 99 {
+                    assert!(message.get("error").is_some(), "pending tool reported success during cleanup");
+                    cancelled = true;
+                } else if message["method"] == "turn/interrupt" {
+                    assert!(!cancelled, "native interrupt waited for tool-result collection");
+                    interrupted = true;
+                    for response in [
+                        json!({"id":message["id"],"result":{}}),
+                        json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"interrupted"}}}),
+                    ] { socket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string().into())).await?; }
+                }
+                if cancelled && interrupted { break; }
+            }
+            Ok::<_, anyhow::Error>(())
+        });
+        let (events, mut event_stream) = crate::backend::events::channel();
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
+            permission, Some(events.clone()), trace, "session".into()).await?;
+        process.set_control_context(context).await;
+        let request = BackendRequest {
+            execution_owner: None, harness_session_id:"session".into(), workspace,
+            input:BackendInput::from_text("wait for diagnostics"), mode:PromptMode::Chat,
+            model:"fixture".into(), effort:"low".into(), context_window:None,
+            access:Default::default(), service_tier:Default::default(), execution_mode:PermissionMode::Read,
+            backend_session_id:Some("thread".into()), control_context:None,
+        };
+        let lane = SteeringLane::default();
+        let mut steering = lane.activate(None)?;
+        let mut output = BackendOutput::default();
+        let run = CodexTurnCoordinator::new(&backend, &mut process, &mut output, &mut steering,
+            Some(events), &request, "thread").run("turn".into(), true, Vec::new());
+        let stop = async {
+            let query = editor.recv().await?.context("LSP request was not sent")?;
+            let query: Value = serde_json::from_slice(query.bytes())?;
+            assert_eq!(query["event"], "lsp.request");
+            loop {
+                let event = event_stream.recv().await?.context("provider events stopped behind LSP")?;
+                if event.kind == "assistant_message" { break; }
+            }
+            let started = Instant::now();
+            lane.cleanup_execution().await?;
+            assert!(started.elapsed() < Duration::from_secs(1), "cleanup waited for LSP timeout");
+            let cancelled = editor.recv().await?.context("editor cancellation was not sent")?;
+            let cancelled: Value = serde_json::from_slice(cancelled.bytes())?;
+            assert_eq!(cancelled["event"], "lsp.cancel");
+            assert!(lsp.respond("session", query["payload"]["id"].as_str().unwrap(), json!({}), None).is_err(),
+                "a late LSP response retained authority after cleanup");
+            Ok::<_, anyhow::Error>(())
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::try_join!(run, stop) }).await??;
+        assert_eq!(result["turn"]["status"], "interrupted");
+        server.await??;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn chat_cancellation_pauses_provider_goal_and_waits_for_acknowledgements() -> Result<()> {

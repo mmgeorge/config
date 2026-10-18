@@ -1977,7 +1977,9 @@ function M.submit()
       interrupted.cancel_complete = true
       resume_check_interrupted_prompt(state, interrupted)
     end
-    local sent, failure = pcall(client.request_for, state.session.id, "checks.cancel", { run_id = run_id }, cancelled)
+    local sent, failure = pcall(client.request_for, state.session.id, "checks.cancel", {
+      run_id = run_id, interrupt_execution = true,
+    }, cancelled)
     if not sent then cancelled(nil, tostring(failure)) end
     return
   end
@@ -2454,36 +2456,32 @@ end
 ---@param completed? fun(applied: boolean)
 configure_now = function(next_config, validate_selection, completed)
   local state = harness_state()
-  local request_config = vim.tbl_extend("force", {}, next_config, { validate = validate_selection == true })
+  local request_config = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
+  state.task_config = request_config
   state.configuring = true
   state.configuring_config = request_config
-  M.refresh_winbar()
-  client.request("session.configure", request_config, function(result, request_error)
-    if state.configuring_config ~= request_config then return end
-    state.configuring = false
-    state.configuring_config = nil
-    if request_error then
-      if next_config.model == nil and (next_config.effort ~= nil or next_config.service_tier ~= nil) then
-        state.configuration_error = request_error
-      else
-        report_configuration_error(request_error)
-      end
-      M.refresh_winbar()
-      if completed then completed(false) end
-      if state.pending_config then vim.schedule(M.drain) end
-      return
+  state.configuration_error = nil
+  if state.configuration_completion then state.configuration_completion.complete(false) end
+  local finished = false
+  local configuration = { complete = function(applied)
+    if finished then return end
+    finished = true
+    if state.configuring_config == request_config then
+      state.configuring = false
+      state.configuring_config = nil
     end
-    state.session = result
-    if type(next_config.lsp_tools) == "boolean" then state.lsp_tools = next_config.lsp_tools end
-    if type(next_config.subagent_tools) == "boolean" then
-      state.subagent_tools = next_config.subagent_tools
+    if applied then
+      prune_pending_settings(state)
+      if next_config.model and not state.session.resolved_model then M.resolve_runtime_model() end
     end
-    state.configuration_error = nil
-    prune_pending_settings(state)
     M.refresh_winbar()
-    if next_config.model and not result.resolved_model then M.resolve_runtime_model() end
-    if completed then completed(true) end
-    vim.schedule(M.drain)
+    if completed then completed(applied) end
+  end }
+  state.configuration_completion = configuration
+  M.task_transition({ action = "configure", config = request_config }, nil, function(applied)
+    if state.task_config == request_config then state.task_config = nil end
+    if state.configuration_completion == configuration then state.configuration_completion = nil end
+    configuration.complete(applied)
   end)
 end
 
@@ -2540,21 +2538,7 @@ function M.configure(next_config, validate_selection, completed)
     state.pending_config, state.pending_config_validate = nil, false
     if state.pending_config_completed then state.pending_config_completed(false) end
     state.pending_config_completed = nil
-    local requested = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
-    state.task_config = requested
-    if state.configuration_completion then state.configuration_completion.complete(false) end
-    local finished = false
-    local configuration = { complete = function(applied)
-      if finished then return end
-      finished = true
-      if completed then completed(applied) end
-    end }
-    state.configuration_completion = configuration
-    M.task_transition({ action = "configure", config = requested }, nil, function(applied)
-      if state.task_config == requested then state.task_config = nil end
-      if state.configuration_completion == configuration then state.configuration_completion = nil end
-      configuration.complete(applied)
-    end)
+    configure_now(next_config, validate_selection, completed)
     return
   end
   local tuning_only = not completed and next(next_config) ~= nil

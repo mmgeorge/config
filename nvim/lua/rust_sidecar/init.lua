@@ -11,7 +11,7 @@
 ---@field crate_name string
 ---@field crate_dir fun(): string
 ---@field executable_name? string
----@field artifact_root? fun(): string
+---@field artifact_root? fun(): string Runtime cache directory for executable leases and diagnostics.
 ---@field binary_target? string
 ---@field locked? boolean
 ---@field profile? 'dev'|'release' Cargo profile, defaulting to release.
@@ -19,7 +19,7 @@
 ---@class RustSidecarBuilder
 ---@field crate_dir fun(): string
 ---@field manifest_path fun(): string
----@field artifact_root fun(): string
+---@field artifact_root fun(): string Runtime cache directory, independent of Cargo output.
 ---@field binary_path fun(): string
 ---@field build_command fun(): string[]
 ---@field build fun(callback: fun(result: RustSidecarExecutableResult)) Runs Cargo asynchronously even when the executable exists. Concurrent build and ensure callers share one result.
@@ -126,7 +126,7 @@ function M.new(spec)
   end
 
   function builder.binary_path()
-    return vim.fs.joinpath(builder.artifact_root(), "build", profile == "dev" and "debug" or "release", executable_name())
+    return vim.fs.joinpath(builder.crate_dir(), "target", profile == "dev" and "debug" or "release", executable_name())
   end
 
   function builder.build_command()
@@ -135,8 +135,6 @@ function M.new(spec)
       "build",
       "--manifest-path",
       builder.manifest_path(),
-      "--target-dir",
-      vim.fs.joinpath(builder.artifact_root(), "build"),
     }
     if profile == "release" then command[#command + 1] = "--release"
     else vim.list_extend(command, { "--profile", "dev" }) end

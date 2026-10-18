@@ -10,20 +10,18 @@ by `nvim/rust/forge/rust-toolchain.toml`, and the platform C compiler. Real lang
 fixtures also need Git and the selected language server. TypeScript fixtures need
 Node/npm and the native TypeScript server, with their dependency installed locally.
 
-## Resolve the target and build
+## Build the development executable
 
-Start at the repository root. Resolve the artifact directory from Neovim instead
-of guessing a Windows or macOS cache path, then change to the Rust workspace so
-Cargo selects its pinned toolchain:
+Start at the repository root, then change to the Rust workspace so Cargo selects
+its pinned toolchain and writes to the crate's default `target` directory:
 
 ```nu
-let target = (^nvim --headless -u NONE --cmd 'set rtp^=./nvim' -c "lua io.write(require('forge.builder').artifact_root() .. '/build')" -c 'qa!' | str trim)
 cd nvim/rust/forge
-cargo build --profile dev --locked --target-dir $target --bin forge
+cargo build --profile dev --locked --bin forge
 ```
 
-Neovim's `:ForgeBuild` always builds the development executable in `build/debug`.
-`:ForgeBuildRelease` builds the release executable in `build/release`. Both commands
+Neovim's `:ForgeBuild` always builds the development executable in `target/debug`.
+`:ForgeBuildRelease` builds the release executable in `target/release`. Both commands
 are available before the Forge plugin loads. Contributors still own the rebuild
 after source changes. Do not use the existence of an older executable, `cargo check`,
 or a passing test binary as proof that the editor runs the changed code.
@@ -33,13 +31,13 @@ compilation, uses limited debug information, and disables LTO. External packages
 use optimization level 3 without debug information through
 `[profile.dev.package."*"]`. Cargo excludes workspace members from that override,
 and the test profile inherits dev. These dependencies belong to the development
-cache. Cargo does not reuse artifacts from `build/release` for development builds.
+cache. Cargo does not reuse artifacts from `target/release` for development builds.
 The first development build compiles any missing dependency artifacts.
 
 For an explicit release or performance check, use the same target directory:
 
 ```nu
-cargo build --release --locked --target-dir $target --bin forge
+cargo build --release --locked --bin forge
 ```
 
 Forge continues to launch the development executable after a release build. To
@@ -60,10 +58,10 @@ Run the affected test target first. From the Rust workspace, these examples reus
 the same development target:
 
 ```nu
-cargo test --profile dev --locked --target-dir $target -p forge-diff --lib declaration_calls::tests
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib plan::
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib declaration::tests
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib control_tools::
+cargo test --profile dev --locked -p forge-diff --lib declaration_calls::tests
+cargo test --profile dev --locked -p forge-harness --lib plan::
+cargo test --profile dev --locked -p forge-harness --lib declaration::tests
+cargo test --profile dev --locked -p forge-harness --lib control_tools::
 ```
 
 Add `--offline` only when all dependencies are already available. Broaden to the
@@ -80,12 +78,16 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_s
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_checks_host.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_message_folds_host.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_markdown_folds.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_configuration_host.lua
 ```
 
 The message-fold fixture checks three-line previews, caret rendering, prompt submission,
 automatic response folding on the next exchange, and retained manual expansion in a fresh host.
 Both fold fixtures load the installed Markdown renderer and parsers. The Markdown fixture
 checks repeated list folding beside a status row and cursor refreshes for stale bullet decorations.
+The configuration fixture applies thinking changes while idle, while a blocking provider owns
+execution but Lua reports idle, and while the task is paused. It verifies resumption preserves
+the task identity and paused changes do not restart provider work.
 
 Enforce an external execution deadline when running these commands through an
 automation tool. A fixture that prints success but remains alive does not pass.
@@ -113,13 +115,13 @@ use the direct commands above and record the actual exit status and deadline.
 
 Check resolution changes affect package ownership, concrete commands, and evidence
 accepted by the automatic gate. Run the targeted Rust tests from the Rust workspace
-with the development target resolved above:
+with the same default target directory:
 
 ```nu
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib checks:: -- --test-threads=1
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib plan::design_review::tests
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib automatic_checks_repair_once
-cargo test --profile dev --locked --target-dir $target -p forge-harness --lib selected_plan_checks_are_versioned
+cargo test --profile dev --locked -p forge-harness --lib checks:: -- --test-threads=1
+cargo test --profile dev --locked -p forge-harness --lib plan::design_review::tests
+cargo test --profile dev --locked -p forge-harness --lib automatic_checks_repair_once
+cargo test --profile dev --locked -p forge-harness --lib selected_plan_checks_are_versioned
 ```
 
 The check tests cover package discovery, argument expansion, deduplication,
@@ -157,7 +159,7 @@ arguments rather than granting agents a separate terminal-validation path.
 Build the fixture generator with the same development target:
 
 ```nu
-cargo build --profile dev --locked --target-dir $target -p forge-harness --example plan_navigation_fixture
+cargo build --profile dev --locked -p forge-harness --example plan_navigation_fixture
 ```
 
 Start a fresh Neovim from the repository root with `nvim` on its runtimepath. Set
@@ -219,6 +221,33 @@ and request functions. Close the host and delete its temporary workspace and
 data directories after manual inspection.
 
 ## Static and documentation checks
+
+The Codex transport tests include a pending editor LSP request while provider text and
+execution cleanup continue. The service check-interruption test holds native cleanup open
+and verifies that both direct prompt admission and editor check cancellation wait for it.
+Run these filters with the development profile and a 300-second compilation deadline:
+
+```text
+cargo test --profile dev --locked -p forge-harness --lib backend::codex
+cargo test --profile dev --locked -p forge-harness --lib service::tests
+```
+
+The shared `control_tools::executor` tests cover cancellation of active and queued tools,
+editor-request revocation, and retention of completed results. The `backend::copilot` and
+`backend::acp` tests exercise that executor through their real callback adapters. Copilot's
+in-memory SDK transport test withholds a send response and requires native abort first.
+Run these additional filters when changing provider lifecycle ownership:
+
+```text
+cargo test --profile dev --locked -p forge-harness --lib control_tools::executor
+cargo test --profile dev --locked -p forge-harness --lib backend::copilot
+cargo test --profile dev --locked -p forge-harness --lib backend::acp
+```
+
+Run `harness_prompt_lifecycle.lua` for composer preservation during check interruption and
+`harness_configuration_host.lua` against the rebuilt executable for thinking changes with
+stale editor busy state. Terminal inventory tests assert a configuration-free attachment
+and connection reuse across both pagination and repeated polls.
 
 From the repository root, verify whitespace and the affected documentation links:
 

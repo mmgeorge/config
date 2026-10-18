@@ -242,9 +242,11 @@ successful handshake.
 ## Executable ownership
 
 `forge.builder` delegates to independent `rust_sidecar` builders for development
-and release profiles. The default runtime uses `build/debug`, and `:ForgeBuild`
+and release profiles. Cargo output stays in the crate's default `target` directory,
+separate from the runtime cache used for executable leases and diagnostics.
+The default runtime uses `target/debug`, and `:ForgeBuild`
 always builds that development executable. `:ForgeBuildRelease` explicitly builds
-`build/release` without changing runtime selection. Setting
+`target/release` without changing runtime selection. Setting
 `vim.g.forge_build_profile = "release"` before loading Forge selects that runtime.
 `for_profile()` returns a stable builder for explicit profile operations, so
 concurrent requests for different profiles retain separate completion callbacks

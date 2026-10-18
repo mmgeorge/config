@@ -95,16 +95,24 @@ impl CopilotTurnEvent {
 
     /// Fence future sends and wait only for a send that already owns dispatch.
     pub(super) async fn stop(&self) -> Result<bool> {
-        self.state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?
-            .cancelled = true;
+        self.request_stop()?;
         let _dispatch = self.dispatch.lock().await;
         let state = self
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
         Ok(state.submitted)
+    }
+
+    /// Fence new sends immediately and identify a submitted send that still needs collection.
+    pub(super) fn request_stop(&self) -> Result<StopRequest> {
+        let submitted = {
+            let mut state = self.state.lock()
+                .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
+            state.cancelled = true;
+            state.submitted
+        };
+        Ok(StopRequest { submitted, sending: self.dispatch.try_lock().is_err() })
     }
 
     pub(super) async fn wait_finished(&self) {
@@ -189,6 +197,14 @@ impl CopilotTurnEvent {
         }
         Ok(())
     }
+}
+
+/// Separates the native abort signal from collection of a committed SDK send.
+pub(super) struct StopRequest {
+    /// Reports that a native send was admitted before the stop fence.
+    pub(super) submitted: bool,
+    /// Reports that its SDK response has not yet released dispatch ownership.
+    pub(super) sending: bool,
 }
 
 /// Retains send ownership and the exact native history boundary across prompt completion.

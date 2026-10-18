@@ -344,7 +344,52 @@ its command text. Compound commands, expressions, and unknown options keep their
 text. The durable command stays unchanged, and expanded output includes that original
 command above its output. These display summaries do not alter approval or execution input.
 
+## Provider execution and cancellation
+
+`Backend` uses async trait methods for native provider operations. That interface does not
+provide execution isolation. Its default session cancellation delegates to execution cleanup,
+so an adapter cannot accidentally use a weaker stop path by omitting an override.
+`ControlToolExecutor` owns the shared lifecycle used by Codex,
+Copilot, Claude, and Antigravity control callbacks. The raw `ControlToolRuntime` remains inside
+the control-tools module, so production adapters cannot bypass this lifecycle.
+
+Each executor owns one canonical runtime, a cancellation signal, and admission accounting.
+Runtime mutations remain serialized. Cancellation revokes new admissions and interrupts both
+the current tool wait and callers waiting for the runtime lock. A completed result retains its
+admission until its adapter publishes or discards it. Cleanup collects those admissions before
+reusing the provider turn. A new turn receives a fresh executor and cannot accept late results
+from the prior generation. LSP cancellation uses the same path as checkpoint, check, repository,
+and agent-tool waits.
+
+Native adapters signal stop before collecting local callbacks. Codex sends `turn/interrupt`
+before awaiting request-result cleanup. Copilot sends abort before collecting a pending SDK send
+response, then repeats abort when needed to cover that send's commit race. ACP cancels callback
+authority and stops its owned process tree before collecting tool calls. Adapter code retains
+provider framing, native acknowledgements, and thread identities. Shared code owns tool execution
+and cancellation semantics.
+
+ACP session preparation holds a per-runtime admission lock. Its published session map remains
+available while a provider launches or responds to its startup handshake. Cleanup can therefore
+observe an unsubmitted session and return without waiting for startup.
+Publication also checks the shared submission-cancellation flag, so a late startup
+response cannot reactivate a cancelled prompt.
+
 ## Codex turn coordination
+
+Codex callbacks execute outside the socket reader. The connection owns request tasks and
+publishes their completed results through the same coordinator that reads provider frames.
+Canonical control tools share an ordered executor. Each waits for the preceding result to
+publish before executing, while approval callbacks have independent waits. An LSP lookup
+or approval therefore cannot prevent the coordinator from receiving
+steering, cancellation, or another provider event. Cleanup revokes pending request tasks,
+sends native interruption, then collects callbacks and preserves completed tool results.
+Turn completion and transport failure also collect the request tasks.
+
+Background terminal inventory uses a separate passive connection per runtime owner. Its
+initial `thread/resume` supplies only `threadId`, without changing model, effort, service tier,
+or permission configuration. Subsequent polls reuse that connection and read every inventory
+page. A changed thread or failed request invalidates the cached connection. Passive traffic
+does not execute broadcast tool callbacks or publish them as foreground activity.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before

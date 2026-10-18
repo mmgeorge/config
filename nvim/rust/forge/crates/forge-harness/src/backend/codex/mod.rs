@@ -19,6 +19,7 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
+mod request_execution;
 mod process;
 mod text_generation;
 mod runtime;
@@ -36,6 +37,12 @@ struct CodexConnection {
     timing: Vec<BackendTimingRecord>,
 }
 
+struct TerminalConnection {
+    process: CodexJsonRpc,
+    output: BackendOutput,
+    thread_id: String,
+}
+
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
     runtime: CodexRuntime,
@@ -47,6 +54,7 @@ pub struct CodexBackend {
     active_turn_by_session: Mutex<HashMap<String, CodexTurnState>>,
     turn_started: Notify,
     connection_by_session: Mutex<HashMap<String, Arc<Mutex<CodexConnection>>>>,
+    terminal_connection_by_session: Mutex<HashMap<String, Arc<Mutex<Option<TerminalConnection>>>>>,
     completed_turn_by_session: Mutex<HashMap<String, String>>,
     permission_coordinator: Arc<PermissionCoordinator>,
     trace: Arc<TraceStore>,
@@ -135,6 +143,7 @@ impl CodexBackend {
             active_turn_by_session: Mutex::new(HashMap::new()),
             turn_started: Notify::new(),
             connection_by_session: Mutex::new(HashMap::new()),
+            terminal_connection_by_session: Mutex::new(HashMap::new()),
             completed_turn_by_session: Mutex::new(HashMap::new()),
             permission_coordinator,
             trace,
@@ -175,7 +184,7 @@ impl CodexBackend {
                 request.harness_session_id.clone(),
             )
             .await?;
-        process.set_execution_owner(request.owner()?);
+        process.set_execution_owner(request.owner()?).await;
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
         let initialize_started = Instant::now();
         process.request("initialize", json!({
@@ -295,7 +304,7 @@ impl CodexBackend {
                 &request.workspace,
                 request.execution_mode,
                 event_sink,
-            );
+            ).await;
             return Ok(connection);
         }
         let connection = Arc::new(Mutex::new(self.connect(request, output, event_sink).await?));
@@ -400,12 +409,7 @@ impl CodexBackend {
             return Ok(None);
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        let backend_request = Self::catalog_backend_request(&request);
-        if self.settings_root.is_some() {
-            self.load_thread(&mut process,&mut output,&backend_request,false,Vec::new()).await?;
-        } else {
-            Self::load_terminal_thread(&mut process, &mut output, &thread_id, &backend_request).await?;
-        }
+        Self::load_terminal_thread(&mut process, &mut output, &thread_id).await?;
         Ok(Some((process, output, thread_id)))
     }
 
@@ -413,14 +417,13 @@ impl CodexBackend {
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
         thread_id: &str,
-        request: &BackendRequest,
     ) -> Result<()> {
         let mut retries_remaining = 4;
         loop {
             let id = process
                 .send_request(
                     "thread/resume",
-                    Self::secure_thread(json!({ "threadId": thread_id, "cwd": request.workspace }), request),
+                    json!({ "threadId": thread_id }),
                 )
                 .await
                 .context("load Codex thread for background terminal request")?;
@@ -835,7 +838,11 @@ impl CodexBackend {
         let mut settled = false;
         let mut observed_message_list = Vec::new();
         loop {
-            let message = process.receive_message().await?;
+            let received = process.receive_message().await?;
+            let message = match received {
+                json_rpc::ReceivedMessage::Provider(message) => message,
+                completed => { process.publish_received(completed, output).await?; continue; }
+            };
             if let Some(result) =
                 CodexJsonRpc::request_result(&message, request_id, "thread/goal/set")
             {
@@ -914,7 +921,11 @@ impl CodexBackend {
         );
         let mut observed_message_list = Vec::new();
         loop {
-            let message = process.receive_message().await?;
+            let received = process.receive_message().await?;
+            let message = match received {
+                json_rpc::ReceivedMessage::Provider(message) => message,
+                completed => { process.publish_received(completed, output).await?; continue; }
+            };
             if let Some(response) = CodexJsonRpc::request_result(&message, request_id, "turn/start")
             {
                 let turn = response?;
@@ -1034,16 +1045,29 @@ impl Backend for CodexBackend {
 
     async fn background_terminals(
         &self,
-        request: BackendCatalogRequest,
+        mut request: BackendCatalogRequest,
     ) -> Result<super::terminal::TerminalSnapshot> {
-        let Some((mut process, mut output, thread_id)) = self.terminal_connection(request).await?
-        else {
+        let runtime_key = request.runtime_key()?;
+        request.backend_session_id = self.active_session_id_for(&runtime_key).await.or(request.backend_session_id);
+        let Some(thread_id) = request.backend_session_id.clone() else {
             return Ok(super::terminal::TerminalSnapshot {
                 supported: true,
                 starting: false,
                 terminal: Vec::new(),
             });
         };
+        let slot = self.terminal_connection_by_session.lock().await
+            .entry(runtime_key).or_insert_with(|| Arc::new(Mutex::new(None))).clone();
+        let mut connection = slot.lock().await;
+        if connection.as_ref().is_none_or(|connection| connection.thread_id != thread_id) {
+            *connection = None;
+            let Some((process, output, thread_id)) = self.terminal_connection(request).await? else {
+                anyhow::bail!("Codex thread disappeared while opening terminal inventory");
+            };
+            *connection = Some(TerminalConnection { process, output, thread_id });
+        }
+        let TerminalConnection { process, output, thread_id } = connection.as_mut().unwrap();
+        let result = async {
         let mut snapshot = super::terminal::TerminalSnapshot {
             supported: true,
             starting: false,
@@ -1056,7 +1080,7 @@ impl Backend for CodexBackend {
                 .request(
                     "thread/backgroundTerminals/list",
                     json!({"threadId": thread_id, "limit": 100, "cursor": cursor}),
-                    &mut output,
+                    output,
                 )
                 .await?;
             snapshot
@@ -1076,6 +1100,9 @@ impl Backend for CodexBackend {
             cursor = Some(next);
         }
         Ok(snapshot)
+        }.await;
+        if result.is_err() { *connection = None; }
+        result
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -1084,6 +1111,7 @@ impl Backend for CodexBackend {
         }
         self.runtime.shutdown().await?;
         self.connection_by_session.lock().await.clear();
+        self.terminal_connection_by_session.lock().await.clear();
         self.steering_by_session.lock().await.clear();
         self.active_turn_by_session.lock().await.clear();
         self.completed_turn_by_session.lock().await.clear();
@@ -1133,7 +1161,7 @@ impl Backend for CodexBackend {
                 .flatten();
         }
         let dynamic_tool_definition = ControlToolRegistry.definition_list_for_context(Some(&control_context),request.owner()?.is_root());
-        process.set_control_context(control_context);
+        process.set_control_context(control_context).await;
         request.model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
         output.runtime.model = Some(request.model.clone());
@@ -1791,7 +1819,6 @@ mod test {
         let trace = Arc::new(TraceStore::open(fixture.path())?);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
-        let expected_workspace = workspace.clone();
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
@@ -1800,8 +1827,7 @@ mod test {
                     serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                         .unwrap();
                 assert_eq!(request["method"], "thread/resume");
-                assert_eq!(request["params"]["threadId"], "provider-thread");
-                assert_eq!(request["params"]["cwd"], expected_workspace);
+                assert_eq!(request["params"], json!({"threadId":"provider-thread"}));
                 response["id"] = request["id"].clone();
                 socket
                     .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -1825,16 +1851,55 @@ mod test {
             &mut process,
             &mut BackendOutput::default(),
             "provider-thread",
-            &CodexBackend::catalog_backend_request(&BackendCatalogRequest {
-                execution_owner: None,
-                harness_session_id: "session".into(), workspace: workspace.clone(),
-                access: Default::default(), execution_mode: PermissionMode::Read,
-                backend_session_id: Some("provider-thread".into()),
-            }),
         )
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
         result
+    }
+
+    #[tokio::test]
+    async fn terminal_polling_reuses_passive_connection_across_pages_and_polls() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused-provider".into()], permission.clone(), trace.clone(), None)?;
+        let request = BackendCatalogRequest {
+            execution_owner: None, harness_session_id: "session".into(), workspace: workspace.clone(),
+            access: Default::default(), execution_mode: PermissionMode::Read,
+            backend_session_id: Some("provider-thread".into()),
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for (cursor, next, process_id) in [(Value::Null, json!("next"), "one"),
+                (json!("next"), Value::Null, "two"), (Value::Null, Value::Null, "three")] {
+                let message: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(message["method"], "thread/backgroundTerminals/list");
+                assert_eq!(message["params"]["threadId"], "provider-thread");
+                assert_eq!(message["params"]["cursor"], cursor);
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                    "id":message["id"], "result":{"data":[{"processId":process_id,"command":"nu"}],"nextCursor":next}
+                }).to_string().into())).await.unwrap();
+            }
+        });
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
+            permission, None, trace, "session".into()).await?;
+        process.set_activity_publication(false);
+        backend.terminal_connection_by_session.lock().await.insert(request.runtime_key()?,
+            Arc::new(Mutex::new(Some(TerminalConnection {
+                process, output: BackendOutput::default(), thread_id: "provider-thread".into(),
+            }))));
+        let first = backend.background_terminals(request.clone()).await?;
+        assert_eq!(first.terminal.iter().map(|terminal| terminal.id.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        let second = backend.background_terminals(request).await?;
+        assert_eq!(second.terminal[0].id, "three");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        Ok(())
     }
 
     #[tokio::test]

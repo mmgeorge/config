@@ -19,7 +19,7 @@ use crate::backend::{
     McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::{
-    ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext,
+    ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
     apply_invocation, control_tool_failure_json,
 };
 use crate::session::PermissionMode;
@@ -817,6 +817,7 @@ impl Backend for CopilotBackend {
                 }
             }
         }
+        control_router.close().await?;
         while let Ok(invocation) = control_stream.try_receive() {
             if let Err(error) = apply_invocation(&invocation, &mut output) {
                 output.control_error = Some(format!("{error:#}"));
@@ -1234,25 +1235,26 @@ impl Backend for CopilotBackend {
         Ok(())
     }
 
-    async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        if self.turn_event(session_id).await.stop().await?
-            && let Some(session) = self.active_session(session_id).await {
-            session.abort().await.context("abort active Copilot turn")?;
-        }
-        Ok(())
-    }
-
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        let controls = self.control_router(session_id).await.cancel()?;
         let turn_event = self.turn_event(session_id).await;
-        tokio::time::timeout(std::time::Duration::from_secs(8), async {
-            if turn_event.stop().await? {
+        let stop = turn_event.request_stop()?;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            if stop.submitted {
                 let session = self.active_session(session_id).await.context("Submitted Copilot session is missing")?;
                 session.abort().await.context("abort active Copilot turn")?;
+            }
+            if turn_event.stop().await? {
+                if stop.sending || !stop.submitted {
+                    let session = self.active_session(session_id).await.context("Submitted Copilot session is missing")?;
+                    session.abort().await.context("abort committed Copilot send after collection")?;
+                }
                 turn_event.wait_finished().await;
             }
             Ok::<_, anyhow::Error>(())
-        }).await.context("Copilot execution did not stop within 8 seconds")??;
-        Ok(())
+        }).await.context("Copilot execution did not stop within 8 seconds").and_then(|result| result);
+        if let Some(controls) = controls { controls.close().await; }
+        result
     }
 
     async fn rollback_cancelled_turn_for(&self, session_id: &str) -> Result<bool> {
@@ -1420,7 +1422,7 @@ fn model_options(
 #[derive(Default)]
 struct ControlToolRouter {
     sender: StandardMutex<Option<mpsc::Sender<ControlToolInvocation>>>,
-    runtime: StandardMutex<Option<Arc<Mutex<ControlToolRuntime>>>>,
+    runtime: StandardMutex<Option<Arc<ControlToolExecutor>>>,
 }
 
 impl ControlToolRouter {
@@ -1439,7 +1441,7 @@ impl ControlToolRouter {
             .runtime
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))? =
-            Some(Arc::new(Mutex::new(ControlToolRuntime::new(context))));
+            Some(Arc::new(ControlToolExecutor::new(context)));
         Ok(ControlToolStream {
             router: Arc::clone(self),
             receiver,
@@ -1468,19 +1470,19 @@ impl ControlToolRouter {
             drop(sender_guard);
             (active_sender, admission, runtime)
         };
-        let mut runtime = runtime.lock().await;
         {
             let sender = self.sender.lock()
                 .map_err(|_| anyhow::anyhow!("Copilot control-tool router lock poisoned"))?;
             anyhow::ensure!(sender.as_ref().is_some_and(|current| current.same_channel(&active_sender)),
                 "Copilot control-tool invocation belongs to a collected turn");
         }
-        let result = runtime.invoke(invocation.clone()).await;
-        let execution_finished = runtime.execution_finished();
+        let outcome = runtime.execute(invocation.clone()).await?;
+        let execution_finished = outcome.execution_finished;
+        let result = outcome.result;
         let failure_json = result
             .as_ref()
             .err()
-            .map(|error| control_tool_failure_json(&invocation, error, runtime.plan_document()));
+            .map(|error| control_tool_failure_json(&invocation, error, outcome.plan_document.as_ref()));
         let sender_guard = self
             .sender
             .lock()
@@ -1508,6 +1510,19 @@ impl ControlToolRouter {
         admission.send(invocation);
         Ok(result.message)
     }
+
+    async fn close(&self) -> Result<()> {
+        let runtime = self.cancel()?;
+        if let Some(runtime) = runtime { runtime.close().await; }
+        Ok(())
+    }
+
+    fn cancel(&self) -> Result<Option<Arc<ControlToolExecutor>>> {
+        let runtime = self.runtime.lock()
+            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?.clone();
+        if let Some(runtime) = &runtime { runtime.cancel(); }
+        Ok(runtime)
+    }
 }
 
 struct ControlToolStream {
@@ -1530,7 +1545,7 @@ impl Drop for ControlToolStream {
         if let Ok(mut sender) = self.router.sender.lock() {
             *sender = None;
             if let Ok(mut runtime) = self.router.runtime.lock() {
-                *runtime = None;
+                if let Some(runtime) = runtime.take() { runtime.cancel(); }
             }
         }
     }
@@ -1809,6 +1824,33 @@ mod test {
             stream.receive().await.unwrap().name,
             "goal_complete"
         );
+    }
+
+    #[tokio::test]
+    async fn collecting_control_stream_cancels_pending_runtime_work() -> Result<()> {
+        let router = Arc::new(ControlToolRouter::default());
+        let mut context = ControlTurnContext::inactive(PromptMode::Chat);
+        context.has_active_goal = true;
+        context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
+        let mut stream = router.activate(context)?;
+        let mut pending = Box::pin(router.route(ControlToolInvocation {
+            name: "goal_complete".into(), arguments: json!({"summary":"complete"}),
+        }));
+        assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        let (outcome, closed) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            tokio::join!(pending, router.close())
+        }).await?;
+        closed?;
+        assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
+        assert!(stream.try_receive().is_err());
+        drop(stream);
+        let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
+        replacement.has_active_goal = true;
+        let mut stream = router.activate(replacement)?;
+        router.route(ControlToolInvocation { name: "goal_complete".into(),
+            arguments: json!({"summary":"replacement"}) }).await?;
+        assert_eq!(stream.receive().await.unwrap().name, "goal_complete");
+        Ok(())
     }
 
     #[tokio::test]

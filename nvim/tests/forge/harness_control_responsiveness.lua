@@ -97,18 +97,21 @@ local success, failure = xpcall(function()
   assert(applied == true, "successful active configuration was reported as unsuccessful")
   state.busy, state.task_operation = false, nil
   local configuration_request = {}
-  client.request = function(method, params, callback)
-    assert(method == "session.configure", method)
-    configuration_request[#configuration_request + 1] = { params = params, callback = callback }
+  controller.task_transition = function(action, _, callback)
+    assert(action.action == "configure")
+    configuration_request[#configuration_request + 1] = { params = action.config, callback = callback }
   end
   local first_applied, second_applied
   controller.configure({ default_write_permission = "write" }, true, function(result) first_applied = result end)
   controller.configure({ plan_auto_approve_revisions = true }, true, function(result) second_applied = result end)
   assert(#configuration_request == 1 and second_applied == nil)
-  configuration_request[1].callback(vim.tbl_extend("force", state.session, { default_write_permission = "write" }))
+  state.session.default_write_permission = "write"
+  configuration_request[1].callback(true)
+  controller.drain()
   assert(vim.wait(1000, function() return #configuration_request == 2 end, 10),
     "a completed idle edit did not drain the next configuration")
-  configuration_request[2].callback(vim.tbl_extend("force", state.session, { plan_auto_approve_revisions = true }))
+  state.session.plan_auto_approve_revisions = true
+  configuration_request[2].callback(true)
   assert(first_applied == true and second_applied == true and state.pending_config_completed == nil,
     "successive idle configuration edits lost their completion callbacks")
   local resource_picker = require("forge.views.harness.provider_picker")

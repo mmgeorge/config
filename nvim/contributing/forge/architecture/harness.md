@@ -483,6 +483,10 @@ Harness resolves and caches backend model metadata when the view activates, then
 the catalog when it opens so persisted model and effort selections remain current during provider work.
 Model, effort, service-tier, backend, and
 execution-mode selections continue through their normal mutation owners. Configuration changes
+that affect execution always use `task.transition`, including when Lua currently reports idle.
+The host determines whether execution needs collection, so a delayed busy snapshot cannot route
+a thinking or model change through the settled-session guard. Presentation-only status thoughts
+and input timeouts retain their independent live-update paths. Configuration changes
 interrupt active work immediately, collect the current execution, apply and verify the requested
 revision, and resume the same exchange when its task remains active. Durable timeline events report
 interruption, application, verification, and resume. Provider changes require idle work and an
@@ -610,8 +614,12 @@ outside product requirements. Incompatible workspace changes use plan revision.
 ## Cancellation and mode restart
 
 `turn.cancel` bypasses the broker's serialized request queue so Ctrl-c can interrupt an active
-provider turn instead of waiting behind it. The broker drops the prompt future, asks the backend
-to release any retained transport, then either retracts or cancels the interaction. A newly
+provider turn instead of waiting behind it. Cleanup retains the provider reader until native
+execution is collected, then releases the prompt and either retracts or cancels the interaction.
+Submitting a replacement prompt during checks uses the same ownership order. The editor sends
+`checks.cancel` with `interrupt_execution`, and the service acknowledges it only after native
+cleanup. Direct prompt admission and check cancellation during a provider turn enforce the
+same boundary. Cancelling a manual run without an active provider affects only that run. A newly
 submitted `prompt.submit` remains retractable only while the provider has produced no assistant
 message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
 do not consume that eligibility. Codex maps an eligible retraction to app-server
@@ -1434,7 +1442,7 @@ fails queued acknowledgements and releases its generation's admission state. A d
 retains its acknowledgement owner until completion or drop.
 
 The Copilot control router uses a 32-slot bounded channel. It reserves a slot before validating
-the invocation or invoking `ControlToolRuntime`. Each invocation retains its complete arguments.
+the invocation or entering the shared `ControlToolExecutor`. Each invocation retains its complete arguments.
 Reservation failure therefore precedes any plan or terminal-state mutation. Validation
 failures and calls without a routed result release their reservations. Accepted invocations retain
 their order in the receiver. These limits count queued and reserved invocations. A dequeued

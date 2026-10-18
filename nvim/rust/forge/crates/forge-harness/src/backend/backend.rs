@@ -672,8 +672,10 @@ pub trait Backend: Send + Sync {
     /// Interrupt the parent and descendants for one session and await terminal evidence.
     async fn cleanup_execution(&self, session_id: &str) -> Result<()>;
 
-    /// Stop one Harness session's active provider transport.
-    async fn cancel_session(&self, session_id: &str) -> Result<()>;
+    /// Stop and collect one session through the same execution cleanup contract.
+    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        self.cleanup_execution(session_id).await
+    }
 
     /// Return one Harness session's provider conversation after interruption.
     async fn active_session_id_for(&self, session_id: &str) -> Option<String>;
@@ -836,9 +838,8 @@ impl Backend for MockBackend {
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .context("LSP fixture requires tool name")?;
             let invocation = crate::control_tools::ControlToolInvocation { name, arguments };
-            let text = match crate::control_tools::ControlToolRuntime::new(context)
-                .invoke(invocation)
-                .await
+            let text = match crate::control_tools::ControlToolExecutor::new(context)
+                .execute(invocation).await.and_then(|outcome| outcome.result)
             {
                 Ok(result) => result.message,
                 Err(error) => format!("LSP error: {error:#}"),

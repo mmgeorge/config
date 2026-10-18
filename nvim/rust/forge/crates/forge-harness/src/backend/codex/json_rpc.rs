@@ -1,18 +1,16 @@
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
-use crate::backend::approval::{
-    ApprovalResolution, PermissionCoordinator, codex_response, permission_from_provider,
-    protected_target,
-};
+use crate::backend::approval::PermissionCoordinator;
+#[cfg(test)]
+use crate::backend::approval::permission_from_provider;
 use crate::backend::{
     BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
     ToolActivityKind,
 };
 use crate::control_tools::{
-    ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext, apply_invocation,
-    control_tool_failure_json,
+    ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext, apply_invocation,
 };
-use crate::plan::{PlanDocument, render_plan};
+use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::session::{ContextUsage, PermissionMode};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
@@ -75,7 +73,7 @@ impl McpContext {
 }
 
 #[derive(Clone, Debug)]
-struct DynamicToolTraceContext {
+pub(super) struct DynamicToolTraceContext {
     invocation_id: String,
     request_id: Value,
     item_id: Option<String>,
@@ -91,7 +89,7 @@ struct DynamicToolTraceContext {
 }
 
 impl DynamicToolTraceContext {
-    fn from_message(message: &Value) -> Option<Self> {
+    pub(super) fn from_message(message: &Value) -> Option<Self> {
         let method = message.get("method").and_then(Value::as_str)?;
         let params = message.get("params").unwrap_or(message);
         let tool_name = control_tool_name(method, params)?.to_owned();
@@ -153,7 +151,7 @@ impl DynamicToolTraceContext {
         })
     }
 
-    fn payload(&self, fields: Value) -> Value {
+    pub(super) fn payload(&self, fields: Value) -> Value {
         let mut payload = json!({
             "invocation_id": self.invocation_id,
             "request_id": self.request_id,
@@ -208,6 +206,21 @@ fn plan_mutation_summary(arguments: &Value) -> Value {
     Value::Object(resource_map)
 }
 
+/// Separates provider frames from completed local tool work.
+pub(super) enum ReceivedMessage {
+    /// A frame read from the provider socket.
+    Provider(Value),
+    /// A local request ready for response publication.
+    Request(Box<ExecutedRequest>),
+}
+
+impl ReceivedMessage {
+    /// Returns provider routing metadata regardless of execution stage.
+    pub(super) fn message(&self) -> &Value {
+        match self { Self::Provider(message) => message, Self::Request(request) => &request.message }
+    }
+}
+
 /// Owns one session-scoped JSON-RPC connection to the shared Codex app-server.
 pub struct CodexJsonRpc {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
@@ -215,14 +228,17 @@ pub struct CodexJsonRpc {
     workspace: String,
     execution_mode: PermissionMode,
     planning_feedback: bool,
-    plan_document: Option<PlanDocument>,
-    control_runtime: Option<ControlToolRuntime>,
-    replay_invocation: Option<ControlToolInvocation>,
+    request_executor: Arc<tokio::sync::Mutex<RequestExecutor>>,
+    control_executor: Option<Arc<ControlToolExecutor>>,
+    request_tasks: tokio::task::JoinSet<ExecutedRequest>,
+    pending_requests: HashMap<tokio::task::Id, Value>,
+    control_completion: Option<tokio::sync::oneshot::Receiver<()>>,
     accepted_control_invocation_key_set: HashSet<String>,
     mcp: McpContext,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     activity_publication: bool,
+    requests_cancelled: bool,
     trace: Arc<TraceStore>,
     session_id: String,
     execution_owner: Option<crate::backend::ExecutionOwner>,
@@ -248,14 +264,17 @@ impl CodexJsonRpc {
             workspace: workspace.to_owned(),
             execution_mode,
             planning_feedback: false,
-            plan_document: None,
-            control_runtime: None,
-            replay_invocation: None,
+            request_executor: Arc::new(tokio::sync::Mutex::new(RequestExecutor::new(workspace.to_owned(), execution_mode, permission_coordinator.clone(), event_sink.clone(), trace.clone(), session_id.clone()))),
+            request_tasks: tokio::task::JoinSet::new(),
+            control_executor: None,
+            pending_requests: HashMap::new(),
+            control_completion: None,
             accepted_control_invocation_key_set: HashSet::new(),
             mcp: McpContext::default(),
             permission_coordinator,
             event_sink,
             activity_publication: true,
+            requests_cancelled: false,
             trace,
             session_id,
             execution_owner:None,
@@ -263,12 +282,13 @@ impl CodexJsonRpc {
     }
 
     /// Bind provider permission callbacks before starting or resuming a conversation.
-    pub fn set_execution_owner(&mut self, owner: crate::backend::ExecutionOwner) {
+    pub async fn set_execution_owner(&mut self, owner: crate::backend::ExecutionOwner) {
+        self.request_executor.lock().await.set_owner(Some(owner.clone()));
         self.execution_owner = Some(owner);
     }
 
     /// Update request context and reset control-call identity before reusing this process.
-    pub fn set_request_context(
+    pub async fn set_request_context(
         &mut self,
         workspace: &str,
         execution_mode: PermissionMode,
@@ -277,9 +297,11 @@ impl CodexJsonRpc {
         self.workspace = workspace.to_owned();
         self.execution_mode = execution_mode;
         self.event_sink = event_sink;
+        self.requests_cancelled = false;
+        self.control_executor = None;
         self.accepted_control_invocation_key_set.clear();
         self.mcp.call.clear();
-        self.control_runtime = None;
+        self.request_executor.lock().await.reset(workspace.to_owned(), execution_mode, self.event_sink.clone());
     }
 
     /// Isolate preparation traffic until the current provider turn is admitted.
@@ -293,10 +315,9 @@ impl CodexJsonRpc {
     }
 
     /// Seed provider-visible control validation from one broker-owned turn snapshot.
-    pub fn set_control_context(&mut self, context: ControlTurnContext) {
-        self.plan_document = context.plan_document.clone();
+    pub async fn set_control_context(&mut self, context: ControlTurnContext) {
         self.planning_feedback = context.planning_feedback;
-        self.control_runtime = Some(ControlToolRuntime::new(context));
+        self.control_executor = Some(self.request_executor.lock().await.configure(context));
     }
 
     /// Send one JSON-RPC notification without allocating a response identifier.
@@ -335,43 +356,74 @@ impl CodexJsonRpc {
     /// Read and normalize one provider message while preserving request routing metadata.
     pub async fn read_message(&mut self, output: &mut BackendOutput) -> Result<Value> {
         let message = self.receive_message().await?;
-        self.publish_message(message, output).await
+        self.publish_received(message, output).await
     }
 
     /// Reads a provider frame without starting delivery that a competing command can cancel.
-    pub async fn receive_message(&mut self) -> Result<Value> {
-        let encoded = loop {
-            let frame = self
-                .socket
-                .next()
-                .await
-                .context("shared Codex app-server closed before completing the request")??;
-            match frame {
-                Message::Text(text) => break text.to_string(),
-                Message::Binary(bytes) => {
-                    break String::from_utf8(bytes.to_vec())
-                        .context("decode shared Codex app-server binary frame")?;
-                }
-                Message::Ping(payload) => {
-                    self.socket.send(Message::Pong(payload)).await?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(close) => {
-                    anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
-                }
-                Message::Frame(_) => {}
+    pub async fn receive_message(&mut self) -> Result<ReceivedMessage> {
+        tokio::select! {
+            biased;
+            completed = self.request_tasks.join_next_with_id(), if !self.request_tasks.is_empty() => {
+                let (task_id, result) = completed.context("provider request worker disappeared")?
+                    .context("provider request worker failed")?;
+                self.pending_requests.remove(&task_id);
+                Ok(ReceivedMessage::Request(Box::new(result)))
             }
-        };
-        self.trace.record(
-            &self.session_id,
-            "model.received_raw",
-            json!({ "bytes": encoded.len() }),
-        );
-        let message: Value = serde_json::from_str(&encoded)
-            .context("decode backend JSON-RPC message")?;
-        self.trace
-            .record_ref(&self.session_id, "model.received", &message);
-        Ok(message)
+            message = receive_provider_message(&mut self.socket, &self.trace, &self.session_id) => {
+                message.map(ReceivedMessage::Provider)
+            }
+        }
+    }
+
+    /// Applies completed request effects without stopping the provider frame reader.
+    pub async fn publish_received(&mut self, received: ReceivedMessage, output: &mut BackendOutput) -> Result<Value> {
+        match received {
+            ReceivedMessage::Provider(message) => self.publish_message(message, output).await,
+            ReceivedMessage::Request(result) => {
+                let message = result.message.clone();
+                self.complete_provider_request(*result, output).await?;
+                if self.activity_publication && !rejects_question_resolution(self.planning_feedback,
+                    message["method"].as_str().unwrap_or_default(), &message) {
+                    normalize_event_in_workspace(&message, output, self.event_sink.as_ref(), &self.workspace, false).await;
+                }
+                Ok(message)
+            }
+        }
+    }
+
+    /// Cancels local request waits before releasing the provider execution owner.
+    pub async fn cancel_requests(&mut self, output: &mut BackendOutput) -> Result<()> {
+        self.cancel_request_work();
+        self.collect_requests(output).await
+    }
+
+    /// Revokes local tool authority without delaying the native interrupt message.
+    pub(super) fn cancel_request_work(&mut self) {
+        self.requests_cancelled = true;
+        if let Some(executor) = &self.control_executor { executor.cancel(); }
+        self.control_completion = None;
+        self.request_tasks.abort_all();
+    }
+
+    /// Publishes completed results and collects cancelled callbacks after signalling the provider.
+    pub(super) async fn collect_requests(&mut self, output: &mut BackendOutput) -> Result<()> {
+        while let Some(completed) = self.request_tasks.join_next_with_id().await {
+            match completed {
+                Ok((task_id, result)) => {
+                    self.pending_requests.remove(&task_id);
+                    self.complete_provider_request(result, output).await?;
+                }
+                Err(error) if error.is_cancelled() => {}
+                Err(error) => return Err(error).context("provider request worker failed during cleanup"),
+            }
+        }
+        let pending = std::mem::take(&mut self.pending_requests);
+        for (_, message) in pending {
+            self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
+                "error":{"code":-32001,"message":"Provider execution was cancelled"}})).await?;
+        }
+        if let Some(executor) = &self.control_executor { executor.close().await; }
+        Ok(())
     }
 
     /// Publishes one consumed frame completely before processing another provider command.
@@ -390,34 +442,36 @@ impl CodexJsonRpc {
         }
         let rejects_question_resolution =
             rejects_question_resolution(self.planning_feedback, method, &message);
-        let provider_request_success =
-            if message.get("id").is_some() && message.get("method").is_some() {
-                self.replay_invocation = None;
-                Some(self.respond_to_provider_request(&message).await?)
-            } else {
-                None
+        if message.get("id").is_some() && message.get("method").is_some() {
+            if self.requests_cancelled {
+                self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
+                    "error":{"code":-32001,"message":"Provider execution was cancelled"}})).await?;
+                return Ok(message);
+            }
+            let executor = self.request_executor.clone();
+            let request = message.clone();
+            let approval = method != "item/tool/call";
+            let ordered = if approval { None } else {
+                let (completed, next) = tokio::sync::oneshot::channel();
+                let previous = self.control_completion.replace(next);
+                Some((previous, completed))
             };
-        if self.activity_publication
-            && !rejects_question_resolution
-            && let Some(response_success) = provider_request_success
-            && should_apply_control_request_semantics(
-                &message,
-                &mut self.accepted_control_invocation_key_set,
-                response_success,
-            )
-        {
-            if self.control_runtime.is_some() {
-                if let Some(invocation) = self.replay_invocation.take() {
-                    apply_invocation(&invocation, output)?;
-                }
-            } else {
-                apply_control_request_result(&message, output, response_success)?;
-            }
-            if let (Some(runtime), Some(request)) = (self.control_runtime.as_ref(), output.design_patch.last_mut())
-                && let Some(digests) = runtime.patch_source_digests(request.expected_version)
-            {
-                request.source_digests = digests.clone();
-            }
+            let mut independent = RequestExecutor::new(self.workspace.clone(), self.execution_mode,
+                self.permission_coordinator.clone(), self.event_sink.clone(), self.trace.clone(), self.session_id.clone());
+            independent.set_owner(self.execution_owner.clone());
+            let received_at = Instant::now();
+            let task = self.request_tasks.spawn(async move {
+                if let Some((previous, completed)) = ordered {
+                    if let Some(previous) = previous && previous.await.is_err() {
+                        return ExecutedRequest::cancelled(request);
+                    }
+                    let mut result = executor.lock().await.execute(request, received_at).await;
+                    result.control_completion = Some(completed);
+                    result
+                } else { independent.execute(request, received_at).await }
+            });
+            self.pending_requests.insert(task.id(), message.clone());
+            return Ok(message);
         }
         if self.activity_publication && !rejects_question_resolution {
             normalize_event_in_workspace(
@@ -472,49 +526,9 @@ impl CodexJsonRpc {
             .context("write shared Codex app-server JSON-RPC request")
     }
 
-    async fn respond_to_provider_request(&mut self, message: &Value) -> Result<bool> {
-        let id = message.get("id").cloned().unwrap_or(Value::Null);
-        let method = message
-            .get("method")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
-        let trace_context = DynamicToolTraceContext::from_message(message);
-        if let Some(context) = trace_context.as_ref() {
-            self.trace.record(
-                &self.session_id,
-                "dynamic_tool_started",
-                context.payload(json!({ "phase": "provider_request" })),
-            );
-            self.trace.record(
-                &self.session_id,
-                "dynamic_tool_received",
-                context.payload(
-                    json!({ "handler_queue_ms": context.started_at.elapsed().as_millis() as u64 }),
-                ),
-            );
-        }
-        let result = self
-            .provider_request_result(method, message, trace_context.as_ref())
-            .await;
-        if let (Some(context), Err(error)) = (trace_context.as_ref(), &result) {
-            self.trace.record(
-                &self.session_id,
-                "dynamic_tool_failed",
-                context.payload(json!({
-                    "phase": "provider_request",
-                    "error_category": "internal",
-                    "error": format!("{error:#}"),
-                })),
-            );
-        }
-        let response = match result {
-            Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
-            Err(error) => json!({
-                "jsonrpc": "2.0",
-                "id": id,
-                "error": { "code": -32001, "message": format!("{error:#}") }
-            }),
-        };
+    async fn complete_provider_request(&mut self, completed: ExecutedRequest, output: &mut BackendOutput) -> Result<bool> {
+        let ExecutedRequest { message, response, trace_context, invocation, source_digests,
+            has_runtime, execution_finished, control_completion } = completed;
         let serialization_started_at = Instant::now();
         let encoded_response = match serde_json::to_string(&response) {
             Ok(encoded) => encoded,
@@ -597,289 +611,78 @@ impl CodexJsonRpc {
             }
         }
         write_result?;
-        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("plan_phase_done")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
-            let params = message.get("params").unwrap_or(message);
+        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(&message)), Some("plan_phase_done")) && execution_finished {
+            let params = message.get("params").unwrap_or(&message);
             if let (Some(thread), Some(turn)) = (params.get("threadId").and_then(Value::as_str), params.get("turnId").and_then(Value::as_str)) {
                 self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn})).await?;
             }
         }
+        if self.activity_publication && should_apply_control_request_semantics(
+            &message, &mut self.accepted_control_invocation_key_set, response_success,
+        ) {
+            if has_runtime {
+                if let Some(invocation) = invocation { apply_invocation(&invocation, output)?; }
+            } else { apply_control_request_result(&message, output, response_success)?; }
+            if let (Some(digests), Some(request)) = (source_digests, output.design_patch.last_mut()) {
+                request.source_digests = digests;
+            }
+        }
+        if let Some(completed) = control_completion { let _ = completed.send(()); }
         Ok(response_success)
     }
 
-    async fn provider_request_result(
-        &mut self,
-        method: &str,
-        message: &Value,
-        trace_context: Option<&DynamicToolTraceContext>,
-    ) -> Result<Value> {
-        match method {
-            "item/commandExecution/requestApproval"
-            | "item/fileChange/requestApproval"
-            | "item/permissions/requestApproval"
-            | "mcpServer/elicitation/request" => {
-                if method == "mcpServer/elicitation/request"
-                    && message
-                        .pointer("/params/meta/codex_approval_kind")
-                        .and_then(Value::as_str)
-                        != Some("mcp_tool_call")
-                {
-                    return Ok(json!({ "action": "decline", "content": Value::Null }));
-                }
-                let resolution = self.authorize_provider_request(method, message).await?;
-                Ok(codex_response(message, resolution))
-            }
-            "item/tool/call"
-                if rejects_question_resolution(self.planning_feedback, method, message) =>
-            {
-                Ok(json!({
-                    "contentItems": [{
-                        "type": "inputText",
-                        "text": "Harness already recorded and consumed this planning feedback. Continue with design_patch, question_ask, or plan_submit."
-                    }],
-                    "success": false
-                }))
-            }
-            "item/tool/call" => {
-                let params = message.get("params").unwrap_or(message);
-                if let Some(invocation) = control_invocation(method, params)? {
-                    let validation_started_at = Instant::now();
-                    let mut decoded_output = BackendOutput::default();
-                    if let Err(error) = apply_invocation(&invocation, &mut decoded_output) {
-                        let failure_json = control_tool_failure_json(
-                            &invocation,
-                            &error,
-                            self.plan_document.as_ref(),
-                        );
-                        if let Some(context) = trace_context {
-                            self.trace.record(
-                                &self.session_id,
-                                "dynamic_tool_failed",
-                                context.payload(json!({
-                                    "phase": "argument_validation",
-                                    "error_category": "schema",
-                                    "error": format!("{error:#}"),
-                                    "validation_ms": validation_started_at.elapsed().as_millis() as u64,
-                                })),
-                            );
-                        }
-                        return Ok(json!({
-                            "contentItems": [{
-                                "type": "inputText",
-                                "text": failure_json
-                            }],
-                            "success": false
-                        }));
-                    }
-                    if let Some(context) = trace_context {
-                        self.trace.record(
-                            &self.session_id,
-                            "dynamic_tool_validated",
-                            context.payload(json!({
-                                "phase": "argument_validation",
-                                "validation_ms": validation_started_at.elapsed().as_millis() as u64,
-                            })),
-                        );
-                    }
-                    let execution_started_at = Instant::now();
-                    let execution_message = match self
-                        .execute_control_invocation(&invocation, decoded_output)
-                        .await
-                    {
-                        Ok(message) => message,
-                        Err(error) => {
-                            let failure_json = control_tool_failure_json(
-                                &invocation,
-                                &error,
-                                self.plan_document.as_ref(),
-                            );
-                            if let Some(context) = trace_context {
-                                self.trace.record(
-                                    &self.session_id,
-                                    "dynamic_tool_failed",
-                                    context.payload(json!({
-                                        "phase": "semantic_execution",
-                                        "error_category": "semantic",
-                                        "error": format!("{error:#}"),
-                                        "execution_ms": execution_started_at.elapsed().as_millis() as u64,
-                                    })),
-                                );
-                            }
-                            return Ok(json!({
-                                "contentItems": [{
-                                    "type": "inputText",
-                                    "text": failure_json
-                                }],
-                                "success": false
-                            }));
-                        }
-                    };
-                    if let Some(context) = trace_context {
-                        self.trace.record(
-                            &self.session_id,
-                            "dynamic_tool_executed",
-                            context.payload(json!({
-                                "phase": "semantic_execution",
-                                "execution_ms": execution_started_at.elapsed().as_millis() as u64,
-                                "resulting_version": self.plan_document.as_ref().map(|document| document.version),
-                            })),
-                        );
-                    }
-                    let response_text = if let Some(message) = execution_message {
-                        message
-                    } else {
-                        match invocation.name.as_str() {
-                            "harness_plan_edit" => format!(
-                                "Plan edit accepted. The active canonical version is {}. Submission validation has not run.",
-                                self.plan_document
-                                    .as_ref()
-                                    .map(|document| document.version)
-                                    .unwrap_or_default()
-                            ),
-                            "plan_read" => self
-                                .plan_document
-                                .as_ref()
-                                .map(serde_json::to_string_pretty)
-                                .transpose()?
-                                .context("plan read lost its active canonical document")?,
-                            "plan_submit" => format!(
-                                "Plan version {} passed canonical submission validation.",
-                                self.plan_document
-                                    .as_ref()
-                                    .map(|document| document.version)
-                                    .unwrap_or_default()
-                            ),
-                            _ => "Recorded by Forge Harness".into(),
-                        }
-                    };
-                    return Ok(json!({
-                        "contentItems": [{ "type": "inputText", "text": response_text }],
-                        "success": true
-                    }));
-                }
-                Ok(json!({
-                    "contentItems": [{ "type": "inputText", "text": "Unknown Harness dynamic tool" }],
-                    "success": false
-                }))
-            }
-            _ => Ok(Value::Null),
-        }
+    #[cfg(test)]
+    async fn respond_to_provider_request(&mut self, message: &Value) -> Result<bool> {
+        let result = self.request_executor.lock().await.execute(message.clone(), Instant::now()).await;
+        self.complete_provider_request(result, &mut BackendOutput::default()).await
     }
 
-    async fn execute_control_invocation(
-        &mut self,
-        invocation: &ControlToolInvocation,
-        mut output: BackendOutput,
-    ) -> Result<Option<String>> {
-        if let Some(runtime) = self.control_runtime.as_mut() {
-            let result = runtime.invoke_decoded(invocation.clone(), output).await?;
-            self.plan_document = runtime.plan_document().cloned();
-            self.replay_invocation = result.invocation;
-            return Ok(Some(result.message));
+    #[cfg(test)]
+    async fn finish_requests(&mut self, output: &mut BackendOutput) -> Result<()> {
+        while !self.request_tasks.is_empty() {
+            let message = self.receive_message().await?;
+            self.publish_received(message, output).await?;
         }
-        match invocation.name.as_str() {
-            name if crate::control_tools::is_agent_tool(name) => {
-                anyhow::bail!("agent tools require an authenticated active root turn");
-            }
-            "plan_phase_done" => {
-                anyhow::bail!("phase completion requires an active execution control context");
-            }
-            "harness_plan_edit" => {
-                anyhow::bail!("obsolete plan edit tool. Use design_patch");
-            }
-            "design_patch" => {
-                let request = output.design_patch.pop().context("design patch has no request")?;
-                self.plan_document = Some(self.plan_document.as_ref().context("design patch has no active design")?.patch_design(Path::new(&self.workspace), request)?);
-                return Ok(Some(format!("Declaration patch accepted. Active version: {}",self.plan_document.as_ref().unwrap().version)));
-            }
-            "plan_read" => {
-                let requested_plan_id = output
-                    .plan_read
-                    .as_deref()
-                    .context("plan read did not produce a plan id")?;
-                let document = self
-                    .plan_document
-                    .as_ref()
-                    .context("plan read has no active canonical document")?;
-                anyhow::ensure!(
-                    requested_plan_id == document.plan_id,
-                    "requested plan id does not match the active plan"
-                );
-                if let Some(design) = &document.design {
-                    let value = design.inspect(Path::new(&self.workspace), invocation.arguments.get("path").and_then(Value::as_str), invocation.arguments.get("baseline").and_then(Value::as_bool).unwrap_or(false))?;
-                    return Ok(Some(serde_json::json!({"plan_id":document.plan_id,"version":document.version,"declarations":value}).to_string()));
-                }
-            }
-            "plan_submit" => {
-                let submission = output
-                    .plan_submit
-                    .as_ref()
-                    .context("plan submit did not produce a submission")?;
-                let document = self
-                    .plan_document
-                    .as_ref()
-                    .context("plan submit has no active canonical document")?;
-                anyhow::ensure!(
-                    submission.plan_id == document.plan_id,
-                    "submitted plan id does not match the active plan"
-                );
-                anyhow::ensure!(
-                    submission.expected_version == document.version,
-                    "submitted version {} does not match active version {}",
-                    submission.expected_version,
-                    document.version
-                );
-                document.validate_for_submission()?;
-                let mut document = document.clone();
-                if let Some(design) = &document.design {
-                    document.design = Some(design.formatted()?);
-                }
-                render_plan(&document)?;
-            }
-            _ => {}
-        }
-        Ok(None)
-    }
-
-    async fn authorize_provider_request(
-        &mut self,
-        method: &str,
-        message: &Value,
-    ) -> Result<ApprovalResolution> {
-        let request = permission_from_provider(method, message, &self.workspace)?;
-        let protected = {
-            let store = self.permission_coordinator.store();
-            let store = store
-                .read()
-                .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
-            protected_target(&request, &store)
-        };
-        if protected {
-            return Ok(ApprovalResolution::DenyOnce);
-        }
-        let resolution = self
-            .permission_coordinator
-            .authorize(
-                self.execution_mode,
-                request,
-                Some(crate::backend::ProviderAddress {
-                    owner: self.execution_owner.clone(),
-                    thread_id: message
-                        .pointer("/params/threadId")
-                        .and_then(Value::as_str)
-                        .context("approval request omitted its provider thread")?
-                        .to_owned(),
-                    turn_id: message
-                        .pointer("/params/turnId")
-                        .and_then(Value::as_str)
-                        .context("approval request omitted its provider turn")?
-                        .to_owned(),
-                }),
-                self.event_sink.as_ref(),
-            )
-            .await?;
-        Ok(resolution)
+        Ok(())
     }
 }
+
+async fn receive_provider_message(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, trace: &TraceStore, session_id: &str,
+) -> Result<Value> {
+        let encoded = loop {
+            let frame = socket
+                .next()
+                .await
+                .context("shared Codex app-server closed before completing the request")??;
+            match frame {
+                Message::Text(text) => break text.to_string(),
+                Message::Binary(bytes) => {
+                    break String::from_utf8(bytes.to_vec())
+                        .context("decode shared Codex app-server binary frame")?;
+                }
+                Message::Ping(payload) => {
+                    socket.send(Message::Pong(payload)).await?;
+                }
+                Message::Pong(_) => {}
+                Message::Close(close) => {
+                    anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
+                }
+                Message::Frame(_) => {}
+            }
+        };
+        trace.record(
+            session_id,
+            "model.received_raw",
+            json!({ "bytes": encoded.len() }),
+        );
+        let message: Value = serde_json::from_str(&encoded)
+            .context("decode backend JSON-RPC message")?;
+        trace
+            .record_ref(session_id, "model.received", &message);
+        Ok(message)
+}
+
 
 fn apply_control_request_result(
     message: &Value,
@@ -916,7 +719,7 @@ fn should_apply_control_request_semantics(
         .is_none_or(|key| accepted_control_invocation_key_set.insert(key))
 }
 
-fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
+pub(super) fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
     let params = value.get("params").unwrap_or(value);
     planning_feedback
         && matches!(
@@ -1641,7 +1444,7 @@ fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
     }
 }
 
-fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolInvocation>> {
+pub(super) fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolInvocation>> {
     let Some(control_name) = control_tool_name(method, value) else {
         return Ok(None);
     };
@@ -2233,7 +2036,7 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn selected_checks_replay_before_later_design_edits() -> anyhow::Result<()> {
         use super::*;
         let fixture = tempfile::tempdir()?;
@@ -2263,7 +2066,7 @@ mod test {
         context.plan_state = Some(crate::plan::PlanState::Revising);
         context.plan_document = Some(document.clone());
         context.workspace_root = Some(fixture.path().to_owned());
-        process.set_control_context(context);
+        process.set_control_context(context).await;
         let mut output = BackendOutput::default();
         for (id, tool, arguments) in [
             (1, "plan_checks_add", json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]})),
@@ -2275,6 +2078,7 @@ mod test {
                 "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),"tool":tool,"arguments":arguments
             }}), &mut output).await?;
         }
+        process.finish_requests(&mut output).await?;
         assert_eq!(output.design_patch.len(), 2);
         for patch in output.design_patch {
             document = document.patch_design(fixture.path(), patch)?;
@@ -2424,11 +2228,12 @@ mod test {
         let mut output = BackendOutput::default();
         process.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), &mut output).await?;
         tokio::time::timeout(Duration::from_secs(2), server).await??;
-        let failure = process.execute_control_invocation(&ControlToolInvocation {
-            name: "plan_phase_done".into(),
-            arguments: json!({"phase":"implement","revision":1,"summary":"Implemented"}),
-        }, BackendOutput::default()).await.unwrap_err();
-        assert!(failure.to_string().contains("active execution control context"));
+        let failure = process.request_executor.lock().await.execute(json!({
+            "id":91, "method":"item/tool/call", "params":{"tool":"plan_phase_done",
+                "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
+        }), Instant::now()).await;
+        assert_eq!(failure.response["result"]["success"], false);
+        assert!(failure.response.to_string().contains("active execution control context"));
         Ok(())
     }
 

@@ -12,7 +12,12 @@ does not transfer the earlier setup's approval to that task.
 
 ## Automatic and explicit checks
 
-While a check run is active, its timeline group shows only executing checks.
+While a check run is active, the status area shows executing checks and their latest
+nonempty output line. The line updates as output arrives, and complete logs remain
+available in the saved result.
+Submitting a new message during checks stops the previous execution and collects
+its running checks before starting the message. The composer retains newer drafts
+while that interruption finishes.
 Completed runs retain the full details. Result summaries omit configuration-error
 counts and show a failed count only when more than one check failed.
 
