@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 vim.o.columns = 130
+vim.o.lines = 50
 require("forge").setup({ harness = { backend = "mock" } })
 local client = require("forge.client")
 local settings = require("forge.views.harness.settings")
@@ -15,6 +16,13 @@ local configured_session = {
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
 }
 local original_request = client.request_for
+local commit_settings = require("forge.integrations.commit_settings")
+local original_commit_request = commit_settings.request
+commit_settings.request = function(_, _, callback)
+  callback({ revision = 0, gemini_available = false, effective_source = "harness",
+    settings = { source = "harness", models = { codex = { model = "mock-model", thinking = "low" },
+      copilot = { model = "mock-model", thinking = "low" } } } })
+end
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "settings-session")
   assert(method == "trace.status" or method == "trace.configure" or method == "trace.session.clear"
@@ -55,12 +63,12 @@ local success, failure = xpcall(function()
   local instance = picker._state_for_test()
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
   assert(text:find("CLI: Codex CLI", 1, true), text)
-  assert(text:find("Logging", 1, true) and text:find("Off", 1, true), text)
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
   assert(text:find("Description", 1, true), text)
   assert(not text:find("[←", 1, true), text)
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
+  assert(options.logging.columns[1] == "Logging" and options.logging.columns[2]:find("Off", 1, true))
   for index, option in ipairs(instance.spec.page_list[1].option_list) do
     if option.id == "logging" then instance.state.selected_index_by_page[instance.spec.page_list[1].id] = index end
   end
@@ -165,6 +173,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 controller.configure = original_configure
 client.request_for = original_request
+commit_settings.request = original_commit_request
 vim.fn.delete(path)
 if not success then error(failure) end
 print("harness_settings: passed")

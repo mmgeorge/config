@@ -69,8 +69,14 @@ Forge disables native folding in generated views and does not create native fold
 
 Harness retains its Rust-owned node projection and incremental IPC patches. Lua applies
 that projection directly, without projecting or scanning the retained transcript again.
-The node's display state and the rows published in the same revision must agree. Expanding
-an unloaded node keeps its heading visible while the existing asynchronous content request
+The node's display state and the rows published in the same revision must agree.
+
+Harness Markdown handlers retain only decorations inside the current projected message
+ranges and clip spans at their ends before render-markdown caches them. Incremental parser
+trees can retain deleted list items at a collapsed boundary. Filtering before caching prevents
+cursor refreshes from restoring their bullets on a separator or another transcript entry.
+
+Expanding an unloaded node keeps its heading visible while the existing asynchronous content request
 runs. A successful response inserts content. Closing during loading cancels expansion
 intent, and a late response cannot reopen the node. Errors clear loading state and remain
 visible through the existing notification and recovery paths.

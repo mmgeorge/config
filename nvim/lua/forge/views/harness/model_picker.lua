@@ -132,6 +132,7 @@ end
 ---@field backend? string
 ---@field current_model? string
 ---@field is_current? fun(): boolean
+---@field on_close? fun()
 ---@field on_confirm fun(config: {model: string, effort: string?, context_window: string|userdata})
 
 ---@param options ForgeHarnessModelPickerOptions
@@ -196,6 +197,7 @@ function ModelPicker.open(options)
     local spec = {
       owner = owner,
       host = options.host,
+      on_close = options.on_close,
       page_list = {
         {
           id = "model",

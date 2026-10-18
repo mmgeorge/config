@@ -18,11 +18,11 @@ if not vim.g.forge_message_folds_grid then
 end
 
 local plugin_root = vim.fs.joinpath(vim.fn.stdpath("data"), "lazy")
+vim.opt.runtimepath:append(vim.fs.joinpath(vim.fn.stdpath("data"), "site"))
 vim.opt.runtimepath:append(plugin_root .. "/render-markdown.nvim")
 vim.opt.runtimepath:append(plugin_root .. "/nvim-treesitter")
 require("render-markdown").setup(require("plugins.markdown")[1].opts())
 vim.cmd("runtime plugin/render-markdown.lua")
-vim.fn.writefile({ "plugin ready" }, "D:/.cache/fold-debug.txt")
 
 local root, workspace, data = vim.fn.getcwd(), vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -39,7 +39,6 @@ local state, errors = require("forge.session").harness, {}
 require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
 local controller = require("forge.views.harness.controller")
 local function await(predicate, reason)
-  vim.fn.writefile({ reason }, "D:/.cache/fold-debug.txt", "a")
   assert(vim.wait(15000, function() return #errors > 0 or predicate() end, 10), reason)
   assert(#errors == 0, table.concat(errors, "\n"))
 end
@@ -121,6 +120,13 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_set_cursor(state.transcript_win, { list_start + 1, 0 })
   vim.cmd("normal! zt")
   local namespace = require("render-markdown.core.ui").ns
+  local function render_response()
+    local current = messages("ForgeHarnessResponse")[4]
+    require("forge.render.harness.markdown").render(state.transcript_buf, state.transcript_win, {
+      { first0 = list_start, after0 = list_start + current.entry.row_count },
+    })
+  end
+  render_response()
   local function bullet_count()
     local count = 0
     for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(state.transcript_buf, namespace, 0, -1, { details = true })) do
@@ -131,16 +137,24 @@ local success, failure = xpcall(function()
     return count
   end
   vim.cmd("redraw!")
-  vim.fn.writefile({ "list before wait " .. bullet_count() }, "D:/.cache/fold-debug.txt", "a")
-  vim.fn.writefile(vim.split(vim.inspect({ start = list_start, text = vim.api.nvim_buf_get_lines(state.transcript_buf, list_start, -1, false), marks = vim.api.nvim_buf_get_extmarks(state.transcript_buf, namespace, 0, -1, { details = true }) }), "\n"), "D:/.cache/fold-marks.txt")
   await(function() return bullet_count() == 3 end, "expanded response bullets did not render")
   toggle(list_response)
   await(function() return messages("ForgeHarnessResponse")[4].entry.metadata.node.display == "preview" end, "list response did not collapse")
   vim.wait(200)
+  require("render-markdown.core.ui").update(state.transcript_buf, state.transcript_win, "CursorMoved", false)
+  vim.wait(30)
   vim.cmd("redraw!")
   assert(bullet_count() == 1, "collapsed response retained hidden bullet decorations: " .. bullet_count())
+  local preview_row = vim.fn.screenpos(state.transcript_win, list_start + 3, 1).row
+  assert(preview_row > 0, "list preview was not rendered on the attached grid")
+  local rendered = ""
+  for column = 1, 80 do rendered = rendered .. vim.fn.screenstring(preview_row, column) end
+  assert(rendered:find("Rechargeable directional dash", 1, true), "visible list item was lost")
+  toggle(messages("ForgeHarnessResponse")[4])
+  await(function() return messages("ForgeHarnessResponse")[4].entry.metadata.node.display == "full" end, "list response did not reopen")
+  render_response()
+  await(function() return bullet_count() == 3 end, "reopening did not restore the complete list")
 end, debug.traceback)
-vim.fn.writefile({ tostring(success), tostring(failure) }, "D:/.cache/fold-debug.txt", "a")
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
 client.stop()

@@ -826,10 +826,11 @@ function M.request_host(method, params, callback, progress)
   end)
 end
 
----@param params table
----@param callback ForgeCallback
----@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
-function M.request_generation(params, callback, on_model)
+--- Resolve isolated generation launch settings without starting a provider.
+---@param selection? {model: string, reasoning_effort?: string}
+---@return ForgeTextGenerationConfig? generation
+---@return string? failure
+function M.generation_config(selection)
   local harness_config = config.options.harness
   local selected = session.harness.session
   local backend = selected and selected.backend or harness_config.backend
@@ -837,11 +838,10 @@ function M.request_generation(params, callback, on_model)
     backend = backend_preference.load(harness_config.backends, backend)
   end
   local configured = harness_config.backends[backend]
-  if not configured then callback(nil, "Unknown Harness backend: " .. tostring(backend)) return end
-  local selection = (config.options.commit_generation or {})[backend]
+  if not configured then return nil, "Unknown Harness backend: " .. tostring(backend) end
+  selection = selection or (config.options.commit_generation or {})[backend]
   if selection and (type(selection) ~= "table" or type(selection.model) ~= "string" or vim.trim(selection.model) == "") then
-    callback(nil, "Invalid commit-generation model for backend: " .. backend)
-    return
+    return nil, "Invalid commit-generation model for backend: " .. backend
   end
   ---@type ForgeTextGenerationConfig
   local generation = {
@@ -850,10 +850,19 @@ function M.request_generation(params, callback, on_model)
     reasoning_effort = selection and selection.reasoning_effort,
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
   }
+  return generation
+end
+
+---@param params table
+---@param callback ForgeCallback
+---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
+---@param selection? {model: string, reasoning_effort?: string}
+function M.request_generation(params, callback, on_model, selection)
+  local generation, failure = M.generation_config(selection)
+  if not generation then callback(nil, failure) return end
   if on_model then
-    local model = generation.model == "default" and selected and selected.resolved_model or generation.model
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
-    on_model(model .. effort .. " (" .. backend .. ")")
+    on_model(generation.model .. effort .. " (" .. generation.backend.kind .. ")")
   end
   M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback)
 end

@@ -365,6 +365,7 @@ pub(crate) enum RoutedMethod {
     Revisions,
     RepositoryWrite,
     RepositoryGenerate,
+    GenerationSettings,
     Status,
     StatusContext,
     StatusNavigate,
@@ -444,6 +445,7 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
         "repository.revisions" => Ok(RoutedMethod::Revisions),
         "repository.write" => Ok(RoutedMethod::RepositoryWrite),
         "repository.generate" => Ok(RoutedMethod::RepositoryGenerate),
+        "repository.generation_settings" => Ok(RoutedMethod::GenerationSettings),
         "status" => Ok(RoutedMethod::Status),
         "status.context" => Ok(RoutedMethod::StatusContext),
         "status.navigate" => Ok(RoutedMethod::StatusNavigate),
@@ -665,6 +667,10 @@ impl HostRouter {
                     request.params,
                     &self.host.harness,
                 ).await?;
+                send_completed_result(sink, request.id, result).await?;
+            }
+            RoutedMethod::GenerationSettings => {
+                let result = crate::runtime::commit_message::settings(request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::Notifications => {

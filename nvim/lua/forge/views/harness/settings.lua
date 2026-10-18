@@ -168,6 +168,8 @@ end
 function M.open(state, host)
   if not state.session then return end
   local session_id = state.session.id
+  M._revision = (M._revision or 0) + 1
+  local owner_revision = M._revision
   request(session_id, "trace.status", {}, function(status)
     if not state.session or state.session.id ~= session_id then return end
     local pending = false
@@ -177,6 +179,7 @@ function M.open(state, host)
     local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
+    local commit
     local timeout_focus = { approval_timeout = "amount", answer_timeout = "amount" }
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
@@ -206,6 +209,7 @@ function M.open(state, host)
     local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
+      if commit and commit:change(id, direction or 1) then return end
       if timeout_focus[id] then
         configure({ [id] = duration.change(duration.value(active[id]), timeout_focus[id], direction or 1) })
         return
@@ -268,6 +272,7 @@ function M.open(state, host)
     build_spec = function()
       local policy = access.policy(active)
       local supported = state.capability and state.capability.os_sandbox == true
+      local commit_rows = commit and commit:rows() or {}
       local provider_setup = (active.backend == "claude" or active.backend == "antigravity") and {
         id = "provider-setup", label = "Provider setup",
         columns = { "Provider setup", "Install / sign in", "Manage the ACP runtime and OAuth login" },
@@ -279,6 +284,7 @@ function M.open(state, host)
             .. (configuration_pending and " · Changes pending" or ""),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
+            commit_rows[1], commit_rows[2], commit_rows[3],
             { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
             { id = "answer_timeout", label = "Answer timeout", columns = { "Answer timeout", duration.render(duration.value(active.answer_timeout), timeout_focus.answer_timeout), "Automatically answer questions using recommended defaults · 0 disables" } },
             { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
@@ -314,6 +320,7 @@ function M.open(state, host)
         },
         on_confirm = function(result)
           local id = result.option.id
+          if commit and commit:open(id) then return false end
           if timeout_focus[id] and timeout_focus[id] == "amount" then
             if pending then return false end
             vim.ui.input({ prompt = result.option.label .. " amount (0 = Off): ", default = tostring(duration.value(active[id]).amount) }, function(text)
@@ -346,6 +353,12 @@ function M.open(state, host)
         end,
       }
     end
+    commit = require("forge.views.harness.commit_configuration").new({
+      backend = active.backend, session_id = session_id, host = host,
+      current = function() return M._revision == owner_revision and state.session and state.session.id == session_id end,
+      changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
+      reopen = function() M.open(state, host) end,
+    })
     picker.open(build_spec())
   end)
 end

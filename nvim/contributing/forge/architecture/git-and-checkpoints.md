@@ -210,9 +210,15 @@ The Lua client resolves the provider separately from these generation settings,
 and the native service forwards the explicit effort into the temporary provider
 session. Generation never attaches to the active conversation or changes its
 model. Providers without an override retain the configured Harness model.
-`ai.adapters.use_gemini_for_commits` gates the direct Gemini commit path and
-defaults to `false`. Enabling it still requires a Gemini API key. The flag does
-not change chat, PR creation, or inline-edit adapter selection.
+`repository.generation_settings` reads and saves globally shared source, model,
+and thinking choices in the existing `SettingsStore` provider namespace
+`commit_generation`. Its revision check rejects concurrent stale writes. The
+host checks Gemini key availability without exposing the credential. Missing
+credentials make the effective source Harness without erasing the saved choice.
+`/config` uses the shared source picker, model picker, and field controls. Each
+generation reads the current snapshot before capturing its model settings.
+The initial `ai.adapters.use_gemini_for_commits` flag defaults to `false`; saved
+preferences take precedence. Other AI features keep their existing adapters.
 
 The shared prompt requests fast generation with minimal reasoning while retaining
 factual accuracy. Generated messages default to a title only. Small changes generally do not justify

@@ -158,10 +158,15 @@ function M.render(buf, win, range_list)
           local marks = base.parse(context)
           local ranges = layout_ranges[context.buf]
           if not ranges then return marks end
-          marks = vim.deepcopy(marks)
-          for _, mark in ipairs(marks) do
+          local visible = {}
+          for _, source_mark in ipairs(marks) do
             for _, range in ipairs(ranges) do
-              if mark.start_row >= range.first0 and mark.start_row < range.after0 then
+              -- Incremental trees can retain deleted list items at a shortened region's boundary.
+              if source_mark.start_row >= range.first0 and source_mark.start_row < range.after0 then
+                local mark = vim.deepcopy(source_mark)
+                if mark.opts.end_row and mark.opts.end_row >= range.after0 then
+                  mark.opts.end_row, mark.opts.end_col = range.after0, 0
+                end
                 local padding = math.max(0, (range.indent or 2) - 2 - (range.source_indent or 0))
                 if mark.opts.virt_text_win_col then
                   mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + math.max(0, (range.indent or 2) - 2)
@@ -171,11 +176,12 @@ function M.render(buf, win, range_list)
                     table.insert(line, 1, { string.rep(" ", padding), "Normal" })
                   end
                 end
+                visible[#visible + 1] = mark
                 break
               end
             end
           end
-          return marks
+          return visible
         end)
       end }
     end

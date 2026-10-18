@@ -34,19 +34,6 @@ local function text_to_lines(text)
 end
 
 local function native_request(cwd, ref, ignored, callback, is_current, on_model)
-  local selected = require("ai.adapters").get().commit
-  local model
-  if selected ~= "harness" then
-    local resolved, failure = require("ai").resolve(selected)
-    if not resolved then callback(nil, failure) return end
-    model = { provider = resolved.provider.name, model = resolved.model, thinking = resolved.thinking }
-    on_model(model.model .. (model.thinking ~= nil and (" · thinking " .. tostring(model.thinking)) or ""))
-  else
-    on_model("Harness")
-  end
-  local params = { operation = "generate", workspace = cwd,
-    comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
-    ignored_paths = ignored or {}, model = model }
   local lifetime = M._states
   local function receive(result, failure)
     if M._states ~= lifetime or (is_current and not is_current()) then return end
@@ -61,9 +48,31 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     end
     callback(result, failure)
   end
-  if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
-  elseif selected == "harness" then require("forge.client").request_generation(params, receive, on_model)
-  else require("forge.client").request_host("repository.generate", params, receive) end
+  local function resolved(snapshot, failure)
+    if M._states ~= lifetime or (is_current and not is_current()) then return end
+    if not snapshot then callback(nil, failure) return end
+    local client = require("forge.client")
+    local generation, configuration_failure = client.generation_config()
+    if not generation then callback(nil, configuration_failure) return end
+    local choice = require("forge.integrations.commit_settings").model(snapshot, generation.backend.kind)
+    local model = snapshot.effective_source == "gemini"
+      and { provider = "gemini", model = choice.model, thinking = choice.thinking } or nil
+    on_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. tostring(choice.thinking)) or ""))
+    local params = { operation = "generate", workspace = cwd,
+      comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
+      ignored_paths = ignored or {}, model = model }
+    if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
+    elseif model then client.request_host("repository.generate", params, receive)
+    else
+      local effort = choice.thinking
+      assert(effort == nil or type(effort) == "string", "Harness thinking must be a reasoning level")
+      client.request_generation(params, receive, on_model, { model = choice.model, reasoning_effort = effort })
+    end
+  end
+  require("forge.integrations.commit_settings").request(nil, nil, function(...)
+    local ok, failure = pcall(resolved, ...)
+    if not ok then callback(nil, tostring(failure)) end
+  end)
 end
 
 ---@param state ForgeAICommitState

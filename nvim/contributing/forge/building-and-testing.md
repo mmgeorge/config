@@ -58,10 +58,13 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_review_
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_check_selection.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/plan_checks_host.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_message_folds_host.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_markdown_folds.lua
 ```
 
 The message-fold fixture checks three-line previews, caret rendering, prompt submission,
 automatic response folding on the next exchange, and retained manual expansion in a fresh host.
+Both fold fixtures load the installed Markdown renderer and parsers. The Markdown fixture
+checks repeated list folding beside a status row and cursor refreshes for stale bullet decorations.
 
 Enforce an external execution deadline when running these commands through an
 automation tool. A fixture that prints success but remains alive does not pass.
