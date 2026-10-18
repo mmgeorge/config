@@ -41,6 +41,16 @@ local ok, failure = xpcall(function()
   busy.queue = {}
   assert(not display(busy, 50):find("edit queued", 1, true), "empty queue must clear the editing hint")
   busy.queue = { "next" }
+  busy.queue_edit = {}
+  assert(display(busy):find("<C-q> unqueue", 1, true), "editing must advertise moving the message back to the prompt")
+  assert(display(busy):find("<M-t> next queued", 1, true), "queue editing must advertise forward navigation")
+  local editing_hints = keymaps.view_hint_entries("harness", commands, busy, "queue_edit")
+  assert(#editing_hints == 3 and editing_hints[1].id == "queue")
+  assert(editing_hints[3].id == "next_queued" and editing_hints[3].key == "<M-t>")
+  config.options.keymaps.harness.queue = "<F6>"
+  assert(display(busy):find("<F6> unqueue", 1, true), "unqueue must use the configured queue binding")
+  config.options.keymaps.harness.queue = original.queue
+  busy.queue_edit = nil
   config.options.keymaps.harness.edit_queued = "<M-Up>"
   assert(display(busy, 50):find("<M-Up> edit queued", 1, true), "queue hint must use the configured binding")
   config.options.keymaps.harness.edit_queued = false

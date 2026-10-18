@@ -14,7 +14,10 @@ local leases = {}
 ---@param buffer integer
 ---@param owned boolean
 function M.retain(buffer, owned)
-  local lease = leases[buffer] or { count = 0, owned = owned }
+  local lease = leases[buffer] or { count = 0, owned = owned, generation = 0 }
+  if lease.timer and not lease.timer:is_closing() then lease.timer:stop() lease.timer:close() end
+  lease.timer = nil
+  lease.generation = lease.generation + 1
   lease.count = lease.count + 1
   leases[buffer] = lease
 end
@@ -25,9 +28,50 @@ function M.release(buffer)
   if not lease then return end
   lease.count = lease.count - 1
   if lease.count > 0 then return end
-  leases[buffer] = nil
-  if lease.owned and vim.api.nvim_buf_is_valid(buffer) and not vim.bo[buffer].modified
-    and #vim.fn.win_findbuf(buffer) == 0 then vim.api.nvim_buf_delete(buffer, { force = true }) end
+  if not lease.owned then leases[buffer] = nil return end
+  local generation = lease.generation
+  lease.timer = vim.defer_fn(function()
+    if leases[buffer] ~= lease or lease.count ~= 0 or lease.generation ~= generation then return end
+    leases[buffer] = nil
+    if vim.api.nvim_buf_is_valid(buffer) and not vim.bo[buffer].modified
+      and #vim.fn.win_findbuf(buffer) == 0 then vim.api.nvim_buf_delete(buffer, { force = true }) end
+  end, 60000)
+end
+
+---Refresh retained hidden source from disk without replacing editor-owned changes.
+---@param buffer integer
+---@param receive fun(failure: string?)
+function M.refresh(buffer, receive)
+  local lease = leases[buffer]
+  if not lease or not lease.owned or vim.bo[buffer].modified or #vim.fn.win_findbuf(buffer) > 0 then receive() return end
+  M.retain(buffer, true)
+  local tick = vim.api.nvim_buf_get_changedtick(buffer)
+  M.read(vim.api.nvim_buf_get_name(buffer), function(contents, failure)
+    if not failure and (not vim.api.nvim_buf_is_valid(buffer) or vim.api.nvim_buf_get_changedtick(buffer) ~= tick) then
+      failure = "source_changed: retained source changed while refreshing"
+    end
+    if not failure and not vim.bo[buffer].modified and #vim.fn.win_findbuf(buffer) == 0 then
+      local rows = M.rows(contents)
+      if not vim.deep_equal(rows, vim.api.nvim_buf_get_lines(buffer, 0, -1, false)) then
+        vim.api.nvim_buf_set_lines(buffer, 0, -1, false, rows)
+        vim.bo[buffer].modified = false
+      end
+    end
+    M.release(buffer)
+    receive(failure)
+  end)
+end
+
+---Release retained source buffers when the Harness language service closes.
+function M.close()
+  for buffer, lease in pairs(leases) do
+    if lease.count == 0 then
+      if lease.timer and not lease.timer:is_closing() then lease.timer:stop() lease.timer:close() end
+      leases[buffer] = nil
+      if lease.owned and vim.api.nvim_buf_is_valid(buffer) and not vim.bo[buffer].modified
+        and #vim.fn.win_findbuf(buffer) == 0 then vim.api.nvim_buf_delete(buffer, { force = true }) end
+    end
+  end
 end
 
 ---@param path string

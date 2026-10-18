@@ -1,4 +1,5 @@
 local source = require("forge.lsp.source")
+local diagnostics = require("forge.lsp.diagnostics")
 local M = {}
 
 local methods = {
@@ -82,7 +83,9 @@ function M.request(workspace, arguments, authorize, receive, budget)
     if cancel_startup then cancel_startup() end
     deadline:stop() deadline:close()
     guard:stop() guard:close()
-    for _, request in ipairs(requests) do request.client:cancel_request(request.id) end
+    for _, request in ipairs(requests) do
+      if request.cancel then request.cancel() else request.client:cancel_request(request.id) end
+    end
     for buffer in pairs(buffers) do
       source.release(buffer)
     end
@@ -218,7 +221,13 @@ function M.request(workspace, arguments, authorize, receive, budget)
           enrich(index + 1)
         end
         local target = source.loaded(row.path)
-        if target then versions[target] = vim.api.nvim_buf_get_changedtick(target) accept(vim.api.nvim_buf_get_lines(target, 0, -1, false))
+        if target and versions[target] then accept(vim.api.nvim_buf_get_lines(target, 0, -1, false))
+        elseif target then source.refresh(target, function(refresh_error)
+          if not valid() then return end
+          if refresh_error then finish(refresh_error) return end
+          versions[target] = vim.api.nvim_buf_get_changedtick(target)
+          accept(vim.api.nvim_buf_get_lines(target, 0, -1, false))
+        end)
         else source.read(row.path, function(contents, read_error)
           if not valid() then return end
           if read_error then warnings[#warnings + 1] = read_error enrich(index + 1)
@@ -237,7 +246,7 @@ function M.request(workspace, arguments, authorize, receive, budget)
     outstanding = outstanding + 1
     attempted = attempted + 1
     clients[client.id] = client
-    local accepted, id = client:request(method, params, function(failure, value)
+    local function response(failure, value)
       outstanding = outstanding - 1
       if not valid() then return end
       if failure and failure.code == -32801 and (retries or 0) < 2 then
@@ -255,8 +264,12 @@ function M.request(workspace, arguments, authorize, receive, budget)
         if not success then finish("invalid_response: " .. client.name .. " — " .. tostring(callback_error)) return end
       end
       collect()
-    end, buffer)
-    if accepted then requests[#requests + 1] = { client = client, id = id }
+    end
+    local accepted, id, cancel
+    if method == methods.diagnostics then
+      accepted, cancel = diagnostics.request(client, buffer, params, response)
+    else accepted, id = client:request(method, params, response, buffer) end
+    if accepted then requests[#requests + 1] = { client = client, id = id, cancel = cancel }
     else outstanding = outstanding - 1 warnings[#warnings + 1] = "server_error: " .. client.name .. " rejected the request." end
   end
   local function run(buffer, client)
@@ -372,7 +385,10 @@ function M.request(workspace, arguments, authorize, receive, budget)
       send(client, methods.workspace_symbols, symbol_query(client), buffer, function(value) symbols(value, client) end)
       collect() return
     end
-    if buffer then run(buffer, client)
+    if buffer then source.refresh(buffer, function(refresh_error)
+      if not valid() then return end
+      if refresh_error then finish(refresh_error) else run(buffer, client) end
+    end)
     else source.read(path, function(contents, read_error)
       if not valid() then return end
       if read_error then finish(read_error) return end

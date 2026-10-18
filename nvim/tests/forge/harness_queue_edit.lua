@@ -42,15 +42,20 @@ local success, failure = xpcall(function()
   state.queue = { prior_entry, second_entry, third_entry }
   compose("original composer draft")
 
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == third_entry
     and #state.queue == 3 and state.queue[1] == prior_entry and state.queue[2] == second_entry
     and state.queue[3] == third_entry, "editing the tail changed queue order or chose the wrong barrier")
   compose("/model rejected impossible prompt")
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   assert(state.queue_edit.entry == second_entry and state.queue_edit.drafts[third_entry] == "/model rejected impossible prompt"
     and state.queue_edit.barrier == second_entry, "moving backward did not retain the third-entry draft")
   compose("second edited")
+  controller.edit_queued(1)
+  assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == second_entry
+    and composer_text() == "/model rejected impossible prompt", "forward navigation changed the barrier or lost a draft")
+  controller.edit_queued(-1)
+  assert(state.queue_edit.entry == second_entry and composer_text() == "second edited")
   controller.submit()
   assert(#warnings == 1 and warnings[1]:find("Queued message 3", 1, true), "invalid later draft was not identified by queue position")
   assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == second_entry
@@ -89,9 +94,9 @@ local success, failure = xpcall(function()
   local retained_entry = { text = "retain me", task_id = "task-1" }
   state.queue, state.busy = { deleted_entry, retained_entry }, true
   compose("another composer draft")
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   compose("retained draft")
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   assert(state.queue_edit.entry == deleted_entry and state.queue_edit.drafts[retained_entry] == "retained draft"
     and state.queue[1] == deleted_entry and state.queue[2] == retained_entry,
     "moving from the third entry to the second lost its draft or changed queue order")
@@ -104,6 +109,25 @@ local success, failure = xpcall(function()
   controller.drain()
   assert(requests[4].method == "prompt.submit" and requests[4].params.text == "retained draft"
     and #state.queue == 0, "deleting the second entry did not release the third entry")
+
+  local before = { text = "before", task_id = "task-1" }
+  local selected = { text = "selected", task_id = "task-1" }
+  local after = { text = "after", task_id = "task-1" }
+  state.queue, state.busy = { before, selected, after }, false
+  compose("original draft")
+  controller.edit_queued(-1)
+  compose("after edited")
+  controller.edit_queued(-1)
+  compose("steer this instead")
+  controller.queue_submit()
+  assert(not state.queue_edit and #state.queue == 2 and state.queue[1] == before and state.queue[2] == after
+    and after.text == "after edited" and composer_text() == "steer this instead" and #requests == 4,
+    "unqueue lost the active draft, reordered other messages, or submitted automatically")
+  state.busy = true
+  controller.steer_submit()
+  assert(requests[5].method == "turn.steer" and requests[5].params.text == "steer this instead"
+    and #state.queue == 2 and state.queue[1] == before and state.queue[2] == after,
+    "unqueued prompt could not be steered independently of the remaining queue")
 end, debug.traceback)
 
 if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end

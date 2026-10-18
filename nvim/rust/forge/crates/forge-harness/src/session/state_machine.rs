@@ -305,11 +305,6 @@ impl SessionPhase {
         Self::Idle
     }
 
-    /// Report whether the structural idle phase should remain invisible.
-    pub fn visible(&self) -> bool {
-        !matches!(self, Self::Idle)
-    }
-
     /// Computes elapsed time from recorded intervals without inventing a running clock.
     pub(crate) fn elapsed_ms(&self, now_ms: i64) -> u64 {
         match self {
@@ -497,8 +492,8 @@ mod test {
     }
 
     #[test]
-    fn idle_phase_remains_structural_and_invisible() {
-        assert!(!SessionPhase::Idle.visible());
+    fn idle_phase_has_no_animation() {
+        assert!(!SessionPhase::Idle.animated());
     }
 
     #[test]

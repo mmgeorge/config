@@ -25,20 +25,23 @@ local function position(queue, entry)
   end
 end
 
----Select the preceding queued entry without changing the queue order or releasing its successors.
+---Move through queued entries without changing order or advancing the earliest edit barrier.
 ---@param state table
 ---@param draft string
+---@param direction integer
 ---@return string? text
 ---@return string? failure
 ---@return ForgeAttachmentSelection[]? attachments
-function M.previous(state, draft)
+function M.move(state, draft, direction)
   local edit = state.queue_edit
+  if direction > 0 and not edit then return nil, "No queued prompt is being edited" end
   ---@type integer?
   local index = #state.queue + 1
   if edit then index = position(state.queue, edit.entry) end
   if not index then return nil, "The queued message being edited is no longer available" end
-  index = index - 1
+  index = index + direction
   if index < 1 then return nil, edit and "Already editing the first queued prompt" or "No queued prompt to edit" end
+  if index > #state.queue then return nil, "Already editing the last queued prompt" end
   if index == 1 and state.configuring then return nil, "The first queued prompt is being admitted" end
   local entry = state.queue[index]
   if type(entry) == "string" then

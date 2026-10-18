@@ -291,6 +291,7 @@ function M.close()
     end
   end
   workspaces = {}
+  source.close()
 end
 
 return M

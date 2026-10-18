@@ -1,4 +1,4 @@
-use super::shell::{self, CommandShell};
+use super::shell::{self, CommandAnalysisFailure, CommandShell};
 use anyhow::Result;
 use std::ops::Range;
 
@@ -14,9 +14,12 @@ pub struct CommandInvocation {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+/// Retains every resolved invocation and any failure preventing authorization.
 pub struct CommandNormalization {
+    /// Executable occurrences recovered before analysis completed or failed.
     pub invocation_list: Vec<CommandInvocation>,
-    pub ambiguous: bool,
+    /// Failure that prevents using partial invocation results for authorization.
+    pub failure: Option<CommandAnalysisFailure>,
 }
 
 /// Projects a command payload for presentation while retaining its original source coordinates.
@@ -445,7 +448,7 @@ pub fn normalize_command_in(command: &str, shell: CommandShell) -> CommandNormal
 fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> CommandNormalization {
     if depth >= 16 {
         return CommandNormalization {
-            ambiguous: true,
+            failure: Some(CommandAnalysisFailure::Incomplete("nested shell analysis budget exhausted".into())),
             ..Default::default()
         };
     }
@@ -453,7 +456,7 @@ fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> Command
         return normalize_script(script, depth, 0);
     }
     let parsed = shell::parse(command, shell);
-    if parsed.ambiguous {
+    if parsed.failure.is_some() {
         return parsed;
     }
     let mut result = CommandNormalization::default();
@@ -462,18 +465,24 @@ fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> Command
         let nested_shell = CommandShell::from_executable(&executable);
         if nested_shell == CommandShell::Unknown {
             if matches!(executable.as_str(), "cmd" | "fish") {
-                result.ambiguous = true;
+                result.failure.get_or_insert_with(|| {
+                    CommandAnalysisFailure::Unsupported(format!("shell {executable}"))
+                });
             }
             result.invocation_list.push(invocation);
             continue;
         }
         let Some(script) = shell_script(&invocation.source, shell) else {
-            result.ambiguous = true;
+            result.failure.get_or_insert_with(|| {
+                CommandAnalysisFailure::Unsupported("shell launcher arguments".into())
+            });
             result.invocation_list.push(invocation);
             continue;
         };
         let nested = normalize_script(script, depth, invocation.source_range.start);
-        result.ambiguous |= nested.ambiguous;
+        if result.failure.is_none() {
+            result.failure = nested.failure;
+        }
         result.invocation_list.extend(nested.invocation_list);
     }
     result
@@ -549,7 +558,9 @@ fn normalize_script(
         {
             invocation.source_range = source_offset + first.start..source_offset + last.end;
         } else {
-            result.ambiguous = true;
+            result.failure.get_or_insert_with(|| {
+                CommandAnalysisFailure::Incomplete("nested shell source mapping failed".into())
+            });
         }
     }
     result
@@ -674,7 +685,7 @@ mod test {
         ] {
             let display = display_command(source, shell);
             let parsed = normalize_command_in(source, shell);
-            assert!(!parsed.ambiguous, "{source}");
+            assert!(parsed.failure.is_none(), "{source}");
             for invocation in parsed.invocation_list {
                 let range = display.project_range(&invocation.source_range).unwrap();
                 assert_eq!(&display.source[range], invocation.source, "{source}");
@@ -685,7 +696,7 @@ mod test {
     #[test]
     fn splits_compounds_without_splitting_quoted_separators() {
         let result = normalize_command("git status && rg \"a|b\" src | Select-Object -First 1");
-        assert!(!result.ambiguous);
+        assert!(result.failure.is_none());
         assert_eq!(result.invocation_list.len(), 3);
         assert_eq!(result.invocation_list[0].token_list[0], "git");
         assert_eq!(result.invocation_list[2].token_list[0], "Select-Object");
@@ -697,7 +708,7 @@ mod test {
             r#"tool "a;b" "a|b" "a&b" "a'b" "a\"b" """#,
             CommandShell::Bash,
         );
-        assert!(!original.ambiguous);
+        assert!(original.failure.is_none());
         assert_eq!(original.invocation_list.len(), 1);
         let pattern = exact_command_pattern(&original.invocation_list[0]).unwrap();
         assert_eq!(
@@ -711,7 +722,7 @@ mod test {
         let result = normalize_command(
             r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command "git commit -m test""#,
         );
-        assert!(!result.ambiguous);
+        assert!(result.failure.is_none());
         assert_eq!(
             result.invocation_list,
             vec![CommandInvocation {
@@ -732,7 +743,7 @@ mod test {
             &format!("Get-ChildItem registry -Directory | {block}"),
             CommandShell::PowerShell,
         );
-        assert!(!result.ambiguous);
+        assert!(result.failure.is_none());
         assert_eq!(result.invocation_list.len(), 4);
         assert_eq!(result.invocation_list[1].source, block);
         assert!(result.invocation_list[1].structural);
@@ -744,12 +755,12 @@ mod test {
             "Write-Output @(Get-Item one; Get-Item two) @{ name = 'x'; value = @(1, 2) }",
             CommandShell::PowerShell,
         );
-        assert!(!nested.ambiguous);
+        assert!(nested.failure.is_none());
         assert!(nested.invocation_list.len() >= 3);
         assert!(normalize_command_in(
             "ForEach-Object { Get-ChildItem; Write-Output 'done'",
             CommandShell::PowerShell,
-        ).ambiguous);
-        assert!(normalize_command_in("tool (one]", CommandShell::PowerShell).ambiguous);
+        ).failure.is_some());
+        assert!(normalize_command_in("tool (one]", CommandShell::PowerShell).failure.is_some());
     }
 }

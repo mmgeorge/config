@@ -1503,6 +1503,13 @@ impl HarnessBroker {
         use crate::task::{TaskKind, TaskStatus};
         let command = required_text(&action, "action")?;
         match command.as_str() {
+            "undo" => {
+                let rollback = action.get("rollback").cloned().context("undo requires rollback selection")?;
+                anyhow::ensure!(rollback["scope"] == "conversation", "undo requires conversation rollback scope");
+                self.pause_task(false).await?;
+                self.cancel_settled_execution().await?;
+                self.rollback_conversation(rollback).await
+            }
             "pause" | "clear" => {
                 let (_, mut events) = self.pause_task(command == "clear").await?;
                 events.extend(self.cancel_settled_execution().await?.1);
@@ -3695,6 +3702,9 @@ Planning continuation: turn {} of {}.",
             };
         }
 
+        if self.session.backend_session_id.is_none() {
+            input = self.rollback_context(&interaction.id, input)?;
+        }
         let mut backend_request = self.backend_request(input, mode);
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
@@ -7318,6 +7328,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn apply_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        match params.get("scope").and_then(Value::as_str).unwrap_or("workspace") {
+            "conversation" => return self.rollback_conversation(params).await,
+            "workspace" => {},
+            _ => anyhow::bail!("unknown rollback scope"),
+        }
         anyhow::ensure!(self.agent_coordinator.active_count() == 0,
             "child execution must settle before workspace rollback");
         let preview_id = required_text(&params, "preview_id")?;
@@ -7371,32 +7386,79 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         &mut self,
         mut journal: crate::checkpoint::RestoreJournal,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let mut events = Vec::new();
-        if let Some(first) = journal.preview.exchange_ids.first() {
-            self.store
-                .record_rollback(&self.session.id, &journal.preview.exchange_ids)?;
-            if self.session.goal_id.is_some() {
-                let mut goal = self.active_goal()?;
-                self.sync_native_goal(&goal, "cleared").await?;
-                goal.state = GoalState::Cleared;
-                goal.updated_at_ms = self.clock.now_ms();
-                self.store.save_goal(&goal)?;
-                self.session.goal_id = None;
-            }
-            self.save_session()?;
-            if let Some(exchange) = self
-                .store
-                .list_exchange(&self.session.id)?
-                .into_iter()
-                .find(|exchange| &exchange.id == first)
-            {
-                events
-                    .push(self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?);
-            }
-        }
+        let events = self.finish_conversation_rollback(&journal.preview.exchange_ids).await?;
         journal.state = crate::checkpoint::RestoreState::Complete;
         journal.save(&self.store.objects)?;
         Ok((json!({"restored":true}), events))
+    }
+
+    async fn rollback_conversation(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
+            "child execution must settle before conversation rollback");
+        self.require_restore_recovered()?;
+        let requested = required_text(&params, "exchange_id")?;
+        let target = self.store.checkpoint_owner(&self.session.id, &requested)?;
+        let expected_latest = required_text(&params, "latest_exchange_id")?;
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        anyhow::ensure!(exchanges.last().is_some_and(|exchange| exchange.id == expected_latest),
+            "conversation changed; select the rollback interaction again");
+        let position = exchanges.iter().position(|exchange| exchange.id == target)
+            .context("rollback interaction disappeared")?;
+        anyhow::ensure!(exchanges[position].disposition == crate::exchange::HistoryDisposition::Current,
+            "selected interaction has already been rolled back");
+        anyhow::ensure!(exchanges.iter().all(|exchange| exchange.completed_at_ms.is_some()),
+            "cancel or finish active work before conversation rollback");
+        let ids = exchanges[position..].iter().map(|exchange| exchange.id.clone()).collect::<Vec<_>>();
+        self.store.require_settled_exchange_tree(&self.session.id, &ids)?;
+        let events = self.finish_conversation_rollback(&ids).await?;
+        Ok((json!({"restored":true,"scope":"conversation"}), events))
+    }
+
+    async fn finish_conversation_rollback(&mut self, exchange_ids: &[String]) -> Result<Vec<SessionEvent>> {
+        let Some(first) = exchange_ids.first() else { return Ok(Vec::new()); };
+        let mut session = self.session.clone();
+        if session.goal_id.is_some() {
+            let mut goal = self.active_goal()?;
+            self.sync_native_goal(&goal, "cleared").await?;
+            goal.state = GoalState::Cleared;
+            goal.updated_at_ms = self.clock.now_ms();
+            self.store.save_goal(&goal)?;
+            session.goal_id = None;
+        }
+        let replacement = crate::backend::build(self.backend_launch.clone(),
+            self.permission_coordinator.clone(), self.trace.clone(), self.data_root.clone())?;
+        self.backend.shutdown().await?;
+        self.backend = Arc::from(replacement);
+        session.backend_session_id = None;
+        session.provider_checkpoint_id = None;
+        session.provider_fork_state = ProviderForkState::Ready;
+        session.context_usage = None;
+        session.last_compaction_turn = None;
+        session.acquire_lease(&self.client_id, self.clock.now_ms())?;
+        session.updated_at_ms = self.clock.now_ms();
+        self.store.record_rollback(&session, exchange_ids)?;
+        self.session = session;
+        self.context_usage_fresh = false;
+        let exchange = self.store.list_exchange(&self.session.id)?.into_iter()
+            .find(|exchange| &exchange.id == first).context("rolled-back interaction disappeared")?;
+        Ok(vec![self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?])
+    }
+
+    fn rollback_context(&self, current_exchange: &str, input: BackendInput) -> Result<BackendInput> {
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        if !exchanges.iter().any(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current) {
+            return Ok(input);
+        }
+        let retained = exchanges.iter().filter(|exchange| exchange.id != current_exchange
+            && exchange.disposition == crate::exchange::HistoryDisposition::Current).collect::<Vec<_>>();
+        let history = serde_json::to_string(&retained)?;
+        let context = format!("The conversation was rolled back. Use only this retained conversation history as prior context. The current workspace files are authoritative.\n{history}\n\nCurrent request:\n");
+        Ok(match input {
+            BackendInput::Text { text, attachments } => BackendInput::Text { text:format!("{context}{text}"), attachments },
+            BackendInput::Skill { name, arguments, attachments } => BackendInput::Skill {
+                name, arguments:format!("{context}{arguments}"), attachments,
+            },
+        })
     }
 
     #[cfg(test)]
@@ -8358,6 +8420,10 @@ mod test {
                 std::fs::write(Path::new(&request.workspace).join("seed.txt"), if turn > 0 { "fixed" } else { "broken" })?;
             }
             if turn == 0 && self.explicit {
+                let context = request.control_context.as_ref().unwrap();
+                let advertised = crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), true);
+                assert!(advertised.iter().any(|tool| tool.name == "checks_run"));
+                assert!(!crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), false).iter().any(|tool| tool.name.starts_with("checks_")));
                 let scope = request.control_context.as_ref().unwrap().checks.as_ref().unwrap();
                 let started: Value = serde_json::from_str(&scope.invoke("checks_run", json!({"ids":["verify"]})).await?)?;
                 loop {
@@ -10623,6 +10689,42 @@ mod test {
     }
 
     #[tokio::test]
+    async fn conversation_rollback_preserves_files_and_restarts_with_retained_context() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut first = completed_interaction("retained", &broker.session.id, Vec::new());
+        first.prompt = "KEEP_THIS_CONTEXT".into();
+        let mut second = completed_interaction("removed", &broker.session.id, Vec::new());
+        second.ordinal = 2;
+        second.prompt = "DROP_THIS_CONTEXT".into();
+        assert!(second.checkpoint_before.is_none());
+        broker.store.save_exchange(&first)?;
+        broker.store.save_exchange(&second)?;
+        broker.session.backend_session_id = Some("old-provider-history".into());
+        broker.save_session()?;
+        std::fs::write(repository.path().join("seed.txt"), "Keep these file changes\n")?;
+        std::fs::write(repository.path().join("new-file.txt"), "Keep this new file\n")?;
+        let mut params = json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"stale"});
+        assert!(broker.apply_rollback(params.clone()).await.is_err());
+        assert_eq!(broker.store.list_exchange(&broker.session.id)?[1].disposition, crate::exchange::HistoryDisposition::Current);
+        params["latest_exchange_id"] = json!("removed");
+        let (result, events) = broker.apply_rollback(params).await?;
+        assert_eq!(result["scope"], "conversation");
+        assert!(events.iter().any(|event| event.event == "interaction_rolled_back"));
+        assert_eq!(std::fs::read_to_string(repository.path().join("seed.txt"))?, "Keep these file changes\n");
+        assert_eq!(std::fs::read_to_string(repository.path().join("new-file.txt"))?, "Keep this new file\n");
+        assert!(crate::checkpoint::RestoreJournal::progress(&broker.store.objects, &broker.session.id)?.is_none());
+        assert!(broker.store.load_session(&broker.session.id)?.unwrap().backend_session_id.is_none());
+        assert!(!broker.snapshot()?.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == "removed")));
+        let input = broker.rollback_context("new-request", BackendInput::from_text("CURRENT_REQUEST"))?;
+        let BackendInput::Text { text, .. } = input else { unreachable!() };
+        assert!(text.contains("KEEP_THIS_CONTEXT") && text.contains("CURRENT_REQUEST"));
+        assert!(!text.contains("DROP_THIS_CONTEXT"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn consecutive_rollbacks_follow_restored_workspace_history() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -10656,6 +10758,10 @@ mod test {
             std::fs::read_to_string(repository.path().join("seed.txt")).unwrap(),
             "first\n"
         );
+        let visible = broker.snapshot().unwrap().timeline;
+        assert!(visible.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[0])));
+        assert!(!visible.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[1])),
+            "rollback must remove the reverted request instead of leaving a timeline tombstone");
         assert!(
             broker
                 .rollback_exchange(json!({"exchange_id":exchange_id[1]}))
@@ -10680,6 +10786,8 @@ mod test {
             history[1].disposition,
             crate::exchange::HistoryDisposition::Superseded
         );
+        assert!(!broker.snapshot().unwrap().timeline.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { .. })),
+            "rolled-back and superseded requests must stay out of the rebuilt timeline");
     }
 
     #[test]
@@ -13009,8 +13117,9 @@ mod test {
         );
         assert!(snapshot.get("exchange").is_none() && snapshot.get("timeline").is_none());
         let timeline = child_controller.snapshot().unwrap().timeline;
-        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline.len(), 2);
         assert!(matches!(&timeline[0], TimelineEntry::SessionEvent { .. }));
+        assert!(matches!(&timeline[1], TimelineEntry::Status { status: SessionPhase::Idle, .. }));
         let failed_preparation = prepare_provider_fork(
             data.path(),
             "fork-client",

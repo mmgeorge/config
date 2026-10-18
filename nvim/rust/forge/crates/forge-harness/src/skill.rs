@@ -93,7 +93,7 @@ impl SkillAccess {
                     return false;
                 }
                 let parsed = normalize_command_in(command, shell.unwrap_or_default());
-                !parsed.ambiguous
+                parsed.failure.is_none()
                     && !parsed.invocation_list.is_empty()
                     && parsed.invocation_list.iter().all(|invocation| {
                         if invocation.source.contains(['>', '<']) {
@@ -162,7 +162,7 @@ impl SkillAccess {
                 .map(CommandShell::from_executable)
                 .unwrap_or_else(CommandShell::default);
             let parsed = normalize_command_in(command, shell);
-            if !parsed.ambiguous {
+            if parsed.failure.is_none() {
                 for invocation in &parsed.invocation_list {
                     path.extend(read_paths(invocation));
                 }

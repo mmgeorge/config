@@ -34,6 +34,8 @@ pub struct ToolOutputView {
     heading: Option<crate::turn::ToolCall>,
     owner: String,
     pub(super) group: String,
+    /// Keeps the current tool preview at a fixed height during its exchange.
+    pub(super) live_preview: bool,
 }
 
 /// Owns one incremental terminal parser and its normalized row index.
@@ -180,6 +182,7 @@ impl ToolOutputView {
         self.heading = replacement.heading.clone();
         self.owner.clone_from(&replacement.owner);
         self.group.clone_from(&replacement.group);
+        self.live_preview = replacement.live_preview;
         true
     }
 
@@ -217,7 +220,7 @@ impl ToolOutputView {
         ensure!(!call_id.is_empty() && call_id.len() <= 256, "invalid tool call identity");
         Ok(Self {
             call_id, file: None, saved: Arc::new(saved.to_owned()), parsed: OnceLock::new(),
-            heading: None, owner: String::new(), group: String::new(),
+            heading: None, owner: String::new(), group: String::new(), live_preview: false,
         })
     }
 

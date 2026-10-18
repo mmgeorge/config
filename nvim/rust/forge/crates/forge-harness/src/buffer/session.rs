@@ -1396,12 +1396,23 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     let entry_ids = open.sections.document.entry_ids();
     let existing = entry_ids.iter().position(|id| id == "harness:staging");
     if let Some(staging) = &open.staging {
-        let mut source = String::new();
-        append_staging_section(&mut source, "Steering active turn", &staging.steering);
-        append_staging_section(&mut source, "Queued follow-up inputs", &staging.queue);
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
-        let block = super::transcript::TranscriptRenderer::new(width)?
-            .literal(block_id.clone(), &source, 0)?;
+        let mut rows = Vec::new();
+        append_staging_section(&mut rows, "Steering active turn", &staging.steering, width)?;
+        append_staging_section(&mut rows, "Queued follow-up inputs", &staging.queue, width)?;
+        let mut block = forge_buffer::block::BufferBlock {
+            id: block_id.clone(),
+            text: forge_buffer::text::BufferText::from_rows(rows)?,
+            metadata: Default::default(),
+        };
+        block.metadata.decoration.push(forge_buffer::block::Decoration {
+            range: forge_buffer::block::TextRange {
+                start: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                end: forge_buffer::block::TextPosition { row: block.text.row_count(), column: 0 },
+            },
+            capture: "ForgeStatusHint".into(),
+            priority: 100,
+        });
         let entry = TranscriptEntry {
             id: "harness:staging".into(),
             block: vec![block],
@@ -1427,20 +1438,18 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     Ok(())
 }
 
-fn append_staging_section(source: &mut String, label: &str, values: &[String]) {
+fn append_staging_section(rows: &mut Vec<String>, label: &str, values: &[String], width: &WidthProfile) -> Result<()> {
     if values.is_empty() {
-        return;
+        return Ok(());
     }
-    if !source.is_empty() {
-        source.push('\n');
+    if !rows.is_empty() {
+        rows.push(String::new());
     }
-    source.push_str(label);
-    source.push('\n');
+    rows.extend(width.wrap_plain(label, 0)?);
     for value in values {
-        source.push_str("• ");
-        source.push_str(value);
-        source.push('\n');
+        rows.extend(width.wrap_plain(&format!("• {value}"), 2.min(width.columns.saturating_sub(1)))?);
     }
+    Ok(())
 }
 
 fn retain_patch(open: &mut OpenPresentation, patch: BufferPatch) -> Result<()> {
@@ -1577,6 +1586,39 @@ mod tests {
     }
 
     #[test]
+    fn staged_prompts_keep_hanging_indentation_after_resize() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(Vec::new())?;
+        let document = DocumentId("aligned-staging".into());
+        let view = ViewId("aligned-staging-view".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let prompt = "a Harness execution request is already running: no permits available\nwhen I entered this prompt it failed\n    never lose this indentation 界";
+        owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(), queue: vec![prompt.into()],
+            steering: vec!["Keep steering text aligned when it wraps across several display rows 界".into()],
+        })?;
+        for columns in [32, 54] {
+            let width = WidthProfile { columns, ..WidthProfile::default() };
+            owner.dispatch(PresentationRequest::Resize {
+                document: document.clone(), view: view.clone(), width: width.clone(),
+            })?;
+            let snapshot = owner.snapshot(&document)?;
+            let rows = snapshot.block.last().unwrap().text.wire_rows();
+            let mut in_prompt = false;
+            for row in rows {
+                assert!(width.cells(row, 0)? <= columns);
+                if row.starts_with("• ") { in_prompt = true; }
+                else if row.is_empty() || row == "Queued follow-up inputs" { in_prompt = false; }
+                else if in_prompt { assert!(row.starts_with("  "), "unaligned continuation: {row:?}"); }
+            }
+            assert!(snapshot.block.last().unwrap().text.wire_rows().iter()
+                .any(|row| row.starts_with("      never")));
+        }
+        assert_eq!(owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue, vec![prompt.to_owned()]);
+        Ok(())
+    }
+
+    #[test]
     fn staging_preserves_complete_large_payloads_across_reflow() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![interaction_entry("main")])?;
@@ -1594,9 +1636,10 @@ mod tests {
         let rows = owner.snapshot(&document)?.block.iter()
             .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
         assert!(rows.contains("queue-0-"));
-        assert!(rows.contains(&last));
-        assert!(rows.find("queue-0-").unwrap() < rows.find(&last).unwrap());
-        assert!(rows.contains(&steering));
+        let unwrapped = rows.lines().map(str::trim_start).collect::<String>();
+        assert!(unwrapped.contains(&last));
+        assert!(unwrapped.find("queue-0-").unwrap() < unwrapped.find(&last).unwrap());
+        assert!(unwrapped.contains(&steering));
         owner.reconcile(vec![
             interaction_entry("main"),
             interaction_entry("followup"),
@@ -1628,7 +1671,7 @@ mod tests {
         })?;
         let rows = owner.snapshot(&document)?.block.iter()
             .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
-        assert!(rows.contains(&last));
+        assert!(rows.lines().map(str::trim_start).collect::<String>().contains(&last));
         assert_eq!(owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue.len(), 1);
         Ok(())
     }
@@ -1976,12 +2019,13 @@ mod tests {
         let snapshot = owner.snapshot(&document)?;
         let preview = snapshot.block.iter().find(|block| block.id.0 == "active:turn:1:tool:preview").unwrap();
         assert!(preview.text.wire_rows().iter().any(|row| row.contains("seventh")));
-        assert!(preview.text.row_count() <= 4);
+        assert_eq!(preview.text.row_count(), 4);
+        assert_eq!(snapshot.block.iter().find(|block| block.id.0 == "active:turn:1:tool:hidden").unwrap().text.row_count(), 0);
         Ok(())
     }
 
     #[test]
-    fn hidden_parallel_tool_output_stays_cached_until_group_expansion() -> Result<()> {
+    fn hidden_parallel_tool_output_stays_cached_until_exchange_completion() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         use super::super::nodes::{NodeAction, NodeRequest};
         use serde_json::{json, Value};
@@ -2012,6 +2056,7 @@ mod tests {
         let before = owner.snapshot(&document)?;
         assert!(!before.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"));
         assert!(before.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
+        assert_eq!(before.block.iter().find(|block| block.id.0 == "parallel:turn:1:latest:preview").unwrap().text.row_count(), 4);
         let activity = event.activity.as_mut().unwrap();
         activity.id = "tool".into();
         activity.title = "Read output".into();
@@ -2026,12 +2071,13 @@ mod tests {
         let group = after.block.iter().find_map(|block| block.metadata.node.as_ref()
             .filter(|node| node.kind == forge_buffer::node::NodeKind::ToolGroup)).unwrap();
         owner.dispatch(PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view, sequence: 100, node: group.id.0.clone(),
+            document: document.clone(), view: view.clone(), sequence: 100, node: group.id.0.clone(),
             generation: group.generation, action: NodeAction::SetExpansion { expanded: true },
             rows: 40, width: WidthProfile::default(),
         } })?;
         let expanded = owner.snapshot(&document)?;
-        assert!(expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"));
+        assert!(!expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"),
+            "expanding a live group must keep older tools hidden");
         assert!(expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
         let source = &owner.open.as_ref().unwrap().sections.nodes.tool["parallel:turn:1:tool"];
         assert!(source.preview(true)?.row.contains(&"Late older output"));
@@ -2040,10 +2086,25 @@ mod tests {
             status: Some("inProgress".into()), output_delta: false, change: Default::default() });
         exchange.observe_turn(&event, 4)?;
         owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
+            exchange: exchange.clone(), agent_by_id: HashMap::new() }])?;
+        assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
+            block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 1,
+            "new calls must replace the preview even after explicit group expansion");
+        assert_eq!(owner.snapshot(&document)?.block.iter().find(|block|
+            block.id.0 == "parallel:turn:1:third:preview").unwrap().text.row_count(), 4);
+        exchange.state = crate::exchange::ExchangeState::Complete;
+        exchange.completed_at_ms = Some(5);
+        owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
             exchange, agent_by_id: HashMap::new() }])?;
+        let activity = "parallel:exchange";
+        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(activity).unwrap();
+        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view, sequence: 101, node: activity.into(), generation,
+            action: NodeAction::SetExpansion { expanded: true }, rows: 40, width: WidthProfile::default(),
+        } })?;
         assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
             block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 3,
-            "new calls must preserve explicit group expansion");
+            "completed exchanges must allow the full tool history to expand");
         Ok(())
     }
 

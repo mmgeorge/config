@@ -81,13 +81,13 @@ local success, failure = xpcall(function()
   compose("/model invalid xhigh never run")
   controller.queue_submit()
   local invalid_model_entry = state.queue[1]
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   assert(state.configuring and #state.queue == 1 and state.queue[1] == invalid_model_entry and not state.queue_edit
     and #warnings == 1, "the configuring queue front became editable")
   requests[5].callback(nil, "unavailable model")
   assert(#rejected == 1 and #state.queue == 1 and #requests == 5 and not state.configuring)
   assert(state.session.model == "picked", "rejected configuration changed the active model")
-  controller.edit_last_queued()
+  controller.edit_queued(-1)
   assert(#state.queue == 1 and state.queue[1] == invalid_model_entry and state.queue_edit.entry == invalid_model_entry
     and table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
       == "/model invalid xhigh never run", "failed configuration was removed or lost its queued identity")

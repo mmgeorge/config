@@ -7,9 +7,9 @@ use crate::permissions::document::{
     CATEGORY_WEBFETCH, PermissionDecision,
 };
 use crate::permissions::matcher::{
-    CommandParseError, PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
+    CommandAnalysisError, PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
 };
-use crate::permissions::shell::{self, CommandHighlight, CommandShell};
+use crate::permissions::shell::{self, CommandAnalysisFailure, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
 use crate::permissions::directory::{DirectoryGrant, DirectoryOperation, DirectoryPolicy};
 use crate::session::{InputDeadline, InputTimeout, PermissionMode, ResolutionSource};
@@ -672,7 +672,7 @@ fn target_rule_list(target: &PermissionTarget, broad: bool) -> Vec<(String, Stri
         PermissionTarget::UnknownFile { .. } => {}
         PermissionTarget::Command { command, shell } => {
             let normalization = normalize_command_in(command, shell.unwrap_or_default());
-            if normalization.ambiguous {
+            if normalization.failure.is_some() {
                 return rule_list;
             }
             for invocation in &normalization.invocation_list {
@@ -951,8 +951,9 @@ pub fn permission_from_provider(
 
 /// Recovers provider arguments before applying the selected shell's quoting rules.
 fn provider_command(params: &Value, uses_argv_serialization: bool) -> Result<(String, Option<CommandShell>)> {
-    let parse_error = || CommandParseError {
+    let parse_error = || CommandAnalysisError {
         shell: provider_shell(params).unwrap_or(CommandShell::Unknown),
+        failure: CommandAnalysisFailure::MalformedTransport,
     };
     let command = params.get("command");
     let arguments = if let Some(arguments) = params
@@ -1405,7 +1406,7 @@ mod test {
                 let failure = tokio::time::timeout(std::time::Duration::from_secs(1),
                     coordinator.authorize_callback(mode, forced, request, None, Some(&sink)))
                     .await.unwrap().unwrap_err();
-                assert!(failure.downcast_ref::<crate::permissions::matcher::CommandParseError>().is_some());
+                assert!(failure.downcast_ref::<crate::permissions::matcher::CommandAnalysisError>().is_some());
                 assert!(failure.to_string().contains("shell_command_parse_error"));
                 assert!(failure.to_string().contains("split independent operations"));
                 assert!(coordinator.pending_list().unwrap().is_empty());
@@ -1815,7 +1816,7 @@ mod test {
                     shell: Some(shell)
                 }]
             );
-            assert!(!normalize_command_in(script, shell).ambiguous);
+            assert!(!normalize_command_in(script, shell).failure.is_some());
             let request = permission_from_copilot(
                 "id".into(),
                 "shell",
@@ -1849,7 +1850,7 @@ mod test {
             command: source.into(), shell: Some(CommandShell::PowerShell),
         }]);
         let parsed = normalize_command_in(source, CommandShell::PowerShell);
-        assert!(!parsed.ambiguous);
+        assert!(parsed.failure.is_none());
         assert_eq!(parsed.invocation_list.len(), 1);
         assert_eq!(parsed.invocation_list[0].token_list, [
             "rg", "-n", "timeline|markdown|table|wrap", r"C:\Users\mattm\.codex\memories\MEMORY.md",
@@ -1892,7 +1893,7 @@ mod test {
                         command: source.into(), shell: Some(shell),
                     }]);
                     let parsed = normalize_command_in(source, shell);
-                    assert!(!parsed.ambiguous, "{shell:?}: {source}: {parsed:?}");
+                    assert!(parsed.failure.is_none(), "{shell:?}: {source}: {parsed:?}");
                     let expected = if source.contains('\n') { 2 } else { 1 };
                     assert_eq!(parsed.invocation_list.len(), expected, "{shell:?}: {source}");
                     assert!(parsed.invocation_list.iter().all(|command| command.command_name == "probe"));
@@ -1914,7 +1915,7 @@ mod test {
             ).unwrap();
             let PermissionTarget::Command {command, shell} = &request.target_list[0] else { panic!() };
             let parsed = normalize_command_in(command, shell.unwrap());
-            assert!(!parsed.ambiguous, "{command}: {parsed:?}");
+            assert!(parsed.failure.is_none(), "{command}: {parsed:?}");
             assert_eq!(parsed.invocation_list.len(), 1);
             assert_eq!(parsed.invocation_list[0].token_list, arguments);
         }
@@ -1932,7 +1933,7 @@ mod test {
             let error = permission_from_provider(
                 "item/commandExecution/requestApproval", &json!({"params":params}), ".",
             ).unwrap_err();
-            assert!(error.downcast_ref::<CommandParseError>().is_some(), "{error:#}");
+            assert!(error.downcast_ref::<CommandAnalysisError>().is_some(), "{error:#}");
         }
     }
 

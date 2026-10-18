@@ -273,6 +273,12 @@ function M.refresh_winbar()
   local state = harness_state()
   if not state.command_set then return end
   tabline.set_session_name(state.timeline_tab, state.session and state.session.name)
+  local right_status = context_status.segment(state.session and state.session.context_usage) or {}
+  for _, hint in ipairs(keymaps.view_hint_entries("harness", state.command_set, state, "queue_edit")) do
+    if #right_status > 0 then right_status[#right_status + 1] = { text = " • ", group = "ForgeStatusHint" } end
+    right_status[#right_status + 1] = { text = hint.key, group = "ForgeStatusHintKey" }
+    right_status[#right_status + 1] = { text = " " .. hint.label, group = "ForgeStatusHint" }
+  end
   keymaps.apply_view_winbar(
     state.transcript_win,
     "",
@@ -280,7 +286,7 @@ function M.refresh_winbar()
     state.command_set,
     status_text(),
     nil,
-    context_status.segment(state.session and state.session.context_usage)
+    right_status
   )
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.wo[state.composer_win].winbar = ""
@@ -1297,27 +1303,51 @@ local function confirm_restore_preview(preview, interaction)
 end
 
 ---@param interaction ForgeRollbackInteraction
-local function confirm_rollback(interaction)
+---@param latest_exchange_id string
+local function confirm_rollback(interaction, latest_exchange_id)
   local state = harness_state()
   local session_id, generation = state.session.id, client.host_generation()
   if state.busy or state.restore_applying then return end
-  client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(preview, err)
+  local choices = {
+    { label = "Cancel", value = "cancel" },
+    { label = "Conversation only", detail = "Keep all current files", value = "conversation" },
+  }
+  if interaction.checkpoint_before and not state.no_checkpoint then
+    choices[#choices + 1] = { label = "Conversation and files", detail = "Restore this interaction's checkpoint", value = "workspace" }
+  end
+  open_choice_picker(state, "Rollback interaction", "Choose what to roll back", choices, function(choice)
     if harness_state() ~= state or not state.session or state.session.id ~= session_id
       or client.host_generation() ~= generation then return end
-    if err then notifications.error(err, "Harness undo") return end
-    confirm_restore_preview(preview, interaction)
+    if not choice or choice == "cancel" or state.busy or state.restore_applying then return end
+    if choice == "workspace" then
+      client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(preview, err)
+        if harness_state() ~= state or not state.session or state.session.id ~= session_id
+          or client.host_generation() ~= generation then return end
+        if err then notifications.error(err, "Harness undo") return end
+        confirm_restore_preview(preview, interaction)
+      end)
+      return
+    end
+    if choice ~= "conversation" then return end
+    local operation = {}
+    state.restore_applying = operation
+    M.task_transition({ action = "undo", rollback = {
+      scope = "conversation", exchange_id = interaction.id, latest_exchange_id = latest_exchange_id,
+    } }, nil, function(applied)
+      if harness_state() ~= state or not state.session or state.session.id ~= session_id
+        or client.host_generation() ~= generation or state.restore_applying ~= operation then return end
+      state.restore_applying = nil
+      if not applied then return end
+      restore_composer_prompt(interaction.prompt or "")
+    end)
   end)
 end
 
----Open the checkpointed interaction picker for an editable rollback.
-local function open_exchange_undo_picker()
+---Open settled interaction history before choosing a rollback scope.
+local function open_exchange_undo_picker(recovery)
   local state = harness_state()
   if state.busy then
     notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
-    return
-  end
-  if state.no_checkpoint then
-    notifications.warn("Undo is unavailable because this session has NO CHECKPOINT", "Harness undo")
     return
   end
   local session_id, generation = state.session and state.session.id, client.host_generation()
@@ -1333,7 +1363,7 @@ local function open_exchange_undo_picker()
     local option_list = {}
     for index = #(interaction_list or {}), 1, -1 do
       local interaction = interaction_list[index]
-      if interaction.checkpoint_before and rollback_state[interaction.state]
+      if rollback_state[interaction.state]
         and interaction.disposition == "current"
       then
         local prompt = vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
@@ -1345,18 +1375,33 @@ local function open_exchange_undo_picker()
         }
       end
     end
+    if recovery and not recovery.pending then
+      option_list[#option_list + 1] = { id = "undo-file-restore", label = "Undo last file restore",
+        detail = "Preview restoring files from before the last rollback", value = { undo_file_restore = true } }
+    end
     open_choice_picker(
       state,
       "Select Exchange",
       nil,
       option_list,
-      confirm_rollback,
+      function(interaction)
+        if interaction.undo_file_restore then
+          client.request_for(session_id, "exchange.recovery", { action = "undo" }, function(preview, err)
+            if harness_state() ~= state or not state.session or state.session.id ~= session_id
+              or client.host_generation() ~= generation then return end
+            if err then notifications.error(err, "Harness recovery") return end
+            confirm_restore_preview(preview)
+          end)
+        else
+          confirm_rollback(interaction, interaction_list[#interaction_list].id)
+        end
+      end,
       "This session has no exchanges available to undo."
     )
   end)
 end
 
----Open saved restore recovery before offering exchange history.
+---Open interaction history directly unless an unfinished file restore needs recovery.
 function M.open_undo_picker()
   local state = harness_state()
   if state.busy or state.restore_applying then
@@ -1370,18 +1415,13 @@ function M.open_undo_picker()
       or client.host_generation() ~= generation then return end
     if err then notifications.error(err, "Harness recovery") return end
     if not recovery or recovery == vim.NIL then open_exchange_undo_picker() return end
+    if not recovery.pending then open_exchange_undo_picker(recovery) return end
     local choices = { { label = "Cancel", value = "cancel" } }
-    if recovery.pending then
-      choices[#choices + 1] = { label = "Continue interrupted restore", value = "continue" }
-      choices[#choices + 1] = { label = "Restore pre-restore files", value = "undo" }
-    else
-      choices[#choices + 1] = { label = "Select an earlier exchange", value = "history" }
-      choices[#choices + 1] = { label = "Undo last restore", value = "undo" }
-    end
-    open_choice_picker(state, "Harness restore", recovery.pending and "An interrupted restore requires recovery." or nil, choices, function(choice)
+    choices[#choices + 1] = { label = "Continue interrupted restore", value = "continue" }
+    choices[#choices + 1] = { label = "Restore pre-restore files", value = "undo" }
+    open_choice_picker(state, "Harness restore", "An interrupted restore requires recovery.", choices, function(choice)
       if harness_state() ~= state or not state.session or state.session.id ~= session_id
         or client.host_generation() ~= generation then return end
-      if choice == "history" then open_exchange_undo_picker() return end
       if choice ~= "undo" and choice ~= "continue" then return end
       if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
       client.request_for(session_id, "exchange.recovery", { action = choice }, function(result, failure)
@@ -1506,13 +1546,13 @@ function M.open_background_picker()
   end)
 end
 
-local function finish_queue_edit(state, text)
+local function finish_queue_edit(state, text, unqueue)
   local edit = state.queue_edit
   queue_editor.remember(state, text)
   local source = require("forge.views.harness.completion.command_source")
   for index, entry in ipairs(state.queue) do
     local draft = edit.drafts[entry]
-    if draft and draft ~= "" then
+    if draft and draft ~= "" and not (unqueue and entry == edit.entry) then
       local _, _, failure = model_command(draft)
       if not source.accepts_prompt(draft) or not source.queues_execution(draft) then
         failure = "Use a prompt, or clear the text to delete this queued message"
@@ -1526,12 +1566,17 @@ local function finish_queue_edit(state, text)
       end
     end
   end
-  local original, failure, attachments = queue_editor.finish(state, text)
+  local selected_attachments = edit.attachments[edit.entry]
+  local original, failure, attachments = queue_editor.finish(state, unqueue and "" or text)
   if failure then notifications.warn(failure, "ForgeHarness") return end
-  if text ~= "" then prompt_history.record(text) end
+  if unqueue then original, attachments = text, selected_attachments
+  elseif text ~= "" then prompt_history.record(text) end
   set_composer_text(state.composer_buf, original, attachments)
+  if unqueue and state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+    vim.api.nvim_set_current_win(state.composer_win)
+  end
   M.refresh_winbar()
-  M.drain()
+  if not unqueue then M.drain() end
 end
 
 function M.submit()
@@ -1922,7 +1967,7 @@ function M.queue_submit()
   if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
   harness_state().execution_notice = nil
   local state = harness_state()
-  if state.queue_edit then M.submit() return end
+  if state.queue_edit then finish_queue_edit(state, composer_text(state.composer_buf), true) return end
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
@@ -1940,11 +1985,11 @@ function M.queue_submit()
   M.drain()
 end
 
-function M.edit_last_queued()
+function M.edit_queued(direction)
   local state = harness_state()
   if not attachments_ready(state.composer_buf) then return end
   local draft = composer_text(state.composer_buf)
-  local text, failure, attachments = queue_editor.previous(state, draft)
+  local text, failure, attachments = queue_editor.move(state, draft, direction)
   if failure then notifications.warn(failure, "ForgeHarness") return end
   set_composer_text(state.composer_buf, text, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
@@ -2262,7 +2307,7 @@ function M.task_transition(action, submitted_text, completed, method)
     synchronize_state(function(_, sync_failure)
       if sync_failure then return end
       M.render()
-      if not failure then M.drain() end
+      if not failure and action.action ~= "undo" then M.drain() end
     end)
   end, function()
     if submitted_text and harness_state() == state and composer_text(state.composer_buf) == submitted_text then
@@ -2521,7 +2566,8 @@ function M.command_set()
       or not presentation.ready or presentation.closed or presentation.failure then return end
     presentation.selection.start()
   end)
-  command_set.register(set, "edit_queued", M.edit_last_queued)
+  command_set.register(set, "edit_queued", function() M.edit_queued(-1) end)
+  command_set.register(set, "next_queued", function() M.edit_queued(1) end)
   command_set.register(set, "submit", M.submit)
   command_set.register(set, "queue", M.queue_submit)
   command_set.register(set, "steer", M.steer_submit)
@@ -2560,7 +2606,7 @@ end
 function M.composer_command_set()
   local set = M.command_set()
   local controls = {
-    submit = true, queue = true, steer = true, cancel = true, edit_queued = true,
+    submit = true, queue = true, steer = true, cancel = true, edit_queued = true, next_queued = true,
     toggle_mode = true, effort_down = true, effort_up = true,
   }
   for _, id in ipairs(vim.deepcopy(set.order)) do

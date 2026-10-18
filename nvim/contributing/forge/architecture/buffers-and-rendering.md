@@ -53,6 +53,9 @@ the timeline. Lua coalesces changes through the presentation's `staging` operati
 Rust keeps them in a presentation-local block, separate from durable exchange
 history. These rows use normal timeline scrolling and never enter composer text
 or its height calculation. Refreshing staging preserves intentional transcript browsing.
+Each staged prompt uses a two-cell hanging indent, so wrapped rows and explicit newlines
+align with the text after its bullet. Resizing reflows that indentation without changing
+the stored draft or queue order.
 
 `forge.window_presentation` retains the ordinary source-window options before a native
 view applies document settings. Native documents use a fixed one-cell margin, while
@@ -149,12 +152,22 @@ Action-target snapshots remain separate and only validate whether a response sti
 The timeline projects ordered exchange items into separate message, tool-group, and change
 nodes. Consecutive ordinary tools share a group. Commentary, steering, or a file edit ends that
 group. An active group shows its count, latest tool heading, and a preview of that tool's last
-four display rows. Earlier tool headings stay out of the live preview. Expanding the group shows
-every tool, and expanding an individual tool loads its complete output through the existing paging
-path. A settled group defaults to collapsed tools without previews. Exchange completion also
+four display rows. The live output body pads unused rows and keeps its overflow count out of the
+layout, so empty, short, and long outputs occupy the same four rows. Full output remains retained
+for expansion. Earlier tool headings stay out of the live preview even when the group is
+explicitly expanded. Groups that finish before their exchange retain this compact body when opened.
+After exchange completion, expanding the group shows every tool. Expanding an individual tool
+loads its complete output through the existing paging path. A settled group defaults to collapsed
+tools without previews. Exchange completion also
 collapses the activity node and leaves its aggregate changes and final response outside it.
 Hidden tools retain their output caches, including late parallel output, without changing visible
-rows. Explicit group expansion persists while new calls arrive.
+rows. Explicit group expansion persists while new calls arrive, but its live body remains limited
+to the latest tool until exchange completion.
+
+The status entry persists through idle, running, and waiting phases under one identity. It renders
+an initial separator, the phase label, and two reserved detail rows. Optional thought previews
+occupy those detail rows instead of increasing the status height. Idle status has no animation
+or action hint. Complete thoughts remain in the conversation timeline.
 
 Tool output deltas update the existing output cache. File edits have no generic tool-output
 cache, so their deltas reconcile the change node instead. Both paths retain the same provider

@@ -28,6 +28,5 @@ pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;
 pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::CheckToolScope;
-#[cfg(test)]
 pub(crate) use tools::ConfigureChecks;
 pub(crate) use automatic::AutomaticChecks;

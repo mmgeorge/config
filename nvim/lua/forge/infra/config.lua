@@ -77,6 +77,7 @@
 ---@field steer ForgeKeymap
 ---@field cancel ForgeKeymap
 ---@field edit_queued ForgeKeymap
+---@field next_queued ForgeKeymap
 ---@field toggle_mode ForgeKeymap
 ---@field previous_prompt ForgeKeymap
 ---@field next_prompt ForgeKeymap
@@ -283,6 +284,7 @@ M.defaults = {
       steer = false,
       cancel = "<C-c>",
       edit_queued = "<M-s>",
+      next_queued = "<M-t>",
       toggle_mode = "<S-Tab>",
       previous_prompt = "<C-y>",
       next_prompt = "<C-z>",

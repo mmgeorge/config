@@ -102,9 +102,10 @@ bypass the busy broker lock. Target authorization precedes editor reads, and Rus
 checks returned paths again before publishing bounded text. Cancellation drops
 the pending identity and sends `lsp.cancel`. Late replies cannot revive it.
 
-The adapter uses pull diagnostics when supported and otherwise reads Neovim's
-diagnostic store. Unknown freshness remains explicit. Harness retains no query
-result cache and creates no dependency projects.
+The adapter reuses current diagnostic reports, pulls when invalidated, and otherwise reads
+Neovim's push diagnostic store. Unknown freshness remains explicit. Diagnostic reuse is scoped
+to the client, provider, source version, and invalidation generation. Other semantic queries
+retain no cross-query result cache. Harness creates no dependency projects.
 
 Package discovery uses manifests and workspace membership rather than syntax or
 LSP results. The check configuration chooses the package manager explicitly.
@@ -234,6 +235,19 @@ integration still require their own accounting and lifecycle work.
 
 
 ### Agent target resolution and path search
+
+`forge.lsp.diagnostics` shares completed pull reports with the editor's diagnostic handler.
+Queries for the same client, document, and provider coalesce while a pull is pending. Repeated
+queries reuse a report only while its buffer tick and client invalidation generation still match.
+Source notifications, saves, watched-file changes, configuration changes, and server diagnostic
+refreshes invalidate reuse. New pulls supply the previous result ID and retain the prior items
+when the server answers `unchanged`. Cancelling one consumer preserves a pull needed by another.
+Push-only servers continue to expose their editor diagnostic namespace with unknown freshness.
+
+`forge.lsp.source` retains unused, owned hidden buffers for 60 seconds after the last request.
+Reuse refreshes hidden source from disk without rewriting unchanged text or replacing visible or
+modified editor buffers. Expiry and language-service shutdown release unused owned buffers.
+This bounds idle retention without limiting source size or the number of requested documents.
 
 `forge.lsp.target` resolves declaration names and exact source occurrences for
 all position-based tools. File lookup uses the captured structural snapshot.

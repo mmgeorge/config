@@ -20,7 +20,7 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
     for fixture in fixture_list {
         let source = fixture.replace("CHECK", "probe");
         let parsed = normalize_command_in(&source, shell);
-        if parsed.ambiguous {
+        if parsed.failure.is_some() {
             let mut parser = Parser::new();
             parser.set_language(&shell.grammar().unwrap()).unwrap();
             let tree = parser.parse(&source, None).unwrap();
@@ -55,7 +55,7 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
         let asked = policy("allow", "ask")
             .evaluate(PermissionMode::Write, &request)
             .unwrap();
-        if parsed.ambiguous || allowed.decision != PermissionDecision::Allow
+        if parsed.failure.is_some() || allowed.decision != PermissionDecision::Allow
             || denied.decision != PermissionDecision::Deny || asked.decision != PermissionDecision::Ask
             || asked.pending_target_list.is_empty()
             || !asked.pending_target_list.iter().all(|target| matches!(target,
@@ -145,7 +145,7 @@ fn powershell_commands_nested_in_every_supported_construct_obey_policy() {
 fn powershell_comma_arguments_keep_independent_permissions_and_source_ranges() {
     let source = "Get-ChildItem D:/.local/share/nvim/forge,D:/.cache/nvim/forge -ErrorAction SilentlyContinue |\n  Select-Object FullName,LastWriteTime;\n  rg -n 'markdown|wrap|table|timeline|database' .agents/rules/forge.md .agents/rules/nvim.md";
     let parsed = normalize_command_in(source, CommandShell::PowerShell);
-    assert!(!parsed.ambiguous, "{parsed:?}");
+    assert!(parsed.failure.is_none(), "{parsed:?}");
     assert_eq!(parsed.invocation_list.len(), 3);
     for invocation in &parsed.invocation_list {
         assert_eq!(&source[invocation.source_range.clone()], invocation.source,);
@@ -255,7 +255,7 @@ fn powershell_native_options_and_adjacent_expressions_remain_arguments() {
 
 fn check_execution(shell: CommandShell, source: &str, expected: &[&str]) {
     let parsed = normalize_command_in(source, shell);
-    assert!(!parsed.ambiguous, "{shell:?}: {source}\n{parsed:?}");
+    assert!(parsed.failure.is_none(), "{shell:?}: {source}\n{parsed:?}");
     let actual = parsed
         .invocation_list
         .iter()
@@ -675,7 +675,7 @@ fn parser_preserves_complete_commands_beyond_former_byte_limit() {
         CommandShell::Nushell,
     ] {
         let parsed = normalize_command_in(&source, shell);
-        assert!(!parsed.ambiguous, "{shell:?}");
+        assert!(parsed.failure.is_none(), "{shell:?}");
         assert_eq!(parsed.invocation_list.len(), 2, "{shell:?}");
         assert_eq!(
             parsed.invocation_list[0].token_list,
@@ -707,10 +707,10 @@ fn parser_structural_guards_fail_closed() {
                 &format!("{}probe{}", "(".repeat(100), ")".repeat(100)),
                 shell
             )
-            .ambiguous
+            .failure.is_some()
         );
     }
-    assert!(normalize_command_in("probe", CommandShell::Unknown).ambiguous);
+    assert!(normalize_command_in("probe", CommandShell::Unknown).failure.is_some());
 }
 
 #[test]
@@ -735,7 +735,7 @@ fn explicit_shell_launchers_use_their_own_grammar() {
         ),
     ] {
         let parsed = normalize_command_in(launcher, CommandShell::PowerShell);
-        assert!(!parsed.ambiguous, "{launcher}: {parsed:?}");
+        assert!(parsed.failure.is_none(), "{launcher}: {parsed:?}");
         assert!(
             parsed
                 .invocation_list
@@ -803,7 +803,7 @@ fn powershell_foreach_ranges_are_expressions_and_only_loop_commands_need_permiss
     for range in ["1..1", "0..10", "-2..2", "5..1"] {
         let source = format!("foreach ($iteration in {range}) {{ whoami.exe /groups }}");
         let parsed = normalize_command_in(&source, CommandShell::PowerShell);
-        assert!(!parsed.ambiguous, "{source}: {parsed:?}");
+        assert!(parsed.failure.is_none(), "{source}: {parsed:?}");
         assert_eq!(parsed.invocation_list.len(), 1, "{source}: {parsed:?}");
         assert_eq!(parsed.invocation_list[0].source, "whoami.exe /groups");
         let request = PermissionRequest {
@@ -864,7 +864,7 @@ fn shell_quote_decoding_preserves_policy_arguments() {
         let decoded = super::super::command::shell_token_list(source, shell).unwrap();
         assert_eq!(decoded[1], expected, "{shell:?}: {source}");
         let parsed = normalize_command_in(source, shell);
-        if parsed.ambiguous {
+        if parsed.failure.is_some() {
             failure_list.push(format!("{shell:?}: {source}"));
             continue;
         }
@@ -919,11 +919,11 @@ fn lexical_escapes_preserve_arguments_and_rejected_syntax_stays_rejected() {
         assert_eq!(tokens, ["probe", expected]);
         let parsed = normalize_command_in(source, shell);
         if shell == CommandShell::PowerShell {
-            assert!(!parsed.ambiguous);
+            assert!(parsed.failure.is_none());
             assert_eq!(parsed.invocation_list.len(), 1);
             assert_eq!(parsed.invocation_list[0].token_list, tokens);
         } else {
-            assert!(parsed.ambiguous);
+            assert!(parsed.failure.is_some());
         }
     }
 }
@@ -954,7 +954,7 @@ fn nested_launcher_coordinates_survive_quotes_escapes_and_unicode() {
         ),
     ] {
         let parsed = normalize_command_in(source, shell);
-        assert!(!parsed.ambiguous, "{source}: {parsed:?}");
+        assert!(parsed.failure.is_none(), "{source}: {parsed:?}");
         assert_eq!(parsed.invocation_list.len(), 2, "{source}");
         assert_eq!(
             &source[parsed.invocation_list[0].source_range.clone()],

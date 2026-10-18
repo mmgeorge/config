@@ -504,11 +504,22 @@ refresh. A pending first refresh returns a starting snapshot. An unattached rest
 returns an empty snapshot, since a persisted provider identity does not mean startup is running.
 An initialization delay therefore does not consume the terminal query's eight-second deadline.
 
-The `/undo` specialization loads the active session's durable interaction records and lists
-checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
-second picker with `Cancel` selected before the destructive choice. A successful broker rollback
+The `/undo` specialization opens the active session's settled current interactions newest first.
+Selecting a record offers conversation-only rollback or conversation with file restoration when
+a checkpoint exists. Conversation-only rollback leaves files and Git's index untouched and works
+without checkpoints. Its confirmed `task.transition` action `undo` validates the selected history,
+collects execution through the normal cancellation and child-quiescence path, and leaves the task
+paused before applying the conversation rollback. The broker rechecks the history after collection.
+File restoration retains its preview and explicit confirmation. Only an
+unfinished file restore interrupts entry into the history list with recovery choices. A successful broker rollback
 restores the selected interaction's exact multiline prompt to `HarnessInput`, moves the cursor to
 its end, and enters Insert mode so the reverted request can be edited or resubmitted.
+The timeline omits rolled-back and superseded exchanges instead of showing a rollback entry.
+Durable records retain their disposition and execution outcome for checkpoint history and recovery.
+The same visibility rule applies when the session reopens and to delegated exchange history.
+Both scopes replace the provider conversation and atomically persist the cleared provider identity
+with the reverted history. The next prompt supplies the retained current exchanges as context to
+the new provider conversation, excluding the rolled-back and superseded messages.
 
 The `/sessions` specialization defaults to the current repository and toggles all repositories with
 `C-o`. Moving the result selection requests a read-only `session.preview` projection and temporarily
@@ -559,8 +570,11 @@ Explicit pause and clear also finalize an exchange waiting for user input. Close
 retain their recorded questions in history but cannot expose them as active questions.
 Unanswered question rows in a cancelled exchange display Cancelled and cannot reopen a prompt.
 Internal pauses for configuration changes preserve waiting questions until work resumes.
-Execution admission retains one permit per session from request preparation through response
-delivery. A second execution cannot reset the first request's cancellation state. Cleanup owns
+Execution admission retains one permit per session from request preparation through provider
+and exchange finalization. The host transfers that permit into service dispatch, which releases
+it and the composer submission ownership before publishing the completion response. Response
+backpressure cannot make a finished request reject the next prompt. A second execution cannot
+reset an active request's cancellation state. Cleanup owns
 a separate control permit that blocks new execution admission until cleanup returns. Status
 reads and approval responses remain available. Ctrl-C during a mode restart suppresses its
 automatic resumption and waits for the existing cleanup acknowledgement and execution result.
@@ -921,7 +935,12 @@ permission document remains outside provider write authority, including shell co
 The command permission category displays as `shell` while retaining the Rulesync `bash` storage key.
 The matcher splits recognized compound shell requests into distinct command targets and omits targets
 already allowed by policy. Each remaining target owns one picker page with its own exact and broad
-choices. Ambiguous command text returns a parse error without opening the picker.
+choices. Failed command analysis never opens the picker, executes a command, or records
+a permission rule. Malformed transport and shell syntax return `shell_command_parse_error`.
+Valid constructs outside the analyzer's supported subset return `shell_command_unsupported`
+with the construct name. Interrupted parsing, exhausted analysis budgets, and source-mapping
+failures return `shell_command_analysis_failed` with the underlying reason. Partial command
+results never authorize execution or supply persistent approval choices.
 Each command approval item retains its complete script payload, shell identity, syntax captures,
 and byte ranges for the executable occurrences covered by its choices. Quoted copies of a command
 do not contribute approval ranges. Nested launcher decoding maps those ranges back through quoting
@@ -936,6 +955,27 @@ executed command or stored permission pattern.
 PageUp and PageDown scroll long details independently of the decision list. The visible line range
 indicates remaining content. Exact choices refer to the highlighted command instead of repeating it.
 Shell analysis uses pinned PowerShell, bash, zsh, and Nushell syntax trees without executing source.
+PowerShell `Where-Object` analysis binds script-block and property parameter sets, including
+the `where` and `?` aliases and the module-qualified cmdlet name. Property-only filters,
+`-Not`, implicit equality, case-sensitive comparisons, explicit `I` comparison aliases,
+and `-Is`/`-IsNot` type predicates retain their native parameter roles. Property and value
+arguments can be positional or named. `-InputObject`, common parameters and their aliases,
+unambiguous parameter abbreviations, inline parameter values, and the `--` end-of-parameters
+marker are recognized. Named arguments bind before positional arguments, so reordering them
+does not change which operand is the property or comparison value.
+Filter scripts must be literal script blocks. Dynamic script references and mixed parameter
+sets fail analysis without opening approval. Argument expressions remain visible to the normal
+command traversal, including expressions in properties, values, common parameters, and explicit
+input. Type literals are permitted only as operands of `-Is`/`-IsNot` within the filter. The
+structural filter retains explicit deny rules, and every nested executable keeps its own
+permission decision. The parameter contract follows the
+[PowerShell cmdlet reference](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/where-object)
+and [common parameter reference](https://learn.microsoft.com/en-us/powershell/module/microsoft.powershell.core/about/about_commonparameters).
+Static `[Math]::Min(...)` and `[System.Math]::Min(...)` calls with exactly two arguments are
+expressions rather than executable permission targets. Both arguments remain subject to
+normal command traversal. Other .NET methods, dynamic receivers, and member-invoking
+`ForEach-Object` parameter sets remain unsupported. Recognition uses syntax nodes without
+evaluating expressions, and preserves the original source and executable coordinates.
 Codex command approval text encodes an argument vector with POSIX `shlex` quoting on every platform.
 The provider boundary decodes that transport with `shlex`, retaining structured argument vectors
 when available. A recognized launcher supplies its exact script argument and shell identity to
@@ -952,9 +992,10 @@ Recognized callback builtins such as PowerShell `ForEach-Object` and `Where-Obje
 `each`, `par-each`, `where`, `filter`, `reduce`, `any`, and `all`, require every nested command to pass
 policy. An explicit denial of a callback builtin still rejects the request. Control-flow bodies,
 conditions, substitutions, and static nested shell invocations contribute their own command targets.
-Dynamic command names, code evaluation, unrecognized callback consumers, definitions, redirections,
-and parser errors return `shell_command_parse_error` to the provider without creating an approval.
-The error directs the agent to simplify the command or split independent operations while keeping
+Dynamic command names, code evaluation, unrecognized callback consumers, definitions, and
+redirections return `shell_command_unsupported`. Invalid syntax returns `shell_command_parse_error`.
+Both failures reach the provider without creating an approval. The error directs the agent to
+rewrite the unsupported construct or split independent operations while keeping
 pipelines intact. This validation also applies to YOLO and mandatory provider callbacks.
 Unsupported string forms such as ANSI-C quoting, PowerShell here-strings, and Nushell raw strings
 return errors. Escaped newlines in Zsh also return errors because the pinned grammar can turn the

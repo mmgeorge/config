@@ -100,11 +100,19 @@ the caret or message body to show or hide the complete text.
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
 `ForgeHarnessLog` requires an open Harness session. Inside Harness, `/sessions`
-opens durable session search and `/undo` opens checkpoint rollback.
+opens durable session search and `/undo` opens the interaction list directly.
+After selecting an interaction, choose **Conversation only** to keep current files,
+or **Conversation and files** to restore its checkpoint too. Conversation-only
+rollback works without a file checkpoint. Confirming conversation rollback collects
+active execution before changing history and leaves the task paused. An unfinished
+restore requires recovery first.
 
+The status area stays present between responses and shows **Idle** when no work is running.
+It reserves two rows below the phase label, so starting and finishing a response does not add
+or remove that space. Live tool output similarly occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
 Enable **Status thoughts** in `/config` to show the latest thought below it in
-italics, aligned with the phase label and wrapped to the window width. The option
+italics, aligned with the phase label and wrapped into the two reserved rows. The option
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thought messages remain available in the timeline either way.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
@@ -122,10 +130,15 @@ Use `Alt-Up` and `Alt-Down` for prompt history. Timeline folding, navigation, he
 and close shortcuts remain in the upper pane.
 
 `M-s` edits the newest queued prompt in place. Repeating it moves backward through
-the queue without changing message order. Earlier messages may execute, but the
+the queue, and `M-t` moves forward while editing. Navigation preserves message order
+and saved drafts. Earlier messages may execute, but the
 message being edited and all later messages wait. `Ctrl-S` saves the edit in its
 reserved position. Submitting an empty edit deletes that message. Finishing restores
 any unqueued draft that was in the composer before editing began.
+While editing, `Ctrl-Q` instead removes the selected message from the queue and keeps
+its edited text and attachments in the normal prompt. It does not submit automatically,
+so you can steer that text into the active response or submit it later. The upper bar
+shows the configured unqueue and queue-navigation shortcuts during editing.
 
 Paste an absolute file path into the Harness composer to attach the file. Terminal
 drag-and-drop works when the terminal pastes the dropped paths. Quoted paths,

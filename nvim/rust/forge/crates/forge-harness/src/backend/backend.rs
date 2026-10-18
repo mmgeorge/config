@@ -852,6 +852,13 @@ impl Backend for MockBackend {
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
+        if let Some(context) = request.control_context.as_ref()
+            && context.checks.as_ref().is_some_and(|scope| scope.setup_reviewed().is_some()) {
+            let advertised = crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), true);
+            anyhow::ensure!(advertised.iter().any(|tool| tool.name == "checks_list")
+                && advertised.iter().any(|tool| tool.name == "checks_configure"),
+                "check setup requires advertised list and configuration tools");
+        }
         if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
             && scope.setup_reviewed() == Some(false) {
             let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;

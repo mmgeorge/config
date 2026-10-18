@@ -166,14 +166,12 @@ impl BrokerObserver {
         if let Some(run) = self.check_runner.active()?.and_then(|id|self.check_runner.history().ok()?.into_iter().find(|run|run.id == id)) {
             status = run.status();
         }
-        if status.visible() {
-            timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
+        timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
                 status_thoughts,
                 id: format!("{}:status", source_session.id),
                 created_at_ms: 0,
                 status: status.clone(),
-            });
-        }
+        });
         let approval = self
             .permission_coordinator
             .pending_list()?

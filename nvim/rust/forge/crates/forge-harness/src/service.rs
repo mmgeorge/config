@@ -366,7 +366,7 @@ impl HarnessService {
     }
 
     /// Arm provider work in input order before concurrent dispatch can admit a later cancellation.
-    /// Keep the permit until dispatch and response delivery finish. Overlapping execution and
+    /// Keep the permit until execution finalization, then release it before publishing completion. Overlapping execution and
     /// pending cleanup reject admission without resetting the current cancellation state.
     pub async fn prepare(&self, session_id: Option<&str>, method: HarnessMethod) -> Result<Option<OwnedSemaphorePermit>> {
         let _activity = self.admit().await?;
@@ -397,14 +397,24 @@ impl HarnessService {
         Ok(())
     }
 
-    /// Route a validated session operation without holding the initialization mutex during work.
-    ///
-    /// The host must call `prepare` in input order before dispatching provider-bound operations.
+    /// Route an operation without transferring a host-held execution permit.
+    /// Provider-bound host requests use `dispatch_admitted` with the permit from `prepare`.
     pub async fn dispatch(
+        &self,
+        session_id: Option<String>,
+        request: Request,
+        sink: &MessageSender,
+    ) -> Result<()> {
+        self.dispatch_admitted(session_id, request, sink, None).await
+    }
+
+    /// Publish completion only after the admitted execution and composer capture are released.
+    pub async fn dispatch_admitted(
         &self,
         session_id: Option<String>,
         mut request: Request,
         sink: &MessageSender,
+        mut admission: Option<OwnedSemaphorePermit>,
     ) -> Result<()> {
         let method = HarnessMethod::decode(&request.method)?;
         if method == HarnessMethod::Shutdown {
@@ -523,7 +533,8 @@ impl HarnessService {
                 });
             }
         }
-        let result = Box::pin(route_request(registry, session_id, request, method, sink, &self.syntax)).await;
+        let result = Box::pin(route_request(registry, session_id, request, method, sink, &self.syntax,
+            &mut admission, &mut prompt_admission)).await;
         if let Some(stage) = edit_total { stage.complete(json!({"status":if result.is_ok() { "completed" } else { "failed" }})); }
         drop(prompt_admission);
         result
@@ -1076,6 +1087,8 @@ async fn route_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
+    admission: &mut Option<OwnedSemaphorePermit>,
+    prompt_admission: &mut Option<PromptAdmission>,
 ) -> Result<()> {
     if matches!(
         method,
@@ -1467,7 +1480,7 @@ async fn route_request(
     }
     let edit_trace = matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate | HarnessMethod::PlanEntityRename)
         .then(|| crate::plan::edit_trace::PlanEditTrace::new(registry.runtime.trace(), &session_id, &request.method, &request.params));
-    if route_control_request(&controller, &request, method, message_sink, syntax, edit_trace.as_ref()).await? {
+    if route_control_request(&controller, &request, method, message_sink, syntax, edit_trace.as_ref(), admission).await? {
         return Ok(());
     }
 
@@ -1543,11 +1556,21 @@ async fn route_request(
     for event in result.event {
         message_sink.send_event(event).await?;
     }
-    if shutdown {
-        message_sink.send_terminal(Message::Response(result.response))?;
-    } else {
-        message_sink.send_response(result.response).await?;
-    }
+    publish_execution_completion(message_sink, result.response, admission, prompt_admission, shutdown).await
+}
+
+/// Release finalized execution ownership before its response can admit the next prompt.
+async fn publish_execution_completion(
+    sink: &MessageSender,
+    response: Response,
+    admission: &mut Option<OwnedSemaphorePermit>,
+    prompt_admission: &mut Option<PromptAdmission>,
+    terminal: bool,
+) -> Result<()> {
+    drop(prompt_admission.take());
+    drop(admission.take());
+    if terminal { sink.send_terminal(Message::Response(response))?; }
+    else { sink.send_response(response).await?; }
     Ok(())
 }
 
@@ -1574,7 +1597,20 @@ fn admit_task_intent(controller: &SessionController, session_id: &str, request: 
         return Ok(previous);
     }
     let action = request.params.get("action").and_then(Value::as_str).context("task action is required")?;
-    ensure!(["plan", "execute", "goal", "fork", "attach_plan", "resume", "pause", "clear", "permission", "configure", "compact"].contains(&action), "unknown task action");
+    ensure!(["plan", "execute", "goal", "fork", "attach_plan", "resume", "pause", "clear", "undo", "permission", "configure", "compact"].contains(&action), "unknown task action");
+    if action == "undo" {
+        let rollback = &request.params["rollback"];
+        ensure!(rollback["scope"] == "conversation", "undo requires conversation rollback scope");
+        let selected = rollback["exchange_id"].as_str().filter(|id| !id.is_empty())
+            .context("undo requires exchange_id")?;
+        let latest = rollback["latest_exchange_id"].as_str().context("undo requires latest_exchange_id")?;
+        let exchanges = store.list_exchange(session_id)?;
+        ensure!(exchanges.last().is_some_and(|exchange| exchange.id == latest),
+            "conversation changed; select the rollback interaction again");
+        ensure!(exchanges.iter().any(|exchange| exchange.id == selected
+            && exchange.disposition == crate::exchange::HistoryDisposition::Current),
+            "selected interaction is unavailable for rollback");
+    }
     if action == "permission" {
         let permission: crate::session::PermissionMode = serde_json::from_value(request.params.get("mode").cloned().context("permission is required")?)?;
         ensure!(controller.backend.descriptor().capability.execution_mode_list.contains(&permission), "permission is unavailable for this backend");
@@ -1596,7 +1632,7 @@ fn admit_task_intent(controller: &SessionController, session_id: &str, request: 
         .map(|operation| operation.resume_after_transition).unwrap_or_else(||
         task.as_ref().is_some_and(|task| task.status == crate::task::TaskStatus::Running)
             || (task.is_none() && controller.execution_admission.available_permits() == 0));
-    let resume_after_transition = if matches!(action, "pause" | "clear") { false }
+    let resume_after_transition = if matches!(action, "pause" | "clear" | "undo") { false }
         else if matches!(action, "plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume") { true }
         else { running_intent };
     let operation = crate::task::TaskOperation {
@@ -2035,6 +2071,7 @@ async fn route_control_request(
     message_sink: &MessageSender,
     syntax: &Arc<SyntaxEngine>,
     trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
+    admission: &mut Option<OwnedSemaphorePermit>,
 ) -> Result<bool> {
     if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate | HarnessMethod::PlanEntityRename) {
         let dispatch = trace.map(|trace| trace.stage("service.dispatch_edit"));
@@ -2106,12 +2143,14 @@ async fn route_control_request(
         let result = controller.agent_coordinator.sender().request(crate::agent::AgentRequest {
             operation_id:request.params["operation_id"].as_str().map(str::to_owned).unwrap_or_else(||uuid::Uuid::new_v4().to_string()),
             source:crate::agent::AgentSource::User,operation}).await?;
+        drop(admission.take());
         message_sink.send_response(Response::success(request.id,result)?).await?;
         return Ok(true);
     }
     if matches!(method, HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel)
         && let Some((value, events)) = controller.revision_review.decide(method, request.params.clone()).await? {
         for event in events { message_sink.send_event(event).await?; }
+        drop(admission.take());
         message_sink.send_response(Response::success(request.id, value)?).await?;
         return Ok(true);
     }
@@ -3016,7 +3055,7 @@ mod tests {
                 response.send(Ok((json!({"reviewed":true}), Vec::new()))).unwrap();
             };
             let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::join!(route_control_request(&controller, &request, method, &sink, &service.syntax, None), respond)
+                tokio::join!(route_control_request(&controller, &request, method, &sink, &service.syntax, None, &mut None), respond)
             }).await.expect("review controls must not acquire the provider's broker lock");
             assert!(routed.unwrap());
             let frame = output.recv().await.unwrap().unwrap();
@@ -3158,7 +3197,7 @@ mod tests {
         let answers:Vec<_> = requested_view["item_list"].as_array().unwrap().iter()
             .map(|item|json!({"item_id":item["id"],"choice_id":"allow_once"})).collect();
         assert!(route_control_request(&controller,&Request {id:2,method:"approval.resolve".into(),
-            params:json!({"approval_id":approval_id,"answer_list":answers})},HarnessMethod::ApprovalResolve,&sink,&service.syntax,None).await?);
+            params:json!({"approval_id":approval_id,"answer_list":answers})},HarnessMethod::ApprovalResolve,&sink,&service.syntax,None,&mut None).await?);
         assert_eq!(pending.await??,crate::backend::approval::ApprovalResolution::AllowOnce);
         let resolved = tokio::time::timeout(Duration::from_secs(2), events.recv()).await??.unwrap();
         assert_eq!(resolved.kind, "approval_resolved");
@@ -3251,6 +3290,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn conversation_undo_collects_execution_admission_before_rollback() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let session = crate::session::SessionStore::load_session(&store, &session_id)?.unwrap();
+        let exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"latest", "session_id":session_id, "agent_id":session.primary_agent_id, "ordinal":1,
+            "prompt":"Remove this conversation entry", "kind":"chat", "state":"complete", "created_at_ms":0,
+            "completed_at_ms":1, "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        store.save_exchange(&exchange)?;
+        let file = fixture.path().join("keep.txt");
+        std::fs::write(&file, "unchanged")?;
+        let execution = controller.execution_admission.acquire().await?;
+        let mut request = Request { id:2, method:"task.transition".into(), params:json!({
+            "operation_id":"undo-latest", "action":"undo", "rollback":{
+                "scope":"conversation", "exchange_id":"latest", "latest_exchange_id":"stale"
+            }
+        }) };
+        assert!(admit_task_intent(&controller, &session_id, &request, &mut store).is_err());
+        request.params["rollback"]["latest_exchange_id"] = json!("latest");
+        let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
+        assert!(!operation.resume_after_transition);
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let mut transition = Box::pin(execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink));
+        assert!(futures_util::poll!(transition.as_mut()).is_pending(), "rollback bypassed execution ownership");
+        drop(execution);
+        tokio::time::timeout(Duration::from_secs(2), transition).await??;
+        assert_eq!(store.list_exchange(&session_id)?[0].disposition, crate::exchange::HistoryDisposition::RolledBack);
+        assert_eq!(std::fs::read_to_string(file)?, "unchanged");
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn checks_setup_can_be_interrupted_while_provider_startup_is_pending() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
@@ -3335,6 +3414,56 @@ mod tests {
                 break;
             }
         }
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn finalized_execution_releases_admission_before_response_delivery() -> Result<()> {
+        let semaphore = Arc::new(Semaphore::new(1));
+        let mut admission = Some(Arc::clone(&semaphore).acquire_owned().await?);
+        let mut prompt_admission = None;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for sequence in 0..forge_protocol::MAX_PENDING_FRAMES - forge_protocol::RESERVED_CONTROL_RECORDS {
+            sink.send(sequence)?;
+        }
+        let mut completion = Box::pin(publish_execution_completion(&sink,
+            Response::success(2, json!({"completed":true}))?, &mut admission, &mut prompt_admission, false));
+        assert!(futures_util::poll!(completion.as_mut()).is_pending(), "fixture must block response delivery");
+        let next = Arc::clone(&semaphore).try_acquire_owned()
+            .expect("finished execution still owns admission while its completion waits for delivery");
+        drop(output.recv().await?.context("expected queued frame")?);
+        completion.await?;
+        drop(next);
+        assert!(admission.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn next_prompt_is_admitted_when_previous_completion_arrives() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service.open_session(1, initialize(&fixture, "mock")).await?;
+        let first = service.prepare(None, HarnessMethod::PromptSubmit).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let dispatch = service.dispatch_admitted(None, Request {
+            id:2, method:"prompt.submit".into(), params:json!({"text":"First request"}),
+        }, &sink, first);
+        let next = async {
+            loop {
+                let frame = output.recv().await?.context("completion response is missing")?;
+                let message: Value = serde_json::from_slice(frame.bytes())?;
+                if message["id"] == 2 {
+                    assert!(message.get("error").is_none(), "{message}");
+                    return service.prepare(None, HarnessMethod::PromptSubmit).await;
+                }
+            }
+        };
+        let (_, admission) = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::try_join!(dispatch, next)
+        }).await??;
+        assert!(admission.is_some());
+        drop(admission);
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }

@@ -23,6 +23,10 @@ pub(crate) fn is_agent_tool(name: &str) -> bool {
         | "agent_list" | "agent_activity" | "agent_tool_output")
 }
 
+fn is_check_tool(name: &str) -> bool {
+    matches!(name, "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel")
+}
+
 /// Defines one Harness control tool independently from any provider transport.
 #[derive(Clone, Debug)]
 pub struct ControlToolDefinition {
@@ -210,6 +214,38 @@ impl ControlToolRegistry {
                 ),
             },
         ];
+        definitions.extend([
+            ControlToolDefinition {
+                name: "checks_list",
+                description: "Read project check configuration, revision, overrides, history, and concrete command previews before configuring or running checks.",
+                input_schema: strict_object_input_schema(vec![], &[]),
+            },
+            ControlToolDefinition {
+                name: "checks_configure",
+                description: "Save project checks and managed Nushell helpers during /checks setup after the user answers the setup questions. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
+                input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))
+                    .expect("check configuration schema is serializable"),
+            },
+            ControlToolDefinition {
+                name: "checks_run",
+                description: "Run enabled configured checks by ID with optional file or exact test-case selections. Never supplies replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
+                input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest))
+                    .expect("check run schema is serializable"),
+            },
+            ControlToolDefinition {
+                name: "checks_status",
+                description: "Read recorded results for a check run, optionally waiting wait_ms milliseconds for progress.",
+                input_schema: strict_object_input_schema(
+                    vec![("run_id", string_schema()), ("wait_ms", json!({"type":"integer", "minimum":0}))],
+                    &["run_id"],
+                ),
+            },
+            ControlToolDefinition {
+                name: "checks_cancel",
+                description: "Request cancellation of a configured check run by run_id.",
+                input_schema: strict_object_input_schema(vec![("run_id", string_schema())], &["run_id"]),
+            },
+        ]);
         definitions.extend(lsp::definitions());
         definitions
     }
@@ -235,6 +271,9 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
+                if is_check_tool(definition.name) {
+                    return root && context.is_some_and(|context| context.checks.is_some());
+                }
                 if lsp::is_tool(definition.name) {
                     return context
                         .and_then(|context| context.lsp.as_ref())
@@ -670,6 +709,31 @@ mod test {
         );
     }
     use super::*;
+    #[test]
+    fn checks_catalog_matches_runtime_requests_and_root_ownership() {
+        let requests = [
+            ("checks_list", json!({})),
+            ("checks_configure", json!({"expected_revision":"revision","config":{"version":2,"definitions":[]}})),
+            ("checks_run", json!({"ids":["unit"],"selections":{"unit":{"kind":"cases","cases":[{"file":"src/lib.rs","name":"tests::example","target":"lib"}]}}})),
+            ("checks_status", json!({"run_id":"run","wait_ms":100})),
+            ("checks_cancel", json!({"run_id":"run"})),
+        ];
+        let catalog = ControlToolRegistry.mcp_tool_list();
+        for (name, arguments) in requests {
+            assert_eq!(catalog.iter().filter(|tool| tool["name"] == name).count(), 1);
+            apply_invocation(&ControlToolInvocation { name: name.into(), arguments: arguments.clone() }, &mut BackendOutput::default()).unwrap();
+            let mut invalid = arguments;
+            invalid["workspace"] = json!("untrusted");
+            assert!(validate_arguments(&ControlToolInvocation { name: name.into(), arguments: invalid }).is_err());
+        }
+        let root = crate::backend::ExecutionOwner::root("session");
+        let child = crate::backend::ExecutionOwner { session_id: "session".into(), agent_id: "child".into() };
+        assert_eq!(ControlToolRegistry.definition_list_for_owner(&root, false, false).iter().filter(|tool| is_check_tool(tool.name)).count(), 5);
+        assert!(!ControlToolRegistry.definition_list_for_owner(&child, true, true).iter().any(|tool| is_check_tool(tool.name)));
+        let context = ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
+        assert!(!ControlToolRegistry.definition_list_for_context(Some(&context), true).iter().any(|tool| is_check_tool(tool.name)));
+    }
+
     #[test]
     fn design_patch_contract_replaces_legacy_authoring_tools() {
         let definition = ControlToolRegistry.definition_list();

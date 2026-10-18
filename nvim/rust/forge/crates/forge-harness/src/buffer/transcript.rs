@@ -48,13 +48,20 @@ impl<'profile> TranscriptRenderer<'profile> {
                 }
             }
             rows
-        } else { preview_rows(self.profile,&output.preview(false)?)?.0 };
+        } else {
+            let mut rows = preview_rows(self.profile,&output.preview(false)?)?.0;
+            if output.live_preview {
+                if output.preview(false)?.total_rows == 0 { rows.clear(); }
+                rows.resize(4, String::new());
+            }
+            rows
+        };
         self.output_block(BlockId(id),rows)
     }
 
     /// Changes hidden output counts without replacing the heading or its preview.
     pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
-        let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
+        let hidden = if expanded || output.live_preview { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
         let rows = if hidden == 0 { Vec::new() }
             else { tool_body_rows(self.profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)? };
         self.output_block(BlockId(format!("{call_id}:hidden")),rows)
@@ -690,6 +697,25 @@ mod test {
             .refresh_tool_heading(&heading, "tool_call", Some(300), false, "inspect({})", true)?;
         assert_eq!(expanded.text.row(0), heading.text.row(0));
         assert_eq!(expanded.text.row_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn live_tool_preview_reserves_four_rows_without_an_overflow_row() -> Result<()> {
+        for columns in [12, 80] {
+            let width = WidthProfile { columns, ..Default::default() };
+            let renderer = TranscriptRenderer::new(&width)?;
+            let mut output = ToolOutputView::new("live".into(), "")?;
+            output.live_preview = true;
+            for delta in ["", "one", "\ntwo\nthree\nfour\nfive", "\n界".repeat(200).as_str()] {
+                output.append(delta)?;
+                let body = renderer.tool_body("live", &output, false, 0)?;
+                assert_eq!(body.text.row_count(), 4);
+                assert!(body.text.wire_rows().iter().all(|row| width.cells(row, 0).unwrap() <= columns));
+                assert_eq!(renderer.tool_hidden("live", &output, false)?.text.row_count(), 0);
+            }
+            assert!(output.preview(true)?.row.iter().any(|row| *row == "one"));
+        }
         Ok(())
     }
 

@@ -280,6 +280,8 @@ impl TimelineProjector {
             });
         }
         for run in checks { result.push(TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run }); }
+        result.retain(|entry| !matches!(entry, TimelineEntry::Exchange { exchange, .. }
+            if exchange.disposition != crate::exchange::HistoryDisposition::Current));
         result.sort_by_key(TimelineEntry::created_at_ms);
         Ok(result)
     }
@@ -377,7 +379,8 @@ fn build_agent_entry(
         .get(run_id)
         .into_iter()
         .flatten()
-        .filter(|exchange| exchange_id.is_none_or(|id| exchange.id == id))
+        .filter(|exchange| exchange.disposition == crate::exchange::HistoryDisposition::Current
+            && exchange_id.is_none_or(|id| exchange.id == id))
         .cloned()
         .collect();
     let mut agent = Vec::new();

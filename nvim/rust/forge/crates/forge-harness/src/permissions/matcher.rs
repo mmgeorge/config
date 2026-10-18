@@ -3,7 +3,7 @@ use super::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision, PermissionDocument,
 };
-use super::shell::CommandShell;
+use super::shell::{CommandAnalysisFailure, CommandShell};
 use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
@@ -67,21 +67,29 @@ pub struct PermissionEvaluation {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Rejects command execution when Harness cannot determine every shell invocation.
-pub struct CommandParseError {
+pub struct CommandAnalysisError {
+    /// Shell selected at the provider or nested-launcher boundary.
     pub(crate) shell: CommandShell,
+    /// Cause that prevents authorization of any partial result.
+    pub(crate) failure: CommandAnalysisFailure,
 }
 
-impl std::fmt::Display for CommandParseError {
+impl std::fmt::Display for CommandAnalysisError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            formatter,
-            "shell_command_parse_error: Harness could not safely parse the {:?} command. Simplify it or split independent operations into separate tool calls, keeping pipelines intact. No command was executed.",
-            self.shell
-        )
+        match &self.failure {
+            CommandAnalysisFailure::MalformedTransport => write!(formatter,
+                "shell_command_parse_error: Harness could not decode the {:?} command transport. No command was executed.", self.shell),
+            CommandAnalysisFailure::Syntax => write!(formatter,
+                "shell_command_parse_error: Harness could not parse the {:?} command syntax. Simplify it or split independent operations into separate tool calls, keeping pipelines intact. No command was executed.", self.shell),
+            CommandAnalysisFailure::Unsupported(construct) => write!(formatter,
+                "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.", self.shell),
+            CommandAnalysisFailure::Incomplete(reason) => write!(formatter,
+                "shell_command_analysis_failed: Harness could not finish {:?} command analysis: {reason}. No command was executed.", self.shell),
+        }
     }
 }
 
-impl std::error::Error for CommandParseError {}
+impl std::error::Error for CommandAnalysisError {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 /// Binds one unapproved executable occurrence to its complete original source.
@@ -253,14 +261,15 @@ impl CompiledPermissionDocument {
         command: &str,
         shell: Option<CommandShell>,
         mode: PermissionMode,
-    ) -> Result<Vec<TargetEvaluation>, CommandParseError> {
+    ) -> Result<Vec<TargetEvaluation>, CommandAnalysisError> {
         let CommandNormalization {
             invocation_list,
-            ambiguous,
+            failure,
         } = super::command::normalize_command_in(command, shell.unwrap_or_default());
-        if ambiguous {
-            return Err(CommandParseError {
+        if let Some(failure) = failure {
+            return Err(CommandAnalysisError {
                 shell: shell.unwrap_or_default(),
+                failure,
             });
         }
         Ok(invocation_list
@@ -313,7 +322,7 @@ impl CompiledPermissionDocument {
         &self,
         mode: PermissionMode,
         request: &PermissionRequest,
-    ) -> Result<PermissionEvaluation, CommandParseError> {
+    ) -> Result<PermissionEvaluation, CommandAnalysisError> {
         let mut result_list = Vec::new();
         for target in &request.target_list {
             if let PermissionTarget::Command { command, shell } = target {

@@ -435,7 +435,7 @@ impl TimelineRenderer<'_> {
             }
             TimelineEntry::Status { id, status, agent_count, status_thoughts, .. } => {
                 let text = match status {
-                    SessionPhase::Idle => String::new(),
+                    SessionPhase::Idle => "Idle".into(),
                     SessionPhase::Paused => "Paused".into(),
                     SessionPhase::Compacting { .. } => {
                         let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
@@ -490,8 +490,7 @@ impl TimelineRenderer<'_> {
                     &text,
                     0,
                 )?;
-                if status.visible() {
-                    block.metadata.status = Some(StatusPresentation {
+                block.metadata.status = Some(StatusPresentation {
                         row: 1,
                         animated: status.animated(),
                         hint: match status {
@@ -502,8 +501,7 @@ impl TimelineRenderer<'_> {
                             SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
                             _ => None,
                         },
-                    });
-                }
+                });
                 if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
                     block.metadata.decoration.push(Decoration {
                         range: TextRange {
@@ -557,6 +555,9 @@ impl TimelineRenderer<'_> {
                 if *status_thoughts && let SessionPhase::Working { reasoning_summary: Some(summary), .. } = status {
                     append_reasoning_preview(&mut block, &self.content_width(), summary)?;
                 }
+                let mut rows = block.text.wire_rows();
+                rows.resize(rows.len().max(4), "");
+                block.text = forge_buffer::text::BufferText::from_rows(rows)?;
                 self.push(block)?;
                 if let SessionPhase::Working { execution: Some(execution), activity, .. } = status
                     && WorkflowActivity::from(execution.phase) == *activity && execution.has_comparison() {
@@ -1211,6 +1212,7 @@ impl TimelineRenderer<'_> {
                             let start = self.block.len();
                             self.margin += 2;
                             let count = calls.len();
+                            let live_exchange = interaction.completed_at_ms.is_none();
                             let (_, last_turn, last_tool) = calls.last().expect("nonempty tool group");
                             let last_tool_id = &last_tool.id;
                             let followed_in_turn = last_turn.items().iter().rposition(|item| matches!(item,
@@ -1226,12 +1228,12 @@ impl TimelineRenderer<'_> {
                             self.literal(&group_id, &label, None)?;
                             for (index, (_, turn, tool)) in calls.into_iter().enumerate() {
                                 let tool_start = self.block.len();
-                                self.tool(turn.id(), tool, &group_id, !settled && index + 1 == count)?;
+                                self.tool(turn.id(), tool, &group_id, live_exchange && index + 1 == count)?;
                                 let node = format!("{}:{}:tool", turn.id(), tool.id);
-                                self.fold(tool_start, &node, settled || index + 1 < count, NodeKind::Tool);
+                                self.fold(tool_start, &node, !live_exchange || index + 1 < count, NodeKind::Tool);
                                 if let Some(node) = &mut self.block[tool_start].metadata.node {
                                     node.lifecycle = if tool.state() == crate::turn::ToolState::Running { NodeLifecycle::Live } else { NodeLifecycle::Settled };
-                                    if !settled && index + 1 == count { node.default_display = NodeDisplay::Preview; }
+                                    if live_exchange && index + 1 == count { node.default_display = NodeDisplay::Preview; }
                                     if self.expansion.get(&node.id.0) == Some(&true) {
                                         let output = &self.tool[&format!("{}:{}", turn.id(), tool.id)];
                                         let limit = self.tool_limit.get(&node.id.0).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
@@ -1241,9 +1243,9 @@ impl TimelineRenderer<'_> {
                                 }
                             }
                             self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
-                            if !settled {
+                            if live_exchange {
                                 let node = self.block[start].metadata.node.as_mut().expect("tool group node");
-                                node.lifecycle = NodeLifecycle::Live;
+                                node.lifecycle = if settled { NodeLifecycle::Settled } else { NodeLifecycle::Live };
                                 node.default_display = NodeDisplay::Preview;
                                 node.resolve(self.expansion.get(&group_id).copied());
                             }
@@ -1690,6 +1692,7 @@ impl TimelineRenderer<'_> {
         let mut output = ToolOutputView::new(call_id.clone(), &tool.output)?;
         output.heading(tool);
         output.group = group.to_owned();
+        output.live_preview = preview;
         let id = format!("{call_id}:tool");
         let target = TargetId(id.clone());
         let label = tool.title.clone();
@@ -2000,7 +2003,7 @@ fn append_reasoning_preview(block: &mut BufferBlock, width: &WidthProfile, summa
     )?;
     let start = block.text.row_count();
     let mut rows = block.text.wire_rows();
-    rows.extend(rendered.block.text.wire_rows());
+    rows.extend(rendered.block.text.wire_rows().into_iter().take(2));
     block.text = forge_buffer::text::BufferText::from_rows(rows)?;
     block.metadata.decoration.push(Decoration {
         range: TextRange {
@@ -3987,7 +3990,7 @@ mod tests {
             },
         }, &WidthProfile::default(), 133_000).unwrap();
         let initial = render(execution.clone());
-        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention", "Checking files"]);
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention", "Checking files", ""]);
         assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
         assert!(initial.entry.block[1].metadata.fold[0].closed);
         let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
@@ -4003,7 +4006,7 @@ mod tests {
         execution.progress.unverified.clear();
         execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
-        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched", "Checking files"]);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched", "Checking files", ""]);
         assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
     }
 
@@ -4011,6 +4014,7 @@ mod tests {
     fn status_text_and_animation_are_committed_together() {
         use forge_buffer::block::StatusHint;
         let cases = [
+            (SessionPhase::Idle, "Idle", false, None),
             (SessionPhase::Paused, "Paused", false, None),
             (SessionPhase::AwaitingApproval { exchange_id: "exchange".into() }, "Waiting for your approval", false, Some(StatusHint::Permission)),
             (SessionPhase::Compacting { started_at_ms: 1_000 }, "Compacting · 2s", true, None),
@@ -4025,7 +4029,7 @@ mod tests {
         for (phase, expected, animated, hint) in cases {
             let projection = project_at(&TimelineEntry::Status { status_thoughts: true, agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
             let block = &projection.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", expected]);
+            assert_eq!(block.text.wire_rows(), vec!["", expected, "", ""]);
             assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
             block.validate().unwrap();
             let encoded = serde_json::to_vec(block).unwrap();
@@ -4054,7 +4058,7 @@ mod tests {
 
         assert_eq!(
             projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working · 3s"]
+            vec!["", "Working · 3s", "", ""]
         );
         let status = &projection.entry.block[0].metadata;
         assert!(status.gutter.is_empty(), "status text must not be split into the sign column");
@@ -4090,7 +4094,7 @@ mod tests {
             let rows = block.text.wire_rows();
             assert_eq!(rows[0], "");
             assert_eq!(rows[1], format!("{} · 3s", activity.active_label()));
-            assert_eq!(rows[2..].join(" "), "Considering virtual program implementation I'm thinking about changes");
+            assert_eq!(rows[2..].join(" ").trim(), "Considering virtual program implementation I'm thinking about changes");
             assert!(rows[2..].iter().all(|row| !row.starts_with(' ')));
             assert!(block.metadata.status.as_ref().unwrap().animated);
             assert_eq!(block.metadata.status.as_ref().unwrap().row, 1);
@@ -4098,7 +4102,7 @@ mod tests {
                 decoration.capture == "ForgeHarnessCommentary"
                     && decoration.range.start.row == 2
                     && decoration.range.start.column == 0
-                    && decoration.range.end.row == rows.len()));
+                    && decoration.range.end.row <= rows.len()));
         }
     }
 
@@ -4117,12 +4121,12 @@ mod tests {
             let rows = projection.entry.block[0].text.wire_rows();
             assert_eq!(rows[1], "Planning · 37s");
             if summary.trim().is_empty() {
-                assert_eq!(rows.len(), 2);
+                assert_eq!(rows, vec!["", "Planning · 37s", "", ""]);
             } else {
-                assert!(rows.len() > 3);
+                assert_eq!(rows.len(), 4);
                 assert!(rows[2..].iter().all(|row| width.cells(row, 0).unwrap() <= 32));
-                assert_eq!(rows[2..].iter().map(|row| row.trim()).collect::<Vec<_>>().join(" "),
-                    "Considering new ECS components with Unicode 界 and enough detail to wrap");
+                assert!("Considering new ECS components with Unicode 界 and enough detail to wrap"
+                    .starts_with(&rows[2..].iter().map(|row| row.trim()).collect::<Vec<_>>().join(" ")));
             }
         }
     }
@@ -4170,7 +4174,7 @@ mod tests {
             )
             .unwrap();
             let block = &projected.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer"]);
+            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer", "", ""]);
             assert_eq!(block.metadata.target[0].id.0, "session:status:question");
             assert_eq!(block.metadata.target[0].range.start.row, 1);
             assert!(block.metadata.fold.is_empty());
@@ -4196,7 +4200,7 @@ mod tests {
         let block = &projected.entry.block[0];
         assert_eq!(
             block.text.wire_rows(),
-            vec!["", "Waiting for plan review · revision 1"]
+            vec!["", "Waiting for plan review · revision 1", "", ""]
         );
         let target = &block.metadata.target[0];
         assert_eq!(target.range.start.row, 1);

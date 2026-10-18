@@ -5,6 +5,9 @@ use std::ops::{ControlFlow, Range};
 use std::time::{Duration, Instant};
 use tree_sitter::{Language, Node, Parser, Tree};
 
+#[path = "powershell_filter.rs"]
+mod powershell_filter;
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandShell {
@@ -49,6 +52,19 @@ impl CommandShell {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Retains the reason command analysis cannot authorize execution.
+pub enum CommandAnalysisFailure {
+    /// Provider arguments could not be decoded without changing their meaning.
+    MalformedTransport,
+    /// Shell source contains missing or invalid syntax.
+    Syntax,
+    /// Valid syntax whose execution cannot be resolved by the analyzer.
+    Unsupported(String),
+    /// Analysis could not finish or preserve executable source coordinates.
+    Incomplete(String),
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Carries a syntax capture in zero-based, end-exclusive source byte coordinates.
 pub struct CommandHighlight {
@@ -60,11 +76,16 @@ pub struct CommandHighlight {
     pub priority: usize,
 }
 
-fn parse_tree(command: &str, shell: CommandShell) -> Option<Tree> {
-    let language = shell.grammar()?;
+fn parse_tree(command: &str, shell: CommandShell) -> Result<Tree, CommandAnalysisFailure> {
+    let language = shell.grammar().ok_or_else(|| {
+        CommandAnalysisFailure::Unsupported("unknown shell".into())
+    })?;
+    if command.trim().is_empty() {
+        return Err(CommandAnalysisFailure::Syntax);
+    }
     // The pinned Zsh grammar treats escaped newlines as command boundaries.
-    if command.trim().is_empty() || (shell == CommandShell::Zsh && command.contains("\\\n")) {
-        return None;
+    if shell == CommandShell::Zsh && command.contains("\\\n") {
+        return Err(CommandAnalysisFailure::Unsupported("Zsh escaped newline".into()));
     }
     let mut parser = Parser::new();
     let parse_source = parse_source(command, shell);
@@ -76,18 +97,21 @@ fn parse_tree(command: &str, shell: CommandShell) -> Option<Tree> {
             ControlFlow::Continue(())
         }
     };
-    parser.set_language(&language).ok().and_then(|()| {
-        parser.parse_with_options(
+    parser.set_language(&language).map_err(|error| {
+        CommandAnalysisFailure::Incomplete(format!("shell grammar unavailable: {error}"))
+    })?;
+    parser
+        .parse_with_options(
             &mut |offset, _| &parse_source.as_bytes()[offset..],
             None,
             Some(tree_sitter::ParseOptions::new().progress_callback(&mut progress)),
         )
-    })
+        .ok_or_else(|| CommandAnalysisFailure::Incomplete("shell parser interrupted".into()))
 }
 
 /// Colors shell syntax independently of whether permission analysis can resolve execution.
 pub fn highlights(command: &str, shell: CommandShell) -> Vec<CommandHighlight> {
-    let Some(tree) = parse_tree(command, shell) else {
+    let Ok(tree) = parse_tree(command, shell) else {
         return Vec::new();
     };
     let mut result = Vec::new();
@@ -163,22 +187,35 @@ pub fn highlights(command: &str, shell: CommandShell) -> Vec<CommandHighlight> {
 
 pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization {
     let mut result = CommandNormalization::default();
-    let Some(tree) = parse_tree(command, shell) else {
-        result.ambiguous = true;
-        return result;
+    let tree = match parse_tree(command, shell) {
+        Ok(tree) => tree,
+        Err(failure) => {
+            result.failure = Some(failure);
+            return result;
+        }
     };
+    if tree.root_node().has_error() {
+        result.failure = Some(CommandAnalysisFailure::Syntax);
+        return result;
+    }
     let mut pending = vec![(tree.root_node(), 0)];
     let mut visited = 0;
     let mut validated_structure = false;
     while let Some((node, depth)) = pending.pop() {
         visited += 1;
-        if depth > 64
-            || visited > 8192
-            || node.is_error()
-            || node.is_missing()
-            || unsupported(node, command, shell)
-        {
-            result.ambiguous = true;
+        if depth > 64 || visited > 8192 {
+            result.failure = Some(CommandAnalysisFailure::Incomplete(
+                "shell traversal budget exhausted".into(),
+            ));
+            break;
+        }
+        if unsupported(node, command, shell) {
+            result.failure = Some(CommandAnalysisFailure::Unsupported(
+                match node.kind() {
+                    "invokation_expression" | "invokation_foreach_expression" => "method invocation".into(),
+                    kind => kind.replace('_', " "),
+                },
+            ));
             break;
         }
         if node.kind() == "command" {
@@ -187,42 +224,46 @@ pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization 
                 Ok(None) => {
                     validated_structure = true;
                 }
-                Err(()) => {
-                    result.ambiguous = true;
+                Err(failure) => {
+                    result.failure = Some(failure);
                     break;
                 }
             }
         }
-        validated_structure |= match shell {
-            CommandShell::PowerShell => matches!(
-                node.kind(),
-                "if_statement"
-                    | "foreach_statement"
-                    | "for_statement"
-                    | "while_statement"
-                    | "do_statement"
-                    | "switch_statement"
-                    | "try_statement"
-            ),
-            CommandShell::Bash | CommandShell::Zsh => matches!(
-                node.kind(),
-                "test_command"
-                    | "if_statement"
-                    | "for_statement"
-                    | "while_statement"
-                    | "case_statement"
-            ),
-            CommandShell::Nushell => {
-                node.kind().starts_with("ctrl_") || node.kind() == "where_command"
-            }
-            CommandShell::Unknown => false,
-        };
+        validated_structure |= (shell == CommandShell::PowerShell
+            && powershell_math_min(node, command))
+            || match shell {
+                CommandShell::PowerShell => matches!(
+                    node.kind(),
+                    "if_statement"
+                        | "foreach_statement"
+                        | "for_statement"
+                        | "while_statement"
+                        | "do_statement"
+                        | "switch_statement"
+                        | "try_statement"
+                ),
+                CommandShell::Bash | CommandShell::Zsh => matches!(
+                    node.kind(),
+                    "test_command"
+                        | "if_statement"
+                        | "for_statement"
+                        | "while_statement"
+                        | "case_statement"
+                ),
+                CommandShell::Nushell => {
+                    node.kind().starts_with("ctrl_") || node.kind() == "where_command"
+                }
+                CommandShell::Unknown => false,
+            };
         let mut cursor = node.walk();
         let children = node.children(&mut cursor).collect::<Vec<_>>();
         pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
     }
-    if result.invocation_list.is_empty() && !validated_structure {
-        result.ambiguous = true;
+    if result.failure.is_none() && result.invocation_list.is_empty() && !validated_structure {
+        result.failure = Some(CommandAnalysisFailure::Unsupported(
+            "expression without a resolvable command".into(),
+        ));
     }
     result
 }
@@ -282,6 +323,42 @@ fn argument_nodes(node: Node<'_>) -> Vec<Node<'_>> {
     result
 }
 
+fn powershell_math_min(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != "invokation_expression" {
+        return false;
+    }
+    let mut cursor = node.walk();
+    let child_list = node.named_children(&mut cursor)
+        .filter(|child| child.kind() != "comment")
+        .collect::<Vec<_>>();
+    let [receiver, member, arguments] = child_list.as_slice() else {
+        return false;
+    };
+    if receiver.kind() != "type_literal"
+        || !["[Math]", "[System.Math]"].iter().any(|name| text(*receiver, source).eq_ignore_ascii_case(name))
+        || member.kind() != "member_name"
+        || !text(*member, source).eq_ignore_ascii_case("Min")
+        || arguments.kind() != "argument_list"
+        || source[receiver.end_byte()..member.start_byte()].trim() != "::"
+    {
+        return false;
+    }
+    let Some(expressions) = arguments.child_by_field_name("argument_expression_list") else {
+        return false;
+    };
+    let mut cursor = expressions.walk();
+    let argument_count = expressions.named_children(&mut cursor)
+        .filter(|child| child.kind() == "argument_expression")
+        .count();
+    argument_count == 2
+}
+
+fn powershell_math_receiver(node: Node<'_>, source: &str) -> bool {
+    node.parent().is_some_and(|parent| {
+        parent.named_child(0) == Some(node) && powershell_math_min(parent, source)
+    })
+}
+
 fn unsupported(node: Node<'_>, source: &str, shell: CommandShell) -> bool {
     match shell {
         CommandShell::PowerShell => match node.kind() {
@@ -292,13 +369,14 @@ fn unsupported(node: Node<'_>, source: &str, shell: CommandShell) -> bool {
             | "inlinescript_statement"
             | "parallel_statement"
             | "sequence_statement"
-            | "invokation_expression"
             | "invokation_foreach_expression"
             | "cast_expression"
-            | "type_literal"
             | "redirection"
             | "stop_parsing"
             | "switch_filename" => true,
+            "invokation_expression" => !powershell_math_min(node, source),
+            "type_literal" => !powershell_math_receiver(node, source)
+                && !powershell_filter::is_type_operand(node, source),
             "variable" | "braced_variable" => {
                 text(node, source).to_ascii_lowercase().contains("$env:")
             }
@@ -342,7 +420,7 @@ fn invocation(
     node: Node<'_>,
     source: &str,
     shell: CommandShell,
-) -> Result<Option<CommandInvocation>, ()> {
+) -> Result<Option<CommandInvocation>, CommandAnalysisFailure> {
     let field = match shell {
         CommandShell::PowerShell => "command_name",
         CommandShell::Nushell => "head",
@@ -352,7 +430,7 @@ fn invocation(
     let name = node
         .children_by_field_name(field, &mut cursor)
         .find(|child| child.is_named())
-        .ok_or(())?;
+        .ok_or_else(|| CommandAnalysisFailure::Unsupported("unresolved command name".into()))?;
     if contains(name, "variable")
         || contains(name, "val_variable")
         || contains(name, "variable_ref")
@@ -364,7 +442,7 @@ fn invocation(
         || contains(name, "val_interpolated")
         || contains(name, "expr_parenthesized")
     {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported("dynamic command name".into()));
     }
     let name_text = text(name, source).trim();
     if shell == CommandShell::PowerShell
@@ -375,15 +453,17 @@ fn invocation(
     {
         return Ok(None);
     }
-    let name_token = shell_token_list(name_text, shell).map_err(|_| ())?;
+    let name_token = shell_token_list(name_text, shell).map_err(|_| {
+        CommandAnalysisFailure::Unsupported("command name encoding".into())
+    })?;
     let executable = name_token.join(" ").trim_start_matches('^').to_owned();
     if executable.is_empty() || executable.starts_with('$') {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported("dynamic command name".into()));
     }
     let folded = executable.to_ascii_lowercase();
     if shell == CommandShell::Nushell && matches!(folded.as_str(), "overlay" | "hide" | "hide-env")
     {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported(format!("command {executable}")));
     }
     if matches!(
         folded.as_str(),
@@ -398,7 +478,7 @@ fn invocation(
             | "command"
             | "exec"
     ) {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported(format!("command {executable}")));
     }
     let block_kind = match shell {
         CommandShell::PowerShell => "script_block_expression",
@@ -407,10 +487,10 @@ fn invocation(
     };
     let argument_list = argument_nodes(node);
     let has_block = argument_list.iter().any(|child| child.kind() == block_kind);
+    let filter = shell == CommandShell::PowerShell && powershell_filter::is_command(&folded);
     let structural = match shell {
-        CommandShell::PowerShell => matches!(
-            folded.as_str(),
-            "foreach-object" | "foreach" | "%" | "where-object" | "where" | "?"
+        CommandShell::PowerShell => filter || matches!(
+            folded.as_str(), "foreach-object" | "foreach" | "%"
         ),
         CommandShell::Nushell => matches!(
             folded.as_str(),
@@ -418,9 +498,11 @@ fn invocation(
         ),
         _ => false,
     };
-    if structural {
+    if filter {
+        powershell_filter::analyze(node, source)?;
+    } else if structural {
         if !has_block {
-            return Err(());
+            return Err(CommandAnalysisFailure::Unsupported(format!("{executable} parameter set")));
         }
         if argument_list.iter().any(|child| {
             matches!(
@@ -436,7 +518,7 @@ fn invocation(
                     | "expr_parenthesized"
             )
         }) {
-            return Err(());
+            return Err(CommandAnalysisFailure::Unsupported(format!("{executable} script-block arguments")));
         }
         if shell == CommandShell::PowerShell {
             for child in &argument_list {
@@ -446,25 +528,27 @@ fn invocation(
                         "-begin" | "-process" | "-end" | "-filterscript"
                     )
                 {
-                    return Err(());
+                    return Err(CommandAnalysisFailure::Unsupported(format!("{executable} parameter {}", text(*child, source))));
                 }
             }
         }
         if shell == CommandShell::Nushell && folded == "do" && text(node, source).contains("--env")
         {
-            return Err(());
+            return Err(CommandAnalysisFailure::Unsupported("Nushell do --env".into()));
         }
     }
     if has_block && !structural {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported(format!("script block passed to {executable}")));
     }
     let raw = text(node, source);
     let command = trim_invocation(raw, shell).to_owned();
     let source_start = node.start_byte() + raw.len() - raw.trim_start().len();
     let source_range = source_start..source_start + command.len();
-    let mut token_list = shell_token_list(&command, shell).map_err(|_| ())?;
+    let mut token_list = shell_token_list(&command, shell).map_err(|_| {
+        CommandAnalysisFailure::Unsupported("command argument encoding".into())
+    })?;
     if token_list.is_empty() {
-        return Err(());
+        return Err(CommandAnalysisFailure::Unsupported("empty executable".into()));
     }
     let command_name = executable
         .rsplit(['/', '\\'])

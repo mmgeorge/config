@@ -549,7 +549,7 @@ impl HostRouter {
                 StatusSubscription::Closed => anyhow::bail!("Forge status subscription is closed"),
             }
         }
-        let _harness_admission = envelope.harness_admission;
+        let harness_admission = envelope.harness_admission;
         let request = envelope.request;
         match method {
             RoutedMethod::StatusNavigate => {
@@ -1246,7 +1246,7 @@ impl HostRouter {
             RoutedMethod::Harness(_) => {
                 self.host
                     .harness
-                    .dispatch(envelope.session_id, request, sink)
+                    .dispatch_admitted(envelope.session_id, request, sink, harness_admission)
                     .await?;
             }
         }

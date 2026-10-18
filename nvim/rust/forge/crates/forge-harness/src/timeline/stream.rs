@@ -224,17 +224,15 @@ impl TimelineStream {
         let agent_count = self.entry_list.iter().find_map(|entry|match entry {
             TimelineEntry::Status {agent_count,..} => Some(*agent_count),_=>None,
         }).unwrap_or(0);
-        let next_status = status.visible().then(|| TimelineEntry::Status { agent_count, status_thoughts,
+        let next_status = TimelineEntry::Status { agent_count, status_thoughts,
             id: status_id.clone(),
             created_at_ms: 0,
             status,
-        });
+        };
         let next_interaction = next_interaction
             .map(|entry| serde_json::to_value(&entry).map(|value| (entry, value)))
             .transpose()?;
-        let next_status = next_status
-            .map(|entry| serde_json::to_value(&entry).map(|value| (entry, value)))
-            .transpose()?;
+        let status_value = serde_json::to_value(&next_status)?;
         let base_revision = self.revision;
         let mut operation = Vec::new();
         if let Some(id) = removed {
@@ -258,17 +256,7 @@ impl TimelineStream {
                 .unwrap_or(self.entry_list.len());
             self.upsert(entry, value, insertion, &mut operation);
         }
-        if let Some((entry, value)) = next_status {
-            self.upsert(entry, value, self.entry_list.len(), &mut operation);
-        } else if let Some(index) = self.entry_index.get(&status_id).copied() {
-            self.entry_list.remove(index);
-            self.value_list.remove(index);
-            operation.push(TimelineOperation::Remove {
-                index,
-                id: status_id,
-            });
-            self.reindex();
-        }
+        self.upsert(next_status, status_value, self.entry_list.len(), &mut operation);
         if !operation.is_empty() {
             self.revision += 1;
         }
@@ -487,7 +475,7 @@ mod test {
         assert!(stream.append_tool_output(&exchange, &event)?.is_none());
         assert_eq!(stream.revision(), 1);
         let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
-        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { .. }]));
+        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { .. }, TimelineOperation::Insert { entry: TimelineEntry::Status { status: SessionPhase::Idle, .. }, .. }]));
         let TimelineEntry::Exchange { exchange:updated, .. } = &stream.entry_list()[0] else {
             panic!("expected reconciled exchange");
         };
@@ -537,9 +525,11 @@ mod test {
         };
         stream.update_live(None, None, phase(), true)?;
         assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: true, .. }]));
-        stream.update_live(None, None, SessionPhase::Idle, true)?;
-        assert!(stream.entry_list().is_empty());
-        stream.update_live(None, None, phase(), false)?;
+        let idle = stream.update_live(None, None, SessionPhase::Idle, true)?;
+        assert!(matches!(idle.operation.as_slice(), [TimelineOperation::Replace { .. }]));
+        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status: SessionPhase::Idle, .. }]));
+        let resumed = stream.update_live(None, None, phase(), false)?;
+        assert!(matches!(resumed.operation.as_slice(), [TimelineOperation::Replace { .. }]));
         assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: false, .. }]));
         Ok(())
     }

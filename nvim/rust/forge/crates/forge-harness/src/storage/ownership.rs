@@ -54,10 +54,11 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Commit rollback history for primary exchanges and their delegated descendants together.
-    pub(crate) fn record_rollback(&mut self, session_id: &str, roots: &[String]) -> Result<()> {
+    /// Commit rollback history and the replacement provider identity together.
+    pub(crate) fn record_rollback(&mut self, session: &crate::session::HarnessSession, roots: &[String]) -> Result<()> {
         use crate::exchange::HistoryDisposition;
         use rusqlite::{TransactionBehavior, params};
+        let session_id = &session.id;
         self.require_settled_exchange_tree(session_id, roots)?;
         let records: Vec<Exchange> = self.list_payload(
             "SELECT payload FROM exchange_record WHERE session_id=?1",
@@ -91,12 +92,18 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1",
+            [session_id], |row| row.get(0))?;
+        let stored = super::decode_current_session(&payload)?.context("rollback session is unavailable")?;
+        ensure!(stored.lease_owner == session.lease_owner, "Harness session lease ownership changed");
         for exchange in updates {
             transaction.execute(
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",
                 params![exchange.id, serde_json::to_string(&exchange)?],
             )?;
         }
+        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            params![session.id,super::encode_session(session)?,session.updated_at_ms])?;
         transaction.commit()?;
         Ok(())
     }
