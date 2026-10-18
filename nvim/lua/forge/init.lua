@@ -140,6 +140,7 @@
 
 ---@class ForgeModule
 ---@field config ForgeConfig?
+---@field open_background_timeline fun(session_id?: string)
 ---@field _gitstatus_debug_log_file string?
 local M = {}
 
@@ -254,6 +255,7 @@ M.open_branch_diff = commands.open_branch_diff
 M.open_file_revision = commands.open_file_revision
 M.open_compact_preview = commands.open_compact_preview
 M.open_harness = function() require("forge.views.harness").open() end
+M.open_background_timeline = function(session_id) require("forge.views.background").open(session_id) end
 M.new_harness_session = function() require("forge.views.harness").new_session() end
 M.set_git_backend = git_backend.set_backend
 M.reset_git_backend = git_backend.reset_backend

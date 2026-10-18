@@ -8,6 +8,7 @@ return {
       "ForgeHarness", "ForgeHarnessNew", "ForgeHarnessLog", "ForgePermissions", "ForgeStartupLog",
       "ForgeGitConfigCacheReset",
       "ForgeDebugCommitPromptPreview",
+      "ForgeDebugBackgroundTimeline",
     },
     init = function()
       vim.api.nvim_create_user_command("ForgeBuild", function()
@@ -41,6 +42,9 @@ return {
     config = function(_, opts)
       local forge = require("forge")
       forge.setup(opts)
+      vim.api.nvim_create_user_command("ForgeDebugBackgroundTimeline", function(command)
+        forge.open_background_timeline(command.args ~= "" and command.args or nil)
+      end, { nargs = "?", desc = "Inspect the Background session timeline" })
       vim.api.nvim_create_user_command("ForgeDebugCommitPromptPreview", function(command)
         require("forge.views.commit_prompt_preview").open({ comparison = command.args ~= "" and command.args or "head" })
       end, {

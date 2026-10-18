@@ -163,7 +163,7 @@ impl CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<CodexConnection> {
         let process_started = Instant::now();
-        let resources = self.resources(&Self::catalog_from_request(request)).await?;
+        let resources = if request.mode == PromptMode::Background { None } else { self.resources(&Self::catalog_from_request(request)).await? };
         let runtime = resources.as_ref().map(|resources|&resources.runtime).unwrap_or(&self.runtime);
         let mut process = runtime
             .connect(
@@ -216,6 +216,23 @@ impl CodexBackend {
     async fn configured_parameters(&self, mut parameter: Value, request: &BackendRequest,
         process: &mut CodexJsonRpc, output: &mut BackendOutput) -> Result<Value> {
         parameter["config"]["model_reasoning_summary"] = json!("concise");
+        if request.mode == PromptMode::Background {
+            let native = process.request("config/read", json!({"includeLayers":false,"cwd":request.workspace}), output).await?;
+            let mut config = text_generation::tool_free_config();
+            let servers = native.pointer("/config/mcp_servers").and_then(Value::as_object).map(|servers| servers.keys()
+                .map(|name| (name.clone(),json!({"enabled":false}))).collect::<serde_json::Map<String,Value>>()).unwrap_or_default();
+            config["mcp_servers"] = Value::Object(servers);
+            config["model_reasoning_effort"] = json!(request.effort);
+            config["model_reasoning_summary"] = json!("concise");
+            config["project_doc_max_bytes"] = json!(0);
+            config["hooks"] = json!({});
+            parameter["config"] = config;
+            parameter["baseInstructions"] = json!(request.system_message());
+            parameter["developerInstructions"] = Value::Null;
+            parameter["approvalPolicy"] = json!("never");
+            parameter["sandbox"] = json!("read-only");
+            return Ok(parameter);
+        }
         if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
             let mut config = resources.configure(process,output,&request.workspace).await?;
             if let Some(existing) = parameter.get("config").and_then(Value::as_object) {
@@ -255,8 +272,8 @@ impl CodexBackend {
         let thread = response.pointer("/thread/id").or_else(||response.get("threadId"))
             .or_else(||response.get("thread_id")).and_then(Value::as_str).map(str::to_owned)
             .or(request.backend_session_id.clone()).context("Codex thread response omitted thread id")?;
-        if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
-            resources.retain_thread(&thread).await;
+        if request.mode != PromptMode::Background {
+            if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? { resources.retain_thread(&thread).await; }
         }
         Ok(thread)
     }

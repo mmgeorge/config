@@ -84,6 +84,9 @@ impl Clock for SystemClock {
 /// Represents initialization state supplied by the Neovim client.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InitializeRequest {
+    /// Creates or resumes only a tool-free Background conversation when present.
+    #[serde(default)]
+    pub background: Option<crate::background::BackgroundIdentity>,
     #[serde(default)]
     /// Resolves the dotfiles-owned global Rulesync catalog independently of workspace.
     pub config_dir: Option<String>,
@@ -528,6 +531,7 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    context_usage_fresh: bool,
     pub(crate) lsp: Arc<crate::control_tools::lsp::LspService>,
     checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
@@ -627,6 +631,7 @@ impl HarnessBroker {
                 let selected = store
                     .load_session(session_id)?
                     .context("session not found")?;
+                anyhow::ensure!(selected.background.is_some() == request.background.is_some(), "Background and interactive sessions cannot share a provider conversation");
                 anyhow::ensure!(
                     crate::workspace::same(&selected.workspace, &workspace),
                     "session uses a different workspace"
@@ -644,7 +649,7 @@ impl HarnessBroker {
                     store
                         .list_session(Some(&workspace))?
                         .into_iter()
-                        .find(|session| session.backend == request.backend.kind)
+                        .find(|session| session.background.is_none() && session.backend == request.backend.kind)
                 };
                 match latest_session {
                     Some(session) => {
@@ -653,7 +658,7 @@ impl HarnessBroker {
                     None => {
                         created_session = true;
                         let preference =
-                            store.load_preference(&workspace, &request.backend.kind)?;
+                            if request.background.is_some() { None } else { store.load_preference(&workspace, &request.backend.kind)? };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
                             primary_agent_id: HarnessSession::primary_agent_id(&session_id),
@@ -691,6 +696,7 @@ impl HarnessBroker {
                             native_fork: false,
                             native_compact: backend_descriptor.capability.native_compact,
                             context_usage: None,
+            background: request.background.clone(), auto_compaction: Default::default(), last_compaction_turn: None,
                         };
                         session.context_window = preference.as_ref().and_then(|preference| {
                             preference
@@ -713,7 +719,7 @@ impl HarnessBroker {
         session.updated_at_ms = now_ms;
         let shared = crate::settings::SettingsStore::open(&data_root)?.get(&session.workspace,&session.id,&session.backend)?;
         shared.desired.apply(&mut session,backend_descriptor.capability.native_compact)?;
-        if created_session {
+        if created_session && request.background.is_none() {
             shared.apply_provider_defaults(&mut session)?;
         }
         permission_coordinator.configure_input_timeouts(&session.id, session.approval_timeout, session.answer_timeout)?;
@@ -727,7 +733,7 @@ impl HarnessBroker {
             store.save_agent_run(&Agent::primary(&session.id, now_ms))?;
         }
         let previous_preference = store.load_preference(&session.workspace, &session.backend)?;
-        if previous_preference.is_none() {
+        if previous_preference.is_none() && request.background.is_none() {
             store.save_preference(
                 &session.workspace,
                 &session.backend,
@@ -779,11 +785,12 @@ impl HarnessBroker {
             check_runner: Arc::clone(&check_runner), presentation: Arc::clone(&presentation), trace: Arc::clone(&trace),
         });
         let broker = Self {
+            context_usage_fresh: false,
             lsp: runtime.lsp.clone(),
             active_operation_id: None,
             observer,
             repositories: Arc::clone(&runtime.repositories),
-            checkpoint: match &workspace_kind { WorkspaceKind::Git(workspace) => Some(GitCheckpoint::new(workspace)), _ => None },
+            checkpoint: match &workspace_kind { WorkspaceKind::Git(workspace) if request.background.is_none() => Some(GitCheckpoint::new(workspace)), _ => None },
             diff: Arc::clone(&runtime.diff),
             store,
             plan_file,
@@ -861,6 +868,7 @@ impl HarnessBroker {
         &self,
         mode: PromptMode,
     ) -> Option<crate::control_tools::ControlTurnContext> {
+        if mode == PromptMode::Background { return Some(crate::control_tools::ControlTurnContext::inactive(mode)); }
         let plan = self.current_plan_id().ok().flatten()
             .as_deref()
             .and_then(|plan_id| self.store.load_plan(plan_id).ok().flatten());
@@ -912,6 +920,84 @@ impl HarnessBroker {
     /// Build the initial snapshot returned by the initialize response.
     pub fn snapshot(&self) -> Result<BrokerSnapshot> {
         self.observer.publish(self)
+    }
+
+    /// Generate one tool-free Background exchange using its durable provider conversation.
+    pub(crate) async fn generate_background(
+        &mut self,
+        input: String,
+        identity: crate::background::BackgroundIdentity,
+        model: String,
+        effort: String,
+        policy: crate::session::AutoCompaction,
+        sink: BackendEventSink,
+    ) -> Result<String> {
+        anyhow::ensure!(self.session.background.is_some(), "Background request requires a Background session");
+        if let Some(previous) = &self.session.background {
+            if !previous.reason.is_empty() && self.store.list_exchange(&self.session.id)?.is_empty() {
+                self.store.save_session_event(&crate::timeline::SessionEventRecord {
+                    id:uuid::Uuid::new_v4().to_string(),session_id:self.session.id.clone(),created_at_ms:self.clock.now_ms(),
+                    detail:crate::timeline::SessionEventKind::Configuration { operation_id:uuid::Uuid::new_v4().to_string(),
+                        state:"completed".into(),field:vec!["background_session".into()],reason:Some(previous.reason.clone()) },
+                })?;
+            }
+        }
+        self.session.background = Some(identity);
+        self.session.model = model;
+        self.session.effort = effort;
+        self.session.context_window = None;
+        self.session.service_tier = Default::default();
+        self.session.execution_mode = PermissionMode::Read;
+        self.session.auto_compaction = policy;
+        self.checkpoint = None;
+        self.event_sink = Some(sink);
+        self.save_session()?;
+        let result = self.run_interaction_input(input.clone(), PromptMode::Background,
+            Some(ExchangeAdmission::chat(input.clone())), BackendInput::from_text(input)).await;
+        self.event_sink = None;
+        result?;
+        self.save_session()?;
+        let exchange = self.store.list_exchange(&self.session.id)?.pop().context("Background exchange is missing")?;
+        let text = exchange.turn.iter().flat_map(|turn| turn.messages())
+            .filter(|message| message.kind() == crate::turn::MessageKind::Assistant && message.delivery() == crate::turn::MessageDelivery::Final)
+            .map(|message| message.text()).collect::<Vec<_>>().join("\n");
+        crate::backend::TextGeneration::CommitMessage.validate(&text)
+    }
+
+    /// Retain a Background failure even when no assistant response can be published.
+    pub(crate) fn background_failure(&mut self, stage: &str, reason: String) -> Result<()> {
+        self.store.save_session_event(&crate::timeline::SessionEventRecord {
+            id:uuid::Uuid::new_v4().to_string(),session_id:self.session.id.clone(),created_at_ms:self.clock.now_ms(),
+            detail:crate::timeline::SessionEventKind::Configuration { operation_id:uuid::Uuid::new_v4().to_string(),
+                state:"failed".into(),field:vec![stage.into()],reason:Some(reason) },
+        })?;
+        Ok(())
+    }
+
+    /// Compact once per newly completed provider turn while retaining the full timeline.
+    pub(crate) async fn auto_compact(&mut self) -> Result<()> {
+        let policy = &self.session.auto_compaction;
+        if !policy.enabled || !self.context_usage_fresh { return Ok(()); }
+        anyhow::ensure!(self.capability.native_compact, "This backend does not support automatic compaction");
+        policy.validate(self.session.context_usage.as_ref())?;
+        if self.store.list_session_event(&self.session.id)?.iter().any(|event|
+            matches!(&event.detail, SessionEventKind::Compaction { compaction }
+                if compaction.state == crate::backend::CompactionState::Running
+                    && Some(&compaction.thread_id) == self.session.backend_session_id.as_ref())) {
+            return Ok(());
+        }
+        if !policy.due(self.session.context_usage.as_ref(), self.capability.native_compact) { return Ok(()); }
+        let latest_exchange = self.store.list_exchange(&self.session.id)?.pop();
+        let latest = latest_exchange.as_ref().and_then(|exchange| exchange.turn.last()).map(|turn| turn.id().to_owned());
+        let native_compacted = latest_exchange.as_ref().is_some_and(|exchange| exchange.node_list.iter().any(|node|
+            matches!(node, crate::exchange::ExchangeNode::Compaction { compaction, .. }
+                if matches!(compaction.state, crate::backend::CompactionState::Completed | crate::backend::CompactionState::Running))));
+        if latest.is_none() || latest == self.session.last_compaction_turn { return Ok(()); }
+        self.session.last_compaction_turn = latest;
+        self.save_session()?;
+        if native_compacted { return Ok(()); }
+        self.compact_session(false).await?;
+        Ok(())
     }
 
     /// Shares the read-only session boundary with out-of-band controls.
@@ -1205,7 +1291,7 @@ impl HarnessBroker {
             HarnessMethod::SessionResume => self.resume_session(params).await,
             HarnessMethod::SessionRename => self.rename_session(params),
             HarnessMethod::SessionConfigure => self.configure_session(params).await,
-            HarnessMethod::SessionCompact => self.compact_session().await,
+            HarnessMethod::SessionCompact => self.compact_session(true).await,
             HarnessMethod::SessionDelete => self.delete_session(params),
             HarnessMethod::SessionFork => anyhow::bail!(
                 "session.fork must route through the process-wide session coordinator"
@@ -1427,7 +1513,7 @@ impl HarnessBroker {
                 if command == "configure" { self.configuration_progress("applying").await?; }
                 match command.as_str() {
                     "configure" => { self.configure_session(action.get("config").cloned().context("configuration is required")?).await?; },
-                    "compact" => { self.compact_session().await?; },
+                    "compact" => { self.compact_session(true).await?; },
                     _ => { self.select_execution_mode(json!({"mode":permission}))?; },
                 }
                 if command == "configure"
@@ -3297,8 +3383,17 @@ Planning continuation: turn {} of {}.",
         admission: Option<ExchangeAdmission>,
         input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        self.context_usage_fresh = false;
         match Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await {
-            Ok(result) => Box::pin(self.settle_automatic_checks(result, mode)).await,
+            Ok(result) => {
+                let mut result = Box::pin(self.settle_automatic_checks(result, mode)).await?;
+                if mode != PromptMode::Background {
+                    if let Err(error) = self.auto_compact().await {
+                        result.1.push(self.event("background_error", json!({"error":format!("Automatic compaction failed: {error:#}")}))?);
+                    }
+                }
+                Ok(result)
+            },
             Err(error) if self.exchange_runtime.is_some() => {
                 match self.finalize_interaction_after_processing_failure().await {
                     Ok(()) => Err(error),
@@ -3729,6 +3824,7 @@ Planning continuation: turn {} of {}.",
         self.session.native_compact = output.capability.native_compact;
         if let Some(context_usage) = output.metrics.context_usage.clone() {
             self.session.context_usage = Some(context_usage);
+            self.context_usage_fresh = true;
         }
         self.session.backend_session_id = output.backend_session_id.clone();
         self.session.provider_checkpoint_id = output.provider_checkpoint_id.clone();
@@ -4619,11 +4715,11 @@ Planning continuation: turn {} of {}.",
         parent_input: &mut crate::backend::ActiveSteering,
         deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
-        self.notify_unavailable_mcp(&BackendCatalogRequest {
+        if request.mode != PromptMode::Background { self.notify_unavailable_mcp(&BackendCatalogRequest {
             execution_owner: request.execution_owner.clone(), harness_session_id: request.harness_session_id.clone(),
             workspace: request.workspace.clone(), access: request.access.clone(), execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
-        }, event).await?;
+        }, event).await?; }
         let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(crate::backend::ExecutionOwner::root(&self.session.id),
             interaction.id.clone(),self.agent_coordinator.clone())?;
         if let Some(context) = &mut request.control_context {context.agent = Some(agent_scope);}
@@ -5071,7 +5167,7 @@ Planning continuation: turn {} of {}.",
                 return Ok(None);
             }
             self.collect_active_initial_checkpoint(interaction).await?;
-            let WorkspaceKind::Git(_) = &self.workspace_kind else {
+            if self.checkpoint.is_none() {
                 let mut changes = crate::exchange::ProviderDiffBuilder::default();
                 self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
                 interaction.attributed_diff_text = changes.finish();
@@ -5561,6 +5657,7 @@ Planning continuation: turn {} of {}.",
             if backend_event.address.as_ref().is_none_or(|address|
                 self.session.backend_session_id.as_deref() == Some(address.thread_id.as_str())) {
                 self.session.context_usage = Some(context_usage);
+            self.context_usage_fresh = true;
             }
             self.emit_backend_event(backend_event, event).await?;
             return Ok(());
@@ -6273,7 +6370,7 @@ Planning continuation: turn {} of {}.",
         }
         let mut selection_events = self.select_review_task(&plan).await?;
         let compact_event = if self.session.plan_compact {
-            self.compact_session().await?.1
+            self.compact_session(true).await?.1
         } else {
             Vec::new()
         };
@@ -7478,6 +7575,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             resource_selection = Some(settings.desired);
         }
         let mut configured = self.session.clone();
+        if let Some(value) = params.get("auto_compaction") {
+            let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
+            policy.validate(configured.context_usage.as_ref())?;
+            anyhow::ensure!(!policy.enabled || self.capability.native_compact, "This backend does not support automatic compaction");
+            configured.auto_compaction = policy;
+        }
         (configured.approval_timeout, configured.answer_timeout) = self.permission_coordinator.input_timeouts(&self.session.id)?;
         let access = params.get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
@@ -7651,19 +7754,21 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if params.get("settings_revision").is_none() {
             let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
             let snapshot = settings.get(&self.session.workspace,&self.session.id,&self.session.backend)?;
-            let mut portable = settings.layer_settings(crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id)?;
+            let scope = if params.get("auto_compaction").is_some() { crate::settings::SettingScope::Session } else { crate::settings::SettingScope::Global };
+            let mut portable = settings.layer_settings(scope,&self.session.workspace,&self.session.id)?;
             let mut changed = false;
             if params.get("access").is_some() { portable.access = Some(self.session.access.clone()); changed = true; }
             if params.get("shell").is_some() { portable.shell = Some(self.session.shell); changed = true; }
             if params.get("default_write_permission").is_some() { portable.default_write_permission = Some(self.session.default_write_permission); changed = true; }
             if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
+            if params.get("auto_compaction").is_some() { portable.auto_compaction = Some(self.session.auto_compaction.clone()); changed = true; }
             if params.get("plan_compact").is_some() { portable.plan_compact = Some(self.session.plan_compact); changed = true; }
             if params.get("plan_auto_approve_revisions").is_some() { portable.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions); changed = true; }
             if params.get("approval_timeout").is_some() { portable.approval_timeout = Some(self.session.approval_timeout); changed = true; }
             if params.get("answer_timeout").is_some() { portable.answer_timeout = Some(self.session.answer_timeout); changed = true; }
             if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
             if let Some(enabled) = lsp_tools {portable.lsp_tools = Some(enabled);changed = true;}
-            let revision = if changed { settings.update(snapshot.revision,crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
+            let revision = if changed { settings.update(snapshot.revision,scope,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
             if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
                 settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
                     "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
@@ -7766,7 +7871,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         Ok(if patch.is_empty() { Vec::new() } else { vec![self.event("document_changed", patch.notification())?] })
     }
 
-    async fn compact_session(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn compact_session(&mut self, manual: bool) -> Result<(Value, Vec<SessionEvent>)> {
         anyhow::ensure!(
             self.capability.native_compact,
             "current backend does not support context compaction"
@@ -7780,7 +7885,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             id: Uuid::new_v4().to_string(),
             thread_id: self.session.backend_session_id.clone().expect("validated provider conversation"),
             state: crate::backend::CompactionState::Running,
-            manual: true, started_at_ms: Some(now_ms), completed_at_ms: None,
+            manual, started_at_ms: Some(now_ms), completed_at_ms: None,
             result: crate::backend::CompactionResult {
                 context_tokens_before: self.session.context_usage.as_ref().map(|usage| usage.used),
                 ..Default::default()
@@ -7881,7 +7986,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             input,
-            mode,
+            mode: if self.session.background.is_some() { PromptMode::Background } else { mode },
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
@@ -7889,7 +7994,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             access: self.session.access.clone(),
             execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
-            control_context: self.control_turn_context(mode),
+            control_context: self.control_turn_context(if self.session.background.is_some() { PromptMode::Background } else { mode }),
         }
     }
 
@@ -7911,6 +8016,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     fn save_preference(&mut self, update_model_preference: bool) -> Result<()> {
+        if self.session.background.is_some() { return Ok(()); }
         let previous = self
             .store
             .load_preference(&self.session.workspace, &self.session.backend)?;
@@ -9058,6 +9164,7 @@ mod test {
         std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
         let initialize = InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(),permission_file:None,
@@ -9115,6 +9222,7 @@ mod test {
         broker.pause_goal().await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
         let mut resumed = InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
@@ -9299,6 +9407,7 @@ mod test {
         crate::checks::configure_fixture(repository.path());
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
@@ -9399,6 +9508,7 @@ mod test {
             crate::checks::configure_fixture(repository.path());
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
@@ -9830,6 +9940,7 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = HarnessBroker::initialize_with_clock(
                 InitializeRequest {
+            background: None,
                     backend_launch_by_provider: Default::default(),
             config_dir: None,
                     data_root: data.path().to_string_lossy().into_owned(),
@@ -9885,6 +9996,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -11659,6 +11771,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -11687,7 +11800,7 @@ mod test {
         assert_eq!(broker.session.model, "mock-model");
         assert_eq!(broker.session.effort, "low");
         broker.session.backend_session_id = Some("mock-session".into());
-        let (_, events) = broker.compact_session().await.unwrap();
+        let (_, events) = broker.compact_session(true).await.unwrap();
         assert!(events.iter().any(|event| event.event == "context_compacted"));
         assert_eq!(broker.session.effort, "low");
         let preference = broker.store.load_preference(&broker.session.workspace, "mock").unwrap().unwrap();
@@ -11699,6 +11812,7 @@ mod test {
         drop(broker);
         let next = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -11753,6 +11867,7 @@ mod test {
             native_fork: false,
             native_compact: false,
             context_usage: None,
+            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
         };
         assert!(acquire_lease(&mut session, "two", 10).is_err());
         assert!(acquire_lease(&mut session, "two", 21).is_ok());
@@ -11828,6 +11943,7 @@ mod test {
         crate::checks::configure_fixture(repository);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data_root.to_string_lossy().into_owned(),
@@ -12372,11 +12488,56 @@ mod test {
     }
 
     #[tokio::test]
+    async fn auto_compaction_requires_fresh_usage_and_runs_once_per_turn() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = HarnessBroker::initialize(serde_json::from_value(json!({
+            "data_root":data.path(),"workspace":repository.path(),"client_id":"automatic-compaction",
+            "backend":{"kind":"mock","command":[]},"model":"mock-model","effort":"low"
+        }))?)?;
+        let result = broker.dispatch(Request { id:1,method:"prompt.submit".into(),params:json!({"text":"First turn"}) }).await;
+        assert!(result.response.error().is_none());
+        broker.session.auto_compaction = crate::session::AutoCompaction {enabled:true,threshold_tokens:40_000};
+        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.context_usage_fresh = false;
+        broker.auto_compact().await?;
+        assert!(broker.store.list_session_event(&broker.session.id)?.is_empty());
+        broker.context_usage_fresh = true;
+        broker.auto_compact().await?;
+        let records = broker.store.list_session_event(&broker.session.id)?;
+        assert_eq!(records.len(),1);
+        let SessionEventKind::Compaction {compaction} = &records[0].detail else {panic!("missing compaction")};
+        assert!(!compaction.manual);
+        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.auto_compact().await?;
+        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),1);
+        let result = broker.dispatch(Request {id:2,method:"prompt.submit".into(),params:json!({"text":"Second turn"})}).await;
+        assert!(result.response.error().is_none());
+        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.context_usage_fresh = true;
+        broker.auto_compact().await?;
+        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),2);
+        let result = broker.dispatch(Request {id:3,method:"prompt.submit".into(),params:json!({"text":"Third turn"})}).await;
+        assert!(result.response.error().is_none());
+        broker.store.save_session_event(&SessionEventRecord {id:"native-running".into(),session_id:broker.session.id.clone(),created_at_ms:1,
+            detail:SessionEventKind::Compaction {compaction:crate::backend::Compaction {
+                id:"native-running".into(),thread_id:broker.session.backend_session_id.clone().unwrap(),state:crate::backend::CompactionState::Running,
+                manual:false,started_at_ms:Some(1),completed_at_ms:None,result:Default::default(),
+            }}})?;
+        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.context_usage_fresh = true;
+        broker.auto_compact().await?;
+        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),3,"native compaction must exclude another request");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn compaction_captures_context_usage_without_creating_an_interaction() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -12578,6 +12739,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let initialize = |client_id: &str, name: &str| InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
@@ -12619,6 +12781,7 @@ mod test {
         let other_workspace = repository();
         let data = tempfile::tempdir().unwrap();
         let mut request = InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
@@ -12670,6 +12833,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -12817,6 +12981,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -12921,6 +13086,7 @@ mod test {
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -12974,6 +13140,7 @@ mod test {
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -13021,6 +13188,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let request = InitializeRequest {
+            background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
@@ -13055,6 +13223,7 @@ mod test {
         assert_eq!(child["execution_mode"], "read");
 
         let fresh = HarnessBroker::initialize_with_clock(InitializeRequest {
+            background: None,
             workspace: other_repository.path().to_string_lossy().into_owned(),
             ..request
         }, Box::new(FixedClock(300))).unwrap();
@@ -13071,6 +13240,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -13129,6 +13299,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -13202,6 +13373,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -13247,6 +13419,7 @@ mod test {
 
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14262,6 +14435,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(), permission_file: None,
@@ -14315,6 +14489,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14388,6 +14563,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14436,6 +14612,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14480,6 +14657,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14553,6 +14731,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14591,6 +14770,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14668,6 +14848,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14745,6 +14926,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
@@ -14846,6 +15028,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+            background: None,
                 backend_launch_by_provider: Default::default(),
             config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),

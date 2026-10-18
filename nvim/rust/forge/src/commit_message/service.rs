@@ -1,4 +1,4 @@
-use super::{context, provider};
+use super::context;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -7,10 +7,7 @@ use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_diff::syntax::SyntaxEngine;
 use forge_git::store::RepositoryStore;
-use forge_harness::{
-    backend::TextGeneration,
-    service::{HarnessService, TextGenerationConfig},
-};
+use forge_harness::{backend::TextGeneration, service::{HarnessService, TextGenerationConfig}};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -37,14 +34,6 @@ pub enum Comparison {
     PullRequest,
 }
 
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct ModelSpec {
-    pub provider: String,
-    pub model: String,
-    pub thinking: Option<Value>,
-}
-
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct GenerationRequest {
@@ -59,7 +48,6 @@ pub struct GenerationRequest {
     pub max_bytes: Option<usize>,
     #[serde(default)]
     pub ignored_paths: Vec<String>,
-    pub model: Option<ModelSpec>,
     pub generation: Option<TextGenerationConfig>,
 }
 
@@ -74,6 +62,8 @@ pub struct PromptPreview {
 
 #[derive(Clone, Serialize)]
 pub struct GenerationResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
     pub state: String,
     pub message: Option<String>,
     pub source_requests: usize,
@@ -87,7 +77,6 @@ pub struct GenerationService {
     repository: Arc<RepositoryStore>,
     diff: Arc<DiffEngine>,
     syntax: Arc<SyntaxEngine>,
-    http: reqwest::Client,
     admission: Arc<Semaphore>,
     completed: Arc<Notify>,
 }
@@ -102,11 +91,6 @@ impl GenerationService {
             repository,
             diff,
             syntax,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(120))
-                .redirect(reqwest::redirect::Policy::none())
-                .pool_max_idle_per_host(4)
-                .build()?,
             admission: Arc::new(Semaphore::new(4)),
             completed: Arc::new(Notify::new()),
         })
@@ -116,6 +100,7 @@ impl GenerationService {
         &self,
         params: Value,
         harness: &HarnessService,
+        delivery: Option<(forge_protocol::outbound::MessageSender, u64)>,
     ) -> Result<GenerationResponse> {
         let request: GenerationRequest = serde_json::from_value(params)?;
         let preview = request.operation == "preview";
@@ -125,11 +110,11 @@ impl GenerationService {
             "unknown detached generation operation"
         );
         ensure!(
-            preview || context_only || request.model.is_some() != request.generation.is_some(),
-            "generation requires exactly one API model or standalone provider configuration"
+            preview || context_only || request.generation.is_some(),
+            "generation requires Harness provider configuration"
         );
         ensure!(
-            !(preview || context_only) || request.model.is_none() && request.generation.is_none(),
+            !(preview || context_only) || request.generation.is_none(),
             "prompt preview does not accept provider configuration"
         );
         ensure!(context_only == (request.comparison == Comparison::PullRequest),
@@ -142,7 +127,7 @@ impl GenerationService {
             ensure!(request.base.is_none() && request.head.is_none() && request.max_bytes.is_none(),
                 "commit generation does not accept pull request context options");
         }
-        let permit = Arc::new(GenerationPermit {
+        let _permit = Arc::new(GenerationPermit {
             permit: Some(
                 Arc::clone(&self.admission)
                     .try_acquire_owned()
@@ -155,6 +140,7 @@ impl GenerationService {
                 Ok(context) => context,
                 Err(failure) if context_only && failure.is::<forge_git::revision::comparison::MergeConflict>() => {
                     return Ok(GenerationResponse {
+                        session_id: None,
                         state: "conflicts".into(),
                         message: None,
                         source_requests: 0,
@@ -164,6 +150,7 @@ impl GenerationService {
                 }
                 Err(failure) if context::generation_was_superseded(&failure) => {
                     return Ok(GenerationResponse {
+                        session_id: None,
                         state: "retry".into(),
                         message: None,
                         source_requests: 0,
@@ -174,6 +161,7 @@ impl GenerationService {
                 Err(failure) => return Err(failure),
             };
         let mut response = GenerationResponse {
+            session_id: None,
             state: if context.prompt.is_some() {
                 "ready"
             } else {
@@ -199,31 +187,13 @@ impl GenerationService {
             });
             return Ok(response);
         }
-        let message = if let Some(model) = request.model.as_ref() {
-            ensure!(
-                !model.model.is_empty() && model.model.len() <= 256 && model.provider.len() <= 32,
-                "invalid generation model identity"
-            );
-            ensure!(
-                model.thinking.as_ref().is_none_or(|value| value
-                    .as_str()
-                    .is_some_and(|value| value.len() <= 32)
-                    || value.as_u64().is_some_and(|value| value <= 1_000_000)),
-                "invalid generation thinking configuration"
-            );
-            provider::generate(&self.http, model, prompt, &permit).await?
-        } else {
-            harness
-                .generate_text(
-                    request
-                        .generation
-                        .context("Missing standalone provider configuration")?,
-                    &request.workspace,
-                    TextGeneration::CommitMessage,
-                    prompt,
-                )
-                .await?
-        };
+        let generated = harness.background.generate(forge_harness::background::BackgroundRequest {
+            config: request.generation.context("Missing Background provider configuration")?,
+            context: context.background.context("Missing Background Git context")?,
+            input: prompt.to_owned(), delivery,
+        }).await?;
+        response.session_id = Some(generated.session_id);
+        let message = generated.text;
         response.message = Some(message);
         Ok(response)
     }

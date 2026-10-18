@@ -54,22 +54,18 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     local client = require("forge.client")
     local generation, configuration_failure = client.generation_config()
     if not generation then callback(nil, configuration_failure) return end
-    local choice = require("forge.integrations.commit_settings").model(snapshot, generation.backend.kind)
-    local model = snapshot.effective_source == "gemini"
-      and { provider = "gemini", model = choice.model, thinking = choice.thinking } or nil
-    on_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. tostring(choice.thinking)) or ""))
+    local choice = require("forge.integrations.background_settings").model(snapshot, generation.backend.kind)
+    on_model(choice.model .. (choice.thinking ~= nil and (" · thinking " .. choice.thinking) or ""))
     local params = { operation = "generate", workspace = cwd,
       comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
-      ignored_paths = ignored or {}, model = model }
+      ignored_paths = ignored or {} }
     if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
-    elseif model then client.request_host("repository.generate", params, receive)
     else
-      local effort = choice.thinking
-      assert(effort == nil or type(effort) == "string", "Harness thinking must be a reasoning level")
-      client.request_generation(params, receive, on_model, { model = choice.model, reasoning_effort = effort })
+      client.request_generation(params, receive, on_model, { model = choice.model,
+        reasoning_effort = choice.thinking, auto_compaction = snapshot.settings.auto_compaction })
     end
   end
-  require("forge.integrations.commit_settings").request(nil, nil, function(...)
+  require("forge.integrations.background_settings").request(nil, nil, function(...)
     local ok, failure = pcall(resolved, ...)
     if not ok then callback(nil, tostring(failure)) end
   end)

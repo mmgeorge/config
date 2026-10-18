@@ -16,11 +16,11 @@ local configured_session = {
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
 }
 local original_request = client.request_for
-local commit_settings = require("forge.integrations.commit_settings")
+local commit_settings = require("forge.integrations.background_settings")
 local original_commit_request = commit_settings.request
 commit_settings.request = function(_, _, callback)
   callback({ revision = 0, gemini_available = false, effective_source = "harness",
-    settings = { source = "harness", models = { codex = { model = "mock-model", thinking = "low" },
+    settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 }, models = { codex = { model = "mock-model", thinking = "low" },
       copilot = { model = "mock-model", thinking = "low" } } } })
 end
 client.request_for = function(session_id, method, params, callback)

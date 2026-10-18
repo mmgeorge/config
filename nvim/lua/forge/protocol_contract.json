@@ -1,5 +1,5 @@
 {
-  "version": 18,
+  "version": 19,
   "node": {
     "kind": [
       "exchange",
@@ -22,6 +22,10 @@
     ]
   },
   "session": {
+    "background_error": {
+      "route": "handle",
+      "required": { "error": "string" }
+    },
     "task_operation": {
       "route": "handle",
       "required": {
@@ -313,6 +317,10 @@
     }
   },
   "request": {
+    "repository.generate.progress": {
+      "route": "progress",
+      "required": { "session_id": "string", "event": "object" }
+    },
     "result.part": {
       "route": "transport",
       "required": {}

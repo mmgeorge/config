@@ -147,6 +147,7 @@ function M.open(options, callback)
     end, 30000)
     if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
+    elseif options.request then options.request(current.params, receive)
     else client.request_for(options.session_id, "harness.document", current.params, receive) end
   end
   local function request(params, done, valid, cancel)
@@ -258,14 +259,14 @@ function M.open(options, callback)
     owner.ready = true
     render_markdown()
     vim.schedule(function() if alive() then owner.observe_sections() end end)
-    owner.terminals = require("forge.views.harness.terminals").watch({
+    if not options.read_only then owner.terminals = require("forge.views.harness.terminals").watch({
       session_id = options.session_id, alive = alive, notice = notice,
       update = function(snapshot)
         owner.transcript.background_terminals = snapshot
         if options.on_update then options.on_update() end
       end,
-    })
-    vim.bo[options.composer_buffer].modifiable = true
+    }) end
+    vim.bo[options.composer_buffer].modifiable = not options.read_only
     callback(owner)
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
@@ -744,6 +745,7 @@ function M.open(options, callback)
   end
 
   function owner.submit(callback)
+    if options.read_only then if callback then callback(nil, "This timeline is read-only") end return end
     if not alive() or not owner.ready then callback(nil, "Harness documents are not ready") return end
     if owner.failure then callback(nil, owner.failure) return end
     if owner.submission then callback(nil, "Composer submission is already active") return end

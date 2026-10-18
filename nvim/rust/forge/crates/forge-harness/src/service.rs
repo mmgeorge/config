@@ -30,7 +30,14 @@ pub struct TextGenerationConfig {
     pub model: String,
     /// Explicit effort for the isolated request, independent of the active conversation.
     pub reasoning_effort: Option<String>,
+    /// Background default, overridden by saved per-session policy.
+    #[serde(default = "background_compaction")]
+    pub auto_compaction: crate::session::AutoCompaction,
     pub data_root: PathBuf,
+}
+
+fn background_compaction() -> crate::session::AutoCompaction {
+    crate::session::AutoCompaction { enabled: true, ..Default::default() }
 }
 
 /// Owns lazy Harness initialization and independently serialized session controllers.
@@ -39,6 +46,8 @@ pub struct HarnessService {
     diff: Arc<DiffEngine>,
     syntax: Arc<SyntaxEngine>,
     registry: Mutex<Option<Arc<SessionControllerRegistry>>>,
+    /// Independent owner for non-interactive persistent conversations.
+    pub background: Arc<crate::background::BackgroundManager>,
     accepting: AtomicBool,
     activity: RwLock<()>,
 }
@@ -333,6 +342,7 @@ impl HarnessService {
         syntax: Arc<SyntaxEngine>,
     ) -> Self {
         Self {
+            background: crate::background::BackgroundManager::new(Arc::clone(&repositories), Arc::clone(&diff), Arc::clone(&syntax)),
             repositories,
             diff,
             syntax,
@@ -507,6 +517,7 @@ impl HarnessService {
     /// A timeout retains the registry and task ownership. A later call can finish shutdown.
     /// Provider subprocess cleanup still follows each backend's existing destruction contract.
     pub async fn shutdown(&self, deadline: Duration) -> Result<()> {
+        tokio::time::timeout(deadline, self.background.shutdown()).await.context("Background shutdown timed out")?;
         self.accepting.store(false, Ordering::Release);
         tokio::time::timeout(deadline, async {
             let mut child_quiescence = Vec::new();
@@ -2315,6 +2326,7 @@ mod tests {
         let generator = service();
         let text = tokio::time::timeout(Duration::from_secs(1), generator.generate_text(
             TextGenerationConfig {
+                auto_compaction: Default::default(),
                 backend: crate::backend::BackendLaunch { kind: "mock".into(), command: vec![] },
                 model: "default".into(), reasoning_effort: Some("low".into()), data_root,
             },

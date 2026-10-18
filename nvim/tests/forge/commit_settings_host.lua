@@ -24,7 +24,7 @@ package.loaded["forge.builder"] = { ensure = function(callback)
   return function() end
 end }
 require("forge").setup({ harness = { backend = "mock" },
-  commit_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
+  background_generation = { mock = { model = "mock-model", reasoning_effort = "low" } } })
 vim.fn.chdir(workspace)
 local client = require("forge.client")
 client._set_launcher_for_test(vim.system)
@@ -46,16 +46,15 @@ require("forge").open_harness()
 wait(function() return state.ready and state.session end, "Harness did not start")
 local before = { model = state.session.model, effort = state.session.effort }
 settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
-wait(function() local model = option("commit-model") return model and not model.disabled_reason end, "Commit controls did not load")
+wait(function() local model = option("background-model") return model and not model.disabled_reason end, "Background controls did not load")
 local expected = stage == "save" and "low" or "medium"
-assert(option("commit-provider").columns[2]:find("Harness", 1, true))
-assert(option("commit-model").columns[2]:find("mock-model", 1, true))
-assert(option("commit-thinking").columns[2]:find(expected, 1, true), vim.inspect(option("commit-thinking")))
+assert(option("background-model").columns[2]:find("mock-model", 1, true))
+assert(option("background-thinking").columns[2]:find(expected, 1, true), vim.inspect(option("background-thinking")))
 local lines = vim.api.nvim_buf_get_lines(picker._state_for_test().buf, 0, -1, false)
-assert(table.concat(lines, "\n"):find("Commit provider", 1, true), "Commit controls did not render")
+assert(table.concat(lines, "\n"):find("Background model", 1, true), "Background controls did not render")
 if stage == "save" then
-  picker._state_for_test().spec.action_list[2].callback({ option = option("commit-thinking") })
-  wait(function() return option("commit-thinking").columns[2]:find("medium", 1, true) ~= nil end, "Thinking did not save")
+  picker._state_for_test().spec.action_list[2].callback({ option = option("background-thinking") })
+  wait(function() return option("background-thinking").columns[2]:find("medium", 1, true) ~= nil end, "Thinking did not save")
 end
 assert(state.session.model == before.model and state.session.effort == before.effort, "Commit settings changed the chat")
 local generator = require("forge.integrations.ai_commit")

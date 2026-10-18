@@ -21,6 +21,8 @@ pub enum SettingScope {
 #[serde(deny_unknown_fields)]
 /// Retains portable choices without copying provider authentication or native files.
 pub struct PortableSettings {
+    /// Requests native compaction after completed turns reach this token threshold.
+    pub auto_compaction: Option<crate::session::AutoCompaction>,
     /// Controls reported file authorization and requested OS isolation independently of approval mode.
     pub access: Option<crate::session::AccessPolicy>,
     /// Selects the check shell used by Harness execution.
@@ -51,6 +53,7 @@ pub struct PortableSettings {
 
 impl PortableSettings {
     fn inherit(&mut self, overriding: Self) {
+        if overriding.auto_compaction.is_some() { self.auto_compaction = overriding.auto_compaction; }
         if overriding.access.is_some() { self.access = overriding.access; }
         if overriding.shell.is_some() { self.shell = overriding.shell; }
         if overriding.default_write_permission.is_some() { self.default_write_permission = overriding.default_write_permission; }
@@ -67,6 +70,10 @@ impl PortableSettings {
 
     /// Apply validated portable choices while preserving provider-local model identity.
     pub fn apply(&self, session: &mut crate::session::HarnessSession, native_compact: bool) -> Result<()> {
+        if let Some(policy) = &self.auto_compaction {
+            policy.validate(session.context_usage.as_ref())?;
+            session.auto_compaction = policy.clone();
+        }
         if let Some(access) = &self.access { session.access = access.clone().validate()?; }
         session.access = crate::backend::BackendKind::parse(&session.backend)?.resolve_access(session.access.clone());
         if let Some(shell) = self.shell { shell.executable()?; session.shell = shell; }
@@ -352,6 +359,7 @@ impl SettingsStore {
 
     fn write_layer(&mut self, expected_revision: u64, scope: SettingScope, workspace: &str, session: &str,
         setting: &PortableSettings, receipt: Option<(&str,&Value)>, imported: &[super::ImportedResource]) -> Result<SettingsMutation> {
+        if let Some(policy) = &setting.auto_compaction { policy.validate(None)?; }
         if let Some(timeout) = setting.approval_timeout { timeout.validate()?; }
         if let Some(timeout) = setting.answer_timeout { timeout.validate()?; }
         if let Some(access) = &setting.access { access.clone().validate()?; }

@@ -4,16 +4,7 @@ use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::time::Duration;
 
-/// Generate text in a tool-free ephemeral thread with captured visible history.
-pub(super) async fn generate(
-    process: &mut CodexJsonRpc,
-    output: &mut BackendOutput,
-    workspace: &str,
-    purpose: TextGeneration,
-    model: &str,
-    reasoning_effort: Option<&str>,
-    history: &str,
-) -> Result<String> {
+pub(super) fn tool_free_config() -> Value {
     let mut config = json!({"web_search":"disabled", "skills.include_instructions":false,
         "orchestrator.skills.enabled":false, "tools.update_plan.enabled":false,
         "tools.experimental_request_user_input.enabled":false});
@@ -43,6 +34,20 @@ pub(super) async fn generate(
     ] {
         config[format!("features.{feature}")] = json!(false);
     }
+    config
+}
+
+/// Generate text in a tool-free ephemeral thread with captured visible history.
+pub(super) async fn generate(
+    process: &mut CodexJsonRpc,
+    output: &mut BackendOutput,
+    workspace: &str,
+    purpose: TextGeneration,
+    model: &str,
+    reasoning_effort: Option<&str>,
+    history: &str,
+) -> Result<String> {
+    let mut config = tool_free_config();
     let started = tokio::time::timeout(Duration::from_secs(20), async {
         let effective = process
             .request(

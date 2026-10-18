@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 46;
+const SESSION_FORMAT_VERSION: u32 = 47;
 const PREFERENCE_FORMAT_VERSION: u32 = 40;
 
 /// Stores one session with the exact durable format that produced it.
@@ -1367,6 +1367,7 @@ mod test {
             native_fork: false,
             native_compact: false,
             context_usage: None,
+            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
         }
     }
 

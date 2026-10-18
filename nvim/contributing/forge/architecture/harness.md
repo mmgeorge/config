@@ -709,6 +709,17 @@ client-observed completion latency in the `forge/harness-perf.log` JSONL stream 
 
 ## Context usage and compaction
 
+`AutoCompaction` is a portable per-session policy with an enabled flag and a positive token
+threshold. Ordinary sessions default to disabled. Background sessions default to enabled at
+128,000 tokens. The policy does not change the provider's context window and never measures
+billing totals or estimates bytes as tokens. It runs after completed provider work, serializes
+with subsequent input, and records its last attempted turn to prevent repeated idle retries.
+Provider-initiated compaction remains authoritative. Unsupported compaction and invalid known
+capacity produce explicit diagnostics. Missing usage remains unverified until the provider
+reports it. Full exchanges and timeline records survive model-context compaction. On restart, an operation
+that never confirmed completion becomes unconfirmed rather than retaining a running indicator.
+
+
 Provider token-usage notifications normalize into durable `ContextUsage` session state. The
 Harness winbar renders the remaining percentage and total window at its right edge without
 adding timeline entries for usage changes. `Compaction` defines provider context replacement as a

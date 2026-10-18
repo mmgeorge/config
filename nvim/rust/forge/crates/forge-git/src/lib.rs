@@ -1,3 +1,4 @@
+pub mod history;
 pub mod checkpoint;
 pub mod completion;
 pub mod config_location;

@@ -1,3 +1,5 @@
+mod auto_compaction;
+pub use auto_compaction::AutoCompaction;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
@@ -116,6 +118,15 @@ impl std::error::Error for SessionLeaseConflict {}
 /// Represents one durable conversation and its backend identity.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
+    /// Distinguishes tool-free Background conversations from interactive sessions.
+    #[serde(default)]
+    pub background: Option<crate::background::BackgroundIdentity>,
+    /// Controls explicit compaction using reported context usage.
+    #[serde(default)]
+    pub auto_compaction: AutoCompaction,
+    /// Prevents retry loops when compaction fails or leaves usage above the threshold.
+    #[serde(default)]
+    pub last_compaction_turn: Option<String>,
     pub id: String,
     /// Stable owner of the session's primary timeline and exchanges.
     pub primary_agent_id: String,

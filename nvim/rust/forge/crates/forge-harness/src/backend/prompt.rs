@@ -3,6 +3,7 @@ use super::{BackendRequest, HARNESS_SYSTEM_MESSAGE, PromptMode};
 impl BackendRequest {
     /// Bind shared provider instructions to the permission and purpose of this turn.
     pub(crate) fn system_message(&self) -> String {
+        if self.mode == PromptMode::Background { return super::TextGeneration::CommitMessage.instructions().to_owned(); }
         format!(
             "{HARNESS_SYSTEM_MESSAGE}\n\n{}",
             self.interaction_contract()
@@ -12,6 +13,7 @@ impl BackendRequest {
     /// Supply current interaction context even when a provider reuses a live session.
     pub(crate) fn interaction_contract(&self) -> String {
         let purpose = match self.mode {
+            PromptMode::Background => return super::TextGeneration::CommitMessage.instructions().to_owned(),
             PromptMode::Chat => {
                 "Answer the current user request. This interaction does not itself start, clear, or complete a Harness task."
             }
@@ -72,6 +74,13 @@ mod test {
     use crate::backend::{BackendInput, ServiceTier};
     use crate::control_tools::ControlTurnContext;
     use crate::session::PermissionMode;
+
+    #[test]
+    fn background_profile_excludes_workflow_instructions_and_tools() {
+        let context = ControlTurnContext::inactive(PromptMode::Background);
+        assert!(crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(&context),true).is_empty());
+        assert!(crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(&context),false).is_empty());
+    }
 
     #[test]
     fn current_context_replaces_previous_permission_and_does_not_infer_answers_from_text() {

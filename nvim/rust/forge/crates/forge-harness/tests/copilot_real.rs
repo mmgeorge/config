@@ -128,6 +128,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
     std::fs::write(workspace.join("README.md"), "# Copilot fixture\n").unwrap();
 
     let mut broker = HarnessBroker::initialize(InitializeRequest {
+        background: None,
         backend_launch_by_provider: Default::default(),
             config_dir: None,
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),

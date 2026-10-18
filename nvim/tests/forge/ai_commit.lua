@@ -6,12 +6,11 @@ local original_adapters = package.loaded["ai.adapters"]
 local original_backend = ai_commit._backend
 local original_client = package.loaded["forge.client"]
 local original_notify = vim.notify
-local original_settings = package.loaded["forge.integrations.commit_settings"]
+local original_settings = package.loaded["forge.integrations.background_settings"]
 local function generation_config() return { backend = { kind = "codex" } } end
-package.loaded["forge.integrations.commit_settings"] = {
+package.loaded["forge.integrations.background_settings"] = {
   request = function(_, _, callback)
-    local selected = require("ai.adapters").get().commit
-    callback({ effective_source = selected == "harness" and "harness" or "gemini" })
+    callback({ settings = { auto_compaction = { enabled = true, threshold_tokens = 128000 } } })
   end,
   model = function() return { model = "fixture-model" } end,
 }
@@ -159,18 +158,6 @@ local function run()
   assert_equal(notices[#notices].level, vim.log.levels.ERROR)
 
   ai_commit.reset_backend()
-  package.loaded["forge.client"] = {
-    request_host = function(method, params, callback)
-      assert_equal(method, "repository.generate")
-      assert_equal(params.model.provider, "gemini")
-      assert_equal(params.model.model, "fixture-model")
-      callback({ state = "ready", message = "fix: use configured API" })
-    end,
-    request_generation = function() error("API generation selected a CLI provider") end,
-    generation_config = generation_config,
-  }
-  ai_commit.ensure("D:/configured-api", { ref = "HEAD" })
-  assert_equal(ai_commit.state("D:/configured-api", "HEAD").message, "fix: use configured API")
   package.loaded["ai.adapters"] = { get = function() return { commit = "harness" } end }
   package.loaded.ai = { resolve = function() error("Harness fallback resolved an API model") end }
   package.loaded["forge.client"] = {
@@ -198,7 +185,7 @@ ai_commit.set_backend(original_backend)
 package.loaded.ai = original_ai
 package.loaded["ai.adapters"] = original_adapters
 package.loaded["forge.client"] = original_client
-package.loaded["forge.integrations.commit_settings"] = original_settings
+package.loaded["forge.integrations.background_settings"] = original_settings
 vim.notify = original_notify
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("ai_commit OK")

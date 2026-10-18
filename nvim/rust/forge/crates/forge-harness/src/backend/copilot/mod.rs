@@ -247,11 +247,13 @@ impl CopilotBackend {
         let tool_list =
             self.control_tool_list(self.control_router(&request.runtime_key()?).await, request);
         let system_message = SystemMessageConfig::new()
-            .with_mode("append")
-            .with_content(SYSTEM_MESSAGE);
-        let permission_handler: Arc<dyn PermissionHandler> = Arc::new(CopilotPermissionHandler {
+            .with_mode(if request.mode == PromptMode::Background { "replace" } else { "append" })
+            .with_content(if request.mode == PromptMode::Background { request.system_message() } else { SYSTEM_MESSAGE.to_owned() });
+        let permission_handler: Arc<dyn PermissionHandler> = if request.mode == PromptMode::Background {
+            Arc::new(github_copilot_sdk::handler::DenyAllHandler)
+        } else { Arc::new(CopilotPermissionHandler {
             context: self.permission_context(&request.runtime_key()?).await,
-        });
+        }) };
         let checkpoint_hooks = Arc::new(CopilotCheckpointHooks {
             context: self.permission_context(&request.runtime_key()?).await,
         });
@@ -261,7 +263,7 @@ impl CopilotBackend {
             access: request.access.clone(), execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
         };
-        let resources = self.settings_root.as_ref().map(|root| {
+        let resources = self.settings_root.as_ref().filter(|_| request.mode != PromptMode::Background).map(|root| {
             crate::settings::SessionResources::load(root, &resource_request, "copilot", "copilotcli")
         }).transpose()?;
         let profile = resources.as_ref().map(|resources| {
@@ -305,6 +307,17 @@ impl CopilotBackend {
                 "context_tier":config.context_tier, "system_message":SYSTEM_MESSAGE,
                 "workspace":request.workspace, "streaming":true, "enable_config_discovery":resources.is_none(), "enable_skills":true,
             }));
+            if request.mode == PromptMode::Background {
+                config.available_tools = Some(Vec::new());
+                config.tools = Some(Vec::new());
+                config.enable_config_discovery = Some(false);
+                config.enable_skills = Some(false);
+                config.enable_file_hooks = Some(false);
+                config.hooks = Some(false);
+                config.skip_custom_instructions = Some(true);
+                config.mcp_servers = Some(Default::default());
+                config.enable_session_store = Some(true);
+            }
             client
                 .resume_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
                 .await
@@ -332,6 +345,17 @@ impl CopilotBackend {
                 "context_tier":config.context_tier, "system_message":SYSTEM_MESSAGE,
                 "workspace":request.workspace, "streaming":true, "enable_config_discovery":resources.is_none(), "enable_skills":true,
             }));
+            if request.mode == PromptMode::Background {
+                config.available_tools = Some(Vec::new());
+                config.tools = Some(Vec::new());
+                config.enable_config_discovery = Some(false);
+                config.enable_skills = Some(false);
+                config.enable_file_hooks = Some(false);
+                config.hooks = Some(false);
+                config.skip_custom_instructions = Some(true);
+                config.mcp_servers = Some(Default::default());
+                config.enable_session_store = Some(true);
+            }
             client
                 .create_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
                 .await

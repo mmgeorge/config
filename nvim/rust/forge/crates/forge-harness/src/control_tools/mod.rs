@@ -229,6 +229,7 @@ impl ControlToolRegistry {
         context: Option<&ControlTurnContext>,
         root: bool,
     ) -> Vec<ControlToolDefinition> {
+        if context.is_some_and(|context| context.mode == crate::backend::PromptMode::Background) { return Vec::new(); }
         let phase =
             context.and_then(|context| context.execution.as_ref().map(|execution| execution.phase));
         self.definition_list()

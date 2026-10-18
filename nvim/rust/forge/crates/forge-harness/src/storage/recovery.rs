@@ -11,6 +11,19 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_event = {
+            let mut statement = transaction.prepare("SELECT payload FROM session_event_record WHERE session_id=?1")?;
+            statement.query_map([session_id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for payload in session_event {
+            let mut event: crate::timeline::SessionEventRecord = serde_json::from_str(&payload)?;
+            if let crate::timeline::SessionEventKind::Compaction { compaction } = &mut event.detail
+                && compaction.state == crate::backend::CompactionState::Running {
+                compaction.state = crate::backend::CompactionState::Unconfirmed;
+                compaction.result.error = Some("Runtime stopped before compaction completion was confirmed".into());
+                transaction.execute("UPDATE session_event_record SET payload=?2 WHERE id=?1", params![event.id, serde_json::to_string(&event)?])?;
+            }
+        }
         let exchange = {
             let mut statement =
                 transaction.prepare("SELECT payload FROM exchange_record WHERE session_id=?1")?;

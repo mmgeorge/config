@@ -166,7 +166,7 @@ impl PermissionCoordinator {
             crate::backend::BackendKind::Antigravity => ("antigravity", "antigravity-cli"),
             _ => ("mock", "mock"),
         };
-        let selected = if let Some(root) = root {
+        let selected = if request.mode == crate::backend::PromptMode::Background { Vec::new() } else if let Some(root) = root {
             crate::settings::SessionResources::load(root, &crate::backend::BackendCatalogRequest {
                 execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),
                 workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,

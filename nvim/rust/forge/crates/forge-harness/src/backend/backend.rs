@@ -106,6 +106,8 @@ pub struct BackendLaunch {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PromptMode {
+    /// Run a persistent tool-free generation request.
+    Background,
     Chat,
     Plan,
     PlanDiscussion,

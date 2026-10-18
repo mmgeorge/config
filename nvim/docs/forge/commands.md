@@ -24,28 +24,33 @@ commands complete the file argument before the revision argument.
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
 selected model. A persistent notification shows an animated spinner, model name,
-and elapsed seconds until generation completes. Failures display the error and
-preserve the existing draft, including edits made while waiting. The current
-request does not stream thought summaries.
+and elapsed seconds until generation completes. Readable provider reasoning summaries appear
+when available. Failures preserve the existing draft, including edits made while waiting.
 
-When commit generation uses Harness, it creates an isolated, tool-free provider
-session. Codex and Copilot default to `gpt-6-luna` with low reasoning effort,
-independently of the active chat model. Configure those defaults through Forge
-setup. `/config` exposes **Commit provider**, **Commit model**, and **Commit
-thinking**. The provider chooser offers Harness and Gemini, with Gemini disabled
-when `GEMINI_API_KEY` is unavailable. Model and thinking choices are independent
-for Gemini and each Harness backend. Enter opens a picker, and Left/Right cycles
-values. Changes are saved globally, survive restarts, and apply to the next commit
-generation without reconfiguring the chat. Failed saves preserve the prior values.
-Other AI adapters retain their own Gemini selection.
+Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
+default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
+provides **Background model**, **Background thinking**, **Background auto compact**, and
+**Background compact at tokens**. Choices persist across restarts. Gemini is not part
+of this workflow. Other AI features retain their existing adapters.
 
-Unsaved defaults use Harness. The optional
-`require("ai.adapters").use_gemini_for_commits` flag controls only that initial
-default, and saved `/config` preferences take precedence.
+The first actual generation creates the session. Normal commits reuse it. Switching
+branches or rewriting history starts another conversation, with the old timeline retained.
+Each request includes the last ten complete Git commit messages for terminology and style.
+
+Background auto-compaction defaults to **128,000 tokens** using the model's default context
+window. Ordinary Harness sessions default to off and have separate **Auto compact** and
+**Compact at tokens** controls in `/config`. Compaction runs after completed turns, with no
+idle timer. Missing provider usage cannot trigger compaction. Failed compaction is visible
+and does not discard generated text.
+
+`:ForgeDebugBackgroundTimeline [session_id]` opens the recorded Background conversation
+without changing the active chat or sending model input. Use **Tab** to expand rows, **H**
+to select an earlier conversation, **c** for its compaction configuration, and **q** to close.
+Opening the command before any generation does not create a session.
 
 ```lua
 require("forge").setup({
-  commit_generation = {
+  background_generation = {
     codex = { model = "gpt-6-luna", reasoning_effort = "low" },
     copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
   },
@@ -182,6 +187,7 @@ case removes its empty file group without deleting project source files.
 | `:ForgeBuild` | None | Explicitly build Forge and report the selected executable |
 | `:ForgeStartupLog` | None | Open the startup diagnostic log |
 | `:ForgeGitConfigCacheReset` | None | Clear the cached Git configuration location |
+| `:ForgeDebugBackgroundTimeline [session_id]` | Optional saved Background session ID | Inspect generation history, provider status, failures, and compaction |
 | `:ForgeDebugCommitPromptPreview [comparison]` | Optional `head`, `staged`, or `latest_commit` | Inspect the exact system instructions and compact commit context without calling a model |
 
 `ForgeDebugCommitPromptPreview` defaults to `head`, including staged, unstaged,

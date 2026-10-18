@@ -366,6 +366,7 @@ pub(crate) enum RoutedMethod {
     RepositoryWrite,
     RepositoryGenerate,
     GenerationSettings,
+    BackgroundTimeline,
     Status,
     StatusContext,
     StatusNavigate,
@@ -445,7 +446,8 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
         "repository.revisions" => Ok(RoutedMethod::Revisions),
         "repository.write" => Ok(RoutedMethod::RepositoryWrite),
         "repository.generate" => Ok(RoutedMethod::RepositoryGenerate),
-        "repository.generation_settings" => Ok(RoutedMethod::GenerationSettings),
+        "background.settings" => Ok(RoutedMethod::GenerationSettings),
+        "background.timeline" => Ok(RoutedMethod::BackgroundTimeline),
         "status" => Ok(RoutedMethod::Status),
         "status.context" => Ok(RoutedMethod::StatusContext),
         "status.navigate" => Ok(RoutedMethod::StatusNavigate),
@@ -666,7 +668,12 @@ impl HostRouter {
                 let result = self.host.generation.dispatch(
                     request.params,
                     &self.host.harness,
+                    Some((sink.clone(), request.id)),
                 ).await?;
+                send_completed_result(sink, request.id, result).await?;
+            }
+            RoutedMethod::BackgroundTimeline => {
+                let result = self.host.harness.background.timeline(request.params).await?;
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::GenerationSettings => {

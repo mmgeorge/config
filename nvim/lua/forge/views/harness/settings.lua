@@ -210,6 +210,23 @@ function M.open(state, host)
       if pending or not context.option then return end
       local id = context.option.id
       if commit and commit:change(id, direction or 1) then return end
+      if id == "auto-compact" or id == "compact-threshold" then
+        local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
+        if id == "auto-compact" then
+          if not (state.capability and state.capability.native_compact) then notifications.error("This provider does not support compaction", "Harness") return end
+          policy.enabled = not policy.enabled
+          configure({ auto_compaction = policy })
+        else
+          vim.ui.input({ prompt = "Compact at tokens: ", default = tostring(policy.threshold_tokens) }, function(value)
+            if not value or not state.session or state.session.id ~= session_id then return end
+            local amount = tonumber(value)
+            if not amount or amount <= 0 or amount % 1 ~= 0 then notifications.error("Enter a positive whole token count", "Harness") return end
+            policy.threshold_tokens = amount
+            configure({ auto_compaction = policy })
+          end)
+        end
+        return
+      end
       if timeout_focus[id] then
         configure({ [id] = duration.change(duration.value(active[id]), timeout_focus[id], direction or 1) })
         return
@@ -284,7 +301,9 @@ function M.open(state, host)
             .. (configuration_pending and " · Changes pending" or ""),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
-            commit_rows[1], commit_rows[2], commit_rows[3],
+            commit_rows[1], commit_rows[2], commit_rows[3], commit_rows[4],
+            { id = "auto-compact", label = "Auto compact", columns = { "Auto compact", picker_field.render(active.auto_compaction and active.auto_compaction.enabled and "On" or "Off", true), state.capability and state.capability.native_compact and (active.context_usage and active.context_usage ~= vim.NIL and "Current session · after completed turns" or "Waiting for provider context usage") or "Unavailable for this provider" } },
+            { id = "compact-threshold", label = "Compact at tokens", columns = { "Compact at tokens", picker_field.render(tostring(active.auto_compaction and active.auto_compaction.threshold_tokens or 128000), true), "Current session · provider-reported context tokens" } },
             { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
             { id = "answer_timeout", label = "Answer timeout", columns = { "Answer timeout", duration.render(duration.value(active.answer_timeout), timeout_focus.answer_timeout), "Automatically answer questions using recommended defaults · 0 disables" } },
             { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
@@ -353,9 +372,9 @@ function M.open(state, host)
         end,
       }
     end
-    commit = require("forge.views.harness.commit_configuration").new({
+    commit = require("forge.views.harness.background_configuration").new({
       backend = active.backend, session_id = session_id, host = host,
-      current = function() return M._revision == owner_revision and state.session and state.session.id == session_id end,
+      current = function() return M._revision == owner_revision and state.session ~= nil and state.session.id == session_id end,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
       reopen = function() M.open(state, host) end,
     })

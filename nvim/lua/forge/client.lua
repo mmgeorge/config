@@ -28,10 +28,16 @@ local RESERVED_METHOD = {
 ---@alias ForgeCallback fun(result?: any, error?: string, error_detail?: table)
 ---@alias ForgeSubscriber fun(event: string, payload: any, session_id?: string)
 
+---@class ForgeBackgroundSelection
+---@field model string
+---@field reasoning_effort? string
+---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
+
 ---@class ForgeTextGenerationConfig
 ---@field backend {kind: string, command: string[]}
 ---@field model string
 ---@field reasoning_effort? string
+---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
 ---@field data_root string
 
 ---@class ForgeClient
@@ -413,6 +419,10 @@ local function dispatch_message(message, timing)
   end
   if message.event == "lsp.request" or message.event == "lsp.cancel" then
     require("forge.lsp.bridge").handle(message.event, message.payload, message.session_id, client.generation)
+    return
+  end
+  if message.event == "background_error" then
+    notifications.error(message.payload and message.payload.error or "Background operation failed", "Forge Background")
     return
   end
   if message.event then
@@ -827,7 +837,7 @@ function M.request_host(method, params, callback, progress)
 end
 
 --- Resolve isolated generation launch settings without starting a provider.
----@param selection? {model: string, reasoning_effort?: string}
+---@param selection? ForgeBackgroundSelection
 ---@return ForgeTextGenerationConfig? generation
 ---@return string? failure
 function M.generation_config(selection)
@@ -839,15 +849,16 @@ function M.generation_config(selection)
   end
   local configured = harness_config.backends[backend]
   if not configured then return nil, "Unknown Harness backend: " .. tostring(backend) end
-  selection = selection or (config.options.commit_generation or {})[backend]
+  selection = selection or (config.options.background_generation or {})[backend]
   if selection and (type(selection) ~= "table" or type(selection.model) ~= "string" or vim.trim(selection.model) == "") then
-    return nil, "Invalid commit-generation model for backend: " .. backend
+    return nil, "Invalid Background-generation model for backend: " .. backend
   end
   ---@type ForgeTextGenerationConfig
   local generation = {
     backend = { kind = backend, command = vim.deepcopy(configured.command or {}) },
     model = selection and selection.model or (selected and selected.model or harness_config.model),
     reasoning_effort = selection and selection.reasoning_effort,
+    auto_compaction = selection and selection.auto_compaction,
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
   }
   return generation
@@ -856,7 +867,7 @@ end
 ---@param params table
 ---@param callback ForgeCallback
 ---@param on_model? fun(model: string) Receives the configured generation model before request dispatch.
----@param selection? {model: string, reasoning_effort?: string}
+---@param selection? ForgeBackgroundSelection
 function M.request_generation(params, callback, on_model, selection)
   local generation, failure = M.generation_config(selection)
   if not generation then callback(nil, failure) return end
@@ -864,7 +875,19 @@ function M.request_generation(params, callback, on_model, selection)
     local effort = generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or ""
     on_model(generation.model .. effort .. " (" .. generation.backend.kind .. ")")
   end
-  M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback)
+  local label = generation.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+  M.request_host("repository.generate", vim.tbl_extend("force", params, { generation = generation }), callback, function(progress)
+    local event = progress.event
+    if not on_model or type(event) ~= "table" then return end
+    if event.kind == "runtime_resolved" and event.data and event.data.model then
+      label = event.data.model .. (generation.reasoning_effort and (" · thinking " .. generation.reasoning_effort) or "")
+      on_model(label)
+    elseif event.kind == "reasoning_summary" and type(event.text) == "string" then
+      on_model(label .. "\n" .. event.text)
+    elseif event.kind == "status" and event.data and type(event.data.reasoning_summary) == "string" then
+      on_model(label .. "\n" .. event.data.reasoning_summary)
+    end
+  end)
 end
 
 ---@param action string

@@ -64,6 +64,7 @@ pub fn prepare_new_session(
         native_fork: false,
         native_compact,
         context_usage: None,
+            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
     };
     let shared = crate::settings::SettingsStore::open(data_root)?.get(&child.workspace,&child.id,&child.backend)?;
     shared.desired.apply(&mut child,native_compact)?;

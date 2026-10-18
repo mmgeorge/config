@@ -195,30 +195,34 @@ commit's immutable old and new objects. All three routes use the same native dif
 excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
 an inventory entry without a text excerpt.
 
-The Lua generation owner maintains one persistent notification per workspace and
-comparison. It shows an animated spinner, the resolved API model or configured
-Harness model, and elapsed seconds. Completion, failure, cancellation, and
-superseding requests stop the timer. Generation errors replace that notification
-even if the commit buffer was edited or closed while waiting. Failed regeneration
-preserves the prior draft. Empty or malformed successful responses fail explicitly.
-The current request returns a completed response, so the notification does not
-receive streaming provider thought summaries.
+The Lua generation owner maintains a persistent spinner with the resolved model,
+reasoning effort, elapsed time, and provider-supplied readable reasoning summaries.
+Failures remain visible after the editor buffer closes and never replace an existing draft.
+The `repository.generate` route accepts Harness configuration only. Gemini and direct
+HTTP provider selection are absent from this workflow.
 
-`commit_generation` selects an independent model and optional `reasoning_effort`
-for each Harness provider. Codex and Copilot default to `gpt-6-luna` and `low`.
-The Lua client resolves the provider separately from these generation settings,
-and the native service forwards the explicit effort into the temporary provider
-session. Generation never attaches to the active conversation or changes its
-model. Providers without an override retain the configured Harness model.
-`repository.generation_settings` reads and saves globally shared source, model,
-and thinking choices in the existing `SettingsStore` provider namespace
-`commit_generation`. Its revision check rejects concurrent stale writes. The
-host checks Gemini key availability without exposing the credential. Missing
-credentials make the effective source Harness without erasing the saved choice.
-`/config` uses the shared source picker, model picker, and field controls. Each
-generation reads the current snapshot before capturing its model settings.
-The initial `ai.adapters.use_gemini_for_commits` flag defaults to `false`; saved
-preferences take precedence. Other AI features keep their existing adapters.
+`HarnessService.background` owns persistent, tool-free Background conversations independently
+of interactive Harness initialization. The first nonempty generation creates a conversation.
+Each request captures canonical worktree identity, symbolic branch, HEAD, and the complete
+messages of the ten most recent reachable commits. Current changes remain authoritative and
+history supplies terminology rather than evidence of uncommitted changes. HEAD verification
+rejects history captured for a different revision.
+
+A Background conversation resumes while its branch and backend/model remain unchanged and
+its previous HEAD remains an ancestor. Branch changes, detached revision changes, and rewritten
+history create a new conversation while preserving the earlier timeline. An unborn branch's
+first commit counts as forward progress. Native provider IDs survive host restarts. Worktree
+admission and an operating-system ownership lock serialize work across requests and editors.
+Ownership persists through maintenance and is released after provider shutdown.
+
+`background.settings` stores revisioned per-provider model/thinking defaults and the Background
+auto-compaction policy in `SettingsStore`. Codex and Copilot default to `gpt-6-luna` with `low`
+thinking. Background compaction defaults to 128,000 retained context tokens. A session override
+uses the ordinary session settings layer. `background.timeline` reads the same durable exchanges
+through `SessionPresentation` without acquiring the provider or selecting an interactive chat.
+`:ForgeDebugBackgroundTimeline` opens that inspection view, with prior conversations accessible
+through its history selector. Provider/tool/approval availability is enforced by the Background
+execution profile, not by hiding actions in Lua.
 
 The shared prompt requests fast generation with minimal reasoning while retaining
 factual accuracy. Generated messages default to a title only. Small changes generally do not justify

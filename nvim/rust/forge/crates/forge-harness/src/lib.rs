@@ -1,3 +1,4 @@
+pub mod background;
 pub(crate) mod process;
 pub mod agent;
 pub mod backend;

@@ -595,6 +595,7 @@ async fn durable_operation_receipts_prevent_duplicate_child_tasks_before_and_aft
     broker.backend.shutdown().await?;
     drop(broker);
     let mut recovered=HarnessBroker::initialize(InitializeRequest {
+            background: None,
         backend_launch_by_provider:Default::default(),config_dir:None,data_root:data.path().to_string_lossy().into_owned(),
         permission_file:None,workspace:repository.path().to_string_lossy().into_owned(),client_id:"receipt-reopen".into(),
         backend:BackendLaunch {kind:"mock".into(),command:vec!["mock".into()]},model:"mock-model".into(),effort:"low".into(),

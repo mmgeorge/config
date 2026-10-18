@@ -215,3 +215,13 @@ grammars or queries change.
 For recorded manual checks, name the exact UI action and observed destination.
 Source-only syntax analysis, a mock LSP response, and a real project-server test
 provide different evidence and should be reported separately.
+
+## Background generation verification
+
+Run `nvim/tests/forge/background_host.lua` against the rebuilt release executable. It checks
+persistent generation without interactive Harness initialization, branch-aware rotation,
+session compaction overrides, and the read-only native timeline. The existing
+`commit_settings_host.lua` fixture checks Background defaults across fresh host processes.
+Run the `background::tests` and `compaction` filters in `forge-harness`, plus the
+`commit_message::` filter in `forge`. Provider authentication is unnecessary for these
+fixtures. Report real Codex or Copilot requests separately from mock-provider evidence.

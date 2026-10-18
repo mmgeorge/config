@@ -295,7 +295,7 @@ impl BrokerObserver {
                 .unwrap_or_else(|| session.workspace.clone());
             store.list_session(Some(&workspace))?
         };
-        Ok((serde_json::to_value(session)?, Vec::new()))
+        Ok((serde_json::to_value(session.into_iter().filter(|session| session.background.is_none()).collect::<Vec<_>>())?, Vec::new()))
     }
 
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {

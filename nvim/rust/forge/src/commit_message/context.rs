@@ -16,6 +16,7 @@ use super::excerpt::ChangedFile;
 use super::{Comparison, GenerationRequest, excerpt};
 
 pub struct CommitContext {
+    pub background: Option<forge_harness::background::BackgroundContext>,
     pub prompt: Option<String>,
     pub source_requests: usize,
     pub diff_pairs: usize,
@@ -31,6 +32,9 @@ pub async fn collect(
     syntax: &Arc<SyntaxEngine>,
     request: &GenerationRequest,
 ) -> Result<CommitContext> {
+    let background = if request.comparison == Comparison::PullRequest { None } else {
+        Some(forge_harness::background::BackgroundContext::read(store, &request.workspace).await?)
+    };
     let repository = store
         .open(PathBuf::from(&request.workspace))
         .await?
@@ -252,7 +256,13 @@ pub async fn collect(
             .saturating_sub(TextGeneration::CommitMessage.instructions().len() + header.len()));
         Some(format!("{header}{}", excerpt::prompt(&mut files, syntax, limit).await))
     };
+    let prompt = if let Some(background) = &background {
+        background.verify(store).await?;
+        prompt.map(|diff| format!("Current authoritative comparison at HEAD {} on {}. Earlier requests and generated drafts are historical, not current changes. Prior drafts do not prove a commit occurred.\n\nLast 10 reachable commits (style and terminology examples only):\n{}\nCurrent authoritative changes:\n{}",
+            background.head.as_deref().unwrap_or("unborn"), background.branch.as_deref().unwrap_or("detached HEAD"), background.history, diff))
+    } else { prompt };
     Ok(CommitContext {
+        background,
         prompt,
         source_requests,
         diff_pairs,
@@ -353,7 +363,7 @@ mod tests {
         let mut request = GenerationRequest {
             operation: "context".into(), workspace: root.to_string_lossy().into_owned(),
             comparison: Comparison::PullRequest, base: Some("main".into()), head: Some(head),
-            max_bytes: Some(4000), ignored_paths: vec![], model: None, generation: None,
+            max_bytes: Some(4000), ignored_paths: vec![], generation: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
@@ -423,8 +433,7 @@ mod tests {
                 head: None,
                 max_bytes: None,
                 ignored_paths: vec![],
-                model: None,
-                generation: None,
+                                generation: None,
             };
             for (label, comparison) in [
                 ("head", Comparison::Head),
@@ -478,8 +487,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-            model: None,
-            generation: None,
+                        generation: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
@@ -533,8 +541,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-            model: None,
-            generation: None,
+                        generation: None,
         };
         let mut pending = Box::pin(collect(&store, &diff, &syntax, &request));
         let before_release =
@@ -586,8 +593,7 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec!["excluded.txt".into()],
-            model: None,
-            generation: None,
+                        generation: None,
         };
         let prompt = collect(&store, &diff, &syntax, &request)
             .await
