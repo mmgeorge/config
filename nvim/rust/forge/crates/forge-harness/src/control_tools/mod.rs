@@ -62,7 +62,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name:"agent_followup",
-                description:"Admit another task into an existing child's retained conversation. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history.",
+                description:"Admit another task into an existing child's retained conversation while its profile is enabled. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history. Current session delegation and profile settings govern every new task.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
             },
             ControlToolDefinition {

@@ -16,6 +16,13 @@ local function snapshot(document, text, editable)
     } or {} } } } }
 end
 local owner
+local prompt_submission = require("forge.views.harness.prompt_submission")
+local session_state = { session = { id = "test-session" } }
+local function submit(callback)
+  local context, failure = owner.capture_prompt()
+  assert(context, failure)
+  prompt_submission.start(session_state, { text = "", context = context }, callback)
+end
 local ok, failure = xpcall(function()
   local transcript = vim.api.nvim_create_buf(false, true)
   local composer = vim.api.nvim_create_buf(false, true)
@@ -51,13 +58,13 @@ local ok, failure = xpcall(function()
   owner.follow_tail()
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit agent action did not follow the tail")
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
-  owner.submit(function() end)
+  submit(function() end)
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
   local submission = requests[3]
   assert(submission.method == "prompt.submit" and submission.params.text == "first typed prompt")
   assert(submission.params.submission.document == opened.document and not submission.params.composer)
   local function transition(state, token)
-    return owner.receive({ kind = "prompt_submission", data = { document = opened.document,
+    return prompt_submission.receive(session_state, { kind = "prompt_submission", data = { document = opened.document,
       token = token or submission.params.submission.token, state = state } })
   end
   assert(not transition("accepted", 99), "stale acceptance cleared a draft")
@@ -67,7 +74,7 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "first typed prompt")
   submission.callback(nil, "turn_retracted")
 
-  owner.submit(function() end)
+  submit(function() end)
   submission = requests[#requests]
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "newer draft", "λ" })
   assert(transition("accepted"))
@@ -76,7 +83,7 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "retraction overwrote newer typing")
   submission.callback(nil, "turn_retracted")
 
-  owner.submit(function() end)
+  submit(function() end)
   submission = requests[#requests]
   assert(submission.params.text == "newer draft\nλ", "submission lost multiline Unicode text")
   assert(transition("accepted"))
@@ -86,28 +93,37 @@ local ok, failure = xpcall(function()
   submission.callback(nil, "turn_retracted")
 
   local cancellation
-  owner.submit(function(_, _, detail) cancellation = detail end)
+  submit(function(_, _, detail) cancellation = detail end)
   submission = requests[#requests]
   submission.callback(nil, "interrupted", { code = "turn_cancelled" })
   assert(cancellation and cancellation.code == "turn_cancelled", "composer dropped structured cancellation")
-  owner.submit(function() end)
+  submit(function() end)
   submission = requests[#requests]
   submission.callback(nil, "admission failed")
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance", "failure lost the draft")
   local request_count = #requests
-  for _, source in ipairs({ { " " }, { string.rep("x", 65537) }, vim.fn["repeat"]({ "row" }, 4097) }) do
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { " " })
+  local rejected
+  submit(function(result, submission_error) rejected = not result and submission_error end)
+  assert(rejected and #requests == request_count, "blank draft reached Rust")
+  for _, source in ipairs({ { string.rep("x", 65537) }, vim.fn["repeat"]({ "row" }, 4097) }) do
     vim.api.nvim_buf_set_lines(composer, 0, -1, false, source)
-    local rejected
-    owner.submit(function(result, submission_error) rejected = not result and submission_error end)
-    assert(rejected and #requests == request_count, "invalid draft reached Rust")
+    submit(function() end)
+    local large_submission = requests[#requests]
+    assert(large_submission.params.text == table.concat(source, "\n"), "valid draft was truncated")
+    large_submission.callback({})
   end
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft at close" })
-  owner.submit(function() error("closed presentation delivered a late callback") end)
+  local completed_after_close = 0
+  submit(function() completed_after_close = completed_after_close + 1 end)
   submission = requests[#requests]
   assert(owner.close())
   assert(requests[#requests].params.operation == "close")
   assert(not transition("accepted"), "closed presentation accepted a late submission event")
   submission.callback({})
+  submission.callback({})
+  assert(completed_after_close == 1 and not session_state.prompt_submission,
+    "presentation close discarded or duplicated request completion")
   assert(not vim.api.nvim_buf_is_valid(composer), "closing the workspace retained its owned composer buffer")
 
   transcript = vim.api.nvim_create_buf(false, true)

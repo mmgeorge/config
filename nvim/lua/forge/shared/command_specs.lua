@@ -147,7 +147,7 @@ M.view_specs = {
     { id = "save", label = "save / ask", desc = "Save feedback and answer new plan questions", modes = { "n", "i" }, pinned = true },
     { id = "delete", label = "delete", desc = "Delete the plan comment under the cursor", modes = "n", pinned = true },
     { id = "delete_tests", label = "delete tests/checks", desc = "Delete selected planned tests or disable selected checks", modes = "x", visual = true, pinned = false },
-    { id = "accept", label = "accept", desc = "Approve the exact saved declaration design", modes = "n", pinned = true },
+    { id = "accept", label = "accept", desc = "Approve the exact saved declaration design with an optional comment", modes = "n", pinned = true },
     { id = "request_changes", label = "changes", desc = "Request a semantic revision from review comments", modes = "n", pinned = true },
     { id = "abort_plan", label = "abort plan", desc = "Abort this active plan and exit Plan mode", modes = "n", pinned = true },
     { id = "close", label = "close", desc = "Return to Harness without deciding", modes = "n", pinned = true },

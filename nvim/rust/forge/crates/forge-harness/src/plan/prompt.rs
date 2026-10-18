@@ -101,9 +101,9 @@ Review comments:
             PlanExecutionPromptKind::ResumeAfterInterruption => "Resume the same Execute task after interruption. Preserve its plan, accepted revision, and phase. Inspect current files, completed tool results, and any background commands before retrying unfinished work. Do not assume interruption rolled back changes or stopped a command.",
         };
         format!(
-            "{continuation}\nExecution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nAccepted semantic design:\n{}",
+            "{continuation}\nExecution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nReviewer approval comments (context only, not plan edits):\n{}\nAccepted semantic design:\n{}",
             execution.id, execution.plan_id, execution.instructions(),
-            execution.findings.join("\n"), document_json
+            execution.findings.join("\n"), execution.approval_comments.join("\n"), document_json
         )
     }
 

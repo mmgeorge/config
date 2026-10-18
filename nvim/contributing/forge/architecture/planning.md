@@ -466,9 +466,11 @@ line/body input, then Rust resolves every line to its exact semantic target befo
 read-only revision turn. That revision interaction names the overall comment when present and otherwise stays
 `Request plan changes`. The durable `ChangesRequested` record remains state-machine history but
 does not create a duplicate timeline node. PlanReview admits only one acceptance or revision request
-at a time. Once the reviewer commits `oY` or confirms an `oN` comment, it destroys the physical
-Markdown buffer immediately and restores the originating Harness window while the broker request
-continues. Failed revision requests preserve the Lua annotation cache so `op` can rebuild the review
+at a time. Both `oY` and `oN` open an optional-comment popup. `Enter` or `Ctrl-S` submits in normal
+or insert mode, while `Esc` or `Ctrl-C` cancels without sending a decision. Submission checks that
+the plan and review buffer still match the captured revision, then hides the review and restores
+the originating Harness window while the broker request continues. Failed revision requests preserve
+the Lua annotation cache so `op` can rebuild the review
 surface. Acceptance creates durable `PlanAcceptance` input in Rust and reuses the Harness multi-page
 question picker for provider-context reuse and execution authorization. Dismissing that picker
 cancels pending acceptance and restores plan-review status. Rust attaches one collapsed
@@ -481,6 +483,11 @@ retain an `ExchangeAnchor` containing the owning exchange ID and a boundary in i
 source node sequence. `TimelineProjector` inserts their content as `ExchangeNode::PlanEvent`
 inside that exchange. The timeline has no separate plan lifecycle, execution, or resolution
 container. Live provider replacement preserves these derived nodes at their captured positions.
+An optional acceptance comment is stored on `PlanAcceptance` until all acceptance questions resolve,
+then copied to the accepted lifecycle record and execution history without changing the plan digest
+or design. Initial and revised execution prompts and live revision responses include these notes as
+reviewer context. Revised execution state and its acceptance lifecycle record commit in one storage
+transaction, so retry cannot observe one without the other.
 Question answers and withdrawals retain the matching question identity and place its resolved
 details at the response boundary.
 The collapsed clarification row retains the question, options, and response, without duplicating

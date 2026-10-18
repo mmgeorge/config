@@ -2,6 +2,7 @@ vim.loader.enable(false)
 local config = require("forge.infra.config")
 local keymaps = require("forge.shared.keymaps")
 local commands = require("forge.views.harness.controller").command_set()
+local composer_commands = require("forge.views.harness.controller").composer_command_set()
 local original = vim.deepcopy(config.options.keymaps.harness)
 local buffer = vim.api.nvim_create_buf(false, true)
 local ok, failure = xpcall(function()
@@ -24,11 +25,11 @@ local ok, failure = xpcall(function()
   config.options.keymaps.harness.help = original.help
   local function display(state, width)
     return vim.api.nvim_eval_statusline(keymaps.render_hintbar(
-      keymaps.view_hint_entries("harness", commands, state, "composer"), width or 140),
+      keymaps.view_hint_entries("harness", composer_commands, state, "composer"), width or 140),
       { use_winbar = true, maxwidth = width or 140 }).str
   end
   assert(display({}):find("<C-s> submit", 1, true))
-  assert(display({}):find("? help (normal)", 1, true))
+  assert(not display({}):find("help", 1, true))
   assert(not display({}):find("q close", 1, true))
   assert(not display({}):find("edit queued", 1, true))
   local busy = { busy = true, capability = { native_steer = true }, queue = { "next" } }
@@ -54,14 +55,14 @@ local ok, failure = xpcall(function()
   text = display(busy)
   assert(text:find("<F5> submit", 1, true))
   assert(not text:find("<C-q>", 1, true))
-  keymaps.setup_view_keymaps(buffer, "harness", commands)
+  keymaps.setup_view_keymaps(buffer, "harness", composer_commands)
   vim.api.nvim_buf_call(buffer, function()
     assert(vim.fn.maparg("q", "n", false, true).buffer ~= 1)
     assert(vim.fn.maparg("<F5>", "i", false, true).buffer == 1)
     assert(vim.fn.maparg("<C-s>", "i", false, true).buffer ~= 1)
     assert(vim.fn.maparg("<C-q>", "i", false, true).buffer ~= 1)
   end)
-  require("forge.shared.view_command_set").unregister(commands, "submit")
+  require("forge.shared.view_command_set").unregister(composer_commands, "submit")
   assert(not display(busy):find("<F5>", 1, true), "hint advertised an unregistered action")
   local escaped = keymaps.render_hintbar({ { id = "help", key = "%", label = "100% help" } }, 80)
   assert(vim.api.nvim_eval_statusline(escaped, { use_winbar = true, maxwidth = 80 }).str:find("% 100% help", 1, true))

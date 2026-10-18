@@ -21,6 +21,7 @@ local session_navigation = require("forge.views.harness.session_navigation")
 local task_control = require("forge.views.harness.task")
 local queue_editor = require("forge.views.harness.queue_editor")
 local attachment = require("forge.views.harness.attachment")
+local prompt_submission = require("forge.views.harness.prompt_submission")
 local tabline = require("forge.views.harness.tabline")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
@@ -598,7 +599,7 @@ local function on_event(event, payload)
       state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
       M.refresh_winbar()
     elseif payload.kind == "prompt_submission" then
-      if state.presentation then state.presentation.receive(payload) end
+      prompt_submission.receive(state, payload)
     elseif payload.kind == "approval_requested" then
       if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
@@ -938,7 +939,13 @@ end
 ---@param text string
 begin_request = function(text, from_composer, attachments)
   local state = harness_state()
-  if from_composer then attachments = attachment.capture(state.composer_buf).attachments end
+  local context
+  if from_composer then
+    local failure
+    if state.presentation then context, failure = state.presentation.capture_prompt()
+    else failure = "Harness composer is not ready" end
+    if not context then notifications.error(failure, "ForgeHarness") return end
+  end
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
@@ -948,8 +955,6 @@ begin_request = function(text, from_composer, attachments)
     state.goal = { objective = goal_objective, state = "active" }
   end
   M.render()
-  local method = "prompt.submit"
-  local params = { text = text, attachments = attachments or {} }
   local function receive(result, request_error, error_detail)
     if finish_execution(request_error, error_detail) then return end
     state.cancel_requested = false
@@ -973,10 +978,7 @@ begin_request = function(text, from_composer, attachments)
     end
     synchronize_state(M.drain)
   end
-  if from_composer then
-    if state.presentation then state.presentation.submit(receive)
-    else receive(nil, "Harness composer is not ready") end
-  else client.request(method, params, receive) end
+  prompt_submission.start(state, { text = text, attachments = attachments, context = context }, receive)
 end
 
 ---@return nil
@@ -2553,6 +2555,22 @@ function M.attach_transcript(buf)
   keymaps.setup_view_keymaps(buf, "harness", state.command_set)
 end
 
+---Keep timeline navigation out of the editable prompt's command bindings.
+---@return ForgeViewCommandSet
+function M.composer_command_set()
+  local set = M.command_set()
+  local controls = {
+    submit = true, queue = true, steer = true, cancel = true, edit_queued = true,
+    toggle_mode = true, effort_down = true, effort_up = true,
+  }
+  for _, id in ipairs(vim.deepcopy(set.order)) do
+    if not controls[id] then command_set.unregister(set, id) end
+  end
+  command_set.register(set, "history_previous", prompt_history.previous)
+  command_set.register(set, "history_next", prompt_history.next)
+  return set
+end
+
 function M.attach()
   local state = harness_state()
   local composer_buffer = state.composer_buf
@@ -2579,12 +2597,7 @@ function M.attach()
   if client.host_accepting() then state.host_error = nil end
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
-  local composer_command_set = M.command_set()
-  command_set.unregister(composer_command_set, "visual_line_with_gutter")
-  command_set.unregister(composer_command_set, "open_timeline")
-  command_set.register(composer_command_set, "history_previous", prompt_history.previous)
-  command_set.register(composer_command_set, "history_next", prompt_history.next)
-  keymaps.setup_view_keymaps(state.composer_buf, "harness", composer_command_set)
+  keymaps.setup_view_keymaps(state.composer_buf, "harness", M.composer_command_set())
   require("forge.views.harness.workspace").attach(state)
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end

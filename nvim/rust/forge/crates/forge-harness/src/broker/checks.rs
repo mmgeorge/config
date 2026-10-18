@@ -38,7 +38,7 @@ impl HarnessBroker {
                 goal.state = GoalState::Blocked;
                 goal.updated_at_ms = self.clock.now_ms();
                 self.store
-                    .save_execution_transition(&execution, &goal, None, None)?;
+                    .save_execution_transition(&execution, &goal, None, None, None)?;
                 if let Some(run) = execution.check_runs.last().cloned() {
                     self.publish_check_run(&mut execution, &run, &mut Vec::new())
                         .await?;
@@ -281,7 +281,7 @@ impl HarnessBroker {
         goal.updated_at_ms = self.clock.now_ms();
         Self::save_run(&mut execution, &run);
         self.store
-            .save_execution_transition(&execution, &goal, None, None)?;
+            .save_execution_transition(&execution, &goal, None, None, None)?;
         self.settle_task(None)?;
         self.publish_check_run(&mut execution, &run, &mut events)
             .await?;

@@ -78,8 +78,11 @@ local success, failure = xpcall(function()
   assert(rendered:find("Inspect [Image #1]", 1, true) and not rendered:find("forge-attachment", 1, true),
     "attachment metadata was visible on the editor grid: " .. rendered)
 
-  vim.api.nvim_win_set_cursor(state.composer_win, { 1, 10 })
-  vim.api.nvim_feedkeys("yiA", "xt", false)
+  local selected = attachment.capture(state.composer_buf).attachments[1]
+  vim.api.nvim_win_set_cursor(state.composer_win, { 1, selected.start })
+  vim.cmd("normal! v")
+  vim.api.nvim_win_set_cursor(state.composer_win, { 1, selected["end"] - 1 })
+  vim.api.nvim_feedkeys("y", "xt", false)
   local image_reference = vim.fn.getreg('"')
   assert(image_reference == "[Image #1]", "yank copied non-text payload")
   state.busy = true

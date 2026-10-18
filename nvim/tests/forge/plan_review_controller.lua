@@ -81,6 +81,16 @@ local success, failure = xpcall(function()
     local _, first = review.owner.replica.sequence:position(id)
     return review.owner.replica.physical_row(first + (offset or 0))
   end
+  local function answer_decision(comment, key)
+    local decision_win = vim.api.nvim_get_current_win()
+    local decision_buf = vim.api.nvim_win_get_buf(decision_win)
+    vim.api.nvim_buf_set_lines(decision_buf, 0, -1, false, vim.split(comment, "\n", { plain = true }))
+    local mapping_list = vim.api.nvim_buf_get_keymap(decision_buf, "n")
+    for _, mapping in ipairs(mapping_list) do
+      if mapping.lhs == key then mapping.callback() return end
+    end
+    error("missing decision mapping " .. key)
+  end
   assert(closed("plan:file-tree:1"), "file tree did not start closed")
   assert(not closed("plan:section:foundation"), "stage hid task headings")
   assert(closed("plan:design:1"), "task did not start closed")
@@ -139,7 +149,32 @@ local success, failure = xpcall(function()
   assert(detached.closed and review.owner ~= detached and review.owner.attached(),
     "reopening detached review did not establish a fresh native attachment")
   review.command_set.action_by_id.accept.run({})
-  assert(pending and pending.params.review.document == review.owner.document and pending.params.digest == nil)
+  answer_decision("", "<Esc>")
+  assert(not pending and not state.busy, "cancelling the decision sent an RPC")
+
+  review.command_set.action_by_id.accept.run({})
+  local captured_digest = review.plan.review_digest
+  review.plan.review_digest = "changed-while-popup-open"
+  answer_decision("stale comment", "<CR>")
+  assert(not pending and not state.busy, "stale review digest sent an RPC")
+  review.plan.review_digest = captured_digest
+
+  review.command_set.action_by_id.accept.run({})
+  local original_get_changedtick = vim.api.nvim_buf_get_changedtick
+  vim.api.nvim_buf_get_changedtick = function(buffer)
+    local changedtick = original_get_changedtick(buffer)
+    return buffer == review.buf and changedtick + 1 or changedtick
+  end
+  local decision_ok, decision_failure = pcall(answer_decision, "stale tick comment", "<CR>")
+  vim.api.nvim_buf_get_changedtick = original_get_changedtick
+  assert(decision_ok, decision_failure)
+  assert(not pending and not state.busy, "stale changedtick sent an RPC")
+
+  review.command_set.action_by_id.accept.run({})
+  assert(not pending, "approval dispatched before the decision popup was answered")
+  answer_decision("Approved after review", "<CR>")
+  assert(pending and pending.params.comment == "Approved after review"
+    and pending.params.review.document == review.owner.document and pending.params.digest == nil)
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
   pending.callback({ session = { id = "plan-session" }, active_plan = { acceptance = {} } })
   assert(activated and state.plan_review == nil and not state.busy)
@@ -152,17 +187,15 @@ local success, failure = xpcall(function()
   native.open(review.plan)
   review = state.plan_review
   review.command_set.action_by_id.accept.run({})
+  answer_decision("", "<CR>")
   pending.callback({ session = { id = "plan-session" }, active_plan = { state = "accepted", acceptance = vim.NIL },
     goal_execution = { state = "paused" } })
   assert(execution == nil and state.plan_review == nil,
     "revision approval overrode the backend pause with an execute request")
   native.open(review.plan)
   review = state.plan_review
-  local popup = require("forge.infra.popup_window")
-  local original_input = popup.input
-  popup.input = function(_, callback) callback("Please revise") end
   review.command_set.action_by_id.request_changes.run({})
-  popup.input = original_input
+  answer_decision("Please revise", "<C-s>")
   assert(pending.method == "plan.request_changes" and pending.params.comment == "Please revise")
   assert(state.plan_review == review and not review.owner.closed, "revision closed before its capture completed")
   pending.callback(nil, "revision rejected")
@@ -173,6 +206,7 @@ local success, failure = xpcall(function()
   review = state.plan_review
   review.owner.saving = true
   review.command_set.action_by_id.accept.run({})
+  answer_decision("", "<CR>")
   assert(review.owner.pending_operation and state.busy)
   generation = 2
   native.open(review.plan)

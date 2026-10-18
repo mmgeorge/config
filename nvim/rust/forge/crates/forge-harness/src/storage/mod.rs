@@ -672,8 +672,8 @@ impl SqliteStore {
         )
     }
 
-    /// Commit execution state with its goal, accepted revision, and owning phase result.
-    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>, exchange: Option<&Exchange>) -> Result<()> {
+    /// Atomically commits execution state, its goal and optional plan, exchange, and lifecycle event.
+    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>, exchange: Option<&Exchange>, lifecycle: Option<&PlanLifecycleRecord>) -> Result<()> {
         let mut execution_payload = serde_json::to_value(execution)?;
         execution_payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
         let mut rows = vec![("plan_execution_record", execution.id.as_str(), execution_payload),
@@ -682,6 +682,12 @@ impl SqliteStore {
             let mut payload = serde_json::to_value(plan)?;
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
             rows.push(("plan_record", plan.id.as_str(), payload));
+        }
+        if let Some(lifecycle) = lifecycle {
+            anyhow::ensure!(lifecycle.session_id == execution.session_id, "lifecycle belongs to another conversation");
+            let mut payload = serde_json::to_value(lifecycle)?;
+            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+            rows.push(("plan_lifecycle_record", lifecycle.id.as_str(), payload));
         }
         let transaction = self.connection.transaction()?;
         if let Some(exchange) = exchange {

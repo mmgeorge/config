@@ -116,6 +116,10 @@ preserving queued follow-ups. If the active turn cannot accept it, the text join
 the follow-up queue and Harness shows a warning.
 Queued prompts and pending steering appear below the status in the upper timeline
 pane. The lower prompt buffer contains only the draft being edited.
+The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
+adds submission, queueing, steering, cancellation, mode, and effort controls there.
+Use `Alt-Up` and `Alt-Down` for prompt history. Timeline folding, navigation, help,
+and close shortcuts remain in the upper pane.
 
 `M-s` edits the newest queued prompt in place. Repeating it moves backward through
 the queue without changing message order. Earlier messages may execute, but the
@@ -131,8 +135,8 @@ their existing behavior. Clipboard image pixels are not read.
 
 An import keeps the path visible while copying the file asynchronously, then
 replaces it with `[Image #1]`, `[PDF #2]`, or `[File #3]`. The marker retains a
-separate typed file object. `yiA` copies the entire attachment and `diA` cuts it.
-Paste that object elsewhere in the draft with `p` or `P`. Full-line and visual
+separate typed file object. Copy or cut its complete label with your usual text
+selection and editing commands, then paste it elsewhere in the draft. Full-line and visual
 copies that include the complete label also retain its attachment state. Typing
 the visible label creates ordinary text. Undo, prompt history, and queued-message
 editing preserve complete references. Moving or deleting the original file after
@@ -197,6 +201,11 @@ Declaration navigation never opens a popup.
 While a planning response is running, follow-up instructions can revise and resubmit the plan
 in that same response. A later edit requires a new submission before review. Submission never
 authorizes implementation.
+Approving a plan and requesting changes both open an optional-comment popup. Press
+`Enter` or `Ctrl-S` in normal or insert mode to submit, including an empty comment.
+`Esc` or `Ctrl-C` cancels the decision. Approval comments remain with the accepted
+revision and are included in execution context. A plan changed while its popup is
+open must be reviewed again before the decision can be submitted.
 Save pending annotations before a definition jump that changes the projection.
 `Constructs` lists directly instantiated types in green and factory calls with function highlighting.
 Factories are identified by their owned named return type. `Calls` lists other invocations and

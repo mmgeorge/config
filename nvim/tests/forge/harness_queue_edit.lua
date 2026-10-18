@@ -2,6 +2,10 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
+local submission = require("forge.views.harness.prompt_submission")
+submission.start = function(_, prompt, callback)
+  client.request("prompt.submit", { text = prompt.text, attachments = prompt.attachments or {} }, callback)
+end
 local history = require("forge.views.harness.prompt_history")
 local notifications = require("forge.infra.notifications")
 local requests, warnings = {}, {}

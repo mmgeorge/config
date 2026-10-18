@@ -1691,7 +1691,11 @@ impl HarnessBroker {
                 self.save_session()?;
                 let saved_source = action.get("saved_source_digest").cloned().or_else(|| plan.acceptance.as_ref()
                     .and_then(|acceptance| acceptance.saved_source_digest.as_ref()).map(|digest| json!(digest)));
-                self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"execution_mode":self.session.default_write_permission,"saved_source_digest":saved_source})).await
+                let comment = action.get("comment").and_then(Value::as_str)
+                    .map(str::trim).filter(|comment| !comment.is_empty()).map(|comment| json!(comment))
+                    .or_else(|| plan.acceptance.as_ref()
+                        .and_then(|acceptance| acceptance.overall_comment.as_ref()).map(|comment| json!(comment)));
+                self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"execution_mode":self.session.default_write_permission,"saved_source_digest":saved_source,"comment":comment})).await
             }
             "attach_plan" => {
                 let plan_id = required_text(&action, "plan_id")?;
@@ -1902,9 +1906,15 @@ impl HarnessBroker {
                 if root.model == "default" && let Some(model) = &self.session.resolved_model {root.model = model.clone();}
                 let selection = self.agent_backend_factory.resolve(&root,
                     crate::backend::BackendKind::parse(&self.session.backend)?, spawn).await?;
+                anyhow::ensure!(request.source != AgentSource::Model || self.agent_coordinator.enabled(), "model-facing subagent tools are disabled");
+                self.agent_backend_factory.profiles.resolve(Some(&selection.profile))?;
                 self.agent_coordinator.reserve_spawn(&request, spawn, selection, &admitted_parent.id, self.clock.now_ms())?
             }
-            AgentOperation::Followup { target, message } => self.agent_coordinator.reserve_followup(&request, target, message, &admitted_parent.id, self.clock.now_ms())?,
+            AgentOperation::Followup { target, message } => {
+                let agent = self.agent_coordinator.resolve(target)?;
+                self.agent_backend_factory.profiles.resolve(Some(&agent.definition))?;
+                self.agent_coordinator.reserve_followup(&request, target, message, &admitted_parent.id, self.clock.now_ms())?
+            }
             _ => unreachable!(),
         };
         let persisted = (|| -> Result<()> {
@@ -6091,6 +6101,8 @@ Planning continuation: turn {} of {}.",
             .review_digest
             .clone()
             .context("submitted plan digest is missing")?;
+        let overall_comment = params.get("comment").and_then(Value::as_str)
+            .map(str::trim).filter(|comment| !comment.is_empty()).map(str::to_owned);
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == review_digest,
@@ -6112,14 +6124,25 @@ Planning continuation: turn {} of {}.",
             execution.revision_history.push(crate::plan::execution::ExecutionRevision {
                 revision: execution.revision, reason: execution.pending_revision_reason.take().unwrap(), approval: "user".into(), recorded_at_ms: self.clock.now_ms(),
             });
+            if let Some(comment) = overall_comment.clone() { execution.approval_comments.push(comment); }
             execution.progress = Default::default();
             let resume = execution.review_paused;
             execution.review_paused = false;
             if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision accepted".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
-            let mut events = vec![self.event("plan_accepted", json!({"plan":plan,"execution":execution}))?];
+            let lifecycle = PlanLifecycleRecord {
+                title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
+                id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
+                kind: PlanLifecycleKind::Accepted, model_revision: plan.model_revision, user_revision: plan.user_revision,
+                overall_comment: overall_comment.clone(), annotation: Vec::new(), question: None, answer: None,
+                created_at_ms: self.clock.now_ms(),
+            };
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, Some(&lifecycle))?;
+            let mut events = vec![self.event("backend_event", json!({
+                "kind":"timeline_plan_lifecycle", "data":{"kind":"plan_lifecycle", "id":lifecycle.id,
+                    "created_at_ms":lifecycle.created_at_ms, "plan":&plan, "lifecycle":&lifecycle}
+            }))?, self.event("plan_accepted", json!({"plan":plan,"lifecycle":lifecycle,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
@@ -6140,6 +6163,7 @@ Planning continuation: turn {} of {}.",
         }
         let mut events = self.select_review_task(&plan).await?;
         acceptance.saved_source_digest = Some(reviewed.saved_digest);
+        acceptance.overall_comment = overall_comment;
         plan.acceptance = Some(acceptance);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
@@ -6317,6 +6341,7 @@ Planning continuation: turn {} of {}.",
             "digest": acceptance.review_digest,
             "saved_source_digest": acceptance.saved_source_digest,
             "execution_mode": execution_mode,
+            "comment": acceptance.overall_comment,
         }))
         .await
     }
@@ -6356,6 +6381,8 @@ Planning continuation: turn {} of {}.",
             .review_digest
             .clone()
             .context("submitted plan digest is missing")?;
+        let overall_comment = params.get("comment").and_then(Value::as_str)
+            .map(str::trim).filter(|comment| !comment.is_empty()).map(str::to_owned);
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == digest,
@@ -6414,7 +6441,7 @@ Planning continuation: turn {} of {}.",
             kind: PlanLifecycleKind::Accepted,
             model_revision: plan.model_revision,
             user_revision: plan.user_revision,
-            overall_comment: None,
+            overall_comment: overall_comment.clone(),
             annotation: Vec::new(),
             question: None,
             answer: None,
@@ -6449,7 +6476,7 @@ Planning continuation: turn {} of {}.",
             revision: plan.model_revision, generation: 0, planning_backend_session_id,
             execution_backend_session_id: self.session.backend_session_id.clone(),
             lifecycle: Vec::new(), findings: Vec::new(), progress: Default::default(),
-            verification: Vec::new(), check_runs: Vec::new(), revision_history: Vec::new(), pending_revision_reason: None,
+            verification: Vec::new(), check_runs: Vec::new(), revision_history: Vec::new(), approval_comments: overall_comment.iter().cloned().collect(), pending_revision_reason: None,
             review_paused: false, observed_source: Default::default(), observed_generation: 0,
             observed_check: Default::default(), created_at_ms: execution_created_at_ms, completed_at_ms: None,
         };
@@ -6619,7 +6646,7 @@ Planning continuation: turn {} of {}.",
             execution.generation += 1;
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision changes requested".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
             let mut events = vec![self.event("plan_changes_requested", json!({"plan":plan,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
@@ -6699,7 +6726,7 @@ Planning continuation: turn {} of {}.",
             execution.generation += 1;
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision rejected".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
             let mut events = vec![self.event("plan_revision_rejected", json!({"plan":plan,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
@@ -9222,22 +9249,29 @@ mod test {
         initialize.session_id = Some(session_id);
         let mut broker = HarnessBroker::initialize_with_clock(initialize,Box::new(FixedClock(200))).unwrap();
         assert_eq!(broker.snapshot().unwrap().active_plan.as_ref().unwrap().state,PlanState::AwaitingReview);
-        let result = broker.dispatch(Request { id:3,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest}) }).await;
+        let result = broker.dispatch(Request { id:3,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest,"comment":"  \n "}) }).await;
         assert!(result.response.error().is_none(),"{:?}",result.response.error());
-        assert!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.is_some());
+        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.unwrap().overall_comment, None);
+        let reviewer_comment = "Preserve the public API name during execution";
+        let result = broker.dispatch(Request { id:4,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest,"comment":reviewer_comment}) }).await;
+        assert!(result.response.error().is_none(),"{:?}",result.response.error());
+        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.unwrap().overall_comment.as_deref(), Some(reviewer_comment));
         let planning_exchange_id = broker.store.list_exchange(&broker.session.id).unwrap()
             .last().unwrap().id.clone();
         broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 2 });
-        let result = broker.dispatch(Request { id:4, method:"plan.accept".into(), params:json!({"plan_id":revised.id,"digest":revised.review_digest,"execution_mode":"write"}) }).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
-        assert_eq!(result.response.result().unwrap()["manual_changes"], json!(revised.manual_changes));
+        let result = broker.transition_task(json!({"action":"execute","plan_id":revised.id,"digest":revised.review_digest,"comment":null})).await;
+        let (result, _) = result.unwrap();
+        assert_eq!(result["manual_changes"], json!(revised.manual_changes));
         let snapshot = broker.snapshot().unwrap();
         let acceptance = broker.store.list_plan_lifecycle(&broker.session.id).unwrap()
             .into_iter().find(|event| event.kind == PlanLifecycleKind::Accepted).unwrap();
+        assert_eq!(acceptance.overall_comment.as_deref(), Some(reviewer_comment));
         assert_ne!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
         assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
         assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Checking);
         let execution_id = snapshot.goal_execution.unwrap().id;
+        let persisted_execution = broker.store.load_plan_execution(&execution_id).unwrap().unwrap();
+        assert_eq!(persisted_execution.approval_comments, [reviewer_comment]);
         broker.pause_goal().await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
         let mut resumed = InitializeRequest {
@@ -9258,6 +9292,7 @@ mod test {
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(resumed, Box::new(FixedClock(400))).unwrap();
         let recovered = broker.snapshot().unwrap().goal_execution.unwrap();
+        assert_eq!(recovered.approval_comments, [reviewer_comment]);
         assert_eq!(recovered.phase, crate::plan::PlanPhase::Resolve);
         assert_eq!(recovered.state, PlanExecutionState::Paused);
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
@@ -9500,6 +9535,10 @@ mod test {
             assert!(!runtime.execution_finished(), "revision review must retain the provider turn");
             let response: Value = serde_json::from_str(&result.message)?;
             assert!(response.get("document").is_none(), "internal canonical source must not inflate tool output");
+            if response["plan_state"] == "accepted" && response["revision"] == 2 {
+                assert_eq!(response["approval_comments"], json!(["Keep this approved scope"]),
+                    "live plan_submit response must include the accepted reviewer note");
+            }
             let read = runtime.invoke(ControlToolInvocation { name:"plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
             let state: Value = serde_json::from_str(&read.message)?;
             assert_eq!(state["execution"]["generation"], response["generation"], "the next tool must use the reviewed generation");
@@ -9681,12 +9720,18 @@ mod test {
                 assert!(review.decide(HarnessMethod::PlanAcceptanceBegin,
                     json!({"plan_id":plan.id,"digest":"stale"})).await.is_err());
                 let (method, params) = match decision {
-                    "accept" => (HarnessMethod::PlanAcceptanceBegin, json!({"plan_id":plan.id})),
+                    "accept" => (HarnessMethod::PlanAcceptanceBegin, json!({"plan_id":plan.id,"comment":"Keep this approved scope"})),
                     "reject" => (HarnessMethod::PlanCancel, json!({"plan_id":plan.id})),
                     _ => (HarnessMethod::PlanRequestChanges, json!({"plan_id":plan.id,"comment":"Retain the approved scope"})),
                 };
                 let (_, events) = review.decide(method, params).await.unwrap().unwrap();
                 assert!(events.iter().all(|event| event.event != "goal_continue_requested"));
+                if decision == "accept" {
+                    assert!(events.iter().any(|event| event.event == "backend_event"
+                        && event.payload["data"]["lifecycle"]["overall_comment"] == "Keep this approved scope"));
+                    assert!(events.iter().any(|event| event.event == "plan_accepted"
+                        && event.payload["lifecycle"]["overall_comment"] == "Keep this approved scope"));
+                }
             };
             let (accepted, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 tokio::join!(broker.continue_goal(), decide)
@@ -9698,6 +9743,11 @@ mod test {
             let execution = broker.snapshot().unwrap().goal_execution.unwrap();
             assert!(execution.pending_revision_reason.is_none());
             assert_eq!(execution.revision, if decision == "accept" { 2 } else { 1 });
+            if decision == "accept" {
+                let response = broker.revision_review_response(&execution.id).unwrap();
+                assert_eq!(response["approval_comments"], json!(["Keep this approved scope"]));
+                assert_eq!(execution.revision_history.last().unwrap().approval, "user");
+            }
             let rendered = timeline_text(&broker.snapshot().unwrap());
             assert!(rendered.contains("Plan revision requested"), "{rendered}");
             assert!(!rendered.contains("Plan implementation continued"), "{rendered}");

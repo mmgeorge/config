@@ -1980,6 +1980,73 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn hidden_parallel_tool_output_stays_cached_until_group_expansion() -> Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use serde_json::{json, Value};
+        let mut value = serde_json::to_value(interaction_entry("parallel"))?;
+        value["exchange"]["state"] = json!("running");
+        value["exchange"]["completed_at_ms"] = Value::Null;
+        value["exchange"]["execution_started_at_ms"] = json!(1);
+        value["exchange"]["turn"][0]["state"] = json!({"kind":"running"});
+        value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = json!("inProgress");
+        value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = Value::Null;
+        let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
+        let mut event = BackendEvent {
+            received_at_ms: None, address: Some(ProviderAddress { owner: None,
+                thread_id: "thread".into(), turn_id: "parallel".into() }),
+            turn_boundary: None, kind: "tool".into(), text: None, data: Value::Null,
+            summary: None, task_update: None,
+            activity: Some(ToolActivity { id: "latest".into(), kind: ToolActivityKind::Command,
+                title: "Latest parallel tool".into(), output: Some("Latest output".into()),
+                status: Some("inProgress".into()), output_delta: false, change: Default::default() }),
+        };
+        exchange.observe_turn(&event, 2)?;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
+            exchange: exchange.clone(), agent_by_id: HashMap::new() }])?;
+        let document = DocumentId("hidden-parallel".into());
+        let view = ViewId("hidden-parallel-view".into());
+        let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let before = owner.snapshot(&document)?;
+        assert!(!before.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"));
+        assert!(before.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
+        let activity = event.activity.as_mut().unwrap();
+        activity.id = "tool".into();
+        activity.title = "Read output".into();
+        activity.output = Some("\nLate older output".into());
+        activity.output_delta = true;
+        exchange.observe_turn(&event, 3)?;
+        owner.append_tool_output(&exchange, &event)?.expect("hidden tool output delta");
+        owner.sync(&document, opened.transcript.revision)?;
+        let after = owner.snapshot(&document)?;
+        assert_eq!(serde_json::to_value(&before.block)?, serde_json::to_value(&after.block)?,
+            "an older tool's output must not move or replace the live preview");
+        let group = after.block.iter().find_map(|block| block.metadata.node.as_ref()
+            .filter(|node| node.kind == forge_buffer::node::NodeKind::ToolGroup)).unwrap();
+        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view, sequence: 100, node: group.id.0.clone(),
+            generation: group.generation, action: NodeAction::SetExpansion { expanded: true },
+            rows: 40, width: WidthProfile::default(),
+        } })?;
+        let expanded = owner.snapshot(&document)?;
+        assert!(expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"));
+        assert!(expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
+        let source = &owner.open.as_ref().unwrap().sections.nodes.tool["parallel:turn:1:tool"];
+        assert!(source.preview(true)?.row.contains(&"Late older output"));
+        event.activity = Some(ToolActivity { id: "third".into(), kind: ToolActivityKind::Command,
+            title: "Third parallel tool".into(), output: Some("Third output".into()),
+            status: Some("inProgress".into()), output_delta: false, change: Default::default() });
+        exchange.observe_turn(&event, 4)?;
+        owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
+            exchange, agent_by_id: HashMap::new() }])?;
+        assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
+            block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 3,
+            "new calls must preserve explicit group expansion");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn markdown_responses_keep_source_without_native_syntax_jobs() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};

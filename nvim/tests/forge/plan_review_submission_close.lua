@@ -18,7 +18,16 @@ package.loaded["forge.views.harness.controller"] = {
   present_plan_question = function() end,
   task_transition = function(action) assert(action.action == "execute" and action.plan_id == "plan") end,
 }
-require("forge.infra.popup_window").input = function(_, callback) callback("") end
+local function submit_decision(comment)
+  local decision_buf = vim.api.nvim_get_current_buf()
+  vim.api.nvim_buf_set_lines(decision_buf, 0, -1, false, { comment })
+  local decision_mapping
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(decision_buf, "n")) do
+    if mapping.lhs == "<CR>" then decision_mapping = mapping.callback end
+  end
+  assert(decision_mapping, "decision popup did not bind Enter")
+  decision_mapping()
+end
 harness.session = { id = "session" }
 harness.transcript_win = vim.api.nvim_get_current_win()
 local controller = require("forge.views.plan_review.native_controller")
@@ -46,6 +55,7 @@ end
 for _, action in ipairs({ "request_changes", "accept", "abort_plan" }) do
   local review = open_review()
   review.command_set.action_by_id[action].run({})
+  if action ~= "abort_plan" then submit_decision("") end
   local request = pending[#pending]
   assert(request.method == (action == "accept" and "plan.acceptance.begin" or action == "abort_plan" and "plan.cancel" or "plan.request_changes"))
   assert(request.params.draft_annotation[1].source.body == "Preserve this feedback")
@@ -58,6 +68,7 @@ end
 
 local review = open_review()
 review.command_set.action_by_id.request_changes.run({})
+submit_decision("")
 local request = pending[#pending]
 request.callback(nil, "Submission failed")
 assert(#vim.fn.win_findbuf(review.buf) == 1, "failed submission did not restore the review")

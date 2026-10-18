@@ -277,6 +277,42 @@ local function delete_tests(review)
   end, nil, { title = "Delete planned tests" })
 end
 
+local function prompt_decision(review, method, title)
+  if review.plan.historical_revision or review.owner.closed then return end
+  if session.harness.busy then
+    notifications.info("A Harness request is already running", "ForgePlanReview")
+    return
+  end
+  if review.decision_window and vim.api.nvim_win_is_valid(review.decision_window) then
+    vim.api.nvim_set_current_win(review.decision_window)
+    return
+  end
+  local tick = vim.api.nvim_buf_get_changedtick(review.buf)
+  local digest, version = review.plan.review_digest, review.owner.version
+  local plan_id, revision = review.plan.id, review.plan.model_revision
+  local view = review.owner.current_view()
+  if not view then return end
+  local generation = client.host_generation()
+  review.decision_window = require("forge.views.plan_review.decision").open({
+    title = title, parent_win = view.window,
+  }, function(comment)
+    review.decision_window = nil
+    if comment == nil then return end
+    if session.harness.plan_review ~= review or review.owner.closed
+      or client.host_generation() ~= generation or not session.harness.session
+      or session.harness.session.id ~= review.session_id
+      or not vim.api.nvim_buf_is_valid(review.buf)
+      or tick ~= vim.api.nvim_buf_get_changedtick(review.buf)
+      or digest ~= review.plan.review_digest or version ~= review.owner.version
+      or plan_id ~= review.plan.id or revision ~= review.plan.model_revision
+      or review.plan.historical_revision then
+      notice("Plan changed while the review comment was open. Review it again before submitting.")
+      return
+    end
+    submit(review, method, { comment = vim.trim(comment) })
+  end)
+end
+
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review, function() action(review, "toggle_declaration") end) end)
@@ -287,20 +323,14 @@ local function commands(review)
   end)
   for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
-  command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
+  command_set.register(set, "accept", function()
+    prompt_decision(review, "plan.acceptance.begin", "Approval comment (optional)")
+  end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision then submit(review, "plan.cancel", {}) end
   end)
   command_set.register(set, "request_changes", function()
-    if review.plan.historical_revision then return end
-    local tick = vim.api.nvim_buf_get_changedtick(review.buf)
-    popup.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
-      if not comment then return end
-      if not vim.api.nvim_buf_is_valid(review.buf) or tick ~= vim.api.nvim_buf_get_changedtick(review.buf) then
-        notice("Plan annotations changed while the review comment was open") return
-      end
-      submit(review, "plan.request_changes", { comment = vim.trim(comment) })
-    end)
+    prompt_decision(review, "plan.request_changes", "Request changes comment (optional)")
   end)
   command_set.register(set, "close", function() close_review(review) end)
   command_set.register(set, "help", function() keymaps.show_view_help("plan_review", set, "PlanReview") end)

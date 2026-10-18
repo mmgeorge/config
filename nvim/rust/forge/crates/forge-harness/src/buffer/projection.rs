@@ -1241,6 +1241,12 @@ impl TimelineRenderer<'_> {
                                 }
                             }
                             self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
+                            if !settled {
+                                let node = self.block[start].metadata.node.as_mut().expect("tool group node");
+                                node.lifecycle = NodeLifecycle::Live;
+                                node.default_display = NodeDisplay::Preview;
+                                node.resolve(self.expansion.get(&group_id).copied());
+                            }
                             self.margin -= 2;
                             self.offset_layout(start, 1);
                         }
@@ -2451,6 +2457,7 @@ mod tests {
         project_at, project_at_with_separator, session_event_text,
     };
     use forge_buffer::width::WidthProfile;
+    use forge_buffer::node::NodeDisplay;
     use serde_json::{Value, json};
     use std::collections::HashMap;
 
@@ -3279,12 +3286,11 @@ mod tests {
                     })
                     .collect();
                 for (index, fold) in tool_folds.iter().enumerate() {
-                    assert_eq!(
-                        fold.closed,
-                        index + 1 < count as usize,
-                        "only a completed tool with a successor should collapse"
-                    );
+                    assert_eq!(fold.closed, index + 1 < count as usize,
+                        "only a completed tool with a successor should collapse");
                 }
+                assert_eq!(projected.tool.len(), count as usize, "hidden tools must retain full sources");
+                assert_eq!(group.metadata.node.as_ref().unwrap().default_display, NodeDisplay::Preview);
                 if status == "completed" {
                     assert_eq!(tool_folds.len(), count as usize);
                     let text = projected

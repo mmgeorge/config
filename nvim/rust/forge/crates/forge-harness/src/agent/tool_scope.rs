@@ -43,6 +43,13 @@ mod tests {
         }
         assert!(scope.invoke("agent_spawn",json!({"profile":"worker","text":"task","execution_owner":{"session_id":"foreign"}})).await.is_err());
         assert!(coordinator.try_receive().is_none());
+        coordinator.set_enabled(false);
+        assert!(!scope.available());
+        assert!(scope.invoke("agent_spawn",json!({"profile":"worker","text":"task"})).await.is_err());
+        assert!(scope.invoke("agent_followup",json!({"target":"worker-1","message":"task"})).await.is_err());
+        assert!(coordinator.try_receive().is_none());
+        coordinator.set_enabled(true);
+        assert!(scope.available(), "reenabling must restore the same live root scope");
         drop(lease);
         assert!(!scope.available());
         assert!(scope.invoke("agent_list",json!({})).await.is_err());

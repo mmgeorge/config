@@ -23,7 +23,7 @@ function M.open(options, callback)
     loading_mark = {}
   end
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
-  local owner = { document = identity, submission_sequence = 0, closed = false, syncing = false, pending = false, output = {},
+  local owner = { document = identity, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
     timeline_key = "main", timeline_view = {}, epoch = 0,
     staging = { queue = {}, steering = {} }, applied_staging = { queue = {}, steering = {} } }
@@ -789,55 +789,15 @@ function M.open(options, callback)
     end
   end
 
-  function owner.submit(callback)
-    if options.read_only then if callback then callback(nil, "This timeline is read-only") end return end
-    if not alive() or not owner.ready then callback(nil, "Harness documents are not ready") return end
-    if owner.failure then callback(nil, owner.failure) return end
-    if owner.submission then callback(nil, "Composer submission is already active") return end
-    local source = vim.api.nvim_buf_get_lines(options.composer_buffer, 0, -1, false)
-    local text = table.concat(source, "\n")
-    if not text:find("%S") then
-      callback(nil, "Prompt requires nonempty text")
-      return
-    end
-    owner.submission_sequence = owner.submission_sequence + 1
-    local submission = { token = owner.submission_sequence, source = source,
-      changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer),
-      attachments = require("forge.views.harness.attachment").capture(options.composer_buffer).attachments }
-    owner.submission = submission
+  ---Capture the current draft's view identity without owning its request lifetime.
+  ---@return ForgePromptContext? context
+  ---@return string? failure
+  function owner.capture_prompt()
+    if options.read_only then return nil, "This timeline is read-only" end
+    if not alive() or not owner.ready then return nil, "Harness documents are not ready" end
+    if owner.failure then return nil, owner.failure end
     owner.follow_tail()
-    client.request_for(options.session_id, "prompt.submit", {
-      text = text, submission = { document = identity, token = submission.token },
-      attachments = submission.attachments,
-    }, function(result, failure, error_detail)
-      if owner.closed or owner.host_generation ~= client.host_generation() or owner.submission ~= submission then return end
-      owner.submission = nil
-      callback(result, failure, error_detail)
-    end)
-  end
-
-  function owner.receive(event)
-    if not alive() or not owner.ready or event.kind ~= "prompt_submission" then return false end
-    local transition = event.data
-    local submission = owner.submission
-    if type(transition) ~= "table" or transition.document ~= identity or not submission
-        or transition.token ~= submission.token or not vim.api.nvim_buf_is_valid(options.composer_buffer) then return false end
-    local changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
-    if transition.state == "accepted" and not submission.accepted then
-      submission.accepted = true
-      if changedtick == submission.changedtick then
-        vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, { "" })
-        require("forge.views.harness.attachment").restore(options.composer_buffer, {})
-        submission.cleared_tick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
-      end
-    elseif transition.state == "retracted" and submission.cleared_tick then
-      if changedtick == submission.cleared_tick then
-        vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, submission.source)
-        require("forge.views.harness.attachment").restore(options.composer_buffer, submission.attachments)
-      end
-      submission.cleared_tick = nil
-    end
-    return true
+    return { document = identity, buffer = options.composer_buffer, is_current = alive }
   end
 
   function owner.close(close_options)

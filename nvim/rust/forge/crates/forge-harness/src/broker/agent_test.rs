@@ -14,6 +14,56 @@ struct RoutingBackend {
 }
 
 #[tokio::test]
+async fn profile_toggles_gate_fresh_and_retained_child_admission() -> Result<()> {
+    use crate::agent::{AgentOperation, AgentProfile, AgentRequest, AgentSource, SpawnAgentRequest};
+    let repository = repository();
+    let data = tempfile::tempdir()?;
+    let mut broker = planning_question_broker(repository.path(), data.path(), false);
+    broker.agent_coordinator.set_enabled(true);
+    save_child_profile(&broker, "reviewer", AgentProfile::default())?;
+    let (admitted, _) = broker.start_agent(json!({"profile":"reviewer","text":"First review"})).await?;
+    let target = admitted["agent"]["id"].as_str().context("missing child identity")?.to_owned();
+    settle_managed_children(&mut broker).await?;
+    let original = broker.agent_coordinator.resolve(&target)?;
+    let task_count = broker.store.list_agent_task(&broker.session.id)?.len();
+    let profiles = crate::agent::AgentProfileStore::new(broker.agent_backend_factory.profiles.snapshot()?.path.into());
+    let snapshot = profiles.snapshot()?;
+    let mut document = snapshot.document;
+    document.profiles.get_mut("reviewer").unwrap().enabled = false;
+    profiles.save(&snapshot.revision, document)?;
+    for source in [AgentSource::User, AgentSource::Model] {
+        for operation in [
+            AgentOperation::Spawn(SpawnAgentRequest {profile:Some("reviewer".into()),text:"New review".into()}),
+            AgentOperation::Followup {target:target.clone(),message:"Another review".into()},
+        ] {
+            let error = broker.handle_agent_request(AgentRequest {operation_id:Uuid::new_v4().to_string(),source,operation},
+                None, &mut Vec::new()).await.unwrap_err();
+            assert!(error.to_string().contains("subagent profile is disabled: reviewer"), "{error:#}");
+            assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count);
+            assert_eq!(broker.agent_coordinator.active_count(), 0);
+        }
+    }
+    let snapshot = profiles.snapshot()?;
+    let mut document = snapshot.document;
+    let profile = document.profiles.get_mut("reviewer").unwrap();
+    profile.enabled = true;
+    profile.instructions = "New spawns use these instructions".into();
+    profiles.save(&snapshot.revision, document)?;
+    let result = broker.handle_agent_request(AgentRequest {operation_id:Uuid::new_v4().to_string(),source:AgentSource::Model,
+        operation:AgentOperation::Followup {target:target.clone(),message:"Review after enabling".into()}},
+        None, &mut Vec::new()).await?;
+    assert_eq!(result["agent"]["id"], target);
+    assert_eq!(result["agent"]["selection"], serde_json::to_value(&original.selection)?);
+    settle_managed_children(&mut broker).await?;
+    assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count + 1);
+    let (fresh, _) = broker.start_agent(json!({"profile":"reviewer","text":"Fresh enabled review"})).await?;
+    assert_ne!(fresh["agent"]["id"], target);
+    assert_eq!(fresh["agent"]["selection"]["instructions"], "New spawns use these instructions");
+    settle_managed_children(&mut broker).await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn profile_selection_captures_tuning_and_instructions_without_widening_permissions() -> Result<()> {
     use crate::agent::{AgentProfile, SpawnAgentRequest};
     use crate::backend::BackendKind;
@@ -267,12 +317,33 @@ async fn child_tool_configuration_resumes_the_same_goal_exchange() -> Result<()>
     parent.goal_id = Some(goal.id.clone());
     parent.execution_started_at_ms = None;
     broker.store.save_exchange(&parent)?;
-    broker.transition_task(json!({"action":"configure","resume":true,"config":{"subagent_tools":true}})).await?;
-    assert_eq!(broker.store.list_exchange(&broker.session.id)?.last().unwrap().id,parent.id);
-    assert_eq!(broker.current_task()?.unwrap().status,crate::task::TaskStatus::Running);
-    assert_eq!(broker.active_goal()?.state,GoalState::Active);
-    assert_eq!(broker.agent_coordinator.active_count(),1);
-    assert!(broker.agent_coordinator.enabled());
+    for enabled in [true, false, true] {
+        broker.transition_task(json!({"action":"configure","resume":true,"config":{"subagent_tools":enabled}})).await?;
+        assert_eq!(broker.store.list_exchange(&broker.session.id)?.last().unwrap().id,parent.id);
+        assert_eq!(broker.current_task()?.unwrap().status,crate::task::TaskStatus::Running);
+        assert_eq!(broker.active_goal()?.state,GoalState::Active);
+        assert_eq!(broker.agent_coordinator.active_count(),1);
+        assert_eq!(broker.agent_coordinator.enabled(), enabled);
+        let task_count = broker.store.list_agent_task(&broker.session.id)?.len();
+        let result = broker.handle_agent_request(crate::agent::AgentRequest {
+            operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::Model,
+            operation:crate::agent::AgentOperation::Followup {target:child.agent.id.clone(),message:"Next task".into()},
+        }, Some(&mut parent), &mut Vec::new()).await;
+        if enabled {
+            assert_eq!(result?["agent"]["id"], child.agent.id);
+            assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count + 1);
+        } else {
+            assert!(result.unwrap_err().to_string().contains("subagent tools are disabled"));
+            let spawn = broker.handle_agent_request(crate::agent::AgentRequest {
+                operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::Model,
+                operation:crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
+                    profile:Some("worker".into()),text:"Disabled spawn".into(),
+                }),
+            }, Some(&mut parent), &mut Vec::new()).await;
+            assert!(spawn.unwrap_err().to_string().contains("subagent tools are disabled"));
+            assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), task_count);
+        }
+    }
     Ok(())
 }
 

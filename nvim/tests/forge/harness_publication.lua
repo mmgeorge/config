@@ -60,7 +60,8 @@ local prompt = table.concat(prompt_rows, "\n")
 assert(#prompt > 65536)
 vim.api.nvim_buf_set_lines(composer, 0, -1, false, prompt_rows)
 local submitted = false
-owner.submit(function(result, failure)
+require("forge.views.harness.prompt_submission").start({ session = { id = "publication" } },
+  { text = prompt, context = assert(owner.capture_prompt()) }, function(result, failure)
   assert(result and not failure, failure)
   submitted = true
 end)

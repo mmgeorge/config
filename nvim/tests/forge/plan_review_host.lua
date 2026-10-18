@@ -145,6 +145,13 @@ local success, failure = xpcall(function()
   end
   review.owner.saving = true
   review.command_set.action_by_id.accept.run({})
+  local decision_buf = vim.api.nvim_get_current_buf()
+  local decision_mapping
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(decision_buf, "n")) do
+    if mapping.lhs == "<CR>" then decision_mapping = mapping.callback end
+  end
+  assert(decision_mapping, "approval decision popup did not bind Enter")
+  decision_mapping()
   assert(review.owner.pending_operation and not submitted_capture)
   local original_document = review.owner.document
   local original_generation = client.host_generation()

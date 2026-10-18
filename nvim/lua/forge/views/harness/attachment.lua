@@ -9,7 +9,6 @@ local paste_installed = false
 ---@type ForgeAttachmentOwner?
 local paste_owner
 local register_attachment = {}
-local paste_attachment
 
 ---@class ForgeAttachmentSelection
 ---@field id string
@@ -40,8 +39,6 @@ local paste_attachment
 ---@field objects table[]
 ---@field undo table<integer, ForgeAttachmentSelection[]>
 ---@field undo_sequence? integer
----@field selected_yank? ForgePromptDraft
----@field before_yank? ForgePromptDraft
 
 ---@param buffer integer
 ---@param mark integer
@@ -271,6 +268,24 @@ local function import_paste(owner)
   pump(owner)
 end
 
+local function after_register_paste(owner, draft)
+  if draft then
+    local first = vim.api.nvim_buf_get_mark(owner.buffer, "[")
+    local lines = vim.api.nvim_buf_get_lines(owner.buffer, 0, -1, false)
+    local base = first[2]
+    for row = 1, first[1] - 1 do base = base + #lines[row] + 1 end
+    local captured = M.capture(owner.buffer)
+    for _, selected in ipairs(draft.attachments) do
+      local copy = vim.deepcopy(selected)
+      copy.start, copy["end"] = base + selected.start, base + selected["end"]
+      captured.attachments[#captured.attachments + 1] = copy
+    end
+    M.restore(owner.buffer, captured.attachments)
+  else
+    import_paste(owner)
+  end
+end
+
 local function install_paste()
   if paste_installed then return end
   paste_installed = true
@@ -281,6 +296,30 @@ local function install_paste()
       register_attachment[register], register_attachment['"'] = nil, nil
     end,
   })
+  local pending
+  local function finish_register_paste()
+    local captured = pending
+    pending = nil
+    if not captured then return end
+    local owner = captured.owner
+    if owner_by_buffer[owner.buffer] ~= owner or not vim.api.nvim_buf_is_valid(owner.buffer)
+      or vim.api.nvim_get_current_buf() ~= owner.buffer
+      or vim.api.nvim_buf_get_changedtick(owner.buffer) == captured.tick then return end
+    local ok, failure = pcall(after_register_paste, owner, captured.draft)
+    if not ok then notifications.error(tostring(failure), "Harness attachment") end
+  end
+  vim.on_key(function(key)
+    finish_register_paste()
+    local owner = owner_by_buffer[vim.api.nvim_get_current_buf()]
+    if not owner or (key ~= "p" and key ~= "P") then return end
+    local mode = vim.fn.mode(1)
+    if mode ~= "n" and mode ~= "v" and mode ~= "V" and mode ~= "\22" then return end
+    local register = vim.v.register
+    local draft = register_attachment[register]
+    if draft and vim.fn.getreg(register) ~= draft.text then draft = nil end
+    pending = { owner = owner, draft = draft, tick = vim.api.nvim_buf_get_changedtick(owner.buffer) }
+    vim.schedule(finish_register_paste)
+  end, namespace)
   local previous = vim.paste
   vim.paste = function(lines, phase)
     if phase == -1 or phase == 1 then
@@ -300,36 +339,6 @@ local function install_paste()
   end
 end
 
----Import native register pastes through the same range capture as terminal pastes.
-function M.after_paste()
-  local owner = owner_by_buffer[vim.api.nvim_get_current_buf()]
-  if not owner then return end
-  if paste_attachment then
-    local draft = paste_attachment
-    paste_attachment = nil
-    local first = vim.api.nvim_buf_get_mark(owner.buffer, "[")
-    local lines = vim.api.nvim_buf_get_lines(owner.buffer, 0, -1, false)
-    local base = first[2]
-    for row = 1, first[1] - 1 do base = base + #lines[row] + 1 end
-    local captured = M.capture(owner.buffer)
-    for _, selected in ipairs(draft.attachments) do
-      local copy = vim.deepcopy(selected)
-      copy.start, copy["end"] = base + selected.start, base + selected["end"]
-      captured.attachments[#captured.attachments + 1] = copy
-    end
-    M.restore(owner.buffer, captured.attachments)
-    return
-  end
-  local ok, failure = pcall(import_paste, owner)
-  if not ok then notifications.error(tostring(failure), "Harness attachment") end
-end
-
-function M.before_paste()
-  local register = vim.v.register
-  local candidate = register_attachment[register] or (register == '"' and register_attachment['"'])
-  paste_attachment = candidate and vim.fn.getreg(register) == candidate.text and candidate or nil
-end
-
 ---@param buffer integer?
 ---@return boolean
 function M.pending(buffer)
@@ -340,25 +349,6 @@ end
 ---@param buffer integer
 function M.decorate(buffer)
   vim.api.nvim_set_hl(0, "ForgeHarnessAttachmentLabel", { link = "Special", default = true })
-end
-
-local function select_attachment()
-  local cursor = vim.api.nvim_win_get_cursor(0)
-  local owner = owner_by_buffer[vim.api.nvim_get_current_buf()]
-  if not owner then return end
-  for _, object in ipairs(owner.objects) do
-    local first, last = position(owner.buffer, object.first), position(owner.buffer, object.last)
-    if first and last and first[1] == cursor[1] - 1 and cursor[2] >= first[2] and cursor[2] < last[2] then
-      local selected = vim.deepcopy(object.selection)
-      selected.start, selected["end"] = 0, #selected.label
-      owner.selected_yank = { text = selected.label, attachments = { selected } }
-      vim.cmd("normal! \27")
-      vim.api.nvim_win_set_cursor(0, { cursor[1], first[2] })
-      vim.cmd("normal! v")
-      vim.api.nvim_win_set_cursor(0, { cursor[1], last[2] - 1 })
-      return
-    end
-  end
 end
 
 ---@param buffer integer
@@ -373,23 +363,14 @@ function M.attach(buffer, session_id)
   vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, {
     buffer = buffer, callback = function() M.capture(buffer, true) end,
   })
-  for _, key in ipairs({ "p", "P" }) do
-    vim.keymap.set({ "n", "x" }, key, "<Cmd>lua require('forge.views.harness.attachment').before_paste()<CR>" .. key .. "<Cmd>lua require('forge.views.harness.attachment').after_paste()<CR>",
-      { buffer = buffer, silent = true, desc = "Paste text or Harness file attachment" })
-  end
-  vim.keymap.set({ "o", "x" }, "iA", select_attachment,
-    { buffer = buffer, silent = true, desc = "Select complete Harness attachment" })
-  vim.keymap.set({ "o", "x" }, "aA", select_attachment,
-    { buffer = buffer, silent = true, desc = "Select complete Harness attachment" })
   vim.api.nvim_create_autocmd("TextYankPost", {
     buffer = buffer,
     callback = function()
       local copied = table.concat(vim.v.event.regcontents, "\n")
       if vim.v.event.regtype == "V" then copied = copied .. "\n" end
-      local selected = owner.selected_yank
-      owner.selected_yank = nil
-      if not selected or selected.text ~= copied then
-        local source = owner.before_yank or M.capture(buffer)
+      local selected
+      do
+        local source = M.capture(buffer)
         local first = vim.api.nvim_buf_get_mark(buffer, "[")
         local lines = vim.split(source.text, "\n", { plain = true })
         local offset = vim.v.event.regtype == "V" and 0 or first[2]
@@ -403,18 +384,11 @@ function M.attach(buffer, session_id)
           end
         end
       end
-      owner.before_yank = nil
       local register = vim.v.event.regname ~= "" and vim.v.event.regname or '"'
       local saved = #selected.attachments > 0 and selected or nil
       register_attachment[register], register_attachment['"'] = saved, saved
     end,
   })
-  for _, key in ipairs({ "d", "c", "x" }) do
-    vim.keymap.set("n", key, function()
-      owner.before_yank = M.capture(buffer)
-      return key
-    end, { buffer = buffer, expr = true, silent = true })
-  end
   vim.api.nvim_create_autocmd("BufWipeout", {
     group = vim.api.nvim_create_augroup("ForgeAttachmentOwner" .. buffer, { clear = true }),
     buffer = buffer,

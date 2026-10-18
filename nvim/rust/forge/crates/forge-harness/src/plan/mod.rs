@@ -363,6 +363,9 @@ pub struct PlanElicitation {
 pub struct PlanAcceptance {
     pub review_digest: String,
     #[serde(default)]
+    /// Retains the reviewer's optional acceptance note without changing the reviewed design.
+    pub overall_comment: Option<String>,
+    #[serde(default)]
     pub saved_source_digest: Option<String>,
     pub execution_mode_list: Vec<PermissionMode>,
     pub elicitation: PlanElicitation,
@@ -399,6 +402,7 @@ impl PlanAcceptance {
         .normalize()?;
         Ok(Self {
             review_digest,
+            overall_comment: None,
             saved_source_digest: None,
             execution_mode_list: execution_mode_list.to_vec(),
             elicitation: PlanElicitation::new(question_set),
@@ -1286,6 +1290,7 @@ mod test {
         fallback.expire().unwrap();
         assert!(matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First"));
         let mut acceptance = PlanAcceptance::new("digest".into(), &[PermissionMode::Read, PermissionMode::Write]).unwrap();
+        assert_eq!(acceptance.overall_comment, None);
         acceptance.elicitation.start_timeout(Default::default(), 0).unwrap();
         assert!(acceptance.elicitation.deadline.is_none());
         assert!(acceptance.elicitation.expire().is_err());

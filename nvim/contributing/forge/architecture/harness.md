@@ -206,12 +206,16 @@ buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab
 Lua owns the complete unsent Harness draft. Opening a transcript and typing in HarnessInput never
 transmit draft text or local edit revisions to Rust. Explicit file-path pastes import the selected
 file through `attachment.import`, independently of prompt submission. Ctrl-s captures the complete draft,
-then sends one `prompt.submit` request with separate text and typed attachment fields and a monotonically increasing token
-bound to the transcript document lifetime. Rust tracks submission admission without retaining a
+then sends one `prompt.submit` request with separate text and typed attachment fields and a monotonically increasing session token
+paired with the captured transcript document. Rust tracks submission admission without retaining a
 composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
 Retraction restores its exact rows only while the cleared buffer retains its changedtick.
 Newer typing survives both transitions. Rejection retains the draft, and closing or replacing
-the presentation invalidates late transitions. Plan preparation precedes acceptance. Git checkpoint
+the presentation invalidates late draft edits. `views/harness/prompt_submission.lua` owns the
+request in session state independently of that presentation. Every transport completion releases
+its matching request and reaches the controller, including errors and cancellation after view
+closure. Duplicate completion cannot release a newer request. The controller clears busy state
+and refreshes authoritative task state before draining queued follow-ups. Plan preparation precedes acceptance. Git checkpoint
 acquisition starts asynchronously when the exchange is admitted and does not delay acceptance or
 the initial timeline projection.
 
@@ -227,9 +231,17 @@ and publishes a named copy and metadata under the data root's `attachments` dire
 The import returns a typed object with its retained identity, filename, media type,
 and visible label. The composer keeps these objects separately from its plain text and
 anchors their label spans with extmarks. Text never contains a hidden attachment URL.
-The `iA` and `aA` text objects and register metadata preserve the objects when copied or
-moved. Queue drafts and prompt history retain the text and attachment list together.
+Native text selections and register metadata preserve the objects when copied or moved.
+Queue drafts and prompt history retain the text and attachment list together.
+Register metadata is captured by `TextYankPost`, without replacing the user's normal-mode
+delete, change, insert, or paste mappings. Register pastes are observed after keymap resolution,
+so user-defined paste direction and bindings remain native editor operations.
 Typing a label or an attachment-shaped string creates ordinary text.
+
+The composer binds only submission, queueing, steering, cancellation, mode, effort, and prompt
+history controls. It inherits ordinary text editing and navigation mappings. Timeline navigation,
+folding, help, and close shortcuts belong to the transcript. Prompt history defaults to Alt-Up
+and Alt-Down so the arrow keys retain their editor behavior.
 
 Request admission resolves only the explicit attachment list. `BackendInput` carries
 the resolved objects through provider requests and user steering. Provider adapters
@@ -1196,6 +1208,9 @@ Metadata-only inspection does not advance the child's last-activity timestamp.
 `/agents on` and `/agents off` submit explicit `subagent_tools` values through the same
 configuration path as `/config`. Both commands remain local during active work or child
 timeline selection and never become child prompts. Command completion offers both forms.
+The current setting gates model requests at invocation and admission, including requests queued
+before a disable operation. Reenabling restores admission in the same session. Already-admitted
+child tasks continue, and explicit user spawning remains available while model delegation is off.
 
 `/agents spawn <profile> <text>` admits a fresh child using the named enabled profile. `/agents spawn`
 opens the profile picker and then the task composer. `/agents spawn <profile>` opens that composer's
@@ -1209,6 +1224,10 @@ actions operate on the instance identity.
 The file is the global source of truth across workspaces and providers. `/agents edit` opens a profile
 picker over `agent.profiles.get`, and `/agents edit <profile>` opens the named profile directly.
 The edit picker includes disabled profiles.
+Every fresh spawn and follow-up checks the current profile enablement before admission, including
+follow-ups to existing children. Disabling a profile blocks new tasks without cancelling admitted
+work. Reenabling it permits new tasks in the same session. Retained children keep their captured
+provider selection, instructions, and conversation history.
 `oc` closes the picker and opens the global configuration file in a new tab.
 Tab selects Enable, Provider, Model, Thinking, or Speed on the selected profile. Left/Right
 cycles that field through a revision-checked save.

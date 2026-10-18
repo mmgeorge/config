@@ -742,6 +742,14 @@ local success, failure = xpcall(function()
     return original_request(session_id, method, params, callback)
   end
   state.plan_review.command_set.action_by_id.accept.run({})
+  local decision_win = vim.api.nvim_get_current_win()
+  local decision_buf = vim.api.nvim_win_get_buf(decision_win)
+  local decision_mapping
+  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(decision_buf, "n")) do
+    if mapping.lhs == "<CR>" then decision_mapping = mapping.callback end
+  end
+  assert(decision_mapping, "approval decision popup did not bind Enter")
+  decision_mapping()
   await(function() return pending_approval end, "approval was not dispatched")
   assert(state.plan_review.owner.attached() and state.plan_review.owner.submission_pending,
     "approval released its document before acknowledgement")

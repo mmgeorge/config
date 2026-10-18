@@ -148,10 +148,13 @@ Action-target snapshots remain separate and only validate whether a response sti
 
 The timeline projects ordered exchange items into separate message, tool-group, and change
 nodes. Consecutive ordinary tools share a group. Commentary, steering, or a file edit ends that
-group. While its owning exchange remains active, the latest tool can show a preview of its last
-four display rows. Explicit expansion loads the complete output through the existing paging
+group. An active group shows its count, latest tool heading, and a preview of that tool's last
+four display rows. Earlier tool headings stay out of the live preview. Expanding the group shows
+every tool, and expanding an individual tool loads its complete output through the existing paging
 path. A settled group defaults to collapsed tools without previews. Exchange completion also
 collapses the activity node and leaves its aggregate changes and final response outside it.
+Hidden tools retain their output caches, including late parallel output, without changing visible
+rows. Explicit group expansion persists while new calls arrive.
 
 Tool output deltas update the existing output cache. File edits have no generic tool-output
 cache, so their deltas reconcile the change node instead. Both paths retain the same provider

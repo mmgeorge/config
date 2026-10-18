@@ -732,10 +732,19 @@ fn render(
                         budget
                     })
             };
+            let child_start = if source_block.metadata.node.as_ref().is_some_and(|node|
+                node.kind == forge_buffer::node::NodeKind::ToolGroup
+                    && node.default_display == forge_buffer::node::NodeDisplay::Preview)
+                && !intent.contains_key(id) {
+                (cursor + 1..after).rev().find(|index| source[*index].metadata.node.as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool
+                        && node.parent.as_ref().is_some_and(|parent| parent.0 == *id)))
+                    .unwrap_or(cursor + 1)
+            } else { cursor + 1 };
             let more = expanded
                 && (render(
                     source,
-                    cursor + 1,
+                    child_start,
                     after,
                     revision,
                     intent,

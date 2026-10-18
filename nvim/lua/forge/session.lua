@@ -87,6 +87,8 @@ M.empty_diff_rows = {}
 ---@field configuration_debounce? boolean
 ---@field configuration_error? string
 ---@field pending_steer table[]
+---@field prompt_submission? ForgePromptSubmission
+---@field prompt_sequence? integer
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
 ---@field composer_buf integer?

@@ -275,7 +275,7 @@ impl HarnessBroker {
                 plan.document_version = document.version;
                 plan.updated_at_ms = now_ms;
                 self.store
-                    .save_execution_transition(&execution, &goal, Some(&plan), None)?;
+                    .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
                 return Ok(
                     json!({"result":"draft_saved","version":document.version,"document":document,"execution":execution.response()}),
                 );
@@ -482,7 +482,7 @@ impl HarnessBroker {
             );
         }
         self.store
-            .save_execution_transition(&execution, &goal, Some(&plan), Some(interaction))?;
+            .save_execution_transition(&execution, &goal, Some(&plan), Some(interaction), None)?;
         if !phase_completion && execution.state == crate::plan::PlanExecutionState::Active {
             return self.revision_review_response(execution_id);
         }
@@ -532,6 +532,7 @@ impl HarnessBroker {
         response["result"] = json!("reviewed");
         response["plan_state"] = serde_json::to_value(plan.state)?;
         response["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
+        response["approval_comments"] = serde_json::to_value(&execution.approval_comments)?;
         response["document"] = serde_json::to_value(self.plan_file.read_working_document(&self.session.id, &plan.id)?)?;
         Ok(response)
     }
@@ -715,7 +716,7 @@ impl HarnessBroker {
                 report_exchange = Some(interaction);
             }
         }
-        self.store.save_execution_transition(&execution, goal, None, report_exchange.as_ref())?;
+        self.store.save_execution_transition(&execution, goal, None, report_exchange.as_ref(), None)?;
         Ok(())
     }
 }

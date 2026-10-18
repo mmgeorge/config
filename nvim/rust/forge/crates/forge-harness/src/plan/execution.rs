@@ -260,6 +260,9 @@ pub struct PlanExecutionRecord {
     #[serde(default)]
     pub check_runs: Vec<crate::checks::CheckRun>,
     pub revision_history: Vec<ExecutionRevision>,
+    #[serde(default)]
+    /// Carries accepted reviewer notes into initial, resumed, and live review responses.
+    pub approval_comments: Vec<String>,
     pub pending_revision_reason: Option<String>,
     pub review_paused: bool,
     pub observed_source: BTreeMap<String, String>,
@@ -518,6 +521,7 @@ mod tests {
             verification: Vec::new(),
             check_runs: Vec::new(),
             revision_history: Vec::new(),
+            approval_comments: Vec::new(),
             pending_revision_reason: None,
             review_paused: false,
             observed_source: BTreeMap::new(),
@@ -534,6 +538,10 @@ mod tests {
         let mut record = execution();
         record.revision = 3;
         record.findings.push("Reset still retains score".into());
+        record.approval_comments.push("Preserve the public API name".into());
+        let persisted = serde_json::to_vec(&record).unwrap();
+        let mut record: PlanExecutionRecord = serde_json::from_slice(&persisted).unwrap();
+        assert_eq!(record.approval_comments, ["Preserve the public API name"]);
         for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
             record.phase = phase;
             for (kind, prefix) in [
@@ -546,6 +554,7 @@ mod tests {
                 assert!(prompt.contains("Execution ID: execution\nPlan ID: plan"));
                 assert!(prompt.contains(&format!("Phase: {phase:?}. Accepted revision: 3.")));
                 assert!(prompt.contains("Reset still retains score"));
+                assert!(prompt.contains("Reviewer approval comments (context only, not plan edits):\nPreserve the public API name"));
                 assert!(prompt.ends_with("accepted document"));
                 if phase == PlanPhase::Implement {
                     assert!(prompt.contains("Do not edit or submit the plan, reconcile declaration metadata, or run builds"));
