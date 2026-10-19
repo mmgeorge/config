@@ -224,6 +224,31 @@ pending_refresh({ { name = "starting-server", enabled = true, status = "connecte
 mcp_picker = picker._state_for_test()
 mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
 assert_true(mcp_page.option_list[1].label == "✓ starting-server", "refresh should replace starting status")
+pending_refresh = nil
+assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20),
+  "connected servers must keep refreshing without returning to starting")
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[1].label == "✓ starting-server", "pending refresh must preserve connected status")
+pending_refresh({ { name = "starting-server", enabled = true, status = "failed", status_detail = "connection closed" } })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[1].detail:find("connection closed", 1, true),
+  "the open picker must observe later connection failures")
+assert_true(mcp_page.option_list[1].columns[5] == "failed: connection closed",
+  "the Status column must explain why a server failed")
+pending_refresh = nil
+assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20), "failed rows must remain refreshable")
+pending_refresh({ { name = "starting-server", enabled = true, status = "unavailable",
+  status_detail = "missing environment variable FIXTURE_KEY", transport = "stdio" } })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[1].columns[5] == "status unavailable: missing environment variable FIXTURE_KEY",
+  "the Status column must retain the unavailable reason")
+mcp_picker.spec.action_list[2].callback({ option = mcp_page.option_list[1] })
+assert_true(vim.iter(picker._state_for_test().frame.lines):any(function(line)
+  return line:find("missing environment variable FIXTURE_KEY", 1, true) ~= nil
+end), "expanded MCP details must preserve the full failure reason")
 picker.close(false)
 catalog_reads = 0
 pending_refresh = nil

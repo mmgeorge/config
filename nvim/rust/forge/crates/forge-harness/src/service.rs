@@ -190,13 +190,7 @@ impl HarnessService {
                         json!({"supported":false,"reason":"Provider does not expose background terminal inventory","terminal":[]}),
                     );
                 }
-                let request = controller.catalog_request.read().await.clone();
-                let snapshot = tokio::time::timeout(
-                    Duration::from_secs(8),
-                    controller.backend.background_terminals(request),
-                )
-                .await
-                .context("background terminal query timed out")??;
+                let snapshot = controller.background_terminals().await?;
                 return Ok(serde_json::to_value(snapshot)?);
             }
             crate::buffer::session::PresentationRequest::Highlight { document } => {
@@ -867,6 +861,45 @@ impl Drop for PromptAdmission {
 }
 
 impl SessionController {
+    async fn background_terminals(&self) -> Result<crate::backend::terminal::TerminalSnapshot> {
+        let request = self.catalog_request.read().await.clone();
+        let revision = self.mcp_revision.load(Ordering::Acquire);
+        let configuring = || -> Result<bool> {
+            Ok(SqliteStore::open(&self.data_root)?
+                .latest_task_operation(&request.harness_session_id)?
+                .is_some_and(|operation| {
+                    operation.action["action"] == "configure"
+                        && matches!(
+                            operation.state.as_str(),
+                            "admitted"
+                                | "accepted"
+                                | "stopping"
+                                | "running"
+                                | "applying"
+                                | "verifying"
+                        )
+                }))
+        };
+        let pending = || crate::backend::terminal::TerminalSnapshot {
+            supported: true,
+            starting: true,
+            terminal: Vec::new(),
+        };
+        if configuring()? {
+            return Ok(pending());
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(8),
+            self.backend.background_terminals(request.clone()),
+        )
+        .await
+        .context("background terminal query timed out");
+        if revision != self.mcp_revision.load(Ordering::Acquire) || configuring()? {
+            return Ok(pending());
+        }
+        result?
+    }
+
     /// Collects the native execution before a replacement prompt can release its owner.
     async fn interrupt_checks(&self, session_id: &str, run_id: &str) -> Result<()> {
         let active = self.checks.active()?;
@@ -3787,6 +3820,120 @@ mod tests {
         drop(broker);
         owner.shutdown(Duration::from_secs(1)).await?;
         generator.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct TerminalInventoryBackend {
+        started: Notify,
+        release: Notify,
+        calls: AtomicU64,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for TerminalInventoryBackend {
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                kind: BackendKind::Mock,
+                label: "Terminal fixture".into(),
+                capability: crate::backend::BackendCapability {
+                    background_terminals: true,
+                    ..Default::default()
+                },
+            }
+        }
+        async fn background_terminals(
+            &self,
+            _: BackendCatalogRequest,
+        ) -> Result<crate::backend::terminal::TerminalSnapshot> {
+            self.calls.fetch_add(1, Ordering::AcqRel);
+            self.started.notify_one();
+            self.release.notified().await;
+            anyhow::bail!("connection closed")
+        }
+        async fn prompt_stream(
+            &self,
+            _: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<BackendOutput> {
+            anyhow::bail!("terminal fixture cannot prompt")
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn cleanup_execution(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn cancel_session(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn has_active_turn(&self, _: &str) -> bool {
+            false
+        }
+        async fn active_session_id_for(&self, _: &str) -> Option<String> {
+            None
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_inventory_discards_configuration_races_but_reports_unrelated_errors()
+    -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let mut controller = registry
+            .controller_by_id
+            .write()
+            .await
+            .remove(&registry.initial_session_id)
+            .unwrap();
+        let backend = Arc::new(TerminalInventoryBackend::default());
+        Arc::get_mut(&mut controller).unwrap().backend = backend.clone();
+        registry
+            .controller_by_id
+            .write()
+            .await
+            .insert(registry.initial_session_id.clone(), controller.clone());
+        let mut store = SqliteStore::open(&controller.data_root)?;
+        let mut operation = crate::task::TaskOperation {
+            id: "terminal-config".into(),
+            session_id: registry.initial_session_id.clone(),
+            action: json!({"action":"configure"}),
+            state: "applying".into(),
+            error: None,
+            exchange_id: None,
+            created_at_ms: 1,
+            resume_after_transition: false,
+        };
+        store.save_task_operation(&operation)?;
+        assert!(controller.background_terminals().await?.starting);
+        assert_eq!(backend.calls.load(Ordering::Acquire), 0);
+        operation.state = "completed".into();
+        store.save_task_operation(&operation)?;
+        let query = controller.background_terminals();
+        tokio::pin!(query);
+        tokio::select! {
+            result = &mut query => panic!("terminal query settled before release: {result:?}"),
+            _ = backend.started.notified() => {}
+        }
+        controller.mcp_revision.fetch_add(1, Ordering::AcqRel);
+        backend.release.notify_one();
+        assert!(query.await?.starting);
+        operation.state = "resuming".into();
+        store.save_task_operation(&operation)?;
+        backend.release.notify_one();
+        assert!(
+            controller
+                .background_terminals()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("connection closed")
+        );
+        service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }
 

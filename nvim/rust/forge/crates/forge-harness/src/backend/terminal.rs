@@ -6,7 +6,7 @@ use serde_json::Value;
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct TerminalSnapshot {
     pub supported: bool,
-    /// The provider session is initializing and has not published an inventory.
+    /// The provider session is initializing or applying resource configuration.
     pub starting: bool,
     pub terminal: Vec<BackgroundTerminal>,
 }

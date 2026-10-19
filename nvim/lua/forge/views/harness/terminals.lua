@@ -20,6 +20,7 @@ function M.watch(options)
         last_error = failure
       else
         last_error = nil
+        if result and result.starting then return end
         options.update(result)
         if result and result.supported == false then observer.close() end
       end

@@ -502,19 +502,37 @@ impl CodexBackend {
             return Ok(None);
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        Self::load_terminal_thread(&mut process, &mut output, &thread_id).await?;
+        let resources = self.resources(&request).await?;
+        Self::load_terminal_thread(&mut process, &mut output, &request, resources.as_deref())
+            .await?;
         Ok(Some((process, output, thread_id)))
     }
 
     async fn load_terminal_thread(
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
-        thread_id: &str,
+        request: &BackendCatalogRequest,
+        resources: Option<&CodexResources>,
     ) -> Result<()> {
+        let thread_id = request
+            .backend_session_id
+            .as_deref()
+            .context("terminal thread id missing")?;
+        if let Some(resources) = resources {
+            if resources.thread().await.as_deref() == Some(thread_id) {
+                return Ok(());
+            }
+        }
+        let mut parameter = json!({"threadId":thread_id});
+        if let Some(resources) = resources {
+            parameter["config"] = resources
+                .configure(process, output, &request.workspace)
+                .await?;
+        }
         let mut retries_remaining = 4;
         loop {
             let id = process
-                .send_request("thread/resume", json!({ "threadId": thread_id }))
+                .send_request("thread/resume", parameter.clone())
                 .await
                 .context("load Codex thread for background terminal request")?;
             let (message, result) = loop {
@@ -538,9 +556,13 @@ impl CodexBackend {
                             && message.ends_with(" is empty")
                     });
             if !empty_rollout || retries_remaining == 0 {
-                return result
+                result
                     .map(|_| ())
-                    .context("load Codex thread for background terminal request");
+                    .context("load Codex thread for background terminal request")?;
+                if let Some(resources) = resources {
+                    resources.retain_thread(thread_id).await;
+                }
+                return Ok(());
             }
             retries_remaining -= 1;
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -1105,6 +1127,15 @@ impl Backend for CodexBackend {
             self.command.clone(),
         )?);
         self.cleanup_execution(&request.runtime_key()?).await?;
+        let terminal_slot = self
+            .terminal_connection_by_session
+            .lock()
+            .await
+            .entry(request.runtime_key()?)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
+        let mut terminal = terminal_slot.lock().await;
+        *terminal = None;
         self.connection_by_session
             .lock()
             .await
@@ -2156,14 +2187,112 @@ mod test {
             "session".into(),
         )
         .await?;
+        let request = BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace,
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: Some("provider-thread".into()),
+        };
         let result = CodexBackend::load_terminal_thread(
             &mut process,
             &mut BackendOutput::default(),
-            "provider-thread",
+            &request,
+            None,
         )
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
         result
+    }
+
+    #[tokio::test]
+    async fn terminal_status_preserves_resources_and_does_not_resume_a_loaded_thread() -> Result<()>
+    {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        crate::settings::SettingsStore::open(fixture.path())?.configure_catalog(fixture.path())?;
+        let request = BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: workspace.clone(),
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: Some("provider-thread".into()),
+        };
+        let resources = CodexResources::new(fixture.path(), &request, vec!["unused".into()])?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for method in [
+                "config/read",
+                "skills/extraRoots/set",
+                "skills/list",
+                "thread/resume",
+                "thread/backgroundTerminals/list",
+            ] {
+                let message: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(message["method"], method);
+                let result = match method {
+                    "config/read" => {
+                        json!({"config":{"mcp_servers":{"native":{"command":"native"}}}})
+                    }
+                    "skills/list" => json!({"data":[]}),
+                    "thread/resume" => {
+                        assert_eq!(message["params"]["threadId"], "provider-thread");
+                        assert_eq!(
+                            message.pointer("/params/config/mcp_servers/native/enabled"),
+                            Some(&json!(false))
+                        );
+                        assert_eq!(
+                            message.pointer("/params/config/skills/bundled/enabled"),
+                            Some(&json!(false))
+                        );
+                        assert!(message["params"].get("model").is_none());
+                        assert!(message["params"].get("developerInstructions").is_none());
+                        json!({"thread":{"id":"provider-thread"}})
+                    }
+                    _ => json!({}),
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":message["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?,
+            None,
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        )
+        .await?;
+        let mut output = BackendOutput::default();
+        CodexBackend::load_terminal_thread(&mut process, &mut output, &request, Some(&resources))
+            .await?;
+        CodexBackend::load_terminal_thread(&mut process, &mut output, &request, Some(&resources))
+            .await?;
+        process
+            .request(
+                "thread/backgroundTerminals/list",
+                json!({"threadId":"provider-thread"}),
+                &mut output,
+            )
+            .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        Ok(())
     }
 
     #[tokio::test]
@@ -2264,6 +2393,125 @@ mod test {
         backend.shutdown().await.unwrap();
         let inventory = result.expect("MCP inventory exceeded 30 seconds").unwrap();
         eprintln!("MCP inventory: {} servers", inventory.len());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires authenticated Codex CLI and Neovim, makes one minimal model request"]
+    async fn live_terminal_polling_preserves_mcp_inventory() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let definitions = fixture.path().join("rulesync-global/.rulesync");
+        std::fs::create_dir_all(&definitions)?;
+        let script = fixture.path().join("mcp.lua");
+        std::fs::write(
+            &script,
+            r#"
+for line in io.lines() do
+  local request = vim.json.decode(line)
+  if request.id ~= nil then
+    local result = vim.empty_dict()
+    if request.method == 'initialize' then
+      result = {protocolVersion=request.params.protocolVersion, capabilities={tools=vim.empty_dict()}, serverInfo={name='fixture',version='1'}}
+    elseif request.method == 'tools/list' then
+      result = {tools={{name='ready',description='Read fixture readiness',inputSchema={type='object',properties=vim.empty_dict()}}}}
+    elseif request.method == 'tools/call' then
+      result = {content={{type='text',text='ready'}}}
+    end
+    io.write(vim.json.encode({jsonrpc='2.0',id=request.id,result=result}) .. '\n')
+    io.flush()
+  end
+end
+"#,
+        )?;
+        std::fs::write(definitions.join("mcp.json"), json!({"mcpServers":{
+            "fixture":{"command":"nvim","args":["--headless","-u","NONE","-i","NONE","-l",script]},
+            "missing":{"command":"nvim","envVars":["FORGE_LIVE_MCP_MISSING_608C"]}
+        }}).to_string())?;
+        crate::settings::SettingsStore::open(fixture.path())?.configure_catalog(fixture.path())?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["codex".into(), "app-server".into()],
+            PermissionCoordinator::transient(&workspace)?,
+            Arc::new(TraceStore::open(fixture.path())?),
+            Some(fixture.path().into()),
+        )?;
+        let mut request = BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "mcp-terminal-smoke".into(),
+            workspace,
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: None,
+        };
+        let mut settings = crate::settings::SettingsStore::open(fixture.path())?;
+        let catalog = settings.catalog(&request.workspace, &request.harness_session_id, "codex")?;
+        let mut desired = catalog.settings.desired;
+        let missing = catalog
+            .server
+            .iter()
+            .find(|server| server.name == "missing")
+            .unwrap();
+        desired.mcp.insert(missing.id.clone(), true);
+        settings.update(
+            catalog.settings.revision,
+            crate::settings::SettingScope::Session,
+            &request.workspace,
+            &request.harness_session_id,
+            &desired,
+        )?;
+        drop(settings);
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let mut prompt = CodexBackend::catalog_backend_request(&request);
+            prompt.input = BackendInput::from_text("Reply OK. Do not use tools or change files.");
+            prompt.effort = "low".into();
+            anyhow::ensure!(
+                !backend.model_list(prompt.clone()).await?.is_empty(),
+                "model catalog missing"
+            );
+            request.backend_session_id = backend
+                .prompt_stream(prompt, None)
+                .await?
+                .backend_session_id;
+            for _ in 0..2 {
+                let servers = backend.mcp_list(request.clone()).await?;
+                let unavailable = servers
+                    .iter()
+                    .find(|server| server.name == "missing")
+                    .context("missing MCP row disappeared")?;
+                anyhow::ensure!(
+                    unavailable.status == McpStatus::Unavailable,
+                    "missing credential did not stay isolated"
+                );
+                anyhow::ensure!(
+                    unavailable
+                        .status_detail
+                        .as_deref()
+                        .is_some_and(|reason| reason.contains("FORGE_LIVE_MCP_MISSING_608C")),
+                    "missing credential reason disappeared"
+                );
+                let server = servers
+                    .iter()
+                    .find(|server| server.name == "fixture")
+                    .context("fixture MCP absent")?;
+                anyhow::ensure!(
+                    server.status == McpStatus::Connected,
+                    "fixture MCP status: {:?}",
+                    server.status
+                );
+                anyhow::ensure!(
+                    server.tools.iter().any(|tool| tool.name == "ready"),
+                    "fixture tool missing"
+                );
+                backend.background_terminals(request.clone()).await?;
+                backend
+                    .reconcile_settings(request.clone(), &Default::default())
+                    .await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        })
+        .await;
+        backend.shutdown().await?;
+        outcome.context("live MCP smoke test timed out")??;
+        Ok(())
     }
 
     #[test]

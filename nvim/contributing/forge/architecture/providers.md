@@ -161,9 +161,16 @@ carry explicit `Global` or `Workspace` source scope into `/skills` and `/mcp`, i
 scope of enablement preferences. Native imports recover this scope from their stored owner, even
 when their source path is outside that workspace. Provider-only entries show `Provider` rather than
 inferring a scope. Both pickers expose the source column and expand the definition path with Tab.
-MCP details retain the cached tool list. Runtime status refreshes preserve source metadata.
-Environment references resolve only into ephemeral provider launch payloads. Missing credentials mark optional default MCP
-resources unavailable, while explicitly enabled resources fail launch. Stdio MCP launch preparation
+MCP details retain the cached tool list and complete failure reason. The final Status
+column shows that reason, and Tab expands it with the source and tools. Runtime status
+refreshes preserve source metadata.
+Routine discovery refreshes retain the last observed status and tool list while the
+request runs. Only servers without an observation show starting. Configuration changes
+invalidate that observation together with the session's discovery job.
+Environment references resolve only into ephemeral provider launch payloads. Missing credentials mark
+only the affected MCP resource unavailable and omit it from launch, including explicitly enabled
+resources. The saved selection remains available for retry, and catalog, model discovery, and other
+servers continue. Providers isolate startup failures after receiving a valid launch payload. Stdio MCP launch preparation
 checks the executable against the server's working directory and effective PATH, including Windows
 executable and command-script suffixes and Unix executable permissions. Missing commands stay visible
 as unavailable rows and are omitted from every provider's launch payload without changing saved
@@ -389,11 +396,17 @@ steering, cancellation, or another provider event. Cleanup revokes pending reque
 sends native interruption, then collects callbacks and preserves completed tool results.
 Turn completion and transport failure also collect the request tasks.
 
-Background terminal inventory uses a separate passive connection per runtime owner. Its
-initial `thread/resume` supplies only `threadId`, without changing model, effort, service tier,
-or permission configuration. Subsequent polls reuse that connection and read every inventory
+Background terminal inventory uses a separate passive connection per runtime owner. It
+reads an already-loaded thread without resuming it. When loading is necessary, `thread/resume`
+retains the session's canonical MCP and skill configuration, without overriding model, effort,
+service tier, or instructions. Subsequent polls reuse that connection and read every inventory
 page. A changed thread or failed request invalidates the cached connection. Passive traffic
 does not execute broadcast tool callbacks or publish them as foreground activity.
+Resource replacement clears the terminal connection while holding its poll lock,
+before shutting down the old Codex runtime. Shared terminal observation pauses during
+configuration and discards results from an older configuration revision. Lua retains
+the previous terminal inventory during this pending state. Unrelated failures remain
+visible and the next poll can reconnect.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before

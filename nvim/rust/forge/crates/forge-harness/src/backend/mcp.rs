@@ -59,12 +59,13 @@ impl McpDiscovery {
                 .completed_at
                 .is_none_or(|completed| completed.elapsed() > Duration::from_secs(5))
         {
-            self.servers = tokio::time::timeout(
+            let configured = tokio::time::timeout(
                 Duration::from_secs(10),
                 backend.mcp_configuration(request.clone()),
             )
             .await
             .context("MCP configuration discovery timed out")??;
+            let previous = std::mem::replace(&mut self.servers, configured);
             if self.servers.is_empty() {
                 self.completed_at = Some(Instant::now());
                 return Ok(Vec::new());
@@ -77,7 +78,20 @@ impl McpDiscovery {
                     )
                     && !(server.status == McpStatus::Unavailable && server.status_detail.is_some())
                 {
-                    server.status = McpStatus::Loading;
+                    if let Some(observed) = previous.iter().find(|observed| {
+                        observed.resource_id == server.resource_id
+                            && observed.name == server.name
+                            && observed.enabled == server.enabled
+                    }) {
+                        server.status = observed.status.clone();
+                        server.status_detail.clone_from(&observed.status_detail);
+                        server.tools.clone_from(&observed.tools);
+                        server.tool_error.clone_from(&observed.tool_error);
+                        server.token_count = observed.token_count;
+                        server.token_estimated = observed.token_estimated;
+                    } else {
+                        server.status = McpStatus::Loading;
+                    }
                 }
             }
             self.pending = Some(tokio::spawn(async move {
@@ -258,5 +272,18 @@ mod test {
             rows
         );
         assert_eq!(backend.calls.load(Ordering::SeqCst), 1);
+        discovery.completed_at = Some(Instant::now() - Duration::from_secs(6));
+        assert_eq!(
+            discovery
+                .snapshot(backend.clone(), request())
+                .await
+                .unwrap(),
+            rows
+        );
+        tokio::task::yield_now().await;
+        assert_eq!(backend.calls.load(Ordering::SeqCst), 2);
+        backend.release.notify_one();
+        tokio::task::yield_now().await;
+        assert_eq!(discovery.snapshot(backend, request()).await.unwrap(), rows);
     }
 }

@@ -71,8 +71,11 @@ end
 
 ---@param definition table
 ---@return string[]
-local function tool_line_list(definition)
+local function mcp_detail_lines(definition)
   local result = source_details(definition.source_path)
+  if type(definition.status_detail) == "string" and definition.status_detail ~= "" then
+    result[#result + 1] = "└ Status: " .. mcp_status_label(definition)
+  end
   local tool_name_list = vim.tbl_map(function(tool) return tool.name end, definition.tools or {})
   if #tool_name_list > 0 then
     result[#result + 1] = "└ Tools: " .. table.concat(tool_name_list, ", ")
@@ -260,7 +263,7 @@ function M.open_mcp(options)
           return
         end
         current_mcp_list = refreshed or {}
-        if provider_is_loading() then start_animation(nil) end
+        start_animation(nil)
         if picker.is_open(owner) then picker.update(build_spec()) end
       end)
     end
@@ -276,7 +279,7 @@ function M.open_mcp(options)
           return
         end
         animation_index = animation_index % #loading_icon_list + 1
-        picker.update(build_spec())
+        if loading_name or provider_is_loading() then picker.update(build_spec()) end
         refresh_ticks = refresh_ticks + 1
         if refresh_ticks >= 17 and not next(pending_by_id) and not refreshing then
           refresh_ticks = 0
@@ -304,7 +307,7 @@ function M.open_mcp(options)
             token_label(definition.token_count, definition.token_estimated),
             pending_by_id[definition.resource_id or definition.name] and "pending" or mcp_status_label(definition),
           },
-          child_line_list = expanded_by_id[definition.resource_id or definition.name] and tool_line_list(definition) or nil,
+          child_line_list = expanded_by_id[definition.resource_id or definition.name] and mcp_detail_lines(definition) or nil,
         }
       end
       return {
@@ -374,7 +377,7 @@ function M.open_mcp(options)
       }
     end
     picker.open(build_spec())
-    if provider_is_loading() then start_animation(nil) end
+    start_animation(nil)
   end)
 end
 

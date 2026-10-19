@@ -115,14 +115,7 @@ impl SessionResources {
                             (McpStatus::Loading, None)
                         }
                     }
-                    Err(error) if settings.desired.mcp.get(&definition.id) != Some(&true) => {
-                        (McpStatus::Unavailable, Some(error.to_string()))
-                    }
-                    Err(error) => {
-                        return Err(
-                            error.context("Explicitly enabled MCP server cannot be launched")
-                        );
-                    }
+                    Err(error) => (McpStatus::Unavailable, Some(error.to_string())),
                 }
             } else {
                 (McpStatus::Disabled, None)
@@ -478,6 +471,29 @@ mod test {
                 &setting,
             )
             .unwrap();
-        assert!(SessionResources::load(root.path(), &request, "copilot", "copilotcli").is_err());
+        for (backend, target) in [
+            ("codex", "codexcli"),
+            ("copilot", "copilotcli"),
+            ("claude", "claudecode"),
+            ("antigravity", "antigravity-cli"),
+        ] {
+            let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
+            let missing = loaded
+                .mcp
+                .iter()
+                .find(|server| server.name == "missing")
+                .unwrap();
+            assert!(missing.enabled);
+            assert_eq!(missing.status, McpStatus::Unavailable);
+            assert!(
+                missing
+                    .status_detail
+                    .as_deref()
+                    .unwrap()
+                    .contains("FORGE_RESOURCE_TEST_MISSING_81D3")
+            );
+            assert_eq!(loaded.launch.len(), 1);
+            assert_eq!(loaded.launch[0].0, "selected");
+        }
     }
 }
