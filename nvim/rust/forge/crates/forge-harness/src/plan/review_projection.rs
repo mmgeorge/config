@@ -22,25 +22,47 @@ pub(super) fn update_tests(
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let (old_start, old_end) = super::design_review::test_source_range(previous)?;
     let (new_start, new_end) = super::design_review::test_source_range(&source.rendered)?;
-    ensure!(old_start == new_start, "test edit changed preceding source rows");
-    let start = block.iter().position(|block| block.id.0 == "plan:section:tests")
+    ensure!(
+        old_start == new_start,
+        "test edit changed preceding source rows"
+    );
+    let start = block
+        .iter()
+        .position(|block| block.id.0 == "plan:section:tests")
         .context("test section is not projected")?;
-    let end = block.iter().position(|block| block.id.0 == "plan:section:tests:separator")
+    let end = block
+        .iter()
+        .position(|block| block.id.0 == "plan:section:tests:separator")
         .context("test section separator is not projected")?;
     ensure!(start < end, "test projection range is invalid");
     let shift = new_end as i64 - old_end as i64;
     for anchor in target.values_mut() {
-        if anchor.line as usize > old_end { anchor.line = (anchor.line as i64 + shift) as u32; }
+        if anchor.line as usize > old_end {
+            anchor.line = (anchor.line as i64 + shift) as u32;
+        }
     }
-    let design = source.document.design.as_ref().context("test edit has no design")?;
+    let design = source
+        .document
+        .design
+        .as_ref()
+        .context("test edit has no design")?;
     let (mut replacement, navigation) = super::design_review::test_inventory(design)?;
     for (index, row) in replacement.iter_mut().enumerate() {
-        if let Some(anchor) = navigation.iter().find(|anchor| anchor.line as usize == index + 1) {
+        if let Some(anchor) = navigation
+            .iter()
+            .find(|anchor| anchor.line as usize == index + 1)
+        {
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
-            row.metadata.target.push(TargetRange { id: id.clone(), range: TextRange {
-                start: TextPosition { row: 0, column: 0 },
-                end: TextPosition { row: row.text.row_count(), column: 0 },
-            }});
+            row.metadata.target.push(TargetRange {
+                id: id.clone(),
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition {
+                        row: row.text.row_count(),
+                        column: 0,
+                    },
+                },
+            });
             let mut anchor = anchor.clone();
             anchor.line += new_start as u32;
             target.insert(id, anchor);
@@ -48,8 +70,11 @@ pub(super) fn update_tests(
     }
     block.splice(start..end, replacement);
     let block = forge_buffer::collapse::project(block, &source.collapse)?;
-    let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target)
-        .map(|range| &range.id).collect();
+    let visible: std::collections::HashSet<_> = block
+        .iter()
+        .flat_map(|block| &block.metadata.target)
+        .map(|range| &range.id)
+        .collect();
     target.retain(|id, _| visible.contains(id));
     Ok((block, target))
 }
@@ -63,28 +88,63 @@ pub(crate) fn project(
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     if source.document.design.is_some() {
         let started = Instant::now();
-        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref(),&source.revealed)
-            .and_then(|(mut block, mut target)| {
-                if let Some(review) = &source.execution_review {
-                    let (heading, body) = review.split_once('\n').unwrap_or((review, ""));
-                    let mut heading = MarkdownRenderer::source(BlockId("plan:execution:heading".into()), heading, width)?.block;
-                    let report = MarkdownRenderer::source(BlockId("plan:execution:report".into()), body, width)?.block;
-                    heading.metadata.fold.push(FoldRange {
-                        collapsed_suffix: Some(" …".into()), heading_start: None,
-                        collapse_children: false, expand_children: false,
-                        id: FoldId("plan:execution:report".into()), start: TextPosition { row: 0, column: 0 },
-                        end: BlockAnchor { block: report.id.clone(), position: TextPosition { row: report.text.row_count(), column: 0 } }, closed: true,
-                    });
-                    block.push(heading);
-                    block.push(report);
-                }
-                let block = forge_buffer::collapse::project(block, &source.collapse)?;
-                let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target).map(|target| &target.id).collect();
-                target.retain(|id, _| visible.contains(id));
-                Ok((block, target))
-            });
+        let result = super::design_review::project(
+            &source.document,
+            width,
+            annotation,
+            revision,
+            focused,
+            &source.declaration_syntax,
+            source.public_only,
+            source.trace.as_ref(),
+            &source.revealed,
+        )
+        .and_then(|(mut block, mut target)| {
+            if let Some(review) = &source.execution_review {
+                let (heading, body) = review.split_once('\n').unwrap_or((review, ""));
+                let mut heading = MarkdownRenderer::source(
+                    BlockId("plan:execution:heading".into()),
+                    heading,
+                    width,
+                )?
+                .block;
+                let report =
+                    MarkdownRenderer::source(BlockId("plan:execution:report".into()), body, width)?
+                        .block;
+                heading.metadata.fold.push(FoldRange {
+                    collapsed_suffix: Some(" …".into()),
+                    heading_start: None,
+                    collapse_children: false,
+                    expand_children: false,
+                    id: FoldId("plan:execution:report".into()),
+                    start: TextPosition { row: 0, column: 0 },
+                    end: BlockAnchor {
+                        block: report.id.clone(),
+                        position: TextPosition {
+                            row: report.text.row_count(),
+                            column: 0,
+                        },
+                    },
+                    closed: true,
+                });
+                block.push(heading);
+                block.push(report);
+            }
+            let block = forge_buffer::collapse::project(block, &source.collapse)?;
+            let visible: std::collections::HashSet<_> = block
+                .iter()
+                .flat_map(|block| &block.metadata.target)
+                .map(|target| &target.id)
+                .collect();
+            target.retain(|id, _| visible.contains(id));
+            Ok((block, target))
+        });
         if let Some(trace) = &source.trace {
-            trace.record("plan.review.projection", started.elapsed(), result.as_ref().map_or(0, |(block, _)| block.len()));
+            trace.record(
+                "plan.review.projection",
+                started.elapsed(),
+                result.as_ref().map_or(0, |(block, _)| block.len()),
+            );
         }
         return result;
     }
@@ -254,7 +314,8 @@ pub(crate) fn project(
         block[start_block].metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            collapse_children: false, expand_children: false,
+            collapse_children: false,
+            expand_children: false,
             id: FoldId(format!("plan:heading:{source_row}")),
             start: TextPosition { row: 0, column: 0 },
             end,
@@ -323,7 +384,8 @@ pub(crate) fn project(
             .push(FoldRange {
                 collapsed_suffix: None,
                 heading_start,
-                collapse_children: false, expand_children: false,
+                collapse_children: false,
+                expand_children: false,
                 id: FoldId(fold_id),
                 start: TextPosition { row: 0, column: 0 },
                 end: endpoint,
@@ -352,7 +414,8 @@ pub(crate) fn project(
             collapsed_suffix: None,
             heading_start: None,
             id: FoldId(format!("plan:file-tree:{source_start}")),
-            collapse_children: false, expand_children: false,
+            collapse_children: false,
+            expand_children: false,
             start: TextPosition { row: 0, column: 0 },
             end: endpoint,
             closed: true,
@@ -366,19 +429,34 @@ pub(crate) fn project(
     Ok((block, target))
 }
 
-pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget, text: &str) {
+pub(super) fn append_semantic_style(
+    metadata: &mut BlockMetadata,
+    target: &PlanReviewTarget,
+    text: &str,
+) {
     match target {
         PlanReviewTarget::Behavior { offset, .. } => {
-            append_range(metadata, text.len() - text.trim_start().len(), text.len(), if *offset == 0 { "Normal" } else { "@comment" });
+            append_range(
+                metadata,
+                text.len() - text.trim_start().len(),
+                text.len(),
+                if *offset == 0 { "Normal" } else { "@comment" },
+            );
         }
         PlanReviewTarget::Call { name, kind, .. } => {
             let Some(start) = text.find(name) else { return };
             let member = name.rfind([':', '.', '#']).map_or(0, |column| column + 1);
             let mut cursor = 0;
             while cursor < member {
-                let Some(relative) = name[cursor..member].find(|character: char| character.is_alphabetic() || character == '_') else { break };
+                let Some(relative) = name[cursor..member]
+                    .find(|character: char| character.is_alphabetic() || character == '_')
+                else {
+                    break;
+                };
                 let opening = cursor + relative;
-                let closing = name[opening..member].find(|character: char| !character.is_alphanumeric() && character != '_').map_or(member, |length| opening + length);
+                let closing = name[opening..member]
+                    .find(|character: char| !character.is_alphanumeric() && character != '_')
+                    .map_or(member, |length| opening + length);
                 let identifier = &name[opening..closing];
                 let capture = if identifier.chars().next().is_some_and(char::is_uppercase) {
                     "@type"
@@ -390,14 +468,29 @@ pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanR
                 append_range(metadata, start + opening, start + closing, capture);
                 cursor = closing;
             }
-            append_range(metadata, start + member, start + name.len(), match kind {
-                super::CallKind::Property => "@variable.member",
-                super::CallKind::Value => "@variable",
-                super::CallKind::Construct if member > 0 && name[member..].chars().next().is_some_and(char::is_lowercase) => "@function.method.call",
-                super::CallKind::Construct => "ForgeWalkthroughType",
-                super::CallKind::Call | super::CallKind::Callback if member > 0 => "@function.method.call",
-                super::CallKind::Call | super::CallKind::Callback => "@function.call",
-            });
+            append_range(
+                metadata,
+                start + member,
+                start + name.len(),
+                match kind {
+                    super::CallKind::Property => "@variable.member",
+                    super::CallKind::Value => "@variable",
+                    super::CallKind::Construct
+                        if member > 0
+                            && name[member..]
+                                .chars()
+                                .next()
+                                .is_some_and(char::is_lowercase) =>
+                    {
+                        "@function.method.call"
+                    }
+                    super::CallKind::Construct => "ForgeWalkthroughType",
+                    super::CallKind::Call | super::CallKind::Callback if member > 0 => {
+                        "@function.method.call"
+                    }
+                    super::CallKind::Call | super::CallKind::Callback => "@function.call",
+                },
+            );
         }
         PlanReviewTarget::Task { title } => {
             append_term(metadata, text, title, "ForgeWalkthroughItemTitle", 0)
@@ -536,7 +629,9 @@ pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanR
 fn append_signature_style(metadata: &mut BlockMetadata, text: &str, member: &str) {
     let mut cursor = 0;
     while cursor < text.len() {
-        let Some(relative) = text[cursor..].find(|character: char| character.is_alphabetic() || character == '_') else {
+        let Some(relative) =
+            text[cursor..].find(|character: char| character.is_alphabetic() || character == '_')
+        else {
             break;
         };
         let start = cursor + relative;
@@ -549,7 +644,10 @@ fn append_signature_style(metadata: &mut BlockMetadata, text: &str, member: &str
             continue;
         }
         let suffix = text[end..].trim_start();
-        let capture = if matches!(identifier, "mut" | "dyn" | "impl" | "const" | "fn" | "unsafe" | "extern") {
+        let capture = if matches!(
+            identifier,
+            "mut" | "dyn" | "impl" | "const" | "fn" | "unsafe" | "extern"
+        ) {
             "@keyword.modifier"
         } else if suffix.starts_with(':') && !suffix.starts_with("::") {
             "@variable.parameter"
@@ -1095,30 +1193,63 @@ mod tests {
         for (text, member, expected) in [
             ("  - velocity: Vec2", "velocity", vec!["Vec2"]),
             ("  - velocity_value(): Vec2", "velocity_value", vec!["Vec2"]),
-            ("  - animate_shape(time: Res<Time>, shapes: Query<(&ShapeMotion, &mut Transform)>)",
-                "animate_shape", vec!["Res", "Time", "Query", "ShapeMotion", "Transform"]),
-            ("  + complete(message_id: &str): Result<(), QueueError>",
-                "complete", vec!["str", "Result", "QueueError"]),
-            ("    [String]): AccessTokenResponse", "scopes", vec!["String", "AccessTokenResponse"]),
+            (
+                "  - animate_shape(time: Res<Time>, shapes: Query<(&ShapeMotion, &mut Transform)>)",
+                "animate_shape",
+                vec!["Res", "Time", "Query", "ShapeMotion", "Transform"],
+            ),
+            (
+                "  + complete(message_id: &str): Result<(), QueueError>",
+                "complete",
+                vec!["str", "Result", "QueueError"],
+            ),
+            (
+                "    [String]): AccessTokenResponse",
+                "scopes",
+                vec!["String", "AccessTokenResponse"],
+            ),
             ("  - résumé: Vec2", "résumé", vec!["Vec2"]),
         ] {
             let mut metadata = super::BlockMetadata::default();
-            super::append_semantic_style(&mut metadata, &super::PlanReviewTarget::EntityMember {
-                entity: "SceneSystems".into(), member: member.into(),
-            }, text);
-            let types: Vec<_> = metadata.visible_decoration.iter()
+            super::append_semantic_style(
+                &mut metadata,
+                &super::PlanReviewTarget::EntityMember {
+                    entity: "SceneSystems".into(),
+                    member: member.into(),
+                },
+                text,
+            );
+            let types: Vec<_> = metadata
+                .visible_decoration
+                .iter()
                 .filter(|decoration| decoration.capture == "@type")
                 .map(|decoration| &text[decoration.range.start.column..decoration.range.end.column])
                 .collect();
             assert_eq!(types, expected, "{text}");
-            assert!(metadata.source_overlay.is_empty(), "signature type became an owner path");
+            assert!(
+                metadata.source_overlay.is_empty(),
+                "signature type became an owner path"
+            );
         }
         let text = "  + shape: Option<Vec2>";
         let mut metadata = super::BlockMetadata::default();
-        super::append_semantic_style(&mut metadata, &super::PlanReviewTarget::EnumVariantField {
-            entity: "Event".into(), variant: "Moved".into(), field: "shape".into(),
-        }, text);
-        assert_eq!(metadata.visible_decoration.iter().filter(|decoration| decoration.capture == "@type").count(), 2);
+        super::append_semantic_style(
+            &mut metadata,
+            &super::PlanReviewTarget::EnumVariantField {
+                entity: "Event".into(),
+                variant: "Moved".into(),
+                field: "shape".into(),
+            },
+            text,
+        );
+        assert_eq!(
+            metadata
+                .visible_decoration
+                .iter()
+                .filter(|decoration| decoration.capture == "@type")
+                .count(),
+            2
+        );
     }
 
     #[test]
@@ -1295,9 +1426,9 @@ mod tests {
             .find(|anchor| anchor.json_path == "/overview")
             .unwrap();
         let annotation = ReviewAnnotation {
-                parent_id: None,
-                kind: Default::default(),
-                reply: None,
+            parent_id: None,
+            kind: Default::default(),
+            reply: None,
             anchor: None,
             id: "note".into(),
             source: PlanAnnotationInput {

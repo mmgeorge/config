@@ -257,11 +257,7 @@ fn acquire_with_identity(
             if let Some(identity) = identity {
                 *identity = Some(source.identity());
             }
-            finish_source(
-                source,
-                ContentOrigin::Supplied,
-                request.expected,
-            )
+            finish_source(source, ContentOrigin::Supplied, request.expected)
         }
         ContentSource::Worktree { path, conversion } => read_worktree(
             local,

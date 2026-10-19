@@ -152,7 +152,12 @@ pub struct StatusPresentation {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum StatusHint { Working, Question, Review, Permission }
+pub enum StatusHint {
+    Working,
+    Question,
+    Review,
+    Permission,
+}
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
@@ -201,15 +206,32 @@ impl BlockMetadata {
     /// Charge retained vector storage and nested strings without serializing metadata.
     fn allocated_bytes(&self) -> usize {
         use std::mem::size_of;
-        self.content_node.as_ref().map_or(0, |node| node.0.capacity()) + self.node.as_ref().map_or(0, |node| node.id.0.capacity()
-            + node.parent.as_ref().map_or(0, |parent| parent.0.capacity()))
+        self.content_node
+            .as_ref()
+            .map_or(0, |node| node.0.capacity())
+            + self.node.as_ref().map_or(0, |node| {
+                node.id.0.capacity() + node.parent.as_ref().map_or(0, |parent| parent.0.capacity())
+            })
             + self.section.capacity() * size_of::<DeferredSection>()
-            + self.section.iter().map(|section| section.id.0.capacity()).sum::<usize>()
+            + self
+                .section
+                .iter()
+                .map(|section| section.id.0.capacity())
+                .sum::<usize>()
             + self.target.capacity() * size_of::<TargetRange>()
             + self.collapse.capacity() * size_of::<Collapse>()
-            + self.collapse.iter().map(|collapse| collapse.id.0.capacity() + collapse.opening.block.0.capacity()).sum::<usize>()
-            + self.layout.as_ref().and_then(|layout| layout.marker.as_ref())
-                .map_or(0, |marker| marker.text.capacity() + marker.capture.capacity())
+            + self
+                .collapse
+                .iter()
+                .map(|collapse| collapse.id.0.capacity() + collapse.opening.block.0.capacity())
+                .sum::<usize>()
+            + self
+                .layout
+                .as_ref()
+                .and_then(|layout| layout.marker.as_ref())
+                .map_or(0, |marker| {
+                    marker.text.capacity() + marker.capture.capacity()
+                })
             + self.decoration.capacity() * size_of::<Decoration>()
             + self.visible_decoration.capacity() * size_of::<Decoration>()
             + self.source_highlight.capacity() * size_of::<Decoration>()
@@ -248,8 +270,11 @@ impl BlockMetadata {
             + self
                 .fold
                 .iter()
-                .map(|fold| fold.id.0.capacity() + fold.end.block.0.capacity()
-                    + fold.collapsed_suffix.as_ref().map_or(0, String::capacity))
+                .map(|fold| {
+                    fold.id.0.capacity()
+                        + fold.end.block.0.capacity()
+                        + fold.collapsed_suffix.as_ref().map_or(0, String::capacity)
+                })
                 .sum::<usize>()
             + self
                 .gutter
@@ -296,7 +321,12 @@ impl BufferBlock {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
-        if self.metadata.status.as_ref().is_some_and(|status| status.row >= self.text.row_count()) {
+        if self
+            .metadata
+            .status
+            .as_ref()
+            .is_some_and(|status| status.row >= self.text.row_count())
+        {
             return Err(ContractError("status requires a physical row"));
         }
         if let Some(layout) = &self.metadata.layout {
@@ -304,27 +334,43 @@ impl BufferBlock {
                 return Err(ContractError("content indent must contain 2..=256 cells"));
             }
             if let Some(marker) = &layout.marker {
-                if marker.text.chars().count() != 1 || marker.text.chars().any(char::is_control)
-                    || marker.capture.is_empty() || marker.capture.len() > 256 {
-                    return Err(ContractError("content marker requires one printable character and a capture"));
+                if marker.text.chars().count() != 1
+                    || marker.text.chars().any(char::is_control)
+                    || marker.capture.is_empty()
+                    || marker.capture.len() > 256
+                {
+                    return Err(ContractError(
+                        "content marker requires one printable character and a capture",
+                    ));
                 }
             }
         }
         self.id.validate()?;
-        if let Some(node) = &self.metadata.content_node { node.validate()?; }
+        if let Some(node) = &self.metadata.content_node {
+            node.validate()?;
+        }
         if let Some(node) = &self.metadata.node {
             node.id.validate()?;
-            if let Some(parent) = &node.parent { parent.validate()?; }
-            if node.generation > crate::MAX_COUNTER || node.content_revision > crate::MAX_COUNTER
-                || node.order as u64 > crate::MAX_COUNTER || node.loaded_rows as u64 > crate::MAX_COUNTER
-                || node.loaded_bytes as u64 > crate::MAX_COUNTER {
-                return Err(ContractError("node revision exceeds the exact counter range"));
+            if let Some(parent) = &node.parent {
+                parent.validate()?;
+            }
+            if node.generation > crate::MAX_COUNTER
+                || node.content_revision > crate::MAX_COUNTER
+                || node.order as u64 > crate::MAX_COUNTER
+                || node.loaded_rows as u64 > crate::MAX_COUNTER
+                || node.loaded_bytes as u64 > crate::MAX_COUNTER
+            {
+                return Err(ContractError(
+                    "node revision exceeds the exact counter range",
+                ));
             }
         }
         for section in &self.metadata.section {
             section.id.validate()?;
             if section.revision > crate::MAX_COUNTER {
-                return Err(ContractError("section revision exceeds the exact counter range"));
+                return Err(ContractError(
+                    "section revision exceeds the exact counter range",
+                ));
             }
         }
         for collapse in &self.metadata.collapse {
@@ -387,7 +433,11 @@ impl BufferBlock {
         }
         for fold in &self.metadata.fold {
             fold.id.validate()?;
-            if fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.chars().any(char::is_control)) {
+            if fold
+                .collapsed_suffix
+                .as_ref()
+                .is_some_and(|suffix| suffix.chars().any(char::is_control))
+            {
                 return Err(ContractError("fold summary suffix requires printable text"));
             }
             fold.end.block.validate()?;

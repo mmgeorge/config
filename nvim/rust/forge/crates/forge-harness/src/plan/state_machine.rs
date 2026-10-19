@@ -38,9 +38,10 @@ impl PlanStateMachine {
                     PlanState::Generating
                 }
             }
-            (PlanState::Generating | PlanState::Revising | PlanState::AwaitingReview, PlanEvent::PlanSubmitted) => {
-                PlanState::AwaitingReview
-            }
+            (
+                PlanState::Generating | PlanState::Revising | PlanState::AwaitingReview,
+                PlanEvent::PlanSubmitted,
+            ) => PlanState::AwaitingReview,
             (PlanState::AwaitingReview, PlanEvent::ChangesRequested) => PlanState::Revising,
             (PlanState::AwaitingReview, PlanEvent::Accepted) => PlanState::Accepted,
             (PlanState::Failed, PlanEvent::RetryRequested) => {

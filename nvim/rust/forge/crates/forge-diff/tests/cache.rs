@@ -32,14 +32,18 @@ fn reservations_track_live_inputs_beyond_cache_budgets_and_release_on_drop() {
             result: 0,
         })
         .unwrap();
-    let additional = cache.reserve(AnalysisBytes {
+    let additional = cache
+        .reserve(AnalysisBytes {
             source: 1,
-            result: 0
-        }).unwrap();
-    let large = cache.reserve(AnalysisBytes {
+            result: 0,
+        })
+        .unwrap();
+    let large = cache
+        .reserve(AnalysisBytes {
             source: 0,
-            result: 21
-        }).unwrap();
+            result: 21,
+        })
+        .unwrap();
     drop(additional);
     drop(large);
     let second = cache

@@ -137,15 +137,27 @@ impl TraceStore {
     }
 
     fn session_path(&self, session_id: &str) -> PathBuf {
-        let name = if !session_id.is_empty() && session_id.bytes().all(|byte| byte.is_ascii_alphanumeric() || byte == b'-') {
+        let name = if !session_id.is_empty()
+            && session_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
             session_id.to_owned()
-        } else { format!("_{}", hex::encode(session_id.as_bytes())) };
-        self.path.parent().unwrap().join("logs").join(format!("{name}.jsonl"))
+        } else {
+            format!("_{}", hex::encode(session_id.as_bytes()))
+        };
+        self.path
+            .parent()
+            .unwrap()
+            .join("logs")
+            .join(format!("{name}.jsonl"))
     }
 
     /// Apply the editor default only before an explicit preference has been saved.
     pub fn configure_default(&self, enabled: bool) -> Result<TraceStatus> {
-        if self.config_path.exists() { return Ok(self.status()); }
+        if self.config_path.exists() {
+            return Ok(self.status());
+        }
         self.configure(enabled)
     }
 
@@ -256,7 +268,10 @@ impl TraceStore {
             return;
         }
         if let Err(error) = self.record_detail(session_id, event, payload) {
-            let _ = writeln!(std::io::stderr(), "Forge Harness detailed trace write failed: {error}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Forge Harness detailed trace write failed: {error}"
+            );
         }
         let record = json!({
             "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
@@ -268,7 +283,10 @@ impl TraceStore {
             return;
         };
         if line.len() > 16 * 1024 {
-            let _ = writeln!(std::io::stderr(), "Forge Harness trace record exceeded its 16 KiB encoding limit");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Forge Harness trace record exceeded its 16 KiB encoding limit"
+            );
             return;
         }
         let Ok(mut file) = self.file.lock() else {
@@ -290,14 +308,20 @@ impl TraceStore {
             appended.and(unlocked)
         })();
         if let Err(error) = written {
-            let _ = writeln!(std::io::stderr(), "Forge Harness trace write failed: {error}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Forge Harness trace write failed: {error}"
+            );
         }
     }
 
     fn record_detail(&self, session_id: &str, event: &str, payload: &Value) -> Result<()> {
         let path = self.session_path(session_id);
         fs::create_dir_all(path.parent().unwrap())?;
-        let lock = OpenOptions::new().create(true).read(true).write(true)
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
             .open(path.with_extension("lock"))?;
         lock.lock()?;
         let mut record = json!({
@@ -309,11 +333,20 @@ impl TraceStore {
             record["payload"] = json!({ "omitted": "record exceeds 15 MiB", "bytes": line.len() });
             line = serde_json::to_vec(&record)?;
         }
-        if path.metadata().is_ok_and(|metadata| metadata.len() + line.len() as u64 + 1 > MAX_TRACE_BYTES) {
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.len() + line.len() as u64 + 1 > MAX_TRACE_BYTES)
+        {
             for generation in (1..=3).rev() {
-                let source = if generation == 1 { path.clone() } else { path.with_extension(format!("jsonl.{}", generation - 1)) };
+                let source = if generation == 1 {
+                    path.clone()
+                } else {
+                    path.with_extension(format!("jsonl.{}", generation - 1))
+                };
                 let destination = path.with_extension(format!("jsonl.{generation}"));
-                if source.exists() { fs::copy(source, destination)?; }
+                if source.exists() {
+                    fs::copy(source, destination)?;
+                }
             }
             File::create(&path)?;
         }
@@ -327,12 +360,33 @@ impl TraceStore {
 
 fn redact(value: &Value) -> Value {
     match value {
-        Value::Object(object) => Value::Object(object.iter().map(|(key, value)| {
-            let secret = matches!(key.to_ascii_lowercase().as_str(),
-                "authorization" | "api_key" | "apikey" | "access_token" | "refresh_token" | "password" | "secret"
-                    | "mcp_servers" | "mcpservers");
-            (key.clone(), if secret { Value::String("[redacted]".into()) } else { redact(value) })
-        }).collect()),
+        Value::Object(object) => Value::Object(
+            object
+                .iter()
+                .map(|(key, value)| {
+                    let secret = matches!(
+                        key.to_ascii_lowercase().as_str(),
+                        "authorization"
+                            | "api_key"
+                            | "apikey"
+                            | "access_token"
+                            | "refresh_token"
+                            | "password"
+                            | "secret"
+                            | "mcp_servers"
+                            | "mcpservers"
+                    );
+                    (
+                        key.clone(),
+                        if secret {
+                            Value::String("[redacted]".into())
+                        } else {
+                            redact(value)
+                        },
+                    )
+                })
+                .collect(),
+        ),
         Value::Array(array) => Value::Array(array.iter().map(redact).collect()),
         _ => value.clone(),
     }
@@ -349,11 +403,19 @@ mod test {
         let directory = tempdir().unwrap();
         let trace = TraceStore::open(directory.path()).unwrap();
         trace.configure(true).unwrap();
-        trace.record("session-a", "model.sent", json!({"params":{"prompt":"full prompt","authorization":"secret"}}));
+        trace.record(
+            "session-a",
+            "model.sent",
+            json!({"params":{"prompt":"full prompt","authorization":"secret"}}),
+        );
         trace.record("session-a", "model.sent", json!({"params":{"config":{"mcp_servers":{
             "fixture":{"env":{"CUSTOM_NAME":"credential-value"},"http_headers":{"X-Custom":"header-value"}}
         }}}}));
-        trace.record("session-b", "model.received", json!({"text":"other conversation"}));
+        trace.record(
+            "session-b",
+            "model.received",
+            json!({"text":"other conversation"}),
+        );
         let contents = std::fs::read_to_string(trace.session_status("session-a").path).unwrap();
         assert!(contents.contains("full prompt"));
         assert!(contents.contains("[redacted]"));
@@ -362,7 +424,10 @@ mod test {
         assert!(!contents.contains("other conversation"));
         trace.configure(false).unwrap();
         trace.record("session-a", "model.sent", json!({"text":"disabled"}));
-        assert_eq!(contents, std::fs::read_to_string(trace.session_status("session-a").path).unwrap());
+        assert_eq!(
+            contents,
+            std::fs::read_to_string(trace.session_status("session-a").path).unwrap()
+        );
         drop(trace);
         let reopened = TraceStore::open(directory.path()).unwrap();
         assert!(!reopened.configure_default(true).unwrap().enabled);
@@ -375,7 +440,12 @@ mod test {
         trace.configure(true).unwrap();
         trace.record("session", "first", json!({}));
         let path = trace.session_path("session");
-        std::fs::OpenOptions::new().write(true).open(&path).unwrap().set_len(super::MAX_TRACE_BYTES).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(super::MAX_TRACE_BYTES)
+            .unwrap();
         trace.record("session", "second", json!({}));
         assert!(std::fs::read_to_string(&path).unwrap().contains("second"));
         assert!(path.with_extension("jsonl.1").exists());

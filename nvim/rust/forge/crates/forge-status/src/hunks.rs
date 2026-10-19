@@ -1,9 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use forge_buffer::{
-    block::{
-        BlockAnchor, BlockMetadata, BufferBlock, TargetRange,
-        TextPosition, TextRange,
-    },
+    block::{BlockAnchor, BlockMetadata, BufferBlock, TargetRange, TextPosition, TextRange},
     identity::{BlockId, FoldId, TargetId},
     sequence::SequenceEdit,
     text::BufferText,
@@ -76,13 +73,20 @@ pub(crate) fn project(
             .as_ref()
             .and_then(|cursor| cursor.group(index))
             .context("display group missing")?;
-        let mut header = if let Some(header) = file.group.get(&index).and_then(|group| file.body.as_ref().and_then(|body| body.block(&group.header))) {
+        let mut header = if let Some(header) = file.group.get(&index).and_then(|group| {
+            file.body
+                .as_ref()
+                .and_then(|body| body.block(&group.header))
+        }) {
             header.clone()
         } else {
             let (header, group_target) = if let Some(group) = file.group.get(&index) {
                 (group.header.clone(), group.target.clone())
             } else {
-                (BlockId(document.next_id("hunk-header")?), TargetId(document.next_id("group")?))
+                (
+                    BlockId(document.next_id("hunk-header")?),
+                    TargetId(document.next_id("group")?),
+                )
             };
             document.hunk.insert(
                 group_target.clone(),
@@ -114,7 +118,9 @@ pub(crate) fn project(
                     byte_column: 0,
                 }
             };
-            projection.source.push((header.clone(), vec![Some(coordinate)]));
+            projection
+                .source
+                .push((header.clone(), vec![Some(coordinate)]));
             file.group.insert(
                 index,
                 DisplayGroupTarget {
@@ -122,8 +128,15 @@ pub(crate) fn project(
                     target: group_target.clone(),
                 },
             );
-            let mut header = forge_diff::presentation::DiffPresenter::new(Default::default()).hunk(
-                header, display, forge_diff::presentation::HunkHeading::Counts { added, removed: deleted })?;
+            let mut header = forge_diff::presentation::DiffPresenter::new(Default::default())
+                .hunk(
+                    header,
+                    display,
+                    forge_diff::presentation::HunkHeading::Counts {
+                        added,
+                        removed: deleted,
+                    },
+                )?;
             header.metadata.target.push(TargetRange {
                 id: group_target,
                 range: TextRange {

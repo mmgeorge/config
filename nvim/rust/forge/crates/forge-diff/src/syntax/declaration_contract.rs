@@ -68,7 +68,10 @@ impl DeclarationContract {
 
     /// Compare required declarations while allowing additional internal declarations.
     pub fn differences(&self, actual: &Self) -> Vec<String> {
-        self.changes(actual).into_iter().map(|change| change.message).collect()
+        self.changes(actual)
+            .into_iter()
+            .map(|change| change.message)
+            .collect()
     }
 
     /// Compare contracts once, retaining source for declaration diff presentation.
@@ -91,16 +94,21 @@ impl DeclarationContract {
                     differences.push(ContractDifference {
                         identity: identity.clone(),
                         expected: expected.text.clone(),
-                        observed: observed.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join("\n"),
-                        message: format!(
-                        "{identity}: expected {}; observed {}",
-                        expected.signature,
-                        observed
+                        observed: observed
                             .iter()
-                            .map(|item| item.signature.as_str())
+                            .map(|item| item.text.as_str())
                             .collect::<Vec<_>>()
-                            .join(" | ")
-                    )});
+                            .join("\n"),
+                        message: format!(
+                            "{identity}: expected {}; observed {}",
+                            expected.signature,
+                            observed
+                                .iter()
+                                .map(|item| item.signature.as_str())
+                                .collect::<Vec<_>>()
+                                .join(" | ")
+                        ),
+                    });
                 }
             }
         }
@@ -126,9 +134,10 @@ impl DeclarationContract {
                         expected: String::new(),
                         observed: declaration.text.clone(),
                         message: format!(
-                        "{identity}: additional exposed declaration {}",
-                        declaration.signature
-                    )});
+                            "{identity}: additional exposed declaration {}",
+                            declaration.signature
+                        ),
+                    });
                 }
             }
         }
@@ -236,10 +245,20 @@ fn collect(
         );
         let display_body = child.child_by_field_name("body");
         let display = if let Some(body) = display_body.filter(|_| container) {
-            format!("{} {{}}", source[child.start_byte()..body.start_byte()].trim_end())
-        } else if let Some(body) = display_body.filter(|_| matches!(kind,
-            "function_item" | "function_declaration" | "method_definition")) {
-            format!("{};", source[child.start_byte()..body.start_byte()].trim_end())
+            format!(
+                "{} {{}}",
+                source[child.start_byte()..body.start_byte()].trim_end()
+            )
+        } else if let Some(body) = display_body.filter(|_| {
+            matches!(
+                kind,
+                "function_item" | "function_declaration" | "method_definition"
+            )
+        }) {
+            format!(
+                "{};",
+                source[child.start_byte()..body.start_byte()].trim_end()
+            )
         } else {
             text.to_owned()
         };

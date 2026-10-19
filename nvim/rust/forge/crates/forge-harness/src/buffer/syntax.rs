@@ -198,12 +198,10 @@ mod tests {
                 ..Default::default()
             },
         )?;
-        let engine = SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 2,
-            })),
-        );
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 2,
+        })));
         let job = MarkdownSyntax {
             target: TargetId("syntax".into()),
             block: rendered.block.id,
@@ -267,12 +265,10 @@ mod tests {
             fragment(hunk, false)?.bytes(),
             b"const shared = 1;\r\nconst next = 'value';\r"
         );
-        let engine = SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 2,
-            })),
-        );
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 2,
+        })));
         let job = SavedDiffSyntax {
             target: TargetId("diff".into()),
             text: text.into(),

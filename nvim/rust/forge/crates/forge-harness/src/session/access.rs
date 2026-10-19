@@ -56,16 +56,35 @@ impl AccessPolicy {
             let mut normalized = Vec::new();
             for directory in directories.iter() {
                 let path = Path::new(directory.trim());
-                ensure!(path.is_absolute(), "{label} directory must be absolute: {directory}");
-                ensure!(path.is_dir(), "{label} directory does not exist: {directory}");
-                let canonical = path.canonicalize()
+                ensure!(
+                    path.is_absolute(),
+                    "{label} directory must be absolute: {directory}"
+                );
+                ensure!(
+                    path.is_dir(),
+                    "{label} directory does not exist: {directory}"
+                );
+                let canonical = path
+                    .canonicalize()
                     .with_context(|| format!("resolve {label} directory: {directory}"))?;
                 let canonical = canonical.to_string_lossy().replace('\\', "/");
-                let canonical = canonical.strip_prefix("//?/UNC/").map(|value| format!("//{value}"))
-                    .unwrap_or_else(|| canonical.strip_prefix("//?/").unwrap_or(&canonical).to_owned());
-                ensure!(!normalized.iter().any(|existing: &String| if cfg!(windows) {
-                    existing.eq_ignore_ascii_case(&canonical)
-                } else { existing == &canonical }), "duplicate {label} directory: {directory}");
+                let canonical = canonical
+                    .strip_prefix("//?/UNC/")
+                    .map(|value| format!("//{value}"))
+                    .unwrap_or_else(|| {
+                        canonical
+                            .strip_prefix("//?/")
+                            .unwrap_or(&canonical)
+                            .to_owned()
+                    });
+                ensure!(
+                    !normalized.iter().any(|existing: &String| if cfg!(windows) {
+                        existing.eq_ignore_ascii_case(&canonical)
+                    } else {
+                        existing == &canonical
+                    }),
+                    "duplicate {label} directory: {directory}"
+                );
                 normalized.push(canonical);
             }
             *directories = normalized;
@@ -83,21 +102,29 @@ impl AccessPolicy {
         #[cfg(windows)]
         {
             #[link(name = "kernel32")]
-            unsafe extern "system" { fn GetLogicalDrives() -> u32; }
+            unsafe extern "system" {
+                fn GetLogicalDrives() -> u32;
+            }
             // Query the drive map without opening removable or network drives.
             let drive_mask = unsafe { GetLogicalDrives() };
-            let mut roots: Vec<_> = ('A'..='Z').enumerate()
+            let mut roots: Vec<_> = ('A'..='Z')
+                .enumerate()
                 .filter(|(index, _)| drive_mask & (1 << index) != 0)
-                .map(|(_, drive)| format!("{drive}:/")).collect();
+                .map(|(_, drive)| format!("{drive}:/"))
+                .collect();
             // Preserve access to a workspace on an unmapped network share.
             if let Some(root) = Path::new(workspace).ancestors().last() {
                 let root = root.to_string_lossy().into_owned();
-                if !roots.contains(&root) { roots.push(root); }
+                if !roots.contains(&root) {
+                    roots.push(root);
+                }
             }
             roots
         }
         #[cfg(not(windows))]
-        { vec!["/".into()] }
+        {
+            vec!["/".into()]
+        }
     }
 }
 

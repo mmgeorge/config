@@ -84,16 +84,12 @@ impl PullRequestEdit {
         );
         if let Some(title) = &self.title {
             ensure!(
-                !title.trim().is_empty()
-                    && !title.contains(['\r', '\n', '\0']),
+                !title.trim().is_empty() && !title.contains(['\r', '\n', '\0']),
                 "invalid GitHub PR title"
             );
         }
         if let Some(body) = &self.body {
-            ensure!(
-                !body.contains('\0'),
-                "GitHub PR body contains NUL"
-            );
+            ensure!(!body.contains('\0'), "GitHub PR body contains NUL");
         }
         Ok(())
     }

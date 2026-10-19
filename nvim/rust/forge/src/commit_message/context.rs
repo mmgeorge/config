@@ -6,11 +6,11 @@ use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::syntax::SyntaxEngine;
 use forge_diff::workers::WorkPriority;
-use forge_harness::backend::TextGeneration;
 use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion};
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, PathState};
 use forge_git::store::RepositoryStore;
+use forge_harness::backend::TextGeneration;
 
 use super::excerpt::ChangedFile;
 use super::{Comparison, GenerationRequest, excerpt};
@@ -32,14 +32,19 @@ pub async fn collect(
     syntax: &Arc<SyntaxEngine>,
     request: &GenerationRequest,
 ) -> Result<CommitContext> {
-    let background = if request.comparison == Comparison::PullRequest { None } else {
+    let background = if request.comparison == Comparison::PullRequest {
+        None
+    } else {
         Some(forge_harness::background::BackgroundContext::read(store, &request.workspace).await?)
     };
     let repository = store
         .open(PathBuf::from(&request.workspace))
         .await?
         .context("generation requires a Git worktree")?;
-    let paths = if matches!(request.comparison, Comparison::LatestCommit | Comparison::PullRequest) {
+    let paths = if matches!(
+        request.comparison,
+        Comparison::LatestCommit | Comparison::PullRequest
+    ) {
         forge_git::revision::comparison::observe(
             store,
             Arc::clone(&repository),
@@ -249,19 +254,30 @@ pub async fn collect(
     let prompt = if files.is_empty() {
         None
     } else {
-        let header = if request.comparison == Comparison::PullRequest { "" } else {
+        let header = if request.comparison == Comparison::PullRequest {
+            ""
+        } else {
             "Generate a conventional commit message for these changes.\n\n"
         };
-        let limit = request.max_bytes.unwrap_or_else(|| excerpt::MAX_INPUT_BYTES
-            .saturating_sub(forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE.len()
-                + TextGeneration::CommitMessage.background_input("").len() + header.len()));
-        Some(format!("{header}{}", excerpt::prompt(&mut files, syntax, limit).await))
+        let limit = request.max_bytes.unwrap_or_else(|| {
+            excerpt::MAX_INPUT_BYTES.saturating_sub(
+                forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE.len()
+                    + TextGeneration::CommitMessage.background_input("").len()
+                    + header.len(),
+            )
+        });
+        Some(format!(
+            "{header}{}",
+            excerpt::prompt(&mut files, syntax, limit).await
+        ))
     };
     let prompt = if let Some(background) = &background {
         background.verify(store).await?;
         prompt.map(|diff| format!("Current authoritative comparison at HEAD {} on {}. Earlier requests and generated drafts are historical, not current changes. Prior drafts do not prove a commit occurred.\n\nLast 10 reachable commits (style and terminology examples only):\n{}\nCurrent authoritative changes:\n{}",
             background.head.as_deref().unwrap_or("unborn"), background.branch.as_deref().unwrap_or("detached HEAD"), background.history, diff))
-    } else { prompt };
+    } else {
+        prompt
+    };
     Ok(CommitContext {
         background,
         prompt,
@@ -342,14 +358,22 @@ mod tests {
         git(root, &["add", "."]);
         git(root, &["commit", "--quiet", "-m", "initial"]);
         git(root, &["checkout", "--quiet", "-b", "feature"]);
-        std::fs::write(root.join("feature.rs"), "fn feature_marker() { hidden_body(); }\n").unwrap();
+        std::fs::write(
+            root.join("feature.rs"),
+            "fn feature_marker() { hidden_body(); }\n",
+        )
+        .unwrap();
         git(root, &["add", "."]);
         git(root, &["commit", "--quiet", "-m", "feature"]);
         git(root, &["branch", "selected-base"]);
         git(root, &["mv", "source.rs", "renamed.rs"]);
         git(root, &["commit", "--quiet", "-m", "rename"]);
-        let output = Command::new("git").arg("-C").arg(root).args(["rev-parse", "HEAD"])
-            .output().unwrap();
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .unwrap();
         assert!(output.status.success());
         let head = String::from_utf8(output.stdout).unwrap().trim().to_owned();
         git(root, &["checkout", "--quiet", "main"]);
@@ -362,15 +386,27 @@ mod tests {
         let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
         let syntax = SyntaxEngine::new(diff.analysis_pool());
         let mut request = GenerationRequest {
-            operation: "context".into(), workspace: root.to_string_lossy().into_owned(),
-            comparison: Comparison::PullRequest, base: Some("main".into()), head: Some(head),
-            max_bytes: Some(4000), ignored_paths: vec![], generation: None, input: None,
+            operation: "context".into(),
+            workspace: root.to_string_lossy().into_owned(),
+            comparison: Comparison::PullRequest,
+            base: Some("main".into()),
+            head: Some(head),
+            max_bytes: Some(4000),
+            ignored_paths: vec![],
+            generation: None,
+            input: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
         assert!(prompt.contains("+ fn feature_marker() {"), "{prompt}");
-        assert!(prompt.contains("renamed.rs (Renamed from source.rs)"), "{prompt}");
-        assert!(!prompt.contains("base_only") && !prompt.contains("uncommitted"), "{prompt}");
+        assert!(
+            prompt.contains("renamed.rs (Renamed from source.rs)"),
+            "{prompt}"
+        );
+        assert!(
+            !prompt.contains("base_only") && !prompt.contains("uncommitted"),
+            "{prompt}"
+        );
         assert!(!prompt.contains("conventional commit"));
         assert!(prompt.len() <= 4000);
         request.base = Some("selected-base".into());
@@ -434,7 +470,8 @@ mod tests {
                 head: None,
                 max_bytes: None,
                 ignored_paths: vec![],
-                                generation: None, input: None,
+                generation: None,
+                input: None,
             };
             for (label, comparison) in [
                 ("head", Comparison::Head),
@@ -488,7 +525,8 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-                        generation: None, input: None,
+            generation: None,
+            input: None,
         };
         let context = collect(&store, &diff, &syntax, &request).await.unwrap();
         let prompt = context.prompt.unwrap();
@@ -542,7 +580,8 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec![],
-                        generation: None, input: None,
+            generation: None,
+            input: None,
         };
         let mut pending = Box::pin(collect(&store, &diff, &syntax, &request));
         let before_release =
@@ -594,7 +633,8 @@ mod tests {
             head: None,
             max_bytes: None,
             ignored_paths: vec!["excluded.txt".into()],
-                        generation: None, input: None,
+            generation: None,
+            input: None,
         };
         let prompt = collect(&store, &diff, &syntax, &request)
             .await

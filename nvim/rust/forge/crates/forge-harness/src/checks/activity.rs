@@ -28,9 +28,17 @@ impl CheckActivity {
         }
         let mut selected = std::collections::BTreeMap::new();
         for command in run.commands.iter().filter(|command| command.selected) {
-            let id = command.context.as_ref().map_or(command.id.as_str(), |context| context.definition_id.as_str());
+            let id = command
+                .context
+                .as_ref()
+                .map_or(command.id.as_str(), |context| {
+                    context.definition_id.as_str()
+                });
             let completed = !matches!(command.state, CheckState::Pending | CheckState::Running);
-            selected.entry(id).and_modify(|finished| *finished &= completed).or_insert(completed);
+            selected
+                .entry(id)
+                .and_modify(|finished| *finished &= completed)
+                .or_insert(completed);
         }
         let duration_ms = run
             .commands

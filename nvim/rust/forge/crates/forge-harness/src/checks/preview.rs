@@ -60,7 +60,9 @@ pub(crate) async fn plan(
     });
     let mut config = snapshot.config.clone();
     for check in &mut config.definitions {
-        if design.document.disabled_checks.contains(&check.id) { check.enabled = false; }
+        if design.document.disabled_checks.contains(&check.id) {
+            check.enabled = false;
+        }
     }
     resolve(
         workspace,
@@ -84,7 +86,10 @@ pub(super) async fn resolve(
     metadata_pending: bool,
     included: &[String],
 ) -> Result<Vec<CheckPreview>> {
-    let request = RunRequest { include: included.to_vec(), ..Default::default() };
+    let request = RunRequest {
+        include: included.to_vec(),
+        ..Default::default()
+    };
     let applicability = super::applicability::resolve(&request, config, Some(files), true)?;
     let request = RunRequest {
         ids: applicability
@@ -153,9 +158,17 @@ pub(super) async fn resolve(
                             let mut item = preview.clone();
                             item.command = invocation.display();
                             if !invocation.files.is_empty() {
-                                item.reason = if included.contains(&definition.id) || applicable.reason.starts_with("Required by") {
-                                    format!("{}. Inputs: {}", applicable.reason, invocation.files.join(", "))
-                                } else { format!("Changed: {}", invocation.files.join(", ")) };
+                                item.reason = if included.contains(&definition.id)
+                                    || applicable.reason.starts_with("Required by")
+                                {
+                                    format!(
+                                        "{}. Inputs: {}",
+                                        applicable.reason,
+                                        invocation.files.join(", ")
+                                    )
+                                } else {
+                                    format!("Changed: {}", invocation.files.join(", "))
+                                };
                             }
                             result.push(item);
                         }

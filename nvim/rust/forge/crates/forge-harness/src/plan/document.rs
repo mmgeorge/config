@@ -626,17 +626,38 @@ pub struct PlanDocument {
 
 impl PlanDocument {
     /// Apply one optimistic declaration patch without exposing the immutable baseline to edits.
-    pub fn patch_design(&self, workspace: &std::path::Path, request: super::DesignPatchRequest) -> Result<Self> {
-        anyhow::ensure!(request.plan_id == self.plan_id, "design plan id does not match the active plan");
-        anyhow::ensure!(request.expected_version == self.version, "design version conflict: expected_version must be {}", self.version);
+    pub fn patch_design(
+        &self,
+        workspace: &std::path::Path,
+        request: super::DesignPatchRequest,
+    ) -> Result<Self> {
+        anyhow::ensure!(
+            request.plan_id == self.plan_id,
+            "design plan id does not match the active plan"
+        );
+        anyhow::ensure!(
+            request.expected_version == self.version,
+            "design version conflict: expected_version must be {}",
+            self.version
+        );
         let mut candidate = self.clone();
-        candidate.design = Some(self.design.as_ref().context("obsolete plan format. Create a new declaration design.")?.patch(workspace, &request.source_digests, &request.patch)?);
+        candidate.design = Some(
+            self.design
+                .as_ref()
+                .context("obsolete plan format. Create a new declaration design.")?
+                .patch(workspace, &request.source_digests, &request.patch)?,
+        );
         if let Some(title) = request.title {
             anyhow::ensure!(!title.trim().is_empty(), "design title must not be empty");
             candidate.title = title.trim().into();
         }
-        if candidate.design == self.design && candidate.title == self.title { return Ok(self.clone()); }
-        candidate.version = self.version.checked_add(1).context("design version overflow")?;
+        if candidate.design == self.design && candidate.title == self.title {
+            return Ok(self.clone());
+        }
+        candidate.version = self
+            .version
+            .checked_add(1)
+            .context("design version overflow")?;
         candidate.validate()?;
         Ok(candidate)
     }
@@ -709,8 +730,14 @@ impl PlanDocument {
     /// Validate references and structural invariants after every semantic edit.
     pub fn validate(&self) -> Result<()> {
         if let Some(design) = &self.design {
-            anyhow::ensure!(self.schema_version == PLAN_SCHEMA_VERSION, "obsolete plan format. Create a new declaration design.");
-            anyhow::ensure!(self.version > 0 && !self.plan_id.is_empty() && !self.title.trim().is_empty(),"design identity, title, and version are required");
+            anyhow::ensure!(
+                self.schema_version == PLAN_SCHEMA_VERSION,
+                "obsolete plan format. Create a new declaration design."
+            );
+            anyhow::ensure!(
+                self.version > 0 && !self.plan_id.is_empty() && !self.title.trim().is_empty(),
+                "design identity, title, and version are required"
+            );
             return design.validate();
         }
         validate_plan_edit(self)
@@ -734,8 +761,14 @@ impl PlanDocument {
     /// Omit deferred verification instructions from code-writing handoffs.
     pub(crate) fn execution_json(&self, phase: super::PlanPhase) -> Result<String> {
         let mut value = self.model_value()?;
-        if matches!(phase, super::PlanPhase::Implement | super::PlanPhase::Resolve) {
-            if let Some(document) = value.get_mut("document").and_then(serde_json::Value::as_object_mut) {
+        if matches!(
+            phase,
+            super::PlanPhase::Implement | super::PlanPhase::Resolve
+        ) {
+            if let Some(document) = value
+                .get_mut("document")
+                .and_then(serde_json::Value::as_object_mut)
+            {
                 document.remove("verification");
                 document.remove("checks");
             }
@@ -750,11 +783,13 @@ impl PlanDocument {
             return Ok(value);
         }
         let mut value = super::codec::to_value(self)?;
-        value.as_object_mut().expect("PlanDocument serializes as an object").remove("prompt");
+        value
+            .as_object_mut()
+            .expect("PlanDocument serializes as an object")
+            .remove("prompt");
         hide_derived_state(&mut value);
         Ok(value)
     }
-
 }
 
 fn hide_derived_state(value: &mut serde_json::Value) {
@@ -1139,6 +1174,8 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains(&format!("supported PlanDocument schema version {PLAN_SCHEMA_VERSION}")));
+        assert!(unsupported.contains(&format!(
+            "supported PlanDocument schema version {PLAN_SCHEMA_VERSION}"
+        )));
     }
 }

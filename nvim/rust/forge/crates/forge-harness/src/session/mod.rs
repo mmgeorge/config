@@ -1,14 +1,14 @@
 mod auto_compaction;
-pub use auto_compaction::AutoCompaction;
 use anyhow::Result;
+pub use auto_compaction::AutoCompaction;
 use serde::{Deserialize, Serialize};
 
 mod access;
 mod shell;
 mod timeout;
-pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
-pub use shell::CheckShell;
 pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox};
+pub use shell::CheckShell;
+pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
 pub mod continuation;
 pub mod state_machine;
 use std::collections::BTreeMap;
@@ -288,6 +288,10 @@ mod context_usage_test {
     }
 }
 
-fn auto_approve_revisions() -> bool { true }
+fn auto_approve_revisions() -> bool {
+    true
+}
 
-fn default_write_permission() -> PermissionMode { PermissionMode::Write }
+fn default_write_permission() -> PermissionMode {
+    PermissionMode::Write
+}

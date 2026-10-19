@@ -2,7 +2,6 @@ use anyhow::{Context, Result, ensure};
 use forge_git::RepositoryPath;
 use serde::Deserialize;
 
-
 #[derive(Clone, Debug, Deserialize)]
 pub struct Artifact {
     pub version: u32,

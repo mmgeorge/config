@@ -514,8 +514,10 @@ mod tests {
 
     #[test]
     fn complete_large_capture_and_growing_settlement_survive_reopening() {
-        let directory = tempfile::Builder::new().prefix(".forge-recovery-")
-            .tempdir_in(std::env::current_dir().unwrap()).unwrap();
+        let directory = tempfile::Builder::new()
+            .prefix(".forge-recovery-")
+            .tempdir_in(std::env::current_dir().unwrap())
+            .unwrap();
         let store = store(&directory);
         let text = format!("{}capture tail", "x".repeat(16 * 1024 * 1024 + 1));
         let mut captured = capture("large-operation");
@@ -523,7 +525,11 @@ mod tests {
         let mut lease = store.prepare(resource(1), captured).unwrap();
         lease.dispatch_possible().unwrap();
         let result = format!("{}settlement tail", "λ".repeat(1024 * 1024));
-        lease.settle(RecoveryPhase::Confirmed { result: json!({"body":result}) }).unwrap();
+        lease
+            .settle(RecoveryPhase::Confirmed {
+                result: json!({"body":result}),
+            })
+            .unwrap();
         drop(lease);
         let record = store.inspect(&resource(1)).unwrap().unwrap();
         assert_eq!(record.capture.submitted["body"], text);

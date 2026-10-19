@@ -82,6 +82,10 @@ M.empty_diff_rows = {}
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
 ---@field check_queue? ForgeCheckQueuePublication
+---@field status_thoughts? boolean
+---@field subagent_tools? boolean
+---@field lsp_tools? boolean
+---@field task_config? table
 ---@field check_editing? boolean
 ---@field check_timing? 'after_queue'|'between_work'
 ---@field check_timing_request? integer

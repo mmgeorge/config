@@ -101,26 +101,45 @@ pub(super) async fn generate(
         .and_then(Value::as_str)
         .context("Missing isolated thread identity")?;
     let result = tokio::time::timeout(Duration::from_secs(60), async {
-        let request_id = process.send_request("turn/start", json!({"threadId":thread,
-            "input":[{"type":"text","text":purpose.input(history),"text_elements":[]}]})).await?;
+        let request_id = process
+            .send_request(
+                "turn/start",
+                json!({"threadId":thread,
+            "input":[{"type":"text","text":purpose.input(history),"text_elements":[]}]}),
+            )
+            .await?;
         let mut text = String::new();
         loop {
             let event = process.read_message(output).await?;
-            if let Some(result) = CodexJsonRpc::request_result(&event, request_id, "turn/start") { result?; }
+            if let Some(result) = CodexJsonRpc::request_result(&event, request_id, "turn/start") {
+                result?;
+            }
             let params = &event["params"];
-            if params["threadId"].as_str() != Some(thread) { continue; }
+            if params["threadId"].as_str() != Some(thread) {
+                continue;
+            }
             match event["method"].as_str() {
                 Some("item/completed") if params["item"]["type"] == "agentMessage" => {
-                    text = params["item"]["text"].as_str().unwrap_or_default().to_owned();
+                    text = params["item"]["text"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_owned();
                 }
                 Some("turn/completed") => {
-                    ensure!(params["turn"]["status"] == "completed", "Isolated turn failed: {}", params["turn"]["error"]);
+                    ensure!(
+                        params["turn"]["status"] == "completed",
+                        "Isolated turn failed: {}",
+                        params["turn"]["error"]
+                    );
                     return purpose.validate(&text);
                 }
                 _ => {}
             }
         }
-    }).await.context("Isolated text generation timed out").and_then(|result| result);
+    })
+    .await
+    .context("Isolated text generation timed out")
+    .and_then(|result| result);
     tokio::time::timeout(
         Duration::from_secs(8),
         process.request("thread/unsubscribe", json!({"threadId":thread}), output),
@@ -136,113 +155,142 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
 
     #[tokio::test]
-    async fn text_generation_uses_selected_model_in_an_isolated_thread()
-    -> Result<()> {
-        for purpose in [TextGeneration::SessionName, TextGeneration::CommitMessage, TextGeneration::PullRequestDescription] {
-        let (input, expected) = match purpose {
-            TextGeneration::SessionName => ("User: Fix terminal status", "Terminal status fixes"),
-            TextGeneration::CommitMessage => ("Staged diff:\n+change", "fix: preserve commit drafts\n\nKeep existing text."),
-            TextGeneration::PullRequestDescription => ("PR evidence: +change", "Preserves the requested change.\n\nKeeps the supplied failure boundary."),
-            _ => unreachable!(),
-        };
-        let fixture = tempfile::tempdir()?;
-        let workspace = fixture.path().to_string_lossy().into_owned();
-        let permission = crate::backend::approval::PermissionCoordinator::transient(&workspace)?;
-        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(fixture.path())?);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("ws://{}", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for method in [
-                "config/read",
-                "model/list",
-                "thread/start",
-                "turn/start",
-                "thread/unsubscribe",
-            ].into_iter().filter(|method| *method != "model/list" || purpose == TextGeneration::SessionName) {
-                let request: Value =
-                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                        .unwrap();
-                assert_eq!(request["method"], method);
-                let result = match method {
-                    "config/read" => {
-                        json!({"config":{"model":"different-default","model_reasoning_effort":"high","mcp_servers":{"test":{}}}})
-                    }
-                    "model/list" => {
-                        json!({"data":[{"model":"selected-model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"minimal"},{"reasoningEffort":"low"}]}]})
-                    }
-                    "thread/start" => {
-                        assert_eq!(request["params"]["model"], "selected-model");
-                        if purpose == TextGeneration::SessionName {
-                            assert_eq!(request["params"]["config"]["model_reasoning_effort"], "minimal");
-                        } else {
-                            assert_eq!(request["params"]["config"]["model_reasoning_effort"], "low");
-                        }
-                        assert_eq!(request["params"]["baseInstructions"], purpose.instructions());
-                        assert_eq!(request["params"]["ephemeral"], true);
-                        assert_eq!(
-                            request["params"]["config"]["mcp_servers"]["test"]["enabled"],
-                            false
-                        );
-                        assert_eq!(request["params"]["config"]["features.shell_tool"], false);
-                        json!({"thread":{"id":"temporary"}})
-                    }
-                    "turn/start" => {
-                        assert_eq!(request["params"]["threadId"], "temporary");
-                        assert_eq!(request["params"]["input"][0]["text"], purpose.input(input));
-                        json!({})
-                    }
-                    _ => {
-                        assert_eq!(request["params"]["threadId"], "temporary");
-                        json!({})
-                    }
-                };
-                socket
-                    .send(tokio_tungstenite::tungstenite::Message::Text(
-                        json!({"id":request["id"],"result":result})
-                            .to_string()
-                            .into(),
-                    ))
-                    .await
+    async fn text_generation_uses_selected_model_in_an_isolated_thread() -> Result<()> {
+        for purpose in [
+            TextGeneration::SessionName,
+            TextGeneration::CommitMessage,
+            TextGeneration::PullRequestDescription,
+        ] {
+            let (input, expected) = match purpose {
+                TextGeneration::SessionName => {
+                    ("User: Fix terminal status", "Terminal status fixes")
+                }
+                TextGeneration::CommitMessage => (
+                    "Staged diff:\n+change",
+                    "fix: preserve commit drafts\n\nKeep existing text.",
+                ),
+                TextGeneration::PullRequestDescription => (
+                    "PR evidence: +change",
+                    "Preserves the requested change.\n\nKeeps the supplied failure boundary.",
+                ),
+                _ => unreachable!(),
+            };
+            let fixture = tempfile::tempdir()?;
+            let workspace = fixture.path().to_string_lossy().into_owned();
+            let permission =
+                crate::backend::approval::PermissionCoordinator::transient(&workspace)?;
+            let trace = std::sync::Arc::new(crate::trace::TraceStore::open(fixture.path())?);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("ws://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for method in [
+                    "config/read",
+                    "model/list",
+                    "thread/start",
+                    "turn/start",
+                    "thread/unsubscribe",
+                ]
+                .into_iter()
+                .filter(|method| *method != "model/list" || purpose == TextGeneration::SessionName)
+                {
+                    let request: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
                     .unwrap();
-                if method == "turn/start" {
-                    for notification in [
-                        json!({"method":"item/completed","params":{"threadId":"temporary","item":{"type":"agentMessage","text":expected}}}),
-                        json!({"method":"turn/completed","params":{"threadId":"temporary","turn":{"status":"completed"}}}),
-                    ] {
-                        socket
-                            .send(tokio_tungstenite::tungstenite::Message::Text(
-                                notification.to_string().into(),
-                            ))
-                            .await
-                            .unwrap();
+                    assert_eq!(request["method"], method);
+                    let result = match method {
+                        "config/read" => {
+                            json!({"config":{"model":"different-default","model_reasoning_effort":"high","mcp_servers":{"test":{}}}})
+                        }
+                        "model/list" => {
+                            json!({"data":[{"model":"selected-model","supportedReasoningEfforts":[{"reasoningEffort":"high"},{"reasoningEffort":"minimal"},{"reasoningEffort":"low"}]}]})
+                        }
+                        "thread/start" => {
+                            assert_eq!(request["params"]["model"], "selected-model");
+                            if purpose == TextGeneration::SessionName {
+                                assert_eq!(
+                                    request["params"]["config"]["model_reasoning_effort"],
+                                    "minimal"
+                                );
+                            } else {
+                                assert_eq!(
+                                    request["params"]["config"]["model_reasoning_effort"],
+                                    "low"
+                                );
+                            }
+                            assert_eq!(
+                                request["params"]["baseInstructions"],
+                                purpose.instructions()
+                            );
+                            assert_eq!(request["params"]["ephemeral"], true);
+                            assert_eq!(
+                                request["params"]["config"]["mcp_servers"]["test"]["enabled"],
+                                false
+                            );
+                            assert_eq!(request["params"]["config"]["features.shell_tool"], false);
+                            json!({"thread":{"id":"temporary"}})
+                        }
+                        "turn/start" => {
+                            assert_eq!(request["params"]["threadId"], "temporary");
+                            assert_eq!(request["params"]["input"][0]["text"], purpose.input(input));
+                            json!({})
+                        }
+                        _ => {
+                            assert_eq!(request["params"]["threadId"], "temporary");
+                            json!({})
+                        }
+                    };
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                    if method == "turn/start" {
+                        for notification in [
+                            json!({"method":"item/completed","params":{"threadId":"temporary","item":{"type":"agentMessage","text":expected}}}),
+                            json!({"method":"turn/completed","params":{"threadId":"temporary","turn":{"status":"completed"}}}),
+                        ] {
+                            socket
+                                .send(tokio_tungstenite::tungstenite::Message::Text(
+                                    notification.to_string().into(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
                     }
                 }
-            }
-        });
-        let mut process = CodexJsonRpc::connect(
-            &endpoint,
-            &workspace,
-            crate::session::PermissionMode::Read,
-            permission,
-            None,
-            trace,
-            "session".into(),
-        )
-        .await?;
-        let result = generate(
-            &mut process,
-            &mut BackendOutput::default(),
-            &workspace,
-            purpose,
-            "selected-model",
-            matches!(purpose, TextGeneration::CommitMessage | TextGeneration::PullRequestDescription).then_some("low"),
-            input,
-        )
-        .await?;
-        assert_eq!(result, expected);
-        tokio::time::timeout(Duration::from_secs(2), server).await??;
+            });
+            let mut process = CodexJsonRpc::connect(
+                &endpoint,
+                &workspace,
+                crate::session::PermissionMode::Read,
+                permission,
+                None,
+                trace,
+                "session".into(),
+            )
+            .await?;
+            let result = generate(
+                &mut process,
+                &mut BackendOutput::default(),
+                &workspace,
+                purpose,
+                "selected-model",
+                matches!(
+                    purpose,
+                    TextGeneration::CommitMessage | TextGeneration::PullRequestDescription
+                )
+                .then_some("low"),
+                input,
+            )
+            .await?;
+            assert_eq!(result, expected);
+            tokio::time::timeout(Duration::from_secs(2), server).await??;
         }
         Ok(())
     }

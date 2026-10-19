@@ -134,10 +134,21 @@ pub struct Exchange {
 
 impl Exchange {
     /// Create a causal root record for manual child admission without a root model turn.
-    pub(crate) fn agent_admission(session_id: &str, ordinal: u64, prompt: String, now_ms: i64) -> Self {
-        let delegation = Delegation { id: uuid::Uuid::new_v4().to_string(), child_agent_id: crate::session::HarnessSession::primary_agent_id(session_id),
-            child_exchange_id: uuid::Uuid::new_v4().to_string(), parent_exchange_id: String::new(), parent_turn_id: None,
-            task: prompt, created_at_ms: now_ms };
+    pub(crate) fn agent_admission(
+        session_id: &str,
+        ordinal: u64,
+        prompt: String,
+        now_ms: i64,
+    ) -> Self {
+        let delegation = Delegation {
+            id: uuid::Uuid::new_v4().to_string(),
+            child_agent_id: crate::session::HarnessSession::primary_agent_id(session_id),
+            child_exchange_id: uuid::Uuid::new_v4().to_string(),
+            parent_exchange_id: String::new(),
+            parent_turn_id: None,
+            task: prompt,
+            created_at_ms: now_ms,
+        };
         let mut exchange = Self::delegated(session_id, &delegation, ordinal);
         exchange.lifecycle = Some("agent_admission".into());
         exchange.state = ExchangeState::Running;
@@ -145,11 +156,22 @@ impl Exchange {
     }
 
     /// Append the reserved task identity without allocating a second child exchange.
-    pub(crate) fn append_agent_task(&mut self, task: &crate::agent::AgentTask) -> anyhow::Result<bool> {
-        anyhow::ensure!(task.session_id == self.session_id && task.parent_exchange_id == self.id,
-            "child admission crosses causal ownership");
-        let appended = self.append_delegation(&task.agent_id, &task.operation_id, &task.message, task.created_at_ms)?;
-        if appended && let Some(ExchangeNode::AgentReference { agent }) = self.node_list.last_mut() {
+    pub(crate) fn append_agent_task(
+        &mut self,
+        task: &crate::agent::AgentTask,
+    ) -> anyhow::Result<bool> {
+        anyhow::ensure!(
+            task.session_id == self.session_id && task.parent_exchange_id == self.id,
+            "child admission crosses causal ownership"
+        );
+        let appended = self.append_delegation(
+            &task.agent_id,
+            &task.operation_id,
+            &task.message,
+            task.created_at_ms,
+        )?;
+        if appended && let Some(ExchangeNode::AgentReference { agent }) = self.node_list.last_mut()
+        {
             agent.child_exchange_id = task.id.clone();
         }
         Ok(appended)
@@ -180,7 +202,8 @@ impl Exchange {
             goal_id: None,
             state: ExchangeState::Queued,
             disposition: HistoryDisposition::Current,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -240,8 +263,15 @@ impl Exchange {
     }
 
     /// Retain one compaction at its first observed position and merge terminal evidence.
-    pub(crate) fn observe_compaction(&mut self, compaction: crate::backend::Compaction, now_ms: i64) {
-        if let Some(ExchangeNode::Compaction { compaction: existing, .. }) = self.node_list.iter_mut().find(|node| {
+    pub(crate) fn observe_compaction(
+        &mut self,
+        compaction: crate::backend::Compaction,
+        now_ms: i64,
+    ) {
+        if let Some(ExchangeNode::Compaction {
+            compaction: existing,
+            ..
+        }) = self.node_list.iter_mut().find(|node| {
             matches!(node, ExchangeNode::Compaction { compaction: existing, .. }
                 if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
         }) {
@@ -249,7 +279,10 @@ impl Exchange {
         } else {
             self.close_running_messages();
             self.node_list.push(ExchangeNode::Compaction {
-                id: format!("{}:compaction:{}:{}", self.id, compaction.thread_id, compaction.id),
+                id: format!(
+                    "{}:compaction:{}:{}",
+                    self.id, compaction.thread_id, compaction.id
+                ),
                 compaction: compaction.observed(now_ms),
             });
         }
@@ -258,9 +291,13 @@ impl Exchange {
     /// Retain fresh usage on the latest compaction without changing settled history.
     pub(crate) fn observe_compaction_usage(&mut self, thread_id: &str, used: u64) -> bool {
         let Some(compaction) = self.node_list.iter_mut().rev().find_map(|node| match node {
-            ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id => Some(compaction),
+            ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id => {
+                Some(compaction)
+            }
             _ => None,
-        }) else { return false };
+        }) else {
+            return false;
+        };
         compaction.observe_context_usage(used)
     }
 
@@ -268,7 +305,9 @@ impl Exchange {
     pub(crate) fn unconfirm_compaction(&mut self, thread_id: &str, now_ms: i64) {
         for node in &mut self.node_list {
             if let ExchangeNode::Compaction { compaction, .. } = node
-                && compaction.thread_id == thread_id && compaction.state == crate::backend::CompactionState::Running {
+                && compaction.thread_id == thread_id
+                && compaction.state == crate::backend::CompactionState::Running
+            {
                 compaction.state = crate::backend::CompactionState::Unconfirmed;
                 compaction.completed_at_ms = Some(now_ms);
             }
@@ -390,16 +429,30 @@ impl Exchange {
                     });
                 }
                 if let Some(reads) = event.data.get("skill_reads") {
-                    let reads: Vec<crate::skill::SkillRead> = serde_json::from_value(reads.clone())?;
+                    let reads: Vec<crate::skill::SkillRead> =
+                        serde_json::from_value(reads.clone())?;
                     for read in reads {
-                        let successful = self.turn.iter().find(|turn|turn.id() == turn_id)
-                            .and_then(|turn|turn.tools().find(|tool|tool.id == read.tool_id))
-                            .is_some_and(|tool|tool.state() == crate::turn::ToolState::Completed && !tool.failed);
-                        if !successful || self.node_list.iter().any(|node|matches!(node,
+                        let successful = self
+                            .turn
+                            .iter()
+                            .find(|turn| turn.id() == turn_id)
+                            .and_then(|turn| turn.tools().find(|tool| tool.id == read.tool_id))
+                            .is_some_and(|tool| {
+                                tool.state() == crate::turn::ToolState::Completed && !tool.failed
+                            });
+                        if !successful
+                            || self.node_list.iter().any(|node| {
+                                matches!(node,
                             ExchangeNode::SkillRead {turn_id:owner,read:existing,..}
-                                if owner == &turn_id && existing.resource_id == read.resource_id)) { continue; }
+                                if owner == &turn_id && existing.resource_id == read.resource_id)
+                            })
+                        {
+                            continue;
+                        }
                         self.node_list.push(ExchangeNode::SkillRead {
-                            id:format!("{turn_id}:skill:{}",read.resource_id),turn_id:turn_id.clone(),read,
+                            id: format!("{turn_id}:skill:{}", read.resource_id),
+                            turn_id: turn_id.clone(),
+                            read,
                         });
                     }
                 }
@@ -476,9 +529,13 @@ impl Exchange {
 
     /// Reopen completed source work for its automatic check repair without replacing its identity.
     pub(crate) fn repair_checks(&mut self, now_ms: i64) -> anyhow::Result<()> {
-        anyhow::ensure!(self.state == ExchangeState::Complete && !self.awaiting_input
-            && self.elicitation.is_none() && self.check_owner.is_some(),
-            "automatic repair requires a completed exchange with check ownership");
+        anyhow::ensure!(
+            self.state == ExchangeState::Complete
+                && !self.awaiting_input
+                && self.elicitation.is_none()
+                && self.check_owner.is_some(),
+            "automatic repair requires a completed exchange with check ownership"
+        );
         self.state = ExchangeState::Running;
         self.completed_at_ms = None;
         self.finalization_outcome = None;
@@ -515,21 +572,35 @@ impl Exchange {
 
     /// Resolves lifecycle ownership without treating a stopped clock as a task pause.
     pub(crate) fn activity(&self) -> ExchangeActivity {
-        if self.state != ExchangeState::Running || self.completed_at_ms.is_some()
-            || self.execution_phase.as_ref().is_some_and(|phase| phase.outcome.is_some()) {
+        if self.state != ExchangeState::Running
+            || self.completed_at_ms.is_some()
+            || self
+                .execution_phase
+                .as_ref()
+                .is_some_and(|phase| phase.outcome.is_some())
+        {
             return ExchangeActivity::Settled;
         }
-        if self.execution_started_at_ms.is_none() && !self.metrics.approval_resume && self.turn.last().is_some_and(|turn| {
-            matches!(turn.state(), crate::turn::TurnState::Finished {
-                outcome: crate::turn::TurnOutcome::Interrupted | crate::turn::TurnOutcome::Cancelled
+        if self.execution_started_at_ms.is_none()
+            && !self.metrics.approval_resume
+            && self.turn.last().is_some_and(|turn| {
+                matches!(
+                    turn.state(),
+                    crate::turn::TurnState::Finished {
+                        outcome: crate::turn::TurnOutcome::Interrupted
+                            | crate::turn::TurnOutcome::Cancelled
+                    }
+                )
             })
-        }) {
+        {
             return ExchangeActivity::Paused;
         }
         if self.metrics.awaiting_approval() {
             return ExchangeActivity::AwaitingApproval;
         }
-        if self.execution_started_at_ms.is_none() && (self.awaiting_input || self.elicitation.is_some()) {
+        if self.execution_started_at_ms.is_none()
+            && (self.awaiting_input || self.elicitation.is_some())
+        {
             return ExchangeActivity::AwaitingInput;
         }
         if let Some(started_at_ms) = self.compaction_started_at_ms() {
@@ -546,7 +617,9 @@ impl Exchange {
         self.node_list.iter().rev().find_map(|node| match node {
             ExchangeNode::Compaction { compaction, .. }
                 if compaction.state == crate::backend::CompactionState::Running =>
-                    Some(compaction.started_at_ms.unwrap_or(self.created_at_ms)),
+            {
+                Some(compaction.started_at_ms.unwrap_or(self.created_at_ms))
+            }
             _ => None,
         })
     }
@@ -839,24 +912,46 @@ mod test {
     #[test]
     fn input_timeout_approval_provenance_survives_exchange_serialization() {
         let mut exchange = interaction();
-        exchange.approval_resolution.push(serde_json::from_value(serde_json::json!({
-            "id":"timed-out", "provider":"test", "exchange_id":exchange.id, "turn_id":null,
-            "reason":"Inspect source", "item_list":[], "deadline":{"expires_at_ms":1000},
-            "resolution_source":"timeout"
-        })).unwrap());
+        exchange.approval_resolution.push(
+            serde_json::from_value(serde_json::json!({
+                "id":"timed-out", "provider":"test", "exchange_id":exchange.id, "turn_id":null,
+                "reason":"Inspect source", "item_list":[], "deadline":{"expires_at_ms":1000},
+                "resolution_source":"timeout"
+            }))
+            .unwrap(),
+        );
         let encoded = serde_json::to_value(&exchange).unwrap();
         let restored: Exchange = serde_json::from_value(encoded.clone()).unwrap();
-        assert_eq!(restored.approval_resolution[0].resolution_source, crate::session::ResolutionSource::Timeout);
-        assert_eq!(restored.approval_resolution[0].deadline.as_ref().unwrap().expires_at_ms, 1000);
+        assert_eq!(
+            restored.approval_resolution[0].resolution_source,
+            crate::session::ResolutionSource::Timeout
+        );
+        assert_eq!(
+            restored.approval_resolution[0]
+                .deadline
+                .as_ref()
+                .unwrap()
+                .expires_at_ms,
+            1000
+        );
         let mut legacy = encoded;
-        legacy.as_object_mut().unwrap().remove("approval_resolution");
-        assert!(serde_json::from_value::<Exchange>(legacy).unwrap().approval_resolution.is_empty());
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("approval_resolution");
+        assert!(
+            serde_json::from_value::<Exchange>(legacy)
+                .unwrap()
+                .approval_resolution
+                .is_empty()
+        );
     }
 
     fn interaction() -> Exchange {
         Exchange {
             lifecycle: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: "primary".into(),
             id: "interaction-one".into(),

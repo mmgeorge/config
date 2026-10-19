@@ -308,57 +308,60 @@ pub(crate) fn control_tool_failure_json(
     error: &Error,
     document: Option<&PlanDocument>,
 ) -> String {
-    let (phase, code, violation) =
-        if let Some(argument_error) = error.downcast_ref::<ControlToolArgumentError>() {
-            (
-                ControlToolFailurePhase::ArgumentValidation,
-                "invalid_arguments".to_owned(),
-                argument_error.violation.clone(),
-            )
-        } else if let Some(mutation_error) = error.downcast_ref::<PlanMutationError>() {
-            (
-                failure_phase(invocation),
-                "invalid_plan_edit".to_owned(),
-                vec![ControlToolViolation {
-                    path: mutation_error.path.clone(),
-                    code: mutation_error.code.clone(),
-                    message: mutation_error.message.clone(),
-                    expected_shape: Some(mutation_error.expected_shape.clone()),
-                    hint: Some(mutation_error.hint.clone()),
-                }],
-            )
-        } else if let Some(validation_error) = error.downcast_ref::<PlanValidationError>() {
-            (
-                failure_phase(invocation),
-                "canonical_validation_failed".to_owned(),
-                validation_error
-                    .violation
-                    .iter()
-                    .map(plan_violation)
-                    .collect(),
-            )
-        } else if let Some(validation_error) = error.downcast_ref::<crate::declaration::DeclarationValidationError>() {
-            (failure_phase(invocation), "declaration_validation_failed".to_owned(), validation_error.diagnostic.iter().map(|diagnostic| ControlToolViolation {
+    let (phase, code, violation) = if let Some(argument_error) =
+        error.downcast_ref::<ControlToolArgumentError>()
+    {
+        (
+            ControlToolFailurePhase::ArgumentValidation,
+            "invalid_arguments".to_owned(),
+            argument_error.violation.clone(),
+        )
+    } else if let Some(mutation_error) = error.downcast_ref::<PlanMutationError>() {
+        (
+            failure_phase(invocation),
+            "invalid_plan_edit".to_owned(),
+            vec![ControlToolViolation {
+                path: mutation_error.path.clone(),
+                code: mutation_error.code.clone(),
+                message: mutation_error.message.clone(),
+                expected_shape: Some(mutation_error.expected_shape.clone()),
+                hint: Some(mutation_error.hint.clone()),
+            }],
+        )
+    } else if let Some(validation_error) = error.downcast_ref::<PlanValidationError>() {
+        (
+            failure_phase(invocation),
+            "canonical_validation_failed".to_owned(),
+            validation_error
+                .violation
+                .iter()
+                .map(plan_violation)
+                .collect(),
+        )
+    } else if let Some(validation_error) =
+        error.downcast_ref::<crate::declaration::DeclarationValidationError>()
+    {
+        (failure_phase(invocation), "declaration_validation_failed".to_owned(), validation_error.diagnostic.iter().map(|diagnostic| ControlToolViolation {
                 path:format!("{}:{}:{}", diagnostic.path, diagnostic.line, diagnostic.column + 1),
                 code:"invalid_declaration_reference".into(),
                 message:format!("{}: {}", diagnostic.reference, diagnostic.reason),
                 expected_shape:None,
                 hint:Some("Patch the declaration or its import, then submit the current version again.".into()),
             }).collect())
-        } else {
-            let message = format!("{error:#}");
-            (
-                failure_phase(invocation),
-                semantic_code(&message).to_owned(),
-                vec![ControlToolViolation {
-                    path: "<request>".to_owned(),
-                    code: semantic_violation_code(&message).to_owned(),
-                    message,
-                    expected_shape: None,
-                    hint: None,
-                }],
-            )
-        };
+    } else {
+        let message = format!("{error:#}");
+        (
+            failure_phase(invocation),
+            semantic_code(&message).to_owned(),
+            vec![ControlToolViolation {
+                path: "<request>".to_owned(),
+                code: semantic_violation_code(&message).to_owned(),
+                message,
+                expected_shape: None,
+                hint: None,
+            }],
+        )
+    };
     let plan_id = document
         .map(|plan| plan.plan_id.as_str())
         .or_else(|| invocation.arguments.get("plan_id").and_then(Value::as_str));

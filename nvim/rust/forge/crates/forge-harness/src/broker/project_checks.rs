@@ -30,8 +30,10 @@ impl HarnessBroker {
         };
         let published = self.check_runner.history()?.iter().any(|run| {
             run.lifecycle.iter().any(|event| {
-                matches!(event.kind, crate::checks::CheckEventKind::ConfigurationSaved)
-                    && event.created_at_ms >= previous.created_at_ms
+                matches!(
+                    event.kind,
+                    crate::checks::CheckEventKind::ConfigurationSaved
+                ) && event.created_at_ms >= previous.created_at_ms
             })
         });
         Ok((!published).then_some(setup))
@@ -206,7 +208,11 @@ impl HarnessBroker {
             .filter(|task| !task.status.terminal())
             .map(|task| task.id);
         let result = match method {
-            HarnessMethod::ChecksList => self.check_runner.catalog_preview(task_id.as_deref(), self.session.shell).await?,
+            HarnessMethod::ChecksList => {
+                self.check_runner
+                    .catalog_preview(task_id.as_deref(), self.session.shell)
+                    .await?
+            }
             HarnessMethod::ChecksOverride => {
                 let overrides = serde_json::from_value(params)?;
                 self.check_runner
@@ -229,16 +235,28 @@ impl HarnessBroker {
                     self.session.shell,
                     "User requested".into(),
                 )?;
-                run.exchange_id = self.store.list_exchange(&self.session.id)?.last().map(|exchange| exchange.id.clone());
+                run.exchange_id = self
+                    .store
+                    .list_exchange(&self.session.id)?
+                    .last()
+                    .map(|exchange| exchange.id.clone());
                 json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
             }
             HarnessMethod::ChecksStatus => {
                 let wait_for_completion = params["wait_for_completion"].as_bool().unwrap_or(false);
-                let wait_ms = params["wait_ms"].as_u64().unwrap_or(if wait_for_completion { 60000 } else { 0 });
-                serde_json::to_value(self.check_runner.status(
-                    &required_text(&params, "run_id")?, wait_ms, wait_for_completion,
-                ).await?)?
-            },
+                let wait_ms = params["wait_ms"]
+                    .as_u64()
+                    .unwrap_or(if wait_for_completion { 60000 } else { 0 });
+                serde_json::to_value(
+                    self.check_runner
+                        .status(
+                            &required_text(&params, "run_id")?,
+                            wait_ms,
+                            wait_for_completion,
+                        )
+                        .await?,
+                )?
+            }
             HarnessMethod::ChecksCancel => {
                 let id = required_text(&params, "run_id")?;
                 self.check_runner.cancel(&id)?;
@@ -263,8 +281,10 @@ impl HarnessBroker {
                 RequestNotAdmitted("wait for active checks and agents before setup").into(),
             );
         }
-        if self.active_plan_awaits_input()? || self.active_plan_has_acceptance()?
-            || self.find_active_interaction_elicitation()?.is_some() {
+        if self.active_plan_awaits_input()?
+            || self.active_plan_has_acceptance()?
+            || self.find_active_interaction_elicitation()?.is_some()
+        {
             return Err(RequestNotAdmitted(
                 "answer the active plan questions before starting separate check setup",
             )
@@ -280,7 +300,8 @@ impl HarnessBroker {
                 || "/checks setup".into(),
                 |id| format!("/checks setup {id}"),
             ));
-        let plan = self.current_plan_id()?
+        let plan = self
+            .current_plan_id()?
             .as_ref()
             .map(|id| self.plan_file.read_working_document(&self.session.id, id))
             .transpose()?
@@ -307,12 +328,24 @@ impl HarnessBroker {
         let Some(id) = &execution.baseline_checkpoint else {
             return Ok(None);
         };
-        let baseline = self.store.load_checkpoint(id)?
+        let baseline = self
+            .store
+            .load_checkpoint(id)?
             .context("execution baseline checkpoint is missing")?;
         let current = GitCheckpoint::new(&self.session.workspace)
-            .capture(&self.store.objects, &self.repositories, &self.session.id, self.clock.now_ms())
+            .capture(
+                &self.store.objects,
+                &self.repositories,
+                &self.session.id,
+                self.clock.now_ms(),
+            )
             .await?;
-        Ok(Some(baseline.changed_paths(&current)?.into_iter()
-            .map(|path| path.as_str().to_owned()).collect()))
+        Ok(Some(
+            baseline
+                .changed_paths(&current)?
+                .into_iter()
+                .map(|path| path.as_str().to_owned())
+                .collect(),
+        ))
     }
 }

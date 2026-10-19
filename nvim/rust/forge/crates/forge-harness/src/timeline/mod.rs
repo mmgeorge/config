@@ -7,10 +7,10 @@ use crate::plan::{
 use crate::session::state_machine::SessionPhase;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap};
+use std::collections::HashMap;
 
-pub mod stream;
 mod planning;
+pub mod stream;
 
 /// Represents one durable session action projected outside model interactions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -28,7 +28,9 @@ pub enum SessionEventKind {
         reason: Option<String>,
     },
     /// Retains an explicitly requested compaction without creating a user exchange.
-    Compaction { compaction: crate::backend::Compaction },
+    Compaction {
+        compaction: crate::backend::Compaction,
+    },
     Renamed {
         name: String,
     },
@@ -92,8 +94,17 @@ pub enum TimelineEntry {
 impl TimelineEntry {
     /// Attach one completed run to its owning exchange, replacing repeated publications.
     fn attach_check(&mut self, run: &crate::checks::CheckRun) -> bool {
-        let Self::Exchange { exchange, check_runs, .. } = self else { return false; };
-        if run.exchange_id.as_deref() != Some(exchange.id.as_str()) { return false; }
+        let Self::Exchange {
+            exchange,
+            check_runs,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if run.exchange_id.as_deref() != Some(exchange.id.as_str()) {
+            return false;
+        }
         if let Some(previous) = check_runs.iter_mut().find(|previous| previous.id == run.id) {
             *previous = run.clone();
         } else {
@@ -105,11 +116,21 @@ impl TimelineEntry {
 
     fn exchange_mut(&mut self, id: &str) -> Option<&mut Exchange> {
         match self {
-            Self::Exchange { exchange, agent_by_id, .. } => {
-                if exchange.id == id { return Some(exchange); }
-                agent_by_id.values_mut().find_map(|agent| agent.exchange_mut(id))
+            Self::Exchange {
+                exchange,
+                agent_by_id,
+                ..
+            } => {
+                if exchange.id == id {
+                    return Some(exchange);
+                }
+                agent_by_id
+                    .values_mut()
+                    .find_map(|agent| agent.exchange_mut(id))
             }
-            Self::AgentLifecycle { exchange, agent, .. } => {
+            Self::AgentLifecycle {
+                exchange, agent, ..
+            } => {
                 if let Some(exchange) = exchange.iter_mut().find(|exchange| exchange.id == id) {
                     return Some(exchange);
                 }
@@ -244,16 +265,28 @@ pub struct TimelineProjection<'a> {
 
 impl TimelineProjector {
     /// Merges durable check groups with plan-owned groups while preserving one identity per run.
-    pub(crate) fn with_checks(mut timeline: Vec<TimelineEntry>, runs: Vec<crate::checks::CheckRun>) -> Vec<TimelineEntry> {
-        for run in runs.into_iter().filter(|run| run.state != crate::checks::CheckState::Running) {
+    pub(crate) fn with_checks(
+        mut timeline: Vec<TimelineEntry>,
+        runs: Vec<crate::checks::CheckRun>,
+    ) -> Vec<TimelineEntry> {
+        for run in runs
+            .into_iter()
+            .filter(|run| run.state != crate::checks::CheckState::Running)
+        {
             if run.exchange_id.is_some() {
                 for entry in &mut timeline {
-                    if entry.attach_check(&run) { break; }
+                    if entry.attach_check(&run) {
+                        break;
+                    }
                 }
                 continue;
             }
-            if !timeline.iter().any(|entry|entry.id() == run.id) {
-                timeline.push(TimelineEntry::Checks {id:run.id.clone(),created_at_ms:run.completed_at_ms.unwrap_or(run.started_at_ms),run});
+            if !timeline.iter().any(|entry| entry.id() == run.id) {
+                timeline.push(TimelineEntry::Checks {
+                    id: run.id.clone(),
+                    created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms),
+                    run,
+                });
             }
         }
         timeline.sort_by_key(TimelineEntry::created_at_ms);
@@ -277,32 +310,60 @@ impl TimelineProjector {
         let mut interaction_list = interaction_list;
         for exchange in &mut interaction_list {
             for node in &mut exchange.node_list {
-                if let crate::exchange::ExchangeNode::ImplementationReport { reference, report, .. } = node {
+                if let crate::exchange::ExchangeNode::ImplementationReport {
+                    reference,
+                    report,
+                    ..
+                } = node
+                {
                     // The reference remains renderable if historical report storage is unavailable.
                     *report = plan_file.implementation_report(reference).ok();
                 }
             }
         }
-        let checks = execution_list.iter().flat_map(|execution| execution.check_runs.clone()).collect::<Vec<_>>();
-        planning::attach(&mut interaction_list, plan_list, lifecycle_list, execution_list,
-            resolution_list, &deviation_list, &audit_list);
-        let mut result = interaction_list.into_iter().map(|exchange| TimelineEntry::Exchange {
-            id: exchange.id.clone(), created_at_ms: exchange.created_at_ms,
-            exchange, check_runs: Vec::new(), agent_by_id: HashMap::new(),
-        }).collect::<Vec<_>>();
+        let checks = execution_list
+            .iter()
+            .flat_map(|execution| execution.check_runs.clone())
+            .collect::<Vec<_>>();
+        planning::attach(
+            &mut interaction_list,
+            plan_list,
+            lifecycle_list,
+            execution_list,
+            resolution_list,
+            &deviation_list,
+            &audit_list,
+        );
+        let mut result = interaction_list
+            .into_iter()
+            .map(|exchange| TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: exchange.created_at_ms,
+                exchange,
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
+            })
+            .collect::<Vec<_>>();
         project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
-            if matches!(&event.detail, SessionEventKind::Renamed { .. }) { continue; }
+            if matches!(&event.detail, SessionEventKind::Renamed { .. }) {
+                continue;
+            }
             if matches!(&event.detail, SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running) { continue; }
+                if compaction.state == crate::backend::CompactionState::Running)
+            {
+                continue;
+            }
             result.push(TimelineEntry::SessionEvent {
                 id: event.id.clone(),
                 created_at_ms: event.created_at_ms,
                 event,
             });
         }
-        result.retain(|entry| !matches!(entry, TimelineEntry::Exchange { exchange, .. }
-            if exchange.disposition != crate::exchange::HistoryDisposition::Current));
+        result.retain(|entry| {
+            !matches!(entry, TimelineEntry::Exchange { exchange, .. }
+            if exchange.disposition != crate::exchange::HistoryDisposition::Current)
+        });
         result.sort_by_key(TimelineEntry::created_at_ms);
         Ok(Self::with_checks(result, checks))
     }
@@ -400,8 +461,10 @@ fn build_agent_entry(
         .get(run_id)
         .into_iter()
         .flatten()
-        .filter(|exchange| exchange.disposition == crate::exchange::HistoryDisposition::Current
-            && exchange_id.is_none_or(|id| exchange.id == id))
+        .filter(|exchange| {
+            exchange.disposition == crate::exchange::HistoryDisposition::Current
+                && exchange_id.is_none_or(|id| exchange.id == id)
+        })
         .cloned()
         .collect();
     let mut agent = Vec::new();
@@ -443,21 +506,18 @@ fn build_agent_entry(
 
 #[cfg(test)]
 mod test {
-    use super::{
-        TimelineEntry, TimelineProjection, TimelineProjector,
-    };
+    use super::{TimelineEntry, TimelineProjection, TimelineProjector};
     use crate::{
         agent::{Agent, AgentState},
         exchange::{Exchange, ExchangeKind, ExchangeState},
-        plan::{
-            PlanFileStore,
-        },
+        plan::PlanFileStore,
     };
 
     fn interaction(id: &str) -> Exchange {
         Exchange {
             lifecycle: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: "primary".into(),
             id: id.into(),
@@ -690,13 +750,15 @@ mod test {
                 id: first.id.clone(),
                 created_at_ms: 1,
                 exchange: first,
-                check_runs: Vec::new(), agent_by_id: std::collections::HashMap::new(),
+                check_runs: Vec::new(),
+                agent_by_id: std::collections::HashMap::new(),
             },
             TimelineEntry::Exchange {
                 id: second.id.clone(),
                 created_at_ms: 2,
                 exchange: second,
-                check_runs: Vec::new(), agent_by_id: std::collections::HashMap::new(),
+                check_runs: Vec::new(),
+                agent_by_id: std::collections::HashMap::new(),
             },
         ];
         super::project_agent_tree(
@@ -712,7 +774,4 @@ mod test {
             assert!(agent_by_id.contains_key("child"));
         }
     }
-
-
-
 }

@@ -12,8 +12,8 @@ pub use collect::{
     HeadState, IndexFileStamp, IndexStamp, MetadataStamp, ObservedPath, WorktreeStamp,
 };
 pub(crate) use collect::{
-    collect_affected, collect_comparison, collect_observation, metadata_stamp, read_head, read_index_stamp,
-    read_worktree_stamp,
+    collect_affected, collect_comparison, collect_observation, metadata_stamp, read_head,
+    read_index_stamp, read_worktree_stamp,
 };
 pub(crate) use count_cache::LineStatsCache;
 pub(crate) use stats::collect as collect_line_stats;
@@ -167,10 +167,7 @@ impl PathRecord {
 /// Reject malformed or truncated records without restricting complete inventory size.
 /// Unknown headers are ignored. No partial result escapes after a parse failure.
 /// Returned statistics and content classifications remain unknown until content analysis.
-pub fn parse_porcelain_v2(
-    input: &[u8],
-    hash: gix::hash::Kind,
-) -> Result<Vec<PathRecord>> {
+pub fn parse_porcelain_v2(input: &[u8], hash: gix::hash::Kind) -> Result<Vec<PathRecord>> {
     if input.is_empty() {
         return Ok(Vec::new());
     }

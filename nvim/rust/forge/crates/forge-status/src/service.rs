@@ -379,16 +379,26 @@ impl StatusService {
             "status service is closed"
         );
         let admission = self.admitted.admit(id.clone())?;
-        let (parent, filename) = self.store.reads
-            .submit(filename.as_os_str().as_encoded_bytes().len(), move |cancellation| {
-                cancellation.check()?;
-                let parent = filename.parent().context("local file has no parent")?
-                    .canonicalize().context("resolve local file parent")?;
-                let filename = parent.join(filename.file_name().context("local file has no name")?);
-                cancellation.check()?;
-                Ok((parent, filename))
-            })?
-            .finish().await?;
+        let (parent, filename) = self
+            .store
+            .reads
+            .submit(
+                filename.as_os_str().as_encoded_bytes().len(),
+                move |cancellation| {
+                    cancellation.check()?;
+                    let parent = filename
+                        .parent()
+                        .context("local file has no parent")?
+                        .canonicalize()
+                        .context("resolve local file parent")?;
+                    let filename =
+                        parent.join(filename.file_name().context("local file has no name")?);
+                    cancellation.check()?;
+                    Ok((parent, filename))
+                },
+            )?
+            .finish()
+            .await?;
         let repository = self
             .store
             .open(parent)
@@ -400,14 +410,22 @@ impl StatusService {
             .as_ref()
             .context("local diff requires worktree")?
             .clone();
-        let relative = self.store.reads
-            .submit(root.as_os_str().as_encoded_bytes().len(), move |cancellation| {
-                cancellation.check()?;
-                let root = root.canonicalize().context("resolve local diff worktree")?;
-                Ok(filename.strip_prefix(root)
-                    .context("local file is outside resolved worktree")?.to_path_buf())
-            })?
-            .finish().await?;
+        let relative = self
+            .store
+            .reads
+            .submit(
+                root.as_os_str().as_encoded_bytes().len(),
+                move |cancellation| {
+                    cancellation.check()?;
+                    let root = root.canonicalize().context("resolve local diff worktree")?;
+                    Ok(filename
+                        .strip_prefix(root)
+                        .context("local file is outside resolved worktree")?
+                        .to_path_buf())
+                },
+            )?
+            .finish()
+            .await?;
         let mut raw = Vec::new();
         for component in relative.components() {
             let std::path::Component::Normal(component) = component else {
@@ -653,7 +671,10 @@ impl StatusService {
         let owner = self.get(&input.document)?;
         let mut document = owner.lock().await;
         if matches!(input.location, StatusLocation::File { .. }) {
-            ensure!(input.revision <= document.revision, "status demand uses a future revision");
+            ensure!(
+                input.revision <= document.revision,
+                "status demand uses a future revision"
+            );
             input.revision = document.revision;
         }
         let target = validate_input(&mut document, &input)?;
@@ -906,7 +927,8 @@ impl StatusService {
                 if file.section == StatusSection::Staged {
                     let mut path = vec![file.record.path.clone()];
                     if let forge_git::snapshot::PathState::Tracked {
-                        relocation: Some(relocation), ..
+                        relocation: Some(relocation),
+                        ..
                     } = &file.record.state
                         && relocation.kind == forge_git::snapshot::ChangeKind::Renamed
                     {
@@ -1044,26 +1066,24 @@ impl StatusService {
             let directory = directory.context("ignored persistence unavailable")?;
             let stage = input.action == "stage";
             let ignore = input.action == "ignore";
-            intent.set_settlement_handler(
-                Arc::new(move |outcome| {
-                    let completed: Vec<_> = private_path
-                        .iter()
-                        .filter(|path| {
-                            (!stage && !ignored_unstage.contains(*path))
-                                || outcome.target.iter().any(|target| {
-                                    target.path.as_ref() == Some(*path)
-                                        && target.completion
-                                            == forge_git::writer::TargetCompletion::Completed
-                                })
-                        })
-                        .cloned()
-                        .collect();
-                    if !completed.is_empty() {
-                        crate::ignored::update(&directory, &root, &expected, &completed, ignore)?;
-                    }
-                    Ok(())
-                }),
-            )?;
+            intent.set_settlement_handler(Arc::new(move |outcome| {
+                let completed: Vec<_> = private_path
+                    .iter()
+                    .filter(|path| {
+                        (!stage && !ignored_unstage.contains(*path))
+                            || outcome.target.iter().any(|target| {
+                                target.path.as_ref() == Some(*path)
+                                    && target.completion
+                                        == forge_git::writer::TargetCompletion::Completed
+                            })
+                    })
+                    .cloned()
+                    .collect();
+                if !completed.is_empty() {
+                    crate::ignored::update(&directory, &root, &expected, &completed, ignore)?;
+                }
+                Ok(())
+            }))?;
         }
         Ok(StatusAction::Write(self.writer.submit(intent)?))
     }
@@ -1272,10 +1292,14 @@ impl StatusService {
                 rows: 128,
                 ..ChunkLimits::default()
             });
-        let mut block = match forge_diff::presentation::DiffPresenter::new(Default::default()).batch(
-            BlockId(document.next_id("body")?), &chunk.rows,
-            |index| file.cursor.as_ref().and_then(|cursor| cursor.group(index)),
-            file.old_syntax.as_ref(), file.new_syntax.as_ref()) {
+        let mut block = match forge_diff::presentation::DiffPresenter::new(Default::default())
+            .batch(
+                BlockId(document.next_id("body")?),
+                &chunk.rows,
+                |index| file.cursor.as_ref().and_then(|cursor| cursor.group(index)),
+                file.old_syntax.as_ref(),
+                file.new_syntax.as_ref(),
+            ) {
             Ok(block) => block,
             Err(failure) => {
                 file.state = BodyState::Unavailable(failure.to_string());
@@ -1326,7 +1350,8 @@ impl StatusService {
             + (block.metadata.decoration.len() + block.metadata.visible_decoration.len()) * 160
             + block.metadata.target.len() * 160
             + block.metadata.gutter.len() * 128
-            + source_rows.capacity() * std::mem::size_of::<Option<forge_diff::source::SourceCoordinate>>();
+            + source_rows.capacity()
+                * std::mem::size_of::<Option<forge_diff::source::SourceCoordinate>>();
         let projection = crate::hunks::project(
             document,
             file,
@@ -1594,7 +1619,9 @@ pub(crate) fn syntax_decorations(
     text: &str,
     metadata: &mut BlockMetadata,
 ) -> Result<()> {
-    Ok(forge_diff::projection::append_syntax_row(metadata, syntax, source_row, row, text)?)
+    Ok(forge_diff::projection::append_syntax_row(
+        metadata, syntax, source_row, row, text,
+    )?)
 }
 
 #[derive(Serialize)]

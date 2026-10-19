@@ -44,25 +44,61 @@ fn source_metadata_preserves_long_overlay_and_fold_summary_text() {
         collapse_children: false,
         expand_children: false,
     });
-    let document = BufferDocument::new(DocumentId("long-source-metadata".into()), vec![entry]).unwrap();
+    let document =
+        BufferDocument::new(DocumentId("long-source-metadata".into()), vec![entry]).unwrap();
     let snapshot = document.snapshot();
     let encoded = serde_json::to_vec(&snapshot).unwrap();
     let decoded: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
-    assert_eq!(decoded["block"][0]["metadata"]["source_overlay"][0]["text"], overlay);
-    assert_eq!(decoded["block"][0]["metadata"]["fold"][0]["collapsed_suffix"], suffix);
+    assert_eq!(
+        decoded["block"][0]["metadata"]["source_overlay"][0]["text"],
+        overlay
+    );
+    assert_eq!(
+        decoded["block"][0]["metadata"]["fold"][0]["collapsed_suffix"],
+        suffix
+    );
 }
 
 #[test]
 fn node_enum_spelling_matches_the_editor_contract() {
     use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
-    let contract: serde_json::Value = serde_json::from_str(include_str!("../../../../../lua/forge/protocol_contract.json")).unwrap();
-    let mut kind = serde_json::json!([NodeKind::Exchange, NodeKind::Message, NodeKind::ToolGroup, NodeKind::Tool,
-        NodeKind::Changes, NodeKind::File, NodeKind::Hunk, NodeKind::Group]);
+    let contract: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../../../lua/forge/protocol_contract.json"
+    ))
+    .unwrap();
+    let mut kind = serde_json::json!([
+        NodeKind::Exchange,
+        NodeKind::Message,
+        NodeKind::ToolGroup,
+        NodeKind::Tool,
+        NodeKind::Changes,
+        NodeKind::File,
+        NodeKind::Hunk,
+        NodeKind::Group
+    ]);
     let mut lifecycle = serde_json::json!([NodeLifecycle::Live, NodeLifecycle::Settled]);
-    let mut display = serde_json::json!([NodeDisplay::Heading, NodeDisplay::Preview, NodeDisplay::Full]);
-    for (name, actual) in [("kind", &mut kind), ("lifecycle", &mut lifecycle), ("display", &mut display)] {
-        let mut expected: Vec<_> = contract["node"][name].as_array().unwrap().iter().map(|value| value.as_str().unwrap()).collect();
-        let mut actual: Vec<_> = actual.as_array_mut().unwrap().iter().map(|value| value.as_str().unwrap()).collect();
+    let mut display = serde_json::json!([
+        NodeDisplay::Heading,
+        NodeDisplay::Preview,
+        NodeDisplay::Full
+    ]);
+    for (name, actual) in [
+        ("kind", &mut kind),
+        ("lifecycle", &mut lifecycle),
+        ("display", &mut display),
+    ] {
+        let mut expected: Vec<_> = contract["node"][name]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        let mut actual: Vec<_> = actual
+            .as_array_mut()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
         expected.sort_unstable();
         actual.sort_unstable();
         assert_eq!(actual, expected, "{name}");
@@ -76,24 +112,53 @@ fn node_relationship_changes_are_rejected_before_committing() {
     use forge_buffer::node::{NodeDisplay, NodeKind, NodeState};
 
     let mut parent = block(0, &["Exchange"]);
-    parent.metadata.node = Some(NodeState::new(FoldId("exchange".into()), NodeKind::Exchange, NodeDisplay::Full));
+    parent.metadata.node = Some(NodeState::new(
+        FoldId("exchange".into()),
+        NodeKind::Exchange,
+        NodeDisplay::Full,
+    ));
     let mut child = block(1, &["Tools"]);
-    let mut child_state = NodeState::new(FoldId("tools".into()), NodeKind::ToolGroup, NodeDisplay::Full);
+    let mut child_state = NodeState::new(
+        FoldId("tools".into()),
+        NodeKind::ToolGroup,
+        NodeDisplay::Full,
+    );
     child_state.parent = Some(FoldId("exchange".into()));
     child.metadata.node = Some(child_state);
     let output = block(2, &["Output"]);
     parent.metadata.fold.push(FoldRange {
-        id: FoldId("exchange".into()), start: TextPosition { row:0, column:0 },
-        end: BlockAnchor { block:output.id.clone(), position:TextPosition { row:1, column:0 } },
-        heading_start:None, closed:false, collapsed_suffix:None, collapse_children:false, expand_children:false,
+        id: FoldId("exchange".into()),
+        start: TextPosition { row: 0, column: 0 },
+        end: BlockAnchor {
+            block: output.id.clone(),
+            position: TextPosition { row: 1, column: 0 },
+        },
+        heading_start: None,
+        closed: false,
+        collapsed_suffix: None,
+        collapse_children: false,
+        expand_children: false,
     });
-    child.metadata.fold.push(FoldRange { id:FoldId("tools".into()), ..parent.metadata.fold[0].clone() });
-    let mut sequence = BlockSequence::new(vec![parent.clone(), child.clone(), output.clone()]).unwrap();
+    child.metadata.fold.push(FoldRange {
+        id: FoldId("tools".into()),
+        ..parent.metadata.fold[0].clone()
+    });
+    let mut sequence =
+        BlockSequence::new(vec![parent.clone(), child.clone(), output.clone()]).unwrap();
     let before: Vec<_> = sequence.blocks().cloned().collect();
 
     let mut shortened = parent.clone();
-    shortened.metadata.fold[0].end = BlockAnchor { block:child.id.clone(), position:TextPosition { row:1, column:0 } };
-    assert!(sequence.splice(0..1, vec![shortened]).unwrap_err().to_string().contains("beyond parent"));
+    shortened.metadata.fold[0].end = BlockAnchor {
+        block: child.id.clone(),
+        position: TextPosition { row: 1, column: 0 },
+    };
+    assert!(
+        sequence
+            .splice(0..1, vec![shortened])
+            .unwrap_err()
+            .to_string()
+            .contains("beyond parent")
+    );
     let mut orphan = child.clone();
     orphan.metadata.node.as_mut().unwrap().parent = Some(FoldId("missing".into()));
     assert!(sequence.splice(1..2, vec![orphan]).is_err());
@@ -106,7 +171,18 @@ fn node_relationship_changes_are_rejected_before_committing() {
     assert_eq!(sequence.blocks().cloned().collect::<Vec<_>>(), before);
 
     child.metadata.node.as_mut().unwrap().parent = None;
-    sequence.apply_edits(vec![SequenceEdit { range:1..2, block:vec![child] }, SequenceEdit { range:0..1, block:vec![] }]).unwrap();
+    sequence
+        .apply_edits(vec![
+            SequenceEdit {
+                range: 1..2,
+                block: vec![child],
+            },
+            SequenceEdit {
+                range: 0..1,
+                block: vec![],
+            },
+        ])
+        .unwrap();
     assert_eq!(sequence.len(), 2);
     assert_eq!(sequence.blocks().last().unwrap(), &output);
 }
@@ -121,7 +197,10 @@ fn subtree_expansion_rebases_parent_past_retained_heading() {
         start: TextPosition { row: 0, column: 0 },
         end: BlockAnchor {
             block: endpoint.id.clone(),
-            position: TextPosition { row: endpoint.text.row_count(), column: 0 },
+            position: TextPosition {
+                row: endpoint.text.row_count(),
+                column: 0,
+            },
         },
         closed: false,
         heading_start: None,
@@ -132,32 +211,75 @@ fn subtree_expansion_rebases_parent_past_retained_heading() {
     let heading = block(2, &["tools"]);
     let mut parent = block(0, &["exchange"]);
     parent.metadata.fold.push(fold("exchange", &heading));
-    let mut document = BufferDocument::new(DocumentId("subtree".into()), vec![
-        parent, block(1, &["thought"]), heading.clone(), block(4, &["next exchange"]),
-    ]).unwrap();
+    let mut document = BufferDocument::new(
+        DocumentId("subtree".into()),
+        vec![
+            parent,
+            block(1, &["thought"]),
+            heading.clone(),
+            block(4, &["next exchange"]),
+        ],
+    )
+    .unwrap();
 
     for _ in 0..3 {
         let child = block(3, &["tool"]);
         let mut expanded = heading.clone();
         expanded.metadata.fold.push(fold("tools", &child));
         let before = document.snapshot();
-        let patch = document.splice(2..3, vec![expanded, child.clone()]).unwrap().unwrap();
-        assert_eq!(apply_snapshot_reference(&before, &patch).unwrap(), document.snapshot());
-        assert_eq!(document.block(&BlockId("block-0".into())).unwrap().metadata.fold[0].end,
-            fold("exchange", &child).end);
+        let patch = document
+            .splice(2..3, vec![expanded, child.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            apply_snapshot_reference(&before, &patch).unwrap(),
+            document.snapshot()
+        );
+        assert_eq!(
+            document
+                .block(&BlockId("block-0".into()))
+                .unwrap()
+                .metadata
+                .fold[0]
+                .end,
+            fold("exchange", &child).end
+        );
 
         let output = block(3, &["tool", "output", "more output"]);
         document.replace_block(output.clone()).unwrap();
         for owner in [0, 2] {
-            assert_eq!(document.block(&BlockId(format!("block-{owner}"))).unwrap().metadata.fold[0].end,
-                fold("expected", &output).end);
+            assert_eq!(
+                document
+                    .block(&BlockId(format!("block-{owner}")))
+                    .unwrap()
+                    .metadata
+                    .fold[0]
+                    .end,
+                fold("expected", &output).end
+            );
         }
         let before = document.snapshot();
-        let patch = document.splice(2..4, vec![heading.clone()]).unwrap().unwrap();
-        assert_eq!(apply_snapshot_reference(&before, &patch).unwrap(), document.snapshot());
-        assert_eq!(document.block(&BlockId("block-0".into())).unwrap().metadata.fold[0].end,
-            fold("exchange", &heading).end);
-        assert_eq!(document.snapshot().block.last().unwrap().id, BlockId("block-4".into()));
+        let patch = document
+            .splice(2..4, vec![heading.clone()])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            apply_snapshot_reference(&before, &patch).unwrap(),
+            document.snapshot()
+        );
+        assert_eq!(
+            document
+                .block(&BlockId("block-0".into()))
+                .unwrap()
+                .metadata
+                .fold[0]
+                .end,
+            fold("exchange", &heading).end
+        );
+        assert_eq!(
+            document.snapshot().block.last().unwrap().id,
+            BlockId("block-4".into())
+        );
     }
 }
 

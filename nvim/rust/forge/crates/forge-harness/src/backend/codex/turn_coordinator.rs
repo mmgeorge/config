@@ -165,8 +165,12 @@ struct ParentTurn {
 impl ParentTurn {
     /// Retain terminal evidence so admission cannot reopen a completed parent turn.
     fn observe(&mut self, message: &Value, thread_id: &str) -> bool {
-        if self.completion.is_some() { return false; }
-        if let Some(started_turn_id) = CodexBackend::notification_thread_turn_id(message, "turn/started", thread_id) {
+        if self.completion.is_some() {
+            return false;
+        }
+        if let Some(started_turn_id) =
+            CodexBackend::notification_thread_turn_id(message, "turn/started", thread_id)
+        {
             self.id = started_turn_id.to_owned();
             self.provider_started = true;
             return true;
@@ -176,7 +180,8 @@ impl ParentTurn {
             return true;
         }
         if is_parent_activity_message(message, thread_id)
-            && message_turn_id(message) == Some(self.id.as_str()) {
+            && message_turn_id(message) == Some(self.id.as_str())
+        {
             self.provider_started = true;
         }
         false
@@ -213,7 +218,8 @@ impl<'a> CodexTurnCoordinator<'a> {
         request: &'a BackendRequest,
         thread_id: &'a str,
     ) -> Self {
-        let provider_goal_active = output.evidence.native_state == Some(crate::goal::GoalState::Active);
+        let provider_goal_active =
+            output.evidence.native_state == Some(crate::goal::GoalState::Active);
         Self {
             backend,
             process,
@@ -244,12 +250,16 @@ impl<'a> CodexTurnCoordinator<'a> {
         provider_started: bool,
         observed_message_list: Vec<Value>,
     ) -> Result<Value> {
-        let result = self.run_inner(turn_id, provider_started, observed_message_list).await;
+        let result = self
+            .run_inner(turn_id, provider_started, observed_message_list)
+            .await;
         let cleanup = self.process.cancel_requests(self.output).await;
         match (result, cleanup) {
             (result, Ok(())) => result,
             (Ok(_), Err(error)) => Err(error),
-            (Err(error), Err(cleanup)) => Err(error.context(format!("provider request cleanup failed: {cleanup:#}"))),
+            (Err(error), Err(cleanup)) => {
+                Err(error.context(format!("provider request cleanup failed: {cleanup:#}")))
+            }
         }
     }
 
@@ -439,20 +449,29 @@ impl<'a> CodexTurnCoordinator<'a> {
 
     async fn start_parent_turn(&mut self, text: String) -> Result<ParentTurn> {
         let input = crate::attachment::codex_input(text, self.request.input.attachments()).await?;
-        let (turn, provider_started, observed_message_list) = self.backend.start_turn(
-            self.process,
-            self.output,
-            self.request,
-            self.thread_id,
-            true,
-            CodexBackend::with_model(CodexBackend::secure(json!({
-                "threadId": self.thread_id,
-                "input": input,
-                "cwd": self.request.workspace,
-                "effort": self.request.effort,
-                "serviceTier": self.request.service_tier
-            }), self.request), &self.request.model),
-        ).await?;
+        let (turn, provider_started, observed_message_list) = self
+            .backend
+            .start_turn(
+                self.process,
+                self.output,
+                self.request,
+                self.thread_id,
+                true,
+                CodexBackend::with_model(
+                    CodexBackend::secure(
+                        json!({
+                            "threadId": self.thread_id,
+                            "input": input,
+                            "cwd": self.request.workspace,
+                            "effort": self.request.effort,
+                            "serviceTier": self.request.service_tier
+                        }),
+                        self.request,
+                    ),
+                    &self.request.model,
+                ),
+            )
+            .await?;
         let id = turn
             .pointer("/turn/id")
             .or_else(|| turn.get("turnId"))
@@ -516,11 +535,18 @@ impl<'a> CodexTurnCoordinator<'a> {
         pending_command: &mut HashMap<u64, SteerCommand>,
     ) {
         let input = if command.operation == ActiveTurnOperation::Steer {
-            match crate::attachment::codex_input(steering_prompt(&command), &command.attachments).await {
+            match crate::attachment::codex_input(steering_prompt(&command), &command.attachments)
+                .await
+            {
                 Ok(input) => Some(input),
-                Err(error) => { command.complete(Err(error)).await; return; }
+                Err(error) => {
+                    command.complete(Err(error)).await;
+                    return;
+                }
             }
-        } else { None };
+        } else {
+            None
+        };
         let (method, params) = match command.operation {
             ActiveTurnOperation::PauseGoal | ActiveTurnOperation::ClearGoal => {
                 if self.native_goal == NativeGoalLifetime::Disabled {
@@ -629,7 +655,9 @@ impl<'a> CodexTurnCoordinator<'a> {
         self.stopping = true;
         self.process.cancel_request_work();
         if thread.is_empty() && parent_turn_id.is_none() && !self.provider_goal_active {
-            command.complete(self.process.collect_requests(self.output).await).await;
+            command
+                .complete(self.process.collect_requests(self.output).await)
+                .await;
             return;
         }
         self.cleanup = Some(DescendantCleanup {
@@ -644,21 +672,38 @@ impl<'a> CodexTurnCoordinator<'a> {
             }),
         });
         if self.provider_goal_active {
-            match self.process.send_request("thread/goal/set", json!({
-                "threadId": self.thread_id, "status": "paused"
-            })).await {
+            match self
+                .process
+                .send_request(
+                    "thread/goal/set",
+                    json!({
+                        "threadId": self.thread_id, "status": "paused"
+                    }),
+                )
+                .await
+            {
                 Ok(request_id) => {
-                    self.cleanup.as_mut().expect("cleanup exists").pending_request.insert(request_id);
+                    self.cleanup
+                        .as_mut()
+                        .expect("cleanup exists")
+                        .pending_request
+                        .insert(request_id);
                 }
                 Err(error) => {
-                    self.cleanup.take().expect("cleanup exists").command.complete(Err(error)).await;
+                    self.cleanup
+                        .take()
+                        .expect("cleanup exists")
+                        .command
+                        .complete(Err(error))
+                        .await;
                     return;
                 }
             }
         }
         self.admit_cleanup_targets().await;
         if let Err(error) = self.process.collect_requests(self.output).await
-            && let Some(cleanup) = self.cleanup.take() {
+            && let Some(cleanup) = self.cleanup.take()
+        {
             cleanup.command.complete(Err(error)).await;
         }
     }
@@ -738,15 +783,18 @@ impl<'a> CodexTurnCoordinator<'a> {
         let Some(cleanup) = self.cleanup.as_ref() else {
             return;
         };
-        if cleanup.pending_request.is_empty() && cleanup.parent.as_ref().is_none_or(|parent| {
-            self.completed_turn
-                .contains(&(parent.thread_id.clone(), parent.turn_id.clone()))
-        }) && cleanup.thread.iter().all(|thread_id| {
-            !self
-                .descendant
-                .active_turn_by_thread
-                .contains_key(thread_id)
-        }) {
+        if cleanup.pending_request.is_empty()
+            && cleanup.parent.as_ref().is_none_or(|parent| {
+                self.completed_turn
+                    .contains(&(parent.thread_id.clone(), parent.turn_id.clone()))
+            })
+            && cleanup.thread.iter().all(|thread_id| {
+                !self
+                    .descendant
+                    .active_turn_by_thread
+                    .contains_key(thread_id)
+            })
+        {
             let cleanup = self.cleanup.take().expect("cleanup exists");
             cleanup.command.complete(Ok(())).await;
         } else if now >= cleanup.deadline {
@@ -780,7 +828,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         if let Some(event_sink) = self.event_sink.as_ref() {
             let _ = event_sink
                 .send_wait(BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),
@@ -846,17 +894,29 @@ mod test {
         let permission = PermissionCoordinator::transient(&workspace)?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let backend = CodexBackend::new_with_permission_coordinator(
-            vec!["unused".into()], permission.clone(), trace.clone(), None,
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
         )?;
         let lsp = Arc::new(LspService::default());
         let (sender, mut editor) = forge_protocol::outbound::channel();
         lsp.attach(sender);
         lsp.set_enabled("session", true);
-        let policy = Arc::new(crate::permissions::matcher::CompiledPermissionDocument::compile(
-            crate::permissions::document::default_permission_document(), directory.path(),
-        ));
-        let (scope, _lease) = lsp.scope("session".into(), "exchange".into(), directory.path().into(),
-            policy, PermissionMode::Read, Arc::new(AtomicBool::new(false)));
+        let policy = Arc::new(
+            crate::permissions::matcher::CompiledPermissionDocument::compile(
+                crate::permissions::document::default_permission_document(),
+                directory.path(),
+            ),
+        );
+        let (scope, _lease) = lsp.scope(
+            "session".into(),
+            "exchange".into(),
+            directory.path().into(),
+            policy,
+            PermissionMode::Read,
+            Arc::new(AtomicBool::new(false)),
+        );
         let mut context = ControlTurnContext::inactive(PromptMode::Chat);
         context.lsp = Some(scope);
 
@@ -870,63 +930,130 @@ mod test {
                     "callId":"pending-lsp","tool":"lsp_context","arguments":{"path":"source.rs","line":1,"column":1}}}),
                 json!({"method":"item/agentMessage/delta","params":{"threadId":"thread","turnId":"turn",
                     "itemId":"progress","delta":"Provider events continue while LSP is pending."}}),
-            ] { socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await?; }
+            ] {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await?;
+            }
             let mut cancelled = false;
             let mut interrupted = false;
             loop {
-                let frame = tokio::time::timeout(Duration::from_secs(2), socket.next()).await?
+                let frame = tokio::time::timeout(Duration::from_secs(2), socket.next())
+                    .await?
                     .context("provider connection closed before interrupt")??;
                 let message: Value = serde_json::from_str(frame.to_text()?)?;
                 if message["id"] == 99 {
-                    assert!(message.get("error").is_some(), "pending tool reported success during cleanup");
+                    assert!(
+                        message.get("error").is_some(),
+                        "pending tool reported success during cleanup"
+                    );
                     cancelled = true;
                 } else if message["method"] == "turn/interrupt" {
-                    assert!(!cancelled, "native interrupt waited for tool-result collection");
+                    assert!(
+                        !cancelled,
+                        "native interrupt waited for tool-result collection"
+                    );
                     interrupted = true;
                     for response in [
                         json!({"id":message["id"],"result":{}}),
                         json!({"method":"turn/completed","params":{"threadId":"thread","turn":{"id":"turn","status":"interrupted"}}}),
-                    ] { socket.send(tokio_tungstenite::tungstenite::Message::Text(response.to_string().into())).await?; }
+                    ] {
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                response.to_string().into(),
+                            ))
+                            .await?;
+                    }
                 }
-                if cancelled && interrupted { break; }
+                if cancelled && interrupted {
+                    break;
+                }
             }
             Ok::<_, anyhow::Error>(())
         });
         let (events, mut event_stream) = crate::backend::events::channel();
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
-            permission, Some(events.clone()), trace, "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            permission,
+            Some(events.clone()),
+            trace,
+            "session".into(),
+        )
+        .await?;
         process.set_control_context(context).await;
         let request = BackendRequest {
-            execution_owner: None, harness_session_id:"session".into(), workspace,
-            input:BackendInput::from_text("wait for diagnostics"), mode:PromptMode::Chat,
-            model:"fixture".into(), effort:"low".into(), context_window:None,
-            access:Default::default(), service_tier:Default::default(), execution_mode:PermissionMode::Read,
-            backend_session_id:Some("thread".into()), control_context:None,
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace,
+            input: BackendInput::from_text("wait for diagnostics"),
+            mode: PromptMode::Chat,
+            model: "fixture".into(),
+            effort: "low".into(),
+            context_window: None,
+            access: Default::default(),
+            service_tier: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: Some("thread".into()),
+            control_context: None,
         };
         let lane = SteeringLane::default();
         let mut steering = lane.activate(None)?;
         let mut output = BackendOutput::default();
-        let run = CodexTurnCoordinator::new(&backend, &mut process, &mut output, &mut steering,
-            Some(events), &request, "thread").run("turn".into(), true, Vec::new());
+        let run = CodexTurnCoordinator::new(
+            &backend,
+            &mut process,
+            &mut output,
+            &mut steering,
+            Some(events),
+            &request,
+            "thread",
+        )
+        .run("turn".into(), true, Vec::new());
         let stop = async {
             let query = editor.recv().await?.context("LSP request was not sent")?;
             let query: Value = serde_json::from_slice(query.bytes())?;
             assert_eq!(query["event"], "lsp.request");
             loop {
-                let event = event_stream.recv().await?.context("provider events stopped behind LSP")?;
-                if event.kind == "assistant_message" { break; }
+                let event = event_stream
+                    .recv()
+                    .await?
+                    .context("provider events stopped behind LSP")?;
+                if event.kind == "assistant_message" {
+                    break;
+                }
             }
             let started = Instant::now();
             lane.cleanup_execution().await?;
-            assert!(started.elapsed() < Duration::from_secs(1), "cleanup waited for LSP timeout");
-            let cancelled = editor.recv().await?.context("editor cancellation was not sent")?;
+            assert!(
+                started.elapsed() < Duration::from_secs(1),
+                "cleanup waited for LSP timeout"
+            );
+            let cancelled = editor
+                .recv()
+                .await?
+                .context("editor cancellation was not sent")?;
             let cancelled: Value = serde_json::from_slice(cancelled.bytes())?;
             assert_eq!(cancelled["event"], "lsp.cancel");
-            assert!(lsp.respond("session", query["payload"]["id"].as_str().unwrap(), json!({}), None).is_err(),
-                "a late LSP response retained authority after cleanup");
+            assert!(
+                lsp.respond(
+                    "session",
+                    query["payload"]["id"].as_str().unwrap(),
+                    json!({}),
+                    None
+                )
+                .is_err(),
+                "a late LSP response retained authority after cleanup"
+            );
             Ok::<_, anyhow::Error>(())
         };
-        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async { tokio::try_join!(run, stop) }).await??;
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::try_join!(run, stop)
+        })
+        .await??;
         assert_eq!(result["turn"]["status"], "interrupted");
         server.await??;
         Ok(())
@@ -934,9 +1061,9 @@ mod test {
 
     #[tokio::test]
     async fn chat_cancellation_pauses_provider_goal_and_waits_for_acknowledgements() -> Result<()> {
-        use crate::backend::{BackendInput, PromptMode};
-        use crate::backend::steering::SteeringLane;
         use crate::backend::approval::PermissionCoordinator;
+        use crate::backend::steering::SteeringLane;
+        use crate::backend::{BackendInput, PromptMode};
         use crate::session::PermissionMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
@@ -947,37 +1074,63 @@ mod test {
         let permission = PermissionCoordinator::transient(&workspace)?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let backend = CodexBackend::new_with_permission_coordinator(
-            vec!["unused".into()], permission.clone(), trace.clone(),
-                    None,
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
         )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let pause: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let pause: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(pause["method"], "thread/goal/set");
             assert_eq!(pause["params"]["status"], "paused");
-            let interrupt: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let interrupt: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(interrupt["method"], "turn/interrupt");
             for message in [
                 json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"interrupted"}}}),
                 json!({"id":interrupt["id"],"result":{}}),
                 json!({"id":pause["id"],"result":{}}),
             ] {
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
             }
             let _ = socket.next().await;
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
-            permission, None, trace, "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
         let request = BackendRequest {
             execution_owner: None,
-            harness_session_id: "session".into(), workspace,
-            input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
-            model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
-            access: Default::default(), service_tier: crate::backend::ServiceTier::Standard, execution_mode: PermissionMode::Read,
-            backend_session_id: Some("parent".into()), control_context: None,
+            harness_session_id: "session".into(),
+            workspace,
+            input: BackendInput::from_text("plan out a new one"),
+            mode: PromptMode::Chat,
+            model: "gpt-5.6-terra".into(),
+            effort: "medium".into(),
+            context_window: None,
+            access: Default::default(),
+            service_tier: crate::backend::ServiceTier::Standard,
+            execution_mode: PermissionMode::Read,
+            backend_session_id: Some("parent".into()),
+            control_context: None,
         };
         let lane = SteeringLane::default();
         let mut steering = lane.activate(None)?;
@@ -1007,13 +1160,20 @@ mod test {
         let workspace = directory.path().to_string_lossy().into_owned();
         let permission = PermissionCoordinator::transient(&workspace)?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
-        let backend = CodexBackend::new_with_permission_coordinator(vec!["unused".into()], permission.clone(), trace.clone(), None)?;
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(request["method"], "turn/start");
             assert_eq!(request["params"]["serviceTier"], "ultrafast");
             for message in [
@@ -1024,29 +1184,67 @@ mod test {
                 json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"second","status":"completed"}}}),
                 json!({"id":request["id"],"result":{"turn":{"id":"second"}}}),
             ] {
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        message.to_string().into(),
+                    ))
+                    .await
+                    .unwrap();
             }
             let _ = socket.next().await;
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read, permission, None, trace, "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
         let request = BackendRequest {
             execution_owner: None,
-            harness_session_id: "session".into(), workspace, input: BackendInput::from_text("parent"),
-            mode: PromptMode::Chat, model: "gpt-5.6-terra".into(), effort: "medium".into(),
-            access: Default::default(), context_window: None, service_tier: crate::backend::ServiceTier::Ultrafast, execution_mode: PermissionMode::Read,
-            backend_session_id: Some("parent".into()), control_context: None,
+            harness_session_id: "session".into(),
+            workspace,
+            input: BackendInput::from_text("parent"),
+            mode: PromptMode::Chat,
+            model: "gpt-5.6-terra".into(),
+            effort: "medium".into(),
+            access: Default::default(),
+            context_window: None,
+            service_tier: crate::backend::ServiceTier::Ultrafast,
+            execution_mode: PermissionMode::Read,
+            backend_session_id: Some("parent".into()),
+            control_context: None,
         };
         let lane = crate::backend::steering::SteeringLane::default();
         let mut steering = lane.activate(None)?;
-        let mut output = BackendOutput { backend_session_id: Some("parent".into()), ..Default::default() };
+        let mut output = BackendOutput {
+            backend_session_id: Some("parent".into()),
+            ..Default::default()
+        };
         let observed = vec![
             json!({"method":"turn/started","params":{"threadId":"child","turn":{"id":"child-turn","status":"inProgress"}}}),
             json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"first","status":"completed"}}}),
         ];
-        let coordinator = CodexTurnCoordinator::new(&backend, &mut process, &mut output, &mut steering, None, &request, "parent");
-        let (completed, acknowledged) = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            tokio::join!(coordinator.run("first".into(), true, observed), lane.steer("continue".into()))
-        }).await?;
+        let coordinator = CodexTurnCoordinator::new(
+            &backend,
+            &mut process,
+            &mut output,
+            &mut steering,
+            None,
+            &request,
+            "parent",
+        );
+        let (completed, acknowledged) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                tokio::join!(
+                    coordinator.run("first".into(), true, observed),
+                    lane.steer("continue".into())
+                )
+            })
+            .await?;
         acknowledged?;
         assert_eq!(completed?["turn"]["id"], "second");
         let encoded = serde_json::to_string(&output.event)?;
@@ -1085,7 +1283,7 @@ mod test {
                 vec!["unused".into()],
                 Arc::clone(&permission),
                 Arc::clone(&trace),
-                            None,
+                None,
             )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -1226,7 +1424,6 @@ mod test {
         }
         Ok(())
     }
-
 
     #[tokio::test]
     async fn interruption_requires_exact_terminal_evidence_or_fails_at_deadline() {
@@ -1446,16 +1643,26 @@ mod test {
 
     #[test]
     fn acknowledged_turn_waits_for_matching_activity_before_accepting_steering() {
-        let mut parent = ParentTurn { id: "current".into(), provider_started: false, completion: None };
+        let mut parent = ParentTurn {
+            id: "current".into(),
+            provider_started: false,
+            completion: None,
+        };
         for (thread_id, turn_id) in [("child", "current"), ("parent", "cancelled")] {
-            parent.observe(&json!({"method":"item/started","params":{
-                "threadId":thread_id,"turnId":turn_id
-            }}), "parent");
+            parent.observe(
+                &json!({"method":"item/started","params":{
+                    "threadId":thread_id,"turnId":turn_id
+                }}),
+                "parent",
+            );
             assert!(!parent.provider_started);
         }
-        parent.observe(&json!({"method":"item/started","params":{
-            "threadId":"parent","turnId":"current"
-        }}), "parent");
+        parent.observe(
+            &json!({"method":"item/started","params":{
+                "threadId":"parent","turnId":"current"
+            }}),
+            "parent",
+        );
         assert!(parent.provider_started);
     }
 }

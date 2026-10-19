@@ -29,11 +29,29 @@ fn constructs_validate_types_and_reject_known_non_types() {
     design.proposed_calls.insert("lib.rs".into(), calls);
     let mut resolver = DeclarationResolver::planned(root.path(), &design, false).unwrap();
     let report = resolver.validate(&design);
-    assert!(!report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "Weapon"));
+    assert!(
+        !report
+            .diagnostic
+            .iter()
+            .any(|diagnostic| diagnostic.reference == "Weapon")
+    );
     for name in ["factory", "LIMIT"] {
-        assert!(report.diagnostic.iter().any(|diagnostic| diagnostic.reference == name && diagnostic.error && diagnostic.reason.contains("Constructs requires a type")), "{report:?}");
+        assert!(
+            report
+                .diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.reference == name
+                    && diagnostic.error
+                    && diagnostic.reason.contains("Constructs requires a type")),
+            "{report:?}"
+        );
     }
-    assert!(report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "ExternalWeapon" && !diagnostic.error));
+    assert!(
+        report
+            .diagnostic
+            .iter()
+            .any(|diagnostic| diagnostic.reference == "ExternalWeapon" && !diagnostic.error)
+    );
 }
 
 #[test]
@@ -44,19 +62,61 @@ fn captured_rust_constructors_keep_factories_and_type_mentions_separate() {
     let (_, mut resolver) = local(root.path(), &[("lib.rs", &declaration)]);
     let mut functions = crate::plan::calls::extract("lib.rs", source).unwrap();
     crate::plan::calls::classify("lib.rs", &mut functions, &mut resolver);
-    let run = functions.iter().find(|function| function.owner == "run").unwrap();
-    let constructors = run.call.iter().flatten().filter(|reference| reference.kind == crate::plan::CallKind::Construct).map(|reference| reference.name.as_str()).collect::<Vec<_>>();
-    assert_eq!(constructors, ["Unit", "Tuple", "Record", "Record::new", "Record::ready", "make"]);
-    assert!(run.call.iter().flatten().any(|reference| reference.name == "Record::new" && reference.kind == crate::plan::CallKind::Callback));
-    for (name, factory) in [("Record::new", true), ("Record::ready", true), ("make", true), ("Record::view", false), ("Record::count", false)] {
+    let run = functions
+        .iter()
+        .find(|function| function.owner == "run")
+        .unwrap();
+    let constructors = run
+        .call
+        .iter()
+        .flatten()
+        .filter(|reference| reference.kind == crate::plan::CallKind::Construct)
+        .map(|reference| reference.name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        constructors,
+        [
+            "Unit",
+            "Tuple",
+            "Record",
+            "Record::new",
+            "Record::ready",
+            "make"
+        ]
+    );
+    assert!(
+        run.call
+            .iter()
+            .flatten()
+            .any(|reference| reference.name == "Record::new"
+                && reference.kind == crate::plan::CallKind::Callback)
+    );
+    for (name, factory) in [
+        ("Record::new", true),
+        ("Record::ready", true),
+        ("make", true),
+        ("Record::view", false),
+        ("Record::count", false),
+    ] {
         let target = resolver.callable("lib.rs", "run", name);
         assert_eq!(resolver.factory(&target), factory, "{name}: {target:?}");
     }
-    let (declaration, mut authored) = crate::plan::calls::parse("lib.rs", &format!("{declaration}Constructs\n  Record::new\nCalls\n  Record::ready\n"), &[]).unwrap();
+    let (declaration, mut authored) = crate::plan::calls::parse(
+        "lib.rs",
+        &format!("{declaration}Constructs\n  Record::new\nCalls\n  Record::ready\n"),
+        &[],
+    )
+    .unwrap();
     crate::plan::calls::classify("lib.rs", &mut authored, &mut resolver);
     let combined = crate::plan::calls::combined("lib.rs", &declaration, &authored).unwrap();
-    assert!(combined.contains("Constructs\n  Record::new\n"), "{combined}");
-    assert!(combined.contains("Calls\n  Record::ready\n"), "authored callback lost its category: {combined}");
+    assert!(
+        combined.contains("Constructs\n  Record::new\n"),
+        "{combined}"
+    );
+    assert!(
+        combined.contains("Calls\n  Record::ready\n"),
+        "authored callback lost its category: {combined}"
+    );
 }
 
 #[test]
@@ -65,16 +125,33 @@ fn external_module_navigation_selects_the_module_file() {
     for (declaration, destination) in [
         ("pub mod assets;\n", "assets.rs"),
         ("pub mod assets;\n", "assets/mod.rs"),
-        ("#[path = \"asset_impl.rs\"]\npub mod assets;\n", "asset_impl.rs"),
+        (
+            "#[path = \"asset_impl.rs\"]\npub mod assets;\n",
+            "asset_impl.rs",
+        ),
     ] {
-        let (_, mut resolver) = local(root.path(), &[("lib.rs", declaration), (destination, "pub struct Asset;\n")]);
+        let (_, mut resolver) = local(
+            root.path(),
+            &[
+                ("lib.rs", declaration),
+                (destination, "pub struct Asset;\n"),
+            ],
+        );
         let line = declaration.lines().count() as u32;
         let result = resolver.at("lib.rs", line, 8);
-        assert!(matches!(result, DeclarationResolution::Resolved { destination: ref target }
-            if target.module_file && Path::new(&target.path).ends_with(destination) && target.line == 1), "{result:?}");
+        assert!(
+            matches!(result, DeclarationResolution::Resolved { destination: ref target }
+            if target.module_file && Path::new(&target.path).ends_with(destination) && target.line == 1),
+            "{result:?}"
+        );
     }
-    let (_, mut resolver) = local(root.path(), &[("lib.rs", "pub mod assets { pub struct Asset; }\n")]);
-    assert!(matches!(resolver.at("lib.rs", 1, 8), DeclarationResolution::Resolved { destination } if !destination.module_file));
+    let (_, mut resolver) = local(
+        root.path(),
+        &[("lib.rs", "pub mod assets { pub struct Asset; }\n")],
+    );
+    assert!(
+        matches!(resolver.at("lib.rs", 1, 8), DeclarationResolution::Resolved { destination } if !destination.module_file)
+    );
 }
 
 #[test]
@@ -105,16 +182,31 @@ fn rust_aliases_generics_and_source_positions_agree() {
 #[test]
 fn rust_local_and_explicit_types_shadow_unavailable_glob_imports() {
     let root = tempfile::tempdir().unwrap();
-    let (_, mut resolver) = local(root.path(), &[
-        ("Cargo.toml", "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nbevy = \"=0.19.1\"\n"),
-        ("src/lib.rs", "mod controls;\nmod arena;\n"),
-        ("src/controls.rs", "use bevy::prelude::*;\npub(crate) struct MovementInput { pub(crate) direction: Vec2 }\npub(crate) fn movement_input(mut movement: ResMut<MovementInput>);\n"),
-        ("src/arena.rs", "use bevy::prelude::*;\nuse crate::controls::MovementInput;\npub(crate) fn move_player(movement: Res<MovementInput>);\n"),
-    ]);
+    let (_, mut resolver) = local(
+        root.path(),
+        &[
+            (
+                "Cargo.toml",
+                "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nbevy = \"=0.19.1\"\n",
+            ),
+            ("src/lib.rs", "mod controls;\nmod arena;\n"),
+            (
+                "src/controls.rs",
+                "use bevy::prelude::*;\npub(crate) struct MovementInput { pub(crate) direction: Vec2 }\npub(crate) fn movement_input(mut movement: ResMut<MovementInput>);\n",
+            ),
+            (
+                "src/arena.rs",
+                "use bevy::prelude::*;\nuse crate::controls::MovementInput;\npub(crate) fn move_player(movement: Res<MovementInput>);\n",
+            ),
+        ],
+    );
     for (path, column) in [("src/controls.rs", 50), ("src/arena.rs", 40)] {
         let result = resolver.at(path, 3, column);
-        assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
-            if destination.path.ends_with("controls.rs") && destination.line == 2), "{path}: {result:?}");
+        assert!(
+            matches!(result, DeclarationResolution::Resolved { ref destination }
+            if destination.path.ends_with("controls.rs") && destination.line == 2),
+            "{path}: {result:?}"
+        );
     }
 }
 
@@ -156,7 +248,8 @@ fn invalid_import_blocks_but_missing_prelude_does_not() {
         report
             .diagnostic
             .iter()
-            .filter(|diagnostic| !diagnostic.error && diagnostic.reason.contains("unchecked during planning"))
+            .filter(|diagnostic| !diagnostic.error
+                && diagnostic.reason.contains("unchecked during planning"))
             .count(),
         1
     );
@@ -394,31 +487,66 @@ fn conditional_module_references_remain_unverified() {
 #[test]
 fn qualified_module_paths_do_not_expand_same_named_function_reexports() {
     let root = tempfile::tempdir().unwrap();
-    let (design, mut resolver) = local(root.path(), &[
-        ("lib.rs", "mod vector;\npub use vector::{vector, Vector};\npub struct Api { pub position: Vector }\n"),
-        ("vector.rs", "pub fn vector() -> Vector;\n#[cfg(feature = \"optional\")]\npub struct Vector;\n"),
-    ]);
+    let (design, mut resolver) = local(
+        root.path(),
+        &[
+            (
+                "lib.rs",
+                "mod vector;\npub use vector::{vector, Vector};\npub struct Api { pub position: Vector }\n",
+            ),
+            (
+                "vector.rs",
+                "pub fn vector() -> Vector;\n#[cfg(feature = \"optional\")]\npub struct Vector;\n",
+            ),
+        ],
+    );
     let report = resolver.validate(&design);
-    assert!(report.diagnostic.iter().all(|diagnostic| !diagnostic.error), "{report:?}");
-    assert!(matches!(resolver.at("lib.rs", 3, 34), DeclarationResolution::Unverified { .. }));
-    assert!(!report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "vector::vector"),
-        "same-named value re-export did not validate its function: {report:?}");
+    assert!(
+        report.diagnostic.iter().all(|diagnostic| !diagnostic.error),
+        "{report:?}"
+    );
+    assert!(matches!(
+        resolver.at("lib.rs", 3, 34),
+        DeclarationResolution::Unverified { .. }
+    ));
+    assert!(
+        !report
+            .diagnostic
+            .iter()
+            .any(|diagnostic| diagnostic.reference == "vector::vector"),
+        "same-named value re-export did not validate its function: {report:?}"
+    );
 }
 
 #[test]
 fn derive_navigation_selects_macro_instead_of_same_named_trait() {
     let workspace = tempfile::tempdir().unwrap();
     let design = design(&[
-        ("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n"),
-        ("src/lib.rs", "pub mod macros;\npub mod traits;\nuse crate::{macros::Component, traits::Component};\n#[derive(Component)]\npub struct Player;\npub fn inspect(value: Component);\n"),
-        ("src/macros.rs", "#[proc_macro_derive(Component)]\npub fn derive_component(input: TokenStream) -> TokenStream {}\n"),
+        (
+            "Cargo.toml",
+            "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n",
+        ),
+        (
+            "src/lib.rs",
+            "pub mod macros;\npub mod traits;\nuse crate::{macros::Component, traits::Component};\n#[derive(Component)]\npub struct Player;\npub fn inspect(value: Component);\n",
+        ),
+        (
+            "src/macros.rs",
+            "#[proc_macro_derive(Component)]\npub fn derive_component(input: TokenStream) -> TokenStream {}\n",
+        ),
         ("src/traits.rs", "pub trait Component {}\n"),
     ]);
     let mut resolver = DeclarationResolver::planned(workspace.path(), &design, false).unwrap();
     let result = resolver.at("src/lib.rs", 4, 11);
-    assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
-        if destination.name == "Component" && destination.path.ends_with("macros.rs")), "{result:?}");
+    assert!(
+        matches!(result, DeclarationResolution::Resolved { ref destination }
+        if destination.name == "Component" && destination.path.ends_with("macros.rs")),
+        "{result:?}"
+    );
     let result = resolver.at("src/lib.rs", 6, 25);
-    assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
-        if destination.name == "Component" && destination.path.ends_with("traits.rs")), "{result:?}");
+    assert!(
+        matches!(result, DeclarationResolution::Resolved { ref destination }
+        if destination.name == "Component" && destination.path.ends_with("traits.rs")),
+        "{result:?}"
+    );
 }

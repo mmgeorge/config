@@ -1,14 +1,15 @@
 use anyhow::Result;
 use forge_buffer::block::{
-    BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, TargetRange, TextChunk, TextPosition, TextRange,
+    BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, TargetRange, TextChunk,
+    TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, TargetId};
 use forge_buffer::markdown::{MarkdownRenderer, RenderedMarkdown};
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
-use super::markdown_math;
 use super::duration::tool_duration;
+use super::markdown_math;
 use super::tool::{ToolOutputPreview, ToolOutputView};
 
 pub struct TranscriptRenderer<'profile> {
@@ -17,74 +18,163 @@ pub struct TranscriptRenderer<'profile> {
 
 impl<'profile> TranscriptRenderer<'profile> {
     /// Builds the independent command heading without retaining an output body.
-    pub(super) fn tool_header(&self, id: BlockId, target: TargetId, kind: &str,
-        elapsed_ms: Option<u64>, failed: bool, title: &str, expanded: bool) -> Result<BufferBlock> {
-        let empty = ToolOutputPreview { row:Vec::new(), hidden_rows:0, total_rows:0 };
-        let mut block = self.tool_preview(id,target,kind,elapsed_ms,failed,title,&empty,expanded)?;
-        let rows = block.metadata.decoration.iter().find(|span|span.capture == "ForgeHarnessOutput")
-            .map_or(block.text.row_count(), |span|span.range.start.row);
+    pub(super) fn tool_header(
+        &self,
+        id: BlockId,
+        target: TargetId,
+        kind: &str,
+        elapsed_ms: Option<u64>,
+        failed: bool,
+        title: &str,
+        expanded: bool,
+    ) -> Result<BufferBlock> {
+        let empty = ToolOutputPreview {
+            row: Vec::new(),
+            hidden_rows: 0,
+            total_rows: 0,
+        };
+        let mut block = self.tool_preview(
+            id, target, kind, elapsed_ms, failed, title, &empty, expanded,
+        )?;
+        let rows = block
+            .metadata
+            .decoration
+            .iter()
+            .find(|span| span.capture == "ForgeHarnessOutput")
+            .map_or(block.text.row_count(), |span| span.range.start.row);
         block.text = BufferText::from_rows(block.text.slice(0..rows)?)?;
-        block.metadata.decoration.retain(|span|span.capture != "ForgeHarnessOutput");
+        block
+            .metadata
+            .decoration
+            .retain(|span| span.capture != "ForgeHarnessOutput");
         block.metadata.target[0].range.end.row = rows;
         Ok(block)
     }
 
     /// Projects one stable output chunk and an independent collapsed hidden-count block.
-    pub(super) fn tool_body(&self, call_id: &str, output: &ToolOutputView, expanded: bool,
-        chunk: usize) -> Result<BufferBlock> {
-        let id = if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") };
+    pub(super) fn tool_body(
+        &self,
+        call_id: &str,
+        output: &ToolOutputView,
+        expanded: bool,
+        chunk: usize,
+    ) -> Result<BufferBlock> {
+        let id = if chunk == 0 {
+            format!("{call_id}:preview")
+        } else {
+            format!("{call_id}:output:{chunk}")
+        };
         let rows = if expanded {
             let source = output.inline_chunk(chunk)?;
             let mut rows = if chunk == 0 {
-                output.header().map_or(Ok(Vec::new()), |header|
-                    tool_source_rows(self.profile, &header.kind, &header.title))?
-            } else { Vec::new() };
-            if source.is_empty() && chunk == 0 {
-                rows.extend(tool_body_rows(self.profile,"no output",rows.is_empty())?);
+                output.header().map_or(Ok(Vec::new()), |header| {
+                    tool_source_rows(self.profile, &header.kind, &header.title)
+                })?
             } else {
-                for (index,text) in source.into_iter().enumerate() {
+                Vec::new()
+            };
+            if source.is_empty() && chunk == 0 {
+                rows.extend(tool_body_rows(self.profile, "no output", rows.is_empty())?);
+            } else {
+                for (index, text) in source.into_iter().enumerate() {
                     let branch = rows.is_empty() && chunk == 0 && index == 0;
-                    rows.extend(tool_body_rows(self.profile,text,branch)?);
+                    rows.extend(tool_body_rows(self.profile, text, branch)?);
                 }
             }
             rows
         } else {
-            let mut rows = preview_rows(self.profile,&output.preview(false)?)?.0;
+            let mut rows = preview_rows(self.profile, &output.preview(false)?)?.0;
             if output.live_preview {
-                if output.preview(false)?.total_rows == 0 { rows.clear(); }
+                if output.preview(false)?.total_rows == 0 {
+                    rows.clear();
+                }
                 rows.resize(4, String::new());
             }
             rows
         };
-        self.output_block(BlockId(id),rows)
+        self.output_block(BlockId(id), rows)
     }
 
     /// Changes hidden output counts without replacing the heading or its preview.
-    pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
-        let hidden = if expanded || output.live_preview { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
-        let rows = if hidden == 0 { Vec::new() }
-            else { tool_body_rows(self.profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)? };
-        self.output_block(BlockId(format!("{call_id}:hidden")),rows)
+    pub(super) fn tool_hidden(
+        &self,
+        call_id: &str,
+        output: &ToolOutputView,
+        expanded: bool,
+    ) -> Result<BufferBlock> {
+        let hidden = if expanded || output.live_preview {
+            0
+        } else {
+            preview_rows(self.profile, &output.preview(false)?)?.1
+        };
+        let rows = if hidden == 0 {
+            Vec::new()
+        } else {
+            tool_body_rows(
+                self.profile,
+                &format!(
+                    "…({hidden} earlier {})",
+                    if hidden == 1 { "line" } else { "lines" }
+                ),
+                false,
+            )?
+        };
+        self.output_block(BlockId(format!("{call_id}:hidden")), rows)
     }
 
     fn output_block(&self, id: BlockId, rows: Vec<String>) -> Result<BufferBlock> {
         let text = BufferText::from_rows(rows)?;
-        let call = id.0.strip_suffix(":preview").or_else(|| id.0.split_once(":output:").map(|(call, _)|call))
-            .or_else(||id.0.strip_suffix(":hidden"));
+        let call =
+            id.0.strip_suffix(":preview")
+                .or_else(|| id.0.split_once(":output:").map(|(call, _)| call))
+                .or_else(|| id.0.strip_suffix(":hidden"));
         let content_node = call.map(|call| forge_buffer::identity::FoldId(format!("{call}:tool")));
-        let mut block = BufferBlock { id, text, metadata:BlockMetadata { content_node, ..Default::default() } };
+        let mut block = BufferBlock {
+            id,
+            text,
+            metadata: BlockMetadata {
+                content_node,
+                ..Default::default()
+            },
+        };
         if block.text.row_count() > 0 {
-            let range = TextRange { start:TextPosition { row:0,column:0 },
-                end:TextPosition { row:block.text.row_count(),column:0 } };
-            block.metadata.target.push(TargetRange { id:TargetId(format!("{}:tool",block.id.0)),range:range.clone() });
-            block.metadata.decoration.push(Decoration { range,capture:"ForgeHarnessOutput".into(),priority:100 });
+            let range = TextRange {
+                start: TextPosition { row: 0, column: 0 },
+                end: TextPosition {
+                    row: block.text.row_count(),
+                    column: 0,
+                },
+            };
+            block.metadata.target.push(TargetRange {
+                id: TargetId(format!("{}:tool", block.id.0)),
+                range: range.clone(),
+            });
+            block.metadata.decoration.push(Decoration {
+                range,
+                capture: "ForgeHarnessOutput".into(),
+                priority: 100,
+            });
         }
         Ok(block)
     }
-    pub(super) fn refresh_tool_heading(&self, previous: &BufferBlock, kind: &str,
-        elapsed_ms: Option<u64>, failed: bool, title: &str, expanded: bool) -> Result<BufferBlock> {
-        let mut block = self.tool_header(previous.id.clone(),previous.metadata.target[0].id.clone(),
-            kind,elapsed_ms,failed,title,expanded)?;
+    pub(super) fn refresh_tool_heading(
+        &self,
+        previous: &BufferBlock,
+        kind: &str,
+        elapsed_ms: Option<u64>,
+        failed: bool,
+        title: &str,
+        expanded: bool,
+    ) -> Result<BufferBlock> {
+        let mut block = self.tool_header(
+            previous.id.clone(),
+            previous.metadata.target[0].id.clone(),
+            kind,
+            elapsed_ms,
+            failed,
+            title,
+            expanded,
+        )?;
         block.metadata.layout = previous.metadata.layout.clone();
         block.metadata.fold = previous.metadata.fold.clone();
         block.metadata.node = previous.metadata.node.clone();
@@ -118,7 +208,8 @@ impl<'profile> TranscriptRenderer<'profile> {
         });
         Self::heading_marker(&mut block, "ForgeHarnessPrompt");
         block.metadata.node = Some(forge_buffer::node::NodeState::new(
-            forge_buffer::identity::FoldId(block.id.0.clone()), forge_buffer::node::NodeKind::Message,
+            forge_buffer::identity::FoldId(block.id.0.clone()),
+            forge_buffer::node::NodeKind::Message,
             forge_buffer::node::NodeDisplay::Preview,
         ));
         Ok(block)
@@ -134,7 +225,10 @@ impl<'profile> TranscriptRenderer<'profile> {
         rendered.block.metadata.markdown = true;
         rendered.block.metadata.layout = Some(ContentLayout {
             indent: 2,
-            marker: Some(TextChunk { text: "●".into(), capture: "ForgeHarnessResponse".into() }),
+            marker: Some(TextChunk {
+                text: "●".into(),
+                capture: "ForgeHarnessResponse".into(),
+            }),
             source_indent: 0,
         });
         Ok(rendered)
@@ -187,17 +281,29 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn heading_marker(block: &mut BufferBlock, capture: &str) {
         if let Some(marker) = block.text.row(0).and_then(|row| {
-            ["▸", "◇", "●"].into_iter().find(|marker| row.starts_with(&format!("{marker} ")))
+            ["▸", "◇", "●"]
+                .into_iter()
+                .find(|marker| row.starts_with(&format!("{marker} ")))
         }) {
             block.metadata.layout = Some(ContentLayout {
                 indent: 2,
                 source_indent: 0,
-                marker: Some(TextChunk { text: marker.into(), capture: capture.into() }),
+                marker: Some(TextChunk {
+                    text: marker.into(),
+                    capture: capture.into(),
+                }),
             });
             block.metadata.conceal.push(Conceal {
-                range: TextRange { start: TextPosition { row: 0, column: 0 },
-                    end: TextPosition { row: 0, column: "▸ ".len() } },
-                replacement: String::new(), line: false, priority: 100,
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition {
+                        row: 0,
+                        column: "▸ ".len(),
+                    },
+                },
+                replacement: String::new(),
+                line: false,
+                priority: 100,
             });
         }
     }
@@ -205,24 +311,52 @@ impl<'profile> TranscriptRenderer<'profile> {
     /// Assigns a fold affordance while preserving tool dots and diff hunk labels.
     pub(super) fn fold_marker(block: &mut BufferBlock) {
         let heading = block.text.row(0).unwrap_or("").trim_start();
-        if heading.starts_with('•') || heading.starts_with("@@") { return; }
+        if heading.starts_with('•') || heading.starts_with("@@") {
+            return;
+        }
         let layout = block.metadata.layout.get_or_insert(ContentLayout {
-            indent: 2, source_indent: 0, marker: None,
+            indent: 2,
+            source_indent: 0,
+            marker: None,
         });
-        let capture = layout.marker.as_ref().map_or("Normal", |marker| marker.capture.as_str()).to_owned();
-        layout.marker = Some(TextChunk { text: "▸".into(), capture });
+        let capture = layout
+            .marker
+            .as_ref()
+            .map_or("Normal", |marker| marker.capture.as_str())
+            .to_owned();
+        layout.marker = Some(TextChunk {
+            text: "▸".into(),
+            capture,
+        });
     }
 
     /// Resolves bodyless headings to events without shifting their byte coordinates.
     pub(super) fn resolve_marker(block: &mut BufferBlock) -> Result<()> {
-        let Some(marker) = block.metadata.layout.as_mut().and_then(|layout| layout.marker.as_mut()) else {
+        let Some(marker) = block
+            .metadata
+            .layout
+            .as_mut()
+            .and_then(|layout| layout.marker.as_mut())
+        else {
             return Ok(());
         };
-        if marker.text == "▸" && block.metadata.fold.is_empty() { marker.text = "◇".into(); }
-        let Some(first) = block.text.row(0) else { return Ok(()); };
-        if ["▸ ", "◇ ", "● "].iter().any(|prefix| first.starts_with(prefix))
-            && !first.starts_with(&marker.text) {
-            let mut rows = block.text.wire_rows().iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+        if marker.text == "▸" && block.metadata.fold.is_empty() {
+            marker.text = "◇".into();
+        }
+        let Some(first) = block.text.row(0) else {
+            return Ok(());
+        };
+        if ["▸ ", "◇ ", "● "]
+            .iter()
+            .any(|prefix| first.starts_with(prefix))
+            && !first.starts_with(&marker.text)
+        {
+            let mut rows = block
+                .text
+                .wire_rows()
+                .iter()
+                .map(|row| (*row).to_owned())
+                .collect::<Vec<_>>();
             rows[0].replace_range(.."▸".len(), &marker.text);
             block.text = BufferText::from_rows(rows)?;
         }
@@ -246,7 +380,9 @@ impl<'profile> TranscriptRenderer<'profile> {
         let duration = tool_duration(elapsed_ms);
         let mut row = vec![tool_heading(self.profile, kind, title, &duration)?];
         let title_rows = row.len();
-        if expanded { row.extend(tool_source_rows(self.profile, kind, title)?); }
+        if expanded {
+            row.extend(tool_source_rows(self.profile, kind, title)?);
+        }
         row.extend(tool_output_rows(self.profile, output, expanded)?);
         let text = BufferText::from_rows(row)?;
         let range = TextRange {
@@ -285,10 +421,12 @@ impl<'profile> TranscriptRenderer<'profile> {
         }
         Ok(block)
     }
-
 }
 
-fn preview_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>) -> Result<(Vec<String>,usize)> {
+fn preview_rows(
+    profile: &WidthProfile,
+    output: &ToolOutputPreview<'_>,
+) -> Result<(Vec<String>, usize)> {
     let mut content_profile = profile.clone();
     let margin = 4.min(content_profile.columns - 1);
     content_profile.columns -= margin;
@@ -299,9 +437,13 @@ fn preview_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>) -> Resul
         let truncated = text.len() > byte_limit;
         let text = if truncated {
             let mut start = text.len() - byte_limit;
-            while !text.is_char_boundary(start) { start += 1; }
+            while !text.is_char_boundary(start) {
+                start += 1;
+            }
             &text[start..]
-        } else { text };
+        } else {
+            text
+        };
         let wrapped = content_profile.wrap_plain(text, 0)?;
         let remaining = 4_usize.saturating_sub(row.len());
         let clipped = wrapped.len() > remaining || truncated;
@@ -312,22 +454,51 @@ fn preview_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>) -> Resul
         }
     }
     row.reverse();
-    if row.is_empty() { row.push("no output".into()); }
-    Ok((row.into_iter().enumerate().map(|(index, text)| {
-        let prefix = if index == 0 && margin == 4 { "  └ ".into() } else { " ".repeat(margin) };
-        format!("{prefix}{text}")
-    }).collect(), hidden_rows))
+    if row.is_empty() {
+        row.push("no output".into());
+    }
+    Ok((
+        row.into_iter()
+            .enumerate()
+            .map(|(index, text)| {
+                let prefix = if index == 0 && margin == 4 {
+                    "  └ ".into()
+                } else {
+                    " ".repeat(margin)
+                };
+                format!("{prefix}{text}")
+            })
+            .collect(),
+        hidden_rows,
+    ))
 }
 
-fn tool_output_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>, expanded: bool) -> Result<Vec<String>> {
+fn tool_output_rows(
+    profile: &WidthProfile,
+    output: &ToolOutputPreview<'_>,
+    expanded: bool,
+) -> Result<Vec<String>> {
     if expanded {
         let mut row = Vec::new();
-        for (index,text) in output.row.iter().enumerate() { row.extend(tool_body_rows(profile,text,index == 0)?); }
-        if row.is_empty() { row.extend(tool_body_rows(profile,"no output",true)?); }
+        for (index, text) in output.row.iter().enumerate() {
+            row.extend(tool_body_rows(profile, text, index == 0)?);
+        }
+        if row.is_empty() {
+            row.extend(tool_body_rows(profile, "no output", true)?);
+        }
         return Ok(row);
     }
-    let (mut row,hidden) = preview_rows(profile,output)?;
-    if hidden > 0 { row.extend(tool_body_rows(profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)?); }
+    let (mut row, hidden) = preview_rows(profile, output)?;
+    if hidden > 0 {
+        row.extend(tool_body_rows(
+            profile,
+            &format!(
+                "…({hidden} earlier {})",
+                if hidden == 1 { "line" } else { "lines" }
+            ),
+            false,
+        )?);
+    }
     Ok(row)
 }
 
@@ -336,20 +507,45 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
     let mut content_profile = profile.clone();
     let margin = 4.min(content_profile.columns - 1);
     content_profile.columns -= margin;
-    Ok(content_profile.wrap_plain(text, 0)?.into_iter().enumerate().map(|(index, text)| {
-        let prefix = if branch && index == 0 && margin == 4 { "  └ ".into() } else { " ".repeat(margin) };
-        format!("{prefix}{text}")
-    }).collect())
+    Ok(content_profile
+        .wrap_plain(text, 0)?
+        .into_iter()
+        .enumerate()
+        .map(|(index, text)| {
+            let prefix = if branch && index == 0 && margin == 4 {
+                "  └ ".into()
+            } else {
+                " ".repeat(margin)
+            };
+            format!("{prefix}{text}")
+        })
+        .collect())
 }
 
 /// Formats a bounded display title without changing the retained provider call.
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
-    let display = matches!(kind, "command" | "check").then(||
-        crate::permissions::command::display_command(title, crate::permissions::shell::CommandShell::default()));
-    let summary = if kind == "command" { display.as_ref().and_then(|display| display.summary()) } else { None };
-    let title = summary.as_deref().unwrap_or_else(|| display.as_ref().map_or(title, |display| display.source.as_str()));
+    let display = matches!(kind, "command" | "check").then(|| {
+        crate::permissions::command::display_command(
+            title,
+            crate::permissions::shell::CommandShell::default(),
+        )
+    });
+    let summary = if kind == "command" {
+        display.as_ref().and_then(|display| display.summary())
+    } else {
+        None
+    };
+    let title = summary.as_deref().unwrap_or_else(|| {
+        display
+            .as_ref()
+            .map_or(title, |display| display.source.as_str())
+    });
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full = if kind == "check" { format!("▸ {normalized} · {}",duration.trim()) } else { format!("• {duration} {normalized}") };
+    let full = if kind == "check" {
+        format!("▸ {normalized} · {}", duration.trim())
+    } else {
+        format!("• {duration} {normalized}")
+    };
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
     }
@@ -362,24 +558,34 @@ fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str)
         prefix.push(character);
         if kind == "tool_call" {
             if quoted {
-                if escaped { escaped = false; }
-                else if character == '\\' { escaped = true; }
-                else if character == '"' { quoted = false; }
+                if escaped {
+                    escaped = false;
+                } else if character == '\\' {
+                    escaped = true;
+                } else if character == '"' {
+                    quoted = false;
+                }
             } else {
                 match character {
                     '"' => quoted = true,
                     '(' => closing.push(')'),
                     '{' => closing.push('}'),
                     '[' => closing.push(']'),
-                    ')' | '}' | ']' => { closing.pop(); }
+                    ')' | '}' | ']' => {
+                        closing.pop();
+                    }
                     _ => {}
                 }
             }
         }
-        if escaped { continue; }
+        if escaped {
+            continue;
+        }
         let suffix: String = closing.iter().rev().collect();
         let candidate = format!("{prefix}…{}{suffix}", if quoted { "\"" } else { "" });
-        if profile.cells(&candidate, 0)? > profile.columns { break; }
+        if profile.cells(&candidate, 0)? > profile.columns {
+            break;
+        }
         best = candidate;
     }
     Ok(best)
@@ -389,10 +595,16 @@ fn tool_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<V
     if kind == "tool_call" && title.contains('(') {
         return tool_body_rows(profile, &format!("Call: {title}"), true);
     }
-    if kind != "command" { return Ok(Vec::new()); }
-    let display = crate::permissions::command::display_command(title,
-        crate::permissions::shell::CommandShell::default());
-    if display.summary().is_none() { return Ok(Vec::new()); }
+    if kind != "command" {
+        return Ok(Vec::new());
+    }
+    let display = crate::permissions::command::display_command(
+        title,
+        crate::permissions::shell::CommandShell::default(),
+    );
+    if display.summary().is_none() {
+        return Ok(Vec::new());
+    }
     tool_body_rows(profile, &format!("Command: {title}"), true)
 }
 
@@ -424,8 +636,11 @@ fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str,
 /// Skips the padded duration column so timing text never receives command or MCP styling.
 fn tool_content_start(text: &str) -> usize {
     let after_bullet = text.split_once("• ").map(|(_, tail)| tail).unwrap_or("");
-    let title = after_bullet.trim_start().split_once(char::is_whitespace)
-        .map(|(_, title)| title.trim_start()).unwrap_or("");
+    let title = after_bullet
+        .trim_start()
+        .split_once(char::is_whitespace)
+        .map(|(_, title)| title.trim_start())
+        .unwrap_or("");
     text.len() - title.len()
 }
 
@@ -561,24 +776,48 @@ mod test {
         let renderer = TranscriptRenderer::new(&profile)?;
         for expanded in [false, true] {
             let mut block = renderer.tool_header(
-                BlockId("check:tool".into()), TargetId("check:tool".into()), "check",
-                Some(102_000), false, "cargo test --locked --lib controls::tests · Running", expanded,
+                BlockId("check:tool".into()),
+                TargetId("check:tool".into()),
+                "check",
+                Some(102_000),
+                false,
+                "cargo test --locked --lib controls::tests · Running",
+                expanded,
             )?;
             TranscriptRenderer::fold_marker(&mut block);
             for elapsed in [102_000, 103_000] {
-                block = renderer.refresh_tool_heading(&block, "check", Some(elapsed), false,
-                    "cargo test --locked --lib controls::tests · Running", expanded)?;
+                block = renderer.refresh_tool_heading(
+                    &block,
+                    "check",
+                    Some(elapsed),
+                    false,
+                    "cargo test --locked --lib controls::tests · Running",
+                    expanded,
+                )?;
                 let heading = block.text.row(0).unwrap();
                 let mut visible = heading.to_owned();
                 for conceal in block.metadata.conceal.iter().rev() {
                     assert_eq!(conceal.range.start.row, 0);
                     assert_eq!(conceal.range.end.row, 0);
-                    visible.replace_range(conceal.range.start.column..conceal.range.end.column,
-                        &conceal.replacement);
+                    visible.replace_range(
+                        conceal.range.start.column..conceal.range.end.column,
+                        &conceal.replacement,
+                    );
                 }
-                let marker = &block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text;
+                let marker = &block
+                    .metadata
+                    .layout
+                    .as_ref()
+                    .unwrap()
+                    .marker
+                    .as_ref()
+                    .unwrap()
+                    .text;
                 let rendered = format!("{marker} {visible}");
-                assert!(rendered.starts_with("▸ cargo test --locked --lib controls::tests · Running"), "{rendered}");
+                assert!(
+                    rendered.starts_with("▸ cargo test --locked --lib controls::tests · Running"),
+                    "{rendered}"
+                );
                 assert_eq!(rendered.matches('▸').count(), 1, "{rendered}");
                 assert!(heading.starts_with("▸ "));
             }
@@ -601,9 +840,13 @@ mod test {
 
     #[test]
     fn attachment_prompt_wraps_only_the_visible_label() -> Result<()> {
-        let profile = WidthProfile { columns: 40, ..WidthProfile::default() };
+        let profile = WidthProfile {
+            columns: 40,
+            ..WidthProfile::default()
+        };
         let source = "Inspect [Image #1]";
-        let block = TranscriptRenderer::new(&profile)?.prompt(BlockId("attachment".into()), &source)?;
+        let block =
+            TranscriptRenderer::new(&profile)?.prompt(BlockId("attachment".into()), &source)?;
         assert_eq!(block.text.row_count(), 1);
         assert_eq!(block.text.row(0), Some("● Inspect [Image #1]"));
         Ok(())
@@ -611,23 +854,43 @@ mod test {
 
     #[test]
     fn expanded_mcp_keeps_one_heading_above_response() -> Result<()> {
-        let profile = WidthProfile { columns: 70, ..WidthProfile::default() };
+        let profile = WidthProfile {
+            columns: 70,
+            ..WidthProfile::default()
+        };
         let renderer = TranscriptRenderer::new(&profile)?;
         let arguments = r#"{"entity_name":"CosmosDbClient","file_path":"cosmos-db-client.ts","hops":1,"token_budget":3500}"#;
         let block = renderer.tool_preview(
-            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), false,
+            BlockId("tool".into()),
+            TargetId("tool".into()),
+            "tool_call",
+            Some(2000),
+            false,
             &format!("sem.sem_context({arguments})"),
-            &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
+            &ToolOutputPreview {
+                row: vec!["response"],
+                hidden_rows: 0,
+                total_rows: 1,
+            },
+            true,
         )?;
         let rows = block.text.wire_rows();
         assert!(rows[0].starts_with("•    2s sem.sem_context({"));
         assert!(rows[0].contains('…'));
         assert!(rows.len() > 2);
         assert_eq!(*rows.last().unwrap(), "  └ response");
-        let call = rows[1..rows.len() - 1].iter()
-            .map(|row| row.trim().trim_start_matches('└').trim()).collect::<String>();
-        assert_eq!(call.strip_prefix("Call:").unwrap().trim(), format!("sem.sem_context({arguments})"));
-        assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= profile.columns));
+        let call = rows[1..rows.len() - 1]
+            .iter()
+            .map(|row| row.trim().trim_start_matches('└').trim())
+            .collect::<String>();
+        assert_eq!(
+            call.strip_prefix("Call:").unwrap().trim(),
+            format!("sem.sem_context({arguments})")
+        );
+        assert!(
+            rows.iter()
+                .all(|row| profile.cells(row, 0).unwrap() <= profile.columns)
+        );
         Ok(())
     }
 
@@ -635,20 +898,43 @@ mod test {
     fn long_json_response_starts_beside_branch_in_preview_and_expansion() -> Result<()> {
         let response = r#"{"ok":false,"tool":"plan_read","phase":"semantic_execution","code":"semantic_execution_failed","message":"plan controls require Harness Plan mode"}"#;
         for columns in [40, 70, 120] {
-            let profile = WidthProfile { columns, ..WidthProfile::default() };
+            let profile = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
             let renderer = TranscriptRenderer::new(&profile)?;
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
-                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), true,
-                    "plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
+                    BlockId("tool".into()),
+                    TargetId("tool".into()),
+                    "tool_call",
+                    Some(2000),
+                    true,
+                    "plan_read",
+                    &ToolOutputPreview {
+                        row: vec![response],
+                        hidden_rows: 0,
+                        total_rows: 1,
+                    },
+                    expanded,
                 )?;
                 let rows = block.text.wire_rows();
                 assert!(rows[1].starts_with("  └ "));
-                let truncated = rows.last().is_some_and(|row| row.contains("…(1 earlier line)"));
+                let truncated = rows
+                    .last()
+                    .is_some_and(|row| row.contains("…(1 earlier line)"));
                 let content_end = rows.len() - usize::from(truncated);
-                let restored = rows[1..content_end].iter().enumerate().map(|(index, row)| {
-                    if index == 0 { row.strip_prefix("  └ ").unwrap() } else { row.strip_prefix("    ").unwrap() }
-                }).collect::<String>();
+                let restored = rows[1..content_end]
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| {
+                        if index == 0 {
+                            row.strip_prefix("  └ ").unwrap()
+                        } else {
+                            row.strip_prefix("    ").unwrap()
+                        }
+                    })
+                    .collect::<String>();
                 if truncated {
                     assert!(!expanded);
                     assert_eq!(content_end - 1, 4);
@@ -656,7 +942,10 @@ mod test {
                 } else {
                     assert_eq!(restored, response);
                 }
-                assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= columns));
+                assert!(
+                    rows.iter()
+                        .all(|row| profile.cells(row, 0).unwrap() <= columns)
+                );
             }
         }
         Ok(())
@@ -666,17 +955,45 @@ mod test {
     fn tool_runtime_precision_preserves_command_decoration_in_both_views() -> Result<()> {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
-        for (elapsed_ms, label) in [(0, "0s"), (2, "0s"), (49, "0s"), (50, "0.1s"),
-            (149, "0.1s"), (150, "0.2s"), (439, "0.4s"), (950, "1s"),
-            (999, "1s"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s"), (9_950, "10s"),
-            (99_949, "99.9s"), (99_950, "1.7m"), (100_050, "1.7m"), (1_000_050, "16.7m"), (u64::MAX, "2e11d")] {
+        for (elapsed_ms, label) in [
+            (0, "0s"),
+            (2, "0s"),
+            (49, "0s"),
+            (50, "0.1s"),
+            (149, "0.1s"),
+            (150, "0.2s"),
+            (439, "0.4s"),
+            (950, "1s"),
+            (999, "1s"),
+            (1000, "1s"),
+            (1050, "1.1s"),
+            (2500, "2.5s"),
+            (9_950, "10s"),
+            (99_949, "99.9s"),
+            (99_950, "1.7m"),
+            (100_050, "1.7m"),
+            (1_000_050, "16.7m"),
+            (u64::MAX, "2e11d"),
+        ] {
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
-                    BlockId("tool:duration".into()), TargetId("expand:duration".into()),
-                    "command", Some(elapsed_ms), false, "cargo test",
-                    &ToolOutputPreview { row: vec![], hidden_rows: 0, total_rows: 0 }, expanded,
+                    BlockId("tool:duration".into()),
+                    TargetId("expand:duration".into()),
+                    "command",
+                    Some(elapsed_ms),
+                    false,
+                    "cargo test",
+                    &ToolOutputPreview {
+                        row: vec![],
+                        hidden_rows: 0,
+                        total_rows: 0,
+                    },
+                    expanded,
                 )?;
-                assert_eq!(block.text.row(0), Some(format!("• {label:>5} cargo test").as_str()));
+                assert_eq!(
+                    block.text.row(0),
+                    Some(format!("• {label:>5} cargo test").as_str())
+                );
                 assert!(block.metadata.decoration.iter().any(|decoration| {
                     decoration.capture == "ForgeHarnessCommand"
                         && decoration.range.start.column == format!("• {label:>5} ").len()
@@ -690,11 +1007,24 @@ mod test {
     fn expanded_tool_keeps_its_group_duration_width() -> Result<()> {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
-        let heading = renderer.tool_header(BlockId("tool".into()), TargetId("tool".into()),
-            "tool_call", Some(300), false, "inspect({})", false)?;
+        let heading = renderer.tool_header(
+            BlockId("tool".into()),
+            TargetId("tool".into()),
+            "tool_call",
+            Some(300),
+            false,
+            "inspect({})",
+            false,
+        )?;
         assert_eq!(heading.text.row(0), Some("•  0.3s inspect({})"));
-        let expanded = TranscriptRenderer::new(&profile)?
-            .refresh_tool_heading(&heading, "tool_call", Some(300), false, "inspect({})", true)?;
+        let expanded = TranscriptRenderer::new(&profile)?.refresh_tool_heading(
+            &heading,
+            "tool_call",
+            Some(300),
+            false,
+            "inspect({})",
+            true,
+        )?;
         assert_eq!(expanded.text.row(0), heading.text.row(0));
         assert_eq!(expanded.text.row_count(), 1);
         Ok(())
@@ -703,16 +1033,35 @@ mod test {
     #[test]
     fn live_tool_preview_reserves_four_rows_without_an_overflow_row() -> Result<()> {
         for columns in [12, 80] {
-            let width = WidthProfile { columns, ..Default::default() };
+            let width = WidthProfile {
+                columns,
+                ..Default::default()
+            };
             let renderer = TranscriptRenderer::new(&width)?;
             let mut output = ToolOutputView::new("live".into(), "")?;
             output.live_preview = true;
-            for delta in ["", "one", "\ntwo\nthree\nfour\nfive", "\n界".repeat(200).as_str()] {
+            for delta in [
+                "",
+                "one",
+                "\ntwo\nthree\nfour\nfive",
+                "\n界".repeat(200).as_str(),
+            ] {
                 output.append(delta)?;
                 let body = renderer.tool_body("live", &output, false, 0)?;
                 assert_eq!(body.text.row_count(), 4);
-                assert!(body.text.wire_rows().iter().all(|row| width.cells(row, 0).unwrap() <= columns));
-                assert_eq!(renderer.tool_hidden("live", &output, false)?.text.row_count(), 0);
+                assert!(
+                    body.text
+                        .wire_rows()
+                        .iter()
+                        .all(|row| width.cells(row, 0).unwrap() <= columns)
+                );
+                assert_eq!(
+                    renderer
+                        .tool_hidden("live", &output, false)?
+                        .text
+                        .row_count(),
+                    0
+                );
             }
             assert!(output.preview(true)?.row.iter().any(|row| *row == "one"));
         }
@@ -722,15 +1071,38 @@ mod test {
     #[test]
     fn tool_headings_stay_single_line_when_expanded_and_resized() -> Result<()> {
         for columns in [12, 40, 90] {
-            let profile = WidthProfile { columns, ..WidthProfile::default() };
+            let profile = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
             let renderer = TranscriptRenderer::new(&profile)?;
             for (kind, title) in [
-                ("command", "Get-Content src/game.rs,src/config.rs;\nGet-ChildItem -Force -Name"),
-                ("tool_call", r#"sem.context({"path":"src/game.rs","query":"a long query with 界 characters"})"#),
+                (
+                    "command",
+                    "Get-Content src/game.rs,src/config.rs;\nGet-ChildItem -Force -Name",
+                ),
+                (
+                    "tool_call",
+                    r#"sem.context({"path":"src/game.rs","query":"a long query with 界 characters"})"#,
+                ),
             ] {
-                let collapsed = renderer.tool_header(BlockId("tool".into()), TargetId("tool".into()),
-                    kind, Some(400), false, title, false)?;
-                let expanded = renderer.refresh_tool_heading(&collapsed, kind, Some(400), false, title, true)?;
+                let collapsed = renderer.tool_header(
+                    BlockId("tool".into()),
+                    TargetId("tool".into()),
+                    kind,
+                    Some(400),
+                    false,
+                    title,
+                    false,
+                )?;
+                let expanded = renderer.refresh_tool_heading(
+                    &collapsed,
+                    kind,
+                    Some(400),
+                    false,
+                    title,
+                    true,
+                )?;
                 assert_eq!(collapsed.text.row_count(), 1);
                 assert_eq!(expanded.text, collapsed.text);
                 assert!(profile.cells(expanded.text.row(0).unwrap(), 0)? <= columns);
@@ -742,22 +1114,45 @@ mod test {
 
     #[test]
     fn shell_summaries_keep_original_commands_in_expanded_output() -> Result<()> {
-        let profile = WidthProfile { columns: 100, ..WidthProfile::default() };
+        let profile = WidthProfile {
+            columns: 100,
+            ..WidthProfile::default()
+        };
         let renderer = TranscriptRenderer::new(&profile)?;
         for (source, expected) in [
-            ("pwsh -Command 'Get-Content src/main.rs -TotalCount 40'", "Read · src/main.rs · first 40 lines"),
-            ("bash -lc 'grep -n TODO src/main.rs'", "Search · \"TODO\" · src/main.rs · line numbers"),
+            (
+                "pwsh -Command 'Get-Content src/main.rs -TotalCount 40'",
+                "Read · src/main.rs · first 40 lines",
+            ),
+            (
+                "bash -lc 'grep -n TODO src/main.rs'",
+                "Search · \"TODO\" · src/main.rs · line numbers",
+            ),
             ("nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
         ] {
             let heading = crate::turn::ToolCall {
-                id:"shell".into(), kind:"command".into(), title:source.into(), output:String::new(),
-                started_at_ms:Some(0), completed_at_ms:Some(100), task_id:None,
-                status:"completed".into(), failed:false, change:Default::default(),
+                id: "shell".into(),
+                kind: "command".into(),
+                title: source.into(),
+                output: String::new(),
+                started_at_ms: Some(0),
+                completed_at_ms: Some(100),
+                task_id: None,
+                status: "completed".into(),
+                failed: false,
+                change: Default::default(),
             };
             let mut output = ToolOutputView::new("shell".into(), "matching content\n")?;
             output.heading(&heading);
-            let header = renderer.tool_header(BlockId("shell".into()), TargetId("shell".into()),
-                "command",Some(100),false,source,false)?;
+            let header = renderer.tool_header(
+                BlockId("shell".into()),
+                TargetId("shell".into()),
+                "command",
+                Some(100),
+                false,
+                source,
+                false,
+            )?;
             assert!(header.text.row(0).unwrap().ends_with(expected));
             let body = renderer.tool_body("shell", &output, true, 0)?;
             let rendered = body.text.wire_rows().join("\n");
@@ -767,29 +1162,56 @@ mod test {
             header.validate()?;
             body.validate()?;
         }
-        assert_eq!(tool_heading(&profile,"command","rg -n TODO src","1s")?, "• 1s rg -n TODO src");
+        assert_eq!(
+            tool_heading(&profile, "command", "rg -n TODO src", "1s")?,
+            "• 1s rg -n TODO src"
+        );
         Ok(())
     }
 
     #[test]
     fn expanded_tools_preserve_arguments_beyond_the_heading_width() -> Result<()> {
-        let profile = WidthProfile { columns: 48, ..WidthProfile::default() };
+        let profile = WidthProfile {
+            columns: 48,
+            ..WidthProfile::default()
+        };
         let renderer = TranscriptRenderer::new(&profile)?;
-        let source = r#"fixture.inspect({"path":"src/deeply/nested/module.rs","offset":123,"limit":456})"#;
+        let source =
+            r#"fixture.inspect({"path":"src/deeply/nested/module.rs","offset":123,"limit":456})"#;
         let call = crate::turn::ToolCall {
-            id: "call".into(), kind: "tool_call".into(), title: source.into(),
-            output: String::new(), started_at_ms: Some(0), completed_at_ms: Some(100),
-            task_id: None, status: "completed".into(), failed: false, change: Default::default(),
+            id: "call".into(),
+            kind: "tool_call".into(),
+            title: source.into(),
+            output: String::new(),
+            started_at_ms: Some(0),
+            completed_at_ms: Some(100),
+            task_id: None,
+            status: "completed".into(),
+            failed: false,
+            change: Default::default(),
         };
         let mut output = ToolOutputView::new("call".into(), "tool result\n")?;
         output.heading(&call);
-        let header = renderer.tool_header(BlockId("call".into()), TargetId("call".into()),
-            "tool_call", Some(100), false, source, true)?;
+        let header = renderer.tool_header(
+            BlockId("call".into()),
+            TargetId("call".into()),
+            "tool_call",
+            Some(100),
+            false,
+            source,
+            true,
+        )?;
         assert!(!header.text.row(0).unwrap().contains("456"));
         let body = renderer.tool_body("call", &output, true, 0)?;
         let rows = body.text.wire_rows();
-        let joined = rows.iter().map(|row| row.trim().trim_start_matches('└').trim()).collect::<String>();
-        assert!(joined.contains(source), "expanded call lost arguments: {joined}");
+        let joined = rows
+            .iter()
+            .map(|row| row.trim().trim_start_matches('└').trim())
+            .collect::<String>();
+        assert!(
+            joined.contains(source),
+            "expanded call lost arguments: {joined}"
+        );
         assert!(joined.contains("tool result"));
         body.validate()?;
         Ok(())
@@ -797,11 +1219,31 @@ mod test {
 
     #[test]
     fn tool_titles_strip_launchers_and_close_truncated_arguments() -> Result<()> {
-        let profile = WidthProfile { columns: 90, ..WidthProfile::default() };
-        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, "2s")?, "• 2s git status --short");
-        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?, "• 2s cargo test");
-        assert_eq!(crate::permissions::command::display_command("pwsh -File build.ps1",
-            crate::permissions::shell::CommandShell::PowerShell).source, "build.ps1");
+        let profile = WidthProfile {
+            columns: 90,
+            ..WidthProfile::default()
+        };
+        assert_eq!(
+            tool_heading(
+                &profile,
+                "command",
+                r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#,
+                "2s"
+            )?,
+            "• 2s git status --short"
+        );
+        assert_eq!(
+            tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?,
+            "• 2s cargo test"
+        );
+        assert_eq!(
+            crate::permissions::command::display_command(
+                "pwsh -File build.ps1",
+                crate::permissions::shell::CommandShell::PowerShell
+            )
+            .source,
+            "build.ps1"
+        );
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
         let heading = tool_heading(&profile, "tool_call", call, "2s")?;
         assert!(heading.starts_with("• 2s sem.sem_context({"));
@@ -840,7 +1282,10 @@ mod test {
                 "    …(96 earlier lines)"
             ]
         );
-        assert_eq!(block.metadata.target[0].range.end.row, block.text.row_count());
+        assert_eq!(
+            block.metadata.target[0].range.end.row,
+            block.text.row_count()
+        );
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessCommand"
                 && decoration.range.start.column == "•    2s ".len()
@@ -888,7 +1333,10 @@ mod test {
     fn active_tool_preview_keeps_four_output_rows_and_call_syntax() -> Result<()> {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
-        let output = super::super::tool::ToolOutputView::new("preview".into(), "one\r\ntwo\nthree\nfour\nfive\n")?;
+        let output = super::super::tool::ToolOutputView::new(
+            "preview".into(),
+            "one\r\ntwo\nthree\nfour\nfive\n",
+        )?;
         let block = renderer.tool_preview(
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
@@ -937,24 +1385,46 @@ mod test {
 
     #[test]
     fn wrapped_tool_output_limits_preview_and_preserves_expansion() -> Result<()> {
-        let profile = WidthProfile { columns: 24, ..WidthProfile::default() };
+        let profile = WidthProfile {
+            columns: 24,
+            ..WidthProfile::default()
+        };
         let renderer = TranscriptRenderer::new(&profile)?;
         let source = format!("{}\nsecond\nthird\n", "界".repeat(60));
         let output = super::super::tool::ToolOutputView::new("wrapped".into(), &source)?;
-        let render = |expanded| renderer.tool_preview(
-            BlockId("wrapped:tool".into()), TargetId("wrapped:tool".into()),
-            "command", Some(10), false, "inspect",
-            &output.preview(expanded)?, expanded,
-        );
+        let render = |expanded| {
+            renderer.tool_preview(
+                BlockId("wrapped:tool".into()),
+                TargetId("wrapped:tool".into()),
+                "command",
+                Some(10),
+                false,
+                "inspect",
+                &output.preview(expanded)?,
+                expanded,
+            )
+        };
         let preview = render(false)?;
         let rows = preview.text.wire_rows();
-        assert_eq!(rows.len(), 6, "preview must contain a heading, four output rows, and a hidden-count row");
+        assert_eq!(
+            rows.len(),
+            6,
+            "preview must contain a heading, four output rows, and a hidden-count row"
+        );
         assert_eq!(rows[5], "    …(1 earlier line)");
         assert!(rows.iter().any(|row| row.contains("second")));
         assert!(rows.iter().any(|row| row.contains("third")));
         let expanded = render(true)?;
-        let restored = expanded.text.wire_rows().iter().skip(1)
-            .map(|row| row.strip_prefix("  └ ").or_else(|| row.strip_prefix("    ")).unwrap())
+        let restored = expanded
+            .text
+            .wire_rows()
+            .iter()
+            .skip(1)
+            .map(|row| {
+                row.strip_prefix("  └ ")
+                    .or_else(|| row.strip_prefix("    "))
+                    .unwrap()
+            })
             .collect::<String>();
         assert_eq!(restored, source.replace('\n', ""));
         preview.validate()?;
@@ -995,9 +1465,14 @@ mod test {
     #[test]
     fn multiline_prompt_preserves_source_indentation_without_extra_padding() -> Result<()> {
         let profile = WidthProfile::default();
-        let block = TranscriptRenderer::new(&profile)?
-            .prompt(BlockId("prompt:multiline".into()), "first\n  indented\n\nlast")?;
-        assert_eq!(block.text.wire_rows(), vec!["● first", "  indented", "", "last"]);
+        let block = TranscriptRenderer::new(&profile)?.prompt(
+            BlockId("prompt:multiline".into()),
+            "first\n  indented\n\nlast",
+        )?;
+        assert_eq!(
+            block.text.wire_rows(),
+            vec!["● first", "  indented", "", "last"]
+        );
         block.validate()?;
         Ok(())
     }
@@ -1014,14 +1489,23 @@ mod test {
         )?;
         assert!(rendered.block.metadata.gutter.is_empty());
         assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().indent, 2);
-        let marker = rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap();
+        let marker = rendered
+            .block
+            .metadata
+            .layout
+            .as_ref()
+            .unwrap()
+            .marker
+            .as_ref()
+            .unwrap();
         assert_eq!(marker.text, "●");
         assert_eq!(marker.capture, "ForgeHarnessResponse");
         assert!(rendered.block.metadata.markdown);
         assert_eq!(rendered.block.metadata.target[0].range.start.column, 2);
-        assert_eq!(rendered.block.text.wire_rows(), vec![
-            "A [界 link](https://example.test).", "", "More text wraps."
-        ]);
+        assert_eq!(
+            rendered.block.text.wire_rows(),
+            vec!["A [界 link](https://example.test).", "", "More text wraps."]
+        );
         rendered.block.validate()?;
         Ok(())
     }
@@ -1031,7 +1515,10 @@ mod test {
         let source = "Added [PROJECT.md](/D:/code/test-plan/PROJECT.md) describing the repo layout and [CONTRIBUTING.md](/D:/code/test-plan/CONTRIBUTING.md) with the run command. [web](https://example.test)";
         let expected = "Added PROJECT.md describing the repo layout and CONTRIBUTING.md with the run command. [web](https://example.test)";
         for columns in [60, 113] {
-            let profile = WidthProfile { columns, ..WidthProfile::default() };
+            let profile = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
             let renderer = TranscriptRenderer::new(&profile)?;
             for rendered in [
                 renderer.response(BlockId("response".into()), source)?,
@@ -1039,10 +1526,19 @@ mod test {
             ] {
                 assert_eq!(rendered.block.text.wire_rows(), vec![expected]);
                 assert_eq!(rendered.link.len(), 3);
-                assert_eq!(rendered.link[0].destination, "/D:/code/test-plan/PROJECT.md");
-                assert_eq!(rendered.link[1].destination, "/D:/code/test-plan/CONTRIBUTING.md");
+                assert_eq!(
+                    rendered.link[0].destination,
+                    "/D:/code/test-plan/PROJECT.md"
+                );
+                assert_eq!(
+                    rendered.link[1].destination,
+                    "/D:/code/test-plan/CONTRIBUTING.md"
+                );
                 let target = &rendered.block.metadata.target[1];
-                assert_eq!(&expected[target.range.start.column..target.range.end.column], "CONTRIBUTING.md");
+                assert_eq!(
+                    &expected[target.range.start.column..target.range.end.column],
+                    "CONTRIBUTING.md"
+                );
                 rendered.block.validate()?;
             }
         }
@@ -1076,20 +1572,46 @@ mod test {
             "**Review** [details](https://example.test)\n\nNext paragraph.\r\n\n",
         )?;
         assert!(rendered.block.metadata.markdown);
-        assert_eq!(rendered.block.text.wire_rows(), vec!["**Review** [details](https://example.test)", "", "Next paragraph."]);
-        assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "○");
+        assert_eq!(
+            rendered.block.text.wire_rows(),
+            vec![
+                "**Review** [details](https://example.test)",
+                "",
+                "Next paragraph."
+            ]
+        );
+        assert_eq!(
+            rendered
+                .block
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .text,
+            "○"
+        );
         assert_eq!(rendered.link[0].destination, "https://example.test");
         Ok(())
     }
 }
-    #[test]
-    fn single_large_output_line_has_a_bounded_preview() -> Result<()> {
-        let source = "λ".repeat(1024 * 1024);
-        let rows = tool_output_rows(&WidthProfile::default(),
-            &ToolOutputPreview { row:vec![&source],hidden_rows:0,total_rows:1 },false)?;
-        assert_eq!(rows.len(),5);
-        assert!(rows[4].contains("1 earlier line"));
-        assert!(rows.iter().map(String::len).sum::<usize>() < 1024);
-        assert_eq!(source.len(),2 * 1024 * 1024);
-        Ok(())
-    }
+#[test]
+fn single_large_output_line_has_a_bounded_preview() -> Result<()> {
+    let source = "λ".repeat(1024 * 1024);
+    let rows = tool_output_rows(
+        &WidthProfile::default(),
+        &ToolOutputPreview {
+            row: vec![&source],
+            hidden_rows: 0,
+            total_rows: 1,
+        },
+        false,
+    )?;
+    assert_eq!(rows.len(), 5);
+    assert!(rows[4].contains("1 earlier line"));
+    assert!(rows.iter().map(String::len).sum::<usize>() < 1024);
+    assert_eq!(source.len(), 2 * 1024 * 1024);
+    Ok(())
+}

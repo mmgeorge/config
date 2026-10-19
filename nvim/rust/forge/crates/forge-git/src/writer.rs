@@ -15,7 +15,9 @@ use tokio::sync::oneshot;
 
 use crate::{
     RepositoryPath,
-    command::{CommandLimits, CommandProgressSink, CommandStream, diagnostic_command, progress_command},
+    command::{
+        CommandLimits, CommandProgressSink, CommandStream, diagnostic_command, progress_command,
+    },
     coordinator::{AdmissionGuard, OperationState},
     mutation::{MutationScope, OperationCompletion, OperationId},
     repository::RepositoryState,
@@ -47,7 +49,10 @@ struct WriteGroup {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PatchDirection {
-    Index { before_exists: bool, after_exists: bool },
+    Index {
+        before_exists: bool,
+        after_exists: bool,
+    },
     Stage,
     Unstage,
     Discard,
@@ -126,7 +131,12 @@ pub struct GitWriteIntent {
     repository: Arc<RepositoryState>,
     action: GitWriteAction,
     precondition: Option<WritePrecondition>,
-    expected: Mutex<Option<(crate::snapshot::HeadState, Vec<crate::snapshot::ObservedPath>)>>,
+    expected: Mutex<
+        Option<(
+            crate::snapshot::HeadState,
+            Vec<crate::snapshot::ObservedPath>,
+        )>,
+    >,
     reservation: IntentReservation,
     progress: Option<CommandProgressSink>,
     settlement: Option<SettlementHandler>,
@@ -186,14 +196,23 @@ pub struct GitWriteService {
 
 impl GitWriteService {
     pub async fn reconcile(&self, repository: &Arc<RepositoryState>) -> Result<()> {
-        let Some(worktree) = &repository.identity.worktree else { return Ok(()); };
-        let scope = vec![MutationScope::Index(worktree.clone()), MutationScope::WorktreeFiles(worktree.clone())];
+        let Some(worktree) = &repository.identity.worktree else {
+            return Ok(());
+        };
+        let scope = vec![
+            MutationScope::Index(worktree.clone()),
+            MutationScope::WorktreeFiles(worktree.clone()),
+        ];
         let operation = self.store.writes.quarantined(&scope);
-        if operation.is_empty() { return Ok(()); }
+        if operation.is_empty() {
+            return Ok(());
+        }
         repository.invalidate()?;
         repository.observe(&self.store).await?;
         self.store.writes.reconciled(&operation);
-        for operation in operation { self.acknowledge(operation); }
+        for operation in operation {
+            self.acknowledge(operation);
+        }
         Ok(())
     }
 
@@ -206,16 +225,33 @@ impl GitWriteService {
 
     /// Reserves queue order without disk access. Preparation runs after preceding writes settle.
     /// The caller owns the reservation until submission and may attach displayed source checks.
-    pub fn reserve(&self, repository: Arc<RepositoryState>, action: GitWriteAction) -> Result<GitWriteIntent> {
+    pub fn reserve(
+        &self,
+        repository: Arc<RepositoryState>,
+        action: GitWriteAction,
+    ) -> Result<GitWriteIntent> {
         action.validate()?;
-        let operation = self.store.writes.admit(action.scopes(&repository)?, action.retained_bytes()?)?;
-        self.store.writes.describe(operation, action.trace_kind(), action.paths().len());
+        let operation = self
+            .store
+            .writes
+            .admit(action.scopes(&repository)?, action.retained_bytes()?)?;
+        self.store
+            .writes
+            .describe(operation, action.trace_kind(), action.paths().len());
         Ok(GitWriteIntent {
-            store: Arc::clone(&self.store), repository, action, precondition: None,
+            store: Arc::clone(&self.store),
+            repository,
+            action,
+            precondition: None,
             preparation_timing: BTreeMap::new(),
             expected: Mutex::new(None),
-            reservation: IntentReservation { store: Arc::clone(&self.store), operation, submitted: false },
-            progress: None, settlement: None,
+            reservation: IntentReservation {
+                store: Arc::clone(&self.store),
+                operation,
+                submitted: false,
+            },
+            progress: None,
+            settlement: None,
         })
     }
 
@@ -234,7 +270,9 @@ impl GitWriteService {
             .store
             .writes
             .admit(action.scopes(&repository)?, retained)?;
-        self.store.writes.describe(operation, action.trace_kind(), action.paths().len());
+        self.store
+            .writes
+            .describe(operation, action.trace_kind(), action.paths().len());
         let reservation = IntentReservation {
             store: Arc::clone(&self.store),
             operation,
@@ -264,8 +302,13 @@ impl GitWriteService {
                         );
                         Ok(())
                     };
-                    let precondition =
-                        WritePrecondition::capture(&mut local, &worker, &action, &mut check, &mut timing)?;
+                    let precondition = WritePrecondition::capture(
+                        &mut local,
+                        &worker,
+                        &action,
+                        &mut check,
+                        &mut timing,
+                    )?;
                     timing.insert("capture_total", started.elapsed().as_micros());
                     Ok((action, precondition, timing))
                 },
@@ -418,29 +461,40 @@ impl GitWriteIntent {
         if let Some(precondition) = &self.precondition {
             precondition.validate_observed(head, observed)
         } else {
-            *self.expected.lock().expect("write expected-source lock") = Some((head.clone(), observed.to_vec()));
+            *self.expected.lock().expect("write expected-source lock") =
+                Some((head.clone(), observed.to_vec()));
             Ok(())
         }
     }
 
     /// Replaces an unprepared queued action after exact local replay, retaining its original scopes.
     pub fn replace_action(&mut self, action: GitWriteAction) -> Result<()> {
-        ensure!(self.precondition.is_none(), "prepared write cannot replace its captured action");
+        ensure!(
+            self.precondition.is_none(),
+            "prepared write cannot replace its captured action"
+        );
         action.validate()?;
-        ensure!(action.paths().iter().all(|path| self.action.paths().contains(path)), "replayed write broadened its selected paths");
-        self.store.writes.resize(self.operation(), action.retained_bytes()?)?;
+        ensure!(
+            action
+                .paths()
+                .iter()
+                .all(|path| self.action.paths().contains(path)),
+            "replayed write broadened its selected paths"
+        );
+        self.store
+            .writes
+            .resize(self.operation(), action.retained_bytes()?)?;
         self.action = action;
         Ok(())
     }
 
     fn precondition(&self) -> &WritePrecondition {
-        self.precondition.as_ref().expect("write execution requires prepared sources")
+        self.precondition
+            .as_ref()
+            .expect("write execution requires prepared sources")
     }
 
-    pub fn set_settlement_handler(
-        &mut self,
-        handler: SettlementHandler,
-    ) -> Result<()> {
+    pub fn set_settlement_handler(&mut self, handler: SettlementHandler) -> Result<()> {
         ensure!(
             self.settlement.is_none(),
             "write settlement handler is already attached"
@@ -501,7 +555,11 @@ impl GitWriteAction {
         match self {
             Self::Batch { action } => {
                 let kind = action.first().map(Self::trace_kind).unwrap_or("batch");
-                if action.iter().all(|action| action.trace_kind() == kind) { kind } else { "batch" }
+                if action.iter().all(|action| action.trace_kind() == kind) {
+                    kind
+                } else {
+                    "batch"
+                }
             }
             Self::Stage { .. } => "stage",
             Self::Unstage { .. } => "unstage",
@@ -617,11 +675,7 @@ impl GitWriteAction {
     }
 
     fn validate(&self) -> Result<()> {
-        if let Self::UpdateRepositoryConfig {
-            replacement,
-            ..
-        } = self
-        {
+        if let Self::UpdateRepositoryConfig { replacement, .. } = self {
             std::str::from_utf8(replacement).context("repository config is not UTF-8")?;
             ensure!(!replacement.contains(&0), "repository config contains NUL");
         }
@@ -810,15 +864,31 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     };
     let prepared = (|| -> Result<()> {
         if intent.precondition.is_none() {
-            intent.precondition = Some(WritePrecondition::capture(&mut local, &intent.repository, &intent.action, &mut check, &mut intent.preparation_timing)?);
+            intent.precondition = Some(WritePrecondition::capture(
+                &mut local,
+                &intent.repository,
+                &intent.action,
+                &mut check,
+                &mut intent.preparation_timing,
+            )?);
         }
-        if let Some((head, observed)) = intent.expected.lock().expect("write expected-source lock").as_ref() {
+        if let Some((head, observed)) = intent
+            .expected
+            .lock()
+            .expect("write expected-source lock")
+            .as_ref()
+        {
             intent.precondition().validate_observed(head, observed)?;
         }
-        intent.precondition().validate(&mut local, &intent.repository, &intent.action, &mut check)
+        intent
+            .precondition()
+            .validate(&mut local, &intent.repository, &intent.action, &mut check)
     })();
     if let Err(error) = prepared {
-        intent.store.writes.phase(intent.operation(), "rejected_settlement");
+        intent
+            .store
+            .writes
+            .phase(intent.operation(), "rejected_settlement");
         let mut outcome = intent.failure(
             TargetCompletion::Rejected,
             format!("write precondition rejected: {error:#}"),
@@ -826,12 +896,21 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         if !outcome.affected.is_empty() {
             match settle_paths(&intent.repository, &outcome.affected) {
                 Ok(path) => outcome.settled = Some(path),
-                Err(error) => outcome.settlement_diagnostic = Some(format!("rejected write reconciliation failed: {error:#}")),
+                Err(error) => {
+                    outcome.settlement_diagnostic =
+                        Some(format!("rejected write reconciliation failed: {error:#}"))
+                }
             }
-            if let Err(error) = intent.repository.invalidate() { outcome.settlement_diagnostic = Some(format!("rejected write invalidation failed: {error:#}")); }
+            if let Err(error) = intent.repository.invalidate() {
+                outcome.settlement_diagnostic =
+                    Some(format!("rejected write invalidation failed: {error:#}"));
+            }
         }
-        if !outcome.affected.is_empty() && outcome.settled.is_none() { let _ = guard.finish_quarantined(OperationCompletion::Failed); }
-        else { let _ = guard.finish(OperationCompletion::Failed); }
+        if !outcome.affected.is_empty() && outcome.settled.is_none() {
+            let _ = guard.finish_quarantined(OperationCompletion::Failed);
+        } else {
+            let _ = guard.finish(OperationCompletion::Failed);
+        }
         return outcome;
     }
 
@@ -889,12 +968,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             continue;
         }
         let result = if let Some(bulk_action) = group.bulk_action {
-            run_path_chunk(
-                &intent,
-                bulk_action,
-                &path,
-                &mut check,
-            )
+            run_path_chunk(&intent, bulk_action, &path, &mut check)
         } else if let Some(direction) = group.patch_direction {
             run_patch_group(&intent, direction, &path, &mut check)
         } else {
@@ -929,7 +1003,10 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             }));
     }
 
-    intent.store.writes.phase(intent.operation(), "settling_paths");
+    intent
+        .store
+        .writes
+        .phase(intent.operation(), "settling_paths");
     // Invalidate every possibly changed repository before releasing cooperative writer scopes.
     let invalidated = if intent.action.shared_refs() {
         intent
@@ -951,7 +1028,10 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         }
     }
     if let Some(handler) = &intent.settlement {
-        intent.store.writes.phase(intent.operation(), "settling_consumer");
+        intent
+            .store
+            .writes
+            .phase(intent.operation(), "settling_consumer");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&outcome)));
         let failure = match result {
             Ok(Ok(())) => None,
@@ -979,7 +1059,11 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     } else {
         OperationCompletion::Completed
     };
-    let completion = if !outcome.affected.is_empty() && outcome.settled.is_none() { guard.finish_quarantined(completion) } else { guard.finish(completion) };
+    let completion = if !outcome.affected.is_empty() && outcome.settled.is_none() {
+        guard.finish_quarantined(completion)
+    } else {
+        guard.finish(completion)
+    };
     if let Err(error) = completion {
         outcome.settlement_diagnostic = Some(format!("receipt collection failed: {error:#}"));
     }
@@ -1179,7 +1263,9 @@ fn run_target(
         }
         GitWriteAction::Stage { .. }
         | GitWriteAction::Unstage { .. }
-        | GitWriteAction::Discard { .. } => anyhow::bail!("path mutation requires grouped execution"),
+        | GitWriteAction::Discard { .. } => {
+            anyhow::bail!("path mutation requires grouped execution")
+        }
         GitWriteAction::Patch { .. } => anyhow::bail!("patch mutation requires grouped execution"),
         GitWriteAction::CreateBranch { name } => {
             command.args(["switch", "-c", name]);
@@ -1390,7 +1476,10 @@ fn settle_paths(repository: &RepositoryState, paths: &[RepositoryPath]) -> Resul
         );
         settled.extend(collected.path);
     }
-    Ok(WriteSettlement { head, path: settled })
+    Ok(WriteSettlement {
+        head,
+        path: settled,
+    })
 }
 
 #[cfg(test)]

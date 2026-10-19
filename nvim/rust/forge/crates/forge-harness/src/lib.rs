@@ -1,28 +1,28 @@
-pub mod background;
+pub mod agent;
 /// Typed file attachments captured independently of prompt text.
 pub mod attachment;
-pub(crate) mod process;
-pub mod agent;
 pub mod backend;
+pub mod background;
 pub mod broker;
 pub mod buffer;
 pub mod checkpoint;
 /// Project check configuration, execution, and recorded results.
 pub mod checks;
 pub mod control_tools;
+pub(crate) mod declaration;
 pub mod exchange;
 pub mod goal;
 mod limits;
 pub mod permissions;
 pub mod plan;
+pub(crate) mod process;
 pub mod protocol;
-pub(crate) mod declaration;
 pub mod service;
 pub mod session;
 pub mod settings;
 pub mod skill;
-pub mod task;
 pub mod storage;
+pub mod task;
 pub mod timeline;
 pub mod trace;
 pub mod turn;

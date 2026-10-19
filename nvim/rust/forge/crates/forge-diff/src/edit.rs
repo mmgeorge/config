@@ -49,7 +49,9 @@ impl fmt::Display for EditError {
             Self::UnknownHunk => formatter.write_str("selected edit belongs to another comparison"),
             Self::DifferentSource => formatter.write_str("selected edit source changed externally"),
             Self::Overlap => formatter.write_str("selected edit overlaps a newer local change"),
-            Self::SizeOverflow => formatter.write_str("selected edit size exceeds addressable memory"),
+            Self::SizeOverflow => {
+                formatter.write_str("selected edit size exceeds addressable memory")
+            }
             Self::Allocation(error) => write!(formatter, "allocate selected edit: {error}"),
             Self::Source(error) => error.fmt(formatter),
         }
@@ -71,55 +73,91 @@ impl EditSelection {
             EditDirection::Forward => (&pair.old, &pair.new),
             EditDirection::Reverse => (&pair.new, &pair.old),
         };
-        let replacement: Vec<_> = analysis.hunks().iter()
+        let replacement: Vec<_> = analysis
+            .hunks()
+            .iter()
             .filter(|hunk| selected.contains(&hunk.id))
             .map(|hunk| {
                 let (range, replacement) = match direction {
                     EditDirection::Forward => (hunk.old_bytes.clone(), hunk.new_bytes.clone()),
                     EditDirection::Reverse => (hunk.new_bytes.clone(), hunk.old_bytes.clone()),
                 };
-                ByteReplacement { range, source: source.clone(), replacement }
+                ByteReplacement {
+                    range,
+                    source: source.clone(),
+                    replacement,
+                }
             })
             .collect();
         if replacement.len() != selected.len() {
             return Err(EditError::UnknownHunk);
         }
-        Ok(Self { before: before.clone(), replacement })
+        Ok(Self {
+            before: before.clone(),
+            replacement,
+        })
     }
 
-    pub fn before(&self) -> &SourceVersion { &self.before }
+    pub fn before(&self) -> &SourceVersion {
+        &self.before
+    }
 
-    pub fn is_empty(&self) -> bool { self.replacement.is_empty() }
+    pub fn is_empty(&self) -> bool {
+        self.replacement.is_empty()
+    }
 
     pub fn retained_bytes(&self) -> usize {
         let mut source = HashSet::from([self.before.identity()]);
-        self.before.bytes().len() + self.replacement.iter().map(|replacement| {
-            std::mem::size_of::<ByteReplacement>() + if source.insert(replacement.source.identity()) { replacement.source.bytes().len() } else { 0 }
-        }).sum::<usize>()
+        self.before.bytes().len()
+            + self
+                .replacement
+                .iter()
+                .map(|replacement| {
+                    std::mem::size_of::<ByteReplacement>()
+                        + if source.insert(replacement.source.identity()) {
+                            replacement.source.bytes().len()
+                        } else {
+                            0
+                        }
+                })
+                .sum::<usize>()
     }
 
     /// Compares exact replacements after both selections reach the same source version.
     pub fn same_edit(&self, other: &Self) -> bool {
         self.before.identity() == other.before.identity()
             && self.replacement.len() == other.replacement.len()
-            && self.replacement.iter().zip(&other.replacement).all(|(left, right)| {
-                left.range == right.range
-                    && left.source.bytes()[left.replacement.clone()] == right.source.bytes()[right.replacement.clone()]
-            })
+            && self
+                .replacement
+                .iter()
+                .zip(&other.replacement)
+                .all(|(left, right)| {
+                    left.range == right.range
+                        && left.source.bytes()[left.replacement.clone()]
+                            == right.source.bytes()[right.replacement.clone()]
+                })
     }
 
     /// Applies only the captured replacements, preserving every unselected byte and line ending.
     pub fn apply(&self) -> Result<AppliedEdit, EditError> {
         if self.is_empty() {
-            return Ok(AppliedEdit { selection: self.clone(), after: self.before.clone() });
+            return Ok(AppliedEdit {
+                selection: self.clone(),
+                after: self.before.clone(),
+            });
         }
-        let size = self.replacement.iter().try_fold(self.before.bytes().len(), |size, replacement| {
-            size.checked_sub(replacement.range.len())
-                .and_then(|size| size.checked_add(replacement.replacement.len()))
-                .ok_or(EditError::SizeOverflow)
-        })?;
+        let size =
+            self.replacement
+                .iter()
+                .try_fold(self.before.bytes().len(), |size, replacement| {
+                    size.checked_sub(replacement.range.len())
+                        .and_then(|size| size.checked_add(replacement.replacement.len()))
+                        .ok_or(EditError::SizeOverflow)
+                })?;
         let mut content = Vec::new();
-        content.try_reserve_exact(size).map_err(|error| EditError::Allocation(error.to_string()))?;
+        content
+            .try_reserve_exact(size)
+            .map_err(|error| EditError::Allocation(error.to_string()))?;
         let mut position = 0;
         for replacement in &self.replacement {
             content.extend_from_slice(&self.before.bytes()[position..replacement.range.start]);
@@ -129,7 +167,10 @@ impl EditSelection {
         content.extend_from_slice(&self.before.bytes()[position..]);
         let after = SourceVersion::new(content, self.before.identity().representation)
             .map_err(EditError::Source)?;
-        Ok(AppliedEdit { selection: self.clone(), after })
+        Ok(AppliedEdit {
+            selection: self.clone(),
+            after,
+        })
     }
 
     /// Maps a selection through a known local edit. Identical replacements become no-ops.
@@ -150,7 +191,8 @@ impl EditSelection {
                     duplicate = true;
                     break;
                 }
-                if previous.range.is_empty() && selected.range.is_empty()
+                if previous.range.is_empty()
+                    && selected.range.is_empty()
                     && previous.range.start == selected.range.start
                 {
                     return Err(EditError::Overlap);
@@ -163,53 +205,88 @@ impl EditSelection {
             }
             if !duplicate {
                 let mut selected = selected.clone();
-                selected.range = selected.range.start.checked_add_signed(offset).ok_or(EditError::Overlap)?
-                    ..selected.range.end.checked_add_signed(offset).ok_or(EditError::Overlap)?;
+                selected.range = selected
+                    .range
+                    .start
+                    .checked_add_signed(offset)
+                    .ok_or(EditError::Overlap)?
+                    ..selected
+                        .range
+                        .end
+                        .checked_add_signed(offset)
+                        .ok_or(EditError::Overlap)?;
                 replacement.push(selected);
             }
         }
-        Ok(Self { before: applied.after.clone(), replacement })
+        Ok(Self {
+            before: applied.after.clone(),
+            replacement,
+        })
     }
 }
 
 impl AppliedEdit {
-    pub fn after(&self) -> &SourceVersion { &self.after }
+    pub fn after(&self) -> &SourceVersion {
+        &self.after
+    }
 
-    pub fn retained_bytes(&self) -> usize { self.selection.retained_bytes() + self.after.bytes().len() }
+    pub fn retained_bytes(&self) -> usize {
+        self.selection.retained_bytes() + self.after.bytes().len()
+    }
 
     /// Reverses this local transition using its original bytes, without recomputing a diff.
     pub fn inverse(&self) -> EditSelection {
         let mut offset: isize = 0;
-        let replacement = self.selection.replacement.iter().map(|replacement| {
-            let start = replacement.range.start.checked_add_signed(offset).expect("validated edit offset");
-            offset += replacement.replacement.len() as isize - replacement.range.len() as isize;
-            ByteReplacement {
-                range: start..start + replacement.replacement.len(),
-                source: self.selection.before.clone(),
-                replacement: replacement.range.clone(),
-            }
-        }).collect();
-        EditSelection { before: self.after.clone(), replacement }
+        let replacement = self
+            .selection
+            .replacement
+            .iter()
+            .map(|replacement| {
+                let start = replacement
+                    .range
+                    .start
+                    .checked_add_signed(offset)
+                    .expect("validated edit offset");
+                offset += replacement.replacement.len() as isize - replacement.range.len() as isize;
+                ByteReplacement {
+                    range: start..start + replacement.replacement.len(),
+                    source: self.selection.before.clone(),
+                    replacement: replacement.range.clone(),
+                }
+            })
+            .collect();
+        EditSelection {
+            before: self.after.clone(),
+            replacement,
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{raw::compute_hunks, source::{Representation, SourcePair}};
+    use crate::{
+        raw::compute_hunks,
+        source::{Representation, SourcePair},
+    };
 
     fn comparison(before: &str, after: &str) -> RawDiff {
         compute_hunks(SourcePair {
-            old: SourceVersion::new(before.as_bytes().to_vec(), Representation::GitCanonical).unwrap(),
-            new: SourceVersion::new(after.as_bytes().to_vec(), Representation::GitCanonical).unwrap(),
-        }).unwrap()
+            old: SourceVersion::new(before.as_bytes().to_vec(), Representation::GitCanonical)
+                .unwrap(),
+            new: SourceVersion::new(after.as_bytes().to_vec(), Representation::GitCanonical)
+                .unwrap(),
+        })
+        .unwrap()
     }
 
     #[test]
     fn every_subset_preserves_unselected_bytes_and_inverts_exactly() {
         for terminator in ["\n", "\r\n"] {
             for final_newline in [false, true] {
-                let before = (0..12).map(|line| format!("line {line}")).collect::<Vec<_>>();
+                let before = (0..12)
+                    .map(|line| format!("line {line}"))
+                    .collect::<Vec<_>>();
                 let mut after = before.clone();
                 after[1] = "replacement α".into();
                 after[5] = "two\ninserted".replace('\n', terminator);
@@ -220,15 +297,32 @@ mod tests {
                 let analysis = comparison(&before, &after);
                 assert_eq!(analysis.hunks().len(), 3);
                 for mask in 0..8 {
-                    let selected: Vec<_> = analysis.hunks().iter().enumerate()
+                    let selected: Vec<_> = analysis
+                        .hunks()
+                        .iter()
+                        .enumerate()
                         .filter(|(index, _)| mask & (1 << index) != 0)
-                        .map(|(_, hunk)| hunk.id).collect();
-                    let captured = EditSelection::capture(&analysis, &selected, EditDirection::Forward).unwrap();
+                        .map(|(_, hunk)| hunk.id)
+                        .collect();
+                    let captured =
+                        EditSelection::capture(&analysis, &selected, EditDirection::Forward)
+                            .unwrap();
                     let applied = captured.apply().unwrap();
-                    assert_eq!(applied.inverse().apply().unwrap().after().bytes(), before.as_bytes());
+                    assert_eq!(
+                        applied.inverse().apply().unwrap().after().bytes(),
+                        before.as_bytes()
+                    );
                     let mut reference = before.as_bytes().to_vec();
-                    for hunk in analysis.hunks().iter().rev().filter(|hunk| selected.contains(&hunk.id)) {
-                        reference.splice(hunk.old_bytes.clone(), after.as_bytes()[hunk.new_bytes.clone()].iter().copied());
+                    for hunk in analysis
+                        .hunks()
+                        .iter()
+                        .rev()
+                        .filter(|hunk| selected.contains(&hunk.id))
+                    {
+                        reference.splice(
+                            hunk.old_bytes.clone(),
+                            after.as_bytes()[hunk.new_bytes.clone()].iter().copied(),
+                        );
                     }
                     assert_eq!(applied.after().bytes(), reference);
                 }
@@ -240,13 +334,29 @@ mod tests {
     fn pending_edits_survive_insertions_and_rollback_without_new_hunk_ids() {
         let analysis = comparison("a\nb\nc\nd\ne\nf\n", "a\ninsert\nb\nc\nd\nchanged\nf\n");
         assert_eq!(analysis.hunks().len(), 2);
-        let first = EditSelection::capture(&analysis, &[analysis.hunks()[0].id], EditDirection::Forward).unwrap();
-        let second = EditSelection::capture(&analysis, &[analysis.hunks()[1].id], EditDirection::Forward).unwrap();
+        let first =
+            EditSelection::capture(&analysis, &[analysis.hunks()[0].id], EditDirection::Forward)
+                .unwrap();
+        let second =
+            EditSelection::capture(&analysis, &[analysis.hunks()[1].id], EditDirection::Forward)
+                .unwrap();
         let applied = first.apply().unwrap();
         let rebased = second.rebase_over(&applied).unwrap();
-        assert_eq!(rebased.apply().unwrap().after().bytes(), analysis.source().new.bytes());
+        assert_eq!(
+            rebased.apply().unwrap().after().bytes(),
+            analysis.source().new.bytes()
+        );
         let reverted = applied.inverse().apply().unwrap();
-        assert_eq!(rebased.rebase_over(&reverted).unwrap().apply().unwrap().after().bytes(), second.apply().unwrap().after().bytes());
+        assert_eq!(
+            rebased
+                .rebase_over(&reverted)
+                .unwrap()
+                .apply()
+                .unwrap()
+                .after()
+                .bytes(),
+            second.apply().unwrap().after().bytes()
+        );
         assert!(first.rebase_over(&applied).unwrap().is_empty());
     }
 
@@ -254,10 +364,19 @@ mod tests {
     fn foreign_and_conflicting_edits_cannot_change_selection() {
         let first = comparison("same\n", "first\n");
         let second = comparison("same\n", "second\n");
-        assert!(matches!(EditSelection::capture(&first, &[second.hunks()[0].id], EditDirection::Forward), Err(EditError::UnknownHunk)));
-        let first = EditSelection::capture(&first, &[first.hunks()[0].id], EditDirection::Forward).unwrap();
-        let second = EditSelection::capture(&second, &[second.hunks()[0].id], EditDirection::Forward).unwrap();
-        assert!(matches!(second.rebase_over(&first.apply().unwrap()), Err(EditError::Overlap)));
+        assert!(matches!(
+            EditSelection::capture(&first, &[second.hunks()[0].id], EditDirection::Forward),
+            Err(EditError::UnknownHunk)
+        ));
+        let first =
+            EditSelection::capture(&first, &[first.hunks()[0].id], EditDirection::Forward).unwrap();
+        let second =
+            EditSelection::capture(&second, &[second.hunks()[0].id], EditDirection::Forward)
+                .unwrap();
+        assert!(matches!(
+            second.rebase_over(&first.apply().unwrap()),
+            Err(EditError::Overlap)
+        ));
     }
 
     #[test]
@@ -265,8 +384,19 @@ mod tests {
         for (before, after) in [("", "new"), ("old", ""), ("old\r\n", "new")] {
             let analysis = comparison(before, after);
             let selected: Vec<_> = analysis.hunks().iter().map(|hunk| hunk.id).collect();
-            for (direction, expected) in [(EditDirection::Forward, after), (EditDirection::Reverse, before)] {
-                assert_eq!(EditSelection::capture(&analysis, &selected, direction).unwrap().apply().unwrap().after().text(), expected);
+            for (direction, expected) in [
+                (EditDirection::Forward, after),
+                (EditDirection::Reverse, before),
+            ] {
+                assert_eq!(
+                    EditSelection::capture(&analysis, &selected, direction)
+                        .unwrap()
+                        .apply()
+                        .unwrap()
+                        .after()
+                        .text(),
+                    expected
+                );
             }
         }
     }

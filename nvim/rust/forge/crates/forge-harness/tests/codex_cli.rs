@@ -207,7 +207,11 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     );
     assert!(
         answered.event.iter().any(|event| event.kind == "usage"
-            && event.data.pointer("/usage/output").and_then(serde_json::Value::as_u64).is_some_and(|output| output > 0)),
+            && event
+                .data
+                .pointer("/usage/output")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|output| output > 0)),
         "Codex should report final turn token usage"
     );
     let model_list = backend
@@ -456,7 +460,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
         backend_launch_by_provider: Default::default(),
-            config_dir: None,
+        config_dir: None,
         data_root: data_root.path().to_string_lossy().into_owned(),
         permission_file: None,
         workspace: repository.path().to_string_lossy().into_owned(),

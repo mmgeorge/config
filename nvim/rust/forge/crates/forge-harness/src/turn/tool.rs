@@ -146,7 +146,9 @@ impl ToolStore {
         }
         if activity.output_delta {
             let mut start = previous_bytes.saturating_sub(16);
-            while !tool.output.is_char_boundary(start) { start += 1; }
+            while !tool.output.is_char_boundary(start) {
+                start += 1;
+            }
             tool.failed = tool.failed || tool_failed(&tool.status, &tool.output[start..]);
         } else {
             tool.failed = tool_failed(&tool.status, &tool.output);
@@ -160,11 +162,25 @@ impl ToolStore {
         self.item.get(id)
     }
 
-    pub(crate) fn timing(&mut self, id: &str, started: Option<i64>, completed: Option<i64>, duration: Option<i64>) {
-        let Some(tool) = self.item.get_mut(id) else { return; };
-        if let Some(started) = started { tool.started_at_ms = Some(started); }
-        if let Some(completed) = completed { tool.completed_at_ms = Some(completed); }
-        if tool.state() != ToolState::Running && let Some(duration) = duration.filter(|duration| *duration >= 0) {
+    pub(crate) fn timing(
+        &mut self,
+        id: &str,
+        started: Option<i64>,
+        completed: Option<i64>,
+        duration: Option<i64>,
+    ) {
+        let Some(tool) = self.item.get_mut(id) else {
+            return;
+        };
+        if let Some(started) = started {
+            tool.started_at_ms = Some(started);
+        }
+        if let Some(completed) = completed {
+            tool.completed_at_ms = Some(completed);
+        }
+        if tool.state() != ToolState::Running
+            && let Some(duration) = duration.filter(|duration| *duration >= 0)
+        {
             if let Some(completed) = tool.completed_at_ms {
                 tool.started_at_ms = Some(completed.saturating_sub(duration));
             }

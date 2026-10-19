@@ -3,8 +3,8 @@ use std::{path::PathBuf, process::Output};
 use serde::Deserialize;
 
 use super::{
-    GhClient, GraphFailure, append_diagnostic, append_graph_failures, classify_failure,
-    diagnostic, remote_result,
+    GhClient, GraphFailure, append_diagnostic, append_graph_failures, classify_failure, diagnostic,
+    remote_result,
 };
 use crate::pull_request::{
     PullRequestMutation, PullRequestMutationOutcome, PullRequestState, PullRequestTarget,

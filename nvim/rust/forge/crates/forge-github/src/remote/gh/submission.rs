@@ -34,10 +34,7 @@ impl GhDirectory {
         pending_review_id: Option<u64>,
         mut expected: Vec<PendingReviewExpected>,
     ) -> Result<ReviewSubmissionContext, RemoteFailure> {
-        if number == 0
-            || number > i32::MAX as u64
-            || pending_review_id == Some(0)
-        {
+        if number == 0 || number > i32::MAX as u64 || pending_review_id == Some(0) {
             return Err(invalid("invalid review submission capture"));
         }
         expected.sort_by_key(|member| member.id);
@@ -184,7 +181,9 @@ impl GhClient {
                 }
                 return Ok(result);
             }
-            page = page.checked_add(1).ok_or_else(|| invalid("pending review page number overflow"))?;
+            page = page
+                .checked_add(1)
+                .ok_or_else(|| invalid("pending review page number overflow"))?;
         }
     }
 }

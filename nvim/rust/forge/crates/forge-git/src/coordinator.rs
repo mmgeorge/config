@@ -73,21 +73,28 @@ struct CoordinatorState {
 
 impl CoordinatorState {
     fn record(&mut self, id: OperationId, phase: &'static str, blocker: Option<OperationId>) {
-        let Some(operation) = self.operations.get(&id) else { return };
+        let Some(operation) = self.operations.get(&id) else {
+            return;
+        };
         let now = Instant::now();
         let blocked_by = blocker.and_then(|blocker| self.operations.get(&blocker));
         self.trace_sequence = self.trace_sequence.saturating_add(1);
         let event = MutationTrace {
             sequence: self.trace_sequence,
-            operation_id: id.value(), operation: operation.kind, phase,
+            operation_id: id.value(),
+            operation: operation.kind,
+            phase,
             elapsed_us: now.duration_since(operation.admitted).as_micros() as u64,
             phase_us: now.duration_since(operation.phase_started).as_micros() as u64,
-            file_count: operation.file_count, command_count: operation.command_count,
+            file_count: operation.file_count,
+            command_count: operation.command_count,
             blocker_id: blocker.map(OperationId::value),
             blocker_operation: blocked_by.map(|previous| previous.kind),
             blocker_phase: blocked_by.map(|previous| previous.phase),
         };
-        if self.trace.len() == TRACE_CAPACITY { self.trace.pop_front(); }
+        if self.trace.len() == TRACE_CAPACITY {
+            self.trace.pop_front();
+        }
         self.trace.push_back(event);
         if blocker.is_none() {
             let operation = self.operations.get_mut(&id).expect("recorded operation");
@@ -139,21 +146,27 @@ impl MutationCoordinator {
     /// Reserves queue, receipt, and declared retained input capacity before preparation allocates.
     /// Callers must include retained patch, path, and precondition inputs in the declared byte bound.
     pub fn admit(&self, scopes: Vec<MutationScope>, input_bytes: usize) -> Result<OperationId> {
-        ensure!(
-            !scopes.is_empty(),
-            "mutation requires at least one scope"
-        );
+        ensure!(!scopes.is_empty(), "mutation requires at least one scope");
         for (index, scope) in scopes.iter().enumerate() {
             ensure!(!scopes[..index].contains(scope), "duplicate mutation scope");
         }
         let mut state = self.state.lock().expect("mutation coordinator lock");
         ensure!(!state.closed, "mutation admission is closed");
-        ensure!(!state.operations.values().any(|previous| previous.quarantined && previous.scopes.iter().any(|scope| scopes.contains(scope))), "repository writes require read-only reconciliation");
+        ensure!(
+            !state
+                .operations
+                .values()
+                .any(|previous| previous.quarantined
+                    && previous.scopes.iter().any(|scope| scopes.contains(scope))),
+            "repository writes require read-only reconciliation"
+        );
         ensure!(
             state.operations.len() < self.capacity,
             "mutation admission is full"
         );
-        let retained = state.input_bytes.checked_add(input_bytes)
+        let retained = state
+            .input_bytes
+            .checked_add(input_bytes)
             .context("mutation retained input accounting overflow")?;
         let id = OperationId::from_value(state.next_id)?;
         state.next_id = state
@@ -193,12 +206,21 @@ impl MutationCoordinator {
 
     /// Records a lifecycle boundary without changing admission or queue ownership.
     pub fn phase(&self, id: OperationId, phase: &'static str) {
-        self.state.lock().expect("mutation coordinator lock").record(id, phase, None);
+        self.state
+            .lock()
+            .expect("mutation coordinator lock")
+            .record(id, phase, None);
     }
 
     /// Counts a command invocation independently of the number of selected files.
     pub fn command_started(&self, id: OperationId) {
-        if let Some(operation) = self.state.lock().expect("mutation coordinator lock").operations.get_mut(&id) {
+        if let Some(operation) = self
+            .state
+            .lock()
+            .expect("mutation coordinator lock")
+            .operations
+            .get_mut(&id)
+        {
             operation.command_count += 1;
         }
     }
@@ -208,12 +230,25 @@ impl MutationCoordinator {
         let state = self.state.lock().expect("mutation coordinator lock");
         let initial = after.is_none();
         let after = after.unwrap_or_else(|| state.trace_sequence.saturating_sub(TRACE_PAGE as u64));
-        let first = state.trace.front().map_or(state.trace_sequence + 1, |event| event.sequence);
-        let events: Vec<_> = state.trace.iter().filter(|event| event.sequence > after)
-            .take(TRACE_PAGE).cloned().collect();
+        let first = state
+            .trace
+            .front()
+            .map_or(state.trace_sequence + 1, |event| event.sequence);
+        let events: Vec<_> = state
+            .trace
+            .iter()
+            .filter(|event| event.sequence > after)
+            .take(TRACE_PAGE)
+            .cloned()
+            .collect();
         MutationTracePage {
             sequence: events.last().map_or(after, |event| event.sequence),
-            dropped: if initial { 0 } else { first.saturating_sub(after.saturating_add(1)) }, events,
+            dropped: if initial {
+                0
+            } else {
+                first.saturating_sub(after.saturating_add(1))
+            },
+            events,
         }
     }
 
@@ -227,11 +262,23 @@ impl MutationCoordinator {
 
     pub fn resize(&self, id: OperationId, input_bytes: usize) -> Result<()> {
         let mut state = self.state.lock().expect("mutation coordinator lock");
-        let operation = state.operations.get(&id).context("unknown queued mutation")?;
-        ensure!(operation.state == OperationState::Queued, "running mutation cannot change its input reservation");
+        let operation = state
+            .operations
+            .get(&id)
+            .context("unknown queued mutation")?;
+        ensure!(
+            operation.state == OperationState::Queued,
+            "running mutation cannot change its input reservation"
+        );
         let retained = state.input_bytes - operation.input_bytes;
-        let total = retained.checked_add(input_bytes).context("mutation input accounting overflow")?;
-        state.operations.get_mut(&id).expect("validated mutation").input_bytes = input_bytes;
+        let total = retained
+            .checked_add(input_bytes)
+            .context("mutation input accounting overflow")?;
+        state
+            .operations
+            .get_mut(&id)
+            .expect("validated mutation")
+            .input_bytes = input_bytes;
         state.input_bytes = total;
         Ok(())
     }
@@ -243,12 +290,33 @@ impl MutationCoordinator {
         loop {
             let blocked = {
                 let mut state = self.state.lock().expect("mutation coordinator lock");
-                let operation = state.operations.get(&id).context("unknown queued mutation")?;
-                ensure!(operation.state == OperationState::Queued, "mutation is no longer queued");
-                let earlier: Vec<_> = state.operations.range(..id).filter(|(_, previous)| previous.scopes.iter().any(|scope| operation.scopes.contains(scope))).collect();
-                ensure!(!earlier.iter().any(|(_, previous)| previous.quarantined), "repository writes require read-only reconciliation");
-                let blockers: Vec<_> = earlier.iter().filter(|(_, previous)| !matches!(previous.state, OperationState::Finished(_)))
-                    .map(|(id, _)| **id).collect();
+                let operation = state
+                    .operations
+                    .get(&id)
+                    .context("unknown queued mutation")?;
+                ensure!(
+                    operation.state == OperationState::Queued,
+                    "mutation is no longer queued"
+                );
+                let earlier: Vec<_> = state
+                    .operations
+                    .range(..id)
+                    .filter(|(_, previous)| {
+                        previous
+                            .scopes
+                            .iter()
+                            .any(|scope| operation.scopes.contains(scope))
+                    })
+                    .collect();
+                ensure!(
+                    !earlier.iter().any(|(_, previous)| previous.quarantined),
+                    "repository writes require read-only reconciliation"
+                );
+                let blockers: Vec<_> = earlier
+                    .iter()
+                    .filter(|(_, previous)| !matches!(previous.state, OperationState::Finished(_)))
+                    .map(|(id, _)| **id)
+                    .collect();
                 for blocker in &blockers {
                     if !reported.contains(blocker) {
                         state.record(id, "blocked", Some(*blocker));
@@ -257,8 +325,13 @@ impl MutationCoordinator {
                 }
                 !blockers.is_empty()
             };
-            if !blocked { return Ok(()); }
-            changed.changed().await.context("mutation coordinator closed during preparation")?;
+            if !blocked {
+                return Ok(());
+            }
+            changed
+                .changed()
+                .await
+                .context("mutation coordinator closed during preparation")?;
         }
     }
 
@@ -316,17 +389,25 @@ impl MutationCoordinator {
             operation.waiting == waiting,
             "mutation has another queue owner"
         );
-        let blocker = state.operations.range(..id).find(|(_, previous)| {
-            (previous.quarantined || !matches!(previous.state, OperationState::Finished(_)))
-                && previous
-                    .scopes
-                    .iter()
-                    .any(|scope| operation.scopes.contains(scope))
-        }).map(|(id, _)| *id);
+        let blocker = state
+            .operations
+            .range(..id)
+            .find(|(_, previous)| {
+                (previous.quarantined || !matches!(previous.state, OperationState::Finished(_)))
+                    && previous
+                        .scopes
+                        .iter()
+                        .any(|scope| operation.scopes.contains(scope))
+            })
+            .map(|(id, _)| *id);
         if let Some(blocker) = blocker {
             if operation.blocker != Some(blocker) {
                 state.record(id, "blocked", Some(blocker));
-                state.operations.get_mut(&id).expect("known mutation").blocker = Some(blocker);
+                state
+                    .operations
+                    .get_mut(&id)
+                    .expect("known mutation")
+                    .blocker = Some(blocker);
             }
             return Ok(None);
         }
@@ -365,7 +446,9 @@ impl MutationCoordinator {
     /// Removes only terminal receipts, allowing callers to acknowledge durable adoption explicitly.
     pub fn take_receipt(&self, id: OperationId) -> Option<OperationCompletion> {
         let mut state = self.state.lock().expect("mutation coordinator lock");
-        if state.operations.get(&id)?.quarantined { return None; }
+        if state.operations.get(&id)?.quarantined {
+            return None;
+        }
         let OperationState::Finished(completion) = state.operations.get(&id)?.state else {
             return None;
         };
@@ -379,14 +462,25 @@ impl MutationCoordinator {
     }
 
     pub fn quarantined(&self, scopes: &[MutationScope]) -> Vec<OperationId> {
-        self.state.lock().expect("mutation coordinator lock").operations.iter()
-            .filter(|(_, operation)| operation.quarantined && operation.scopes.iter().any(|scope| scopes.contains(scope)))
-            .map(|(id, _)| *id).collect()
+        self.state
+            .lock()
+            .expect("mutation coordinator lock")
+            .operations
+            .iter()
+            .filter(|(_, operation)| {
+                operation.quarantined && operation.scopes.iter().any(|scope| scopes.contains(scope))
+            })
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     pub fn reconciled(&self, operation: &[OperationId]) {
         let mut state = self.state.lock().expect("mutation coordinator lock");
-        for id in operation { if let Some(operation) = state.operations.get_mut(id) { operation.quarantined = false; } }
+        for id in operation {
+            if let Some(operation) = state.operations.get_mut(id) {
+                operation.quarantined = false;
+            }
+        }
         self.changed.send_replace(());
     }
 
@@ -411,7 +505,10 @@ impl MutationCoordinator {
 impl AdmissionGuard {
     pub fn finish_quarantined(mut self, completion: OperationCompletion) -> Result<()> {
         let mut state = self.state.lock().expect("mutation coordinator lock");
-        let operation = state.operations.get_mut(&self.id).context("unknown running mutation")?;
+        let operation = state
+            .operations
+            .get_mut(&self.id)
+            .context("unknown running mutation")?;
         operation.state = OperationState::Finished(completion);
         operation.quarantined = true;
         state.record(self.id, "quarantined", None);
@@ -457,12 +554,16 @@ impl AdmissionGuard {
             .get_mut(&self.id)
             .context("unknown running mutation")?
             .state = OperationState::Finished(completion);
-        state.record(self.id, match completion {
-            OperationCompletion::Completed => "completed",
-            OperationCompletion::Failed => "failed",
-            OperationCompletion::CancelledBeforeStart => "cancelled",
-            OperationCompletion::Uncertain => "uncertain",
-        }, None);
+        state.record(
+            self.id,
+            match completion {
+                OperationCompletion::Completed => "completed",
+                OperationCompletion::Failed => "failed",
+                OperationCompletion::CancelledBeforeStart => "cancelled",
+                OperationCompletion::Uncertain => "uncertain",
+            },
+            None,
+        );
         self.finished = true;
         self.changed.send_replace(());
         Ok(())

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use forge_diff::cache::{AnalysisBytes, AnalysisCache, AnalysisKey, CacheLimits};
-use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState, RowKind};
 use forge_diff::display::DisplayHunk;
+use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayRow, DisplayState, RowKind};
 use forge_diff::source::{Representation, SourceCoordinate, SourcePair, SourceSide, SourceVersion};
 use forge_diff::syntax::{HunkContext, SyntaxPoint, SyntaxRange};
 
@@ -38,9 +38,13 @@ impl FileDiff {
             old: SourceVersion::new(old.as_bytes().to_vec(), Representation::DisplayOnly)?,
             new: SourceVersion::new(new.as_bytes().to_vec(), Representation::DisplayOnly)?,
         };
-        let alignment = super::review_alignment::ReviewAlignment::new(path, destination, before, after)?;
-        let diff = if alignment.anchors.is_empty() { forge_diff::raw::compute_hunks(source)? }
-            else { forge_diff::raw::compute_anchored_hunks(source, &alignment.anchors)? };
+        let alignment =
+            super::review_alignment::ReviewAlignment::new(path, destination, before, after)?;
+        let diff = if alignment.anchors.is_empty() {
+            forge_diff::raw::compute_hunks(source)?
+        } else {
+            forge_diff::raw::compute_anchored_hunks(source, &alignment.anchors)?
+        };
         let mut result = Self {
             old_path: before.map(|_| path.into()),
             new_path: after.map(|_| destination.into()),
@@ -275,10 +279,23 @@ mod tests {
     #[test]
     fn inserted_declarations_do_not_separate_existing_callable_versions() {
         use super::super::calls::{CallKind, CallSite, FunctionBody};
-        let calls = |owner: &str, target: &str| FunctionBody { owner: owner.into(), behavior: None, evidence: None,
-            call: Some(vec![CallSite { name: target.into(), kind: CallKind::Call, source: None, unresolved: false }]) };
-        let before = super::super::calls::present("main.rs", "/// Starts the application.\nfn main();\nfn setup();\n",
-            &[calls("main", "setup")]).unwrap();
+        let calls = |owner: &str, target: &str| FunctionBody {
+            owner: owner.into(),
+            behavior: None,
+            evidence: None,
+            call: Some(vec![CallSite {
+                name: target.into(),
+                kind: CallKind::Call,
+                source: None,
+                unresolved: false,
+            }]),
+        };
+        let before = super::super::calls::present(
+            "main.rs",
+            "/// Starts the application.\nfn main();\nfn setup();\n",
+            &[calls("main", "setup")],
+        )
+        .unwrap();
         let mut source = String::new();
         let mut bodies = Vec::new();
         for index in 0..40 {
@@ -289,18 +306,34 @@ mod tests {
         bodies.push(calls("main", "system_0"));
         let after = super::super::calls::present("main.rs", &source, &bodies).unwrap();
         let diff = FileDiff::new("main.rs", "main.rs", Some(&before), Some(&after), &[]).unwrap();
-        let rows = diff.hunk.iter().flat_map(|hunk| &hunk.row).collect::<Vec<_>>();
-        let main = rows.iter().filter(|row| row.text.starts_with("fn main")).collect::<Vec<_>>();
+        let rows = diff
+            .hunk
+            .iter()
+            .flat_map(|hunk| &hunk.row)
+            .collect::<Vec<_>>();
+        let main = rows
+            .iter()
+            .filter(|row| row.text.starts_with("fn main"))
+            .collect::<Vec<_>>();
         assert_eq!(main.len(), 1, "main must remain one matched declaration");
         assert!(main[0].old.is_some() && main[0].new.is_some());
         assert!(diff.alignment.modified(main[0]));
-        assert!(rows.iter().filter(|row| row.text.starts_with("fn system_")).all(|row|
-            row.kind == RowKind::Added && row.old.is_none() && !diff.alignment.modified(row)));
+        assert!(
+            rows.iter()
+                .filter(|row| row.text.starts_with("fn system_"))
+                .all(|row| row.kind == RowKind::Added
+                    && row.old.is_none()
+                    && !diff.alignment.modified(row))
+        );
         let first = before.declaration.text.lines().collect::<Vec<_>>();
         let second = after.declaration.text.lines().collect::<Vec<_>>();
         for row in rows {
-            if let Some(old) = row.old { assert_eq!(row.text, first[old.line]); }
-            if let Some(new) = row.new { assert_eq!(row.text, second[new.line]); }
+            if let Some(old) = row.old {
+                assert_eq!(row.text, first[old.line]);
+            }
+            if let Some(new) = row.new {
+                assert_eq!(row.text, second[new.line]);
+            }
         }
     }
 

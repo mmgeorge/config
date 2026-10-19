@@ -89,7 +89,8 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 impl MessageSender {
     /// Transfers a session event atomically through bounded frames without discarding its payload.
     pub async fn send_event(&self, event: SessionEvent) -> io::Result<()> {
-        crate::contract::validate("session", &event.event, &event.payload).map_err(io::Error::other)?;
+        crate::contract::validate("session", &event.event, &event.payload)
+            .map_err(io::Error::other)?;
         let message = Message::Event(event.clone());
         if encode(&message, MAX_FRAME_BYTES).is_ok() {
             return self.send_wait(message).await;
@@ -210,7 +211,7 @@ impl MessageSender {
         loop {
             match self.try_admit(&message, true, false) {
                 Ok(()) => return Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {},
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
                 Err(error) => return Err(error),
             }
             tokio::select! {
@@ -303,8 +304,13 @@ impl MessageSender {
             budget.bytes -= limit - frame.bytes.len();
             frame.reservation = frame.bytes.len();
         }
-        let sender = if control { &self.control_sender } else { &self.sender };
-        sender.try_send(frame)
+        let sender = if control {
+            &self.control_sender
+        } else {
+            &self.sender
+        };
+        sender
+            .try_send(frame)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
     }
 }
@@ -319,7 +325,9 @@ impl MessageReceiver {
 
     pub fn try_recv(&mut self) -> io::Result<EncodedFrame> {
         self.check()?;
-        if let Ok(frame) = self.control_receiver.try_recv() { return Ok(frame); }
+        if let Ok(frame) = self.control_receiver.try_recv() {
+            return Ok(frame);
+        }
         self.receiver.try_recv().map_err(|error| {
             let kind = match error {
                 mpsc::error::TryRecvError::Empty => io::ErrorKind::WouldBlock,
@@ -333,7 +341,9 @@ impl MessageReceiver {
         if let Some(failure) = self.failure.borrow().clone() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, failure));
         }
-        if let Ok(frame) = self.control_receiver.try_recv() { return Ok(Some(frame)); }
+        if let Ok(frame) = self.control_receiver.try_recv() {
+            return Ok(Some(frame));
+        }
         tokio::select! {
             biased;
             frame = self.control_receiver.recv() => match frame {

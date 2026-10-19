@@ -64,8 +64,7 @@ impl RepositoryState {
         let result = store
             .read(
                 Arc::clone(self),
-                size_of::<RevisionRequest>()
-                    + size_of::<Arc<Self>>(),
+                size_of::<RevisionRequest>() + size_of::<Arc<Self>>(),
                 move |local, cancellation| {
                     let started = Instant::now();
                     let mut check = || {
@@ -234,10 +233,7 @@ fn abbreviated_name(name: &[u8]) -> Vec<u8> {
     name.to_vec()
 }
 
-fn build_candidates(
-    bytes: &[u8],
-    hash: gix::hash::Kind,
-) -> Result<CandidateValues> {
+fn build_candidates(bytes: &[u8], hash: gix::hash::Kind) -> Result<CandidateValues> {
     ensure!(
         bytes.is_empty() || bytes.ends_with(b"\n"),
         "revision enumeration is truncated"
@@ -322,8 +318,7 @@ mod tests {
             record(b"refs/remotes/origin/\xff", b"origin/\xff"),
         ]
         .concat();
-        let complete =
-            build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
+        let complete = build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
         assert_eq!(
             complete.values,
             [b"b".to_vec(), b"heads/a".to_vec(), b"origin/\xff".to_vec()]
@@ -334,8 +329,12 @@ mod tests {
                 + complete.values.iter().map(Vec::capacity).sum::<usize>()
         );
         let bytes = (0..20_001)
-            .map(|index| record(format!("refs/heads/branch-{index:05}").as_bytes(),
-                format!("branch-{index:05}").as_bytes()))
+            .map(|index| {
+                record(
+                    format!("refs/heads/branch-{index:05}").as_bytes(),
+                    format!("branch-{index:05}").as_bytes(),
+                )
+            })
             .flatten()
             .collect::<Vec<_>>();
         let complete = build_candidates(&bytes, gix::hash::Kind::Sha1).unwrap();
@@ -352,38 +351,27 @@ mod tests {
             [record(b"refs/heads/b", b"b"), record(b"refs/heads/a", b"a")].concat(),
             [record(b"refs/heads/a", b"a"), record(b"refs/heads/b", b"a")].concat(),
         ] {
-            assert!(
-                build_candidates(&bytes, gix::hash::Kind::Sha1)
-                    .is_err()
-            );
+            assert!(build_candidates(&bytes, gix::hash::Kind::Sha1).is_err());
         }
         assert!(
-            build_candidates(
-                &record(b"refs/heads/a", b"a"),
-                gix::hash::Kind::Sha256,
-            )
-            .is_err()
+            build_candidates(&record(b"refs/heads/a", b"a"), gix::hash::Kind::Sha256,).is_err()
         );
     }
 
     #[test]
     fn ref_changes_and_cancellation_between_enumerations_reject_collection() {
         let mut enumeration = 0;
-        let changed = collect_candidates(
-            gix::hash::Kind::Sha1,
-            &mut || Ok(()),
-            |_| {
-                enumeration += 1;
-                Ok(record(
-                    if enumeration == 1 {
-                        b"refs/heads/a"
-                    } else {
-                        b"refs/heads/b"
-                    },
-                    if enumeration == 1 { b"a" } else { b"b" },
-                ))
-            },
-        );
+        let changed = collect_candidates(gix::hash::Kind::Sha1, &mut || Ok(()), |_| {
+            enumeration += 1;
+            Ok(record(
+                if enumeration == 1 {
+                    b"refs/heads/a"
+                } else {
+                    b"refs/heads/b"
+                },
+                if enumeration == 1 { b"a" } else { b"b" },
+            ))
+        });
         assert!(
             changed
                 .err()

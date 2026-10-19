@@ -3,15 +3,13 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
-use std::path::PathBuf;
 #[cfg(test)]
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use forge_diff::engine::{DiffEngine, DiffRequest};
-use forge_diff::source::{
-    Representation, SourceError, SourcePair, SourceVersion,
-};
+use forge_diff::source::{Representation, SourceError, SourcePair, SourceVersion};
 use forge_diff::unified::{write_file_header, write_unified};
 use forge_diff::workers::WorkPriority;
 use forge_git::coordinator::AdmissionGuard;
@@ -39,8 +37,9 @@ struct CachedCheckpoint {
 
 impl CachedCheckpoint {
     fn unchanged(&self) -> bool {
-        self.source.iter().all(|(path, stamp)| crate::storage::objects::source_stamp(path)
-            .is_ok_and(|current| current == *stamp))
+        self.source.iter().all(|(path, stamp)| {
+            crate::storage::objects::source_stamp(path).is_ok_and(|current| current == *stamp)
+        })
     }
 }
 
@@ -395,11 +394,21 @@ impl GitCheckpoint {
         check()?;
         let started = std::time::Instant::now();
         let signature = forge_git::checkpoint::signature(&self.workspace, &mut check)?;
-        if let Some(previous) = self.cache.lock().map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))?.as_ref()
-            && previous.signature == signature && previous.record.session_id == session_id && previous.unchanged()
+        if let Some(previous) = self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))?
+            .as_ref()
+            && previous.signature == signature
+            && previous.record.session_id == session_id
+            && previous.unchanged()
         {
             check()?;
-            let _ = writeln!(std::io::stderr(), "checkpoint.reuse duration_ms={}", started.elapsed().as_millis());
+            let _ = writeln!(
+                std::io::stderr(),
+                "checkpoint.reuse duration_ms={}",
+                started.elapsed().as_millis()
+            );
             return Ok(previous.record.clone());
         }
         let inventory = forge_git::checkpoint::inventory(&self.workspace, &signature, &mut check)?;
@@ -471,20 +480,28 @@ impl GitCheckpoint {
                     false,
                 )
             } else {
-                let captured = match objects.capture_file(&path, &self.workspace, base, &mut check) {
-                    Ok(captured) => captured,
-                    Err(error) if error.downcast_ref::<std::io::Error>()
-                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-                        && fs::symlink_metadata(&path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
+                let captured =
+                    match objects.capture_file(&path, &self.workspace, base, &mut check) {
+                        Ok(captured) => captured,
+                        Err(error)
+                            if error.downcast_ref::<std::io::Error>().is_some_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) && fs::symlink_metadata(&path).is_err_and(|error| {
+                                error.kind() == std::io::ErrorKind::NotFound
+                            }) =>
+                        {
                             if inventory.base.contains_key(relative) {
                                 deleted.push(relative.clone());
                             }
                             reusable = false;
                             continue;
                         }
-                    Err(error) => return Err(error)
-                        .with_context(|| format!("capture checkpoint source {}", path.display())),
-                };
+                        Err(error) => {
+                            return Err(error).with_context(|| {
+                                format!("capture checkpoint source {}", path.display())
+                            });
+                        }
+                    };
                 if let Some(stamp) = captured.stamp {
                     source.push((path.clone(), stamp));
                 } else {
@@ -515,8 +532,14 @@ impl GitCheckpoint {
                 (base.checkout != Default::default()).then_some((path, base.checkout))
             })
             .collect::<BTreeMap<_, _>>();
-        let manifest =
-            serde_json::to_vec(&(session_id, &inventory.tree, &file, &deleted, &checkout, &inventory.excluded))?;
+        let manifest = serde_json::to_vec(&(
+            session_id,
+            &inventory.tree,
+            &file,
+            &deleted,
+            &checkout,
+            &inventory.excluded,
+        ))?;
         let _ = writeln!(
             std::io::stderr(),
             "checkpoint.capture candidates={} overrides={} cache_hits={} bytes_read={} duration_ms={}",
@@ -538,10 +561,16 @@ impl GitCheckpoint {
             excluded: inventory.excluded,
             created_at_ms: now_ms,
         };
-        let cached = CachedCheckpoint { signature, record: record.clone(), source };
-        let cached = (reusable && cached.unchanged())
-            .then_some(cached);
-        *self.cache.lock().map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))? = cached;
+        let cached = CachedCheckpoint {
+            signature,
+            record: record.clone(),
+            source,
+        };
+        let cached = (reusable && cached.unchanged()).then_some(cached);
+        *self
+            .cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))? = cached;
         Ok(record)
     }
 
@@ -596,7 +625,9 @@ fn checkpoint_retained_bytes(record: &CheckpointRecord) -> Result<usize> {
             .file
             .iter()
             .flat_map(|file| [&file.path, &file.object_id]),
-    ).chain(record.excluded.iter()) {
+    )
+    .chain(record.excluded.iter())
+    {
         bytes = bytes
             .checked_add(value.capacity())
             .context("checkpoint input size overflow")?;

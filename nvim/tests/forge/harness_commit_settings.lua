@@ -37,22 +37,22 @@ local function open()
 end
 local function option(id)
   for _, entry in ipairs(picker._state_for_test().spec.page_list[1].option_list) do
-    if entry.id == id then return entry end
+    for _, field in ipairs(entry.fields or {}) do if field.id == id then return field end end
   end
   error("Missing option " .. id)
 end
 local function change(id)
   local instance = picker._state_for_test()
-  instance.spec.action_list[2].callback({ option = option(id) })
+  instance.spec.on_field_action({ field = option(id) }, option(id).kind == "toggle" and "toggle" or "change", 1)
 end
 open()
-assert(option("background-model").columns[2]:find("gpt-6-luna", 1, true))
+assert(option("background-model").value:find("gpt-6-luna", 1, true))
 assert(not pcall(option, "background-provider"), "provider selector should be removed")
 change("background-thinking")
 assert(preferences.models.codex.thinking == "medium")
 change("background-compact")
 assert(not preferences.auto_compaction.enabled)
-picker._state_for_test().spec.on_confirm({ option = option("background-model") })
+picker._state_for_test().spec.on_field_action({ field = option("background-model") }, "activate", 1)
 local model_picker = picker._state_for_test()
 model_picker.spec.on_confirm({ option = { value = { id = "second-model", picker_reasoning = "high" } } })
 assert(preferences.models.codex.model == "second-model" and preferences.models.codex.thinking == "high")
@@ -64,7 +64,7 @@ assert(preferences.models.codex.thinking == "high", "failed save replaced prior 
 assert(state.session.model == "chat-model" and state.session.effort == "high", "commit config changed the active chat")
 picker.close()
 open()
-assert(option("background-model").columns[2]:find("second-model", 1, true))
+assert(option("background-model").value:find("second-model", 1, true))
 picker.close()
 print("Background settings: model, thinking, compaction defaults, persistence, errors, and chat isolation passed")
 vim.cmd("qa!")

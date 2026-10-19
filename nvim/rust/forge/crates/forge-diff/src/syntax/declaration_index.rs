@@ -133,7 +133,10 @@ impl DeclarationIndex {
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         if !matches!(
             language,
-            SyntaxLanguage::Rust | SyntaxLanguage::Typescript | SyntaxLanguage::Tsx | SyntaxLanguage::Lua
+            SyntaxLanguage::Rust
+                | SyntaxLanguage::Typescript
+                | SyntaxLanguage::Tsx
+                | SyntaxLanguage::Lua
         ) {
             return Err(SyntaxError::Language(path.into()));
         }
@@ -143,10 +146,15 @@ impl DeclarationIndex {
             .set_language(&language.grammar())
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let mut tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
-        if language == SyntaxLanguage::Rust && tree.root_node().has_error() && source.contains("pub macro") {
+        if language == SyntaxLanguage::Rust
+            && tree.root_node().has_error()
+            && source.contains("pub macro")
+        {
             let mut projection = source.as_bytes().to_vec();
             if project_public_macros(tree.root_node(), source, &mut projection, 0) {
-                tree = parser.parse(&projection, None).ok_or(SyntaxError::Cancelled)?;
+                tree = parser
+                    .parse(&projection, None)
+                    .ok_or(SyntaxError::Cancelled)?;
             }
         }
         let parse = started.elapsed();
@@ -159,12 +167,22 @@ impl DeclarationIndex {
             let surrogate;
             let source = if tree.root_node().has_error() {
                 surrogate = super::declaration::declaration_surrogate(language, source)?;
-                tree = parser.parse(&surrogate, None).ok_or(SyntaxError::Cancelled)?;
+                tree = parser
+                    .parse(&surrogate, None)
+                    .ok_or(SyntaxError::Cancelled)?;
                 surrogate.as_str()
-            } else { source };
+            } else {
+                source
+            };
             lua_imports(tree.root_node(), source, &mut index);
             lua_symbols(tree.root_node(), source, &mut index, &[], 0)?;
-            return Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }));
+            return Ok((
+                index,
+                DeclarationIndexTiming {
+                    parse,
+                    extract: started.elapsed(),
+                },
+            ));
         }
         index.external_module = children(tree.root_node())
             .iter()
@@ -202,47 +220,115 @@ impl DeclarationIndex {
             &mut index,
             0,
         )?;
-        Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }))
+        Ok((
+            index,
+            DeclarationIndexTiming {
+                parse,
+                extract: started.elapsed(),
+            },
+        ))
     }
 }
 
 fn lua_imports(root: Node<'_>, source: &str, index: &mut DeclarationIndex) {
     for statement in children(root) {
-        if !matches!(statement.kind(), "variable_declaration" | "assignment_statement" | "function_call") { continue; }
+        if !matches!(
+            statement.kind(),
+            "variable_declaration" | "assignment_statement" | "function_call"
+        ) {
+            continue;
+        }
         let text = contents(statement, source);
-        let Some(call) = text.find("require") else { continue };
+        let Some(call) = text.find("require") else {
+            continue;
+        };
         let prefix = text[..call].trim_end();
-        if statement.kind() == "function_call" && !prefix.is_empty() { continue; }
-        if statement.kind() != "function_call" && !prefix.ends_with('=') { continue; }
-        if call > 0 && (text.as_bytes()[call - 1].is_ascii_alphanumeric() || text.as_bytes()[call - 1] == b'_') { continue; }
+        if statement.kind() == "function_call" && !prefix.is_empty() {
+            continue;
+        }
+        if statement.kind() != "function_call" && !prefix.ends_with('=') {
+            continue;
+        }
+        if call > 0
+            && (text.as_bytes()[call - 1].is_ascii_alphanumeric()
+                || text.as_bytes()[call - 1] == b'_')
+        {
+            continue;
+        }
         let tail = text[call + "require".len()..].trim_start();
-        let Some(tail) = tail.strip_prefix('(').map(str::trim_start) else { continue };
-        let Some(quote) = tail.chars().next().filter(|quote| matches!(quote, '\'' | '"')) else { continue };
-        let Some((module, rest)) = tail[1..].split_once(quote) else { continue };
-        if !rest.trim_start().starts_with(')') { continue; }
+        let Some(tail) = tail.strip_prefix('(').map(str::trim_start) else {
+            continue;
+        };
+        let Some(quote) = tail
+            .chars()
+            .next()
+            .filter(|quote| matches!(quote, '\'' | '"'))
+        else {
+            continue;
+        };
+        let Some((module, rest)) = tail[1..].split_once(quote) else {
+            continue;
+        };
+        if !rest.trim_start().starts_with(')') {
+            continue;
+        }
         index.import.push(DeclarationImport {
-            scope: Vec::new(), path: Vec::new(), source: Some(module.into()), alias: text[..call].split_once('=').map(|(binding, _)| binding.trim().trim_start_matches("local ").trim()).filter(|binding| !binding.is_empty() && binding.chars().all(|character| character.is_alphanumeric() || character == '_')).map(str::to_owned),
-            glob: false, namespace: false, export: false, visibility: SymbolVisibility::Private,
-            position: position(statement), conditional: false,
+            scope: Vec::new(),
+            path: Vec::new(),
+            source: Some(module.into()),
+            alias: text[..call]
+                .split_once('=')
+                .map(|(binding, _)| binding.trim().trim_start_matches("local ").trim())
+                .filter(|binding| {
+                    !binding.is_empty()
+                        && binding
+                            .chars()
+                            .all(|character| character.is_alphanumeric() || character == '_')
+                })
+                .map(str::to_owned),
+            glob: false,
+            namespace: false,
+            export: false,
+            visibility: SymbolVisibility::Private,
+            position: position(statement),
+            conditional: false,
         });
     }
 }
 
-fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String], depth: usize) -> Result<(), SyntaxError> {
+fn lua_symbols(
+    root: Node<'_>,
+    source: &str,
+    index: &mut DeclarationIndex,
+    scope: &[String],
+    depth: usize,
+) -> Result<(), SyntaxError> {
     let mut local = std::collections::HashSet::new();
     let mut exported = std::collections::HashSet::new();
     for statement in children(root) {
         if statement.kind() == "return_statement" {
-            if let Some(value) = children(statement).into_iter().find(|child| child.kind() == "expression_list") {
-                for name in children(value).into_iter().filter(|child| child.kind() == "identifier") {
+            if let Some(value) = children(statement)
+                .into_iter()
+                .find(|child| child.kind() == "expression_list")
+            {
+                for name in children(value)
+                    .into_iter()
+                    .filter(|child| child.kind() == "identifier")
+                {
                     exported.insert(contents(name, source).to_owned());
                 }
             }
         }
         if statement.kind() == "variable_declaration" {
             for assignment in children(statement) {
-                if let Some(variables) = children(assignment).into_iter().find(|child| child.kind() == "variable_list") {
-                    for name in children(variables).into_iter().filter(|child| child.kind() == "identifier") {
+                if let Some(variables) = children(assignment)
+                    .into_iter()
+                    .find(|child| child.kind() == "variable_list")
+                {
+                    for name in children(variables)
+                        .into_iter()
+                        .filter(|child| child.kind() == "identifier")
+                    {
                         local.insert(contents(name, source).to_owned());
                     }
                 }
@@ -252,56 +338,137 @@ fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope
     lua_symbol_walk(root, source, index, scope, &local, &exported, depth)
 }
 
-fn lua_symbol_walk(node: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String], local: &std::collections::HashSet<String>, exported: &std::collections::HashSet<String>, depth: usize) -> Result<(), SyntaxError> {
-    if depth > 128 { return Err(SyntaxError::CaptureLimit); }
+fn lua_symbol_walk(
+    node: Node<'_>,
+    source: &str,
+    index: &mut DeclarationIndex,
+    scope: &[String],
+    local: &std::collections::HashSet<String>,
+    exported: &std::collections::HashSet<String>,
+    depth: usize,
+) -> Result<(), SyntaxError> {
+    if depth > 128 {
+        return Err(SyntaxError::CaptureLimit);
+    }
     if node.kind() == "function_declaration" {
         if let Some(name) = node.child_by_field_name("name") {
-            let parts = contents(name, source).replace(':', ".").split('.').map(str::to_owned).collect::<Vec<_>>();
-            let Some(member) = parts.last() else { return Ok(()); };
+            let parts = contents(name, source)
+                .replace(':', ".")
+                .split('.')
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            let Some(member) = parts.last() else {
+                return Ok(());
+            };
             let mut owner = scope.to_vec();
             owner.extend(parts[..parts.len() - 1].iter().cloned());
             if parts.len() > 1 {
                 let path = parts[..parts.len() - 1].to_vec();
                 index.reference.push(DeclarationReference {
-                    length: path.join(".").len(), path, position: position(name), scope: scope.to_vec(),
-                    value_namespace: true, macro_namespace: false, conditional: false,
+                    length: path.join(".").len(),
+                    path,
+                    position: position(name),
+                    scope: scope.to_vec(),
+                    value_namespace: true,
+                    macro_namespace: false,
+                    conditional: false,
                 });
             }
             let private = contents(node, source).trim_start().starts_with("local ")
-                || parts.first().is_some_and(|root| local.contains(root) && !exported.contains(root));
+                || parts
+                    .first()
+                    .is_some_and(|root| local.contains(root) && !exported.contains(root));
             index.symbol.push(DeclarationSymbol {
-                role: DeclarationRole::Callable, external_entry: false, property: false,
-                name: member.clone(), scope: owner, position: DeclarationPosition { line: position(name).line, column: position(name).column + contents(name, source).len() as u32 - member.len() as u32 },
-                visibility: if private { SymbolVisibility::Private } else { SymbolVisibility::Public },
-                type_namespace: false, value_namespace: true, macro_namespace: false,
-                conditional: false, global: !private, parameter: false,
+                role: DeclarationRole::Callable,
+                external_entry: false,
+                property: false,
+                name: member.clone(),
+                scope: owner,
+                position: DeclarationPosition {
+                    line: position(name).line,
+                    column: position(name).column + contents(name, source).len() as u32
+                        - member.len() as u32,
+                },
+                visibility: if private {
+                    SymbolVisibility::Private
+                } else {
+                    SymbolVisibility::Public
+                },
+                type_namespace: false,
+                value_namespace: true,
+                macro_namespace: false,
+                conditional: false,
+                global: !private,
+                parameter: false,
             });
         }
         return Ok(());
     }
     if node.kind() == "return_statement" {
-        for expression in children(node).into_iter().filter(|child| child.kind() == "expression_list").flat_map(children).filter(|child| child.kind() == "identifier") {
+        for expression in children(node)
+            .into_iter()
+            .filter(|child| child.kind() == "expression_list")
+            .flat_map(children)
+            .filter(|child| child.kind() == "identifier")
+        {
             index.reference.push(DeclarationReference {
-                path: vec![contents(expression, source).into()], position: position(expression), length: contents(expression, source).len(), scope: scope.to_vec(),
-                value_namespace: true, macro_namespace: false, conditional: false,
+                path: vec![contents(expression, source).into()],
+                position: position(expression),
+                length: contents(expression, source).len(),
+                scope: scope.to_vec(),
+                value_namespace: true,
+                macro_namespace: false,
+                conditional: false,
             });
         }
         return Ok(());
     }
-    if node.kind() == "variable_list" && node.parent().is_some_and(|parent| parent.kind() == "assignment_statement") {
-        for name in children(node).into_iter().filter(|child| matches!(child.kind(), "identifier" | "dot_index_expression")) {
+    if node.kind() == "variable_list"
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "assignment_statement")
+    {
+        for name in children(node)
+            .into_iter()
+            .filter(|child| matches!(child.kind(), "identifier" | "dot_index_expression"))
+        {
             let name_text = contents(name, source);
-            if index.import.iter().any(|import| import.alias.as_deref() == Some(name_text)) { continue; }
+            if index
+                .import
+                .iter()
+                .any(|import| import.alias.as_deref() == Some(name_text))
+            {
+                continue;
+            }
             let mut parts = name_text.split('.').map(str::to_owned).collect::<Vec<_>>();
             let member = parts.pop().unwrap();
             let root = parts.first().map(String::as_str).unwrap_or(&member);
             let public = !local.contains(root) || exported.contains(root);
             index.symbol.push(DeclarationSymbol {
-                role: if parts.is_empty() { DeclarationRole::Value } else { DeclarationRole::Property }, external_entry: false, property: !parts.is_empty(),
-                name: member.clone(), scope: scope.iter().cloned().chain(parts).collect(), position: DeclarationPosition { line: position(name).line, column: position(name).column + name_text.len() as u32 - member.len() as u32 },
-                visibility: if public { SymbolVisibility::Public } else { SymbolVisibility::Private },
-                type_namespace: false, value_namespace: true, macro_namespace: false,
-                conditional: false, global: public, parameter: false,
+                role: if parts.is_empty() {
+                    DeclarationRole::Value
+                } else {
+                    DeclarationRole::Property
+                },
+                external_entry: false,
+                property: !parts.is_empty(),
+                name: member.clone(),
+                scope: scope.iter().cloned().chain(parts).collect(),
+                position: DeclarationPosition {
+                    line: position(name).line,
+                    column: position(name).column + name_text.len() as u32 - member.len() as u32,
+                },
+                visibility: if public {
+                    SymbolVisibility::Public
+                } else {
+                    SymbolVisibility::Private
+                },
+                type_namespace: false,
+                value_namespace: true,
+                macro_namespace: false,
+                conditional: false,
+                global: public,
+                parameter: false,
             });
         }
         return Ok(());
@@ -314,27 +481,60 @@ fn lua_symbol_walk(node: Node<'_>, source: &str, index: &mut DeclarationIndex, s
 
 fn declaration_role(kind: &str) -> DeclarationRole {
     match kind {
-        "function_item" | "function_signature_item" | "function_declaration" | "function_signature" | "method_definition" | "method_signature" => DeclarationRole::Callable,
-        "field_declaration" | "public_field_definition" | "property_signature" => DeclarationRole::Property,
-        "struct_item" | "enum_item" | "trait_item" | "type_item" | "class_declaration" | "abstract_class_declaration" | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "associated_type" => DeclarationRole::Type,
+        "function_item"
+        | "function_signature_item"
+        | "function_declaration"
+        | "function_signature"
+        | "method_definition"
+        | "method_signature" => DeclarationRole::Callable,
+        "field_declaration" | "public_field_definition" | "property_signature" => {
+            DeclarationRole::Property
+        }
+        "struct_item"
+        | "enum_item"
+        | "trait_item"
+        | "type_item"
+        | "class_declaration"
+        | "abstract_class_declaration"
+        | "interface_declaration"
+        | "type_alias_declaration"
+        | "enum_declaration"
+        | "associated_type" => DeclarationRole::Type,
         "mod_item" | "internal_module" | "module" => DeclarationRole::Module,
         "enum_variant" => DeclarationRole::Variant,
-        "type_parameter" | "constrained_type_parameter" | "optional_type_parameter" | "mapped_type_clause" => DeclarationRole::Binding,
+        "type_parameter"
+        | "constrained_type_parameter"
+        | "optional_type_parameter"
+        | "mapped_type_clause" => DeclarationRole::Binding,
         _ => DeclarationRole::Value,
     }
 }
 
 fn declaration_entry(node: Node<'_>, attributes: &str) -> bool {
-    let normalized = attributes.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    let normalized = attributes
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>();
     if normalized.split("#[").skip(1).any(|attribute| {
         let name = attribute.split(['(', ']']).next().unwrap_or_default();
-        matches!(name, "test" | "bench" | "proc_macro" | "proc_macro_attribute" | "proc_macro_derive") || name.ends_with("::test")
-    }) { return true; }
+        matches!(
+            name,
+            "test" | "bench" | "proc_macro" | "proc_macro_attribute" | "proc_macro_derive"
+        ) || name.ends_with("::test")
+    }) {
+        return true;
+    }
     let mut parent = node.parent();
     while let Some(owner) = parent {
-        if matches!(owner.kind(), "trait_item" | "interface_declaration") { return true; }
-        if owner.kind() == "impl_item" { return owner.child_by_field_name("trait").is_some(); }
-        if matches!(owner.kind(), "function_item" | "method_definition") { return false; }
+        if matches!(owner.kind(), "trait_item" | "interface_declaration") {
+            return true;
+        }
+        if owner.kind() == "impl_item" {
+            return owner.child_by_field_name("trait").is_some();
+        }
+        if matches!(owner.kind(), "function_item" | "method_definition") {
+            return false;
+        }
         parent = owner.parent();
     }
     false
@@ -372,12 +572,24 @@ fn quoted_attribute(text: &str, name: &str) -> Option<String> {
 
 fn visibility(node: Node<'_>, source: &str, exported: bool, rust: bool) -> SymbolVisibility {
     if !rust {
-        if matches!(node.kind(), "method_definition" | "method_signature" | "public_field_definition" | "property_signature") {
+        if matches!(
+            node.kind(),
+            "method_definition"
+                | "method_signature"
+                | "public_field_definition"
+                | "property_signature"
+        ) {
             return if children(node).iter().any(|child| {
-                child.kind() == "accessibility_modifier" && matches!(contents(*child, source), "private" | "protected")
-            }) || node.child_by_field_name("name").is_some_and(|name| name.kind() == "private_property_identifier") {
+                child.kind() == "accessibility_modifier"
+                    && matches!(contents(*child, source), "private" | "protected")
+            }) || node
+                .child_by_field_name("name")
+                .is_some_and(|name| name.kind() == "private_property_identifier")
+            {
                 SymbolVisibility::Private
-            } else { SymbolVisibility::Public };
+            } else {
+                SymbolVisibility::Public
+            };
         }
         return if exported {
             SymbolVisibility::Public
@@ -529,7 +741,11 @@ fn walk(
     }
     let rust = language == SyntaxLanguage::Rust;
     let kind = node.kind();
-    let public_macro = rust && kind == "function_item" && contents(node, source).trim_start().starts_with("pub macro ");
+    let public_macro = rust
+        && kind == "function_item"
+        && contents(node, source)
+            .trim_start()
+            .starts_with("pub macro ");
     if matches!(
         kind,
         "block"
@@ -691,13 +907,27 @@ fn walk(
             | "mapped_type_clause"
             | "enum_variant"
     );
-    if !rust && node.parent().is_some_and(|parent| parent.kind() == "enum_body") && matches!(kind, "property_identifier" | "string" | "enum_assignment") {
+    if !rust
+        && node
+            .parent()
+            .is_some_and(|parent| parent.kind() == "enum_body")
+        && matches!(kind, "property_identifier" | "string" | "enum_assignment")
+    {
         let name = node.child_by_field_name("name").unwrap_or(node);
         index.symbol.push(DeclarationSymbol {
-            role: DeclarationRole::Variant, external_entry: false, property: true,
-            name: contents(name, source).trim_matches(['\'', '"']).into(), scope: scope.to_vec(), position: position(name),
-            visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: true, macro_namespace: false,
-            conditional, global: false, parameter: false,
+            role: DeclarationRole::Variant,
+            external_entry: false,
+            property: true,
+            name: contents(name, source).trim_matches(['\'', '"']).into(),
+            scope: scope.to_vec(),
+            position: position(name),
+            visibility: SymbolVisibility::Public,
+            type_namespace: false,
+            value_namespace: true,
+            macro_namespace: false,
+            conditional,
+            global: false,
+            parameter: false,
         });
         return Ok(());
     }
@@ -710,7 +940,9 @@ fn walk(
             if name_text == "global" && !rust {
                 nested.clear();
             } else {
-                if let Some(owner) = member_owner(node, source, language, scope, &name_text, conditional) {
+                if let Some(owner) =
+                    member_owner(node, source, language, scope, &name_text, conditional)
+                {
                     index.member_owner.push(owner);
                 }
                 let parameter = matches!(
@@ -736,13 +968,27 @@ fn walk(
                         | "associated_type"
                 ) || parameter;
                 index.symbol.push(DeclarationSymbol {
-                    role: if kind == "variable_declarator" && node.child_by_field_name("value").is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression")) { DeclarationRole::Callable } else { declaration_role(kind) },
+                    role: if kind == "variable_declarator"
+                        && node.child_by_field_name("value").is_some_and(|value| {
+                            matches!(value.kind(), "arrow_function" | "function_expression")
+                        }) {
+                        DeclarationRole::Callable
+                    } else {
+                        declaration_role(kind)
+                    },
                     external_entry: declaration_entry(node, attributes),
-                    property: matches!(kind, "field_declaration" | "public_field_definition" | "property_signature"),
+                    property: matches!(
+                        kind,
+                        "field_declaration" | "public_field_definition" | "property_signature"
+                    ),
                     name: name_text.clone(),
                     scope: scope.to_vec(),
                     position: position(name),
-                    visibility: if kind == "enum_variant" { SymbolVisibility::Public } else { visibility(node, source, exported, rust) },
+                    visibility: if kind == "enum_variant" {
+                        SymbolVisibility::Public
+                    } else {
+                        visibility(node, source, exported, rust)
+                    },
                     type_namespace: type_namespace && !public_macro,
                     macro_namespace: public_macro || kind == "mod_item",
                     value_namespace: !matches!(
@@ -751,7 +997,8 @@ fn walk(
                             | "type_alias_declaration"
                             | "type_item"
                             | "trait_item"
-                    ) && !parameter && !public_macro,
+                    ) && !parameter
+                        && !public_macro,
                     conditional,
                     global: global || !rust && !index.external_module && scope.is_empty(),
                     parameter,
@@ -800,7 +1047,7 @@ fn walk(
             index.symbol.push(DeclarationSymbol {
                 role: DeclarationRole::Binding,
                 external_entry: false,
-                    property: false,
+                property: false,
                 name: contents(name, source).into(),
                 scope: scope.to_vec(),
                 position: position(name),
@@ -859,7 +1106,7 @@ fn walk(
             index.symbol.push(DeclarationSymbol {
                 role: DeclarationRole::Binding,
                 external_entry: false,
-                    property: false,
+                property: false,
                 name: "Self".into(),
                 scope: nested.clone(),
                 position: position(owner),
@@ -877,7 +1124,7 @@ fn walk(
         index.symbol.push(DeclarationSymbol {
             role: DeclarationRole::Binding,
             external_entry: false,
-                    property: false,
+            property: false,
             name: "Self".into(),
             scope: nested.clone(),
             position: position(node),
@@ -997,28 +1244,43 @@ fn walk(
 }
 
 // Recover unsupported public macro signatures without shifting source coordinates.
-fn project_public_macros(node: Node<'_>, source: &str, projection: &mut [u8], depth: usize) -> bool {
-    if depth > 128 { return false; }
+fn project_public_macros(
+    node: Node<'_>,
+    source: &str,
+    projection: &mut [u8],
+    depth: usize,
+) -> bool {
+    if depth > 128 {
+        return false;
+    }
     let mut changed = false;
-    if node.kind() == "identifier" && contents(node, source) == "macro"
+    if node.kind() == "identifier"
+        && contents(node, source) == "macro"
         && source[..node.start_byte()].trim_end().ends_with("pub")
     {
         let tail = &source[node.end_byte()..];
         let name_start = node.end_byte() + tail.len() - tail.trim_start().len();
-        let name_length = source[name_start..].bytes().take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_').count();
+        let name_length = source[name_start..]
+            .bytes()
+            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+            .count();
         let name_end = name_start + name_length;
         let tail = &source[name_end..];
         let start = name_end + tail.len() - tail.trim_start().len();
         if name_length > 0 && source.as_bytes().get(start) == Some(&b'(') {
             let mut nesting = 0;
             for (offset, byte) in source.as_bytes()[start..].iter().enumerate() {
-                if *byte == b'(' { nesting += 1; }
+                if *byte == b'(' {
+                    nesting += 1;
+                }
                 if *byte == b')' {
                     nesting -= 1;
                     if nesting == 0 {
                         projection[node.byte_range()].copy_from_slice(b"fn   ");
                         for byte in &mut projection[start + 1..start + offset] {
-                            if !matches!(*byte, b'\n' | b'\r') { *byte = b' '; }
+                            if !matches!(*byte, b'\n' | b'\r') {
+                                *byte = b' ';
+                            }
                         }
                         changed = true;
                         break;
@@ -1034,11 +1296,26 @@ fn project_public_macros(node: Node<'_>, source: &str, projection: &mut [u8], de
 }
 
 // Derive names use Rust's macro namespace, independently of same-named traits.
-fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: bool, index: &mut DeclarationIndex) {
-    let Some(attribute) = children(node).into_iter().find(|child| child.kind() == "attribute") else { return; };
+fn rust_attribute(
+    node: Node<'_>,
+    source: &str,
+    scope: &[String],
+    conditional: bool,
+    index: &mut DeclarationIndex,
+) {
+    let Some(attribute) = children(node)
+        .into_iter()
+        .find(|child| child.kind() == "attribute")
+    else {
+        return;
+    };
     let parts = children(attribute);
-    let Some(name) = parts.first() else { return; };
-    let Some(arguments) = parts.iter().find(|child| child.kind() == "token_tree") else { return; };
+    let Some(name) = parts.first() else {
+        return;
+    };
+    let Some(arguments) = parts.iter().find(|child| child.kind() == "token_tree") else {
+        return;
+    };
     match contents(*name, source) {
         "derive" => {
             let mut path = Vec::new();
@@ -1051,23 +1328,37 @@ fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: b
                 } else if matches!(token.kind(), "," | ")") {
                     if let Some(start) = first.take() {
                         index.reference.push(DeclarationReference {
-                            path: std::mem::take(&mut path), position: position(start),
-                            length: token.start_byte() - start.start_byte(), scope: scope.to_vec(),
-                            value_namespace: false, macro_namespace: true, conditional,
+                            path: std::mem::take(&mut path),
+                            position: position(start),
+                            length: token.start_byte() - start.start_byte(),
+                            scope: scope.to_vec(),
+                            value_namespace: false,
+                            macro_namespace: true,
+                            conditional,
                         });
                     }
                 }
             }
         }
         "proc_macro_derive" => {
-            if let Some(name) = children(*arguments).into_iter().find(|child| child.kind() == "identifier") {
+            if let Some(name) = children(*arguments)
+                .into_iter()
+                .find(|child| child.kind() == "identifier")
+            {
                 index.symbol.push(DeclarationSymbol {
                     role: DeclarationRole::Value,
                     external_entry: true,
                     property: false,
-                    name: contents(name, source).into(), scope: scope.to_vec(), position: position(name),
-                    visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: false,
-                    macro_namespace: true, conditional, global: false, parameter: false,
+                    name: contents(name, source).into(),
+                    scope: scope.to_vec(),
+                    position: position(name),
+                    visibility: SymbolVisibility::Public,
+                    type_namespace: false,
+                    value_namespace: false,
+                    macro_namespace: true,
+                    conditional,
+                    global: false,
+                    parameter: false,
                 });
             }
         }
@@ -1078,7 +1369,9 @@ fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: b
 // Only cfg gates the item. cfg_attr may add derives without removing its declaration.
 fn gates_declaration(node: Node<'_>, source: &str) -> bool {
     node.kind() == "identifier" && contents(node, source) == "cfg"
-        || children(node).into_iter().any(|child| gates_declaration(child, source))
+        || children(node)
+            .into_iter()
+            .any(|child| gates_declaration(child, source))
 }
 
 fn synthetic_scope(ordinal: usize, role: &str) -> String {
@@ -1280,15 +1573,35 @@ mod tests {
         source.push_str("pub struct Store;\nimpl<T> Store { pub fn first(value: T); }\n");
         source.push_str("impl<U> Store { pub fn second(value: U); }\n");
         let index = DeclarationIndex::extract("lib.rs", &source).unwrap();
-        let module = index.module.iter().find(|module| module.name == "optional").unwrap();
+        let module = index
+            .module
+            .iter()
+            .find(|module| module.name == "optional")
+            .unwrap();
         assert_eq!(module.path.as_deref(), Some("other.rs"));
         assert!(module.conditional);
-        assert!(!index.symbol.iter().find(|symbol| symbol.name == "Store").unwrap().conditional);
-        let first = index.symbol.iter().find(|symbol| symbol.name == "first").unwrap();
-        let second = index.symbol.iter().find(|symbol| symbol.name == "second").unwrap();
+        assert!(
+            !index
+                .symbol
+                .iter()
+                .find(|symbol| symbol.name == "Store")
+                .unwrap()
+                .conditional
+        );
+        let first = index
+            .symbol
+            .iter()
+            .find(|symbol| symbol.name == "first")
+            .unwrap();
+        let second = index
+            .symbol
+            .iter()
+            .find(|symbol| symbol.name == "second")
+            .unwrap();
         assert_ne!(first.scope, second.scope);
         for (method, parameter) in [(first, "T"), (second, "U")] {
-            assert!(index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == parameter
+            assert!(index.symbol.iter().any(|symbol| symbol.parameter
+                && symbol.name == parameter
                 && symbol.scope == method.scope));
         }
     }
@@ -1298,16 +1611,39 @@ mod tests {
         let source = "pub mod macros { #[rustc_builtin_macro] pub macro Debug($item:item) { /* compiler built-in */ } pub macro Clone($item:item) { /* compiler built-in */ } }";
         let index = DeclarationIndex::extract("lib.rs", source).unwrap();
         for name in ["Debug", "Clone"] {
-            let symbol = index.symbol.iter().find(|symbol| symbol.name == name && symbol.macro_namespace && symbol.scope == ["macros"]).unwrap();
-            assert_eq!(symbol.position.column, source.find(&format!("{name}(")).unwrap() as u32);
+            let symbol = index
+                .symbol
+                .iter()
+                .find(|symbol| {
+                    symbol.name == name && symbol.macro_namespace && symbol.scope == ["macros"]
+                })
+                .unwrap();
+            assert_eq!(
+                symbol.position.column,
+                source.find(&format!("{name}(")).unwrap() as u32
+            );
         }
     }
 
     #[test]
     fn optional_derives_do_not_gate_declarations() {
         let index = DeclarationIndex::extract("lib.rs", "#[cfg_attr(feature = \"serialize\", derive(Serialize))]\n#[doc = \"cfg is mentioned here\"]\npub struct Transform;\n#[cfg_attr(feature = \"optional\", cfg(feature = \"enabled\"))]\npub struct Gated;\n").unwrap();
-        assert!(!index.symbol.iter().find(|symbol| symbol.name == "Transform").unwrap().conditional);
-        assert!(index.symbol.iter().find(|symbol| symbol.name == "Gated").unwrap().conditional);
+        assert!(
+            !index
+                .symbol
+                .iter()
+                .find(|symbol| symbol.name == "Transform")
+                .unwrap()
+                .conditional
+        );
+        assert!(
+            index
+                .symbol
+                .iter()
+                .find(|symbol| symbol.name == "Gated")
+                .unwrap()
+                .conditional
+        );
     }
 
     #[test]
@@ -1351,11 +1687,23 @@ mod tests {
     fn indexes_typescript_variants_and_callable_bindings() {
         let index = DeclarationIndex::extract("api.ts", "export enum State { Ready, Active = 1 } const worker = () => {}; export function install() { register(worker); }").unwrap();
         for name in ["Ready", "Active"] {
-            let symbol = index.symbol.iter().find(|symbol| symbol.name == name).unwrap();
+            let symbol = index
+                .symbol
+                .iter()
+                .find(|symbol| symbol.name == name)
+                .unwrap();
             assert_eq!(symbol.role, DeclarationRole::Variant);
             assert_eq!(symbol.scope, ["State"]);
         }
-        assert_eq!(index.symbol.iter().find(|symbol| symbol.name == "worker").unwrap().role, DeclarationRole::Callable);
+        assert_eq!(
+            index
+                .symbol
+                .iter()
+                .find(|symbol| symbol.name == "worker")
+                .unwrap()
+                .role,
+            DeclarationRole::Callable
+        );
     }
 
     #[test]

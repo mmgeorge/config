@@ -12,8 +12,7 @@ use crate::{
     RepositoryPath,
     command::{CommandLimits, read_command},
     content::{
-        ContentRequest, ContentResult, ContentSource, IndexStage,
-        WorktreeConversion, acquire,
+        ContentRequest, ContentResult, ContentSource, IndexStage, WorktreeConversion, acquire,
     },
     repository::RepositoryState,
     resolve_argument,
@@ -54,7 +53,11 @@ impl WorktreePolicy {
         match self {
             Self::Current | Self::IndexOnly => Ok(None),
             Self::Metadata => {
-                let root = repository.identity.worktree_root.as_ref().context("missing worktree root")?;
+                let root = repository
+                    .identity
+                    .worktree_root
+                    .as_ref()
+                    .context("missing worktree root")?;
                 Ok(Some((read_worktree_stamp(root, path)?, None)))
             }
             Self::Content => fingerprint(repository, path, check).map(Some),
@@ -223,16 +226,25 @@ impl WritePrecondition {
             GitWriteAction::Batch { action } => action.as_slice(),
             action => std::slice::from_ref(action),
         };
-        let policy: HashMap<_, _> = actions.iter().flat_map(|action| {
-            let policy = match action {
-                GitWriteAction::Stage { .. } => WorktreePolicy::Current,
-                GitWriteAction::Unstage { .. }
-                | GitWriteAction::Patch { direction: PatchDirection::Unstage, .. } => WorktreePolicy::IndexOnly,
-                GitWriteAction::Patch { direction: PatchDirection::Stage | PatchDirection::Index { .. }, .. } => WorktreePolicy::Metadata,
-                _ => WorktreePolicy::Content,
-            };
-            action.paths().into_iter().map(move |path| (path, policy))
-        }).collect();
+        let policy: HashMap<_, _> = actions
+            .iter()
+            .flat_map(|action| {
+                let policy = match action {
+                    GitWriteAction::Stage { .. } => WorktreePolicy::Current,
+                    GitWriteAction::Unstage { .. }
+                    | GitWriteAction::Patch {
+                        direction: PatchDirection::Unstage,
+                        ..
+                    } => WorktreePolicy::IndexOnly,
+                    GitWriteAction::Patch {
+                        direction: PatchDirection::Stage | PatchDirection::Index { .. },
+                        ..
+                    } => WorktreePolicy::Metadata,
+                    _ => WorktreePolicy::Content,
+                };
+                action.paths().into_iter().map(move |path| (path, policy))
+            })
+            .collect();
         let inspected: Vec<_> = selected
             .iter()
             .filter(|path| policy[*path] != WorktreePolicy::Current)
@@ -361,7 +373,11 @@ impl WritePrecondition {
         );
         if let Some(expected) = &target.worktree {
             ensure!(
-                Some(expected) == target.worktree_policy.capture(repository, path, check)?.as_ref(),
+                Some(expected)
+                    == target
+                        .worktree_policy
+                        .capture(repository, path, check)?
+                        .as_ref(),
                 "target source changed before execution"
             );
         }
@@ -402,7 +418,11 @@ impl WritePrecondition {
             );
             if let Some(expected) = &captured.worktree {
                 ensure!(
-                    Some(expected) == captured.worktree_policy.capture(repository, path, check)?.as_ref(),
+                    Some(expected)
+                        == captured
+                            .worktree_policy
+                            .capture(repository, path, check)?
+                            .as_ref(),
                     "chunk target source changed before execution"
                 );
             }
@@ -422,7 +442,11 @@ impl WritePrecondition {
         path: &RepositoryPath,
         direction: PatchDirection,
     ) -> (bool, bool) {
-        if let PatchDirection::Index { before_exists, after_exists } = direction {
+        if let PatchDirection::Index {
+            before_exists,
+            after_exists,
+        } = direction
+        {
             return (before_exists, after_exists);
         }
         let target = self

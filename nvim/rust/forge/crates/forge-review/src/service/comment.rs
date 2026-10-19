@@ -38,7 +38,10 @@ impl ReviewService {
             "capture belongs to another review"
         );
         if let ReviewCommentCommand::Snapshot { comment } = command {
-            ensure!(capture.is_empty() && draft.is_empty(), "snapshot cannot adopt a draft capture");
+            ensure!(
+                capture.is_empty() && draft.is_empty(),
+                "snapshot cannot adopt a draft capture"
+            );
             let owner = self.owner(id)?;
             let snapshot = owner
                 .document

@@ -171,7 +171,11 @@ impl CheckToolScope {
             self.runner.refresh_changes().await?;
         }
         let result = match name {
-            "checks_list" => self.runner.catalog_preview(self.task_id.as_deref(), self.shell).await?,
+            "checks_list" => {
+                self.runner
+                    .catalog_preview(self.task_id.as_deref(), self.shell)
+                    .await?
+            }
             "checks_configure" => {
                 ensure!(
                     self.editing_enabled(),
@@ -267,13 +271,12 @@ impl CheckToolScope {
             }
             "checks_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
-                let wait_for_completion = arguments["wait_for_completion"].as_bool().unwrap_or(false);
-                let wait_ms = arguments["wait_ms"].as_u64().unwrap_or(if wait_for_completion { 60000 } else { 0 });
-                serde_json::to_value(
-                    self.runner
-                        .status(id, wait_ms, wait_for_completion)
-                        .await?,
-                )?
+                let wait_for_completion =
+                    arguments["wait_for_completion"].as_bool().unwrap_or(false);
+                let wait_ms = arguments["wait_ms"]
+                    .as_u64()
+                    .unwrap_or(if wait_for_completion { 60000 } else { 0 });
+                serde_json::to_value(self.runner.status(id, wait_ms, wait_for_completion).await?)?
             }
             "checks_cancel" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
@@ -331,23 +334,53 @@ impl CheckToolScope {
 
 impl CheckSupervisor {
     /// Adds concrete task commands without starting checks or publishing run history.
-    pub(crate) async fn catalog_preview(&self, task_id: Option<&str>, shell: CheckShell) -> Result<Value> {
+    pub(crate) async fn catalog_preview(
+        &self,
+        task_id: Option<&str>,
+        shell: CheckShell,
+    ) -> Result<Value> {
         let mut catalog = self.catalog(task_id)?;
         if let Ok(snapshot) = ConfigSnapshot::load(&self.workspace) {
             let overrides = self.overrides(task_id)?;
             let mut config = snapshot.config;
             for definition in &mut config.definitions {
-                if let Some(auto) = overrides.auto.get(&definition.id) { definition.auto = *auto; }
-                if let Some(enabled) = overrides.enabled.get(&definition.id) { definition.enabled = *enabled; }
-                if let Some(scope) = overrides.scopes.get(&definition.id) { definition.scope = *scope; }
+                if let Some(auto) = overrides.auto.get(&definition.id) {
+                    definition.auto = *auto;
+                }
+                if let Some(enabled) = overrides.enabled.get(&definition.id) {
+                    definition.enabled = *enabled;
+                }
+                if let Some(scope) = overrides.scopes.get(&definition.id) {
+                    definition.scope = *scope;
+                }
             }
             if let Some(files) = self.changes.files()? {
-                catalog["preview"] = serde_json::to_value(super::preview::resolve(&self.workspace, &config, &files, None, None, false, &[]).await?)?;
+                catalog["preview"] = serde_json::to_value(
+                    super::preview::resolve(
+                        &self.workspace,
+                        &config,
+                        &files,
+                        None,
+                        None,
+                        false,
+                        &[],
+                    )
+                    .await?,
+                )?;
                 if let Some(checkpoint) = self.changes.snapshot().await? {
-                    let run = self.resolve(self.prepare_request(RunRequest::default(), task_id.map(str::to_owned), shell, "Coverage preview".into())?).await?;
+                    let run = self
+                        .resolve(self.prepare_request(
+                            RunRequest::default(),
+                            task_id.map(str::to_owned),
+                            shell,
+                            "Coverage preview".into(),
+                        )?)
+                        .await?;
                     let mut coverage = Vec::new();
                     for command in &run.commands {
-                        if command.state != super::CheckState::Pending { continue; }
+                        if command.state != super::CheckState::Pending {
+                            continue;
+                        }
                         let previous = self.evidence(&run, command, &checkpoint)?;
                         coverage.push(json!({"id":command.context.as_ref().unwrap().definition_id,"command":command.command,
                             "pending":previous.is_none(),"evidence":previous.map(|(run_id, command)| json!({"run_id":run_id,"state":command.state,"command_id":command.id}))}));
@@ -357,7 +390,8 @@ impl CheckSupervisor {
             }
         }
         if let Some(owner) = task_id.map(str::to_owned).or(self.changes.owner()?) {
-            catalog["automatic"] = serde_json::to_value(super::automatic::AutomaticChecks::open(&self.root, &owner)?)?;
+            catalog["automatic"] =
+                serde_json::to_value(super::automatic::AutomaticChecks::open(&self.root, &owner)?)?;
         }
         Ok(catalog)
     }
@@ -381,7 +415,9 @@ impl CheckSupervisor {
             .map(|snapshot| {
                 let mut config = snapshot.config.clone();
                 for check in &mut config.definitions {
-                    if let Some(auto) = overrides.auto.get(&check.id) { check.auto = *auto; }
+                    if let Some(auto) = overrides.auto.get(&check.id) {
+                        check.auto = *auto;
+                    }
                     if let Some(enabled) = overrides.enabled.get(&check.id) {
                         check.enabled = *enabled;
                     }
@@ -428,7 +464,12 @@ impl CheckSupervisor {
             "check settings cannot change while a run is active"
         );
         let snapshot = ConfigSnapshot::load(&self.workspace)?;
-        for id in overrides.enabled.keys().chain(overrides.scopes.keys()).chain(overrides.auto.keys()) {
+        for id in overrides
+            .enabled
+            .keys()
+            .chain(overrides.scopes.keys())
+            .chain(overrides.auto.keys())
+        {
             let definition = snapshot
                 .config
                 .definitions
@@ -441,7 +482,10 @@ impl CheckSupervisor {
                     "file selection is unsupported"
                 );
                 ensure!(
-                !matches!(scope, super::CheckScope::ChangedCases | super::CheckScope::NewCases) || definition.cases.is_some(),
+                    !matches!(
+                        scope,
+                        super::CheckScope::ChangedCases | super::CheckScope::NewCases
+                    ) || definition.cases.is_some(),
                     "case selection is unsupported"
                 );
             }
@@ -464,7 +508,9 @@ impl CheckSupervisor {
         let overrides = self.overrides(task_id.as_deref())?;
         let changes = self.changes.files()?;
         for definition in &mut snapshot.config.definitions {
-            if let Some(auto) = overrides.auto.get(&definition.id) { definition.auto = *auto; }
+            if let Some(auto) = overrides.auto.get(&definition.id) {
+                definition.auto = *auto;
+            }
             if let Some(scope) = overrides.scopes.get(&definition.id) {
                 definition.scope = *scope;
             }
@@ -496,8 +542,10 @@ impl CheckSupervisor {
         let mut snapshot = ConfigSnapshot::load(&self.workspace)?;
         let overrides = self.overrides(task_id)?;
         for definition in &mut snapshot.config.definitions {
-            if let Some(auto) = overrides.auto.get(&definition.id) { definition.auto = *auto; }
-                if let Some(enabled) = overrides.enabled.get(&definition.id) {
+            if let Some(auto) = overrides.auto.get(&definition.id) {
+                definition.auto = *auto;
+            }
+            if let Some(enabled) = overrides.enabled.get(&definition.id) {
                 definition.enabled = *enabled;
             }
             if let Some(scope) = overrides.scopes.get(&definition.id) {
@@ -643,8 +691,10 @@ impl CheckSupervisor {
         let temporary = self
             .workspace
             .join(format!(".forge.json.{}.tmp", uuid::Uuid::new_v4()));
-        ensure!(editing.is_none_or(|permission| permission.load(Ordering::Acquire)),
-            "Check editing was disabled before configuration publication");
+        ensure!(
+            editing.is_none_or(|permission| permission.load(Ordering::Acquire)),
+            "Check editing was disabled before configuration publication"
+        );
         let publication = (|| {
             for (path, _, source) in &helpers {
                 super::config::reject_links(&self.workspace, path)?;

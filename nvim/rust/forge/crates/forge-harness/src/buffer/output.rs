@@ -40,10 +40,7 @@ impl OutputDocument {
         self.document.snapshot()
     }
 
-    pub fn demand(
-        &mut self,
-        revision: DocumentRevision,
-    ) -> Result<OutputDelivery> {
+    pub fn demand(&mut self, revision: DocumentRevision) -> Result<OutputDelivery> {
         ensure!(
             self.document.revision() == revision,
             "tool output document revision changed"
@@ -105,14 +102,15 @@ impl OutputDocument {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::tool::ToolOutputView;
+    use super::*;
 
     #[test]
     fn demand_preserves_a_line_larger_than_its_page_byte_budget() -> Result<()> {
         let line = "λ".repeat(128 * 1024);
         let output = ToolOutputView::new("call".into(), &format!("{line}\nlast\n"))?;
-        let mut document = OutputDocument::new(DocumentId("tool:large".into()), output.snapshot()?)?;
+        let mut document =
+            OutputDocument::new(DocumentId("tool:large".into()), output.snapshot()?)?;
         let first = document.demand(DocumentRevision(0))?;
         assert!(first.more);
         let snapshot = document.snapshot();

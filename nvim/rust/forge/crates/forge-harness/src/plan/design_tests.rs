@@ -60,26 +60,49 @@ pub(crate) struct DesignTestSelection {
 }
 
 /// Match a test to its declaration while rejecting ambiguous module suffixes.
-pub(super) fn declaration_line(functions: &[forge_diff::syntax::DeclarationCallable], name: &str) -> Option<u32> {
-    if let Some(function) = functions.iter().find(|function| function.owner == name) { return Some(function.line); }
-    let mut matching = functions.iter().filter(|function|
-        name.strip_suffix(&function.owner).is_some_and(|prefix| prefix.ends_with("::"))
-            || function.owner.strip_suffix(name).is_some_and(|prefix| prefix.ends_with("::")));
+pub(super) fn declaration_line(
+    functions: &[forge_diff::syntax::DeclarationCallable],
+    name: &str,
+) -> Option<u32> {
+    if let Some(function) = functions.iter().find(|function| function.owner == name) {
+        return Some(function.line);
+    }
+    let mut matching = functions.iter().filter(|function| {
+        name.strip_suffix(&function.owner)
+            .is_some_and(|prefix| prefix.ends_with("::"))
+            || function
+                .owner
+                .strip_suffix(name)
+                .is_some_and(|prefix| prefix.ends_with("::"))
+    });
     let line = matching.next()?.line;
     matching.next().is_none().then_some(line)
 }
 
 /// Remove exactly the reviewed entries, rejecting stale or ambiguous selections before mutation.
-pub(crate) fn remove(files: &mut Vec<DesignTestFile>, selected: &[DesignTestSelection]) -> Result<()> {
+pub(crate) fn remove(
+    files: &mut Vec<DesignTestFile>,
+    selected: &[DesignTestSelection],
+) -> Result<()> {
     ensure!(!selected.is_empty(), "select at least one planned test");
     let selection: BTreeSet<_> = selected.iter().collect();
     ensure!(selection.len() == selected.len(), "duplicate selected test");
     for test in &selection {
-        ensure!(files.iter().any(|file| file.file == test.file && file.cases.iter().any(|case| case.name == test.name)),
-            "selected test no longer exists: {}: {}", test.file, test.name);
+        ensure!(
+            files.iter().any(|file| file.file == test.file
+                && file.cases.iter().any(|case| case.name == test.name)),
+            "selected test no longer exists: {}: {}",
+            test.file,
+            test.name
+        );
     }
     for file in files.iter_mut() {
-        file.cases.retain(|case| !selection.contains(&DesignTestSelection { file: file.file.clone(), name: case.name.clone() }));
+        file.cases.retain(|case| {
+            !selection.contains(&DesignTestSelection {
+                file: file.file.clone(),
+                name: case.name.clone(),
+            })
+        });
     }
     files.retain(|file| !file.cases.is_empty());
     Ok(())
@@ -90,17 +113,46 @@ pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
     let mut paths = BTreeSet::new();
     for file in files {
         super::design::validate_relative_path(&file.file)?;
-        ensure!(file.file.trim() == file.file && !file.file.chars().any(char::is_control),
-            "plan test file must have a printable, unpadded path");
-        ensure!(paths.insert(&file.file), "duplicate plan test file: {}", file.file);
-        ensure!(!file.cases.is_empty(), "plan test file requires at least one case: {}", file.file);
+        ensure!(
+            file.file.trim() == file.file && !file.file.chars().any(char::is_control),
+            "plan test file must have a printable, unpadded path"
+        );
+        ensure!(
+            paths.insert(&file.file),
+            "duplicate plan test file: {}",
+            file.file
+        );
+        ensure!(
+            !file.cases.is_empty(),
+            "plan test file requires at least one case: {}",
+            file.file
+        );
         let mut names = BTreeSet::new();
         for case in &file.cases {
-            ensure!(case.target.as_ref().is_none_or(|target| !target.is_empty() && target.len() <= 256 && !target.chars().any(char::is_control)), "invalid planned test target");
-            ensure!(!case.name.is_empty() && case.name.trim() == case.name
-                && !case.name.chars().any(char::is_control), "plan test requires a nonempty, single-line name");
-            ensure!(names.insert(&case.name), "duplicate plan test: {}: {}", file.file, case.name);
-            ensure!(!case.description.trim().is_empty(), "plan test requires a description: {}: {}", file.file, case.name);
+            ensure!(
+                case.target.as_ref().is_none_or(|target| !target.is_empty()
+                    && target.len() <= 256
+                    && !target.chars().any(char::is_control)),
+                "invalid planned test target"
+            );
+            ensure!(
+                !case.name.is_empty()
+                    && case.name.trim() == case.name
+                    && !case.name.chars().any(char::is_control),
+                "plan test requires a nonempty, single-line name"
+            );
+            ensure!(
+                names.insert(&case.name),
+                "duplicate plan test: {}: {}",
+                file.file,
+                case.name
+            );
+            ensure!(
+                !case.description.trim().is_empty(),
+                "plan test requires a description: {}: {}",
+                file.file,
+                case.name
+            );
         }
     }
     Ok(())
@@ -111,34 +163,71 @@ pub(super) fn summary(files: &[DesignTestFile]) -> Vec<forge_buffer::block::Text
     let mut counts = [0usize; 4];
     for case in files.iter().flat_map(|file| &file.cases) {
         counts[match case.change {
-            DesignTestChange::New => 0, DesignTestChange::Modified => 1,
-            DesignTestChange::Removed => 2, DesignTestChange::Reused => 3,
+            DesignTestChange::New => 0,
+            DesignTestChange::Modified => 1,
+            DesignTestChange::Removed => 2,
+            DesignTestChange::Reused => 3,
         }] += 1;
     }
     let mut chunks = Vec::new();
-    for ((count, label), capture) in counts.into_iter().zip(["new", "modified", "removed", "reused"])
-        .zip(["ForgeAddRange", "ForgeModifyRange", "ForgeDeleteRange", "Comment"]) {
-        if count == 0 { continue; }
-        if !chunks.is_empty() {
-            chunks.push(forge_buffer::block::TextChunk { text: " · ".into(), capture: "Comment".into() });
+    for ((count, label), capture) in counts
+        .into_iter()
+        .zip(["new", "modified", "removed", "reused"])
+        .zip([
+            "ForgeAddRange",
+            "ForgeModifyRange",
+            "ForgeDeleteRange",
+            "Comment",
+        ])
+    {
+        if count == 0 {
+            continue;
         }
-        chunks.push(forge_buffer::block::TextChunk { text: format!("{count} {label}"), capture: capture.into() });
+        if !chunks.is_empty() {
+            chunks.push(forge_buffer::block::TextChunk {
+                text: " · ".into(),
+                capture: "Comment".into(),
+            });
+        }
+        chunks.push(forge_buffer::block::TextChunk {
+            text: format!("{count} {label}"),
+            capture: capture.into(),
+        });
     }
     if chunks.is_empty() {
-        chunks.push(forge_buffer::block::TextChunk { text: "None planned".into(), capture: "Comment".into() });
+        chunks.push(forge_buffer::block::TextChunk {
+            text: "None planned".into(),
+            capture: "Comment".into(),
+        });
     }
     chunks
 }
 
 /// Projects the complete inventory for section reads and revision diffs.
 pub(super) fn text(files: &[DesignTestFile]) -> String {
-    if files.is_empty() { return "None planned".into(); }
-    files.iter().map(|file| {
-        let cases = file.cases.iter().map(|case| format!("  {}{}\n    {}",
-            case.change.presentation().0, case.name, case.description.replace('\n', "\n    ")))
-            .collect::<Vec<_>>().join("\n");
-        format!("{}\n{cases}", file.file)
-    }).collect::<Vec<_>>().join("\n\n")
+    if files.is_empty() {
+        return "None planned".into();
+    }
+    files
+        .iter()
+        .map(|file| {
+            let cases = file
+                .cases
+                .iter()
+                .map(|case| {
+                    format!(
+                        "  {}{}\n    {}",
+                        case.change.presentation().0,
+                        case.name,
+                        case.description.replace('\n', "\n    ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n{cases}", file.file)
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -147,7 +236,12 @@ mod tests {
 
     #[test]
     fn declaration_lines_reject_ambiguous_leaf_names() {
-        let functions = forge_diff::syntax::DeclarationCalls::extract("tests.rs", "mod first { fn same(); }\nmod second { fn same(); }", true).unwrap();
+        let functions = forge_diff::syntax::DeclarationCalls::extract(
+            "tests.rs",
+            "mod first { fn same(); }\nmod second { fn same(); }",
+            true,
+        )
+        .unwrap();
         assert_eq!(declaration_line(&functions, "same"), None);
         assert_eq!(declaration_line(&functions, "crate::first::same"), Some(1));
         assert_eq!(declaration_line(&functions, "second::same"), Some(2));
@@ -155,17 +249,29 @@ mod tests {
 
     #[test]
     fn complete_inventories_and_selections_preserve_every_file_and_case() {
-        let mut files = (0..257).map(|index| DesignTestFile {
-            file: format!("tests/source_{index}.rs"),
-            cases: (0..5).map(|case| DesignTestCase {
-                name: format!("case_{case}"), target: None,
-                change: DesignTestChange::New, description: "Preserve complete coverage.".into(),
-            }).collect(),
-        }).collect::<Vec<_>>();
+        let mut files = (0..257)
+            .map(|index| DesignTestFile {
+                file: format!("tests/source_{index}.rs"),
+                cases: (0..5)
+                    .map(|case| DesignTestCase {
+                        name: format!("case_{case}"),
+                        target: None,
+                        change: DesignTestChange::New,
+                        description: "Preserve complete coverage.".into(),
+                    })
+                    .collect(),
+            })
+            .collect::<Vec<_>>();
         validate(&files).unwrap();
-        let selected = files.iter().flat_map(|file| file.cases.iter().map(|case| DesignTestSelection {
-            file: file.file.clone(), name: case.name.clone(),
-        })).collect::<Vec<_>>();
+        let selected = files
+            .iter()
+            .flat_map(|file| {
+                file.cases.iter().map(|case| DesignTestSelection {
+                    file: file.file.clone(),
+                    name: case.name.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
         assert_eq!(selected.len(), 1285);
         remove(&mut files, &selected).unwrap();
         assert!(files.is_empty());

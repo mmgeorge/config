@@ -22,9 +22,7 @@ pub struct EditLimits {
 
 impl Default for EditLimits {
     fn default() -> Self {
-        Self {
-            pending_saves: 64,
-        }
+        Self { pending_saves: 64 }
     }
 }
 

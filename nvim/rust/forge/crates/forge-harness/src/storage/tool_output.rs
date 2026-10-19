@@ -40,7 +40,10 @@ pub(super) fn initialize(connection: &mut Connection) -> Result<()> {
     for (id, payload) in records {
         let mut value: Value = serde_json::from_str(&payload)?;
         visit_output(&mut value, |turn, tool, output| {
-            transaction.execute("INSERT OR IGNORE INTO tool_output_owner VALUES(?1,?2,?3)",params![id,turn,tool])?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO tool_output_owner VALUES(?1,?2,?3)",
+                params![id, turn, tool],
+            )?;
             // Recovery can rewrite metadata with empty inline output while retaining chunks.
             if !output.is_empty() {
                 replace(&transaction, &id, turn, tool, output)?;
@@ -105,10 +108,16 @@ pub(super) fn encode(exchange: &Exchange) -> Result<String> {
 }
 
 pub(super) fn synchronize(connection: &Connection, exchange: &Exchange) -> Result<()> {
-    connection.execute("DELETE FROM tool_output_owner WHERE exchange_id=?1",[&exchange.id])?;
+    connection.execute(
+        "DELETE FROM tool_output_owner WHERE exchange_id=?1",
+        [&exchange.id],
+    )?;
     for turn in &exchange.turn {
         for tool in turn.tools() {
-            connection.execute("INSERT INTO tool_output_owner VALUES(?1,?2,?3)",params![exchange.id,turn.id(),tool.id])?;
+            connection.execute(
+                "INSERT INTO tool_output_owner VALUES(?1,?2,?3)",
+                params![exchange.id, turn.id(), tool.id],
+            )?;
             let previous = read(connection, &exchange.id, turn.id(), &tool.id)?;
             if previous != tool.output {
                 replace(connection, &exchange.id, turn.id(), &tool.id, &tool.output)?;
@@ -138,25 +147,43 @@ fn read(connection: &Connection, exchange: &str, turn: &str, tool: &str) -> Resu
 impl SqliteStore {
     /// Reads timeline metadata without hydrating any stored tool output.
     pub(crate) fn load_exchange_metadata(&self, id: &str) -> Result<Option<Exchange>> {
-        Ok(self.list_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?.pop())
+        Ok(self
+            .list_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?
+            .pop())
     }
 
     /// Reads at most 32000 characters while preserving UTF-8 across stored chunks.
-    pub(crate) fn tool_output_page(&self, exchange: &str, turn: &str, tool: &str,
-        offset: usize, limit: usize) -> Result<ToolOutputPage> {
-        ensure!((1..=32000).contains(&limit), "output limit must be from 1 to 32000 characters");
+    pub(crate) fn tool_output_page(
+        &self,
+        exchange: &str,
+        turn: &str,
+        tool: &str,
+        offset: usize,
+        limit: usize,
+    ) -> Result<ToolOutputPage> {
+        ensure!(
+            (1..=32000).contains(&limit),
+            "output limit must be from 1 to 32000 characters"
+        );
         let mut statement = self.connection.prepare(
             "SELECT byte_offset,length(cast(output AS BLOB)) FROM tool_output_chunk WHERE exchange_id=?1 AND turn_id=?2 AND tool_id=?3 ORDER BY byte_offset")?;
-        let mut rows = statement.query(params![exchange,turn,tool])?;
+        let mut rows = statement.query(params![exchange, turn, tool])?;
         let mut output = String::new();
         let mut total_chars = 0usize;
         let mut total_bytes = 0i64;
-        let page_end = offset.checked_add(limit).context("output offset exceeds supported range")?;
+        let page_end = offset
+            .checked_add(limit)
+            .context("output offset exceeds supported range")?;
         while let Some(row) = rows.next()? {
             let byte_offset: i64 = row.get(0)?;
             let bytes: i64 = row.get(1)?;
-            ensure!(byte_offset == total_bytes, "stored tool output has a discontinuous byte offset");
-            total_bytes = total_bytes.checked_add(bytes).context("tool output byte count overflow")?;
+            ensure!(
+                byte_offset == total_bytes,
+                "stored tool output has a discontinuous byte offset"
+            );
+            total_bytes = total_bytes
+                .checked_add(bytes)
+                .context("tool output byte count overflow")?;
             let mut consumed = 0i64;
             while consumed < bytes {
                 let window: Vec<u8> = self.connection.query_row(
@@ -167,17 +194,31 @@ impl SqliteStore {
                     Err(error) if error.error_len().is_none() => error.valid_up_to(),
                     Err(error) => return Err(error).context("stored tool output is not UTF-8"),
                 };
-                ensure!(valid > 0, "stored tool output has an incomplete UTF-8 character");
+                ensure!(
+                    valid > 0,
+                    "stored tool output has an incomplete UTF-8 character"
+                );
                 for character in std::str::from_utf8(&window[..valid])?.chars() {
-                    if (offset..page_end).contains(&total_chars) { output.push(character); }
-                    total_chars = total_chars.checked_add(1).context("tool output character count overflow")?;
+                    if (offset..page_end).contains(&total_chars) {
+                        output.push(character);
+                    }
+                    total_chars = total_chars
+                        .checked_add(1)
+                        .context("tool output character count overflow")?;
                 }
                 consumed += valid as i64;
             }
         }
-        ensure!(offset <= total_chars, "output offset exceeds currently recorded text");
+        ensure!(
+            offset <= total_chars,
+            "output offset exceeds currently recorded text"
+        );
         let next = page_end.min(total_chars);
-        Ok(ToolOutputPage {output,next_offset:(next < total_chars).then_some(next),total_chars})
+        Ok(ToolOutputPage {
+            output,
+            next_offset: (next < total_chars).then_some(next),
+            total_chars,
+        })
     }
 
     pub(crate) fn save_tool_output_delta(

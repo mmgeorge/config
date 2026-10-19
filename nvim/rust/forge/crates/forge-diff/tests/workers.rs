@@ -208,7 +208,9 @@ async fn reservations_bound_inputs_before_transfer_and_survive_admission_close()
     let accepted = pool
         .reserve(WorkPriority::Visible, WorkBudget::new(8, None))
         .unwrap();
-    let large = pool.reserve(WorkPriority::Foreground, WorkBudget::new(9, None)).unwrap();
+    let large = pool
+        .reserve(WorkPriority::Foreground, WorkBudget::new(9, None))
+        .unwrap();
     assert!(matches!(
         pool.reserve(WorkPriority::Foreground, WorkBudget::new(9, None)),
         Err(PoolError::Busy)

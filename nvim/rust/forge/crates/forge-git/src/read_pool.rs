@@ -102,10 +102,7 @@ struct ReadCompletion<Output> {
 
 impl BlockingReadPool {
     pub fn new(max_jobs: usize) -> Result<Self> {
-        ensure!(
-            max_jobs > 0,
-            "repository read limits must be positive"
-        );
+        ensure!(max_jobs > 0, "repository read limits must be positive");
         let (changed, _) = watch::channel(0);
         Ok(Self {
             shared: Arc::new(PoolShared {
@@ -175,7 +172,9 @@ impl BlockingReadPool {
             if state.active.len() == self.shared.max_jobs {
                 return Err(ReadAdmissionError::Busy);
             }
-            let retained = state.input_bytes.checked_add(input_bytes)
+            let retained = state
+                .input_bytes
+                .checked_add(input_bytes)
                 .ok_or(ReadAdmissionError::IdExhausted)?;
             state.next_id = state
                 .next_id

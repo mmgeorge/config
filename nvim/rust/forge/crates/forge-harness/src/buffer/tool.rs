@@ -51,9 +51,11 @@ impl ParsedOutput {
     fn new(saved: &str) -> Result<Self> {
         let collected = Arc::new(Mutex::new(Vec::new()));
         let mut output = Self {
-            display: Arc::new(String::new()), row: Arc::new(Vec::new()),
+            display: Arc::new(String::new()),
+            row: Arc::new(Vec::new()),
             parser: strip_ansi_escapes::Writer::new(OutputCollector(collected.clone())),
-            collected, total_rows: 0,
+            collected,
+            total_rows: 0,
         };
         output.append(saved)?;
         Ok(output)
@@ -62,19 +64,29 @@ impl ParsedOutput {
     fn append(&mut self, delta: &str) -> Result<()> {
         self.parser.write_all(delta.as_bytes())?;
         self.parser.flush()?;
-        let normalized = String::from_utf8(std::mem::take(&mut *self.collected.lock()
-            .map_err(|_| anyhow::anyhow!("tool output collector poisoned"))?))?;
+        let normalized = String::from_utf8(std::mem::take(
+            &mut *self
+                .collected
+                .lock()
+                .map_err(|_| anyhow::anyhow!("tool output collector poisoned"))?,
+        ))?;
         let display = Arc::make_mut(&mut self.display);
         let row = Arc::make_mut(&mut self.row);
         let mut start = display.len();
-        if !display.ends_with('\n') && let Some(previous) = row.pop() { start = previous.start; }
+        if !display.ends_with('\n')
+            && let Some(previous) = row.pop()
+        {
+            start = previous.start;
+        }
         let offset = display.len();
         display.push_str(&normalized);
         for (relative, byte) in normalized.bytes().enumerate() {
             if byte == b'\n' {
                 let end = offset + relative;
                 row.push(start..end);
-                if end > start { self.total_rows = row.len(); }
+                if end > start {
+                    self.total_rows = row.len();
+                }
                 start = end + 1;
             }
         }
@@ -86,7 +98,9 @@ impl ParsedOutput {
     }
 
     fn inline_bytes(&self) -> usize {
-        self.total_rows.checked_sub(1).map_or(0, |index| self.row[index].end)
+        self.total_rows
+            .checked_sub(1)
+            .map_or(0, |index| self.row[index].end)
     }
 }
 
@@ -105,10 +119,15 @@ struct OutputCollector(Arc<Mutex<Vec<u8>>>);
 
 impl Write for OutputCollector {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().map_err(|_| std::io::Error::other("tool output collector poisoned"))?.extend_from_slice(bytes);
+        self.0
+            .lock()
+            .map_err(|_| std::io::Error::other("tool output collector poisoned"))?
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
-    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 impl ToolOutputView {
@@ -119,14 +138,21 @@ impl ToolOutputView {
     }
 
     pub(super) fn has_unloaded_output(&self) -> bool {
-        self.file.as_ref().is_some_and(|(_, total, loaded)| loaded < total)
+        self.file
+            .as_ref()
+            .is_some_and(|(_, total, loaded)| loaded < total)
     }
 
     pub(super) fn load_prefix(&mut self, limit: usize) -> Result<()> {
-        let Some((path, total, loaded)) = self.file.clone() else { return Ok(()); };
+        let Some((path, total, loaded)) = self.file.clone() else {
+            return Ok(());
+        };
         let end = total.min(limit as u64);
-        if end <= loaded { return Ok(()); }
-        let mut file = File::open(&path).with_context(|| format!("open check output {}", path.display()))?;
+        if end <= loaded {
+            return Ok(());
+        }
+        let mut file =
+            File::open(&path).with_context(|| format!("open check output {}", path.display()))?;
         file.seek(SeekFrom::Start(loaded))?;
         let mut bytes = Vec::new();
         file.take(end - loaded).read_to_end(&mut bytes)?;
@@ -136,37 +162,54 @@ impl ToolOutputView {
             Err(_) => bytes.len(),
         };
         self.append(&String::from_utf8_lossy(&bytes[..length]))?;
-        self.file = Some((path,total,loaded + length as u64));
+        self.file = Some((path, total, loaded + length as u64));
         Ok(())
     }
 
     fn parsed(&self) -> Result<&ParsedOutput> {
-        self.parsed.get_or_init(|| ParsedOutput::new(&self.saved).map_err(|error| format!("{error:#}")))
-            .as_ref().map_err(|error| anyhow::anyhow!(error.clone()))
+        self.parsed
+            .get_or_init(|| ParsedOutput::new(&self.saved).map_err(|error| format!("{error:#}")))
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!(error.clone()))
     }
 
     pub fn snapshot(&self) -> Result<ToolOutputSnapshot> {
         let parsed = self.parsed()?;
         Ok(ToolOutputSnapshot {
-            call_id: self.call_id.clone(), saved: Arc::clone(&self.saved),
-            display: Arc::clone(&parsed.display), row: Arc::clone(&parsed.row),
-            total_rows: parsed.total_rows, loaded_rows: 0, expanded: false,
+            call_id: self.call_id.clone(),
+            saved: Arc::clone(&self.saved),
+            display: Arc::clone(&parsed.display),
+            row: Arc::clone(&parsed.row),
+            total_rows: parsed.total_rows,
+            loaded_rows: 0,
+            expanded: false,
         })
     }
     /// Retains source heading fields without copying the saved output or change tree.
     pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
         self.heading = Some(crate::turn::ToolCall {
-            started_at_ms:call.started_at_ms,completed_at_ms:call.completed_at_ms,task_id:None,
-            id:call.id.clone(),kind:call.kind.clone(),title:call.title.clone(),output:String::new(),
-            status:call.status.clone(),failed:call.failed,change:Default::default(),
+            started_at_ms: call.started_at_ms,
+            completed_at_ms: call.completed_at_ms,
+            task_id: None,
+            id: call.id.clone(),
+            kind: call.kind.clone(),
+            title: call.title.clone(),
+            output: String::new(),
+            status: call.status.clone(),
+            failed: call.failed,
+            change: Default::default(),
         });
     }
 
     /// Associates inline chunks with their containing projected entry.
-    pub(super) fn own(&mut self, owner: &str) { self.owner = owner.to_owned(); }
+    pub(super) fn own(&mut self, owner: &str) {
+        self.owner = owner.to_owned();
+    }
 
     /// Resolves the indexed entry owner for inline activation.
-    pub(super) fn owner(&self) -> &str { &self.owner }
+    pub(super) fn owner(&self) -> &str {
+        &self.owner
+    }
 
     /// Renders activation headings from source metadata rather than truncated native text.
     pub(super) fn header(&self) -> Option<&crate::turn::ToolCall> {
@@ -175,10 +218,18 @@ impl ToolOutputView {
 
     /// Keeps the parser and saved bytes while adopting newly projected heading ownership.
     pub(super) fn retain(&mut self, replacement: &Self) -> bool {
-        if let (Some((path,total,_)), Some((next_path,next_total,_))) = (&mut self.file,&replacement.file) {
-            if path != next_path || next_total < total { return false; }
+        if let (Some((path, total, _)), Some((next_path, next_total, _))) =
+            (&mut self.file, &replacement.file)
+        {
+            if path != next_path || next_total < total {
+                return false;
+            }
             *total = *next_total;
-        } else if self.saved != replacement.saved || self.file.is_some() != replacement.file.is_some() { return false; }
+        } else if self.saved != replacement.saved
+            || self.file.is_some() != replacement.file.is_some()
+        {
+            return false;
+        }
         self.heading = replacement.heading.clone();
         self.owner.clone_from(&replacement.owner);
         self.group.clone_from(&replacement.group);
@@ -188,12 +239,18 @@ impl ToolOutputView {
 
     /// Counts independent inline chunks without walking retained output rows.
     pub(super) fn inline_chunks(&self) -> Result<usize> {
-        Ok(self.parsed()?.inline_bytes().div_ceil(INLINE_CHUNK_BYTES).max(1))
+        Ok(self
+            .parsed()?
+            .inline_bytes()
+            .div_ceil(INLINE_CHUNK_BYTES)
+            .max(1))
     }
 
     /// Limits formatted source chunks independently of the retained raw output.
     pub(super) fn inline_prefix_chunks(&self, byte_limit: usize) -> Result<usize> {
-        Ok(self.inline_chunks()?.min(byte_limit.div_ceil(INLINE_CHUNK_BYTES).max(1)))
+        Ok(self
+            .inline_chunks()?
+            .min(byte_limit.div_ceil(INLINE_CHUNK_BYTES).max(1)))
     }
 
     /// Returns the first chunk whose mutable tail can change after an append.
@@ -207,7 +264,9 @@ impl ToolOutputView {
         let bytes = parsed.inline_bytes();
         let boundary = |offset: usize| {
             let mut offset = offset.min(bytes);
-            while !parsed.display.is_char_boundary(offset) { offset += 1; }
+            while !parsed.display.is_char_boundary(offset) {
+                offset += 1;
+            }
             offset
         };
         let start = boundary(index * INLINE_CHUNK_BYTES);
@@ -217,10 +276,19 @@ impl ToolOutputView {
 
     /// Retains raw output without parsing until a preview, expansion, or output view needs it.
     pub fn new(call_id: String, saved: &str) -> Result<Self> {
-        ensure!(!call_id.is_empty() && call_id.len() <= 256, "invalid tool call identity");
+        ensure!(
+            !call_id.is_empty() && call_id.len() <= 256,
+            "invalid tool call identity"
+        );
         Ok(Self {
-            call_id, file: None, saved: Arc::new(saved.to_owned()), parsed: OnceLock::new(),
-            heading: None, owner: String::new(), group: String::new(), live_preview: false,
+            call_id,
+            file: None,
+            saved: Arc::new(saved.to_owned()),
+            parsed: OnceLock::new(),
+            heading: None,
+            owner: String::new(),
+            group: String::new(),
+            live_preview: false,
         })
     }
 
@@ -229,7 +297,11 @@ impl ToolOutputView {
             Arc::make_mut(&mut self.saved).push_str(delta);
             return Ok(());
         }
-        let parsed = self.parsed.get_mut().expect("initialized parser").as_mut()
+        let parsed = self
+            .parsed
+            .get_mut()
+            .expect("initialized parser")
+            .as_mut()
             .map_err(|error| anyhow::anyhow!(error.clone()))?;
         parsed.append(delta)?;
         Arc::make_mut(&mut self.saved).push_str(delta);
@@ -238,21 +310,28 @@ impl ToolOutputView {
 
     pub fn preview(&self, expanded: bool) -> Result<ToolOutputPreview<'_>> {
         let parsed = self.parsed()?;
-        let visible = if expanded { parsed.total_rows } else { 4.min(parsed.total_rows) };
+        let visible = if expanded {
+            parsed.total_rows
+        } else {
+            4.min(parsed.total_rows)
+        };
         let start = parsed.total_rows - visible;
         Ok(ToolOutputPreview {
-            row: parsed.row[start..parsed.total_rows].iter()
-                .map(|range| &parsed.display[range.clone()]).collect(),
-            hidden_rows: parsed.total_rows.saturating_sub(visible), total_rows: parsed.total_rows,
+            row: parsed.row[start..parsed.total_rows]
+                .iter()
+                .map(|range| &parsed.display[range.clone()])
+                .collect(),
+            hidden_rows: parsed.total_rows.saturating_sub(visible),
+            total_rows: parsed.total_rows,
         })
     }
-
 }
 
 impl ToolOutputSnapshot {
     #[cfg(test)]
     pub fn retained_bytes(&self) -> usize {
-        self.saved.len() + self.display.capacity()
+        self.saved.len()
+            + self.display.capacity()
             + self.row.capacity() * std::mem::size_of::<Range<usize>>()
     }
 
@@ -277,7 +356,10 @@ impl ToolOutputSnapshot {
         }
         let mut row = Vec::new();
         let mut bytes = 0;
-        for range in self.row[self.loaded_rows..self.total_rows].iter().take(row_limit) {
+        for range in self.row[self.loaded_rows..self.total_rows]
+            .iter()
+            .take(row_limit)
+        {
             let text = &self.display[range.clone()];
             if !row.is_empty() && bytes + text.len() + 1 > byte_limit {
                 break;
@@ -297,7 +379,10 @@ impl ToolOutputSnapshot {
     /// Advances only after the owning native document accepts this exact batch.
     pub fn accept_batch(&mut self, batch: &ToolOutputBatch) -> Result<()> {
         let expected = self.next_batch(batch.row.len(), batch.byte_limit)?;
-        ensure!(expected.as_ref() == Some(batch), "tool batch differs from saved output or cursor");
+        ensure!(
+            expected.as_ref() == Some(batch),
+            "tool batch differs from saved output or cursor"
+        );
         self.loaded_rows += batch.row.len();
         Ok(())
     }
@@ -364,7 +449,10 @@ impl OwnedToolExport {
 impl Drop for OwnedToolExport {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            let _ = writeln!(std::io::stderr(), "Forge tool export cleanup failed: {error:#}");
+            let _ = writeln!(
+                std::io::stderr(),
+                "Forge tool export cleanup failed: {error:#}"
+            );
         }
     }
 }
@@ -375,21 +463,21 @@ mod tests {
 
     #[test]
     fn check_output_loads_only_requested_prefix_and_retains_unicode_boundaries() -> Result<()> {
-        let directory=tempfile::tempdir()?;
-        let path=directory.path().join("check.output");
-        let saved="αβγ output\n".repeat(20_000);
-        std::fs::write(&path,&saved)?;
-        let mut source=ToolOutputView::file("check".into(),path,saved.len() as u64)?;
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("check.output");
+        let saved = "αβγ output\n".repeat(20_000);
+        std::fs::write(&path, &saved)?;
+        let mut source = ToolOutputView::file("check".into(), path, saved.len() as u64)?;
         assert!(source.saved.is_empty());
         assert!(source.has_unloaded_output());
         source.load_prefix(1024)?;
-        assert!(source.saved.len()<=1024);
+        assert!(source.saved.len() <= 1024);
         assert!(saved.starts_with(source.saved.as_str()));
         source.load_prefix(2048)?;
-        assert!(source.saved.len()<=2048);
+        assert!(source.saved.len() <= 2048);
         assert!(saved.starts_with(source.saved.as_str()));
         source.load_prefix(saved.len())?;
-        assert_eq!(source.saved.as_str(),saved);
+        assert_eq!(source.saved.as_str(), saved);
         assert!(!source.has_unloaded_output());
         Ok(())
     }
@@ -422,7 +510,10 @@ mod tests {
         source.append("last output after previous threshold\n")?;
         let preview = source.preview(true)?;
         assert_eq!(preview.total_rows, row_count + 1);
-        assert_eq!(preview.row.last().copied(), Some("last output after previous threshold"));
+        assert_eq!(
+            preview.row.last().copied(),
+            Some("last output after previous threshold")
+        );
         let directory = tempfile::tempdir()?;
         let snapshot = source.snapshot()?;
         let export = snapshot.export_saved_output(directory.path())?;
@@ -436,7 +527,10 @@ mod tests {
     fn deferred_output_parses_once_on_demand_and_retains_incremental_state() {
         let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
         output.append("1msecond").unwrap();
-        assert!(output.parsed.get().is_none(), "closed output must retain only raw bytes");
+        assert!(
+            output.parsed.get().is_none(),
+            "closed output must retain only raw bytes"
+        );
         assert_eq!(output.preview(true).unwrap().row, ["first", "second"]);
         output.append("\u{1b}[0m third\n").unwrap();
         assert_eq!(output.preview(true).unwrap().row, ["first", "second third"]);
@@ -447,11 +541,17 @@ mod tests {
         let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
         let mut snapshot = output.snapshot().unwrap();
         assert!(Arc::ptr_eq(&output.saved, &snapshot.saved));
-        assert!(Arc::ptr_eq(&output.parsed().unwrap().display, &snapshot.display));
+        assert!(Arc::ptr_eq(
+            &output.parsed().unwrap().display,
+            &snapshot.display
+        ));
         assert!(Arc::ptr_eq(&output.parsed().unwrap().row, &snapshot.row));
         output.append("1msecond\u{1b}[0m\n").unwrap();
         snapshot.expand();
-        assert_eq!(snapshot.next_batch(256, 65536).unwrap().unwrap().row, ["first"]);
+        assert_eq!(
+            snapshot.next_batch(256, 65536).unwrap().unwrap().row,
+            ["first"]
+        );
         assert_eq!(output.preview(true).unwrap().row, ["first", "second"]);
         assert_eq!(snapshot.saved.as_str(), "first\n\u{1b}[3");
     }
@@ -459,23 +559,44 @@ mod tests {
     #[test]
     fn append_preserves_fragmented_ansi_partial_rows_and_trailing_blanks() {
         let mut output = ToolOutputView::new("call".into(), "").unwrap();
-        for chunk in ["\u{1b}[3", "1mλ", "\r", "\n\n", "tail", " continued\u{1b}[", "0m\n\n"] {
+        for chunk in [
+            "\u{1b}[3",
+            "1mλ",
+            "\r",
+            "\n\n",
+            "tail",
+            " continued\u{1b}[",
+            "0m\n\n",
+        ] {
             output.append(chunk).unwrap();
         }
-        assert_eq!(output.preview(false).unwrap().row,vec!["λ","","tail continued"]);
-        assert_eq!(output.preview(false).unwrap().total_rows,3);
+        assert_eq!(
+            output.preview(false).unwrap().row,
+            vec!["λ", "", "tail continued"]
+        );
+        assert_eq!(output.preview(false).unwrap().total_rows, 3);
         output.append("last").unwrap();
-        assert_eq!(output.preview(true).unwrap().row,vec!["λ","","tail continued","","last"]);
-        assert_eq!(output.preview(false).unwrap().hidden_rows,1);
+        assert_eq!(
+            output.preview(true).unwrap().row,
+            vec!["λ", "", "tail continued", "", "last"]
+        );
+        assert_eq!(output.preview(false).unwrap().hidden_rows, 1);
     }
 
     #[test]
     fn preview_keeps_latest_four_lines_and_counts_earlier_lines() {
         for count in 0usize..=6 {
-            let saved = (0..count).map(|index| format!("line {index}\n")).collect::<String>();
+            let saved = (0..count)
+                .map(|index| format!("line {index}\n"))
+                .collect::<String>();
             let view = ToolOutputView::new("call".into(), &saved).unwrap();
             let preview = view.preview(false).unwrap();
-            assert_eq!(preview.row, (count.saturating_sub(4)..count).map(|index| format!("line {index}")).collect::<Vec<_>>());
+            assert_eq!(
+                preview.row,
+                (count.saturating_sub(4)..count)
+                    .map(|index| format!("line {index}"))
+                    .collect::<Vec<_>>()
+            );
             assert_eq!(preview.hidden_rows, count.saturating_sub(4));
         }
     }
@@ -488,9 +609,15 @@ mod tests {
         output.append(" continued\n\u{1b}[3")?;
         output.append("2msix\u{1b}[0m\n")?;
         assert_eq!(output.parsed()? as *const ParsedOutput, parser);
-        assert_eq!(output.preview(false)?.row, ["three", "four", "five continued", "six"]);
+        assert_eq!(
+            output.preview(false)?.row,
+            ["three", "four", "five continued", "six"]
+        );
         assert_eq!(output.preview(false)?.hidden_rows, 2);
-        assert_eq!(output.preview(true)?.row, ["one", "two", "three", "four", "five continued", "six"]);
+        assert_eq!(
+            output.preview(true)?.row,
+            ["one", "two", "three", "four", "five continued", "six"]
+        );
         Ok(())
     }
 
@@ -524,7 +651,11 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let saved = "\u{1b}[31mred\u{1b}[0m\r\n\0tail\n";
         let view = ToolOutputView::new("call".into(), saved).unwrap();
-        let mut export = view.snapshot().unwrap().export_saved_output(directory.path()).unwrap();
+        let mut export = view
+            .snapshot()
+            .unwrap()
+            .export_saved_output(directory.path())
+            .unwrap();
         let path = export.path().unwrap().to_owned();
         assert_eq!(std::fs::read(&path).unwrap(), saved.as_bytes());
         export.close().unwrap();
@@ -545,7 +676,10 @@ mod tests {
 
     #[test]
     fn rejected_delivery_does_not_advance_the_output_cursor() {
-        let mut view = ToolOutputView::new("call".into(), "first\nlast\n").unwrap().snapshot().unwrap();
+        let mut view = ToolOutputView::new("call".into(), "first\nlast\n")
+            .unwrap()
+            .snapshot()
+            .unwrap();
         view.expand();
         let mut batch = view.next_batch(1, 65536).unwrap().unwrap();
         batch.complete = true;

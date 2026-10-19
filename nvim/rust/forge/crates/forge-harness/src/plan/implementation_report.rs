@@ -137,11 +137,7 @@ impl ImplementationReport {
                     file.contract.push("Planned file is absent".into());
                 } else if !original.baseline.contains_key(&path)
                     && initial.is_some_and(|initial| {
-                        initial
-                            .read(objects, &path)
-                            .ok()
-                            .flatten()
-                            .is_some()
+                        initial.read(objects, &path).ok().flatten().is_some()
                     })
                 {
                     file.contract
@@ -203,8 +199,14 @@ impl ImplementationReport {
                     Ok(observed) => {
                         let mut observed = super::calls::from_extracted(observed);
                         let mut actual_design = original.clone();
-                        actual_design.proposed.insert(path.clone(), overview.clone());
-                        let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &actual_design, false)?;
+                        actual_design
+                            .proposed
+                            .insert(path.clone(), overview.clone());
+                        let mut resolver = crate::declaration::DeclarationResolver::planned(
+                            workspace,
+                            &actual_design,
+                            false,
+                        )?;
                         super::calls::classify(&path, &mut observed, &mut resolver);
                         let planned = original
                             .proposed_calls
@@ -284,10 +286,7 @@ impl ImplementationReport {
     }
 
     pub fn load(objects: &ObjectStore, reference: &ImplementationReportRef) -> Result<Self> {
-        serde_json::from_slice(
-            &objects.get(&reference.object_id)?,
-        )
-        .map_err(Into::into)
+        serde_json::from_slice(&objects.get(&reference.object_id)?).map_err(Into::into)
     }
 }
 
@@ -316,9 +315,23 @@ mod tests {
         let mut design = DeclarationDesign::default();
         design.proposed.insert("lib.rs".into(), overview);
         design.proposed_calls.insert("lib.rs".into(), body);
-        let (report, _) = report().capture(&design, None, None, &objects, workspace.path()).unwrap();
-        assert!(report.file[0].references.iter().any(|reference| reference.category == "Constructs" && reference.expected == Some(Vec::new()) && reference.observed == ["Weapon"]));
-        assert!(!report.file[0].references.iter().any(|reference| reference.category == "Accesses"));
+        let (report, _) = report()
+            .capture(&design, None, None, &objects, workspace.path())
+            .unwrap();
+        assert!(
+            report.file[0]
+                .references
+                .iter()
+                .any(|reference| reference.category == "Constructs"
+                    && reference.expected == Some(Vec::new())
+                    && reference.observed == ["Weapon"])
+        );
+        assert!(
+            !report.file[0]
+                .references
+                .iter()
+                .any(|reference| reference.category == "Accesses")
+        );
     }
 
     #[test]

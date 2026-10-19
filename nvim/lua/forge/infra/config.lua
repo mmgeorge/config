@@ -122,6 +122,9 @@
 ---@field scroll_next ForgeKeymap
 ---@field previous_value ForgeKeymap
 ---@field next_value ForgeKeymap
+---@field next_field ForgeKeymap
+---@field previous_field ForgeKeymap
+---@field toggle_field ForgeKeymap
 ---@field focus_input ForgeKeymap
 ---@field submit_input ForgeKeymap
 ---@field close ForgeKeymap
@@ -345,6 +348,9 @@ M.defaults = {
       scroll_next = "<PageDown>",
       previous_value = { "<Left>", "r" },
       next_value = { "<Right>", "h" },
+      next_field = "<Tab>",
+      previous_field = "<S-Tab>",
+      toggle_field = "<Space>",
       focus_input = "go",
       submit_input = "<C-s>",
       clear_input = "<C-c>",

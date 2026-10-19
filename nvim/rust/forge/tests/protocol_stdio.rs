@@ -102,15 +102,26 @@ impl HostProcess {
             if pending_query.is_some() && message["id"].as_u64() == pending_query {
                 pending_query = None;
                 assert!(message.get("error").is_none(), "{message}");
-                let running_with_output = message["result"].as_array().unwrap().iter().any(|exchange| {
-                    exchange["state"] == "running"
-                        && exchange["turn"].as_array().is_some_and(|turns| turns.iter().any(|turn| {
-                            turn["message"].as_array().is_some_and(|messages| messages.iter().any(|message| {
-                                message["kind"] == "assistant"
-                                    && message["text"].as_str().is_some_and(|text| !text.is_empty())
-                            }))
-                        }))
-                });
+                let running_with_output =
+                    message["result"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .any(|exchange| {
+                            exchange["state"] == "running"
+                                && exchange["turn"].as_array().is_some_and(|turns| {
+                                    turns.iter().any(|turn| {
+                                        turn["message"].as_array().is_some_and(|messages| {
+                                            messages.iter().any(|message| {
+                                                message["kind"] == "assistant"
+                                                    && message["text"]
+                                                        .as_str()
+                                                        .is_some_and(|text| !text.is_empty())
+                                            })
+                                        })
+                                    })
+                                })
+                        });
                 if running_with_output {
                     break;
                 }
@@ -118,7 +129,8 @@ impl HostProcess {
             if changed && pending_query.is_none() {
                 changed = false;
                 pending_query = Some(next_query);
-                self.send(json!({"id":next_query,"method":"exchange.list","params":{}})).await;
+                self.send(json!({"id":next_query,"method":"exchange.list","params":{}}))
+                    .await;
                 next_query += 1;
             }
         }

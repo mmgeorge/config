@@ -252,10 +252,7 @@ fn unix_seconds() -> Result<i64> {
 }
 
 fn validate_cursor(cursor: &str) -> Result<()> {
-    ensure!(
-        !cursor.is_empty(),
-        "GitHub issue cursor has invalid length"
-    );
+    ensure!(!cursor.is_empty(), "GitHub issue cursor has invalid length");
     Ok(())
 }
 

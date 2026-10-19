@@ -171,7 +171,9 @@ impl SyntaxLanguage {
             Self::Wgsl => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_wgsl) }),
             Self::Latex => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_latex) }),
             Self::Cue => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_cue) }),
-            Self::Algorithm => Language::new(unsafe { LanguageFn::from_raw(tree_sitter_algorithm) }),
+            Self::Algorithm => {
+                Language::new(unsafe { LanguageFn::from_raw(tree_sitter_algorithm) })
+            }
         }
     }
 }

@@ -189,7 +189,8 @@ fn declaration_boundary_arrow_types_and_literals_remain_unchanged() {
             "/* Documentation ending in =>\n*/\nexport type Label = string;\n",
         ] {
             assert_eq!(
-                declaration_surrogate(DeclarationOverview::language(path).unwrap(), source).unwrap(),
+                declaration_surrogate(DeclarationOverview::language(path).unwrap(), source)
+                    .unwrap(),
                 source,
             );
             check(path, source);
@@ -217,7 +218,10 @@ fn declaration_boundary_callable_arrows_complete_only_expression_bodies() {
             "export type Invalid = (value: string) =>;\n",
             "export const run = (value: string) => { return value; };\n",
         ] {
-            assert!(DeclarationOverview::parse(path, source).is_err(), "{source}");
+            assert!(
+                DeclarationOverview::parse(path, source).is_err(),
+                "{source}"
+            );
         }
     }
 }
@@ -407,7 +411,9 @@ fn lua_literal_require_without_parentheses_is_admitted_before_formatting() {
         "module.lua",
         "local module = require 'platform.module'\nreturn module\n",
     );
-    assert!(DeclarationOverview::parse("module.lua", "local module = require(module_name)\n").is_err());
+    assert!(
+        DeclarationOverview::parse("module.lua", "local module = require(module_name)\n").is_err()
+    );
 }
 
 #[test]

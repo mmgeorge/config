@@ -2,6 +2,7 @@ use crate::backend::{BackendEvent, BackendEventSink};
 use crate::permissions::command::{
     broad_command_pattern, exact_command_pattern, normalize_command_in,
 };
+use crate::permissions::directory::{DirectoryGrant, DirectoryOperation, DirectoryPolicy};
 use crate::permissions::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision,
@@ -11,7 +12,6 @@ use crate::permissions::matcher::{
 };
 use crate::permissions::shell::{self, CommandAnalysisFailure, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
-use crate::permissions::directory::{DirectoryGrant, DirectoryOperation, DirectoryPolicy};
 use crate::session::{InputDeadline, InputTimeout, PermissionMode, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -117,7 +117,9 @@ struct PendingRegistration<'registry> {
 impl Drop for PendingRegistration<'_> {
     fn drop(&mut self) {
         if let Ok(mut pending) = self.registry.lock()
-            && pending.get(&self.id).is_some_and(|entry| entry.token == self.token)
+            && pending
+                .get(&self.id)
+                .is_some_and(|entry| entry.token == self.token)
         {
             pending.remove(&self.id);
         }
@@ -145,20 +147,41 @@ impl PermissionCoordinator {
         }
     }
 
-    pub(crate) fn directories(self: &Arc<Self>, root: Option<&Path>, request: &crate::backend::BackendRequest) -> Result<DirectoryExecution> {
+    pub(crate) fn directories(
+        self: &Arc<Self>,
+        root: Option<&Path>,
+        request: &crate::backend::BackendRequest,
+    ) -> Result<DirectoryExecution> {
         let owner = request.owner()?;
-        let policy = Arc::new(DirectoryPolicy { access: request.access.clone(),
-            workspace: request.workspace.clone().into(), session_id: request.harness_session_id.clone(),
-            settings_root: root.map(Path::to_owned) });
-        let mut directory = self.directory_by_owner.lock().map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
-        anyhow::ensure!(!directory.contains_key(&owner), "directory access already belongs to an active execution");
+        let policy = Arc::new(DirectoryPolicy {
+            access: request.access.clone(),
+            workspace: request.workspace.clone().into(),
+            session_id: request.harness_session_id.clone(),
+            settings_root: root.map(Path::to_owned),
+        });
+        let mut directory = self
+            .directory_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))?;
+        anyhow::ensure!(
+            !directory.contains_key(&owner),
+            "directory access already belongs to an active execution"
+        );
         directory.insert(owner.clone(), policy.clone());
-        Ok(DirectoryExecution { owner, policy, coordinator: self.clone() })
+        Ok(DirectoryExecution {
+            owner,
+            policy,
+            coordinator: self.clone(),
+        })
     }
 
     /// Bind selected bundle access to one provider execution and revoke it when the guard drops.
-    pub(crate) fn skills(self: &Arc<Self>, root: Option<&Path>, request: &crate::backend::BackendRequest,
-        backend: crate::backend::BackendKind) -> Result<crate::skill::SkillExecution> {
+    pub(crate) fn skills(
+        self: &Arc<Self>,
+        root: Option<&Path>,
+        request: &crate::backend::BackendRequest,
+        backend: crate::backend::BackendKind,
+    ) -> Result<crate::skill::SkillExecution> {
         let (provider, target) = match backend {
             crate::backend::BackendKind::Codex => ("codex", "codexcli"),
             crate::backend::BackendKind::Copilot => ("copilot", "copilotcli"),
@@ -166,58 +189,121 @@ impl PermissionCoordinator {
             crate::backend::BackendKind::Antigravity => ("antigravity", "antigravity-cli"),
             _ => ("mock", "mock"),
         };
-        let selected = if request.mode == crate::backend::PromptMode::Background { Vec::new() } else if let Some(root) = root {
-            crate::settings::SessionResources::load(root, &crate::backend::BackendCatalogRequest {
-                execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),
-                workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,
-                backend_session_id:request.backend_session_id.clone(),
-            }, provider, target)?.selected_skill
-        } else { Vec::new() };
-        let access = Arc::new(crate::skill::SkillAccess::new(&request.workspace, &selected)?);
+        let selected = if request.mode == crate::backend::PromptMode::Background {
+            Vec::new()
+        } else if let Some(root) = root {
+            crate::settings::SessionResources::load(
+                root,
+                &crate::backend::BackendCatalogRequest {
+                    execution_owner: request.execution_owner.clone(),
+                    harness_session_id: request.harness_session_id.clone(),
+                    workspace: request.workspace.clone(),
+                    access: request.access.clone(),
+                    execution_mode: request.execution_mode,
+                    backend_session_id: request.backend_session_id.clone(),
+                },
+                provider,
+                target,
+            )?
+            .selected_skill
+        } else {
+            Vec::new()
+        };
+        let access = Arc::new(crate::skill::SkillAccess::new(
+            &request.workspace,
+            &selected,
+        )?);
         let owner = request.owner()?;
-        let mut scope = self.skill_by_owner.lock().map_err(|_|anyhow::anyhow!("skill permission lock poisoned"))?;
-        anyhow::ensure!(!scope.contains_key(&owner), "skill access already belongs to an active execution");
+        let mut scope = self
+            .skill_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
+        anyhow::ensure!(
+            !scope.contains_key(&owner),
+            "skill access already belongs to an active execution"
+        );
         scope.insert(owner.clone(), access.clone());
-        Ok(crate::skill::SkillExecution { observer:Arc::new(Mutex::new(crate::skill::SkillObserver::new(access.clone()))),
-            access, owner, coordinator:self.clone() })
+        Ok(crate::skill::SkillExecution {
+            observer: Arc::new(Mutex::new(crate::skill::SkillObserver::new(access.clone()))),
+            access,
+            owner,
+            coordinator: self.clone(),
+        })
     }
 
     /// Revoke only the matching execution generation's temporary bundle grants.
-    pub(crate) fn release_skills(&self, owner: &crate::backend::ExecutionOwner, access: &Arc<crate::skill::SkillAccess>) {
+    pub(crate) fn release_skills(
+        &self,
+        owner: &crate::backend::ExecutionOwner,
+        access: &Arc<crate::skill::SkillAccess>,
+    ) {
         if let Ok(mut scope) = self.skill_by_owner.lock()
-            && scope.get(owner).is_some_and(|current| Arc::ptr_eq(current, access)) {
+            && scope
+                .get(owner)
+                .is_some_and(|current| Arc::ptr_eq(current, access))
+        {
             scope.remove(owner);
         }
     }
 
     /// Configure future requests without extending any pending deadline.
     pub fn configure_timeout(&self, session_id: &str, timeout: InputTimeout) -> Result<()> {
-        self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .entry(session_id.to_owned()).or_default().0 = timeout.validate()?;
+        self.timeout_by_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .entry(session_id.to_owned())
+            .or_default()
+            .0 = timeout.validate()?;
         Ok(())
     }
 
     /// Publish both future-input settings without touching pending requests.
-    pub fn configure_input_timeouts(&self, session_id: &str, approval: InputTimeout, answer: InputTimeout) -> Result<()> {
-        self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .insert(session_id.to_owned(), (approval.validate()?, answer.validate()?));
+    pub fn configure_input_timeouts(
+        &self,
+        session_id: &str,
+        approval: InputTimeout,
+        answer: InputTimeout,
+    ) -> Result<()> {
+        self.timeout_by_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .insert(
+                session_id.to_owned(),
+                (approval.validate()?, answer.validate()?),
+            );
         Ok(())
     }
 
     /// Read the current settings for one session independently of active provider work.
     pub fn input_timeouts(&self, session_id: &str) -> Result<(InputTimeout, InputTimeout)> {
-        Ok(self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .get(session_id).copied().unwrap_or_default())
+        Ok(self
+            .timeout_by_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .get(session_id)
+            .copied()
+            .unwrap_or_default())
     }
 
     /// Consume one owner's automatic-rejection guidance at its next continuation boundary.
-    pub fn take_timeout_feedback(&self, owner: &crate::backend::ExecutionOwner) -> Result<Option<String>> {
-        Ok(self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.remove(owner))
+    pub fn take_timeout_feedback(
+        &self,
+        owner: &crate::backend::ExecutionOwner,
+    ) -> Result<Option<String>> {
+        Ok(self
+            .feedback_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
+            .remove(owner))
     }
 
     /// Check whether one owner needs a serialized continuation after denial.
     pub fn has_timeout_feedback(&self, owner: &crate::backend::ExecutionOwner) -> Result<bool> {
-        Ok(self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.contains_key(owner))
+        Ok(self
+            .feedback_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
+            .contains_key(owner))
     }
 
     pub fn store(&self) -> Arc<RwLock<PermissionStore>> {
@@ -239,7 +325,8 @@ impl PermissionCoordinator {
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        self.authorize_callback(execution_mode, false, request, address, event_sink).await
+        self.authorize_callback(execution_mode, false, request, address, event_sink)
+            .await
     }
 
     /// Preserve mandatory provider prompts even when ordinary approval handling bypasses prompts.
@@ -251,16 +338,28 @@ impl PermissionCoordinator {
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        let directory_policy = address.as_ref().and_then(|address| address.owner.as_ref())
-            .map(|owner| self.directory_by_owner.lock()
-                .map(|directory| directory.get(owner).cloned())
-                .map_err(|_| anyhow::anyhow!("directory permission lock poisoned")))
-            .transpose()?.flatten();
+        let directory_policy = address
+            .as_ref()
+            .and_then(|address| address.owner.as_ref())
+            .map(|owner| {
+                self.directory_by_owner
+                    .lock()
+                    .map(|directory| directory.get(owner).cloned())
+                    .map_err(|_| anyhow::anyhow!("directory permission lock poisoned"))
+            })
+            .transpose()?
+            .flatten();
         let evaluated = (|| -> Result<PermissionEvaluation> {
-            let store = self.store.read().map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
+            let store = self
+                .store
+                .read()
+                .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?;
             if let Some(policy) = &directory_policy {
-                let mut evaluation = policy.evaluate(&store.compiled(), execution_mode, &mut request)?;
-                if protected_target(&request, &store) { evaluation.decision = PermissionDecision::Deny; }
+                let mut evaluation =
+                    policy.evaluate(&store.compiled(), execution_mode, &mut request)?;
+                if protected_target(&request, &store) {
+                    evaluation.decision = PermissionDecision::Deny;
+                }
                 Ok(evaluation)
             } else {
                 Ok(store.compiled().evaluate(execution_mode, &request)?)
@@ -270,29 +369,66 @@ impl PermissionCoordinator {
             Ok(evaluation) => evaluation,
             Err(error) => {
                 if let Some(sink) = event_sink {
-                    sink.send_wait(BackendEvent { received_at_ms: None, address: address.clone(), turn_boundary: None,
-                        kind: "error".into(), text: Some(format!("Permission evaluation failed: {error:#}")),
-                        data: json!({"error":format!("{error:#}")}), activity: None, summary: None, task_update: None }).await?;
+                    sink.send_wait(BackendEvent {
+                        received_at_ms: None,
+                        address: address.clone(),
+                        turn_boundary: None,
+                        kind: "error".into(),
+                        text: Some(format!("Permission evaluation failed: {error:#}")),
+                        data: json!({"error":format!("{error:#}")}),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    })
+                    .await?;
                 }
                 return Err(error);
             }
         };
         if !forced && evaluation.decision != PermissionDecision::Deny {
-            let scopes = self.skill_by_owner.lock().map_err(|_|anyhow::anyhow!("skill permission lock poisoned"))?;
-            let access = address.as_ref().and_then(|address|address.owner.as_ref())
-                .and_then(|owner|scopes.get(owner).cloned());
+            let scopes = self
+                .skill_by_owner
+                .lock()
+                .map_err(|_| anyhow::anyhow!("skill permission lock poisoned"))?;
+            let access = address
+                .as_ref()
+                .and_then(|address| address.owner.as_ref())
+                .and_then(|owner| scopes.get(owner).cloned());
             drop(scopes);
             if let Some(access) = access {
                 let mut granted = Vec::new();
-                let targets = request.target_list.iter().chain(evaluation.pending_target_list.iter());
+                let targets = request
+                    .target_list
+                    .iter()
+                    .chain(evaluation.pending_target_list.iter());
                 for target in targets {
-                    if !access.approves(target) { continue; }
-                    if matches!(target,PermissionTarget::Command {..}) && evaluation.pending_command_list.iter()
-                        .any(|command| &command.target == target && command.source.contains(['>', '<'])) { continue; }
+                    if !access.approves(target) {
+                        continue;
+                    }
+                    if matches!(target, PermissionTarget::Command { .. })
+                        && evaluation.pending_command_list.iter().any(|command| {
+                            &command.target == target && command.source.contains(['>', '<'])
+                        })
+                    {
+                        continue;
+                    }
                     let canonical = access.permission_paths(target);
-                    let mut canonical = PermissionRequest { id:request.id.clone(),provider:request.provider.clone(),reason:None,
-                        target_list:canonical.into_iter().map(|path|PermissionTarget::Read {path:path.display().to_string()}).collect() };
-                    let compiled = self.store.read().map_err(|_|anyhow::anyhow!("permission store lock poisoned"))?.compiled();
+                    let mut canonical = PermissionRequest {
+                        id: request.id.clone(),
+                        provider: request.provider.clone(),
+                        reason: None,
+                        target_list: canonical
+                            .into_iter()
+                            .map(|path| PermissionTarget::Read {
+                                path: path.display().to_string(),
+                            })
+                            .collect(),
+                    };
+                    let compiled = self
+                        .store
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                        .compiled();
                     let canonical = if let Some(policy) = &directory_policy {
                         policy.evaluate(&compiled, execution_mode, &mut canonical)?
                     } else {
@@ -303,9 +439,15 @@ impl PermissionCoordinator {
                     }
                     granted.push(target.clone());
                 }
-                evaluation.pending_target_list.retain(|target|!granted.contains(target));
-                evaluation.pending_command_list.retain(|command|!granted.contains(&command.target));
-                if evaluation.pending_target_list.is_empty() { evaluation.decision = PermissionDecision::Allow; }
+                evaluation
+                    .pending_target_list
+                    .retain(|target| !granted.contains(target));
+                evaluation
+                    .pending_command_list
+                    .retain(|command| !granted.contains(&command.target));
+                if evaluation.pending_target_list.is_empty() {
+                    evaluation.decision = PermissionDecision::Allow;
+                }
             }
         }
         match evaluation.decision {
@@ -323,48 +465,113 @@ impl PermissionCoordinator {
         let id = request.id.clone();
         let mut view = approval_view(&request, &evaluation);
         if let Some(policy) = &directory_policy {
-            for (item, target) in view.item_list.iter_mut().zip(&evaluation.pending_target_list) {
+            for (item, target) in view
+                .item_list
+                .iter_mut()
+                .zip(&evaluation.pending_target_list)
+            {
                 if let Some(grant) = policy.grant(target)? {
-                    if !crate::permissions::matcher::path_starts_with(Path::new(&grant.path), &dunce::canonicalize(&policy.workspace)?) {
+                    if !crate::permissions::matcher::path_starts_with(
+                        Path::new(&grant.path),
+                        &dunce::canonicalize(&policy.workspace)?,
+                    ) {
                         for choice in &mut item.choice_list {
-                            if matches!(choice.resolution, ApprovalResolution::AllowBroad | ApprovalResolution::DenyBroad) {
-                                for (_, pattern) in &mut choice.rule_list { *pattern = grant.path.clone(); }
-                                let action = if choice.resolution == ApprovalResolution::AllowBroad { "allow" } else { "deny" };
+                            if matches!(
+                                choice.resolution,
+                                ApprovalResolution::AllowBroad | ApprovalResolution::DenyBroad
+                            ) {
+                                for (_, pattern) in &mut choice.rule_list {
+                                    *pattern = grant.path.clone();
+                                }
+                                let action = if choice.resolution == ApprovalResolution::AllowBroad
+                                {
+                                    "allow"
+                                } else {
+                                    "deny"
+                                };
                                 choice.label = format!("Always {action} directory: {}", grant.path);
                             }
                         }
                     }
-                    if policy.settings_root.is_none() { continue; }
-                    let label = match grant.operation { DirectoryOperation::Read => "readable", DirectoryOperation::Write => "writable" };
-                    item.choice_list.insert(1, ApprovalChoice { id: "allow_global_directory".into(),
-                        label: format!("Allow and add to global {label} directories: {}", grant.path),
-                        resolution: ApprovalResolution::AllowOnce, rule_list: Vec::new(), directory: Some(grant) });
+                    if policy.settings_root.is_none() {
+                        continue;
+                    }
+                    let label = match grant.operation {
+                        DirectoryOperation::Read => "readable",
+                        DirectoryOperation::Write => "writable",
+                    };
+                    item.choice_list.insert(
+                        1,
+                        ApprovalChoice {
+                            id: "allow_global_directory".into(),
+                            label: format!(
+                                "Allow and add to global {label} directories: {}",
+                                grant.path
+                            ),
+                            resolution: ApprovalResolution::AllowOnce,
+                            rule_list: Vec::new(),
+                            directory: Some(grant),
+                        },
+                    );
                 }
             }
         }
         if execution_mode == PermissionMode::Read
-            && execution_owner.as_ref().is_none_or(crate::backend::ExecutionOwner::is_root)
-            && evaluation.pending_target_list.iter().any(|target| matches!(target,
-                PermissionTarget::Write { .. } | PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }))
+            && execution_owner
+                .as_ref()
+                .is_none_or(crate::backend::ExecutionOwner::is_root)
+            && evaluation.pending_target_list.iter().any(|target| {
+                matches!(
+                    target,
+                    PermissionTarget::Write { .. }
+                        | PermissionTarget::UnknownFile {
+                            operation: DirectoryOperation::Write
+                        }
+                )
+            })
         {
             view.required_mode = Some(PermissionMode::Write);
             for item in &mut view.item_list {
-                item.choice_list.retain(|choice| matches!(choice.resolution,
-                    ApprovalResolution::DenyOnce | ApprovalResolution::Cancel));
+                item.choice_list.retain(|choice| {
+                    matches!(
+                        choice.resolution,
+                        ApprovalResolution::DenyOnce | ApprovalResolution::Cancel
+                    )
+                });
             }
         }
         view.execution_owner = execution_owner;
-        let timeout = self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
-            .get(view.execution_owner.as_ref().map(|owner| owner.session_id.as_str()).unwrap_or_default())
-            .copied().unwrap_or_default().0;
-        let now_ms = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?;
+        let timeout = self
+            .timeout_by_session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .get(
+                view.execution_owner
+                    .as_ref()
+                    .map(|owner| owner.session_id.as_str())
+                    .unwrap_or_default(),
+            )
+            .copied()
+            .unwrap_or_default()
+            .0;
+        let now_ms = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis(),
+        )?;
         view.deadline = timeout.deadline(now_ms)?;
         let expires = tokio::time::Instant::now() + timeout.duration();
         let (sender, mut receiver) = oneshot::channel();
         let token = Uuid::new_v4();
         {
-            let mut pending = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-            anyhow::ensure!(!pending.contains_key(&id), "approval request {id} is already pending");
+            let mut pending = self
+                .pending_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            anyhow::ensure!(
+                !pending.contains_key(&id),
+                "approval request {id} is already pending"
+            );
             pending.insert(
                 id.clone(),
                 PendingApproval {
@@ -376,7 +583,11 @@ impl PermissionCoordinator {
                 },
             );
         }
-        let _registration = PendingRegistration { registry: &self.pending_map, id: id.clone(), token };
+        let _registration = PendingRegistration {
+            registry: &self.pending_map,
+            id: id.clone(),
+            token,
+        };
         if let Some(event_sink) = event_sink {
             event_sink
                 .send_wait(BackendEvent {
@@ -393,7 +604,9 @@ impl PermissionCoordinator {
                 .await?;
         }
         let expiry = async {
-            if timeout.amount == 0 { std::future::pending::<()>().await; }
+            if timeout.amount == 0 {
+                std::future::pending::<()>().await;
+            }
             tokio::time::sleep_until(expires).await;
         };
         tokio::select! {
@@ -427,7 +640,9 @@ impl PermissionCoordinator {
             .pending_map
             .lock()
             .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-        let Some(approval) = pending.get_mut(id) else { return Ok(None); };
+        let Some(approval) = pending.get_mut(id) else {
+            return Ok(None);
+        };
         anyhow::ensure!(
             approval
                 .view
@@ -465,8 +680,14 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .get(approval_id)
                 .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
-            anyhow::ensure!(!pending.view.deadline.as_ref().is_some_and(|deadline| deadline.expired(0)),
-                "approval request timed out: {approval_id}");
+            anyhow::ensure!(
+                !pending
+                    .view
+                    .deadline
+                    .as_ref()
+                    .is_some_and(|deadline| deadline.expired(0)),
+                "approval request timed out: {approval_id}"
+            );
             anyhow::ensure!(
                 answer_list.len() == pending.view.item_list.len(),
                 "every approval item requires one answer"
@@ -494,7 +715,9 @@ impl PermissionCoordinator {
                     .find(|choice| &choice.id == *choice_id)
                     .with_context(|| format!("unknown approval choice: {choice_id}"))?;
                 if let Some(directory) = &choice.directory {
-                    if !directory_list.contains(directory) { directory_list.push(directory.clone()); }
+                    if !directory_list.contains(directory) {
+                        directory_list.push(directory.clone());
+                    }
                 }
                 match choice.resolution {
                     ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
@@ -545,20 +768,26 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .remove(approval_id)
                 .expect("validated approval must remain pending while locked");
-            if resolution != ApprovalResolution::AllowOnce { directory_list.clear(); }
+            if resolution != ApprovalResolution::AllowOnce {
+                directory_list.clear();
+            }
             (pending, resolution, rule_list, directory_list)
         };
         let event_sink = pending.resolution_sink.as_ref().or(event_sink);
         let persisted = (|| -> Result<()> {
-          if !directory_list.is_empty() {
-            pending.directory_policy.as_ref().context("directory policy is no longer available")?.save(&directory_list)?;
-          }
-          if !rule_list.is_empty() {
-            self.store
-                .write()
-                .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                .set_rule_list(&rule_list)?;
-          }
+            if !directory_list.is_empty() {
+                pending
+                    .directory_policy
+                    .as_ref()
+                    .context("directory policy is no longer available")?
+                    .save(&directory_list)?;
+            }
+            if !rule_list.is_empty() {
+                self.store
+                    .write()
+                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                    .set_rule_list(&rule_list)?;
+            }
             Ok(())
         })();
         if let Err(error) = persisted {
@@ -568,10 +797,18 @@ impl PermissionCoordinator {
         // Queue the terminal event before the provider can resume and finish its turn.
         if !directory_list.is_empty() {
             if let Some(sink) = event_sink {
-                sink.send_wait(BackendEvent { address: None, turn_boundary: None,
-                    received_at_ms: None, kind: "directory_access_granted".into(), text: None,
-                    activity: None, summary: None, task_update: None,
-                    data: serde_json::to_value(&directory_list)? }).await?;
+                sink.send_wait(BackendEvent {
+                    address: None,
+                    turn_boundary: None,
+                    received_at_ms: None,
+                    kind: "directory_access_granted".into(),
+                    text: None,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                    data: serde_json::to_value(&directory_list)?,
+                })
+                .await?;
             }
         }
         Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
@@ -593,7 +830,10 @@ impl PermissionCoordinator {
     }
 
     pub async fn cancel_all(&self, event_sink: Option<&BackendEventSink>) -> Result<()> {
-        self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.clear();
+        self.feedback_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
+            .clear();
         let pending_list = {
             let mut pending_map = self
                 .pending_map
@@ -611,13 +851,26 @@ impl PermissionCoordinator {
     }
 
     /// Cancel only approvals owned by the interrupted execution.
-    pub async fn cancel_owner(&self, owner: &crate::backend::ExecutionOwner, event_sink: Option<&BackendEventSink>) -> Result<()> {
+    pub async fn cancel_owner(
+        &self,
+        owner: &crate::backend::ExecutionOwner,
+        event_sink: Option<&BackendEventSink>,
+    ) -> Result<()> {
         self.take_timeout_feedback(owner)?;
         let pending_list = {
-            let mut pending_map = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-            let id_list: Vec<_> = pending_map.iter().filter(|(_, pending)| pending.view.execution_owner.as_ref() == Some(owner))
-                .map(|(id, _)| id.clone()).collect();
-            id_list.into_iter().filter_map(|id| pending_map.remove(&id)).collect::<Vec<_>>()
+            let mut pending_map = self
+                .pending_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            let id_list: Vec<_> = pending_map
+                .iter()
+                .filter(|(_, pending)| pending.view.execution_owner.as_ref() == Some(owner))
+                .map(|(id, _)| id.clone())
+                .collect();
+            id_list
+                .into_iter()
+                .filter_map(|id| pending_map.remove(&id))
+                .collect::<Vec<_>>()
         };
         for pending in pending_list {
             let _ = pending.response.send(ApprovalResolution::Cancel);
@@ -660,7 +913,10 @@ pub(crate) struct DirectoryExecution {
 impl Drop for DirectoryExecution {
     fn drop(&mut self) {
         if let Ok(mut directory) = self.coordinator.directory_by_owner.lock()
-            && directory.get(&self.owner).is_some_and(|policy| Arc::ptr_eq(policy, &self.policy)) {
+            && directory
+                .get(&self.owner)
+                .is_some_and(|policy| Arc::ptr_eq(policy, &self.policy))
+        {
             directory.remove(&self.owner);
         }
     }
@@ -929,11 +1185,19 @@ pub fn permission_from_provider(
         let (command, shell) = provider_command(params, method.contains("commandExecution"))?;
         vec![PermissionTarget::Command { command, shell }]
     } else if method.contains("fileChange") || method == "fs/write_text_file" {
-        vec![provider_path(params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Write },
-            |path| PermissionTarget::Write { path })]
+        vec![provider_path(params).map_or(
+            PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Write,
+            },
+            |path| PermissionTarget::Write { path },
+        )]
     } else if method == "fs/read_text_file" {
-        vec![provider_path(params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Read },
-            |path| PermissionTarget::Read { path })]
+        vec![provider_path(params).map_or(
+            PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Read,
+            },
+            |path| PermissionTarget::Read { path },
+        )]
     } else if method.contains("permission") || method.contains("permissions") {
         normalize_permission_payload(params, &encoded)
     } else {
@@ -950,7 +1214,10 @@ pub fn permission_from_provider(
 }
 
 /// Recovers provider arguments before applying the selected shell's quoting rules.
-fn provider_command(params: &Value, uses_argv_serialization: bool) -> Result<(String, Option<CommandShell>)> {
+fn provider_command(
+    params: &Value,
+    uses_argv_serialization: bool,
+) -> Result<(String, Option<CommandShell>)> {
     let parse_error = || CommandAnalysisError {
         shell: provider_shell(params).unwrap_or(CommandShell::Unknown),
         failure: CommandAnalysisFailure::MalformedTransport,
@@ -982,13 +1249,11 @@ fn provider_command(params: &Value, uses_argv_serialization: bool) -> Result<(St
     if arguments.is_empty() || arguments[0].is_empty() {
         return Err(parse_error().into());
     }
-    if let Some((marker, shell)) =
-        crate::permissions::command::shell_script_argument(&arguments)
-    {
+    if let Some((marker, shell)) = crate::permissions::command::shell_script_argument(&arguments) {
         return Ok((arguments[marker + 1].clone(), Some(shell)));
     }
-    let command = shlex::try_join(arguments.iter().map(String::as_str))
-        .map_err(|_| parse_error())?;
+    let command =
+        shlex::try_join(arguments.iter().map(String::as_str)).map_err(|_| parse_error())?;
     Ok((command, Some(CommandShell::Bash)))
 }
 
@@ -1015,10 +1280,18 @@ pub fn permission_from_copilot(
                 .to_owned(),
             shell: provider_shell(&params),
         }],
-        "write" => vec![provider_path(&params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Write },
-            |path| PermissionTarget::Write { path })],
-        "read" => vec![provider_path(&params).map_or(PermissionTarget::UnknownFile { operation: DirectoryOperation::Read },
-            |path| PermissionTarget::Read { path })],
+        "write" => vec![provider_path(&params).map_or(
+            PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Write,
+            },
+            |path| PermissionTarget::Write { path },
+        )],
+        "read" => vec![provider_path(&params).map_or(
+            PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Read,
+            },
+            |path| PermissionTarget::Read { path },
+        )],
         "url" => vec![PermissionTarget::Network {
             target: params
                 .get("url")
@@ -1089,8 +1362,12 @@ fn normalize_permission_payload(params: &Value, encoded: &str) -> Vec<Permission
             .and_then(Value::as_str)
             .unwrap_or(kind);
         return match kind {
-            "read" | "search" => vec![PermissionTarget::UnknownFile { operation: DirectoryOperation::Read }],
-            "edit" | "delete" | "move" => vec![PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }],
+            "read" | "search" => vec![PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Read,
+            }],
+            "edit" | "delete" | "move" => vec![PermissionTarget::UnknownFile {
+                operation: DirectoryOperation::Write,
+            }],
             "execute" => vec![PermissionTarget::Command {
                 command: tool_call
                     .get("rawInput")
@@ -1186,46 +1463,130 @@ mod test {
     #[tokio::test]
     async fn read_mode_file_requests_require_a_mode_transition_without_granting_rules() {
         for (mode, target, root, expected) in [
-            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, true, true),
-            (PermissionMode::Read, PermissionTarget::Write { path: "source.rs".into() }, true, true),
-            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Read }, true, false),
-            (PermissionMode::Write, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, true, false),
-            (PermissionMode::Read, PermissionTarget::UnknownFile { operation: DirectoryOperation::Write }, false, false),
+            (
+                PermissionMode::Read,
+                PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Write,
+                },
+                true,
+                true,
+            ),
+            (
+                PermissionMode::Read,
+                PermissionTarget::Write {
+                    path: "source.rs".into(),
+                },
+                true,
+                true,
+            ),
+            (
+                PermissionMode::Read,
+                PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Read,
+                },
+                true,
+                false,
+            ),
+            (
+                PermissionMode::Write,
+                PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Write,
+                },
+                true,
+                false,
+            ),
+            (
+                PermissionMode::Read,
+                PermissionTarget::UnknownFile {
+                    operation: DirectoryOperation::Write,
+                },
+                false,
+                false,
+            ),
         ] {
             let directory = tempfile::tempdir().unwrap();
             let coordinator = PermissionCoordinator::transient(directory.path()).unwrap();
             let before = coordinator.store.read().unwrap().open().1;
-            let owner = if root { crate::backend::ExecutionOwner::root("session") }
-                else { crate::backend::ExecutionOwner { session_id: "session".into(), agent_id: "child".into() } };
+            let owner = if root {
+                crate::backend::ExecutionOwner::root("session")
+            } else {
+                crate::backend::ExecutionOwner {
+                    session_id: "session".into(),
+                    agent_id: "child".into(),
+                }
+            };
             let (sink, mut stream) = crate::backend::events::channel();
             let waiting_coordinator = coordinator.clone();
             let waiting = tokio::spawn(async move {
-                waiting_coordinator.authorize(mode, PermissionRequest {
-                    id: "file-request".into(), provider: "test".into(), reason: None, target_list: vec![target],
-                }, Some(crate::backend::ProviderAddress { owner: Some(owner), thread_id: "thread".into(), turn_id: "turn".into() }),
-                    Some(&sink)).await.unwrap()
+                waiting_coordinator
+                    .authorize(
+                        mode,
+                        PermissionRequest {
+                            id: "file-request".into(),
+                            provider: "test".into(),
+                            reason: None,
+                            target_list: vec![target],
+                        },
+                        Some(crate::backend::ProviderAddress {
+                            owner: Some(owner),
+                            thread_id: "thread".into(),
+                            turn_id: "turn".into(),
+                        }),
+                        Some(&sink),
+                    )
+                    .await
+                    .unwrap()
             });
-            let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await.unwrap().unwrap().unwrap();
+            let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
             let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
-            assert_eq!(approval.required_mode, expected.then_some(PermissionMode::Write));
+            assert_eq!(
+                approval.required_mode,
+                expected.then_some(PermissionMode::Write)
+            );
             if expected {
-                let error = coordinator.resolve(&approval.id, &[ApprovalAnswer {
-                    item_id: "0".into(), choice_id: "allow_once".into(),
-                }], None).await.unwrap_err();
+                let error = coordinator
+                    .resolve(
+                        &approval.id,
+                        &[ApprovalAnswer {
+                            item_id: "0".into(),
+                            choice_id: "allow_once".into(),
+                        }],
+                        None,
+                    )
+                    .await
+                    .unwrap_err();
                 assert!(error.to_string().contains("unknown approval choice"));
                 assert_eq!(coordinator.pending_list().unwrap().len(), 1);
-                assert!(approval.item_list[0].choice_list.iter().all(|choice| choice.rule_list.is_empty() && choice.directory.is_none()));
+                assert!(
+                    approval.item_list[0]
+                        .choice_list
+                        .iter()
+                        .all(|choice| choice.rule_list.is_empty() && choice.directory.is_none())
+                );
             }
-            coordinator.resolve(&approval.id, &[ApprovalAnswer {
-                item_id: "0".into(), choice_id: "deny_once".into(),
-            }], None).await.unwrap();
+            coordinator
+                .resolve(
+                    &approval.id,
+                    &[ApprovalAnswer {
+                        item_id: "0".into(),
+                        choice_id: "deny_once".into(),
+                    }],
+                    None,
+                )
+                .await
+                .unwrap();
             assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
             assert_eq!(coordinator.store.read().unwrap().open().1, before);
         }
     }
 
     #[tokio::test]
-    async fn directory_approval_persists_global_grants_before_releasing_copilot_requests() -> Result<()> {
+    async fn directory_approval_persists_global_grants_before_releasing_copilot_requests()
+    -> Result<()> {
         use super::*;
         let root = tempfile::tempdir()?;
         let workspace = root.path().join("workspace");
@@ -1235,73 +1596,185 @@ mod test {
         let settings_root = root.path().join("settings");
         let coordinator = PermissionCoordinator::transient(&workspace)?;
         let request = crate::backend::BackendRequest {
-            execution_owner: None, harness_session_id: "directory-session".into(), workspace: workspace.display().to_string(),
-            input: crate::backend::BackendInput::from_text("Read and write"), mode: crate::backend::PromptMode::Chat,
-            model: "default".into(), effort: "default".into(), context_window: None,
+            execution_owner: None,
+            harness_session_id: "directory-session".into(),
+            workspace: workspace.display().to_string(),
+            input: crate::backend::BackendInput::from_text("Read and write"),
+            mode: crate::backend::PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
-            access: crate::session::AccessPolicy { sandbox: false,
-                read_access: crate::session::DirectoryScope::Workspace, ..Default::default() },
-            execution_mode: PermissionMode::Write, backend_session_id: None, control_context: None,
+            access: crate::session::AccessPolicy {
+                sandbox: false,
+                read_access: crate::session::DirectoryScope::Workspace,
+                ..Default::default()
+            },
+            execution_mode: PermissionMode::Write,
+            backend_session_id: None,
+            control_context: None,
         };
         let address = Some(crate::backend::ProviderAddress {
-            owner: Some(request.owner()?), thread_id: "native".into(), turn_id: "turn".into(),
+            owner: Some(request.owner()?),
+            thread_id: "native".into(),
+            turn_id: "turn".into(),
         });
         let directories = coordinator.directories(Some(&settings_root), &request)?;
-        assert!(coordinator.directories(Some(&settings_root), &request).is_err(), "live ownership was replaced");
-        let mut permission = permission_from_copilot("directory".into(), "read",
-            json!({"path":external.join("read.txt")}), &request.workspace);
-        let write = permission_from_copilot("write".into(), "write",
-            json!({"path":external.join("new/deep/write.txt")}), &request.workspace);
+        assert!(
+            coordinator
+                .directories(Some(&settings_root), &request)
+                .is_err(),
+            "live ownership was replaced"
+        );
+        let mut permission = permission_from_copilot(
+            "directory".into(),
+            "read",
+            json!({"path":external.join("read.txt")}),
+            &request.workspace,
+        );
+        let write = permission_from_copilot(
+            "write".into(),
+            "write",
+            json!({"path":external.join("new/deep/write.txt")}),
+            &request.workspace,
+        );
         permission.target_list.extend(write.target_list);
         let original = permission.clone();
         let (sink, mut stream) = crate::backend::events::channel();
         let waiting_coordinator = coordinator.clone();
         let waiting_address = address.clone();
         let waiter = tokio::spawn(async move {
-            waiting_coordinator.authorize(PermissionMode::Write, permission, waiting_address, Some(&sink)).await
+            waiting_coordinator
+                .authorize(
+                    PermissionMode::Write,
+                    permission,
+                    waiting_address,
+                    Some(&sink),
+                )
+                .await
         });
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await?.unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await?
+            .unwrap()
+            .unwrap();
         assert_eq!(event.kind, "approval_requested");
         let approval: ApprovalRequestView = serde_json::from_value(event.data)?;
         assert_eq!(approval.item_list.len(), 2);
-        let answers = approval.item_list.iter().map(|item| {
-            let choice = item.choice_list.iter().find(|choice| choice.id == "allow_global_directory").unwrap();
-            assert_eq!(choice.directory.as_ref().unwrap().path, dunce::canonicalize(&external).unwrap().display().to_string());
-            ApprovalAnswer { item_id: item.id.clone(), choice_id: choice.id.clone() }
-        }).collect::<Vec<_>>();
+        let answers = approval
+            .item_list
+            .iter()
+            .map(|item| {
+                let choice = item
+                    .choice_list
+                    .iter()
+                    .find(|choice| choice.id == "allow_global_directory")
+                    .unwrap();
+                assert_eq!(
+                    choice.directory.as_ref().unwrap().path,
+                    dunce::canonicalize(&external)
+                        .unwrap()
+                        .display()
+                        .to_string()
+                );
+                ApprovalAnswer {
+                    item_id: item.id.clone(),
+                    choice_id: choice.id.clone(),
+                }
+            })
+            .collect::<Vec<_>>();
         coordinator.resolve(&approval.id, &answers, None).await?;
         let global = crate::settings::SettingsStore::open(&settings_root)?
-            .layer_settings(crate::settings::SettingScope::Global, "", "")?.access.unwrap();
+            .layer_settings(crate::settings::SettingScope::Global, "", "")?
+            .access
+            .unwrap();
         assert_eq!(global.readable_directory.len(), 1);
         assert_eq!(global.writable_directory.len(), 1);
         assert_eq!(waiter.await??, ApprovalResolution::AllowOnce);
         let first = stream.recv().await.unwrap().unwrap();
         assert_eq!(first.kind, "directory_access_granted");
-        assert_eq!(stream.recv().await.unwrap().unwrap().kind, "approval_resolved");
-        assert_eq!(coordinator.authorize(PermissionMode::Write, original.clone(), address.clone(), None).await?,
-            ApprovalResolution::AllowOnce);
+        assert_eq!(
+            stream.recv().await.unwrap().unwrap().kind,
+            "approval_resolved"
+        );
+        assert_eq!(
+            coordinator
+                .authorize(
+                    PermissionMode::Write,
+                    original.clone(),
+                    address.clone(),
+                    None
+                )
+                .await?,
+            ApprovalResolution::AllowOnce
+        );
         drop(directories);
         assert!(coordinator.directory_by_owner.lock().unwrap().is_empty());
         let _directories = coordinator.directories(Some(&settings_root), &request)?;
-        assert_eq!(coordinator.authorize(PermissionMode::Write, original, address.clone(), None).await?,
-            ApprovalResolution::AllowOnce);
-        let missing = permission_from_copilot("missing".into(), "read", json!({}), &request.workspace);
-        assert!(matches!(missing.target_list[0], PermissionTarget::UnknownFile { .. }));
-        assert_eq!(coordinator.store().read().unwrap().compiled().evaluate(PermissionMode::Yolo, &missing)?.decision,
-            PermissionDecision::Ask);
-        assert_eq!(approval_item(&missing.target_list[0], 0).choice_list.len(), 3);
+        assert_eq!(
+            coordinator
+                .authorize(PermissionMode::Write, original, address.clone(), None)
+                .await?,
+            ApprovalResolution::AllowOnce
+        );
+        let missing =
+            permission_from_copilot("missing".into(), "read", json!({}), &request.workspace);
+        assert!(matches!(
+            missing.target_list[0],
+            PermissionTarget::UnknownFile { .. }
+        ));
+        assert_eq!(
+            coordinator
+                .store()
+                .read()
+                .unwrap()
+                .compiled()
+                .evaluate(PermissionMode::Yolo, &missing)?
+                .decision,
+            PermissionDecision::Ask
+        );
+        assert_eq!(
+            approval_item(&missing.target_list[0], 0).choice_list.len(),
+            3
+        );
         let path = external.join("read.txt");
-        coordinator.store().write().unwrap().set_rule_list(&[
-            (CATEGORY_READ.into(), dunce::canonicalize(&external)?.join("read.txt").display().to_string(), PermissionDecision::Deny),
-        ])?;
-        let denied = permission_from_copilot("denied".into(), "read", json!({"path":path}), &request.workspace);
-        assert_eq!(coordinator.authorize(PermissionMode::Yolo, denied, address, None).await?, ApprovalResolution::DenyOnce);
-        let invalid = PermissionRequest { id: "invalid".into(), provider: "test".into(), reason: None,
-            target_list: vec![PermissionTarget::Read { path: String::new() }] };
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            CATEGORY_READ.into(),
+            dunce::canonicalize(&external)?
+                .join("read.txt")
+                .display()
+                .to_string(),
+            PermissionDecision::Deny,
+        )])?;
+        let denied = permission_from_copilot(
+            "denied".into(),
+            "read",
+            json!({"path":path}),
+            &request.workspace,
+        );
+        assert_eq!(
+            coordinator
+                .authorize(PermissionMode::Yolo, denied, address, None)
+                .await?,
+            ApprovalResolution::DenyOnce
+        );
+        let invalid = PermissionRequest {
+            id: "invalid".into(),
+            provider: "test".into(),
+            reason: None,
+            target_list: vec![PermissionTarget::Read {
+                path: String::new(),
+            }],
+        };
         let (sink, mut stream) = crate::backend::events::channel();
-        let address = Some(crate::backend::ProviderAddress { owner: Some(request.owner()?),
-            thread_id: "native".into(), turn_id: "turn".into() });
-        let failure = coordinator.authorize(PermissionMode::Write, invalid, address, Some(&sink)).await.unwrap_err();
+        let address = Some(crate::backend::ProviderAddress {
+            owner: Some(request.owner()?),
+            thread_id: "native".into(),
+            turn_id: "turn".into(),
+        });
+        let failure = coordinator
+            .authorize(PermissionMode::Write, invalid, address, Some(&sink))
+            .await
+            .unwrap_err();
         assert!(failure.to_string().contains("empty"));
         let event = stream.recv().await.unwrap().unwrap();
         assert_eq!(event.kind, "error");
@@ -1310,77 +1783,226 @@ mod test {
     }
 
     #[tokio::test]
-    async fn skill_runtime_grants_preserve_denials_selection_compounds_and_revocation() -> Result<()> {
+    async fn skill_runtime_grants_preserve_denials_selection_compounds_and_revocation() -> Result<()>
+    {
         use super::*;
         let directory = tempfile::tempdir()?;
         let bundle = directory.path().join(".rulesync/skills/fixture");
         std::fs::create_dir_all(bundle.join("scripts"))?;
-        std::fs::write(bundle.join("SKILL.md"),"---\nname: fixture\ntargets: ['*']\n---\nInstructions")?;
-        std::fs::write(bundle.join("scripts/check.py"),"print('ok')")?;
+        std::fs::write(
+            bundle.join("SKILL.md"),
+            "---\nname: fixture\ntargets: ['*']\n---\nInstructions",
+        )?;
+        std::fs::write(bundle.join("scripts/check.py"), "print('ok')")?;
         let permission_path = directory.path().join("permissions.json");
-        std::fs::write(&permission_path,r#"{"permission":{"read":{"*":"ask"},"bash":{"*":"ask"}}}"#)?;
-        let store = Arc::new(RwLock::new(PermissionStore::load(&permission_path,directory.path())?));
+        std::fs::write(
+            &permission_path,
+            r#"{"permission":{"read":{"*":"ask"},"bash":{"*":"ask"}}}"#,
+        )?;
+        let store = Arc::new(RwLock::new(PermissionStore::load(
+            &permission_path,
+            directory.path(),
+        )?));
         let coordinator = Arc::new(PermissionCoordinator::new(store.clone()));
         let request = crate::backend::BackendRequest {
-            execution_owner:None,harness_session_id:"session".into(),workspace:directory.path().display().to_string(),
-            input:crate::backend::BackendInput::from_text("Read skill"),mode:crate::backend::PromptMode::Chat,
-            model:"default".into(),effort:"default".into(),context_window:None,
-            service_tier:crate::backend::ServiceTier::Standard,access:crate::session::AccessPolicy::default(),
-            execution_mode:PermissionMode::Read,backend_session_id:None,control_context:None,
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: directory.path().display().to_string(),
+            input: crate::backend::BackendInput::from_text("Read skill"),
+            mode: crate::backend::PromptMode::Chat,
+            model: "default".into(),
+            effort: "default".into(),
+            context_window: None,
+            service_tier: crate::backend::ServiceTier::Standard,
+            access: crate::session::AccessPolicy::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: None,
+            control_context: None,
         };
-        let address = Some(crate::backend::ProviderAddress {owner:Some(request.owner()?),thread_id:"provider".into(),turn_id:"turn".into()});
-        let skills = coordinator.skills(Some(directory.path()),&request,crate::backend::BackendKind::Codex)?;
+        let address = Some(crate::backend::ProviderAddress {
+            owner: Some(request.owner()?),
+            thread_id: "provider".into(),
+            turn_id: "turn".into(),
+        });
+        let skills = coordinator.skills(
+            Some(directory.path()),
+            &request,
+            crate::backend::BackendKind::Codex,
+        )?;
         let original = store.read().unwrap().open().1;
         let source = bundle.join("SKILL.md").display().to_string();
         let script = bundle.join("scripts/check.py").display().to_string();
-        let operation = |target|PermissionRequest {id:"request".into(),provider:"test".into(),reason:None,target_list:vec![target]};
-        let command = |command|PermissionTarget::Command {command,shell:Some(CommandShell::PowerShell)};
-        for target in [PermissionTarget::Read {path:source.clone()},PermissionTarget::Read {path:bundle.display().to_string()},
-            command(format!("Get-Content -LiteralPath '{source}'")),command(format!("python '{script}' --help"))] {
-            let granted = tokio::time::timeout(std::time::Duration::from_secs(1),
-                coordinator.authorize(PermissionMode::Read,operation(target),address.clone(),None)).await??;
-            assert_eq!(granted,ApprovalResolution::AllowOnce);
+        let operation = |target| PermissionRequest {
+            id: "request".into(),
+            provider: "test".into(),
+            reason: None,
+            target_list: vec![target],
+        };
+        let command = |command| PermissionTarget::Command {
+            command,
+            shell: Some(CommandShell::PowerShell),
+        };
+        for target in [
+            PermissionTarget::Read {
+                path: source.clone(),
+            },
+            PermissionTarget::Read {
+                path: bundle.display().to_string(),
+            },
+            command(format!("Get-Content -LiteralPath '{source}'")),
+            command(format!("python '{script}' --help")),
+        ] {
+            let granted = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                coordinator.authorize(
+                    PermissionMode::Read,
+                    operation(target),
+                    address.clone(),
+                    None,
+                ),
+            )
+            .await??;
+            assert_eq!(granted, ApprovalResolution::AllowOnce);
         }
-        assert_eq!(store.read().unwrap().open().1,original);
-        for target in [PermissionTarget::Write {path:source.clone()},
-            PermissionTarget::Read {path:directory.path().display().to_string()},
+        assert_eq!(store.read().unwrap().open().1, original);
+        for target in [
+            PermissionTarget::Write {
+                path: source.clone(),
+            },
+            PermissionTarget::Read {
+                path: directory.path().display().to_string(),
+            },
             command(format!("python '{script}'; Write-Output unrelated")),
             command(format!("Get-Content '{source}' > outside.txt")),
-            command(format!("python -c \"print('{script}')\""))] {
-            let result = tokio::time::timeout(std::time::Duration::from_millis(20),
-                coordinator.authorize(PermissionMode::Read,operation(target.clone()),address.clone(),None)).await;
-            assert!(!matches!(result,Ok(Ok(ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad))),
-                "unexpected skill grant for {target:?}: {result:?}");
+            command(format!("python -c \"print('{script}')\"")),
+        ] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                coordinator.authorize(
+                    PermissionMode::Read,
+                    operation(target.clone()),
+                    address.clone(),
+                    None,
+                ),
+            )
+            .await;
+            assert!(
+                !matches!(
+                    result,
+                    Ok(Ok(ApprovalResolution::AllowOnce
+                        | ApprovalResolution::AllowExact
+                        | ApprovalResolution::AllowBroad))
+                ),
+                "unexpected skill grant for {target:?}: {result:?}"
+            );
             assert!(coordinator.pending_list()?.is_empty());
         }
-        store.write().unwrap().set_rule_list(&[(CATEGORY_BASH.into(),"python *".into(),PermissionDecision::Deny)])?;
-        assert_eq!(coordinator.authorize(PermissionMode::Read,operation(command(format!("python '{script}'"))),
-            address.clone(),None).await?,ApprovalResolution::DenyOnce);
-        store.write().unwrap().set_rule_list(&[(CATEGORY_READ.into(),source.clone(),PermissionDecision::Deny)])?;
-        assert_eq!(coordinator.authorize(PermissionMode::Read,operation(command(format!("Get-Content '{source}'"))),
-            address.clone(),None).await?,ApprovalResolution::DenyOnce);
+        store.write().unwrap().set_rule_list(&[(
+            CATEGORY_BASH.into(),
+            "python *".into(),
+            PermissionDecision::Deny,
+        )])?;
+        assert_eq!(
+            coordinator
+                .authorize(
+                    PermissionMode::Read,
+                    operation(command(format!("python '{script}'"))),
+                    address.clone(),
+                    None
+                )
+                .await?,
+            ApprovalResolution::DenyOnce
+        );
+        store.write().unwrap().set_rule_list(&[(
+            CATEGORY_READ.into(),
+            source.clone(),
+            PermissionDecision::Deny,
+        )])?;
+        assert_eq!(
+            coordinator
+                .authorize(
+                    PermissionMode::Read,
+                    operation(command(format!("Get-Content '{source}'"))),
+                    address.clone(),
+                    None
+                )
+                .await?,
+            ApprovalResolution::DenyOnce
+        );
         let alias = directory.path().join("profile-alias");
-        #[cfg(windows)] junction::create(&bundle,&alias)?;
-        #[cfg(unix)] std::os::unix::fs::symlink(&bundle,&alias)?;
-        store.write().unwrap().set_rule_list(&[(CATEGORY_READ.into(),"*".into(),PermissionDecision::Allow)])?;
-        assert_eq!(coordinator.authorize(PermissionMode::Read,
-            operation(PermissionTarget::Read {path:alias.join("SKILL.md").display().to_string()}),
-            address.clone(),None).await?,ApprovalResolution::DenyOnce);
-        #[cfg(windows)] junction::delete(&alias)?;
-        #[cfg(unix)] std::fs::remove_file(&alias)?;
+        #[cfg(windows)]
+        junction::create(&bundle, &alias)?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&bundle, &alias)?;
+        store.write().unwrap().set_rule_list(&[(
+            CATEGORY_READ.into(),
+            "*".into(),
+            PermissionDecision::Allow,
+        )])?;
+        assert_eq!(
+            coordinator
+                .authorize(
+                    PermissionMode::Read,
+                    operation(PermissionTarget::Read {
+                        path: alias.join("SKILL.md").display().to_string()
+                    }),
+                    address.clone(),
+                    None
+                )
+                .await?,
+            ApprovalResolution::DenyOnce
+        );
+        #[cfg(windows)]
+        junction::delete(&alias)?;
+        #[cfg(unix)]
+        std::fs::remove_file(&alias)?;
         drop(skills);
         assert!(coordinator.skill_by_owner.lock().unwrap().is_empty());
         store.write().unwrap().save(&original)?;
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
-            coordinator.authorize(PermissionMode::Read,operation(PermissionTarget::Read {path:source.clone()}),address.clone(),None)).await.is_err());
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                coordinator.authorize(
+                    PermissionMode::Read,
+                    operation(PermissionTarget::Read {
+                        path: source.clone()
+                    }),
+                    address.clone(),
+                    None
+                )
+            )
+            .await
+            .is_err()
+        );
         let mut settings = crate::settings::SettingsStore::open(directory.path())?;
-        let catalog = settings.catalog(&request.workspace,&request.harness_session_id,"codex")?;
+        let catalog = settings.catalog(&request.workspace, &request.harness_session_id, "codex")?;
         let mut desired = crate::settings::PortableSettings::default();
-        desired.skill.insert(catalog.skill[0].id.clone(),false);
-        settings.update(0,crate::settings::SettingScope::Global,&request.workspace,&request.harness_session_id,&desired)?;
-        let disabled = coordinator.skills(Some(directory.path()),&request,crate::backend::BackendKind::Codex)?;
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
-            coordinator.authorize(PermissionMode::Read,operation(PermissionTarget::Read {path:source}),address,None)).await.is_err());
+        desired.skill.insert(catalog.skill[0].id.clone(), false);
+        settings.update(
+            0,
+            crate::settings::SettingScope::Global,
+            &request.workspace,
+            &request.harness_session_id,
+            &desired,
+        )?;
+        let disabled = coordinator.skills(
+            Some(directory.path()),
+            &request,
+            crate::backend::BackendKind::Codex,
+        )?;
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                coordinator.authorize(
+                    PermissionMode::Read,
+                    operation(PermissionTarget::Read { path: source }),
+                    address,
+                    None
+                )
+            )
+            .await
+            .is_err()
+        );
         drop(disabled);
         Ok(())
     }
@@ -1394,19 +2016,33 @@ mod test {
         let store = PermissionStore::load(&path, directory.path()).unwrap();
         let coordinator = PermissionCoordinator::new(Arc::new(RwLock::new(store)));
         let (sink, mut stream) = crate::backend::events::channel();
-        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+        for mode in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
             for forced in [false, true] {
                 let request = PermissionRequest {
-                    id: "parse-error".into(), provider: "test".into(), reason: None,
+                    id: "parse-error".into(),
+                    provider: "test".into(),
+                    reason: None,
                     target_list: vec![PermissionTarget::Command {
                         command: "probe 'unfinished".into(),
                         shell: Some(crate::permissions::shell::CommandShell::PowerShell),
                     }],
                 };
-                let failure = tokio::time::timeout(std::time::Duration::from_secs(1),
-                    coordinator.authorize_callback(mode, forced, request, None, Some(&sink)))
-                    .await.unwrap().unwrap_err();
-                assert!(failure.downcast_ref::<crate::permissions::matcher::CommandAnalysisError>().is_some());
+                let failure = tokio::time::timeout(
+                    std::time::Duration::from_secs(1),
+                    coordinator.authorize_callback(mode, forced, request, None, Some(&sink)),
+                )
+                .await
+                .unwrap()
+                .unwrap_err();
+                assert!(
+                    failure
+                        .downcast_ref::<crate::permissions::matcher::CommandAnalysisError>()
+                        .is_some()
+                );
                 assert!(failure.to_string().contains("shell_command_parse_error"));
                 assert!(failure.to_string().contains("split independent operations"));
                 assert!(coordinator.pending_list().unwrap().is_empty());
@@ -1416,13 +2052,21 @@ mod test {
                 assert!(stream.try_recv().is_err());
             }
             let corrected = PermissionRequest {
-                id: "parse-error".into(), provider: "test".into(), reason: None,
+                id: "parse-error".into(),
+                provider: "test".into(),
+                reason: None,
                 target_list: vec![PermissionTarget::Command {
                     command: "probe corrected".into(),
                     shell: Some(crate::permissions::shell::CommandShell::PowerShell),
                 }],
             };
-            assert_eq!(coordinator.authorize(mode, corrected, None, Some(&sink)).await.unwrap(), ApprovalResolution::AllowOnce);
+            assert_eq!(
+                coordinator
+                    .authorize(mode, corrected, None, Some(&sink))
+                    .await
+                    .unwrap(),
+                ApprovalResolution::AllowOnce
+            );
         }
         assert_eq!(std::fs::read(path).unwrap(), before);
     }
@@ -1431,11 +2075,30 @@ mod test {
     async fn input_timeout_rejects_once_without_rules_and_preserves_other_owners() {
         use super::*;
         let directory = tempfile::tempdir().unwrap();
-        let store = Arc::new(RwLock::new(PermissionStore::load(directory.path().join("permissions.json"), directory.path()).unwrap()));
+        let store = Arc::new(RwLock::new(
+            PermissionStore::load(directory.path().join("permissions.json"), directory.path())
+                .unwrap(),
+        ));
         let before = std::fs::read(directory.path().join("permissions.json")).unwrap();
         let coordinator = Arc::new(PermissionCoordinator::new(store));
-        coordinator.configure_timeout("expired", InputTimeout { amount: 1, unit: crate::session::TimeoutUnit::S }).unwrap();
-        coordinator.configure_timeout("waiting", InputTimeout { amount: 0, unit: crate::session::TimeoutUnit::M }).unwrap();
+        coordinator
+            .configure_timeout(
+                "expired",
+                InputTimeout {
+                    amount: 1,
+                    unit: crate::session::TimeoutUnit::S,
+                },
+            )
+            .unwrap();
+        coordinator
+            .configure_timeout(
+                "waiting",
+                InputTimeout {
+                    amount: 0,
+                    unit: crate::session::TimeoutUnit::M,
+                },
+            )
+            .unwrap();
         let (sink, mut stream) = crate::backend::events::channel();
         let mut tasks = Vec::new();
         for session in ["expired", "waiting"] {
@@ -1443,29 +2106,98 @@ mod test {
             let coordinator = coordinator.clone();
             let sink = sink.clone();
             tasks.push(tokio::spawn(async move {
-                coordinator.authorize(PermissionMode::Read, PermissionRequest {
-                    id: "same-id".into(), provider: "test".into(), reason: None,
-                    target_list: vec![PermissionTarget::Command { command: "echo timeout".into(), shell: None }],
-                }, Some(crate::backend::ProviderAddress { owner: Some(owner), thread_id: session.into(), turn_id: "turn".into() }), Some(&sink)).await.unwrap()
+                coordinator
+                    .authorize(
+                        PermissionMode::Read,
+                        PermissionRequest {
+                            id: "same-id".into(),
+                            provider: "test".into(),
+                            reason: None,
+                            target_list: vec![PermissionTarget::Command {
+                                command: "echo timeout".into(),
+                                shell: None,
+                            }],
+                        },
+                        Some(crate::backend::ProviderAddress {
+                            owner: Some(owner),
+                            thread_id: session.into(),
+                            turn_id: "turn".into(),
+                        }),
+                        Some(&sink),
+                    )
+                    .await
+                    .unwrap()
             }));
         }
-        for _ in 0..2 { assert_eq!(stream.recv().await.unwrap().unwrap().kind, "approval_requested"); }
+        for _ in 0..2 {
+            assert_eq!(
+                stream.recv().await.unwrap().unwrap().kind,
+                "approval_requested"
+            );
+        }
         let pending = coordinator.pending_list().unwrap();
-        let original = pending.iter().find(|view| view.execution_owner.as_ref().unwrap().session_id == "expired").unwrap();
+        let original = pending
+            .iter()
+            .find(|view| view.execution_owner.as_ref().unwrap().session_id == "expired")
+            .unwrap();
         let original_deadline = original.deadline.as_ref().unwrap().expires_at_ms;
-        coordinator.configure_timeout("expired", InputTimeout { amount: 5, unit: crate::session::TimeoutUnit::H }).unwrap();
-        assert_eq!(coordinator.pending_list().unwrap().iter().find(|view| view.id == original.id).unwrap().deadline.as_ref().unwrap().expires_at_ms, original_deadline);
-        let expired = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv()).await.unwrap().unwrap().unwrap();
+        coordinator
+            .configure_timeout(
+                "expired",
+                InputTimeout {
+                    amount: 5,
+                    unit: crate::session::TimeoutUnit::H,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            coordinator
+                .pending_list()
+                .unwrap()
+                .iter()
+                .find(|view| view.id == original.id)
+                .unwrap()
+                .deadline
+                .as_ref()
+                .unwrap()
+                .expires_at_ms,
+            original_deadline
+        );
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         assert_eq!(expired.data["resolution_source"], "timeout");
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::TimedOut);
-        assert_eq!(codex_response(&json!({"method":"item/commandExecution/requestApproval"}), ApprovalResolution::TimedOut)["decision"], "decline");
+        assert_eq!(
+            codex_response(
+                &json!({"method":"item/commandExecution/requestApproval"}),
+                ApprovalResolution::TimedOut
+            )["decision"],
+            "decline"
+        );
         let pending = coordinator.pending_list().unwrap();
         assert_eq!(pending.len(), 1);
         assert!(pending[0].deadline.is_none());
-        assert!(coordinator.has_timeout_feedback(&crate::backend::ExecutionOwner::root("expired")).unwrap());
-        assert!(!coordinator.has_timeout_feedback(&crate::backend::ExecutionOwner::root("waiting")).unwrap());
-        assert_eq!(std::fs::read(directory.path().join("permissions.json")).unwrap(), before);
-        coordinator.cancel_owner(&crate::backend::ExecutionOwner::root("waiting"), None).await.unwrap();
+        assert!(
+            coordinator
+                .has_timeout_feedback(&crate::backend::ExecutionOwner::root("expired"))
+                .unwrap()
+        );
+        assert!(
+            !coordinator
+                .has_timeout_feedback(&crate::backend::ExecutionOwner::root("waiting"))
+                .unwrap()
+        );
+        assert_eq!(
+            std::fs::read(directory.path().join("permissions.json")).unwrap(),
+            before
+        );
+        coordinator
+            .cancel_owner(&crate::backend::ExecutionOwner::root("waiting"), None)
+            .await
+            .unwrap();
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(coordinator.pending_list().unwrap().is_empty());
         assert!(coordinator.resolve(&original.id, &[], None).await.is_err());
@@ -1477,10 +2209,23 @@ mod test {
         let (sink, mut stream) = crate::backend::events::channel();
         let provider = coordinator.clone();
         let waiter = tokio::spawn(async move {
-            provider.authorize_callback(PermissionMode::Read, true, PermissionRequest {
-                id: "abandoned".into(), provider: "test".into(), reason: None,
-                target_list: vec![PermissionTarget::Command { command: "probe".into(), shell: None }],
-            }, None, Some(&sink)).await
+            provider
+                .authorize_callback(
+                    PermissionMode::Read,
+                    true,
+                    PermissionRequest {
+                        id: "abandoned".into(),
+                        provider: "test".into(),
+                        reason: None,
+                        target_list: vec![PermissionTarget::Command {
+                            command: "probe".into(),
+                            shell: None,
+                        }],
+                    },
+                    None,
+                    Some(&sink),
+                )
+                .await
         });
         stream.recv().await.unwrap().unwrap();
         assert_eq!(coordinator.pending_list().unwrap().len(), 1);
@@ -1495,29 +2240,78 @@ mod test {
     #[tokio::test]
     async fn cancelling_one_owned_child_preserves_sibling_approval_with_the_same_provider_id() {
         let coordinator = PermissionCoordinator::transient(".").unwrap();
-        let (event_sink,mut event_stream) = crate::backend::events::channel();
+        let (event_sink, mut event_stream) = crate::backend::events::channel();
         let mut waiter = Vec::new();
-        for agent_id in ["first","second"] {
+        for agent_id in ["first", "second"] {
             let coordinator = coordinator.clone();
             let sink = event_sink.clone();
-            let owner = crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:agent_id.into()};
+            let owner = crate::backend::ExecutionOwner {
+                session_id: "root".into(),
+                agent_id: agent_id.into(),
+            };
             waiter.push(tokio::spawn(async move {
-                coordinator.authorize_callback(PermissionMode::Read,true,PermissionRequest {id:"same-provider-id".into(),provider:"test".into(),
-                    reason:None,target_list:vec![PermissionTarget::Command {command:"probe task".into(),shell:None}]},
-                    Some(crate::backend::ProviderAddress {owner:Some(owner),thread_id:"thread".into(),turn_id:"turn".into()}),Some(&sink)).await.unwrap()
+                coordinator
+                    .authorize_callback(
+                        PermissionMode::Read,
+                        true,
+                        PermissionRequest {
+                            id: "same-provider-id".into(),
+                            provider: "test".into(),
+                            reason: None,
+                            target_list: vec![PermissionTarget::Command {
+                                command: "probe task".into(),
+                                shell: None,
+                            }],
+                        },
+                        Some(crate::backend::ProviderAddress {
+                            owner: Some(owner),
+                            thread_id: "thread".into(),
+                            turn_id: "turn".into(),
+                        }),
+                        Some(&sink),
+                    )
+                    .await
+                    .unwrap()
             }));
-            assert_eq!(event_stream.recv().await.unwrap().unwrap().kind,"approval_requested");
+            assert_eq!(
+                event_stream.recv().await.unwrap().unwrap().kind,
+                "approval_requested"
+            );
         }
-        assert_eq!(coordinator.pending_list().unwrap().len(),2);
-        coordinator.cancel_owner(&crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:"first".into()},Some(&event_sink)).await.unwrap();
-        assert_eq!(event_stream.recv().await.unwrap().unwrap().kind,"approval_cancelled");
-        assert_eq!(waiter.remove(0).await.unwrap(),ApprovalResolution::Cancel);
+        assert_eq!(coordinator.pending_list().unwrap().len(), 2);
+        coordinator
+            .cancel_owner(
+                &crate::backend::ExecutionOwner {
+                    session_id: "root".into(),
+                    agent_id: "first".into(),
+                },
+                Some(&event_sink),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            event_stream.recv().await.unwrap().unwrap().kind,
+            "approval_cancelled"
+        );
+        assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(!waiter[0].is_finished());
         let pending = coordinator.pending_list().unwrap();
-        assert_eq!(pending.len(),1);
-        assert_eq!(pending[0].execution_owner.as_ref().unwrap().agent_id,"second");
-        coordinator.cancel_owner(&crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:"second".into()},None).await.unwrap();
-        assert_eq!(waiter.remove(0).await.unwrap(),ApprovalResolution::Cancel);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(
+            pending[0].execution_owner.as_ref().unwrap().agent_id,
+            "second"
+        );
+        coordinator
+            .cancel_owner(
+                &crate::backend::ExecutionOwner {
+                    session_id: "root".into(),
+                    agent_id: "second".into(),
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiter.remove(0).await.unwrap(), ApprovalResolution::Cancel);
     }
 
     fn evaluate_review(request: &PermissionRequest) -> PermissionEvaluation {
@@ -1526,7 +2320,8 @@ mod test {
         )
         .unwrap();
         crate::permissions::matcher::CompiledPermissionDocument::compile(document, ".")
-            .evaluate(PermissionMode::Write, request).unwrap()
+            .evaluate(PermissionMode::Write, request)
+            .unwrap()
     }
 
     #[test]
@@ -1808,7 +2603,8 @@ mod test {
                     "params": { "args": [executable, "-c", script] }
                 }),
                 ".",
-            ).unwrap();
+            )
+            .unwrap();
             assert_eq!(
                 request.target_list,
                 vec![PermissionTarget::Command {
@@ -1837,7 +2633,8 @@ mod test {
 
     #[test]
     fn codex_transport_quoting_preserves_shell_scripts_and_approval_targets() {
-        let source = r#"rg -n "timeline|markdown|table|wrap" C:\Users\mattm\.codex\memories\MEMORY.md"#;
+        let source =
+            r#"rg -n "timeline|markdown|table|wrap" C:\Users\mattm\.codex\memories\MEMORY.md"#;
         let rendered = r#""C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "rg -n \"timeline|markdown|table|wrap\" C:\\Users\\mattm\\.codex\\memories\\MEMORY.md""#;
         let request = permission_from_provider(
             "item/commandExecution/requestApproval",
@@ -1845,19 +2642,31 @@ mod test {
                 "commandActions": [{"type":"unknown", "command":"misleading summary"}],
                 "proposedExecpolicyAmendment": ["unrelated"]}}),
             ".",
-        ).unwrap();
-        assert_eq!(request.target_list, vec![PermissionTarget::Command {
-            command: source.into(), shell: Some(CommandShell::PowerShell),
-        }]);
+        )
+        .unwrap();
+        assert_eq!(
+            request.target_list,
+            vec![PermissionTarget::Command {
+                command: source.into(),
+                shell: Some(CommandShell::PowerShell),
+            }]
+        );
         let parsed = normalize_command_in(source, CommandShell::PowerShell);
         assert!(parsed.failure.is_none());
         assert_eq!(parsed.invocation_list.len(), 1);
-        assert_eq!(parsed.invocation_list[0].token_list, [
-            "rg", "-n", "timeline|markdown|table|wrap", r"C:\Users\mattm\.codex\memories\MEMORY.md",
-        ]);
+        assert_eq!(
+            parsed.invocation_list[0].token_list,
+            [
+                "rg",
+                "-n",
+                "timeline|markdown|table|wrap",
+                r"C:\Users\mattm\.codex\memories\MEMORY.md",
+            ]
+        );
         let rules = json!({"permission":{"bash":{"*":"ask", "rg *":"allow"}}});
         let compiled = crate::permissions::matcher::CompiledPermissionDocument::compile(
-            crate::permissions::document::parse_permission_document(&rules.to_string()).unwrap(), ".",
+            crate::permissions::document::parse_permission_document(&rules.to_string()).unwrap(),
+            ".",
         );
         let evaluation = compiled.evaluate(PermissionMode::Write, &request).unwrap();
         assert_eq!(evaluation.decision, PermissionDecision::Allow);
@@ -1867,8 +2676,14 @@ mod test {
     #[test]
     fn codex_transport_roundtrips_quoting_for_every_supported_shell() {
         for (executable, shell) in [
-            (r"C:\Program Files\PowerShell\7\pwsh.exe", CommandShell::PowerShell),
-            (r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", CommandShell::PowerShell),
+            (
+                r"C:\Program Files\PowerShell\7\pwsh.exe",
+                CommandShell::PowerShell,
+            ),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                CommandShell::PowerShell,
+            ),
             ("/usr/bin/pwsh", CommandShell::PowerShell),
             ("/bin/sh", CommandShell::Bash),
             ("/bin/bash", CommandShell::Bash),
@@ -1887,16 +2702,32 @@ mod test {
                 let rendered = shlex::try_join(arguments).unwrap();
                 for params in [json!({"command":rendered}), json!({"args":arguments})] {
                     let request = permission_from_provider(
-                        "item/commandExecution/requestApproval", &json!({"params":params}), ".",
-                    ).unwrap();
-                    assert_eq!(request.target_list, vec![PermissionTarget::Command {
-                        command: source.into(), shell: Some(shell),
-                    }]);
+                        "item/commandExecution/requestApproval",
+                        &json!({"params":params}),
+                        ".",
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        request.target_list,
+                        vec![PermissionTarget::Command {
+                            command: source.into(),
+                            shell: Some(shell),
+                        }]
+                    );
                     let parsed = normalize_command_in(source, shell);
                     assert!(parsed.failure.is_none(), "{shell:?}: {source}: {parsed:?}");
                     let expected = if source.contains('\n') { 2 } else { 1 };
-                    assert_eq!(parsed.invocation_list.len(), expected, "{shell:?}: {source}");
-                    assert!(parsed.invocation_list.iter().all(|command| command.command_name == "probe"));
+                    assert_eq!(
+                        parsed.invocation_list.len(),
+                        expected,
+                        "{shell:?}: {source}"
+                    );
+                    assert!(
+                        parsed
+                            .invocation_list
+                            .iter()
+                            .all(|command| command.command_name == "probe")
+                    );
                 }
             }
         }
@@ -1911,9 +2742,14 @@ mod test {
             json!({"command":"rg", "args":&arguments[1..]}),
         ] {
             let request = permission_from_provider(
-                "item/commandExecution/requestApproval", &json!({"params":params}), ".",
-            ).unwrap();
-            let PermissionTarget::Command {command, shell} = &request.target_list[0] else { panic!() };
+                "item/commandExecution/requestApproval",
+                &json!({"params":params}),
+                ".",
+            )
+            .unwrap();
+            let PermissionTarget::Command { command, shell } = &request.target_list[0] else {
+                panic!()
+            };
             let parsed = normalize_command_in(command, shell.unwrap());
             assert!(parsed.failure.is_none(), "{command}: {parsed:?}");
             assert_eq!(parsed.invocation_list.len(), 1);
@@ -1931,9 +2767,15 @@ mod test {
             json!({"command":"rg\u{0}tail"}),
         ] {
             let error = permission_from_provider(
-                "item/commandExecution/requestApproval", &json!({"params":params}), ".",
-            ).unwrap_err();
-            assert!(error.downcast_ref::<CommandAnalysisError>().is_some(), "{error:#}");
+                "item/commandExecution/requestApproval",
+                &json!({"params":params}),
+                ".",
+            )
+            .unwrap_err();
+            assert!(
+                error.downcast_ref::<CommandAnalysisError>().is_some(),
+                "{error:#}"
+            );
         }
     }
 
@@ -1944,17 +2786,42 @@ mod test {
         let (sink, mut stream) = crate::backend::events::channel();
         let waiting_coordinator = coordinator.clone();
         let waiting = tokio::spawn(async move {
-            waiting_coordinator.authorize_callback(PermissionMode::Yolo, true, PermissionRequest {
-                id:"mandatory-review".into(), provider:"test".into(), reason:None,
-                target_list:vec![PermissionTarget::Write { path:"review.txt".into() }],
-            }, None, Some(&sink)).await.unwrap()
+            waiting_coordinator
+                .authorize_callback(
+                    PermissionMode::Yolo,
+                    true,
+                    PermissionRequest {
+                        id: "mandatory-review".into(),
+                        provider: "test".into(),
+                        reason: None,
+                        target_list: vec![PermissionTarget::Write {
+                            path: "review.txt".into(),
+                        }],
+                    },
+                    None,
+                    Some(&sink),
+                )
+                .await
+                .unwrap()
         });
-        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await.unwrap().unwrap().unwrap();
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
         let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
         assert_eq!(approval.item_list.len(), 1);
-        coordinator.resolve(&approval.id, &[ApprovalAnswer {
-            item_id:approval.item_list[0].id.clone(),choice_id:"deny_once".into(),
-        }], None).await.unwrap();
+        coordinator
+            .resolve(
+                &approval.id,
+                &[ApprovalAnswer {
+                    item_id: approval.item_list[0].id.clone(),
+                    choice_id: "deny_once".into(),
+                }],
+                None,
+            )
+            .await
+            .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
     }
 
@@ -2043,7 +2910,8 @@ mod test {
         assert_eq!(event.kind, "approval_requested");
         let owned = coordinator
             .bind_owner("approval-one", "child-exchange", Some("child-turn"))
-            .unwrap().unwrap();
+            .unwrap()
+            .unwrap();
         assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
         let snapshot = coordinator.pending_list().unwrap();
         assert_eq!(snapshot[0].exchange_id, owned.exchange_id);
@@ -2066,7 +2934,10 @@ mod test {
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowOnce);
         let resolved = tokio::time::timeout(std::time::Duration::from_secs(1), event_stream.recv())
-            .await.expect("manual resolution must reach the requesting execution").unwrap().unwrap();
+            .await
+            .expect("manual resolution must reach the requesting execution")
+            .unwrap()
+            .unwrap();
         assert_eq!(resolved.kind, "approval_resolved");
         let resolved_view: ApprovalRequestView = serde_json::from_value(resolved.data).unwrap();
         assert_eq!(resolved_view.exchange_id, owned.exchange_id);
@@ -2298,13 +3169,22 @@ mod test {
         };
         let view = approval_view(&request, &evaluate_review(&request));
         assert_eq!(view.item_list.len(), 3);
-        for (item, command) in view.item_list.iter().zip([
-            "probe one,two", "probe three,four", "probe five,six",
-        ]) {
+        for (item, command) in
+            view.item_list
+                .iter()
+                .zip(["probe one,two", "probe three,four", "probe five,six"])
+        {
             let start = source.find(command).unwrap();
             assert_eq!(item.command_list[0].source, source);
-            assert_eq!(item.command_list[0].focus_range_list, vec![start..start + command.len()]);
-            assert!(item.choice_list.iter().any(|choice| !choice.rule_list.is_empty()));
+            assert_eq!(
+                item.command_list[0].focus_range_list,
+                vec![start..start + command.len()]
+            );
+            assert!(
+                item.choice_list
+                    .iter()
+                    .any(|choice| !choice.rule_list.is_empty())
+            );
         }
     }
 }

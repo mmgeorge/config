@@ -186,10 +186,7 @@ fn separate_context_windows_skip_unchanged_gaps_and_keep_raw_targets() {
         ["b", "B", "h", "H"]
     );
     assert_eq!(source.hunks(), original);
-    let no_context = drain(
-        &mut DisplayCursor::new(source, 0),
-        ChunkLimits::default(),
-    );
+    let no_context = drain(&mut DisplayCursor::new(source, 0), ChunkLimits::default());
     assert_eq!(no_context.len(), 4);
 }
 
@@ -211,8 +208,10 @@ fn compact_context_preserves_changed_spans_across_insertions_and_deletions() {
             if source.hunks().is_empty() {
                 continue;
             }
-            let old_range = source.hunks().first().unwrap().old_lines.start..source.hunks().last().unwrap().old_lines.end;
-            let new_range = source.hunks().first().unwrap().new_lines.start..source.hunks().last().unwrap().new_lines.end;
+            let old_range = source.hunks().first().unwrap().old_lines.start
+                ..source.hunks().last().unwrap().old_lines.end;
+            let new_range = source.hunks().first().unwrap().new_lines.start
+                ..source.hunks().last().unwrap().new_lines.end;
             let rows = drain(
                 &mut DisplayCursor::new(source, usize::MAX),
                 ChunkLimits {
@@ -291,10 +290,7 @@ fn a_decoration_budget_that_cannot_fit_one_emphasized_row_uses_base_styles() {
 #[test]
 fn rejected_intraline_work_preserves_the_entire_large_replacement() {
     let source = diff(&"old\n".repeat(65), &"new\n".repeat(65));
-    let rows = drain(
-        &mut DisplayCursor::new(source, 0),
-        ChunkLimits::default(),
-    );
+    let rows = drain(&mut DisplayCursor::new(source, 0), ChunkLimits::default());
     assert_eq!(rows.len(), 130);
     assert!(
         rows.iter().all(|row| row.emphasis.is_empty()

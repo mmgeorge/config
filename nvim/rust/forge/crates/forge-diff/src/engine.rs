@@ -472,9 +472,13 @@ mod tests {
         .unwrap();
         assert_eq!(engine.usage().active_jobs, 1);
         let mut waiting = Box::pin(engine.compare(request("different\n")));
-        assert!(std::future::poll_fn(|context| {
-            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
-        }).await.is_pending());
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
+            })
+            .await
+            .is_pending()
+        );
         drop(waiting);
         first.abort();
         assert!(first.await.is_err_and(|error| error.is_cancelled()));
@@ -497,9 +501,13 @@ mod tests {
         assert_eq!(engine.usage().active_jobs, 1);
         assert_eq!(engine.usage().cache.admitted_entries, 1);
         let mut waiting = Box::pin(engine.compare(request("new\n")));
-        assert!(std::future::poll_fn(|context| {
-            std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
-        }).await.is_pending());
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
+            })
+            .await
+            .is_pending()
+        );
         drop(waiting);
         release.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -540,19 +548,34 @@ mod tests {
         use std::task::Poll;
         for close in [false, true] {
             let engine = DiffEngine::new(CacheLimits::default(), 1);
-            let occupied = engine.pool.reserve(WorkPriority::Visible, WorkBudget::new(0, None)).unwrap();
+            let occupied = engine
+                .pool
+                .reserve(WorkPriority::Visible, WorkBudget::new(0, None))
+                .unwrap();
             let mut pending = Box::pin(engine.compare(request("uncached\n")));
-            assert!(std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context))).await.is_pending());
+            assert!(
+                std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context)))
+                    .await
+                    .is_pending()
+            );
             assert_eq!(engine.usage().active_jobs, 0);
             assert_eq!(engine.usage().cache.admitted_entries, 0);
             if close {
                 engine.close();
-                assert!(matches!(tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap(), Err(EngineError::Closed)));
+                assert!(matches!(
+                    tokio::time::timeout(Duration::from_secs(2), pending)
+                        .await
+                        .unwrap(),
+                    Err(EngineError::Closed)
+                ));
                 assert_eq!(engine.usage().pool.admitted_jobs, 1);
                 drop(occupied);
             } else {
                 drop(occupied);
-                let result = tokio::time::timeout(Duration::from_secs(2), pending).await.unwrap().unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), pending)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(result.source().new.bytes(), b"uncached\n");
                 assert_eq!(engine.usage().pool.admitted_jobs, 0);
             }

@@ -136,16 +136,25 @@ pub fn compute_hunks(source: SourcePair) -> Result<RawDiff, SourceError> {
 
 /// Run the pinned histogram matcher between ordered semantic boundaries.
 /// Anchors partition matching only. All hunk bytes and coordinates remain in the original sources.
-pub fn compute_anchored_hunks(source: SourcePair, anchors: &[LineAnchor]) -> Result<RawDiff, SourceError> {
+pub fn compute_anchored_hunks(
+    source: SourcePair,
+    anchors: &[LineAnchor],
+) -> Result<RawDiff, SourceError> {
     validate_source_pair(&source)?;
     let old_offset = line_offsets(source.old.bytes());
     let new_offset = line_offsets(source.new.bytes());
-    let end = LineAnchor { old: old_offset.len() - 1, new: new_offset.len() - 1 };
+    let end = LineAnchor {
+        old: old_offset.len() - 1,
+        new: new_offset.len() - 1,
+    };
     let mut previous = LineAnchor { old: 0, new: 0 };
     let mut hunk = Vec::new();
     for boundary in anchors.iter().copied().chain(std::iter::once(end)) {
-        if boundary.old < previous.old || boundary.new < previous.new
-            || boundary.old > end.old || boundary.new > end.new {
+        if boundary.old < previous.old
+            || boundary.new < previous.new
+            || boundary.old > end.old
+            || boundary.new > end.new
+        {
             return Err(SourceError::InconsistentMetadata);
         }
         let input = InternedInput::new(
@@ -155,10 +164,17 @@ pub fn compute_anchored_hunks(source: SourcePair, anchors: &[LineAnchor]) -> Res
         let mut comparison = Diff::compute(Algorithm::Histogram, &input);
         comparison.postprocess_lines(&input);
         for change in comparison.hunks() {
-            let old_lines = previous.old + change.before.start as usize..previous.old + change.before.end as usize;
-            let new_lines = previous.new + change.after.start as usize..previous.new + change.after.end as usize;
-            hunk.push(make_hunk(&source, old_offset[old_lines.start]..old_offset[old_lines.end],
-                new_offset[new_lines.start]..new_offset[new_lines.end], old_lines, new_lines));
+            let old_lines = previous.old + change.before.start as usize
+                ..previous.old + change.before.end as usize;
+            let new_lines = previous.new + change.after.start as usize
+                ..previous.new + change.after.end as usize;
+            hunk.push(make_hunk(
+                &source,
+                old_offset[old_lines.start]..old_offset[old_lines.end],
+                new_offset[new_lines.start]..new_offset[new_lines.end],
+                old_lines,
+                new_lines,
+            ));
         }
         previous = boundary;
     }

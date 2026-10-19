@@ -463,30 +463,41 @@ mod tests {
 
     #[test]
     fn capture_reads_changed_file_bytes_without_retrying_or_reusing_an_uncertain_version() {
-        for content in [b"x".as_slice(), b"longer current content".as_slice(), b"other".as_slice()] {
+        for content in [
+            b"x".as_slice(),
+            b"longer current content".as_slice(),
+            b"other".as_slice(),
+        ] {
             let directory = tempfile::tempdir().unwrap();
             let store = ObjectStore::open(directory.path()).unwrap();
             let source = directory.path().join("source");
             fs::write(&source, b"first").unwrap();
             let modified = fs::metadata(&source).unwrap().modified().unwrap();
             let mut changed = false;
-            let captured = store.capture_file(&source, directory.path(), None, &mut || {
-                if !changed {
-                    fs::write(&source, content)?;
-                    fs::File::options().write(true).open(&source)?.set_times(
-                        fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
-                    )?;
-                    changed = true;
-                }
-                Ok(())
-            }).unwrap();
+            let captured = store
+                .capture_file(&source, directory.path(), None, &mut || {
+                    if !changed {
+                        fs::write(&source, content)?;
+                        fs::File::options().write(true).open(&source)?.set_times(
+                            fs::FileTimes::new()
+                                .set_modified(modified + std::time::Duration::from_secs(1)),
+                        )?;
+                        changed = true;
+                    }
+                    Ok(())
+                })
+                .unwrap();
             assert!(changed);
             assert!(captured.stamp.is_none());
             assert_eq!(store.get(&captured.object_id.unwrap()).unwrap(), content);
-            let settled = store.capture_file(&source, directory.path(), None, &mut || Ok(())).unwrap();
+            let settled = store
+                .capture_file(&source, directory.path(), None, &mut || Ok(()))
+                .unwrap();
             assert!(!settled.reused);
             assert!(settled.stamp.is_some());
-            let reused = store.capture_file(&source, directory.path(), None, &mut || Ok(())).unwrap();
+            let reused = store
+                .capture_file(&source, directory.path(), None, &mut || Ok(()))
+                .unwrap();
             assert!(reused.reused);
         }
     }
@@ -514,10 +525,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         assert!(identities.iter().all(|identity| identity == &identities[0]));
-        assert_eq!(
-            objects.get(&identities[0]).unwrap(),
-            content
-        );
+        assert_eq!(objects.get(&identities[0]).unwrap(), content);
         let path = objects.path(&identities[0]).unwrap();
         assert_eq!(fs::read_dir(path.parent().unwrap()).unwrap().count(), 1);
     }
@@ -543,10 +551,7 @@ mod tests {
             fs::write(&source, &content).unwrap();
             let streamed = objects.put_file(&source).unwrap();
             assert_eq!(streamed, objects.put(&content).unwrap());
-            assert_eq!(
-                objects.get(&streamed).unwrap(),
-                content
-            );
+            assert_eq!(objects.get(&streamed).unwrap(), content);
             assert_eq!(objects.put_file(&source).unwrap(), streamed);
         }
         assert!(objects.put_file(directory.path()).is_err());

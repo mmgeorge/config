@@ -65,10 +65,7 @@ pub(super) fn validate(operation: &CheckOperation) -> Result<()> {
         "executable cannot contain bindings"
     );
     for argument in args {
-        ensure!(
-            !argument.contains('\0'),
-            "invalid direct argument"
-        );
+        ensure!(!argument.contains('\0'), "invalid direct argument");
         let mut literal = argument.clone();
         for binding in BINDINGS {
             literal = literal.replace(binding, "");
@@ -138,7 +135,13 @@ impl InvocationResolver {
             if !self.catalog.contains_key(&key) {
                 self.catalog.insert(
                     key.clone(),
-                    PackageCatalog::discover(workspace, directory, manager, toolchain.map(String::as_str)).await?,
+                    PackageCatalog::discover(
+                        workspace,
+                        directory,
+                        manager,
+                        toolchain.map(String::as_str),
+                    )
+                    .await?,
                 );
             }
             self.catalog.get(&key)
@@ -485,14 +488,8 @@ pub(super) async fn capture(
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
     let mut child = crate::process::spawn_owned(command).context("start check discovery")?;
-    let mut stdout = child
-        .stdout()
-        .take()
-        .context("discovery stdout missing")?;
-    let mut stderr = child
-        .stderr()
-        .take()
-        .context("discovery stderr missing")?;
+    let mut stdout = child.stdout().take().context("discovery stdout missing")?;
+    let mut stderr = child.stderr().take().context("discovery stderr missing")?;
     let work = async {
         let mut output = Vec::new();
         let mut errors = Vec::new();
@@ -528,10 +525,18 @@ mod tests {
     #[tokio::test]
     async fn discovery_preserves_output_and_drains_errors_beyond_previous_limits() -> Result<()> {
         let directory = tempfile::tempdir()?;
-        let output = capture("sh", &[
-            "-c".into(),
-            "printf '%08388609d' 0; printf '%01048577d' 0 >&2".into(),
-        ], directory.path(), None, None, 30).await?;
+        let output = capture(
+            "sh",
+            &[
+                "-c".into(),
+                "printf '%08388609d' 0; printf '%01048577d' 0 >&2".into(),
+            ],
+            directory.path(),
+            None,
+            None,
+            30,
+        )
+        .await?;
         assert_eq!(output.len(), 8 * 1024 * 1024 + 1);
         assert!(output.iter().all(|byte| *byte == b'0'));
         Ok(())

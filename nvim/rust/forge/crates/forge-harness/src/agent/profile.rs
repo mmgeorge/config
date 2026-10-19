@@ -1,11 +1,20 @@
-use std::{collections::BTreeMap, io::{Read, Write}, path::PathBuf, sync::Mutex};
+use std::{
+    collections::BTreeMap,
+    io::{Read, Write},
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-fn inherit() -> String { "inherit".into() }
-fn enabled() -> bool { true }
+fn inherit() -> String {
+    "inherit".into()
+}
+fn enabled() -> bool {
+    true
+}
 
 /// Defines user-owned child behavior independently of model-supplied task text.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -31,9 +40,16 @@ pub struct AgentProfile {
 
 impl Default for AgentProfile {
     fn default() -> Self {
-        Self { enabled: true, description: String::new(), instructions: String::new(),
-            provider: inherit(), model: inherit(), reasoning_effort: inherit(),
-            service_tier: inherit(), permission_mode: inherit() }
+        Self {
+            enabled: true,
+            description: String::new(),
+            instructions: String::new(),
+            provider: inherit(),
+            model: inherit(),
+            reasoning_effort: inherit(),
+            service_tier: inherit(),
+            permission_mode: inherit(),
+        }
     }
 }
 
@@ -55,27 +71,60 @@ impl Default for AgentProfileDocument {
         ].into_iter().map(|(name, description, instructions)| (name.into(), AgentProfile {
             description: description.into(), instructions: instructions.into(), ..Default::default()
         })).collect();
-        Self { default_profile: "worker".into(), profiles }
+        Self {
+            default_profile: "worker".into(),
+            profiles,
+        }
     }
 }
 
 impl AgentProfileDocument {
     pub fn validate(&self) -> Result<()> {
-        ensure!(self.profiles.get(&self.default_profile).is_some_and(|profile| profile.enabled),
-            "default_profile must name an enabled profile");
+        ensure!(
+            self.profiles
+                .get(&self.default_profile)
+                .is_some_and(|profile| profile.enabled),
+            "default_profile must name an enabled profile"
+        );
         for (name, profile) in &self.profiles {
-            ensure!(!name.is_empty() && name.len() <= 64 && name.bytes().all(|character|
-                character.is_ascii_alphanumeric() || matches!(character, b'-' | b'_')),
-                "profile names require 1 to 64 ASCII letters, digits, underscores, or hyphens");
-            ensure!(name != "root" && name != "Main" && name != "primary", "reserved profile name: {name}");
-            ensure!(matches!(profile.provider.as_str(), "inherit" | "codex" | "copilot" | "claude" | "antigravity"),
-                "profile {name} has an unsupported provider");
-            ensure!(!profile.model.trim().is_empty() && !profile.reasoning_effort.trim().is_empty(),
-                "profile {name} requires model and reasoning_effort, or inherit/default");
-            ensure!(matches!(profile.service_tier.as_str(), "inherit" | "default" | "fast" | "ultrafast"),
-                "profile {name} has an unsupported service_tier");
-            ensure!(matches!(profile.permission_mode.as_str(), "inherit" | "read" | "write" | "yolo"),
-                "profile {name} has an unsupported permission_mode");
+            ensure!(
+                !name.is_empty()
+                    && name.len() <= 64
+                    && name
+                        .bytes()
+                        .all(|character| character.is_ascii_alphanumeric()
+                            || matches!(character, b'-' | b'_')),
+                "profile names require 1 to 64 ASCII letters, digits, underscores, or hyphens"
+            );
+            ensure!(
+                name != "root" && name != "Main" && name != "primary",
+                "reserved profile name: {name}"
+            );
+            ensure!(
+                matches!(
+                    profile.provider.as_str(),
+                    "inherit" | "codex" | "copilot" | "claude" | "antigravity"
+                ),
+                "profile {name} has an unsupported provider"
+            );
+            ensure!(
+                !profile.model.trim().is_empty() && !profile.reasoning_effort.trim().is_empty(),
+                "profile {name} requires model and reasoning_effort, or inherit/default"
+            );
+            ensure!(
+                matches!(
+                    profile.service_tier.as_str(),
+                    "inherit" | "default" | "fast" | "ultrafast"
+                ),
+                "profile {name} has an unsupported service_tier"
+            );
+            ensure!(
+                matches!(
+                    profile.permission_mode.as_str(),
+                    "inherit" | "read" | "write" | "yolo"
+                ),
+                "profile {name} has an unsupported permission_mode"
+            );
         }
         Ok(())
     }
@@ -96,7 +145,12 @@ pub struct AgentProfileStore {
 }
 
 impl AgentProfileStore {
-    pub fn new(path: PathBuf) -> Self { Self { path, valid: Mutex::new(None) } }
+    pub fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            valid: Mutex::new(None),
+        }
+    }
 
     fn bytes(&self) -> Result<Option<Vec<u8>>> {
         match std::fs::File::open(&self.path) {
@@ -113,51 +167,102 @@ impl AgentProfileStore {
     pub fn snapshot(&self) -> Result<AgentProfileSnapshot> {
         let bytes = match self.bytes() {
             Ok(bytes) => bytes,
-            Err(error) => return Ok(AgentProfileSnapshot { path: self.path.to_string_lossy().into_owned(),
-                revision: "unreadable".into(), document: self.valid.lock().expect("subagent profiles poisoned")
-                    .clone().unwrap_or_default(), error: Some(format!("{error:#}")) }),
+            Err(error) => {
+                return Ok(AgentProfileSnapshot {
+                    path: self.path.to_string_lossy().into_owned(),
+                    revision: "unreadable".into(),
+                    document: self
+                        .valid
+                        .lock()
+                        .expect("subagent profiles poisoned")
+                        .clone()
+                        .unwrap_or_default(),
+                    error: Some(format!("{error:#}")),
+                });
+            }
         };
         let revision = revision(bytes.as_deref());
         let parsed = match bytes {
-            Some(bytes) => serde_json::from_slice::<AgentProfileDocument>(&bytes).context("parse subagent profiles")
-                .and_then(|document| { document.validate()?; Ok(document) }),
+            Some(bytes) => serde_json::from_slice::<AgentProfileDocument>(&bytes)
+                .context("parse subagent profiles")
+                .and_then(|document| {
+                    document.validate()?;
+                    Ok(document)
+                }),
             None => Ok(AgentProfileDocument::default()),
         };
         let mut valid = self.valid.lock().expect("subagent profiles poisoned");
         let (document, error) = match parsed {
-            Ok(document) => { *valid = Some(document.clone()); (document, None) }
-            Err(error) => (valid.clone().unwrap_or_default(), Some(format!("{error:#}"))),
+            Ok(document) => {
+                *valid = Some(document.clone());
+                (document, None)
+            }
+            Err(error) => (
+                valid.clone().unwrap_or_default(),
+                Some(format!("{error:#}")),
+            ),
         };
-        Ok(AgentProfileSnapshot { path: self.path.to_string_lossy().into_owned(), revision, document, error })
+        Ok(AgentProfileSnapshot {
+            path: self.path.to_string_lossy().into_owned(),
+            revision,
+            document,
+            error,
+        })
     }
 
     pub fn resolve(&self, name: Option<&str>) -> Result<(String, AgentProfile)> {
         let snapshot = self.snapshot()?;
-        ensure!(self.valid.lock().expect("subagent profiles poisoned").is_some(),
-            "no valid subagent profile catalog: {}", snapshot.error.unwrap_or_default());
+        ensure!(
+            self.valid
+                .lock()
+                .expect("subagent profiles poisoned")
+                .is_some(),
+            "no valid subagent profile catalog: {}",
+            snapshot.error.unwrap_or_default()
+        );
         let name = name.unwrap_or(&snapshot.document.default_profile);
-        let profile = snapshot.document.profiles.get(name).with_context(||format!("unknown subagent profile: {name}"))?;
+        let profile = snapshot
+            .document
+            .profiles
+            .get(name)
+            .with_context(|| format!("unknown subagent profile: {name}"))?;
         ensure!(profile.enabled, "subagent profile is disabled: {name}");
         Ok((name.to_owned(), profile.clone()))
     }
 
-    pub fn save(&self, expected_revision: &str, document: AgentProfileDocument) -> Result<AgentProfileSnapshot> {
+    pub fn save(
+        &self,
+        expected_revision: &str,
+        document: AgentProfileDocument,
+    ) -> Result<AgentProfileSnapshot> {
         document.validate()?;
         let encoded = serde_json::to_vec_pretty(&document)?;
-        let parent = self.path.parent().context("subagent profiles require a parent directory")?;
+        let parent = self
+            .path
+            .parent()
+            .context("subagent profiles require a parent directory")?;
         std::fs::create_dir_all(parent)?;
         let lock_path = self.path.with_extension("json.lock");
-        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path)?;
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)?;
         lock.try_lock()
             .context("subagent profiles are being saved by another process")?;
         let result = (|| -> Result<()> {
-            ensure!(revision(self.bytes()?.as_deref()) == expected_revision,
-                "subagent profiles changed on disk. Reload before saving");
+            ensure!(
+                revision(self.bytes()?.as_deref()) == expected_revision,
+                "subagent profiles changed on disk. Reload before saving"
+            );
             let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
             temporary.write_all(&encoded)?;
             temporary.write_all(b"\n")?;
             temporary.as_file().sync_all()?;
-            temporary.persist(&self.path).context("publish subagent profiles")?;
+            temporary
+                .persist(&self.path)
+                .context("publish subagent profiles")?;
             Ok(())
         })();
         drop(lock);
@@ -167,7 +272,10 @@ impl AgentProfileStore {
 }
 
 fn revision(bytes: Option<&[u8]>) -> String {
-    bytes.map_or_else(|| "missing".into(), |bytes| hex::encode(Sha256::digest(bytes)))
+    bytes.map_or_else(
+        || "missing".into(),
+        |bytes| hex::encode(Sha256::digest(bytes)),
+    )
 }
 
 #[cfg(test)]
@@ -207,7 +315,13 @@ mod tests {
         let mut document = saved.document.clone();
         document.profiles.get_mut("worker").unwrap().instructions = "Updated globally".into();
         other_workspace.save(&saved.revision, document)?;
-        assert!(store.save(&saved.revision, saved.document).unwrap_err().to_string().contains("changed on disk"));
+        assert!(
+            store
+                .save(&saved.revision, saved.document)
+                .unwrap_err()
+                .to_string()
+                .contains("changed on disk")
+        );
         assert_eq!(store.resolve(None)?.1.instructions, "Updated globally");
         std::fs::write(&path, b"invalid json")?;
         assert!(store.snapshot()?.error.is_some());
@@ -226,8 +340,20 @@ mod tests {
         let directory = tempfile::tempdir()?;
         let store = AgentProfileStore::new(directory.path().join("subagents.json"));
         store.save("missing", document)?;
-        assert!(store.resolve(Some("worker")).unwrap_err().to_string().contains("disabled"));
-        assert!(store.resolve(Some("unknown")).unwrap_err().to_string().contains("unknown"));
+        assert!(
+            store
+                .resolve(Some("worker"))
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
+        assert!(
+            store
+                .resolve(Some("unknown"))
+                .unwrap_err()
+                .to_string()
+                .contains("unknown")
+        );
         let mut value = serde_json::to_value(AgentProfile::default())?;
         value["typo"] = serde_json::json!(true);
         assert!(serde_json::from_value::<AgentProfile>(value).is_err());

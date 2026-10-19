@@ -55,9 +55,7 @@ impl Target {
             "symbol must be nonempty"
         );
         ensure!(
-            self.path
-                .as_ref()
-                .is_none_or(|path| !path.is_empty()),
+            self.path.as_ref().is_none_or(|path| !path.is_empty()),
             "path must be nonempty"
         );
         ensure!(
@@ -225,9 +223,7 @@ impl Arguments {
             "positions are one-based"
         );
         ensure!(
-            self.path
-                .as_ref()
-                .is_none_or(|value| !value.is_empty()),
+            self.path.as_ref().is_none_or(|value| !value.is_empty()),
             "path must be nonempty"
         );
         ensure!(
@@ -398,7 +394,9 @@ mod tests {
         let symbol = "qualified_symbol_".repeat(512);
         let target = json!({"path":path,"symbol":symbol});
         assert!(Arguments::parse("lsp_context", target.clone()).is_ok());
-        assert!(Arguments::parse("lsp_paths", json!({"from":target,"to":{"symbol":"finish"}})).is_ok());
+        assert!(
+            Arguments::parse("lsp_paths", json!({"from":target,"to":{"symbol":"finish"}})).is_ok()
+        );
         assert!(Arguments::parse("lsp_symbols", json!({"path":path,"query":symbol})).is_ok());
         for definition in definitions() {
             let schema = serde_json::to_string(&definition.input_schema).unwrap();
@@ -436,7 +434,11 @@ mod tests {
         assert!(all.path.is_none());
         let workspace = Arguments::parse("lsp_symbols", json!({"query":"Store"})).unwrap();
         assert!(workspace.path.is_none());
-        let file = Arguments::parse("lsp_symbols", json!({"query":"Store","scope":"all","path":"store.rs"})).unwrap();
+        let file = Arguments::parse(
+            "lsp_symbols",
+            json!({"query":"Store","scope":"all","path":"store.rs"}),
+        )
+        .unwrap();
         assert_eq!(file.path.as_deref(), Some("store.rs"));
     }
 

@@ -26,7 +26,7 @@ end
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "settings-session")
   assert(method == "trace.status" or method == "trace.configure" or method == "trace.session.clear"
-    or method == "session.configure" or method == "backend.models")
+    or method == "session.configure" or method == "backend.models" or method == "checks.editing")
   if method == "backend.models" then
     callback({
       { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium" },
@@ -34,7 +34,11 @@ client.request_for = function(session_id, method, params, callback)
     })
     return
   end
+  if method == "checks.editing" then callback({ check_editing = params.enabled }) return end
   if method == "session.configure" then
+    for _, key in ipairs({ "model", "effort", "service_tier", "auto_compaction", "approval_timeout", "answer_timeout" }) do
+      if params[key] ~= nil then configured_session[key] = params[key] end
+    end
     if params.shell then configured_session.shell = params.shell end
     if params.access then configured_session.access = params.access end
     if params.default_write_permission then configured_session.default_write_permission = params.default_write_permission end
@@ -60,106 +64,139 @@ controller.configure = function(params, _, completed)
   end)
 end
 local success, failure = xpcall(function()
-  state = { session = configured_session, capability = { model_selection = true, native_compact = true, os_sandbox = true }, busy = true }
+  state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true }, busy = true }
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local instance = picker._state_for_test()
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
-  assert(text:find("CLI: Codex CLI", 1, true), text)
+  assert(not text:find("CLI:", 1, true), text)
+  assert(instance.spec.page_list[1].subtitle == nil, "settled configuration should have no subtitle")
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
-  assert(text:find("Description", 1, true), text)
   assert(not text:find("[←", 1, true), text)
-  local options = {}
-  for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
-  local timing = options["check-timing"]
-  assert(timing.columns[2]:find("After queue", 1, true), "queue completion is not the default")
-  instance.spec.action_list[2].callback({ option = timing })
-  assert(state.check_timing == "between_work", "queue timing did not toggle")
-  local updated_text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
-  assert(updated_text:find("Between queued work", 1, true), updated_text)
-  instance.spec.action_list[1].callback({ option = timing })
-  assert(state.check_timing == "after_queue", "queue timing did not return to its default")
-  local status_thoughts = options["status-thoughts"]
-  assert(status_thoughts.label == "Status thoughts")
-  assert(status_thoughts.columns[1] == "Status thoughts" and status_thoughts.columns[2]:find("Off", 1, true))
-  assert(status_thoughts.columns[3]:find("latest thought under live status", 1, true)
-    and status_thoughts.columns[3]:find("timeline unchanged", 1, true))
-  instance.spec.action_list[2].callback({ option = status_thoughts })
-  assert(state.status_thoughts == true, "Status thoughts did not configure through the existing setting handler")
-  assert(configured_session.status_thoughts == nil, "Status thoughts is not session-scoped")
-  assert(options.logging.columns[1] == "Logging" and options.logging.columns[2]:find("Off", 1, true))
-  for index, option in ipairs(instance.spec.page_list[1].option_list) do
-    if option.id == "logging" then instance.state.selected_index_by_page[instance.spec.page_list[1].id] = index end
+  assert(not text:find("Description", 1, true), "the permanent description column remains")
+  local function find(id)
+    local current = picker._state_for_test()
+    for index, option in ipairs(current.spec.page_list[1].option_list) do
+      for _, field in ipairs(option.fields or {}) do
+        if field.id == id then return option, field, index end
+      end
+    end
+    error("Missing field " .. id)
   end
-  vim.fn.maparg("h", "n", false, true).callback()
-  assert(enabled, "h did not toggle the selected setting")
-  vim.fn.maparg("r", "n", false, true).callback()
-  assert(not enabled, "r did not toggle the selected setting")
-  assert(not options["subagent-profiles"], "profile editing belongs to /agents edit")
-  local shell = options.shell
+  local function select(id)
+    local option, field, index = find(id)
+    local current = picker._state_for_test()
+    current.state.selected_index_by_page.config = index
+    current.state.field_by_page.config = { [option.id] = field.id }
+    picker.update(current.spec)
+    return field
+  end
+  local function key(id, binding)
+    select(id)
+    local current = picker._state_for_test()
+    local mapping = vim.api.nvim_buf_call(current.buf, function() return vim.fn.maparg(binding, "n", false, true) end)
+    assert(mapping.callback, "missing key " .. binding)
+    mapping.callback()
+  end
+  assert(#instance.spec.page_list[1].option_list == 19, "settings are not grouped into 19 rows")
+  assert(find("check-timing").section == "Checks")
+  assert(find("plan-permission").section == "Planning")
+  assert(find("plan-revisions").section == "Planning")
+  assert(find("default-write-permission").section == "Execute")
+  for _, row in ipairs(instance.spec.page_list[1].option_list) do
+    assert(row.id ~= "permission-defaults" and row.label ~= "Defaults", "obsolete Defaults row remains")
+  end
+  key("check-timing", "<Right>")
+  assert(state.check_timing == "between_work")
+  key("check-timing", "<Left>")
+  assert(state.check_timing == "after_queue")
+  key("status-thoughts", "<Right>")
+  assert(state.status_thoughts ~= true, "arrows must not toggle booleans")
+  key("status-thoughts", "<Space>")
+  assert(state.status_thoughts == true)
+  key("status-thoughts", "<Tab>")
+  local focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)
+  assert(focused.id == "status-thoughts", "Tab left a single-field row")
+  local subagent_row = find("subagent-tools")
+  local lsp_row = find("lsp-tools")
+  assert(subagent_row ~= lsp_row and #subagent_row.fields == 1 and #lsp_row.fields == 1)
+  assert(subagent_row.section == "Tools" and lsp_row.section == "Tools")
+  assert(find("status-thoughts").section == "Display")
+  local last = picker._state_for_test().spec.page_list[1].option_list[19]
+  assert(last.id == "logging" and last.section == "Debug", "Debug must be the final category")
+  key("subagent-tools", "<Tab>")
+  focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)
+  assert(focused.id == "subagent-tools", "flat tool row requires horizontal navigation")
+  key("logging", "<Space>")
+  assert(enabled and require("forge.infra.perf").enabled("harness"))
+  key("logging", "<Space>")
+  assert(not enabled)
+  key("check-editing", "<Space>")
+  assert(state.check_editing == true)
+  key("check-editing", "<Space>")
+  assert(state.check_editing == false)
+  key("default-write-permission", "<Right>")
+  assert(configured_session.default_write_permission == "yolo")
+  local _, execute_permission = find("default-write-permission")
+  assert(execute_permission.value == "YOLO")
+  key("default-write-permission", "<Left>")
+  assert(configured_session.default_write_permission == "write")
+  local _, execute_permission = find("default-write-permission")
+  assert(execute_permission.value == "Write")
+  key("plan-permission", "<Right>")
+  assert(configured_session.plan_permission == "read")
+  key("plan-permission", "<Left>")
+  assert(configured_session.plan_permission == vim.NIL)
+  key("plan-revisions", "<Space>")
+  assert(configured_session.plan_auto_approve_revisions == false)
+  key("plan-revisions", "<Space>")
+  assert(configured_session.plan_auto_approve_revisions == true)
+  key("sandbox", "<Space>")
+  assert(configured_session.access.sandbox == false)
+  key("write-access", "<Right>")
+  assert(configured_session.access.write_access == "full" and configured_session.access.sandbox == false)
+  key("compact-threshold", "<Right>")
+  assert(configured_session.auto_compaction.threshold_tokens == 128001)
+  key("approval_timeout:unit", "<Right>")
+  assert(configured_session.approval_timeout.unit == "h")
+  key("answer_timeout:amount", "<Left>")
+  assert(configured_session.answer_timeout.amount == 9)
+  key("main-model", "<Right>")
+  assert(configured_session.model == "other-model" and configured_session.effort == "low")
+  key("main-thinking", "<Right>")
+  assert(configured_session.effort == "high")
+  key("main-speed", "<Right>")
+  assert(configured_session.service_tier == "fast")
   local executable = vim.fn.executable
   vim.fn.executable = function(name) return name == "nu" and 0 or executable(name) end
-  instance.spec.action_list[2].callback({ option = shell })
+  key("shell", "<Right>")
   assert(configured_session.shell == "system")
   vim.fn.executable = function(name) return name == "nu" and 1 or executable(name) end
-  instance.spec.action_list[2].callback({ option = shell })
+  key("shell", "<Right>")
   assert(configured_session.shell == "nushell")
-  instance.spec.action_list[2].callback({ option = shell })
+  key("shell", "<Right>")
   assert(configured_session.shell == "system")
   vim.fn.executable = executable
-  assert(options["default-write-permission"].id == "default-write-permission" and options["plan-permission"].id == "plan-permission")
-  instance.spec.action_list[2].callback({ option = options["default-write-permission"] }, instance)
-  assert(configured_session.default_write_permission == "yolo")
-  instance.spec.action_list[1].callback({ option = options["default-write-permission"] }, instance)
-  assert(configured_session.default_write_permission == "write")
-  instance.spec.action_list[2].callback({ option = options["plan-permission"] }, instance)
-  assert(configured_session.plan_permission == "read")
-  instance.spec.action_list[1].callback({ option = options["plan-permission"] })
-  assert(configured_session.plan_permission == vim.NIL)
-  instance.spec.action_list[2].callback({ option = options["plan-revisions"] })
-  assert(configured_session.plan_auto_approve_revisions == false)
-  instance.spec.action_list[1].callback({ option = options["plan-revisions"] })
-  assert(configured_session.plan_auto_approve_revisions == true)
-  local sandbox = options["sandbox"]
-  local scope = options["write-access"]
-  instance.spec.action_list[2].callback({ option = sandbox })
-  assert(configured_session.access.sandbox == false)
-  instance.spec.action_list[2].callback({ option = scope })
-  assert(configured_session.access.write_access == "full" and configured_session.access.sandbox == false)
-  assert(configured_session.default_write_permission == "write", "access changed approval mode")
-  local logging = options["logging"]
-  instance.spec.action_list[1].callback({ option = logging })
-  assert(enabled and require("forge.infra.perf").enabled("harness"))
-  instance.spec.action_list[1].callback({ option = logging })
-  assert(not enabled and not require("forge.infra.perf").enabled("harness"))
-  assert(options["native-import"].id == "native-import")
-  assert(options["subagent-tools"].id == "subagent-tools")
-  local provider = options["provider"]
-  assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
-  instance.spec.action_list[1].callback({ option = provider })
-  assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")
-  assert(picker.is_open("harness-config"))
+  find("native-import")
+  find("readable-directories")
+  find("writable-directories")
+  key("provider", "<Left>")
+  assert(picker.is_open("harness-config"), "Left opened an action")
   picker.close()
-  configured_session.backend = "copilot"
-  configured_session.provider_label = "Copilot CLI"
-  configured_session.access.sandbox = false
+  configured_session.backend, configured_session.provider_label = "copilot", "Copilot CLI"
   state.capability.os_sandbox = false
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
-  instance = picker._state_for_test()
-  text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
-  assert(text:find("Disabled (unsupported)", 1, true) and not text:find("Disable to connect", 1, true), text)
-  local sandbox_failure
-  local original_error = require("forge.infra.notifications").error
-  require("forge.infra.notifications").error = function(message) sandbox_failure = message end
-  instance.spec.action_list[2].callback({ option = sandbox })
-  require("forge.infra.notifications").error = original_error
-  assert(sandbox_failure and not configured_session.access.sandbox, "unsupported provider enabled sandbox")
-  local copilot_options = {}
-  for _, option in ipairs(instance.spec.page_list[1].option_list) do copilot_options[option.id] = option end
-  assert(copilot_options["readable-directories"] and copilot_options["writable-directories"])
-  instance.spec.action_list[2].callback({ option = copilot_options["read-access"] })
-  assert(configured_session.access.read_access == "workspace" and not configured_session.access.sandbox)
-  instance.spec.action_list[2].callback({ option = copilot_options["write-access"] })
-  assert(configured_session.access.write_access == "workspace" and not configured_session.access.sandbox)
+  local _, sandbox = find("sandbox")
+  assert(sandbox.disabled_reason:find("unavailable", 1, true), "unsupported sandbox is not explained")
+  local failure_message
+  local original_warn = require("forge.infra.notifications").warn
+  require("forge.infra.notifications").warn = function(message) failure_message = message end
+  key("sandbox", "<Space>")
+  require("forge.infra.notifications").warn = original_warn
+  assert(failure_message and configured_session.access.sandbox == false)
+  key("read-access", "<Right>")
+  assert(configured_session.access.read_access == "workspace")
+  key("write-access", "<Right>")
+  assert(configured_session.access.write_access == "workspace")
   picker.close()
   settings.log("settings-session", "on")
   assert(enabled)

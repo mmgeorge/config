@@ -1,19 +1,17 @@
-mod execution;
 mod checks;
-mod interaction;
-mod project_checks;
+mod execution;
 mod fork;
+mod interaction;
 mod new_session;
-mod replanning;
 mod observation;
+mod project_checks;
+mod replanning;
 pub(crate) use observation::BrokerObserver;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
-use crate::agent::{
-    Agent, AgentLifecycleEvent, AgentRegistry, AgentState,
-};
+use crate::agent::{Agent, AgentLifecycleEvent, AgentRegistry, AgentState};
 #[cfg(test)]
 use crate::backend::BackendForkRequest;
 use crate::backend::approval::{ApprovalRequestView, PermissionCoordinator};
@@ -31,19 +29,18 @@ use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, PlanAcceptance, PlanDocument, PlanElicitation,
-    PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
-    PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
-    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
-    PlanState, digest as plan_digest,
+    ArtifactSummary, PlanAcceptance, PlanDocument, PlanElicitation, PlanExecutionLifecycleEvent,
+    PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState, PlanFileStore,
+    PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer, PlanQuestionResponse,
+    PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanState, digest as plan_digest,
 };
 use crate::protocol::HarnessMethod;
+use crate::session::state_machine::{LifecycleAction, WorkflowActivity};
 use crate::session::{
-    ContextUsage, PermissionMode, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
+    ContextUsage, HarnessPreference, HarnessSession, ModelSetting, PermissionMode, PlanExecutor,
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
-use crate::session::state_machine::{WorkflowActivity, LifecycleAction};
 use crate::timeline::stream::TimelinePatch;
 use crate::timeline::{
     SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
@@ -113,7 +110,10 @@ pub struct InitializeRequest {
     pub lease_conflict_action: Option<String>,
 }
 
-fn agent_summaries(runs: &[Agent], exchanges: &[Exchange]) -> std::collections::HashMap<String, Value> {
+fn agent_summaries(
+    runs: &[Agent],
+    exchanges: &[Exchange],
+) -> std::collections::HashMap<String, Value> {
     runs.iter().map(|run| {
         let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
         let tools: Vec<_> = owned.iter().flat_map(|exchange| exchange.turn.iter()).flat_map(|turn|turn.tools()).collect();
@@ -128,13 +128,24 @@ fn agent_summaries(runs: &[Agent], exchanges: &[Exchange]) -> std::collections::
 }
 
 fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
-    let width = forge_buffer::width::WidthProfile { columns: 100, ..Default::default() };
+    let width = forge_buffer::width::WidthProfile {
+        columns: 100,
+        ..Default::default()
+    };
     let mut lines = Vec::new();
     for (index, entry) in timeline.iter().rev().take(20).rev().enumerate() {
-        let projected = crate::buffer::projection::project(entry, &width, index > 0, &Default::default(), &Default::default())?;
+        let projected = crate::buffer::projection::project(
+            entry,
+            &width,
+            index > 0,
+            &Default::default(),
+            &Default::default(),
+        )?;
         for block in crate::buffer::sections::preview(projected.entry)?.block {
             for row in block.text.wire_rows() {
-                if lines.len() >= 200 { return Ok(lines); }
+                if lines.len() >= 200 {
+                    return Ok(lines);
+                }
                 lines.push(row.chars().take(1000).collect());
             }
         }
@@ -145,8 +156,8 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
-    pub subagent_tools:bool,
-    pub lsp_tools:bool,
+    pub subagent_tools: bool,
+    pub lsp_tools: bool,
     pub status_thoughts: bool,
     pub check_editing: bool,
     pub runtime_epoch: String,
@@ -479,7 +490,8 @@ impl ExchangeAdmission {
         Self {
             lifecycle: None,
             plan_event_id: None,
-            check_owner: None, automatic_owner: None,
+            check_owner: None,
+            automatic_owner: None,
             prompt,
             kind: ExchangeKind::Chat,
             plan_id: None,
@@ -493,7 +505,8 @@ impl ExchangeAdmission {
         Self {
             lifecycle: None,
             plan_event_id: None,
-            check_owner: None, automatic_owner: None,
+            check_owner: None,
+            automatic_owner: None,
             prompt,
             kind: if revision {
                 ExchangeKind::PlanRevision
@@ -511,7 +524,8 @@ impl ExchangeAdmission {
         Self {
             lifecycle: None,
             plan_event_id: None,
-            check_owner: None, automatic_owner: None,
+            check_owner: None,
+            automatic_owner: None,
             prompt,
             kind: ExchangeKind::PlanExecution,
             plan_id: Some(plan_id),
@@ -525,7 +539,8 @@ impl ExchangeAdmission {
         Self {
             lifecycle: None,
             plan_event_id: None,
-            check_owner: None, automatic_owner: None,
+            check_owner: None,
+            automatic_owner: None,
             prompt,
             kind: ExchangeKind::Chat,
             plan_id: None,
@@ -639,7 +654,10 @@ impl HarnessBroker {
                 let selected = store
                     .load_session(session_id)?
                     .context("session not found")?;
-                anyhow::ensure!(selected.background.is_some() == request.background.is_some(), "Background and interactive sessions cannot share a provider conversation");
+                anyhow::ensure!(
+                    selected.background.is_some() == request.background.is_some(),
+                    "Background and interactive sessions cannot share a provider conversation"
+                );
                 anyhow::ensure!(
                     crate::workspace::same(&selected.workspace, &workspace),
                     "session uses a different workspace"
@@ -657,7 +675,9 @@ impl HarnessBroker {
                     store
                         .list_session(Some(&workspace))?
                         .into_iter()
-                        .find(|session| session.background.is_none() && session.backend == request.backend.kind)
+                        .find(|session| {
+                            session.background.is_none() && session.backend == request.backend.kind
+                        })
                 };
                 match latest_session {
                     Some(session) => {
@@ -665,8 +685,11 @@ impl HarnessBroker {
                     }
                     None => {
                         created_session = true;
-                        let preference =
-                            if request.background.is_some() { None } else { store.load_preference(&workspace, &request.backend.kind)? };
+                        let preference = if request.background.is_some() {
+                            None
+                        } else {
+                            store.load_preference(&workspace, &request.backend.kind)?
+                        };
                         let session_id = Uuid::new_v4().to_string();
                         let mut session = HarnessSession {
                             primary_agent_id: HarnessSession::primary_agent_id(&session_id),
@@ -685,17 +708,39 @@ impl HarnessBroker {
                             effort: preference
                                 .as_ref()
                                 .map_or(request.effort, |value| value.effort.clone()),
-                            plan_executor: preference.as_ref().map_or_else(Default::default, |value| value.plan_executor.clone()),
-                            plan_compact: preference.as_ref().is_some_and(|value| value.plan_compact),
-                            plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
+                            plan_executor: preference
+                                .as_ref()
+                                .map_or_else(Default::default, |value| value.plan_executor.clone()),
+                            plan_compact: preference
+                                .as_ref()
+                                .is_some_and(|value| value.plan_compact),
+                            plan_auto_approve_revisions: preference
+                                .as_ref()
+                                .is_none_or(|value| value.plan_auto_approve_revisions),
                             approval_timeout: Default::default(),
                             answer_timeout: Default::default(),
                             context_window: None,
-                            service_tier: preference.as_ref().map(|value| value.service_tier).unwrap_or_default(),
-                            access: preference.as_ref().map(|value| value.access.clone()).unwrap_or_default(),
-                            shell: preference.as_ref().map_or(Default::default(), |preference| preference.shell),
+                            service_tier: preference
+                                .as_ref()
+                                .map(|value| value.service_tier)
+                                .unwrap_or_default(),
+                            access: preference
+                                .as_ref()
+                                .map(|value| value.access.clone())
+                                .unwrap_or_default(),
+                            shell: preference
+                                .as_ref()
+                                .map_or(Default::default(), |preference| preference.shell),
                             execution_mode: PermissionMode::Read,
-                            current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
+                            current_task_id: None,
+                            default_write_permission: preference
+                                .as_ref()
+                                .map_or(PermissionMode::Write, |value| {
+                                    value.default_write_permission
+                                }),
+                            plan_permission: preference
+                                .as_ref()
+                                .and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             goal_id: None,
@@ -704,7 +749,9 @@ impl HarnessBroker {
                             native_fork: false,
                             native_compact: backend_descriptor.capability.native_compact,
                             context_usage: None,
-            background: request.background.clone(), auto_compaction: Default::default(), last_compaction_turn: None,
+                            background: request.background.clone(),
+                            auto_compaction: Default::default(),
+                            last_compaction_turn: None,
                         };
                         session.context_window = preference.as_ref().and_then(|preference| {
                             preference
@@ -725,12 +772,22 @@ impl HarnessBroker {
             session.resolved_model = Some(session.model.clone());
         }
         session.updated_at_ms = now_ms;
-        let shared = crate::settings::SettingsStore::open(&data_root)?.get(&session.workspace,&session.id,&session.backend)?;
-        shared.desired.apply(&mut session,backend_descriptor.capability.native_compact)?;
+        let shared = crate::settings::SettingsStore::open(&data_root)?.get(
+            &session.workspace,
+            &session.id,
+            &session.backend,
+        )?;
+        shared
+            .desired
+            .apply(&mut session, backend_descriptor.capability.native_compact)?;
         if created_session && request.background.is_none() {
             shared.apply_provider_defaults(&mut session)?;
         }
-        permission_coordinator.configure_input_timeouts(&session.id, session.approval_timeout, session.answer_timeout)?;
+        permission_coordinator.configure_input_timeouts(
+            &session.id,
+            session.approval_timeout,
+            session.answer_timeout,
+        )?;
         store.lock_session(&session.id)?;
         store.save_session(&session)?;
         if store
@@ -752,48 +809,80 @@ impl HarnessBroker {
         capability.native_fork = session.native_fork || capability.native_fork;
         capability.native_compact = session.native_compact || capability.native_compact;
         store.interrupt_detached_execution(&session.id)?;
-        session = store.load_session(&session.id)?.context("session disappeared during recovery")?;
-        if store.list_task(&session.id)?.iter().any(|task| Some(&task.id) == session.current_task_id.as_ref()
-            && task.kind == crate::task::TaskKind::Plan && task.status == crate::task::TaskStatus::Paused) {
-
+        session = store
+            .load_session(&session.id)?
+            .context("session disappeared during recovery")?;
+        if store.list_task(&session.id)?.iter().any(|task| {
+            Some(&task.id) == session.current_task_id.as_ref()
+                && task.kind == crate::task::TaskKind::Plan
+                && task.status == crate::task::TaskStatus::Paused
+        }) {
             store.save_owned_session(&session, &request.client_id)?;
         }
         let agent_registry = load_agent_registry(&store, &session.id)?;
         let agent_coordinator = crate::agent::AgentCoordinator::new(session.id.clone());
         agent_coordinator.set_enabled(shared.desired.subagent_tools.unwrap_or(false));
-        runtime.lsp.set_enabled(&session.id, shared.desired.lsp_tools.unwrap_or(false));
+        runtime
+            .lsp
+            .set_enabled(&session.id, shared.desired.lsp_tools.unwrap_or(false));
         for task in store.list_agent_task(&session.id)? {
-            let agent = agent_registry.get(&task.agent_id).cloned().context("stored task has no owning child")?;
+            let agent = agent_registry
+                .get(&task.agent_id)
+                .cloned()
+                .context("stored task has no owning child")?;
             agent_coordinator.retain(agent, task)?;
         }
-        let mut agent_backend_factory = crate::agent::AgentBackendFactory::new(request.backend.clone(), request.backend_launch_by_provider.clone(),
-            permission_coordinator.clone(), trace.clone(), data_root.clone());
-        let profile_path = request.permission_file.as_deref().map(std::path::Path::new)
-            .and_then(std::path::Path::parent).unwrap_or(&data_root).join("subagents.json");
-        agent_backend_factory.profiles = Arc::new(crate::agent::AgentProfileStore::new(profile_path));
+        let mut agent_backend_factory = crate::agent::AgentBackendFactory::new(
+            request.backend.clone(),
+            request.backend_launch_by_provider.clone(),
+            permission_coordinator.clone(),
+            trace.clone(),
+            data_root.clone(),
+        );
+        let profile_path = request
+            .permission_file
+            .as_deref()
+            .map(std::path::Path::new)
+            .and_then(std::path::Path::parent)
+            .unwrap_or(&data_root)
+            .join("subagents.json");
+        agent_backend_factory.profiles =
+            Arc::new(crate::agent::AgentProfileStore::new(profile_path));
         agent_coordinator.set_profiles(agent_backend_factory.profiles.clone());
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
-        let check_runner = crate::checks::CheckSupervisor::open(PathBuf::from(&session.workspace),
-            data_root.join(&session.id).join("checks"), Arc::clone(&presentation),
-            store.objects.clone(), Arc::clone(&runtime.repositories))?;
+        let check_runner = crate::checks::CheckSupervisor::open(
+            PathBuf::from(&session.workspace),
+            data_root.join(&session.id).join("checks"),
+            Arc::clone(&presentation),
+            store.objects.clone(),
+            Arc::clone(&runtime.repositories),
+        )?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
             lsp: runtime.lsp.clone(),
             status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
-            check_editing: Arc::new(AtomicBool::new(shared.desired.check_editing.unwrap_or(false))),
+            check_editing: Arc::new(AtomicBool::new(
+                shared.desired.check_editing.unwrap_or(false),
+            )),
             completion_queue: Default::default(),
-            data_root: data_root.clone(), session_id: session.id.clone(),
-            runtime_epoch: Uuid::new_v4().to_string(), snapshot_revision: AtomicU64::new(0),
+            data_root: data_root.clone(),
+            session_id: session.id.clone(),
+            runtime_epoch: Uuid::new_v4().to_string(),
+            snapshot_revision: AtomicU64::new(0),
             metadata: RwLock::new(observation::ObservationMetadata {
                 revision: 0,
-                capability: capability.clone(), active_wait: None,
+                capability: capability.clone(),
+                active_wait: None,
                 no_checkpoint: matches!(workspace_kind, WorkspaceKind::Untracked(_)),
             }),
-            plan_file: Arc::clone(&plan_file), permission_coordinator: Arc::clone(&permission_coordinator),
-            permission_store: Arc::clone(&permission_store), agent_coordinator: Arc::clone(&agent_coordinator),
-            check_runner: Arc::clone(&check_runner), trace: Arc::clone(&trace),
+            plan_file: Arc::clone(&plan_file),
+            permission_coordinator: Arc::clone(&permission_coordinator),
+            permission_store: Arc::clone(&permission_store),
+            agent_coordinator: Arc::clone(&agent_coordinator),
+            check_runner: Arc::clone(&check_runner),
+            trace: Arc::clone(&trace),
         });
         let broker = Self {
             context_usage_fresh: false,
@@ -801,7 +890,12 @@ impl HarnessBroker {
             active_operation_id: None,
             observer,
             repositories: Arc::clone(&runtime.repositories),
-            checkpoint: match &workspace_kind { WorkspaceKind::Git(workspace) if request.background.is_none() => Some(GitCheckpoint::new(workspace)), _ => None },
+            checkpoint: match &workspace_kind {
+                WorkspaceKind::Git(workspace) if request.background.is_none() => {
+                    Some(GitCheckpoint::new(workspace))
+                }
+                _ => None,
+            },
             diff: Arc::clone(&runtime.diff),
             store,
             plan_file,
@@ -857,7 +951,9 @@ impl HarnessBroker {
         Arc::clone(&self.backend)
     }
 
-    pub(crate) fn checks(&self) -> Arc<crate::checks::CheckSupervisor> { Arc::clone(&self.check_runner) }
+    pub(crate) fn checks(&self) -> Arc<crate::checks::CheckSupervisor> {
+        Arc::clone(&self.check_runner)
+    }
 
     /// Share root-owned admission without requiring the active provider's broker lock.
     pub(crate) fn agent_coordinator(&self) -> Arc<crate::agent::AgentCoordinator> {
@@ -880,8 +976,13 @@ impl HarnessBroker {
         &self,
         mode: PromptMode,
     ) -> Option<crate::control_tools::ControlTurnContext> {
-        if mode == PromptMode::Background { return Some(crate::control_tools::ControlTurnContext::inactive(mode)); }
-        let plan = self.current_plan_id().ok().flatten()
+        if mode == PromptMode::Background {
+            return Some(crate::control_tools::ControlTurnContext::inactive(mode));
+        }
+        let plan = self
+            .current_plan_id()
+            .ok()
+            .flatten()
             .as_deref()
             .and_then(|plan_id| self.store.load_plan(plan_id).ok().flatten());
         let document = plan.as_ref().and_then(|plan| {
@@ -891,7 +992,10 @@ impl HarnessBroker {
         });
         Some(crate::control_tools::ControlTurnContext {
             submission_cancelled: Some(Arc::clone(&self.turn_cancellation.submission_cancelled)),
-            checkpoint: self.exchange_runtime.as_ref().and_then(|runtime| runtime.tool_gate.clone()),
+            checkpoint: self
+                .exchange_runtime
+                .as_ref()
+                .and_then(|runtime| runtime.tool_gate.clone()),
             agent: None,
             checks: None,
             check_shell: self.session.shell,
@@ -913,8 +1017,22 @@ impl HarnessBroker {
                 })
                 .unwrap_or_default(),
             has_active_elicitation: plan.as_ref().is_some_and(|plan| plan.elicitation.is_some()),
-            has_active_execution: self.store.list_plan_execution(&self.session.id).ok()?.iter().any(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && !matches!(execution.state, PlanExecutionState::Complete | PlanExecutionState::Cancelled)),
-            has_active_goal: self.session.goal_id.as_deref()
+            has_active_execution: self
+                .store
+                .list_plan_execution(&self.session.id)
+                .ok()?
+                .iter()
+                .any(|execution| {
+                    Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref()
+                        && !matches!(
+                            execution.state,
+                            PlanExecutionState::Complete | PlanExecutionState::Cancelled
+                        )
+                }),
+            has_active_goal: self
+                .session
+                .goal_id
+                .as_deref()
                 .and_then(|goal_id| self.store.load_goal(goal_id).ok().flatten())
                 .is_some_and(|goal| goal.state == GoalState::Active),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
@@ -944,14 +1062,25 @@ impl HarnessBroker {
         policy: crate::session::AutoCompaction,
         sink: BackendEventSink,
     ) -> Result<String> {
-        anyhow::ensure!(self.session.background.is_some(), "Background request requires a Background session");
+        anyhow::ensure!(
+            self.session.background.is_some(),
+            "Background request requires a Background session"
+        );
         if let Some(previous) = &self.session.background {
-            if !previous.reason.is_empty() && self.store.list_exchange(&self.session.id)?.is_empty() {
-                self.store.save_session_event(&crate::timeline::SessionEventRecord {
-                    id:uuid::Uuid::new_v4().to_string(),session_id:self.session.id.clone(),created_at_ms:self.clock.now_ms(),
-                    detail:crate::timeline::SessionEventKind::Configuration { operation_id:uuid::Uuid::new_v4().to_string(),
-                        state:"completed".into(),field:vec!["background_session".into()],reason:Some(previous.reason.clone()) },
-                })?;
+            if !previous.reason.is_empty() && self.store.list_exchange(&self.session.id)?.is_empty()
+            {
+                self.store
+                    .save_session_event(&crate::timeline::SessionEventRecord {
+                        id: uuid::Uuid::new_v4().to_string(),
+                        session_id: self.session.id.clone(),
+                        created_at_ms: self.clock.now_ms(),
+                        detail: crate::timeline::SessionEventKind::Configuration {
+                            operation_id: uuid::Uuid::new_v4().to_string(),
+                            state: "completed".into(),
+                            field: vec!["background_session".into()],
+                            reason: Some(previous.reason.clone()),
+                        },
+                    })?;
             }
         }
         self.session.background = Some(identity);
@@ -964,50 +1093,98 @@ impl HarnessBroker {
         self.checkpoint = None;
         self.event_sink = Some(sink);
         self.save_session()?;
-        let result = self.run_interaction_input(input.clone(), PromptMode::Background,
-            Some(ExchangeAdmission::chat(input.clone())), BackendInput::from_text(input)).await;
+        let result = self
+            .run_interaction_input(
+                input.clone(),
+                PromptMode::Background,
+                Some(ExchangeAdmission::chat(input.clone())),
+                BackendInput::from_text(input),
+            )
+            .await;
         self.event_sink = None;
         result?;
         self.save_session()?;
-        let exchange = self.store.list_exchange(&self.session.id)?.pop().context("Background exchange is missing")?;
-        let text = exchange.turn.iter().flat_map(|turn| turn.messages())
-            .filter(|message| message.kind() == crate::turn::MessageKind::Assistant && message.delivery() == crate::turn::MessageDelivery::Final)
-            .map(|message| message.text()).collect::<Vec<_>>().join("\n");
+        let exchange = self
+            .store
+            .list_exchange(&self.session.id)?
+            .pop()
+            .context("Background exchange is missing")?;
+        let text = exchange
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .filter(|message| {
+                message.kind() == crate::turn::MessageKind::Assistant
+                    && message.delivery() == crate::turn::MessageDelivery::Final
+            })
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+            .join("\n");
         Ok(text)
     }
 
     /// Retain a Background failure even when no assistant response can be published.
     pub(crate) fn background_failure(&mut self, stage: &str, reason: String) -> Result<()> {
-        self.store.save_session_event(&crate::timeline::SessionEventRecord {
-            id:uuid::Uuid::new_v4().to_string(),session_id:self.session.id.clone(),created_at_ms:self.clock.now_ms(),
-            detail:crate::timeline::SessionEventKind::Configuration { operation_id:uuid::Uuid::new_v4().to_string(),
-                state:"failed".into(),field:vec![stage.into()],reason:Some(reason) },
-        })?;
+        self.store
+            .save_session_event(&crate::timeline::SessionEventRecord {
+                id: uuid::Uuid::new_v4().to_string(),
+                session_id: self.session.id.clone(),
+                created_at_ms: self.clock.now_ms(),
+                detail: crate::timeline::SessionEventKind::Configuration {
+                    operation_id: uuid::Uuid::new_v4().to_string(),
+                    state: "failed".into(),
+                    field: vec![stage.into()],
+                    reason: Some(reason),
+                },
+            })?;
         Ok(())
     }
 
     /// Compact once per newly completed provider turn while retaining the full timeline.
     pub(crate) async fn auto_compact(&mut self) -> Result<()> {
         let policy = &self.session.auto_compaction;
-        if !policy.enabled || !self.context_usage_fresh { return Ok(()); }
-        anyhow::ensure!(self.capability.native_compact, "This backend does not support automatic compaction");
-        policy.validate(self.session.context_usage.as_ref())?;
-        if self.store.list_session_event(&self.session.id)?.iter().any(|event|
-            matches!(&event.detail, SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running
-                    && Some(&compaction.thread_id) == self.session.backend_session_id.as_ref())) {
+        if !policy.enabled || !self.context_usage_fresh {
             return Ok(());
         }
-        if !policy.due(self.session.context_usage.as_ref(), self.capability.native_compact) { return Ok(()); }
+        anyhow::ensure!(
+            self.capability.native_compact,
+            "This backend does not support automatic compaction"
+        );
+        policy.validate(self.session.context_usage.as_ref())?;
+        if self
+            .store
+            .list_session_event(&self.session.id)?
+            .iter()
+            .any(|event| {
+                matches!(&event.detail, SessionEventKind::Compaction { compaction }
+                if compaction.state == crate::backend::CompactionState::Running
+                    && Some(&compaction.thread_id) == self.session.backend_session_id.as_ref())
+            })
+        {
+            return Ok(());
+        }
+        if !policy.due(
+            self.session.context_usage.as_ref(),
+            self.capability.native_compact,
+        ) {
+            return Ok(());
+        }
         let latest_exchange = self.store.list_exchange(&self.session.id)?.pop();
-        let latest = latest_exchange.as_ref().and_then(|exchange| exchange.turn.last()).map(|turn| turn.id().to_owned());
+        let latest = latest_exchange
+            .as_ref()
+            .and_then(|exchange| exchange.turn.last())
+            .map(|turn| turn.id().to_owned());
         let native_compacted = latest_exchange.as_ref().is_some_and(|exchange| exchange.node_list.iter().any(|node|
             matches!(node, crate::exchange::ExchangeNode::Compaction { compaction, .. }
                 if matches!(compaction.state, crate::backend::CompactionState::Completed | crate::backend::CompactionState::Running))));
-        if latest.is_none() || latest == self.session.last_compaction_turn { return Ok(()); }
+        if latest.is_none() || latest == self.session.last_compaction_turn {
+            return Ok(());
+        }
         self.session.last_compaction_turn = latest;
         self.save_session()?;
-        if native_compacted { return Ok(()); }
+        if native_compacted {
+            return Ok(());
+        }
         self.compact_session(false).await?;
         Ok(())
     }
@@ -1029,9 +1206,23 @@ impl HarnessBroker {
                 };
             }
         };
-        let edit_trace = matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete | HarnessMethod::PlanChecksUpdate)
-            .then(|| crate::plan::edit_trace::PlanEditTrace::new(Arc::clone(&self.trace), &self.session.id, &request.method, &request.params));
-        let dispatch_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.dispatch"));
+        let edit_trace = matches!(
+            method,
+            HarnessMethod::PlanEntityRename
+                | HarnessMethod::PlanTestsDelete
+                | HarnessMethod::PlanChecksUpdate
+        )
+        .then(|| {
+            crate::plan::edit_trace::PlanEditTrace::new(
+                Arc::clone(&self.trace),
+                &self.session.id,
+                &request.method,
+                &request.params,
+            )
+        });
+        let dispatch_stage = edit_trace
+            .as_ref()
+            .map(|trace| trace.stage("broker.dispatch"));
         self.timeline_reconciled_after_dispatch = false;
         self.trace.record(
             &self.session.id,
@@ -1047,33 +1238,55 @@ impl HarnessBroker {
             json!({ "request_id": id, "method": request.method }),
         );
         if method == HarnessMethod::TaskTransition {
-            self.active_operation_id = request.params.get("operation_id").and_then(Value::as_str).map(str::to_owned);
+            self.active_operation_id = request
+                .params
+                .get("operation_id")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
         } else if method != HarnessMethod::GoalContinue {
             self.active_operation_id = None;
         }
-        let mutation_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.mutation"));
-        let mut outcome = match crate::attachment::resolve_input(&self.data_root, &request.params).await {
-            Ok(attachments) => {
-                self.submitted_attachments = attachments;
-                let outcome = self.dispatch_inner(method, request.params).await;
-                self.submitted_attachments.clear();
-                outcome
-            }
-            Err(error) => Err(error),
-        };
-        if let Some(stage) = mutation_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
-        let settle_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.settle_task"));
+        let mutation_stage = edit_trace
+            .as_ref()
+            .map(|trace| trace.stage("broker.mutation"));
+        let mut outcome =
+            match crate::attachment::resolve_input(&self.data_root, &request.params).await {
+                Ok(attachments) => {
+                    self.submitted_attachments = attachments;
+                    let outcome = self.dispatch_inner(method, request.params).await;
+                    self.submitted_attachments.clear();
+                    outcome
+                }
+                Err(error) => Err(error),
+            };
+        if let Some(stage) = mutation_stage {
+            stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
+        }
+        let settle_stage = edit_trace
+            .as_ref()
+            .map(|trace| trace.stage("broker.settle_task"));
         if method.settles_task()
-            && !outcome.as_ref().is_err_and(|error| error.is::<RequestNotAdmitted>()) {
-            if let Err(error) = self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}"))) {
+            && !outcome
+                .as_ref()
+                .is_err_and(|error| error.is::<RequestNotAdmitted>())
+        {
+            if let Err(error) =
+                self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}")))
+            {
                 outcome = Err(error.context("persist task outcome"));
             }
         }
-        if let Some(stage) = settle_stage { stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }})); }
+        if let Some(stage) = settle_stage {
+            stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
+        }
         match outcome {
             Ok((value, mut event)) => {
-                if method.settles_task() { self.active_wait_projection = None; }
-                let reconcile_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.timeline_reconcile"));
+                if method.settles_task() {
+                    self.active_wait_projection = None;
+                }
+                let reconcile_stage = edit_trace
+                    .as_ref()
+                    .map(|trace| trace.stage("broker.timeline_reconcile"));
                 let timeline_patch = match self.reconcile_after_dispatch() {
                     Ok(timeline_patch) => timeline_patch,
                     Err(error) => {
@@ -1087,10 +1300,11 @@ impl HarnessBroker {
                         };
                     }
                 };
-                if let Some(stage) = reconcile_stage { stage.complete(json!({})); }
+                if let Some(stage) = reconcile_stage {
+                    stage.complete(json!({}));
+                }
                 if !timeline_patch.is_empty() {
-                    match self.event("document_changed", timeline_patch.notification())
-                    {
+                    match self.event("document_changed", timeline_patch.notification()) {
                         Ok(timeline_event) => event.push(timeline_event),
                         Err(error) => {
                             return DispatchResult {
@@ -1104,7 +1318,9 @@ impl HarnessBroker {
                         }
                     }
                 }
-                let response_stage = edit_trace.as_ref().map(|trace| trace.stage("broker.response_and_trace"));
+                let response_stage = edit_trace
+                    .as_ref()
+                    .map(|trace| trace.stage("broker.response_and_trace"));
                 match Response::success(id, value) {
                     Ok(response) => {
                         self.trace.record(
@@ -1120,8 +1336,12 @@ impl HarnessBroker {
                             "request_succeeded",
                             json!({ "request_id": id, "event_count": event.len() }),
                         );
-                        if let Some(stage) = response_stage { stage.complete(json!({"count":event.len()})); }
-                        if let Some(stage) = dispatch_stage { stage.complete(json!({"status":"completed"})); }
+                        if let Some(stage) = response_stage {
+                            stage.complete(json!({"count":event.len()}));
+                        }
+                        if let Some(stage) = dispatch_stage {
+                            stage.complete(json!({"status":"completed"}));
+                        }
                         DispatchResult { response, event }
                     }
                     Err(error) => DispatchResult {
@@ -1131,11 +1351,14 @@ impl HarnessBroker {
                 }
             }
             Err(error) => {
-                if method.settles_task() { self.active_wait_projection = None; }
+                if method.settles_task() {
+                    self.active_wait_projection = None;
+                }
                 let mut event = Vec::new();
                 if let Ok(timeline_patch) = self.reconcile_after_dispatch()
                     && !timeline_patch.is_empty()
-                    && let Ok(timeline_event) = self.event("document_changed", timeline_patch.notification())
+                    && let Ok(timeline_event) =
+                        self.event("document_changed", timeline_patch.notification())
                 {
                     event.push(timeline_event);
                 }
@@ -1193,14 +1416,21 @@ impl HarnessBroker {
         &mut self,
         method: HarnessMethod,
         params: Value,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Value, Vec<SessionEvent>)>> + Send + '_>> {
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(Value, Vec<SessionEvent>)>> + Send + '_>,
+    > {
         match method {
             HarnessMethod::ChecksSetup => Box::pin(self.setup_checks(params)),
             HarnessMethod::ChecksComplete => Box::pin(async move {
                 let result = (serde_json::to_value(self.snapshot()?)?, Vec::new());
                 self.settle_automatic_checks(result, PromptMode::Chat).await
             }),
-            HarnessMethod::ChecksList | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksSaveDefaults => Box::pin(self.project_checks(method, params)),
+            HarnessMethod::ChecksList
+            | HarnessMethod::ChecksOverride
+            | HarnessMethod::ChecksRun
+            | HarnessMethod::ChecksStatus
+            | HarnessMethod::ChecksCancel
+            | HarnessMethod::ChecksSaveDefaults => Box::pin(self.project_checks(method, params)),
             HarnessMethod::TaskTransition => self.transition_task(params),
             HarnessMethod::BackendModels => Box::pin(self.list_backend_model()),
             HarnessMethod::AgentStart => Box::pin(self.start_agent(params)),
@@ -1210,7 +1440,9 @@ impl HarnessBroker {
             HarnessMethod::PlanAcceptanceBegin => Box::pin(self.begin_plan_acceptance(params)),
             HarnessMethod::PlanChecksUpdate => Box::pin(self.update_plan_checks(params)),
             HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)),
-            HarnessMethod::PlanAnswerQuestions => Box::pin(self.answer_plan_review_questions(params)),
+            HarnessMethod::PlanAnswerQuestions => {
+                Box::pin(self.answer_plan_review_questions(params))
+            }
             HarnessMethod::QuestionAsk => Box::pin(self.ask_question(params)),
             HarnessMethod::QuestionContinue => Box::pin(self.continue_question()),
             HarnessMethod::ApprovalContinue => Box::pin(self.continue_after_approval_timeout()),
@@ -1219,7 +1451,9 @@ impl HarnessBroker {
             HarnessMethod::GoalResume => Box::pin(self.resume_goal(None, None, None)),
             HarnessMethod::GoalClear => Box::pin(self.clear_goal()),
             HarnessMethod::GoalContinue => Box::pin(self.continue_goal()),
-            HarnessMethod::ExchangeRequestChanges => Box::pin(self.request_exchange_changes(params)),
+            HarnessMethod::ExchangeRequestChanges => {
+                Box::pin(self.request_exchange_changes(params))
+            }
             HarnessMethod::ExchangeRollbackPrepare => Box::pin(self.prepare_rollback(params)),
             HarnessMethod::ExchangeRollbackApply => Box::pin(self.apply_rollback(params)),
             HarnessMethod::ExchangeRecovery => Box::pin(self.restore_recovery(params)),
@@ -1243,8 +1477,18 @@ impl HarnessBroker {
             self.refresh_lease()?;
         }
         match method {
-            HarnessMethod::ChecksEditing => Ok((self.observer.set_check_editing(params["enabled"].as_bool().context("check editing requires enabled")?)?, Vec::new())),
-            HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
+            HarnessMethod::ChecksEditing => Ok((
+                self.observer.set_check_editing(
+                    params["enabled"]
+                        .as_bool()
+                        .context("check editing requires enabled")?,
+                )?,
+                Vec::new(),
+            )),
+            HarnessMethod::TaskList => Ok((
+                serde_json::to_value(self.store.list_task(&self.session.id)?)?,
+                Vec::new(),
+            )),
             HarnessMethod::LspAuthorize
             | HarnessMethod::AttachmentImport
             | HarnessMethod::LspRespond
@@ -1272,34 +1516,77 @@ impl HarnessBroker {
             HarnessMethod::AgentList => {
                 Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new()))
             }
-            HarnessMethod::AgentMessage | HarnessMethod::AgentFollowup | HarnessMethod::AgentInterrupt | HarnessMethod::AgentInterruptAll => {
-                let target = ||required_text(&params,"target");
+            HarnessMethod::AgentMessage
+            | HarnessMethod::AgentFollowup
+            | HarnessMethod::AgentInterrupt
+            | HarnessMethod::AgentInterruptAll => {
+                let target = || required_text(&params, "target");
                 let operation = match method {
-                    HarnessMethod::AgentMessage => crate::agent::AgentOperation::Message {target:target()?,message:required_text(&params,"message")?},
-                    HarnessMethod::AgentFollowup => crate::agent::AgentOperation::Followup {target:target()?,message:required_text(&params,"message")?},
-                    HarnessMethod::AgentInterrupt => crate::agent::AgentOperation::Interrupt {target:target()?},
+                    HarnessMethod::AgentMessage => crate::agent::AgentOperation::Message {
+                        target: target()?,
+                        message: required_text(&params, "message")?,
+                    },
+                    HarnessMethod::AgentFollowup => crate::agent::AgentOperation::Followup {
+                        target: target()?,
+                        message: required_text(&params, "message")?,
+                    },
+                    HarnessMethod::AgentInterrupt => {
+                        crate::agent::AgentOperation::Interrupt { target: target()? }
+                    }
                     _ => crate::agent::AgentOperation::InterruptAll,
                 };
                 let mut event = Vec::new();
-                let result = self.handle_agent_request(crate::agent::AgentRequest {operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::User,operation},None,&mut event).await?;
-                Ok((result,event))
+                let result = self
+                    .handle_agent_request(
+                        crate::agent::AgentRequest {
+                            operation_id: Uuid::new_v4().to_string(),
+                            source: crate::agent::AgentSource::User,
+                            operation,
+                        },
+                        None,
+                        &mut event,
+                    )
+                    .await?;
+                Ok((result, event))
             }
             HarnessMethod::AgentModels => {
-                let provider = crate::backend::BackendKind::parse(&required_text(&params,"provider")?)?;
-                let model = self.agent_backend_factory.catalog(provider,self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat)).await?;
-                Ok((serde_json::to_value(model)?,Vec::new()))
+                let provider =
+                    crate::backend::BackendKind::parse(&required_text(&params, "provider")?)?;
+                let model = self
+                    .agent_backend_factory
+                    .catalog(
+                        provider,
+                        self.backend_request(
+                            BackendInput::from_text(String::new()),
+                            PromptMode::Chat,
+                        ),
+                    )
+                    .await?;
+                Ok((serde_json::to_value(model)?, Vec::new()))
             }
-            HarnessMethod::AgentProfilesGet => Ok((serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?, Vec::new())),
+            HarnessMethod::AgentProfilesGet => Ok((
+                serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?,
+                Vec::new(),
+            )),
             HarnessMethod::AgentProfilesSave => {
                 let revision = required_text(&params, "expected_revision")?;
                 let document = serde_json::from_value(params["document"].clone())?;
-                Ok((serde_json::to_value(self.agent_backend_factory.profiles.save(&revision, document)?)?, Vec::new()))
+                Ok((
+                    serde_json::to_value(
+                        self.agent_backend_factory
+                            .profiles
+                            .save(&revision, document)?,
+                    )?,
+                    Vec::new(),
+                ))
             }
             HarnessMethod::PermissionsOpen => self.observer.open_permission_document(),
             HarnessMethod::PermissionsSave => self.observer.save_permission_document(params),
             HarnessMethod::SessionPermissionMode => self.select_execution_mode(params),
             HarnessMethod::SessionMode => self.select_execution_mode(params),
-            HarnessMethod::HistoryRecord => self.observer.record_prompt_history(params, self.clock.now_ms()),
+            HarnessMethod::HistoryRecord => self
+                .observer
+                .record_prompt_history(params, self.clock.now_ms()),
             HarnessMethod::QueueEditLast => {
                 anyhow::bail!("prompt queue ownership lives in the Neovim client")
             }
@@ -1310,10 +1597,14 @@ impl HarnessBroker {
             HarnessMethod::PlanGet => Ok((self.observer.plan(params)?, Vec::new())),
             HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
             HarnessMethod::PlanList => self.observer.list_replanning_choices(),
-            HarnessMethod::PlanDeviationResolve => anyhow::bail!("task-based deviations are no longer supported"),
+            HarnessMethod::PlanDeviationResolve => {
+                anyhow::bail!("task-based deviations are no longer supported")
+            }
             HarnessMethod::QuestionAnswer => self.answer_question(params),
             HarnessMethod::QuestionSkip => self.skip_question(params),
-            HarnessMethod::InputTimeoutConfigure => anyhow::bail!("input timeout settings require the service coordinator"),
+            HarnessMethod::InputTimeoutConfigure => {
+                anyhow::bail!("input timeout settings require the service coordinator")
+            }
             HarnessMethod::ExchangeList => Ok((
                 serde_json::to_value(self.observer.list_exchange_review()?)?,
                 Vec::new(),
@@ -1321,8 +1612,19 @@ impl HarnessBroker {
             HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params),
             HarnessMethod::ExchangeRollbackPreview => {
                 let id = required_text(&params, "preview_id")?;
-                let preview = crate::checkpoint::RestorePreview::load(&self.store.objects, &self.session.id, &id)?;
-                Ok((preview.summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize), Vec::new()))
+                let preview = crate::checkpoint::RestorePreview::load(
+                    &self.store.objects,
+                    &self.session.id,
+                    &id,
+                )?;
+                Ok(
+                    (
+                        preview.summary(
+                            params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize
+                        ),
+                        Vec::new(),
+                    ),
+                )
             }
             HarnessMethod::SessionNew | HarnessMethod::SessionClear => {
                 self.new_session(params).await
@@ -1359,16 +1661,29 @@ impl HarnessBroker {
         }
     }
 
-    async fn answer_plan_review_questions(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn answer_plan_review_questions(
+        &mut self,
+        params: Value,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         let input: forge_buffer::input::DocumentInput = serde_json::from_value(
-            params.get("review").cloned().context("plan question requires its review identity")?,
+            params
+                .get("review")
+                .cloned()
+                .context("plan question requires its review identity")?,
         )?;
-        let digest = params.get("draft_source_digest").and_then(Value::as_str)
+        let digest = params
+            .get("draft_source_digest")
+            .and_then(Value::as_str)
             .context("plan question requires its source digest")?;
-        let annotation = serde_json::from_value(params.get("draft_annotation").cloned()
-            .context("plan questions require captured annotations")?)?;
+        let annotation = serde_json::from_value(
+            params
+                .get("draft_annotation")
+                .cloned()
+                .context("plan questions require captured annotations")?,
+        )?;
         let document = input.document.clone();
-        self.plan_review.save_annotations(&document, digest, annotation)?;
+        self.plan_review
+            .save_annotations(&document, digest, annotation)?;
         let question = self.plan_review.questions(input)?;
         let mut event = Vec::new();
         for question in question {
@@ -1379,40 +1694,73 @@ impl HarnessBroker {
             }));
             let mut admission = ExchangeAdmission::chat(question.body.clone());
             admission.plan_id = Some(question.plan_id.clone());
-            let (result, mut update) = self.run_interaction(
-                format!("{instructions}\n\n{}", question.prompt),
-                PromptMode::PlanQuestion,
-                Some(admission),
-            ).await?;
+            let (result, mut update) = self
+                .run_interaction(
+                    format!("{instructions}\n\n{}", question.prompt),
+                    PromptMode::PlanQuestion,
+                    Some(admission),
+                )
+                .await?;
             event.append(&mut update);
-            let exchange_id = result.pointer("/exchange/id").and_then(Value::as_str)
+            let exchange_id = result
+                .pointer("/exchange/id")
+                .and_then(Value::as_str)
                 .context("plan question completed without its exchange")?;
-            let exchange = self.store.load_exchange(exchange_id)?
+            let exchange = self
+                .store
+                .load_exchange(exchange_id)?
                 .context("plan question exchange is no longer available")?;
-            let answer = exchange.turn.iter().flat_map(|turn| turn.messages())
-                .filter(|message| message.kind() == crate::turn::MessageKind::Assistant
-                    && message.delivery() == crate::turn::MessageDelivery::Final)
-                .map(|message| message.text()).collect::<Vec<_>>().join("\n\n");
-            anyhow::ensure!(!answer.trim().is_empty(), "plan question completed without an answer");
-            self.plan_review.answer(&document, &question, answer.clone(), exchange.duration_ms)?;
-            self.trace.record(&self.session.id, "plan.question.answered", json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms}));
+            let answer = exchange
+                .turn
+                .iter()
+                .flat_map(|turn| turn.messages())
+                .filter(|message| {
+                    message.kind() == crate::turn::MessageKind::Assistant
+                        && message.delivery() == crate::turn::MessageDelivery::Final
+                })
+                .map(|message| message.text())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            anyhow::ensure!(
+                !answer.trim().is_empty(),
+                "plan question completed without an answer"
+            );
+            self.plan_review
+                .answer(&document, &question, answer.clone(), exchange.duration_ms)?;
+            self.trace.record(
+                &self.session.id,
+                "plan.question.answered",
+                json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms}),
+            );
         }
-        Ok((json!({"annotation":self.plan_review.annotations(&document)?}), event))
+        Ok((
+            json!({"annotation":self.plan_review.annotations(&document)?}),
+            event,
+        ))
     }
-
 
     fn current_plan_id(&self) -> Result<Option<String>> {
         Ok(self.current_task()?.and_then(|task| task.plan_id))
     }
 
     async fn select_review_task(&mut self, plan: &PlanRecord) -> Result<Vec<SessionEvent>> {
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        let mut task = self.store.list_task(&self.session.id)?.into_iter()
+        anyhow::ensure!(
+            plan.session_id == self.session.id,
+            "plan belongs to another session"
+        );
+        let mut task = self
+            .store
+            .list_task(&self.session.id)?
+            .into_iter()
             .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
             .context("reviewed plan has no owning task")?;
-        anyhow::ensure!(!task.status.terminal(), "reviewed plan belongs to a completed task");
+        anyhow::ensure!(
+            !task.status.terminal(),
+            "reviewed plan belongs to a completed task"
+        );
         if self.session.current_task_id.as_deref() == Some(task.id.as_str())
-            && task.status != crate::task::TaskStatus::Paused {
+            && task.status != crate::task::TaskStatus::Paused
+        {
             return Ok(Vec::new());
         }
         let (_, events) = self.pause_task(false).await?;
@@ -1422,18 +1770,27 @@ impl HarnessBroker {
         task.updated_at_ms = self.clock.now_ms();
         self.session.current_task_id = Some(task.id.clone());
         self.session.goal_id = task.goal_id.clone();
-        self.store.select_task(&self.session, Some(&task), None, None, &self.client_id)?;
+        self.store
+            .select_task(&self.session, Some(&task), None, None, &self.client_id)?;
         Ok(events)
     }
 
     fn current_task(&self) -> Result<Option<crate::task::TaskRecord>> {
-        Ok(self.store.list_task(&self.session.id)?.into_iter()
+        Ok(self
+            .store
+            .list_task(&self.session.id)?
+            .into_iter()
             .find(|task| Some(&task.id) == self.session.current_task_id.as_ref()))
     }
 
     fn current_task_is_plan(&self) -> Result<bool> {
-        Ok(self.current_task()?.is_some_and(|task| task.kind == crate::task::TaskKind::Plan
-            && matches!(task.status, crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting)))
+        Ok(self.current_task()?.is_some_and(|task| {
+            task.kind == crate::task::TaskKind::Plan
+                && matches!(
+                    task.status,
+                    crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting
+                )
+        }))
     }
 
     async fn pause_task(&mut self, clear: bool) -> Result<(Value, Vec<SessionEvent>)> {
@@ -1443,45 +1800,92 @@ impl HarnessBroker {
         let mut task = self.current_task()?;
         if let Some(task) = task.as_mut() {
             if !task.status.terminal() {
-                if self.current_goal()?.is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused)) {
+                if self
+                    .current_goal()?
+                    .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
+                {
                     events.extend(self.pause_goal().await?.1);
                 }
-                task.status = if clear { TaskStatus::Cancelled } else { TaskStatus::Paused };
+                task.status = if clear {
+                    TaskStatus::Cancelled
+                } else {
+                    TaskStatus::Paused
+                };
                 task.generation += 1;
-                task.reason = Some(if clear { "Cleared by user" } else { "Paused by user" }.into());
+                task.reason = Some(
+                    if clear {
+                        "Cleared by user"
+                    } else {
+                        "Paused by user"
+                    }
+                    .into(),
+                );
                 task.updated_at_ms = self.clock.now_ms();
-
             }
         }
 
         self.session.goal_id = None;
-        if clear { self.session.current_task_id = None; }
-        self.store.select_task(&self.session, task.as_ref(), None, None, &self.client_id)?;
+        if clear {
+            self.session.current_task_id = None;
+        }
+        self.store
+            .select_task(&self.session, task.as_ref(), None, None, &self.client_id)?;
         Ok((serde_json::to_value(self.snapshot()?)?, events))
     }
 
     #[cfg(test)]
-    fn create_task(&mut self, kind: crate::task::TaskKind, title: String, plan_id: Option<String>, goal_id: Option<String>) -> Result<()> {
-        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), title, kind, self.session.execution_mode, self.clock.now_ms());
+    fn create_task(
+        &mut self,
+        kind: crate::task::TaskKind,
+        title: String,
+        plan_id: Option<String>,
+        goal_id: Option<String>,
+    ) -> Result<()> {
+        let mut task = crate::task::TaskRecord::new(
+            self.session.id.clone(),
+            title,
+            kind,
+            self.session.execution_mode,
+            self.clock.now_ms(),
+        );
         task.plan_id = plan_id;
         task.goal_id = goal_id;
         task.begin(self.clock.now_ms())?;
         self.session.current_task_id = Some(task.id.clone());
-        self.store.select_task(&self.session, Some(&task), None, None, &self.client_id)
+        self.store
+            .select_task(&self.session, Some(&task), None, None, &self.client_id)
     }
 
     fn settle_task(&mut self, failure: Option<String>) -> Result<()> {
         use crate::task::{TaskKind, TaskStatus};
-        let Some(mut task) = self.current_task()? else { return Ok(()) };
-        if task.status.terminal() || task.status == TaskStatus::Paused { return Ok(()) }
-        if task.status == TaskStatus::Blocked && task.phase == "checks" && failure.is_none() { return Ok(()); }
+        let Some(mut task) = self.current_task()? else {
+            return Ok(());
+        };
+        if task.status.terminal() || task.status == TaskStatus::Paused {
+            return Ok(());
+        }
+        if task.status == TaskStatus::Blocked && task.phase == "checks" && failure.is_none() {
+            return Ok(());
+        }
         task.permission = self.session.execution_mode;
-        if task.permission.is_write_default() { task.last_write_permission = task.permission; }
+        if task.permission.is_write_default() {
+            task.last_write_permission = task.permission;
+        }
         if let Some(message) = failure {
-            task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) { TaskStatus::Paused } else { TaskStatus::Failed };
+            task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) {
+                TaskStatus::Paused
+            } else {
+                TaskStatus::Failed
+            };
             task.reason = Some(message);
         } else if task.kind == TaskKind::Plan {
-            if let Some(plan) = task.plan_id.as_deref().map(|id| self.store.load_plan(id)).transpose()?.flatten() {
+            if let Some(plan) = task
+                .plan_id
+                .as_deref()
+                .map(|id| self.store.load_plan(id))
+                .transpose()?
+                .flatten()
+            {
                 task.title = plan.title;
                 task.status = match plan.state {
                     PlanState::ConfiguringChecks => TaskStatus::Waiting,
@@ -1494,9 +1898,16 @@ impl HarnessBroker {
                     PlanState::ConfiguringChecks => "checks_setup",
                     PlanState::AwaitingReview => "review",
                     _ => "draft",
-                }.into();
+                }
+                .into();
             }
-        } else if let Some(goal) = task.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten() {
+        } else if let Some(goal) = task
+            .goal_id
+            .as_deref()
+            .map(|id| self.store.load_goal(id))
+            .transpose()?
+            .flatten()
+        {
             task.status = match goal.state {
                 GoalState::Active => TaskStatus::Running,
                 GoalState::Complete => TaskStatus::Completed,
@@ -1506,17 +1917,29 @@ impl HarnessBroker {
             };
             task.reason = match goal.state {
                 GoalState::Blocked => Some("Provider reported that the task is blocked".into()),
-                GoalState::Stalled => Some("Task stopped because no observable progress was recorded".into()),
+                GoalState::Stalled => {
+                    Some("Task stopped because no observable progress was recorded".into())
+                }
                 GoalState::UsageLimited => Some("Provider usage limit reached".into()),
                 GoalState::BudgetLimited => Some("Task budget limit reached".into()),
                 _ => None,
             };
-            if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|entry| entry.goal_id == goal.id) {
+            if let Some(execution) = self
+                .store
+                .list_plan_execution(&self.session.id)?
+                .into_iter()
+                .find(|entry| entry.goal_id == goal.id)
+            {
                 task.phase = format!("{:?}", execution.phase).to_lowercase();
                 if goal.state == GoalState::Stalled {
-                    task.reason = Some(format!("{} stopped because no observable progress was recorded", execution.phase.label()));
+                    task.reason = Some(format!(
+                        "{} stopped because no observable progress was recorded",
+                        execution.phase.label()
+                    ));
                 }
-                if execution.pending_revision_reason.is_some() { task.status = TaskStatus::Waiting; }
+                if execution.pending_revision_reason.is_some() {
+                    task.status = TaskStatus::Waiting;
+                }
             }
         }
         task.updated_at_ms = self.clock.now_ms();
@@ -1748,7 +2171,10 @@ impl HarnessBroker {
 
     async fn transition_resume(&mut self, action: Value) -> Result<(Value, Vec<SessionEvent>)> {
         use crate::task::{TaskKind, TaskStatus};
-        let continuation = action.get("continuation").and_then(Value::as_str).map(str::to_owned);
+        let continuation = action
+            .get("continuation")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let message = action
             .get("text")
             .and_then(Value::as_str)
@@ -1856,7 +2282,8 @@ impl HarnessBroker {
                 message.clone().or(continuation).unwrap_or_else(|| "Resume this planning task. Reassess the saved design against the current repository before continuing.".into()), &document.model_json()?),
                 Some(admission)).await
         } else {
-            self.resume_goal(message, Some(lifecycle), continuation).await
+            self.resume_goal(message, Some(lifecycle), continuation)
+                .await
         }
     }
 
@@ -2075,7 +2502,10 @@ impl HarnessBroker {
                     .all(|turn| turn.state() != crate::turn::TurnState::Running),
             "the latest Harness exchange is not paused for resumption"
         );
-        if let Some(mut task) = self.current_task()?.filter(|task| task.status == crate::task::TaskStatus::Paused) {
+        if let Some(mut task) = self
+            .current_task()?
+            .filter(|task| task.status == crate::task::TaskStatus::Paused)
+        {
             task.begin(self.clock.now_ms())?;
             self.store.save_task(&task)?;
         }
@@ -2083,7 +2513,11 @@ impl HarnessBroker {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => PromptMode::Plan,
             ExchangeKind::PlanExecution => PromptMode::ExecutePlan,
             ExchangeKind::Chat if interaction.goal_id.is_some() => PromptMode::GoalContinuation,
-            ExchangeKind::Chat if interaction.plan_id.is_some() && interaction.check_setup.is_none() => PromptMode::PlanDiscussion,
+            ExchangeKind::Chat
+                if interaction.plan_id.is_some() && interaction.check_setup.is_none() =>
+            {
+                PromptMode::PlanDiscussion
+            }
             ExchangeKind::Chat => PromptMode::Chat,
         };
         if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
@@ -2094,33 +2528,65 @@ impl HarnessBroker {
     }
 
     async fn start_agent(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let operation_id = params.as_object_mut().and_then(|params|params.remove("operation_id"))
-            .and_then(|value|value.as_str().map(str::to_owned))
-            .or_else(||self.active_operation_id.clone()).unwrap_or_else(||Uuid::new_v4().to_string());
+        let operation_id = params
+            .as_object_mut()
+            .and_then(|params| params.remove("operation_id"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .or_else(|| self.active_operation_id.clone())
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let spawn: crate::agent::SpawnAgentRequest = serde_json::from_value(params)?;
-        let request = crate::agent::AgentRequest { operation_id,
-            source: crate::agent::AgentSource::User, operation: crate::agent::AgentOperation::Spawn(spawn) };
+        let request = crate::agent::AgentRequest {
+            operation_id,
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::Spawn(spawn),
+        };
         let mut event = Vec::new();
         let result = self.handle_agent_request(request, None, &mut event).await?;
         Ok((result, event))
     }
 
-    async fn handle_agent_request(&mut self, request: crate::agent::AgentRequest, mut parent: Option<&mut Exchange>,
-        event: &mut Vec<SessionEvent>) -> Result<Value> {
+    async fn handle_agent_request(
+        &mut self,
+        request: crate::agent::AgentRequest,
+        mut parent: Option<&mut Exchange>,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<Value> {
         use crate::agent::{AgentOperation, AgentSource};
-        anyhow::ensure!(request.source != AgentSource::Model || self.agent_coordinator.enabled(), "model-facing subagent tools are disabled");
-        if let Some(task) = self.store.list_agent_task(&self.session.id)?.into_iter().find(|task|task.operation_id == request.operation_id) {
+        anyhow::ensure!(
+            request.source != AgentSource::Model || self.agent_coordinator.enabled(),
+            "model-facing subagent tools are disabled"
+        );
+        if let Some(task) = self
+            .store
+            .list_agent_task(&self.session.id)?
+            .into_iter()
+            .find(|task| task.operation_id == request.operation_id)
+        {
             let agent = self.agent_coordinator.resolve(&task.agent_id)?;
             let same_work = match &request.operation {
-                AgentOperation::Spawn(spawn) => task.ordinal == 1 && task.message == spawn.text
-                    && spawn.profile.as_deref().is_none_or(|profile|profile == agent.definition),
-                AgentOperation::Followup {target,message} => task.ordinal > 1 && task.message == *message
-                    && self.agent_coordinator.resolve(target)?.id == agent.id,
+                AgentOperation::Spawn(spawn) => {
+                    task.ordinal == 1
+                        && task.message == spawn.text
+                        && spawn
+                            .profile
+                            .as_deref()
+                            .is_none_or(|profile| profile == agent.definition)
+                }
+                AgentOperation::Followup { target, message } => {
+                    task.ordinal > 1
+                        && task.message == *message
+                        && self.agent_coordinator.resolve(target)?.id == agent.id
+                }
                 _ => false,
             };
-            anyhow::ensure!(same_work && task.source == request.source
-                && parent.as_deref().is_none_or(|parent|task.parent_exchange_id == parent.id),
-                "operation identity was reused for different child work");
+            anyhow::ensure!(
+                same_work
+                    && task.source == request.source
+                    && parent
+                        .as_deref()
+                        .is_none_or(|parent| task.parent_exchange_id == parent.id),
+                "operation identity was reused for different child work"
+            );
             return Ok(json!({"agent":agent,"task":task,"status":"admitted","replayed":true}));
         }
         match &request.operation {
@@ -2128,67 +2594,150 @@ impl HarnessBroker {
                 let limit = limit.unwrap_or(5);
                 let (agent, task) = self.agent_coordinator.inspection(target)?;
                 let saved;
-                let exchange = if let Some(runtime) = self.child_exchange_runtime_by_agent.get(&agent.id)
-                    .filter(|runtime|runtime.exchange.id == task.id) { &runtime.exchange }
-                else {
-                    saved = self.store.load_exchange_metadata(&task.id)?.context("child activity exchange missing")?;
+                let exchange = if let Some(runtime) = self
+                    .child_exchange_runtime_by_agent
+                    .get(&agent.id)
+                    .filter(|runtime| runtime.exchange.id == task.id)
+                {
+                    &runtime.exchange
+                } else {
+                    saved = self
+                        .store
+                        .load_exchange_metadata(&task.id)?
+                        .context("child activity exchange missing")?;
                     &saved
                 };
-                let awaiting_approval = self.permission_coordinator.pending_list()?.iter().any(|approval|
-                    approval.execution_owner.as_ref().is_some_and(|owner|owner.agent_id == agent.id && owner.session_id == self.session.id));
+                let awaiting_approval =
+                    self.permission_coordinator
+                        .pending_list()?
+                        .iter()
+                        .any(|approval| {
+                            approval.execution_owner.as_ref().is_some_and(|owner| {
+                                owner.agent_id == agent.id && owner.session_id == self.session.id
+                            })
+                        });
                 let result = serde_json::to_value(crate::agent::AgentActivity::capture(
-                    &agent,&task,exchange,limit,self.clock.now_ms(),awaiting_approval)?)?;
+                    &agent,
+                    &task,
+                    exchange,
+                    limit,
+                    self.clock.now_ms(),
+                    awaiting_approval,
+                )?)?;
                 return Ok(result);
             }
-            AgentOperation::ToolOutput { call_ref, offset, limit } => {
+            AgentOperation::ToolOutput {
+                call_ref,
+                offset,
+                limit,
+            } => {
                 let reference = crate::agent::AgentToolReference::decode(call_ref)?;
-                anyhow::ensure!(reference.session_id == self.session.id, "tool reference belongs to another root session");
+                anyhow::ensure!(
+                    reference.session_id == self.session.id,
+                    "tool reference belongs to another root session"
+                );
                 let agent = self.agent_coordinator.resolve(&reference.agent_id)?;
-                let task = self.agent_coordinator.task(&reference.exchange_id).context("tool reference has no admitted child run")?;
-                anyhow::ensure!(task.agent_id == agent.id && task.session_id == self.session.id,
-                    "tool reference crosses child ownership");
-                let exchange = self.store.load_exchange_metadata(&reference.exchange_id)?.context("tool reference exchange missing")?;
-                anyhow::ensure!(exchange.agent_id == agent.id && exchange.session_id == self.session.id,
-                    "tool reference crosses exchange ownership");
-                let tool = exchange.turn.iter().find(|turn|turn.id() == reference.turn_id)
-                    .and_then(|turn|turn.tools().find(|tool|tool.id == reference.tool_id))
+                let task = self
+                    .agent_coordinator
+                    .task(&reference.exchange_id)
+                    .context("tool reference has no admitted child run")?;
+                anyhow::ensure!(
+                    task.agent_id == agent.id && task.session_id == self.session.id,
+                    "tool reference crosses child ownership"
+                );
+                let exchange = self
+                    .store
+                    .load_exchange_metadata(&reference.exchange_id)?
+                    .context("tool reference exchange missing")?;
+                anyhow::ensure!(
+                    exchange.agent_id == agent.id && exchange.session_id == self.session.id,
+                    "tool reference crosses exchange ownership"
+                );
+                let tool = exchange
+                    .turn
+                    .iter()
+                    .find(|turn| turn.id() == reference.turn_id)
+                    .and_then(|turn| turn.tools().find(|tool| tool.id == reference.tool_id))
                     .context("tool reference does not identify a recorded call")?;
-                let page = self.store.tool_output_page(&exchange.id,&reference.turn_id,&reference.tool_id,*offset,*limit)?;
-                return Ok(json!({"call_ref":call_ref,"status":crate::agent::tool_activity_status(tool),
+                let page = self.store.tool_output_page(
+                    &exchange.id,
+                    &reference.turn_id,
+                    &reference.tool_id,
+                    *offset,
+                    *limit,
+                )?;
+                return Ok(
+                    json!({"call_ref":call_ref,"status":crate::agent::tool_activity_status(tool),
                     "failed":tool.failed,"output":page.output,"offset":offset,
-                    "next_offset":page.next_offset,"total_chars":page.total_chars}));
+                    "next_offset":page.next_offset,"total_chars":page.total_chars}),
+                );
             }
             AgentOperation::List { prefix } => {
                 let mut entry = Vec::new();
-                if prefix.as_deref().is_none_or(|prefix|"/root".starts_with(prefix)) {
+                if prefix
+                    .as_deref()
+                    .is_none_or(|prefix| "/root".starts_with(prefix))
+                {
                     entry.push(json!({"agent":Agent::primary(&self.session.id, self.session.created_at_ms),"latest_task":null}));
                 }
-                entry.extend(self.agent_coordinator.snapshot(prefix.as_deref()).into_iter().map(|(agent, task)|json!({"agent":agent,"latest_task":task})));
+                entry.extend(
+                    self.agent_coordinator
+                        .snapshot(prefix.as_deref())
+                        .into_iter()
+                        .map(|(agent, task)| json!({"agent":agent,"latest_task":task})),
+                );
                 return Ok(json!({"agents":entry}));
             }
             AgentOperation::Message { target, message } => {
-                anyhow::ensure!(!message.trim().is_empty(), "informational message must contain nonempty text");
+                anyhow::ensure!(
+                    !message.trim().is_empty(),
+                    "informational message must contain nonempty text"
+                );
                 let mut agent = self.agent_coordinator.resolve(target)?;
                 let id = request.operation_id.clone();
-                if let Some(existing) = agent.inbox.iter().find(|message|message.id == id) {
-                    anyhow::ensure!(existing.message == *message,"operation identity was reused for a different informational message");
+                if let Some(existing) = agent.inbox.iter().find(|message| message.id == id) {
+                    anyhow::ensure!(
+                        existing.message == *message,
+                        "operation identity was reused for a different informational message"
+                    );
                     return Ok(serde_json::to_value(existing)?);
                 }
                 let mut delivery = crate::agent::MessageDelivery::Queued;
                 if let Some(backend) = self.child_backend_by_agent.get(&agent.id)
                     && backend.descriptor().capability.native_steer
-                    && backend.has_active_turn(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key()).await {
+                    && backend
+                        .has_active_turn(
+                            &crate::backend::ExecutionOwner {
+                                session_id: self.session.id.clone(),
+                                agent_id: agent.id.clone(),
+                            }
+                            .runtime_key(),
+                        )
+                        .await
+                {
                     match backend.steer_session(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key(), message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
                         Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
                             "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
                     }
                 }
-                let message = crate::agent::AgentMessage { id, ordinal: agent.inbox.last().map_or(1, |message|message.ordinal+1),
-                    message: message.clone(), delivery, task_id: None, created_at_ms: self.clock.now_ms() };
+                let message = crate::agent::AgentMessage {
+                    id,
+                    ordinal: agent.inbox.last().map_or(1, |message| message.ordinal + 1),
+                    message: message.clone(),
+                    delivery,
+                    task_id: None,
+                    created_at_ms: self.clock.now_ms(),
+                };
                 agent.inbox.push(message.clone());
                 self.store.save_agent_run(&agent)?;
-                if let Some(task) = self.agent_coordinator.snapshot(None).into_iter().find(|(candidate,_)|candidate.id == agent.id).and_then(|(_,task)|task) {
+                if let Some(task) = self
+                    .agent_coordinator
+                    .snapshot(None)
+                    .into_iter()
+                    .find(|(candidate, _)| candidate.id == agent.id)
+                    .and_then(|(_, task)| task)
+                {
                     self.agent_coordinator.retain(agent.clone(), task)?;
                 }
                 self.agent_registry.insert(agent);
@@ -2199,141 +2748,307 @@ impl HarnessBroker {
                 return Ok(json!({"status":"interrupting","target":target}));
             }
             AgentOperation::InterruptAll => {
-                for (agent, _) in self.agent_coordinator.snapshot(None) { self.interrupt_managed_agent(&agent.id, event).await?; }
+                for (agent, _) in self.agent_coordinator.snapshot(None) {
+                    self.interrupt_managed_agent(&agent.id, event).await?;
+                }
                 return Ok(json!({"status":"interrupting"}));
             }
             AgentOperation::Spawn(_) | AgentOperation::Followup { .. } => {}
         }
-        let mut admitted_parent = if let Some(parent) = parent.as_deref() { parent.clone() }
-            else { Exchange::agent_admission(&self.session.id, self.store.next_exchange_ordinal(&self.session.id)?, "Child task admission".into(), self.clock.now_ms()) };
+        let mut admitted_parent = if let Some(parent) = parent.as_deref() {
+            parent.clone()
+        } else {
+            Exchange::agent_admission(
+                &self.session.id,
+                self.store.next_exchange_ordinal(&self.session.id)?,
+                "Child task admission".into(),
+                self.clock.now_ms(),
+            )
+        };
         let admission = match &request.operation {
             AgentOperation::Spawn(spawn) => {
-                let mut root = self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat);
-                if root.model == "default" && let Some(model) = &self.session.resolved_model {root.model = model.clone();}
-                let selection = self.agent_backend_factory.resolve(&root,
-                    crate::backend::BackendKind::parse(&self.session.backend)?, spawn).await?;
-                anyhow::ensure!(request.source != AgentSource::Model || self.agent_coordinator.enabled(), "model-facing subagent tools are disabled");
-                self.agent_backend_factory.profiles.resolve(Some(&selection.profile))?;
-                self.agent_coordinator.reserve_spawn(&request, spawn, selection, &admitted_parent.id, self.clock.now_ms())?
+                let mut root =
+                    self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat);
+                if root.model == "default"
+                    && let Some(model) = &self.session.resolved_model
+                {
+                    root.model = model.clone();
+                }
+                let selection = self
+                    .agent_backend_factory
+                    .resolve(
+                        &root,
+                        crate::backend::BackendKind::parse(&self.session.backend)?,
+                        spawn,
+                    )
+                    .await?;
+                anyhow::ensure!(
+                    request.source != AgentSource::Model || self.agent_coordinator.enabled(),
+                    "model-facing subagent tools are disabled"
+                );
+                self.agent_backend_factory
+                    .profiles
+                    .resolve(Some(&selection.profile))?;
+                self.agent_coordinator.reserve_spawn(
+                    &request,
+                    spawn,
+                    selection,
+                    &admitted_parent.id,
+                    self.clock.now_ms(),
+                )?
             }
             AgentOperation::Followup { target, message } => {
                 let agent = self.agent_coordinator.resolve(target)?;
-                self.agent_backend_factory.profiles.resolve(Some(&agent.definition))?;
-                self.agent_coordinator.reserve_followup(&request, target, message, &admitted_parent.id, self.clock.now_ms())?
+                self.agent_backend_factory
+                    .profiles
+                    .resolve(Some(&agent.definition))?;
+                self.agent_coordinator.reserve_followup(
+                    &request,
+                    target,
+                    message,
+                    &admitted_parent.id,
+                    self.clock.now_ms(),
+                )?
             }
             _ => unreachable!(),
         };
         let persisted = (|| -> Result<()> {
             admitted_parent.append_agent_task(&admission.task)?;
-            self.store.admit_agent_task(&admission.agent, &admission.task, &admitted_parent)
+            self.store
+                .admit_agent_task(&admission.agent, &admission.task, &admitted_parent)
         })();
-        if let Err(error) = persisted { self.agent_coordinator.reject(&request.operation_id); return Err(error); }
+        if let Err(error) = persisted {
+            self.agent_coordinator.reject(&request.operation_id);
+            return Err(error);
+        }
         let launch = self.agent_coordinator.commit(&admission)?;
         self.agent_registry.insert(admission.agent.clone());
-        if let Some(parent) = parent.as_deref_mut() { *parent = admitted_parent; }
-        else { admitted_parent.finish(ExchangeState::Complete, self.clock.now_ms())?; self.store.save_exchange(&admitted_parent)?; }
+        if let Some(parent) = parent.as_deref_mut() {
+            *parent = admitted_parent;
+        } else {
+            admitted_parent.finish(ExchangeState::Complete, self.clock.now_ms())?;
+            self.store.save_exchange(&admitted_parent)?;
+        }
         self.trace.record(&self.session.id,"agent.admitted",json!({"agent_id":admission.agent.id,"exchange_id":admission.task.id,"parent_exchange_id":admission.task.parent_exchange_id,"source":admission.task.source}));
         let warning = if matches!(request.operation, AgentOperation::Spawn(_)) {
             self.agent_backend_factory.profiles.snapshot()?.error
-        } else { None };
+        } else {
+            None
+        };
         let result = json!({"agent":admission.agent,"task":admission.task,"status":"admitted","warning":warning});
-        if launch && admission.launch { self.launch_managed_agent(admission, event).await?; }
+        if launch && admission.launch {
+            self.launch_managed_agent(admission, event).await?;
+        }
         self.publish_agent_state(event).await?;
         Ok(result)
     }
 
     async fn publish_agent_state(&mut self, event: &mut Vec<SessionEvent>) -> Result<()> {
         let snapshot = self.snapshot()?;
-        self.emit_backend_event(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
-            kind:"agent_updated".into(),text:None,data:serde_json::to_value(snapshot.agent)?,
-            activity:None,summary:None,task_update:None},event).await?;
-        let patch = self.presentation.lock().map_err(|_|anyhow::anyhow!("session presentation lock poisoned"))?
-                .reconcile_with_status_thoughts(snapshot.timeline, self.observer.status_thoughts.load(Ordering::Relaxed))?;
-        self.emit_timeline_patch(patch,event).await
+        self.emit_backend_event(
+            BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "agent_updated".into(),
+                text: None,
+                data: serde_json::to_value(snapshot.agent)?,
+                activity: None,
+                summary: None,
+                task_update: None,
+            },
+            event,
+        )
+        .await?;
+        let patch = self
+            .presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+            .reconcile_with_status_thoughts(
+                snapshot.timeline,
+                self.observer.status_thoughts.load(Ordering::Relaxed),
+            )?;
+        self.emit_timeline_patch(patch, event).await
     }
 
-    async fn cancel_agent_approvals(&mut self, owner: &crate::backend::ExecutionOwner,
-        event: &mut Vec<SessionEvent>) -> Result<()> {
-        let pending = self.permission_coordinator.pending_list()?.into_iter()
-            .filter(|approval|approval.execution_owner.as_ref() == Some(owner)).collect::<Vec<_>>();
-        self.permission_coordinator.cancel_owner(owner,None).await?;
+    async fn cancel_agent_approvals(
+        &mut self,
+        owner: &crate::backend::ExecutionOwner,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let pending = self
+            .permission_coordinator
+            .pending_list()?
+            .into_iter()
+            .filter(|approval| approval.execution_owner.as_ref() == Some(owner))
+            .collect::<Vec<_>>();
+        self.permission_coordinator
+            .cancel_owner(owner, None)
+            .await?;
         for approval in pending {
-            if let Some(runtime) = self.child_exchange_runtime_by_agent.get_mut(&owner.agent_id) {
-                runtime.exchange.observe_blocker(format!("approval:{}",approval.id),false,self.clock.now_ms());
+            if let Some(runtime) = self
+                .child_exchange_runtime_by_agent
+                .get_mut(&owner.agent_id)
+            {
+                runtime.exchange.observe_blocker(
+                    format!("approval:{}", approval.id),
+                    false,
+                    self.clock.now_ms(),
+                );
                 self.store.save_exchange(&runtime.exchange)?;
             }
-            self.emit_backend_event(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
-                kind:"approval_cancelled".into(),text:None,data:serde_json::to_value(approval)?,
-                activity:None,summary:None,task_update:None},event).await?;
+            self.emit_backend_event(
+                BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "approval_cancelled".into(),
+                    text: None,
+                    data: serde_json::to_value(approval)?,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+                event,
+            )
+            .await?;
         }
         Ok(())
     }
 
-    async fn interrupt_managed_agent(&mut self, target: &str, event: &mut Vec<SessionEvent>) -> Result<()> {
+    async fn interrupt_managed_agent(
+        &mut self,
+        target: &str,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
         let agent = self.agent_coordinator.resolve(target)?;
-        let owner = crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()};
+        let owner = crate::backend::ExecutionOwner {
+            session_id: self.session.id.clone(),
+            agent_id: agent.id.clone(),
+        };
         let cancelled = self.agent_coordinator.interrupt(target)?;
-        self.cancel_agent_approvals(&owner,event).await?;
+        self.cancel_agent_approvals(&owner, event).await?;
         for mut task in cancelled {
             task.state = ExchangeState::Cancelled;
             task.completed_at_ms = Some(self.clock.now_ms());
             if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
-                exchange.finish(ExchangeState::Cancelled,self.clock.now_ms())?;
+                exchange.finish(ExchangeState::Cancelled, self.clock.now_ms())?;
                 self.store.complete_agent_task(&agent, &task, &exchange)?;
             }
             self.agent_coordinator.retain(agent.clone(), task)?;
         }
         if let Some(mut task) = self.agent_coordinator.cleanup_task(&agent.id) {
-            let backend = self.child_backend_by_agent.get(&agent.id).cloned()
+            let backend = self
+                .child_backend_by_agent
+                .get(&agent.id)
+                .cloned()
                 .context("child cleanup obligation has no retained provider adapter")?;
-            tokio::time::timeout(std::time::Duration::from_secs(30),async {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
                 backend.cancel_session(&owner.runtime_key()).await?;
                 backend.cleanup_execution(&owner.runtime_key()).await?;
                 backend.shutdown().await
-            }).await.context("child cleanup retry exceeded 30 seconds")??;
+            })
+            .await
+            .context("child cleanup retry exceeded 30 seconds")??;
             let mut agent = agent.clone();
             agent.state = AgentState::Ready;
             agent.updated_at_ms = self.clock.now_ms();
             task.error = None;
-            let mut exchange = self.store.load_exchange(&task.id)?.context("child cleanup exchange missing")?;
+            let mut exchange = self
+                .store
+                .load_exchange(&task.id)?
+                .context("child cleanup exchange missing")?;
             exchange.finalization_error = None;
-            self.store.complete_agent_task(&agent,&task,&exchange)?;
+            self.store.complete_agent_task(&agent, &task, &exchange)?;
             self.agent_registry.insert(agent.clone());
-            self.agent_coordinator.retain(agent,task.clone())?;
-            self.agent_coordinator.settled(&owner.agent_id,&task.id,false)?;
+            self.agent_coordinator.retain(agent, task.clone())?;
+            self.agent_coordinator
+                .settled(&owner.agent_id, &task.id, false)?;
             self.child_backend_by_agent.remove(&owner.agent_id);
         }
         self.publish_agent_state(event).await?;
         Ok(())
     }
 
-    async fn launch_managed_agent(&mut self, mut admission: crate::agent::AgentAdmission, event: &mut Vec<SessionEvent>) -> Result<()> {
-        let owner = crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:admission.agent.id.clone()};
+    async fn launch_managed_agent(
+        &mut self,
+        mut admission: crate::agent::AgentAdmission,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let owner = crate::backend::ExecutionOwner {
+            session_id: self.session.id.clone(),
+            agent_id: admission.agent.id.clone(),
+        };
         let prepared = (|| -> Result<_> {
             let mut message = admission.task.message.clone();
-            for incoming in admission.agent.inbox.iter_mut().filter(|message|message.delivery == crate::agent::MessageDelivery::Queued) {
-                message.push_str(&format!("\n\nAdditional information:\n{}",incoming.message));
+            for incoming in admission
+                .agent
+                .inbox
+                .iter_mut()
+                .filter(|message| message.delivery == crate::agent::MessageDelivery::Queued)
+            {
+                message.push_str(&format!(
+                    "\n\nAdditional information:\n{}",
+                    incoming.message
+                ));
                 incoming.delivery = crate::agent::MessageDelivery::Attached;
                 incoming.task_id = Some(admission.task.id.clone());
             }
-            let mut request = self.agent_backend_factory.request(&self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat), &admission.agent,message)?;
-            let backend = self.agent_backend_factory.build(admission.agent.selection.as_ref().context("child selection missing")?.provider)?;
-            let cancellation = self.agent_coordinator.cancellation(&admission.agent.id,&admission.task.id)?;
+            let mut request = self.agent_backend_factory.request(
+                &self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat),
+                &admission.agent,
+                message,
+            )?;
+            let backend = self.agent_backend_factory.build(
+                admission
+                    .agent
+                    .selection
+                    .as_ref()
+                    .context("child selection missing")?
+                    .provider,
+            )?;
+            let cancellation = self
+                .agent_coordinator
+                .cancellation(&admission.agent.id, &admission.task.id)?;
             let lsp_lease = if self.lsp.enabled(&self.session.id) {
-                let policy = self.permission_store.read().map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?.compiled().clone();
-                let (scope, lease) = self.lsp.scope(self.session.id.clone(), admission.task.id.clone(), PathBuf::from(&self.session.workspace),
-                    policy, request.execution_mode, Arc::new(AtomicBool::new(false)));
-                let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+                let policy = self
+                    .permission_store
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                    .compiled()
+                    .clone();
+                let (scope, lease) = self.lsp.scope(
+                    self.session.id.clone(),
+                    admission.task.id.clone(),
+                    PathBuf::from(&self.session.workspace),
+                    policy,
+                    request.execution_mode,
+                    Arc::new(AtomicBool::new(false)),
+                );
+                let mut context =
+                    crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
                 context.lsp = Some(scope);
                 context.workspace_root = Some(PathBuf::from(&self.session.workspace));
                 request.control_context = Some(context);
                 Some(lease)
-            } else { None };
+            } else {
+                None
+            };
             self.store.save_agent_run(&admission.agent)?;
             self.agent_registry.insert(admission.agent.clone());
-            self.agent_coordinator.retain(admission.agent.clone(),admission.task.clone())?;
-            self.child_backend_by_agent.insert(admission.agent.id.clone(),backend.clone());
-            Ok(crate::agent::AgentRuntime {backend,permission:self.permission_coordinator.clone(),request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender(),lsp_lease})
+            self.agent_coordinator
+                .retain(admission.agent.clone(), admission.task.clone())?;
+            self.child_backend_by_agent
+                .insert(admission.agent.id.clone(), backend.clone());
+            Ok(crate::agent::AgentRuntime {
+                backend,
+                permission: self.permission_coordinator.clone(),
+                request,
+                task_id: admission.task.id.clone(),
+                cancellation,
+                sender: self.agent_coordinator.sender(),
+                lsp_lease,
+            })
         })();
         match prepared {
             Ok(runtime) => {
@@ -2341,185 +3056,425 @@ impl HarnessBroker {
                 let task_id = admission.task.id;
                 tokio::spawn(async move {
                     if let Err(error) = runtime.run().await {
-                        let _ = sender.send(crate::agent::AgentCommand::Completed {owner,task_id,output:Err(error),cleanup_error:Some("child event delivery or cleanup failed".into())}).await;
+                        let _ = sender
+                            .send(crate::agent::AgentCommand::Completed {
+                                owner,
+                                task_id,
+                                output: Err(error),
+                                cleanup_error: Some(
+                                    "child event delivery or cleanup failed".into(),
+                                ),
+                            })
+                            .await;
                     }
                 });
             }
-            Err(error) => self.complete_managed_agent(owner,admission.task.id,Err(error),None,event).await?,
+            Err(error) => {
+                self.complete_managed_agent(owner, admission.task.id, Err(error), None, event)
+                    .await?
+            }
         }
         Ok(())
     }
 
     /// Drain owned mutations through the active prompt or idle controller, never both concurrently.
-    pub(crate) async fn drain_agent_commands(&mut self, mut parent: Option<&mut Exchange>) -> Result<Vec<SessionEvent>> {
+    pub(crate) async fn drain_agent_commands(
+        &mut self,
+        mut parent: Option<&mut Exchange>,
+    ) -> Result<Vec<SessionEvent>> {
         let mut event = Vec::new();
         while let Some(command) = self.agent_coordinator.try_receive() {
             match command {
-                crate::agent::AgentCommand::Request {request,authority,response} => {
-                    if response.is_closed() {continue;}
+                crate::agent::AgentCommand::Request {
+                    request,
+                    authority,
+                    response,
+                } => {
+                    if response.is_closed() {
+                        continue;
+                    }
                     let authenticated = if request.source == crate::agent::AgentSource::Model {
-                        authority.as_ref().is_some_and(|authority| !*authority.expired.borrow()
-                            && authority.owner == crate::backend::ExecutionOwner::root(&self.session.id)
-                            && parent.as_deref().is_some_and(|parent|parent.id == authority.parent_exchange_id))
-                    } else {authority.is_none()};
+                        authority.as_ref().is_some_and(|authority| {
+                            !*authority.expired.borrow()
+                                && authority.owner
+                                    == crate::backend::ExecutionOwner::root(&self.session.id)
+                                && parent
+                                    .as_deref()
+                                    .is_some_and(|parent| parent.id == authority.parent_exchange_id)
+                        })
+                    } else {
+                        authority.is_none()
+                    };
                     let result = if authenticated {
-                        self.handle_agent_request(request,parent.as_deref_mut(),&mut event).await
-                    } else {Err(anyhow::anyhow!("agent request has no active authenticated root authority"))};
+                        self.handle_agent_request(request, parent.as_deref_mut(), &mut event)
+                            .await
+                    } else {
+                        Err(anyhow::anyhow!(
+                            "agent request has no active authenticated root authority"
+                        ))
+                    };
                     let _ = response.send(result);
                 }
-                crate::agent::AgentCommand::Event {owner,task_id,event:backend_event} => {
-                    self.observe_managed_agent(owner,&task_id,backend_event,&mut event).await?;
+                crate::agent::AgentCommand::Event {
+                    owner,
+                    task_id,
+                    event: backend_event,
+                } => {
+                    self.observe_managed_agent(owner, &task_id, backend_event, &mut event)
+                        .await?;
                 }
-                crate::agent::AgentCommand::Completed {owner,task_id,output,cleanup_error} => {
-                    Box::pin(self.complete_managed_agent(owner,task_id,output,cleanup_error,&mut event)).await?;
+                crate::agent::AgentCommand::Completed {
+                    owner,
+                    task_id,
+                    output,
+                    cleanup_error,
+                } => {
+                    Box::pin(self.complete_managed_agent(
+                        owner,
+                        task_id,
+                        output,
+                        cleanup_error,
+                        &mut event,
+                    ))
+                    .await?;
                 }
             }
         }
         Ok(event)
     }
 
-    async fn observe_managed_agent(&mut self, owner: crate::backend::ExecutionOwner, task_id: &str, mut backend_event: BackendEvent,
-        event: &mut Vec<SessionEvent>) -> Result<()> {
-        anyhow::ensure!(owner.session_id == self.session.id && !owner.is_root(),"child event crosses execution ownership");
-        anyhow::ensure!(backend_event.address.as_ref().and_then(|address|address.owner.as_ref())
-            .is_none_or(|event_owner|event_owner == &owner),"child provider event has a different execution owner");
-        let mut task = self.agent_coordinator.task(task_id).context("child event has no admitted task")?;
-        anyhow::ensure!(task.agent_id == owner.agent_id,"child event has a different task owner");
-        if task.completed_at_ms.is_some() { return Ok(()); }
-        if backend_event.kind == "agent_lifecycle" {
-            self.apply_agent_lifecycle(&backend_event,Some(&task.parent_exchange_id),event).await?;
+    async fn observe_managed_agent(
+        &mut self,
+        owner: crate::backend::ExecutionOwner,
+        task_id: &str,
+        mut backend_event: BackendEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            owner.session_id == self.session.id && !owner.is_root(),
+            "child event crosses execution ownership"
+        );
+        anyhow::ensure!(
+            backend_event
+                .address
+                .as_ref()
+                .and_then(|address| address.owner.as_ref())
+                .is_none_or(|event_owner| event_owner == &owner),
+            "child provider event has a different execution owner"
+        );
+        let mut task = self
+            .agent_coordinator
+            .task(task_id)
+            .context("child event has no admitted task")?;
+        anyhow::ensure!(
+            task.agent_id == owner.agent_id,
+            "child event has a different task owner"
+        );
+        if task.completed_at_ms.is_some() {
             return Ok(());
         }
-        if backend_event.address.as_ref().is_some_and(|address|self.diagnostic_native_thread.contains(&address.thread_id)) {
+        if backend_event.kind == "agent_lifecycle" {
+            self.apply_agent_lifecycle(&backend_event, Some(&task.parent_exchange_id), event)
+                .await?;
+            return Ok(());
+        }
+        if backend_event
+            .address
+            .as_ref()
+            .is_some_and(|address| self.diagnostic_native_thread.contains(&address.thread_id))
+        {
             return Ok(());
         }
         let provider_thread_id = if backend_event.kind == "agent_conversation_resolved" {
             backend_event.data["thread_id"].as_str()
-        } else { backend_event.address.as_ref().map(|address|address.thread_id.as_str()) };
-        if let Some(provider_thread_id) = provider_thread_id.filter(|id|!id.is_empty()) {
+        } else {
+            backend_event
+                .address
+                .as_ref()
+                .map(|address| address.thread_id.as_str())
+        };
+        if let Some(provider_thread_id) = provider_thread_id.filter(|id| !id.is_empty()) {
             let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
             if agent.provider_thread_id.as_deref() != Some(provider_thread_id) {
                 agent.provider_thread_id = Some(provider_thread_id.to_owned());
                 self.store.save_agent_run(&agent)?;
                 self.agent_registry.insert(agent.clone());
-                self.agent_coordinator.retain(agent,task.clone())?;
+                self.agent_coordinator.retain(agent, task.clone())?;
             }
         }
-        if backend_event.kind == "agent_conversation_resolved" { return Ok(()); }
+        if backend_event.kind == "agent_conversation_resolved" {
+            return Ok(());
+        }
         if backend_event.kind == "runtime_resolved" {
-            let resolved: crate::backend::BackendRuntime = serde_json::from_value(backend_event.data)?;
+            let resolved: crate::backend::BackendRuntime =
+                serde_json::from_value(backend_event.data)?;
             let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
-            if let Some(model) = resolved.model.filter(|model|!model.is_empty())
-                && let Some(selection) = agent.selection.as_mut() {
+            if let Some(model) = resolved.model.filter(|model| !model.is_empty())
+                && let Some(selection) = agent.selection.as_mut()
+            {
                 selection.model = model;
             }
             self.store.save_agent_run(&agent)?;
             self.agent_registry.insert(agent.clone());
-            self.agent_coordinator.retain(agent,task)?;
+            self.agent_coordinator.retain(agent, task)?;
             return self.publish_agent_state(event).await;
         }
         if backend_event.kind == "approval_requested" {
-            let id = backend_event.data["id"].as_str().context("child approval has no identity")?;
-            if !self.permission_coordinator.pending_list()?.iter().any(|approval|approval.id == id) {return Ok(());}
+            let id = backend_event.data["id"]
+                .as_str()
+                .context("child approval has no identity")?;
+            if !self
+                .permission_coordinator
+                .pending_list()?
+                .iter()
+                .any(|approval| approval.id == id)
+            {
+                return Ok(());
+            }
         }
         if task.state == ExchangeState::Queued {
             task.state = ExchangeState::Running;
             self.store.save_agent_task(&task)?;
-            self.agent_coordinator.retain(self.agent_coordinator.resolve(&owner.agent_id)?,task.clone())?;
-            self.trace.record(&self.session.id,"agent.started",json!({"agent_id":owner.agent_id,"exchange_id":task_id}));
+            self.agent_coordinator.retain(
+                self.agent_coordinator.resolve(&owner.agent_id)?,
+                task.clone(),
+            )?;
+            self.trace.record(
+                &self.session.id,
+                "agent.started",
+                json!({"agent_id":owner.agent_id,"exchange_id":task_id}),
+            );
         }
-        anyhow::ensure!(self.child_exchange_runtime_by_agent.get(&owner.agent_id)
-            .is_none_or(|runtime|runtime.exchange.id == task_id),"late child event cannot update a newer task");
+        anyhow::ensure!(
+            self.child_exchange_runtime_by_agent
+                .get(&owner.agent_id)
+                .is_none_or(|runtime| runtime.exchange.id == task_id),
+            "late child event cannot update a newer task"
+        );
         let mut runtime = match self.child_exchange_runtime_by_agent.remove(&owner.agent_id) {
             Some(runtime) => runtime,
             None => {
-                let mut exchange = self.store.load_exchange(task_id)?.context("child task exchange missing")?;
-                if exchange.completed_at_ms.is_some() { return Ok(()); }
+                let mut exchange = self
+                    .store
+                    .load_exchange(task_id)?
+                    .context("child task exchange missing")?;
+                if exchange.completed_at_ms.is_some() {
+                    return Ok(());
+                }
                 exchange.state = ExchangeState::Running;
                 exchange.resume(self.clock.now_ms())?;
-                ChildExchangeRuntime {exchange,synthetic_turn:None,task:TaskTracker::default()}
+                ChildExchangeRuntime {
+                    exchange,
+                    synthetic_turn: None,
+                    task: TaskTracker::default(),
+                }
             }
         };
         if backend_event.kind == "approval_requested" {
-            let id = backend_event.data["id"].as_str().context("child approval has no identity")?;
-            let turn = runtime.exchange.turn.iter().rev().find(|turn|turn.state() == crate::turn::TurnState::Running);
-            let Some(approval) = self.permission_coordinator.bind_owner(id,&runtime.exchange.id,turn.map(|turn|turn.id()))? else {
-                self.child_exchange_runtime_by_agent.insert(owner.agent_id, runtime);
+            let id = backend_event.data["id"]
+                .as_str()
+                .context("child approval has no identity")?;
+            let turn = runtime
+                .exchange
+                .turn
+                .iter()
+                .rev()
+                .find(|turn| turn.state() == crate::turn::TurnState::Running);
+            let Some(approval) = self.permission_coordinator.bind_owner(
+                id,
+                &runtime.exchange.id,
+                turn.map(|turn| turn.id()),
+            )?
+            else {
+                self.child_exchange_runtime_by_agent
+                    .insert(owner.agent_id, runtime);
                 return Ok(());
             };
-            runtime.exchange.observe_blocker(format!("approval:{id}"),true,self.clock.now_ms());
+            runtime
+                .exchange
+                .observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
             backend_event.data = serde_json::to_value(approval)?;
-        } else if matches!(backend_event.kind.as_str(),"approval_resolved" | "approval_cancelled") {
-            if let Some(id) = backend_event.data["id"].as_str() { runtime.exchange.observe_blocker(format!("approval:{id}"),false,self.clock.now_ms()); }
-            runtime.exchange.approval_resolution.push(serde_json::from_value(backend_event.data.clone())?);
+        } else if matches!(
+            backend_event.kind.as_str(),
+            "approval_resolved" | "approval_cancelled"
+        ) {
+            if let Some(id) = backend_event.data["id"].as_str() {
+                runtime.exchange.observe_blocker(
+                    format!("approval:{id}"),
+                    false,
+                    self.clock.now_ms(),
+                );
+            }
+            runtime
+                .exchange
+                .approval_resolution
+                .push(serde_json::from_value(backend_event.data.clone())?);
         } else if let Some(compaction) = backend_event.compaction()? {
-            runtime.exchange.observe_compaction(compaction,backend_event.observed_at_ms(self.clock.now_ms()));
+            runtime.exchange.observe_compaction(
+                compaction,
+                backend_event.observed_at_ms(self.clock.now_ms()),
+            );
         } else {
-            admit_addressless_turn(&mut runtime.exchange,&mut runtime.synthetic_turn,&mut backend_event,self.clock.now_ms())?;
-            runtime.exchange.observe_turn(&backend_event,self.clock.now_ms())?;
-            if let Some(update) = &backend_event.task_update { runtime.task.replace(update); runtime.exchange.task = Some(runtime.task.snapshot().clone()); }
-            if backend_event.address.is_some() { attribute_provider_tool(&mut runtime.exchange,&mut runtime.task,&backend_event)?; }
+            admit_addressless_turn(
+                &mut runtime.exchange,
+                &mut runtime.synthetic_turn,
+                &mut backend_event,
+                self.clock.now_ms(),
+            )?;
+            runtime
+                .exchange
+                .observe_turn(&backend_event, self.clock.now_ms())?;
+            if let Some(update) = &backend_event.task_update {
+                runtime.task.replace(update);
+                runtime.exchange.task = Some(runtime.task.snapshot().clone());
+            }
+            if backend_event.address.is_some() {
+                attribute_provider_tool(&mut runtime.exchange, &mut runtime.task, &backend_event)?;
+            }
         }
-        if backend_event.tool_output_delta().is_some() { self.store.save_tool_output_delta(&runtime.exchange,&backend_event)?; }
-        else { self.store.save_exchange(&runtime.exchange)?; }
-        task.last_activity_at_ms = Some(task.last_activity_at_ms.unwrap_or(i64::MIN)
-            .max(backend_event.received_at_ms.unwrap_or_else(||self.clock.now_ms())));
+        if backend_event.tool_output_delta().is_some() {
+            self.store
+                .save_tool_output_delta(&runtime.exchange, &backend_event)?;
+        } else {
+            self.store.save_exchange(&runtime.exchange)?;
+        }
+        task.last_activity_at_ms = Some(
+            task.last_activity_at_ms.unwrap_or(i64::MIN).max(
+                backend_event
+                    .received_at_ms
+                    .unwrap_or_else(|| self.clock.now_ms()),
+            ),
+        );
         self.store.save_agent_task(&task)?;
-        self.agent_coordinator.retain(self.agent_coordinator.resolve(&owner.agent_id)?,task)?;
-        self.child_exchange_runtime_by_agent.insert(owner.agent_id,runtime);
-        if matches!(backend_event.kind.as_str(),"approval_requested" | "approval_resolved" | "approval_cancelled") {
-            self.emit_backend_event(backend_event,event).await?;
+        self.agent_coordinator
+            .retain(self.agent_coordinator.resolve(&owner.agent_id)?, task)?;
+        self.child_exchange_runtime_by_agent
+            .insert(owner.agent_id, runtime);
+        if matches!(
+            backend_event.kind.as_str(),
+            "approval_requested" | "approval_resolved" | "approval_cancelled"
+        ) {
+            self.emit_backend_event(backend_event, event).await?;
         }
         self.publish_agent_state(event).await?;
         self.agent_coordinator.notify_activity();
         Ok(())
     }
 
-    async fn complete_managed_agent(&mut self, owner: crate::backend::ExecutionOwner, task_id: String,
-        output: Result<crate::backend::BackendOutput>, cleanup_error: Option<String>, event: &mut Vec<SessionEvent>) -> Result<()> {
-        let mut task = self.agent_coordinator.task(&task_id).context("child completion has no admitted task")?;
-        anyhow::ensure!(owner.session_id == self.session.id && task.agent_id == owner.agent_id,"child completion crosses execution ownership");
-        if task.completed_at_ms.is_some() { return Ok(()); }
-        self.cancel_agent_approvals(&owner,event).await?;
+    async fn complete_managed_agent(
+        &mut self,
+        owner: crate::backend::ExecutionOwner,
+        task_id: String,
+        output: Result<crate::backend::BackendOutput>,
+        cleanup_error: Option<String>,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let mut task = self
+            .agent_coordinator
+            .task(&task_id)
+            .context("child completion has no admitted task")?;
+        anyhow::ensure!(
+            owner.session_id == self.session.id && task.agent_id == owner.agent_id,
+            "child completion crosses execution ownership"
+        );
+        if task.completed_at_ms.is_some() {
+            return Ok(());
+        }
+        self.cancel_agent_approvals(&owner, event).await?;
         let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
-        let interrupted = self.agent_coordinator.cancellation(&owner.agent_id,&task_id).is_ok_and(|cancel|*cancel.borrow());
-        task.state = if interrupted {ExchangeState::Cancelled} else if output.is_err() || cleanup_error.is_some() {ExchangeState::Failed} else {ExchangeState::Complete};
-        task.error = cleanup_error.clone().or_else(||output.as_ref().err().map(|error|format!("{error:#}")));
+        let interrupted = self
+            .agent_coordinator
+            .cancellation(&owner.agent_id, &task_id)
+            .is_ok_and(|cancel| *cancel.borrow());
+        task.state = if interrupted {
+            ExchangeState::Cancelled
+        } else if output.is_err() || cleanup_error.is_some() {
+            ExchangeState::Failed
+        } else {
+            ExchangeState::Complete
+        };
+        task.error = cleanup_error
+            .clone()
+            .or_else(|| output.as_ref().err().map(|error| format!("{error:#}")));
         task.completed_at_ms = Some(self.clock.now_ms());
-        if let Ok(output) = &output { agent.provider_thread_id = output.backend_session_id.clone().or(agent.provider_thread_id); }
+        if let Ok(output) = &output {
+            agent.provider_thread_id = output
+                .backend_session_id
+                .clone()
+                .or(agent.provider_thread_id);
+        }
         let runtime = self.child_exchange_runtime_by_agent.remove(&owner.agent_id);
         let mut exchange = if let Some(mut runtime) = runtime {
-            let outcome = match task.state {ExchangeState::Complete=>crate::turn::TurnOutcome::Completed,
-                ExchangeState::Cancelled=>crate::turn::TurnOutcome::Cancelled,_=>crate::turn::TurnOutcome::Failed};
-            finish_synthetic_turn(&mut runtime.exchange,runtime.synthetic_turn.as_ref(),outcome,self.clock.now_ms())?;
+            let outcome = match task.state {
+                ExchangeState::Complete => crate::turn::TurnOutcome::Completed,
+                ExchangeState::Cancelled => crate::turn::TurnOutcome::Cancelled,
+                _ => crate::turn::TurnOutcome::Failed,
+            };
+            finish_synthetic_turn(
+                &mut runtime.exchange,
+                runtime.synthetic_turn.as_ref(),
+                outcome,
+                self.clock.now_ms(),
+            )?;
             runtime.exchange
-        } else {self.store.load_exchange(&task_id)?.context("child completion exchange missing")?};
-        exchange.finish(task.state,self.clock.now_ms())?;
+        } else {
+            self.store
+                .load_exchange(&task_id)?
+                .context("child completion exchange missing")?
+        };
+        exchange.finish(task.state, self.clock.now_ms())?;
         exchange.finalization_error = cleanup_error.clone();
         if exchange.turn.is_empty() {
-            for message in agent.inbox.iter_mut().filter(|message|message.task_id.as_deref() == Some(task_id.as_str())
-                && message.delivery == crate::agent::MessageDelivery::Attached) {
+            for message in agent.inbox.iter_mut().filter(|message| {
+                message.task_id.as_deref() == Some(task_id.as_str())
+                    && message.delivery == crate::agent::MessageDelivery::Attached
+            }) {
                 message.delivery = crate::agent::MessageDelivery::Queued;
                 message.task_id = None;
             }
         }
-        let assistant_message:Vec<_> = exchange.turn.iter().flat_map(|turn|turn.messages())
-            .filter(|message|message.kind() == crate::turn::MessageKind::Assistant).collect();
-        let final_message:Vec<_> = assistant_message.iter().filter(|message|
-            message.delivery() == crate::turn::MessageDelivery::Final).collect();
+        let assistant_message: Vec<_> = exchange
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .filter(|message| message.kind() == crate::turn::MessageKind::Assistant)
+            .collect();
+        let final_message: Vec<_> = assistant_message
+            .iter()
+            .filter(|message| message.delivery() == crate::turn::MessageDelivery::Final)
+            .collect();
         task.final_response = Some(if final_message.is_empty() {
-            assistant_message.last().map(|message|message.text().to_owned()).unwrap_or_default()
-        } else {final_message.iter().map(|message|message.text()).collect::<Vec<_>>().join("\n\n")});
-        agent.state = if cleanup_error.is_some() {AgentState::Closing} else {AgentState::Ready};
+            assistant_message
+                .last()
+                .map(|message| message.text().to_owned())
+                .unwrap_or_default()
+        } else {
+            final_message
+                .iter()
+                .map(|message| message.text())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        });
+        agent.state = if cleanup_error.is_some() {
+            AgentState::Closing
+        } else {
+            AgentState::Ready
+        };
         agent.updated_at_ms = self.clock.now_ms();
         self.store.complete_agent_task(&agent, &task, &exchange)?;
         self.agent_registry.insert(agent.clone());
-        self.agent_coordinator.retain(agent.clone(),task.clone())?;
-        let next = self.agent_coordinator.settled(&owner.agent_id,&task_id,cleanup_error.is_some())?;
-        if cleanup_error.is_none() {self.child_backend_by_agent.remove(&owner.agent_id);}
+        self.agent_coordinator.retain(agent.clone(), task.clone())?;
+        let next =
+            self.agent_coordinator
+                .settled(&owner.agent_id, &task_id, cleanup_error.is_some())?;
+        if cleanup_error.is_none() {
+            self.child_backend_by_agent.remove(&owner.agent_id);
+        }
         self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
         self.publish_agent_state(event).await?;
-        if let Some(next) = next {Box::pin(self.launch_managed_agent(next,event)).await?;}
+        if let Some(next) = next {
+            Box::pin(self.launch_managed_agent(next, event)).await?;
+        }
         Ok(())
     }
 
@@ -2533,7 +3488,11 @@ impl HarnessBroker {
         if let Some(thread) = lifecycle.provider_thread_id {
             self.diagnostic_native_thread.insert(thread);
         }
-        self.trace.record(&self.session.id, "agent.native_diagnostic", backend_event.data.clone());
+        self.trace.record(
+            &self.session.id,
+            "agent.native_diagnostic",
+            backend_event.data.clone(),
+        );
         Ok(None)
     }
 
@@ -2551,7 +3510,10 @@ impl HarnessBroker {
     }
 
     /// Publishes an unresolved default model without replacing an explicit selection.
-    pub(crate) fn resolve_default_model(&mut self, model_list: &[crate::backend::BackendModel]) -> Result<Vec<SessionEvent>> {
+    pub(crate) fn resolve_default_model(
+        &mut self,
+        model_list: &[crate::backend::BackendModel],
+    ) -> Result<Vec<SessionEvent>> {
         if self.session.model == "default"
             && self.session.resolved_model.is_none()
             && let Some(model) = model_list
@@ -2561,7 +3523,10 @@ impl HarnessBroker {
         {
             self.session.resolved_model = Some(model.id.clone());
             self.save_session()?;
-            return Ok(vec![self.event("session_configured", serde_json::to_value(&self.session)?)?]);
+            return Ok(vec![self.event(
+                "session_configured",
+                serde_json::to_value(&self.session)?,
+            )?]);
         }
         Ok(Vec::new())
     }
@@ -2593,8 +3558,7 @@ impl HarnessBroker {
         let submitted_prompt = self.prompt_admission.clone();
         let mut result = Box::pin(self.submit_prompt_inner(params)).await;
         let mut submission_event = Vec::new();
-        Box::pin(self.settle_prompt_admission(result.is_ok(), &mut submission_event))
-            .await?;
+        Box::pin(self.settle_prompt_admission(result.is_ok(), &mut submission_event)).await?;
         if let Ok((_, event)) = &mut result {
             event.append(&mut submission_event);
         }
@@ -2612,7 +3576,7 @@ impl HarnessBroker {
                 if let Some(transition) = transition {
                     Box::pin(self.emit_backend_event(
                         BackendEvent {
-            received_at_ms: None,
+                            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "prompt_submission".into(),
@@ -2647,7 +3611,7 @@ impl HarnessBroker {
         if let Some(transition) = transition {
             self.emit_backend_event(
                 BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "prompt_submission".into(),
@@ -2666,7 +3630,10 @@ impl HarnessBroker {
 
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         self.require_restore_recovered()?;
-        anyhow::ensure!(self.check_runner.active()?.is_none(), "wait for or cancel the active check run before starting source work");
+        anyhow::ensure!(
+            self.check_runner.active()?.is_none(),
+            "wait for or cancel the active check run before starting source work"
+        );
         let text = required_text(&params, "text")?;
         if text.trim() == "/plan" {
             return self.observer.list_replanning_choices();
@@ -2684,7 +3651,10 @@ impl HarnessBroker {
             return Box::pin(self.new_session(Value::Null)).await;
         }
         if text == "/plan cancel" {
-            let plan_id = self.current_task()?.and_then(|task| task.plan_id).context("no current planning task")?;
+            let plan_id = self
+                .current_task()?
+                .and_then(|task| task.plan_id)
+                .context("no current planning task")?;
             return self.cancel_plan(json!({"plan_id":plan_id}));
         }
         if text == "/plan retry" {
@@ -2694,10 +3664,16 @@ impl HarnessBroker {
             return Box::pin(self.replan(selection)).await;
         }
         if !text.starts_with('/')
-            && let Some(task) = self.current_task()?.filter(|task| task.status == crate::task::TaskStatus::Paused) {
-            return self.transition_task(json!({"action":"resume","task_id":task.id,"text":text})).await;
+            && let Some(task) = self
+                .current_task()?
+                .filter(|task| task.status == crate::task::TaskStatus::Paused)
+        {
+            return self
+                .transition_task(json!({"action":"resume","task_id":task.id,"text":text}))
+                .await;
         }
-        let failed_plan_active = self.current_plan_id()?
+        let failed_plan_active = self
+            .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -2707,7 +3683,10 @@ impl HarnessBroker {
             !failed_plan_active,
             "plan generation stopped; run /plan retry or /plan cancel"
         );
-        anyhow::ensure!(text != "/replan", "select a plan and revision with the /replan picker");
+        anyhow::ensure!(
+            text != "/replan",
+            "select a plan and revision with the /replan picker"
+        );
         let explicit_plan_request = text.strip_prefix("/plan ");
         let plan_request = explicit_plan_request;
         if let Some(request) = plan_request {
@@ -2742,11 +3721,14 @@ impl HarnessBroker {
         if let Some(task) = self.current_task()?
             && task.status == crate::task::TaskStatus::Paused
         {
-            return self.transition_task(json!({
-                "action":"resume", "task_id":task.id, "text":text,
-            })).await;
+            return self
+                .transition_task(json!({
+                    "action":"resume", "task_id":task.id, "text":text,
+                }))
+                .await;
         }
-        if let Some(plan) = self.current_plan_id()?
+        if let Some(plan) = self
+            .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -2763,9 +3745,10 @@ impl HarnessBroker {
                         .unwrap_or_else(|| elicitation.question_set.id.clone())
                 })
                 .context("active plan has no elicitation state")?;
-            return Box::pin(self
-                .ask_plan_question(json!({ "question_id": question_id, "text": text })))
-                .await;
+            return Box::pin(
+                self.ask_plan_question(json!({ "question_id": question_id, "text": text })),
+            )
+            .await;
         }
         if let Some(interaction) = self.find_active_interaction_elicitation()? {
             let question_id = interaction
@@ -2778,21 +3761,31 @@ impl HarnessBroker {
                         .or_else(|| Some(elicitation.question_set.id.clone()))
                 })
                 .context("active interaction has no elicitation state")?;
-            return Box::pin(self
-                .ask_question(json!({ "question_id": question_id, "text": text })))
-                .await;
+            return Box::pin(
+                self.ask_question(json!({ "question_id": question_id, "text": text })),
+            )
+            .await;
         }
-        if self.current_plan_id()?.as_deref().map(|id| self.store.load_plan(id)).transpose()?.flatten()
-            .is_some_and(|plan| plan.state == PlanState::ConfiguringChecks) {
+        if self
+            .current_plan_id()?
+            .as_deref()
+            .map(|id| self.store.load_plan(id))
+            .transpose()?
+            .flatten()
+            .is_some_and(|plan| plan.state == PlanState::ConfiguringChecks)
+        {
             return Box::pin(self.configure_plan_checks(text)).await;
         }
-        let active_plan = self.current_plan_id()?
+        let active_plan = self
+            .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
             .flatten();
         if self.current_task_is_plan()?
-            && let Some(plan) = active_plan.as_ref().filter(|plan| plan.state == PlanState::AwaitingReview)
+            && let Some(plan) = active_plan
+                .as_ref()
+                .filter(|plan| plan.state == PlanState::AwaitingReview)
         {
             let mut admission = ExchangeAdmission::chat(text.clone());
             admission.plan_id = Some(plan.id.clone());
@@ -2819,7 +3812,11 @@ impl HarnessBroker {
                 {
                     arguments = format!("{context}{arguments}");
                 }
-                BackendInput::Skill { name, arguments, attachments }
+                BackendInput::Skill {
+                    name,
+                    arguments,
+                    attachments,
+                }
             }
             BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
         };
@@ -3144,7 +4141,8 @@ impl HarnessBroker {
     }
 
     fn active_plan_awaits_input(&self) -> Result<bool> {
-        Ok(self.current_plan_id()?
+        Ok(self
+            .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -3155,7 +4153,8 @@ impl HarnessBroker {
     }
 
     fn active_plan_has_acceptance(&self) -> Result<bool> {
-        Ok(self.current_plan_id()?
+        Ok(self
+            .current_plan_id()?
             .as_deref()
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
@@ -3195,14 +4194,24 @@ impl HarnessBroker {
 
     /// Capture the owning planning exchange for a user review or question action.
     fn plan_exchange_anchor(&self, plan_id: &str) -> Result<crate::plan::ExchangeAnchor> {
-        let exchange = self.store.list_exchange(&self.session.id)?.into_iter().rev()
+        let exchange = self
+            .store
+            .list_exchange(&self.session.id)?
+            .into_iter()
+            .rev()
             .find(|exchange| exchange.plan_id.as_deref() == Some(plan_id))
             .context("planning event has no owning exchange")?;
         Ok(crate::plan::ExchangeAnchor::capture(&exchange))
     }
 
     /// Record planning feedback only on the live exchange that owns the plan.
-    fn append_plan_feedback(&mut self, plan_id: &str, text: String, intent: crate::exchange::InputIntent, question: Option<crate::exchange::QuestionInput>) -> Result<()> {
+    fn append_plan_feedback(
+        &mut self,
+        plan_id: &str,
+        text: String,
+        intent: crate::exchange::InputIntent,
+        question: Option<crate::exchange::QuestionInput>,
+    ) -> Result<()> {
         let mut exchange = self
             .store
             .list_exchange(&self.session.id)?
@@ -3238,12 +4247,23 @@ impl HarnessBroker {
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
         let target = crate::exchange::QuestionInput {
             set_id: elicitation.question_set.id.clone(),
-            question_id: Some(elicitation.question(&question_id).or_else(|| elicitation.current_question())
-                .context("clarification has no pending question")?.id.clone()),
+            question_id: Some(
+                elicitation
+                    .question(&question_id)
+                    .or_else(|| elicitation.current_question())
+                    .context("clarification has no pending question")?
+                    .id
+                    .clone(),
+            ),
             answer: Vec::new(),
         };
         plan.updated_at_ms = self.clock.now_ms();
-        self.append_plan_feedback(&plan.id, text.clone(), crate::exchange::InputIntent::Clarification, Some(target))?;
+        self.append_plan_feedback(
+            &plan.id,
+            text.clone(),
+            crate::exchange::InputIntent::Clarification,
+            Some(target),
+        )?;
         self.store.save_plan(&plan)?;
         let (mut value, mut event) = self
             .run_interaction(
@@ -3328,21 +4348,35 @@ impl HarnessBroker {
         let elicitation_json = serde_json::to_string_pretty(elicitation)?;
         let target = crate::exchange::QuestionInput {
             set_id: elicitation.question_set.id.clone(),
-            question_id: Some(elicitation.question(&question_id).or_else(|| elicitation.current_question())
-                .context("clarification has no pending question")?.id.clone()),
+            question_id: Some(
+                elicitation
+                    .question(&question_id)
+                    .or_else(|| elicitation.current_question())
+                    .context("clarification has no pending question")?
+                    .id
+                    .clone(),
+            ),
             answer: Vec::new(),
         };
         interaction.append_question_input(
-            crate::exchange::InputIntent::Clarification, text.clone(), target, self.clock.now_ms(),
+            crate::exchange::InputIntent::Clarification,
+            text.clone(),
+            target,
+            self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
         let (mut value, mut event) = self
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
-                if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some() && interaction.check_setup.is_none()
-                    && interaction.plan_id.is_some() {
+                if interaction.kind == ExchangeKind::Chat
+                    && interaction.plan_id.is_some()
+                    && interaction.check_setup.is_none()
+                    && interaction.plan_id.is_some()
+                {
                     PromptMode::PlanDiscussion
-                } else { PromptMode::Chat },
+                } else {
+                    PromptMode::Chat
+                },
                 None,
             )
             .await?;
@@ -3367,9 +4401,16 @@ impl HarnessBroker {
             .context("active plan has no elicitation state")?;
         let answer = elicitation.feedback();
         let question = elicitation.question_set.clone();
-        self.append_plan_feedback(&plan.id, answer.clone(), crate::exchange::InputIntent::Answer, Some(crate::exchange::QuestionInput {
-            set_id: question.id.clone(), question_id: None, answer: elicitation.answer.clone(),
-        }))?;
+        self.append_plan_feedback(
+            &plan.id,
+            answer.clone(),
+            crate::exchange::InputIntent::Answer,
+            Some(crate::exchange::QuestionInput {
+                set_id: question.id.clone(),
+                question_id: None,
+                answer: elicitation.answer.clone(),
+            }),
+        )?;
         let now_ms = self.clock.now_ms();
         for pending_question in &elicitation.question_set.questions {
             let response = Some(
@@ -3444,14 +4485,20 @@ impl HarnessBroker {
             .take()
             .context("active interaction has no elicitation state")?;
         let feedback = elicitation.feedback();
-        if interaction.check_setup.is_some() && elicitation.answer.iter().any(|answer|
-            answer.source == crate::session::ResolutionSource::User
-                && !matches!(answer.response, PlanQuestionResponse::Skipped)) {
+        if interaction.check_setup.is_some()
+            && elicitation.answer.iter().any(|answer| {
+                answer.source == crate::session::ResolutionSource::User
+                    && !matches!(answer.response, PlanQuestionResponse::Skipped)
+            })
+        {
             interaction.check_setup = Some(crate::checks::CheckSetupState::Reviewed);
         }
         interaction.awaiting_input = false;
         for node in &mut interaction.node_list {
-            if let ExchangeNode::QuestionPresented { question, answer, .. } = node {
+            if let ExchangeNode::QuestionPresented {
+                question, answer, ..
+            } = node
+            {
                 if question.id == elicitation.question_set.id {
                     *answer = Some(feedback.clone());
                 }
@@ -3461,7 +4508,9 @@ impl HarnessBroker {
             crate::exchange::InputIntent::Answer,
             feedback.clone(),
             crate::exchange::QuestionInput {
-                set_id: elicitation.question_set.id.clone(), question_id: None, answer: elicitation.answer.clone(),
+                set_id: elicitation.question_set.id.clone(),
+                question_id: None,
+                answer: elicitation.answer.clone(),
             },
             self.clock.now_ms(),
         )?;
@@ -3469,8 +4518,11 @@ impl HarnessBroker {
         let prompt = format!(
             "Harness resolved the pending questions and recorded their response sources. Do not call question_answer or question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
         );
-        let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some() && interaction.check_setup.is_none()
-            && interaction.plan_id.is_some() {
+        let (value, mut event) = if interaction.kind == ExchangeKind::Chat
+            && interaction.plan_id.is_some()
+            && interaction.check_setup.is_none()
+            && interaction.plan_id.is_some()
+        {
             self.run_planning_interaction(prompt, None).await?
         } else {
             self.run_interaction(prompt, PromptMode::Chat, None).await?
@@ -3493,7 +4545,10 @@ impl HarnessBroker {
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
         let latest = self.store.list_exchange(&self.session.id)?.pop();
         if let Some(goal) = self.current_goal()?
-            && latest.as_ref().is_some_and(|exchange| exchange.goal_id.as_deref() == Some(goal.id.as_str())) {
+            && latest
+                .as_ref()
+                .is_some_and(|exchange| exchange.goal_id.as_deref() == Some(goal.id.as_str()))
+        {
             if goal.state == GoalState::Active {
                 return self.continue_goal().await;
             }
@@ -3504,15 +4559,25 @@ impl HarnessBroker {
             return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
         };
         if let Some(exchange) = latest.as_ref()
-            && matches!(exchange.kind, ExchangeKind::PlanDraft | ExchangeKind::PlanRevision)
+            && matches!(
+                exchange.kind,
+                ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
+            )
         {
-            let mut admission = ExchangeAdmission::plan(String::new(), exchange.plan_id.clone(), exchange.kind == ExchangeKind::PlanRevision);
-            admission.lifecycle = Some(WorkflowActivity::from_exchange(exchange).event(LifecycleAction::Continued));
-            self.run_planning_interaction(feedback, Some(admission)).await
+            let mut admission = ExchangeAdmission::plan(
+                String::new(),
+                exchange.plan_id.clone(),
+                exchange.kind == ExchangeKind::PlanRevision,
+            );
+            admission.lifecycle =
+                Some(WorkflowActivity::from_exchange(exchange).event(LifecycleAction::Continued));
+            self.run_planning_interaction(feedback, Some(admission))
+                .await
         } else {
             let mut admission = ExchangeAdmission::chat(String::new());
             admission.lifecycle = Some(WorkflowActivity::Working.event(LifecycleAction::Continued));
-            self.run_interaction(feedback, PromptMode::Chat, Some(admission)).await
+            self.run_interaction(feedback, PromptMode::Chat, Some(admission))
+                .await
         }
     }
 
@@ -3521,33 +4586,72 @@ impl HarnessBroker {
         &mut self,
         active_deadline: &mut Option<(String, crate::session::InputDeadline)>,
     ) -> Result<Option<Request>> {
-        if self.turn_cancellation.requested.load(Ordering::Acquire) { return Ok(None); }
-        let mut plan = if self.active_plan_awaits_input()? { Some(self.active_elicitation_plan()?) } else { None };
-        let mut interaction = if plan.is_none() { self.find_active_interaction_elicitation()? } else { None };
-        let elicitation = plan.as_mut().and_then(|plan| plan.elicitation.as_mut())
-            .or_else(|| interaction.as_mut().and_then(|exchange| exchange.elicitation.as_mut()));
+        if self.turn_cancellation.requested.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        let mut plan = if self.active_plan_awaits_input()? {
+            Some(self.active_elicitation_plan()?)
+        } else {
+            None
+        };
+        let mut interaction = if plan.is_none() {
+            self.find_active_interaction_elicitation()?
+        } else {
+            None
+        };
+        let elicitation = plan
+            .as_mut()
+            .and_then(|plan| plan.elicitation.as_mut())
+            .or_else(|| {
+                interaction
+                    .as_mut()
+                    .and_then(|exchange| exchange.elicitation.as_mut())
+            });
         if let Some(elicitation) = elicitation {
             if let Some(deadline) = &elicitation.deadline {
-                let identity = format!("{}:{}", elicitation.question_set.id, deadline.expires_at_ms);
-                if active_deadline.as_ref().is_none_or(|(current, _)| current != &identity) {
+                let identity =
+                    format!("{}:{}", elicitation.question_set.id, deadline.expires_at_ms);
+                if active_deadline
+                    .as_ref()
+                    .is_none_or(|(current, _)| current != &identity)
+                {
                     let mut deadline = deadline.clone();
                     deadline.restore(self.clock.now_ms());
                     *active_deadline = Some((identity, deadline));
                 }
-                if active_deadline.as_ref().is_some_and(|(_, deadline)| deadline.expired(self.clock.now_ms())) {
+                if active_deadline
+                    .as_ref()
+                    .is_some_and(|(_, deadline)| deadline.expired(self.clock.now_ms()))
+                {
                     elicitation.expire()?;
-                    if let Some(plan) = &plan { self.store.save_plan(plan)?; }
-                    if let Some(interaction) = &interaction { self.store.save_exchange(interaction)?; }
+                    if let Some(plan) = &plan {
+                        self.store.save_plan(plan)?;
+                    }
+                    if let Some(interaction) = &interaction {
+                        self.store.save_exchange(interaction)?;
+                    }
                     *active_deadline = None;
-                    return Ok(Some(Request { id: 0, method: "question.continue".into(), params: json!({}) }));
+                    return Ok(Some(Request {
+                        id: 0,
+                        method: "question.continue".into(),
+                        params: json!({}),
+                    }));
                 }
-            } else { *active_deadline = None; }
+            } else {
+                *active_deadline = None;
+            }
             return Ok(None);
         }
         *active_deadline = None;
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
-        if !self.active_plan_has_acceptance()? && self.permission_coordinator.has_timeout_feedback(&owner)? {
-            return Ok(Some(Request { id: 0, method: "approval.continue".into(), params: json!({}) }));
+        if !self.active_plan_has_acceptance()?
+            && self.permission_coordinator.has_timeout_feedback(&owner)?
+        {
+            return Ok(Some(Request {
+                id: 0,
+                method: "approval.continue".into(),
+                params: json!({}),
+            }));
         }
         Ok(None)
     }
@@ -3573,10 +4677,14 @@ impl HarnessBroker {
         admission: Option<ExchangeAdmission>,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let input = BackendInput::from_text(text.clone());
-        let result = self.run_interaction_input(text, mode, admission, input).await?;
+        let result = self
+            .run_interaction_input(text, mode, admission, input)
+            .await?;
         if mode == PromptMode::Chat {
             Box::pin(self.advance_configured_plan(result)).await
-        } else { Ok(result) }
+        } else {
+            Ok(result)
+        }
     }
 
     async fn run_planning_interaction(
@@ -3586,18 +4694,25 @@ impl HarnessBroker {
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut accumulated_event = Vec::new();
         loop {
-            let plan_id = self.current_plan_id()?
+            let plan_id = self
+                .current_plan_id()?
                 .context("planning continuation has no active plan")?;
             let before_document = self
                 .plan_file
                 .read_working_document(&self.session.id, &plan_id)?;
             let before_digest = plan_digest(&serde_json::to_vec(&before_document)?);
-            let discussion = self.store.load_plan(&plan_id)?
+            let discussion = self
+                .store
+                .load_plan(&plan_id)?
                 .is_some_and(|plan| plan.state == PlanState::AwaitingReview);
             let result = self
                 .run_interaction(
                     prompt,
-                    if discussion { PromptMode::PlanDiscussion } else { PromptMode::Plan },
+                    if discussion {
+                        PromptMode::PlanDiscussion
+                    } else {
+                        PromptMode::Plan
+                    },
                     admission.take(),
                 )
                 .await;
@@ -3699,9 +4814,18 @@ Planning continuation: turn {} of {}.",
                 plan.generation.budget.max_turn_count
             );
             let mut continuation = ExchangeAdmission::plan(
-                String::new(), Some(plan.id.clone()), plan.model_revision > 0,
+                String::new(),
+                Some(plan.id.clone()),
+                plan.model_revision > 0,
             );
-            continuation.lifecycle = Some(if plan.state == PlanState::Revising { WorkflowActivity::Revising } else { WorkflowActivity::Planning }.event(LifecycleAction::Continued));
+            continuation.lifecycle = Some(
+                if plan.state == PlanState::Revising {
+                    WorkflowActivity::Revising
+                } else {
+                    WorkflowActivity::Planning
+                }
+                .event(LifecycleAction::Continued),
+            );
             admission = Some(continuation);
         }
     }
@@ -3719,11 +4843,14 @@ Planning continuation: turn {} of {}.",
                 let mut result = Box::pin(self.settle_automatic_checks(result, mode)).await?;
                 if mode != PromptMode::Background {
                     if let Err(error) = Box::pin(self.auto_compact()).await {
-                        result.1.push(self.event("background_error", json!({"error":format!("Automatic compaction failed: {error:#}")}))?);
+                        result.1.push(self.event(
+                            "background_error",
+                            json!({"error":format!("Automatic compaction failed: {error:#}")}),
+                        )?);
                     }
                 }
                 Ok(result)
-            },
+            }
             Err(error) if self.exchange_runtime.is_some() => {
                 match Box::pin(self.finalize_interaction_after_processing_failure()).await {
                     Ok(()) => Err(error),
@@ -3742,45 +4869,105 @@ Planning continuation: turn {} of {}.",
         mode: PromptMode,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         use crate::checks::{AutomaticChecks, CheckState, RunRequest};
-        if !matches!(mode, PromptMode::Chat | PromptMode::RequestChanges | PromptMode::GoalContinuation)
-            || self.check_setup || self.agent_coordinator.active_count() != 0
+        if !matches!(
+            mode,
+            PromptMode::Chat | PromptMode::RequestChanges | PromptMode::GoalContinuation
+        ) || self.check_setup
+            || self.agent_coordinator.active_count() != 0
             || self.find_active_interaction_elicitation()?.is_some()
-        { return Ok(result); }
-        let Some(interaction) = self.store.list_exchange(&self.session.id)?.pop() else { return Ok(result); };
-        if interaction.state != ExchangeState::Complete || interaction.awaiting_input || interaction.plan_id.is_some() || interaction.execution_id.is_some() || interaction.check_setup.is_some() {
+        {
             return Ok(result);
         }
-        let goal = interaction.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten();
-        if goal.as_ref().is_some_and(|goal| goal.state != GoalState::Complete) { return Ok(result); }
-        if self.current_goal()?.is_some_and(|goal| goal.state != GoalState::Complete) { return Ok(result); }
+        let Some(interaction) = self.store.list_exchange(&self.session.id)?.pop() else {
+            return Ok(result);
+        };
+        if interaction.state != ExchangeState::Complete
+            || interaction.awaiting_input
+            || interaction.plan_id.is_some()
+            || interaction.execution_id.is_some()
+            || interaction.check_setup.is_some()
+        {
+            return Ok(result);
+        }
+        let goal = interaction
+            .goal_id
+            .as_deref()
+            .map(|id| self.store.load_goal(id))
+            .transpose()?
+            .flatten();
+        if goal
+            .as_ref()
+            .is_some_and(|goal| goal.state != GoalState::Complete)
+        {
+            return Ok(result);
+        }
+        if self
+            .current_goal()?
+            .is_some_and(|goal| goal.state != GoalState::Complete)
+        {
+            return Ok(result);
+        }
         if crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_err() {
             let catalog = self.check_runner.catalog(None)?;
-            if catalog["configured"] == false { return Ok(result); }
-            anyhow::bail!("Automatic checks could not load configuration: {}", catalog["error"]);
+            if catalog["configured"] == false {
+                return Ok(result);
+            }
+            anyhow::bail!(
+                "Automatic checks could not load configuration: {}",
+                catalog["error"]
+            );
         }
-        let Some(change_owner) = interaction.check_owner.clone() else { return Ok(result); };
+        let Some(change_owner) = interaction.check_owner.clone() else {
+            return Ok(result);
+        };
         let task = self.current_task()?.filter(|task| !task.status.terminal());
-        let owner = task.as_ref().map(|task| task.id.clone()).unwrap_or(change_owner.clone());
+        let owner = task
+            .as_ref()
+            .map(|task| task.id.clone())
+            .unwrap_or(change_owner.clone());
         let mut automatic = AutomaticChecks::open(&self.check_runner.root, &owner)?;
         let timing = crate::settings::SettingsStore::open(&self.data_root)?
-            .get(&self.session.workspace, &self.session.id, &self.session.backend)?
-            .desired.check_timing.unwrap_or_default();
-        if self.observer.completion_queue.defer(timing, &change_owner)? {
+            .get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.backend,
+            )?
+            .desired
+            .check_timing
+            .unwrap_or_default();
+        if self
+            .observer
+            .completion_queue
+            .defer(timing, &change_owner)?
+        {
             automatic.pending = true;
             automatic.save()?;
             result.0["checks_deferred"] = json!(true);
             return Ok(result);
         }
         loop {
-            if self.turn_cancellation.requested.load(Ordering::Acquire) { return Err(anyhow::Error::new(TurnCancelled)); }
+            if self.turn_cancellation.requested.load(Ordering::Acquire) {
+                return Err(anyhow::Error::new(TurnCancelled));
+            }
             if let Some(id) = self.check_runner.active()? {
                 let running = self.check_runner.status(&id, 30_000, false).await?;
-                if running.state == CheckState::Running { continue; }
+                if running.state == CheckState::Running {
+                    continue;
+                }
             }
             self.check_runner.refresh_changes().await?;
-            let mut run = self.check_runner.prepare_request(RunRequest::default(), task.as_ref().map(|task| task.id.clone()), self.session.shell, "Automatic completion checks".into())?;
+            let mut run = self.check_runner.prepare_request(
+                RunRequest::default(),
+                task.as_ref().map(|task| task.id.clone()),
+                self.session.shell,
+                "Automatic completion checks".into(),
+            )?;
             run.exchange_id = Some(interaction.id.clone());
-            if !run.commands.iter().any(|command| command.state != CheckState::Skipped) {
+            if !run
+                .commands
+                .iter()
+                .any(|command| command.state != CheckState::Skipped)
+            {
                 self.observer.completion_queue.finish()?;
                 automatic.pending = false;
                 automatic.blocked = None;
@@ -3798,8 +4985,17 @@ Planning continuation: turn {} of {}.",
                 self.store.save_task(&task)?;
             }
             run.context.as_mut().unwrap().automatic = true;
-            let run = self.check_runner.run(run, self.event_sink.clone(), Some(Arc::clone(&self.turn_cancellation.requested))).await?;
-            if run.state == CheckState::Interrupted { return Err(anyhow::Error::new(TurnCancelled)); }
+            let run = self
+                .check_runner
+                .run(
+                    run,
+                    self.event_sink.clone(),
+                    Some(Arc::clone(&self.turn_cancellation.requested)),
+                )
+                .await?;
+            if run.state == CheckState::Interrupted {
+                return Err(anyhow::Error::new(TurnCancelled));
+            }
             let repair = automatic.observe(&run)?;
             if let Some(reason) = &automatic.blocked {
                 if let Some(mut task) = self.current_task()? {
@@ -3808,16 +5004,35 @@ Planning continuation: turn {} of {}.",
                     task.reason = Some(reason.clone());
                     self.store.save_task(&task)?;
                 }
-                if let Some(mut goal) = goal.as_ref().map(|goal| self.store.load_goal(&goal.id)).transpose()?.flatten() {
+                if let Some(mut goal) = goal
+                    .as_ref()
+                    .map(|goal| self.store.load_goal(&goal.id))
+                    .transpose()?
+                    .flatten()
+                {
                     goal.state = GoalState::Blocked;
                     goal.updated_at_ms = self.clock.now_ms();
                     self.store.save_goal(&goal)?;
                     result.1.retain(|event| event.event != "goal_changed");
-                    result.1.push(self.event("goal_changed", serde_json::to_value(goal)?)?);
+                    result
+                        .1
+                        .push(self.event("goal_changed", serde_json::to_value(goal)?)?);
                 }
-                self.emit_backend_event(BackendEvent { received_at_ms: None, address: None, turn_boundary: None,
-                    kind: "error".into(), text: Some(reason.clone()), data: json!({"owner":owner,"run_id":run.id}),
-                    activity: None, summary: None, task_update: None }, &mut result.1).await?;
+                self.emit_backend_event(
+                    BackendEvent {
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "error".into(),
+                        text: Some(reason.clone()),
+                        data: json!({"owner":owner,"run_id":run.id}),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    },
+                    &mut result.1,
+                )
+                .await?;
                 result.0["automatic_checks"] = json!({"run_id":run.id,"blocked":reason});
                 return Ok(result);
             }
@@ -3826,13 +5041,20 @@ Planning continuation: turn {} of {}.",
                 result.0["automatic_checks"] = json!({"run_id":run.id,"state":run.state});
                 return Ok(result);
             };
-            if let Some(mut current_goal) = goal.as_ref().map(|goal| self.store.load_goal(&goal.id)).transpose()?.flatten() {
-                if current_goal.continuation.turn_count >= current_goal.continuation.max_turn_count {
+            if let Some(mut current_goal) = goal
+                .as_ref()
+                .map(|goal| self.store.load_goal(&goal.id))
+                .transpose()?
+                .flatten()
+            {
+                if current_goal.continuation.turn_count >= current_goal.continuation.max_turn_count
+                {
                     automatic.blocked = Some("Automatic repair requires another provider turn, but the goal turn limit is exhausted.".into());
                     automatic.save()?;
                     current_goal.state = GoalState::Blocked;
                     self.store.save_goal(&current_goal)?;
-                    result.0["automatic_checks"] = json!({"run_id":run.id,"blocked":automatic.blocked});
+                    result.0["automatic_checks"] =
+                        json!({"run_id":run.id,"blocked":automatic.blocked});
                     return Ok(result);
                 }
                 current_goal.continuation.turn_count += 1;
@@ -3841,16 +5063,31 @@ Planning continuation: turn {} of {}.",
             let mut admission = ExchangeAdmission::chat(String::new());
             admission.check_owner = Some(change_owner.clone());
             admission.automatic_owner = Some(owner.clone());
-            let repaired = Box::pin(self.run_interaction_input_inner(prompt.clone(), PromptMode::Chat, Some(admission), BackendInput::from_text(prompt))).await?;
+            let repaired = Box::pin(self.run_interaction_input_inner(
+                prompt.clone(),
+                PromptMode::Chat,
+                Some(admission),
+                BackendInput::from_text(prompt),
+            ))
+            .await?;
             result.0 = repaired.0;
             result.1.extend(repaired.1);
-            let latest = self.store.list_exchange(&self.session.id)?.pop().context("repair exchange disappeared")?;
+            let latest = self
+                .store
+                .list_exchange(&self.session.id)?
+                .pop()
+                .context("repair exchange disappeared")?;
             automatic.repair_exchange = Some(latest.id.clone());
             automatic.save()?;
-            if latest.state != ExchangeState::Complete || latest.awaiting_input || self.find_active_interaction_elicitation()?.is_some() || self.agent_coordinator.active_count() != 0 { return Ok(result); }
+            if latest.state != ExchangeState::Complete
+                || latest.awaiting_input
+                || self.find_active_interaction_elicitation()?.is_some()
+                || self.agent_coordinator.active_count() != 0
+            {
+                return Ok(result);
+            }
         }
     }
-
 
     async fn finalize_interaction_after_processing_failure(&mut self) -> Result<()> {
         let Some(runtime) = self.exchange_runtime.take() else {
@@ -3868,7 +5105,11 @@ Planning continuation: turn {} of {}.",
 
         let now_ms = self.clock.now_ms();
         let mut event = Vec::new();
-        self.record_execution_failure(&mut interaction, "Failed while processing the provider response".into()).await?;
+        self.record_execution_failure(
+            &mut interaction,
+            "Failed while processing the provider response".into(),
+        )
+        .await?;
         finish_synthetic_turn(
             &mut interaction,
             runtime.synthetic_turn.as_ref(),
@@ -3884,7 +5125,7 @@ Planning continuation: turn {} of {}.",
         self.active_wait_projection = None;
         self.emit_live_interaction(
             BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_exchange_failed".into(),
@@ -3907,13 +5148,19 @@ Planning continuation: turn {} of {}.",
         now_ms: i64,
     ) -> Result<()> {
         self.require_restore_recovered()?;
-        let tool_gate = self.checkpoint.as_ref().map(|_| crate::checkpoint::ToolGate::new()).transpose()?;
+        let tool_gate = self
+            .checkpoint
+            .as_ref()
+            .map(|_| crate::checkpoint::ToolGate::new())
+            .transpose()?;
         let checkpoint = self.checkpoint.clone().map(|checkpoint| {
             let objects = self.store.objects.clone();
             let repositories = Arc::clone(&self.repositories);
             let session_id = self.session.id.clone();
             crate::checkpoint::CheckpointTask(tokio::spawn(async move {
-                checkpoint.capture(&objects, &repositories, &session_id, now_ms).await
+                checkpoint
+                    .capture(&objects, &repositories, &session_id, now_ms)
+                    .await
             }))
         });
         self.active_wait_projection = None;
@@ -3943,12 +5190,22 @@ Planning continuation: turn {} of {}.",
         let saved = result.and_then(|checkpoint| {
             let queued_owner = if interaction.execution_id.is_none() {
                 self.observer.completion_queue.owner()?
-            } else { None };
-            let owner = interaction.check_owner.as_ref().or(queued_owner.as_ref()).or(interaction.execution_id.as_ref()).or(interaction.goal_id.as_ref()).unwrap_or(&interaction.id).clone();
+            } else {
+                None
+            };
+            let owner = interaction
+                .check_owner
+                .as_ref()
+                .or(queued_owner.as_ref())
+                .or(interaction.execution_id.as_ref())
+                .or(interaction.goal_id.as_ref())
+                .unwrap_or(&interaction.id)
+                .clone();
             interaction.check_owner = Some(owner.clone());
             self.check_runner.begin_changes(owner, &checkpoint)?;
             interaction.checkpoint_before = Some(checkpoint.id.clone());
-            self.store.save_checkpoint_exchange(&checkpoint, interaction)?;
+            self.store
+                .save_checkpoint_exchange(&checkpoint, interaction)?;
             if let Some(execution_id) = interaction.execution_id.as_deref()
                 && let Some(mut execution) = self.store.load_plan_execution(execution_id)?
                 && execution.baseline_checkpoint.is_none()
@@ -3959,14 +5216,28 @@ Planning continuation: turn {} of {}.",
             Ok(())
         });
         if let Some(gate) = &runtime.tool_gate {
-            gate.complete(saved.as_ref().map(|_| ()).map_err(|error|format!("{error:#}")))?;
+            gate.complete(
+                saved
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}")),
+            )?;
         }
         saved
     }
 
-    async fn collect_initial_checkpoint(&mut self, runtime: &mut ExchangeRuntime, interaction: &mut Exchange) -> Result<()> {
-        let Some(task) = runtime.checkpoint.as_mut() else { return Ok(()); };
-        let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
+    async fn collect_initial_checkpoint(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+    ) -> Result<()> {
+        let Some(task) = runtime.checkpoint.as_mut() else {
+            return Ok(());
+        };
+        let result = (&mut task.0)
+            .await
+            .context("checkpoint worker failed")
+            .and_then(|result| result);
         self.finish_initial_checkpoint(runtime, interaction, result)
     }
 
@@ -3984,14 +5255,19 @@ Planning continuation: turn {} of {}.",
         self.save_session()
     }
 
-    async fn collect_active_initial_checkpoint(&mut self, interaction: &mut Exchange) -> Result<()> {
-        if !self.exchange_runtime.as_ref().is_some_and(|runtime|
-            runtime.exchange_id == interaction.id && runtime.checkpoint.is_some())
-        {
+    async fn collect_active_initial_checkpoint(
+        &mut self,
+        interaction: &mut Exchange,
+    ) -> Result<()> {
+        if !self.exchange_runtime.as_ref().is_some_and(|runtime| {
+            runtime.exchange_id == interaction.id && runtime.checkpoint.is_some()
+        }) {
             return Ok(());
         }
         let mut runtime = self.exchange_runtime.take().expect("checked runtime");
-        let result = self.collect_initial_checkpoint(&mut runtime, interaction).await;
+        let result = self
+            .collect_initial_checkpoint(&mut runtime, interaction)
+            .await;
         self.exchange_runtime = Some(runtime);
         result
     }
@@ -4016,48 +5292,85 @@ Planning continuation: turn {} of {}.",
 
     fn agent_result_message(&self, task: &crate::agent::AgentTask) -> Result<String> {
         let agent = self.agent_coordinator.resolve(&task.agent_id)?;
-        Ok(format!("Harness child result. This is a report from a child agent, not a new user request.\n{}",
+        Ok(format!(
+            "Harness child result. This is a report from a child agent, not a new user request.\n{}",
             serde_json::to_string(&json!({
                 "agent":agent.task_path,"task_id":task.id,"status":task.state,
                 "response":task.final_response,"error":task.error,
-            }))?))
+            }))?
+        ))
     }
 
     fn acknowledge_agent_result(&mut self, mut task: crate::agent::AgentTask) -> Result<()> {
         task.parent_reported = true;
         self.store.save_agent_task(&task)?;
-        self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)
+        self.agent_coordinator
+            .retain(self.agent_coordinator.resolve(&task.agent_id)?, task)
     }
 
-    fn start_agent_result_delivery(&self, attached: &[crate::agent::AgentTask],
+    fn start_agent_result_delivery(
+        &self,
+        attached: &[crate::agent::AgentTask],
         attempted: &mut std::collections::HashSet<String>,
-        delivery: &mut tokio::task::JoinSet<(crate::agent::AgentTask,Result<()>)>) -> Result<()> {
-        if !self.backend.descriptor().capability.native_steer {return Ok(());}
+        delivery: &mut tokio::task::JoinSet<(crate::agent::AgentTask, Result<()>)>,
+    ) -> Result<()> {
+        if !self.backend.descriptor().capability.native_steer {
+            return Ok(());
+        }
         for task in self.agent_coordinator.unreported_result() {
-            if attached.iter().any(|attached|attached.id == task.id) || !attempted.insert(task.id.clone()) {continue;}
+            if attached.iter().any(|attached| attached.id == task.id)
+                || !attempted.insert(task.id.clone())
+            {
+                continue;
+            }
             let message = self.agent_result_message(&task)?;
             let backend = self.backend.clone();
             let session_id = self.session.id.clone();
             delivery.spawn(async move {
-                let result = tokio::time::timeout(std::time::Duration::from_secs(30),async {
-                    anyhow::ensure!(backend.has_active_turn(&session_id).await,"parent provider turn ended before delivery");
-                    backend.steer_session(&session_id,crate::backend::SteeringInput::AgentResult(message)).await
-                }).await.context("parent result delivery exceeded 30 seconds").and_then(|result|result);
-                (task,result)
+                let result = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                    anyhow::ensure!(
+                        backend.has_active_turn(&session_id).await,
+                        "parent provider turn ended before delivery"
+                    );
+                    backend
+                        .steer_session(
+                            &session_id,
+                            crate::backend::SteeringInput::AgentResult(message),
+                        )
+                        .await
+                })
+                .await
+                .context("parent result delivery exceeded 30 seconds")
+                .and_then(|result| result);
+                (task, result)
             });
         }
         Ok(())
     }
 
-    fn finish_agent_result_delivery(&mut self, delivery: std::result::Result<(crate::agent::AgentTask,Result<()>),tokio::task::JoinError>) -> Result<()> {
-        let (task,result) = delivery.context("parent result delivery task failed")?;
+    fn finish_agent_result_delivery(
+        &mut self,
+        delivery: std::result::Result<
+            (crate::agent::AgentTask, Result<()>),
+            tokio::task::JoinError,
+        >,
+    ) -> Result<()> {
+        let (task, result) = delivery.context("parent result delivery task failed")?;
         match result {
             Ok(()) => {
-                self.trace.record(&self.session.id,"agent.result_delivered",json!({"task_id":task.id,"delivery":"steered"}));
+                self.trace.record(
+                    &self.session.id,
+                    "agent.result_delivered",
+                    json!({"task_id":task.id,"delivery":"steered"}),
+                );
                 self.acknowledge_agent_result(task)?;
             }
-            Err(error) => self.trace.record(&self.session.id,"agent.result_queued",json!({
-                "task_id":task.id,"error":format!("{error:#}")})),
+            Err(error) => self.trace.record(
+                &self.session.id,
+                "agent.result_queued",
+                json!({
+                "task_id":task.id,"error":format!("{error:#}")}),
+            ),
         }
         Ok(())
     }
@@ -4095,16 +5408,15 @@ Planning continuation: turn {} of {}.",
                 return Err(anyhow::Error::new(TurnCancelled));
             }
             // Heap-owned child futures keep resumed repair polling within the worker stack.
-            let output = Box::pin(self
-                .prompt_provider_with_timeline(
-                    request.clone(),
-                    interaction,
-                    event,
-                    &continuation_result,
-                    &mut parent_input,
-                    &mut deferred_input,
-                ))
-                .await?;
+            let output = Box::pin(self.prompt_provider_with_timeline(
+                request.clone(),
+                interaction,
+                event,
+                &continuation_result,
+                &mut parent_input,
+                &mut deferred_input,
+            ))
+            .await?;
             for task in continuation_result.drain(..) {
                 self.acknowledge_agent_result(task)?;
             }
@@ -4197,7 +5509,10 @@ Planning continuation: turn {} of {}.",
                 if let Some(input) = deferred_input.pop_front() {
                     self.resume_parent_input(interaction, &input.text, event)
                         .await?;
-                    continuation_input = Some(BackendInput::from_text(input.text.clone()).with_attachments(input.attachments.clone()));
+                    continuation_input = Some(
+                        BackendInput::from_text(input.text.clone())
+                            .with_attachments(input.attachments.clone()),
+                    );
                     input.complete(Ok(())).await;
                     continuation_result = self.agent_coordinator.unreported_result();
                     if let Some(BackendInput::Text { text, .. }) = &mut continuation_input {
@@ -4310,7 +5625,11 @@ Planning continuation: turn {} of {}.",
         .await
     }
 
-    async fn notify_unavailable_mcp(&mut self, request: &BackendCatalogRequest, event: &mut Vec<SessionEvent>) -> Result<()> {
+    async fn notify_unavailable_mcp(
+        &mut self,
+        request: &BackendCatalogRequest,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
         let target = match self.session.backend.as_str() {
             "codex" => "codexcli",
             "copilot" => "copilotcli",
@@ -4318,15 +5637,36 @@ Planning continuation: turn {} of {}.",
             "antigravity" => "antigravity-cli",
             _ => return Ok(()),
         };
-        let resources = crate::settings::SessionResources::load(&self.data_root, request, &self.session.backend, target)?;
+        let resources = crate::settings::SessionResources::load(
+            &self.data_root,
+            request,
+            &self.session.backend,
+            target,
+        )?;
         for (id, message) in &resources.launch_notice {
-            if self.mcp_notice.get(id) == Some(message) { continue; }
-            self.trace.record(&self.session.id, "mcp.start_skipped", json!({"resource_id":id,"reason":message}));
-            self.emit_backend_event(BackendEvent {
-                received_at_ms: None, address: None, turn_boundary: None, kind: "error".into(),
-                text: Some(message.clone()), data: json!({"code":"mcp_command_missing","resource_id":id}),
-                activity: None, summary: None, task_update: None,
-            }, event).await?;
+            if self.mcp_notice.get(id) == Some(message) {
+                continue;
+            }
+            self.trace.record(
+                &self.session.id,
+                "mcp.start_skipped",
+                json!({"resource_id":id,"reason":message}),
+            );
+            self.emit_backend_event(
+                BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "error".into(),
+                    text: Some(message.clone()),
+                    data: json!({"code":"mcp_command_missing","resource_id":id}),
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+                event,
+            )
+            .await?;
         }
         self.mcp_notice = resources.launch_notice;
         Ok(())
@@ -4341,14 +5681,28 @@ Planning continuation: turn {} of {}.",
         parent_input: &mut crate::backend::ActiveSteering,
         deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
-        if request.mode != PromptMode::Background { self.notify_unavailable_mcp(&BackendCatalogRequest {
-            execution_owner: request.execution_owner.clone(), harness_session_id: request.harness_session_id.clone(),
-            workspace: request.workspace.clone(), access: request.access.clone(), execution_mode: request.execution_mode,
-            backend_session_id: request.backend_session_id.clone(),
-        }, event).await?; }
-        let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(crate::backend::ExecutionOwner::root(&self.session.id),
-            interaction.id.clone(),self.agent_coordinator.clone())?;
-        if let Some(context) = &mut request.control_context {context.agent = Some(agent_scope);}
+        if request.mode != PromptMode::Background {
+            self.notify_unavailable_mcp(
+                &BackendCatalogRequest {
+                    execution_owner: request.execution_owner.clone(),
+                    harness_session_id: request.harness_session_id.clone(),
+                    workspace: request.workspace.clone(),
+                    access: request.access.clone(),
+                    execution_mode: request.execution_mode,
+                    backend_session_id: request.backend_session_id.clone(),
+                },
+                event,
+            )
+            .await?;
+        }
+        let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(
+            crate::backend::ExecutionOwner::root(&self.session.id),
+            interaction.id.clone(),
+            self.agent_coordinator.clone(),
+        )?;
+        if let Some(context) = &mut request.control_context {
+            context.agent = Some(agent_scope);
+        }
         let mut agent_revision = self.agent_coordinator.subscribe();
         let mut attempted_result = std::collections::HashSet::new();
         let mut result_delivery = tokio::task::JoinSet::new();
@@ -4363,24 +5717,56 @@ Planning continuation: turn {} of {}.",
         let mut cleanup = cancellation.cleanup.subscribe();
         let (backend_event_sink, mut backend_event_stream) = crate::backend::events::channel();
         let backend_event_sink = backend_event_sink.owned(request.owner()?);
-        let (execution_sender, mut execution_receiver) = tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
-        let execution = self.store.list_plan_execution(&self.session.id)?.into_iter()
-            .find(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && execution.state == PlanExecutionState::Active);
-        if request.mode == PromptMode::ExecutePlan && let (Some(context), Some(execution)) = (&mut request.control_context, execution.as_ref()) {
-            context.execution = Some(crate::plan::execution::ExecutionControlSender { phase: execution.phase, execution_id: execution.id.clone(), generation: execution.generation, sender: execution_sender.clone() });
+        let (execution_sender, mut execution_receiver) =
+            tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
+        let execution = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| {
+                Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref()
+                    && execution.state == PlanExecutionState::Active
+            });
+        if request.mode == PromptMode::ExecutePlan
+            && let (Some(context), Some(execution)) =
+                (&mut request.control_context, execution.as_ref())
+        {
+            context.execution = Some(crate::plan::execution::ExecutionControlSender {
+                phase: execution.phase,
+                execution_id: execution.id.clone(),
+                generation: execution.generation,
+                sender: execution_sender.clone(),
+            });
         }
-        let (check_scope, _check_lease) = crate::checks::CheckToolScope::open(Arc::clone(&self.check_runner), crate::checks::CheckAuthority {
-            task_id:self.current_task()?.filter(|task| !task.status.terminal()).map(|task|task.id),
-            shell:self.session.shell,mode:request.mode,permission:self.session.execution_mode,
-            permissions:Arc::clone(&self.permission_coordinator),
-            address:crate::backend::ProviderAddress {owner:Some(request.owner()?),thread_id:self.session.id.clone(),turn_id:interaction.id.clone()},
-            authorization_sink:backend_event_sink.clone(),
-            editing:Arc::clone(&self.observer.check_editing),
-            setup:interaction.check_setup.is_some(),
-            setup_reviewed:interaction.check_setup == Some(crate::checks::CheckSetupState::Reviewed),
-            can_run:interaction.check_setup.is_none() && self.agent_coordinator.active_count() == 0 && execution.is_none(),
-            agent:Arc::clone(&self.agent_coordinator),
-            cancelled:Arc::clone(&self.turn_cancellation.requested),sink:self.event_sink.clone() });
+        let (check_scope, _check_lease) = crate::checks::CheckToolScope::open(
+            Arc::clone(&self.check_runner),
+            crate::checks::CheckAuthority {
+                task_id: self
+                    .current_task()?
+                    .filter(|task| !task.status.terminal())
+                    .map(|task| task.id),
+                shell: self.session.shell,
+                mode: request.mode,
+                permission: self.session.execution_mode,
+                permissions: Arc::clone(&self.permission_coordinator),
+                address: crate::backend::ProviderAddress {
+                    owner: Some(request.owner()?),
+                    thread_id: self.session.id.clone(),
+                    turn_id: interaction.id.clone(),
+                },
+                authorization_sink: backend_event_sink.clone(),
+                editing: Arc::clone(&self.observer.check_editing),
+                setup: interaction.check_setup.is_some(),
+                setup_reviewed: interaction.check_setup
+                    == Some(crate::checks::CheckSetupState::Reviewed),
+                can_run: interaction.check_setup.is_none()
+                    && self.agent_coordinator.active_count() == 0
+                    && execution.is_none(),
+                agent: Arc::clone(&self.agent_coordinator),
+                cancelled: Arc::clone(&self.turn_cancellation.requested),
+                sink: self.event_sink.clone(),
+            },
+        );
         if let Some(context) = &mut request.control_context {
             context.checks = Some(check_scope);
             if interaction.check_setup.is_some() && request.mode == PromptMode::Chat {
@@ -4401,12 +5787,17 @@ Planning continuation: turn {} of {}.",
         let mut provider_task = tokio::task::JoinSet::new();
         // Provider polling starts at a task boundary instead of inside the host dispatch stack.
         provider_task.spawn(async move {
-                if !backend.checkpoint_tool_gate()
-                    && let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref())
-                { gate.wait().await?; }
-                backend
-                    .prompt_stream(request, Some(backend_event_sink))
-                    .await
+            if !backend.checkpoint_tool_gate()
+                && let Some(gate) = request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.checkpoint.as_ref())
+            {
+                gate.wait().await?;
+            }
+            backend
+                .prompt_stream(request, Some(backend_event_sink))
+                .await
         });
         // Event-loop state must not remain inline in the provider lifecycle future.
         let outcome = Box::pin(async {
@@ -4596,16 +5987,24 @@ Planning continuation: turn {} of {}.",
         } else {
             outcome
         };
-        if outcome.is_err() && let Some(gate) = &runtime.tool_gate {
-            gate.complete(Err("provider turn ended before checkpoint admission completed".into()))?;
+        if outcome.is_err()
+            && let Some(gate) = &runtime.tool_gate
+        {
+            gate.complete(Err(
+                "provider turn ended before checkpoint admission completed".into(),
+            ))?;
         }
         let tools_blocked = runtime.tools_blocked();
-        let cancelled_before_tools = outcome.as_ref().is_err_and(|error| error.is::<TurnCancelled>())
+        let cancelled_before_tools = outcome
+            .as_ref()
+            .is_err_and(|error| error.is::<TurnCancelled>())
             && tools_blocked;
         let outcome = if !cancelled_before_tools && let Some(task) = runtime.checkpoint.as_mut() {
             let cancelled = async {
                 cancellation.cancelled().await;
-                if tools_blocked { return; }
+                if tools_blocked {
+                    return;
+                }
                 std::future::pending::<()>().await;
             };
             let result = tokio::select! {
@@ -4621,7 +6020,9 @@ Planning continuation: turn {} of {}.",
                 }
                 None => Err(anyhow::Error::new(TurnCancelled)),
             }
-        } else { outcome };
+        } else {
+            outcome
+        };
         while !result_delivery.is_empty() {
             tokio::select! {
                 biased;
@@ -4644,7 +6045,9 @@ Planning continuation: turn {} of {}.",
         drop(pending_revision.take());
         let mut outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
             Err(anyhow::Error::new(TurnCancelled))
-        } else { outcome };
+        } else {
+            outcome
+        };
         while let Ok(backend_event) = backend_event_stream.try_recv() {
             if let Err(error) = self
                 .process_backend_event(&mut runtime, interaction, backend_event, event)
@@ -4663,13 +6066,17 @@ Planning continuation: turn {} of {}.",
         if outcome.is_err()
             && let Err(error) = self
                 .permission_coordinator
-                .cancel_owner(&crate::backend::ExecutionOwner::root(&self.session.id), self.event_sink.as_ref())
+                .cancel_owner(
+                    &crate::backend::ExecutionOwner::root(&self.session.id),
+                    self.event_sink.as_ref(),
+                )
                 .await
         {
             outcome = Err(error).context("clear pending approval requests");
         }
         if outcome.as_ref().is_err_and(|error| {
-            checkpoint_failed || error.downcast_ref::<TurnCancelled>().is_some()
+            checkpoint_failed
+                || error.downcast_ref::<TurnCancelled>().is_some()
                 || error
                     .downcast_ref::<crate::backend::events::EventDeliveryFailure>()
                     .is_some()
@@ -4686,32 +6093,48 @@ Planning continuation: turn {} of {}.",
         interaction: &Exchange,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
-        match self.backend.rollback_cancelled_turn_for(&self.session.id).await {
+        match self
+            .backend
+            .rollback_cancelled_turn_for(&self.session.id)
+            .await
+        {
             Ok(true) => {
                 self.store.delete_exchange(&interaction.id)?;
                 self.exchange_runtime.take();
                 self.emit_live(
                     BackendEvent {
-                        received_at_ms: None, address: None, turn_boundary: None,
-                        kind: "timeline_exchange_retracted".into(), text: None,
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "timeline_exchange_retracted".into(),
+                        text: None,
                         data: json!({"exchange_id": interaction.id, "prompt": interaction.prompt}),
-                        activity: None, summary: None, task_update: None,
+                        activity: None,
+                        summary: None,
+                        task_update: None,
                     },
                     event,
-                ).await?;
+                )
+                .await?;
                 Ok(true)
             }
             Ok(false) => Ok(false),
             Err(error) => {
                 self.emit_live(
                     BackendEvent {
-                        received_at_ms: None, address: None, turn_boundary: None,
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
                         kind: "error".into(),
                         text: Some(format!("Cancelled turn could not be retracted: {error:#}")),
-                        data: Value::Null, activity: None, summary: None, task_update: None,
+                        data: Value::Null,
+                        activity: None,
+                        summary: None,
+                        task_update: None,
                     },
                     event,
-                ).await?;
+                )
+                .await?;
                 Ok(false)
             }
         }
@@ -4720,16 +6143,27 @@ Planning continuation: turn {} of {}.",
     /// Retry finalization without submitting provider input or replaying tool execution.
     async fn cancel_settled_execution(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut event = Vec::new();
-        if self.current_goal()?.is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused)) {
+        if self
+            .current_goal()?
+            .is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused))
+        {
             let (_, goal_event) = self.pause_goal().await?;
             event.extend(goal_event);
         }
-        if let Some(mut exchange) = self.store.list_exchange(&self.session.id)?
-            .into_iter().find(|exchange| exchange.state == ExchangeState::Running)
+        if let Some(mut exchange) = self
+            .store
+            .list_exchange(&self.session.id)?
+            .into_iter()
+            .find(|exchange| exchange.state == ExchangeState::Running)
         {
-            anyhow::ensure!(exchange.execution_started_at_ms.is_none()
-                && exchange.turn.iter().all(|turn| turn.state() != crate::turn::TurnState::Running),
-                "execution must settle before idle cancellation");
+            anyhow::ensure!(
+                exchange.execution_started_at_ms.is_none()
+                    && exchange
+                        .turn
+                        .iter()
+                        .all(|turn| turn.state() != crate::turn::TurnState::Running),
+                "execution must settle before idle cancellation"
+            );
             exchange.begin_finalization(ExchangeState::Cancelled, self.clock.now_ms())?;
             self.store.save_exchange(&exchange)?;
         }
@@ -4770,7 +6204,10 @@ Planning continuation: turn {} of {}.",
         self.save_session()?;
         Ok((
             json!({"cancel_requested": true, "finalized_exchange_id": exchange.id}),
-            vec![self.event("exchange_complete", json!({"id":exchange.id,"state":exchange.state}))?],
+            vec![self.event(
+                "exchange_complete",
+                json!({"id":exchange.id,"state":exchange.state}),
+            )?],
         ))
     }
 
@@ -4789,11 +6226,17 @@ Planning continuation: turn {} of {}.",
             self.store
                 .require_settled_exchange_tree(&self.session.id, &descendants)?;
             if outcome == ExchangeState::Cancelled
-                && let Some(runtime) = self.exchange_runtime.as_mut()
-                    .filter(|runtime| runtime.exchange_id == interaction.id && runtime.tools_blocked())
+                && let Some(runtime) = self.exchange_runtime.as_mut().filter(|runtime| {
+                    runtime.exchange_id == interaction.id && runtime.tools_blocked()
+                })
             {
-                runtime.tool_gate.as_ref().expect("blocked tool gate")
-                    .complete(Err("turn cancelled before checkpoint admission completed".into()))?;
+                runtime
+                    .tool_gate
+                    .as_ref()
+                    .expect("blocked tool gate")
+                    .complete(Err(
+                        "turn cancelled before checkpoint admission completed".into()
+                    ))?;
                 runtime.checkpoint.take();
                 interaction.finalization_error = None;
                 interaction.finish(outcome, self.clock.now_ms())?;
@@ -4808,7 +6251,10 @@ Planning continuation: turn {} of {}.",
                 interaction.finish(outcome, self.clock.now_ms())?;
                 return Ok(None);
             };
-            let checkpoint = self.checkpoint.as_ref().context("Git checkpoint adapter is missing")?
+            let checkpoint = self
+                .checkpoint
+                .as_ref()
+                .context("Git checkpoint adapter is missing")?
                 .capture(
                     &self.store.objects,
                     &self.repositories,
@@ -4817,9 +6263,14 @@ Planning continuation: turn {} of {}.",
                 )
                 .await?;
             let before = if let Some(identity) = interaction.checkpoint_before.as_deref() {
-                self.store.load_checkpoint(identity)?.context("interaction before checkpoint is missing")?
+                self.store
+                    .load_checkpoint(identity)?
+                    .context("interaction before checkpoint is missing")?
             } else {
-                anyhow::ensure!(outcome != ExchangeState::Complete, "completed interaction has no initial checkpoint");
+                anyhow::ensure!(
+                    outcome != ExchangeState::Complete,
+                    "completed interaction has no initial checkpoint"
+                );
                 // A failed initial barrier never released tools. Recovery preserves the current workspace.
                 interaction.checkpoint_before = Some(checkpoint.id.clone());
                 checkpoint.clone()
@@ -4927,15 +6378,34 @@ Planning continuation: turn {} of {}.",
                     serde_json::from_value(backend_event.data)?;
                 for grant in grants {
                     let directories = match grant.operation {
-                        crate::permissions::directory::DirectoryOperation::Read => &mut self.session.access.readable_directory,
-                        crate::permissions::directory::DirectoryOperation::Write => &mut self.session.access.writable_directory,
+                        crate::permissions::directory::DirectoryOperation::Read => {
+                            &mut self.session.access.readable_directory
+                        }
+                        crate::permissions::directory::DirectoryOperation::Write => {
+                            &mut self.session.access.writable_directory
+                        }
                     };
-                    if !directories.contains(&grant.path) { directories.push(grant.path); }
+                    if !directories.contains(&grant.path) {
+                        directories.push(grant.path);
+                    }
                 }
                 self.save_session()?;
-                let goal = self.session.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten();
-                let goal_execution = self.store.list_plan_execution(&self.session.id)?
-                    .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
+                let goal = self
+                    .session
+                    .goal_id
+                    .as_deref()
+                    .map(|id| self.store.load_goal(id))
+                    .transpose()?
+                    .flatten();
+                let goal_execution = self
+                    .store
+                    .list_plan_execution(&self.session.id)?
+                    .into_iter()
+                    .rev()
+                    .find(|execution| {
+                        goal.as_ref()
+                            .is_some_and(|goal| goal.id == execution.goal_id)
+                    });
                 self.emit_backend_event(BackendEvent { address: None, turn_boundary: None,
                     received_at_ms: None, kind: "execution_state".into(), text: None,
                     activity: None, summary: None, task_update: None,
@@ -4943,21 +6413,34 @@ Planning continuation: turn {} of {}.",
                         "goal_execution": goal_execution }) }, event).await?;
                 return Ok(());
             }
-            if backend_event.address.as_ref().and_then(|address| address.owner.as_ref())
-                .is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id)) {
-                self.trace.record(&self.session.id,"provider.event.rejected",json!({
-                    "event_type":backend_event.kind,"code":"foreign_execution_owner",
-                }));
+            if backend_event
+                .address
+                .as_ref()
+                .and_then(|address| address.owner.as_ref())
+                .is_some_and(|owner| {
+                    owner != &crate::backend::ExecutionOwner::root(&self.session.id)
+                })
+            {
+                self.trace.record(
+                    &self.session.id,
+                    "provider.event.rejected",
+                    json!({
+                        "event_type":backend_event.kind,"code":"foreign_execution_owner",
+                    }),
+                );
                 return Ok(());
             }
             if backend_event.kind == "error" {
-                self.emit_backend_event(backend_event,event).await?;
+                self.emit_backend_event(backend_event, event).await?;
                 return Ok(());
             }
             if backend_event.kind == "runtime_resolved" {
                 let resolved: crate::backend::BackendRuntime =
                     serde_json::from_value(backend_event.data.clone())?;
-                anyhow::ensure!(backend_event.address.is_none(), "runtime identity must belong to the session stream");
+                anyhow::ensure!(
+                    backend_event.address.is_none(),
+                    "runtime identity must belong to the session stream"
+                );
                 if !resolved.provider.is_empty() {
                     self.session.provider_label = resolved.provider;
                 }
@@ -4974,15 +6457,28 @@ Planning continuation: turn {} of {}.",
                 return Ok(());
             }
             if let Some(compaction) = backend_event.compaction()? {
-                return Box::pin(self.process_compaction_event(runtime, interaction, backend_event, compaction, event)).await;
+                return Box::pin(self.process_compaction_event(
+                    runtime,
+                    interaction,
+                    backend_event,
+                    compaction,
+                    event,
+                ))
+                .await;
             }
             if !self.capability.compaction.background
-                && matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
-                && let Some(address) = &backend_event.address {
+                && matches!(
+                    backend_event.turn_boundary,
+                    Some(crate::backend::TurnBoundary::Finished { .. })
+                )
+                && let Some(address) = &backend_event.address
+            {
                 let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
                 interaction.unconfirm_compaction(&address.thread_id, now_ms);
                 for child in self.child_exchange_runtime_by_agent.values_mut() {
-                    child.exchange.unconfirm_compaction(&address.thread_id, now_ms);
+                    child
+                        .exchange
+                        .unconfirm_compaction(&address.thread_id, now_ms);
                 }
             }
             if let Some(received) = backend_event.received_at_ms {
@@ -4995,16 +6491,37 @@ Planning continuation: turn {} of {}.",
                 }));
             }
             if backend_event.kind == "approval_requested" {
-                let request_id = backend_event.data["id"].as_str().context("approval request omitted its id")?;
-                if !self.permission_coordinator.pending_list()?.iter().any(|approval| approval.id == request_id) { return Ok(()); }
-                let execution_owner = backend_event.address.as_ref().and_then(|address|address.owner.as_ref());
+                let request_id = backend_event.data["id"]
+                    .as_str()
+                    .context("approval request omitted its id")?;
+                if !self
+                    .permission_coordinator
+                    .pending_list()?
+                    .iter()
+                    .any(|approval| approval.id == request_id)
+                {
+                    return Ok(());
+                }
+                let execution_owner = backend_event
+                    .address
+                    .as_ref()
+                    .and_then(|address| address.owner.as_ref());
                 if let Some(owner) = execution_owner {
-                    anyhow::ensure!(owner.session_id == self.session.id, "approval crosses session ownership");
+                    anyhow::ensure!(
+                        owner.session_id == self.session.id,
+                        "approval crosses session ownership"
+                    );
                 }
                 let owner = if let Some(execution_owner) = execution_owner {
-                    if execution_owner.is_root() { &mut *interaction }
-                    else { &mut self.child_exchange_runtime_by_agent.get_mut(&execution_owner.agent_id)
-                        .context("approval refers to an inactive child execution")?.exchange }
+                    if execution_owner.is_root() {
+                        &mut *interaction
+                    } else {
+                        &mut self
+                            .child_exchange_runtime_by_agent
+                            .get_mut(&execution_owner.agent_id)
+                            .context("approval refers to an inactive child execution")?
+                            .exchange
+                    }
                 } else if let Some(address) = backend_event.address.as_ref() {
                     if interaction
                         .turn
@@ -5031,12 +6548,12 @@ Planning continuation: turn {} of {}.",
                 };
                 let turn = owner.turn.iter().find(|turn| {
                     turn.state() == crate::turn::TurnState::Running
-                        && backend_event
-                            .address
-                            .as_ref()
-                            .is_none_or(|address| turn.provider() == address
-                                || (execution_owner.is_some() && address.turn_id.is_empty()
-                                    && turn.provider().thread_id == address.thread_id))
+                        && backend_event.address.as_ref().is_none_or(|address| {
+                            turn.provider() == address
+                                || (execution_owner.is_some()
+                                    && address.turn_id.is_empty()
+                                    && turn.provider().thread_id == address.thread_id)
+                        })
                 });
                 let id = backend_event
                     .data
@@ -5047,7 +6564,10 @@ Planning continuation: turn {} of {}.",
                     id,
                     &owner.id,
                     turn.map(|turn| turn.id()),
-                )? else { return Ok(()); };
+                )?
+                else {
+                    return Ok(());
+                };
                 owner.observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
                 self.store.save_exchange(owner)?;
                 backend_event.data = serde_json::to_value(approval)?;
@@ -5058,20 +6578,35 @@ Planning continuation: turn {} of {}.",
                 backend_event.kind.as_str(),
                 "approval_resolved" | "approval_cancelled"
             ) {
-                let approval: ApprovalRequestView = serde_json::from_value(backend_event.data.clone())?;
+                let approval: ApprovalRequestView =
+                    serde_json::from_value(backend_event.data.clone())?;
                 let now_ms = self.clock.now_ms();
                 if approval.exchange_id.as_deref() == Some(interaction.id.as_str())
-                    || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_none_or(|owner| owner.is_root())) {
+                    || (approval.exchange_id.is_none()
+                        && approval
+                            .execution_owner
+                            .as_ref()
+                            .is_none_or(|owner| owner.is_root()))
+                {
                     interaction.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
                     interaction.approval_resolution.push(approval.clone());
                     self.store.save_exchange(interaction)?;
-                } else if let Some(owner) = self
-                    .child_exchange_runtime_by_agent
-                    .values_mut()
-                    .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str())
-                        || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_some_and(|identity| identity.agent_id == owner.exchange.agent_id)))
+                } else if let Some(owner) =
+                    self.child_exchange_runtime_by_agent
+                        .values_mut()
+                        .find(|owner| {
+                            approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str())
+                                || (approval.exchange_id.is_none()
+                                    && approval.execution_owner.as_ref().is_some_and(|identity| {
+                                        identity.agent_id == owner.exchange.agent_id
+                                    }))
+                        })
                 {
-                    owner.exchange.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                    owner.exchange.observe_blocker(
+                        format!("approval:{}", approval.id),
+                        false,
+                        now_ms,
+                    );
                     owner.exchange.approval_resolution.push(approval.clone());
                     self.store.save_exchange(&owner.exchange)?;
                 }
@@ -5096,7 +6631,8 @@ Planning continuation: turn {} of {}.",
                                 .data
                                 .get("agent_count")
                                 .and_then(Value::as_u64)
-                                .unwrap_or_default() as usize,
+                                .unwrap_or_default()
+                                as usize,
                         });
                         self.store.save_exchange(interaction)?;
                     }
@@ -5121,7 +6657,8 @@ Planning continuation: turn {} of {}.",
                 return Ok(());
             }
             if backend_event.kind == "agent_lifecycle" {
-                self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event).await?;
+                self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event)
+                    .await?;
                 return Ok(());
             }
             if backend_event.address.as_ref().is_some_and(|address| {
@@ -5142,13 +6679,28 @@ Planning continuation: turn {} of {}.",
                 );
                 return Ok(());
             }
-            if Box::pin(self.route_settled_parent_event(interaction, &backend_event, event)).await? {
+            if Box::pin(self.route_settled_parent_event(interaction, &backend_event, event)).await?
+            {
                 return Ok(());
             }
-            Box::pin(self.admit_native_goal_continuation(runtime, interaction, &backend_event, event)).await?;
-            let started_provider_thread = if matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Started)) {
-                backend_event.address.as_ref().map(|address| address.thread_id.clone())
-            } else { None };
+            Box::pin(self.admit_native_goal_continuation(
+                runtime,
+                interaction,
+                &backend_event,
+                event,
+            ))
+            .await?;
+            let started_provider_thread = if matches!(
+                backend_event.turn_boundary,
+                Some(crate::backend::TurnBoundary::Started)
+            ) {
+                backend_event
+                    .address
+                    .as_ref()
+                    .map(|address| address.thread_id.clone())
+            } else {
+                None
+            };
             admit_addressless_turn(
                 interaction,
                 &mut runtime.synthetic_turn,
@@ -5195,7 +6747,7 @@ Planning continuation: turn {} of {}.",
                 self.store.save_exchange(interaction)?;
                 self.emit_live_interaction(
                     BackendEvent {
-                received_at_ms: None,
+                        received_at_ms: None,
                         address: None,
                         turn_boundary: None,
                         kind: "timeline_node_updated".into(),
@@ -5227,8 +6779,12 @@ Planning continuation: turn {} of {}.",
                 runtime.retraction_eligible = false;
             }
             if backend_event.kind == "context_usage" {
-                let context_usage: ContextUsage = serde_json::from_value(backend_event.data.clone())?;
-                let thread_id = backend_event.address.as_ref().map(|address| address.thread_id.as_str())
+                let context_usage: ContextUsage =
+                    serde_json::from_value(backend_event.data.clone())?;
+                let thread_id = backend_event
+                    .address
+                    .as_ref()
+                    .map(|address| address.thread_id.as_str())
                     .or(self.session.backend_session_id.as_deref());
                 if let Some(thread_id) = thread_id
                     && interaction.observe_compaction_usage(thread_id, context_usage.used) {
@@ -5255,10 +6811,11 @@ Planning continuation: turn {} of {}.",
                     let patch = self.reconcile_timeline()?;
                     self.emit_timeline_patch(patch, event).await?;
                 }
-                if backend_event.address.as_ref().is_none_or(|address|
-                    self.session.backend_session_id.as_deref() == Some(address.thread_id.as_str())) {
+                if backend_event.address.as_ref().is_none_or(|address| {
+                    self.session.backend_session_id.as_deref() == Some(address.thread_id.as_str())
+                }) {
                     self.session.context_usage = Some(context_usage);
-                self.context_usage_fresh = true;
+                    self.context_usage_fresh = true;
                 }
                 self.emit_backend_event(backend_event, event).await?;
                 return Ok(());
@@ -5269,7 +6826,7 @@ Planning continuation: turn {} of {}.",
                 self.store.save_exchange(interaction)?;
                 self.emit_live_interaction(
                     BackendEvent {
-                received_at_ms: None,
+                        received_at_ms: None,
                         address: None,
                         turn_boundary: None,
                         kind: "timeline_task_updated".into(),
@@ -5287,7 +6844,8 @@ Planning continuation: turn {} of {}.",
             if backend_event.address.is_some() {
                 attribute_provider_tool(interaction, &mut runtime.task, &backend_event)?;
                 if backend_event.tool_output_delta().is_some() {
-                    self.store.save_tool_output_delta(interaction, &backend_event)?;
+                    self.store
+                        .save_tool_output_delta(interaction, &backend_event)?;
                 } else {
                     self.store.save_exchange(interaction)?;
                 }
@@ -5390,22 +6948,36 @@ Planning continuation: turn {} of {}.",
         backend_event: &BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
-        let Some(address) = backend_event.address.as_ref() else { return Ok(false) };
+        let Some(address) = backend_event.address.as_ref() else {
+            return Ok(false);
+        };
         if current.turn.iter().any(|turn| turn.provider() == address)
             || (backend_event.kind != "usage" && backend_event.turn_boundary.is_none())
         {
             return Ok(false);
         }
-        let Some(mut owner) = self.store.load_provider_exchange(&self.session.id, address)?
-        else { return Ok(false) };
+        let Some(mut owner) = self
+            .store
+            .load_provider_exchange(&self.session.id, address)?
+        else {
+            return Ok(false);
+        };
         if backend_event.kind == "usage" {
             owner.observe_turn(backend_event, self.clock.now_ms())?;
             self.store.save_exchange(&owner)?;
             let status = self.live_interaction_status(Some(current))?;
-            let patch = self.presentation.lock()
+            let patch = self
+                .presentation
+                .lock()
                 .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .update_live(Some(&owner), None, status, self.observer.status_thoughts.load(Ordering::Relaxed))?;
-            self.emit_backend_event(backend_event.clone(), event).await?;
+                .update_live(
+                    Some(&owner),
+                    None,
+                    status,
+                    self.observer.status_thoughts.load(Ordering::Relaxed),
+                )?;
+            self.emit_backend_event(backend_event.clone(), event)
+                .await?;
             self.emit_timeline_patch(patch, event).await?;
         }
         Ok(true)
@@ -5422,13 +6994,20 @@ Planning continuation: turn {} of {}.",
             return Ok(());
         }
         let (Some(address), Some(goal_id), Some(previous)) = (
-            backend_event.address.as_ref(), interaction.goal_id.as_ref(), interaction.turn.last(),
-        ) else { return Ok(()) };
+            backend_event.address.as_ref(),
+            interaction.goal_id.as_ref(),
+            interaction.turn.last(),
+        ) else {
+            return Ok(());
+        };
         if previous.provider().thread_id != address.thread_id
-            || interaction.turn.iter().any(|turn| turn.provider() == address
-                || turn.state() == crate::turn::TurnState::Running)
-            || !self.store.load_goal(goal_id)?.is_some_and(|goal| goal.native
-                && goal.state == GoalState::Active)
+            || interaction.turn.iter().any(|turn| {
+                turn.provider() == address || turn.state() == crate::turn::TurnState::Running
+            })
+            || !self
+                .store
+                .load_goal(goal_id)?
+                .is_some_and(|goal| goal.native && goal.state == GoalState::Active)
         {
             return Ok(());
         }
@@ -5441,27 +7020,45 @@ Planning continuation: turn {} of {}.",
                 crate::turn::TurnOutcome::Failed => ExchangeState::Failed,
             },
         };
-        self.collect_initial_checkpoint(runtime, interaction).await?;
+        self.collect_initial_checkpoint(runtime, interaction)
+            .await?;
         self.capture_final_checkpoint(interaction, outcome).await?;
-        let (mut continuation, _, boundary_event) = self.interaction_for_turn("", true, self.clock.now_ms()).await?;
+        let (mut continuation, _, boundary_event) = self
+            .interaction_for_turn("", true, self.clock.now_ms())
+            .await?;
         event.extend(boundary_event);
         continuation.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
         continuation.kind = interaction.kind;
         continuation.goal_id.clone_from(&interaction.goal_id);
         continuation.task.clone_from(&interaction.task);
-        self.start_exchange_runtime(&mut continuation, self.clock.now_ms()).await?;
-        let mut continuation_runtime = self.exchange_runtime.take().context("continuation runtime is missing")?;
-        self.collect_initial_checkpoint(&mut continuation_runtime, &mut continuation).await?;
+        self.start_exchange_runtime(&mut continuation, self.clock.now_ms())
+            .await?;
+        let mut continuation_runtime = self
+            .exchange_runtime
+            .take()
+            .context("continuation runtime is missing")?;
+        self.collect_initial_checkpoint(&mut continuation_runtime, &mut continuation)
+            .await?;
         *runtime = continuation_runtime;
         runtime.retraction_eligible = false;
         self.store.save_exchange(&continuation)?;
         *interaction = continuation;
-        self.emit_live_interaction(BackendEvent {
-            received_at_ms: None, address: None, turn_boundary: None,
-            kind: "timeline_exchange_started".into(), text: None,
-            data: serde_json::to_value(&interaction)?, activity: None, summary: None,
-            task_update: None,
-        }, interaction, event).await?;
+        self.emit_live_interaction(
+            BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "timeline_exchange_started".into(),
+                text: None,
+                data: serde_json::to_value(&interaction)?,
+                activity: None,
+                summary: None,
+                task_update: None,
+            },
+            interaction,
+            event,
+        )
+        .await?;
         Ok(())
     }
 
@@ -5474,7 +7071,7 @@ Planning continuation: turn {} of {}.",
         self.active_wait_projection = runtime.active_wait.clone();
         self.emit_live_interaction(
             BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_wait_updated".into(),
@@ -5510,12 +7107,18 @@ Planning continuation: turn {} of {}.",
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         let incremental = if backend_event.tool_output_delta().is_some() {
-            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .append_tool_output(interaction,&backend_event)?
+            self.presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .append_tool_output(interaction, &backend_event)?
         } else if backend_event.message_delta().is_some() {
-            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .update_message(interaction,&backend_event)?
-        } else { None };
+            self.presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .update_message(interaction, &backend_event)?
+        } else {
+            None
+        };
         self.emit_backend_event(backend_event, event).await?;
         let timeline_patch = match incremental {
             Some(patch) => patch,
@@ -5530,12 +7133,16 @@ Planning continuation: turn {} of {}.",
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         // Configuration completion belongs to the Rust service. Other forwarded events follow the UI contract.
-        if !matches!(backend_event.kind.as_str(), "configuration_applied" | "configuration_progress")
-            && !forge_protocol::contract::backend_visible(&backend_event.kind) {
+        if !matches!(
+            backend_event.kind.as_str(),
+            "configuration_applied" | "configuration_progress"
+        ) && !forge_protocol::contract::backend_visible(&backend_event.kind)
+        {
             return Ok(());
         }
         if backend_event.kind == "timeline_node_updated" {
-            backend_event.data = json!({"node":{"prompt":backend_event.data.pointer("/node/prompt")}});
+            backend_event.data =
+                json!({"node":{"prompt":backend_event.data.pointer("/node/prompt")}});
         }
         self.trace.record(
             &self.session.id,
@@ -5544,7 +7151,11 @@ Planning continuation: turn {} of {}.",
         );
         if let Some(event_sink) = self.event_sink.as_ref() {
             if let Err(error) = event_sink.send_wait(backend_event).await {
-                self.trace.record(&self.session.id, "presentation.delivery_failed", json!({"error":error.to_string()}));
+                self.trace.record(
+                    &self.session.id,
+                    "presentation.delivery_failed",
+                    json!({"error":error.to_string()}),
+                );
                 self.event_sink = None;
             }
         } else {
@@ -5573,7 +7184,7 @@ Planning continuation: turn {} of {}.",
         if let Some(event_sink) = self.event_sink.as_ref() {
             let delivery = event_sink
                 .send_wait(BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "document_changed".into(),
@@ -5585,7 +7196,11 @@ Planning continuation: turn {} of {}.",
                 })
                 .await;
             if let Err(error) = delivery {
-                self.trace.record(&self.session.id, "presentation.delivery_failed", json!({"error":error.to_string()}));
+                self.trace.record(
+                    &self.session.id,
+                    "presentation.delivery_failed",
+                    json!({"error":error.to_string()}),
+                );
                 self.event_sink = None;
             }
         } else {
@@ -5604,7 +7219,10 @@ Planning continuation: turn {} of {}.",
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .reconcile_with_status_thoughts(timeline, self.observer.status_thoughts.load(Ordering::Relaxed))
+            .reconcile_with_status_thoughts(
+                timeline,
+                self.observer.status_thoughts.load(Ordering::Relaxed),
+            )
     }
 
     fn reconcile_after_dispatch(&mut self) -> Result<TimelinePatch> {
@@ -5634,25 +7252,40 @@ Planning continuation: turn {} of {}.",
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .update_live(interaction, removed_exchange_id, status, self.observer.status_thoughts.load(Ordering::Relaxed))
+            .update_live(
+                interaction,
+                removed_exchange_id,
+                status,
+                self.observer.status_thoughts.load(Ordering::Relaxed),
+            )
     }
 
     fn live_interaction_status(
         &self,
         interaction: Option<&Exchange>,
     ) -> Result<crate::session::state_machine::SessionPhase> {
-        let active_plan = self.current_plan_id()?.as_deref()
-            .map(|id| self.store.load_plan(id)).transpose()?.flatten();
+        let active_plan = self
+            .current_plan_id()?
+            .as_deref()
+            .map(|id| self.store.load_plan(id))
+            .transpose()?
+            .flatten();
         let mut status = crate::session::state_machine::SessionPhase::resolve(
             active_plan.as_ref(),
             self.active_wait_projection.as_ref(),
             interaction,
         );
-        if status == crate::session::state_machine::SessionPhase::Idle && self.agent_coordinator.active_count() > 0 {
-            status = crate::session::state_machine::SessionPhase::WaitingForAgent {agent_count:self.agent_coordinator.active_count()};
+        if status == crate::session::state_machine::SessionPhase::Idle
+            && self.agent_coordinator.active_count() > 0
+        {
+            status = crate::session::state_machine::SessionPhase::WaitingForAgent {
+                agent_count: self.agent_coordinator.active_count(),
+            };
         }
-        if let Some(execution_id) = interaction.and_then(|exchange| exchange.execution_id.as_deref())
-            && let Some(execution) = self.store.load_plan_execution(execution_id)? {
+        if let Some(execution_id) =
+            interaction.and_then(|exchange| exchange.execution_id.as_deref())
+            && let Some(execution) = self.store.load_plan_execution(execution_id)?
+        {
             Self::execution_status(&mut status, &execution);
         }
         Ok(status)
@@ -5687,7 +7320,11 @@ Planning continuation: turn {} of {}.",
         if let Some(previous) = interaction_list.last_mut()
             && previous.state == ExchangeState::Running
         {
-            let outcome = if previous.execution_phase.as_ref().is_some_and(|phase| phase.outcome.is_none()) {
+            let outcome = if previous
+                .execution_phase
+                .as_ref()
+                .is_some_and(|phase| phase.outcome.is_none())
+            {
                 ExchangeState::Interrupted
             } else {
                 ExchangeState::Complete
@@ -5700,17 +7337,28 @@ Planning continuation: turn {} of {}.",
         }
         let mut event = Vec::new();
         if let Some(previous) = interaction_list.last() {
-            self.emit_live_interaction(BackendEvent {
-                received_at_ms: None, address: None, turn_boundary: None,
-                kind: "timeline_exchange_complete".into(), text: None,
-                data: serde_json::to_value(previous)?, activity: None, summary: None,
-                task_update: None,
-            }, previous, &mut event).await?;
+            self.emit_live_interaction(
+                BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "timeline_exchange_complete".into(),
+                    text: None,
+                    data: serde_json::to_value(previous)?,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+                previous,
+                &mut event,
+            )
+            .await?;
         }
         Ok((
             Exchange {
                 lifecycle: None,
-                finalization_error: None, check_owner: None,
+                finalization_error: None,
+                check_owner: None,
                 finalization_outcome: None,
                 agent_id: self.session.primary_agent_id.clone(),
                 id: Uuid::new_v4().to_string(),
@@ -5763,19 +7411,39 @@ Planning continuation: turn {} of {}.",
             .review_digest
             .clone()
             .context("submitted plan digest is missing")?;
-        let overall_comment = params.get("comment").and_then(Value::as_str)
-            .map(str::trim).filter(|comment| !comment.is_empty()).map(str::to_owned);
+        let overall_comment = params
+            .get("comment")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+            .map(str::to_owned);
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == review_digest,
                 "plan changed after the accept action began"
             );
         }
-        anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
-        let reviewed = self.observer.capture_plan_review(&plan.id, &review_digest)?;
-        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.plan_id == plan.id) {
-            anyhow::ensure!(execution.pending_revision_reason.is_some(), "execution already exists. Use /goal resume to continue it");
-            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
+        anyhow::ensure!(
+            !self.refresh_check_review(&plan.id)?,
+            "Configured checks changed. Reopen /plan to review them before acceptance."
+        );
+        let reviewed = self
+            .observer
+            .capture_plan_review(&plan.id, &review_digest)?;
+        if let Some(mut execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| execution.plan_id == plan.id)
+        {
+            anyhow::ensure!(
+                execution.pending_revision_reason.is_some(),
+                "execution already exists. Use /goal resume to continue it"
+            );
+            let mut goal = self
+                .store
+                .load_goal(&execution.goal_id)?
+                .context("execution goal is missing")?;
             self.finalize_review_draft(&mut plan, &reviewed)?;
             plan.accepted_revision = Some(plan.model_revision);
             plan.accepted_digest = plan.review_digest.clone();
@@ -5783,37 +7451,78 @@ Planning continuation: turn {} of {}.",
             plan.state = PlanState::Accepted;
             execution.revision = plan.model_revision;
             execution.generation += 1;
-            execution.revision_history.push(crate::plan::execution::ExecutionRevision {
-                revision: execution.revision, reason: execution.pending_revision_reason.take().unwrap(), approval: "user".into(), recorded_at_ms: self.clock.now_ms(),
-            });
-            if let Some(comment) = overall_comment.clone() { execution.approval_comments.push(comment); }
+            execution
+                .revision_history
+                .push(crate::plan::execution::ExecutionRevision {
+                    revision: execution.revision,
+                    reason: execution.pending_revision_reason.take().unwrap(),
+                    approval: "user".into(),
+                    recorded_at_ms: self.clock.now_ms(),
+                });
+            if let Some(comment) = overall_comment.clone() {
+                execution.approval_comments.push(comment);
+            }
             execution.progress = Default::default();
             let resume = execution.review_paused;
             execution.review_paused = false;
-            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
-            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase { title: "Plan revision accepted".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
+            if resume {
+                execution.state = PlanExecutionState::Active;
+                goal.resume(self.clock.now_ms());
+            }
+            execution.append_lifecycle(
+                self.plan_exchange_anchor(&plan.id)?,
+                self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase {
+                    title: "Plan revision accepted".into(),
+                    phase: execution.phase,
+                    revision: execution.revision,
+                    state: execution.state,
+                },
+            );
             let lifecycle = PlanLifecycleRecord {
-                title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-                id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
-                kind: PlanLifecycleKind::Accepted, model_revision: plan.model_revision, user_revision: plan.user_revision,
-                overall_comment: overall_comment.clone(), annotation: Vec::new(), question: None, answer: None,
+                title: plan.title.clone(),
+                anchor: Some(self.plan_exchange_anchor(&plan.id)?),
+                id: Uuid::new_v4().to_string(),
+                session_id: self.session.id.clone(),
+                plan_id: plan.id.clone(),
+                kind: PlanLifecycleKind::Accepted,
+                model_revision: plan.model_revision,
+                user_revision: plan.user_revision,
+                overall_comment: overall_comment.clone(),
+                annotation: Vec::new(),
+                question: None,
+                answer: None,
                 created_at_ms: self.clock.now_ms(),
             };
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, Some(&lifecycle))?;
+            self.store.save_execution_transition(
+                &execution,
+                &goal,
+                Some(&plan),
+                None,
+                Some(&lifecycle),
+            )?;
             let mut events = vec![self.event("backend_event", json!({
                 "kind":"timeline_plan_lifecycle", "data":{"kind":"plan_lifecycle", "id":lifecycle.id,
                     "created_at_ms":lifecycle.created_at_ms, "plan":&plan, "lifecycle":&lifecycle}
             }))?, self.event("plan_accepted", json!({"plan":plan,"lifecycle":lifecycle,"execution":execution}))?];
-            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            if resume {
+                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
+            }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
         if reviewed.document.design.is_some() {
-            reviewed.document.design.as_ref().unwrap().check_workspace(Path::new(&self.session.workspace))?;
+            reviewed
+                .document
+                .design
+                .as_ref()
+                .unwrap()
+                .check_workspace(Path::new(&self.session.workspace))?;
             if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
-                anyhow::ensure!(expected == reviewed.saved_digest, "saved design changed after review");
+                anyhow::ensure!(
+                    expected == reviewed.saved_digest,
+                    "saved design changed after review"
+                );
             }
-
         }
         let mut acceptance =
             PlanAcceptance::new(review_digest, &self.capability.execution_mode_list)?;
@@ -5832,7 +7541,10 @@ Planning continuation: turn {} of {}.",
 
         self.save_session()?;
         let snapshot = self.snapshot()?;
-        events.push(self.event("plan_acceptance_started", serde_json::to_value(&snapshot.active_elicitation)?)?);
+        events.push(self.event(
+            "plan_acceptance_started",
+            serde_json::to_value(&snapshot.active_elicitation)?,
+        )?);
         Ok((serde_json::to_value(&snapshot)?, events))
     }
 
@@ -5849,24 +7561,61 @@ Planning continuation: turn {} of {}.",
     }
 
     fn delete_plan_tests(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(Arc::clone(&self.trace), &self.session.id, "plan.tests.delete", &params);
+        let trace = crate::plan::edit_trace::PlanEditTrace::new(
+            Arc::clone(&self.trace),
+            &self.session.id,
+            "plan.tests.delete",
+            &params,
+        );
         let mutation = trace.stage("delete.total");
         let plan_id = required_text(&params, "plan_id")?;
         let expected_digest = required_text(&params, "digest")?;
-        let expected_version = params.get("expected_version").and_then(Value::as_u64).context("test deletion requires the reviewed plan version")?;
-        let selected: Vec<crate::plan::DesignTestSelection> = serde_json::from_value(params.get("tests").cloned().context("test selection is missing")?)?;
-        let mut plan = self.store.load_plan(&plan_id)?.context("plan record is missing")?;
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        anyhow::ensure!(plan.state == PlanState::AwaitingReview, "only plans awaiting review can have tests deleted");
-        anyhow::ensure!(plan.review_digest.as_deref() == Some(&expected_digest), "plan changed before test deletion");
-        let (document, rendered, checksum) = self.plan_file.remove_tests(&self.session.id, &plan.id,
-            expected_version, &expected_digest, &selected, Some(&trace))?;
+        let expected_version = params
+            .get("expected_version")
+            .and_then(Value::as_u64)
+            .context("test deletion requires the reviewed plan version")?;
+        let selected: Vec<crate::plan::DesignTestSelection> = serde_json::from_value(
+            params
+                .get("tests")
+                .cloned()
+                .context("test selection is missing")?,
+        )?;
+        let mut plan = self
+            .store
+            .load_plan(&plan_id)?
+            .context("plan record is missing")?;
+        anyhow::ensure!(
+            plan.session_id == self.session.id,
+            "plan belongs to another session"
+        );
+        anyhow::ensure!(
+            plan.state == PlanState::AwaitingReview,
+            "only plans awaiting review can have tests deleted"
+        );
+        anyhow::ensure!(
+            plan.review_digest.as_deref() == Some(&expected_digest),
+            "plan changed before test deletion"
+        );
+        let (document, rendered, checksum) = self.plan_file.remove_tests(
+            &self.session.id,
+            &plan.id,
+            expected_version,
+            &expected_digest,
+            &selected,
+            Some(&trace),
+        )?;
         let records = trace.stage("delete.persist_records");
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
-        let change = format!("Removed planned tests: {}", selected.iter()
-            .map(|test| format!("{}::{}", test.file, test.name)).collect::<Vec<_>>().join(", "));
+        let change = format!(
+            "Removed planned tests: {}",
+            selected
+                .iter()
+                .map(|test| format!("{}::{}", test.file, test.name))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
@@ -5875,40 +7624,101 @@ Planning continuation: turn {} of {}.",
         records.complete(json!({"count":selected.len(), "version":document.version}));
         let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
         mutation.complete(json!({"version":document.version}));
-        Ok((payload.clone(), vec![self.event("plan_tests_deleted", payload)?]))
+        Ok((
+            payload.clone(),
+            vec![self.event("plan_tests_deleted", payload)?],
+        ))
     }
 
     async fn update_plan_checks(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(Arc::clone(&self.trace), &self.session.id, "plan.checks.update", &params);
+        let trace = crate::plan::edit_trace::PlanEditTrace::new(
+            Arc::clone(&self.trace),
+            &self.session.id,
+            "plan.checks.update",
+            &params,
+        );
         let plan_id = required_text(&params, "plan_id")?;
         let expected_digest = required_text(&params, "digest")?;
-        let expected_version = params.get("expected_version").and_then(Value::as_u64).context("check selection requires the reviewed plan version")?;
-        let changes: std::collections::BTreeMap<String, bool> = serde_json::from_value(params.get("enabled").cloned().context("check selection is missing")?)?;
-        let tests: Vec<crate::plan::DesignTestSelection> = serde_json::from_value(params.get("tests").cloned().unwrap_or_else(|| json!([])))?;
-        let mut plan = self.store.load_plan(&plan_id)?.context("plan record is missing")?;
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        anyhow::ensure!(plan.state == PlanState::AwaitingReview, "only plans awaiting review can change checks");
-        anyhow::ensure!(plan.review_digest.as_deref() == Some(&expected_digest), "plan changed before check selection");
-        let (document, rendered, checksum) = self.plan_file.update_checks(&self.session.id, &plan.id,
-            expected_version, &expected_digest, &changes, &tests, Some(&trace)).await?;
+        let expected_version = params
+            .get("expected_version")
+            .and_then(Value::as_u64)
+            .context("check selection requires the reviewed plan version")?;
+        let changes: std::collections::BTreeMap<String, bool> = serde_json::from_value(
+            params
+                .get("enabled")
+                .cloned()
+                .context("check selection is missing")?,
+        )?;
+        let tests: Vec<crate::plan::DesignTestSelection> =
+            serde_json::from_value(params.get("tests").cloned().unwrap_or_else(|| json!([])))?;
+        let mut plan = self
+            .store
+            .load_plan(&plan_id)?
+            .context("plan record is missing")?;
+        anyhow::ensure!(
+            plan.session_id == self.session.id,
+            "plan belongs to another session"
+        );
+        anyhow::ensure!(
+            plan.state == PlanState::AwaitingReview,
+            "only plans awaiting review can change checks"
+        );
+        anyhow::ensure!(
+            plan.review_digest.as_deref() == Some(&expected_digest),
+            "plan changed before check selection"
+        );
+        let (document, rendered, checksum) = self
+            .plan_file
+            .update_checks(
+                &self.session.id,
+                &plan.id,
+                expected_version,
+                &expected_digest,
+                &changes,
+                &tests,
+                Some(&trace),
+            )
+            .await?;
         plan.document_version = document.version;
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
-        plan.manual_changes.push(format!("Updated plan checks: {}", changes.iter().map(|(id, enabled)| format!("{id} {}", if *enabled { "enabled" } else { "disabled" })).collect::<Vec<_>>().join(", ")));
+        plan.manual_changes.push(format!(
+            "Updated plan checks: {}",
+            changes
+                .iter()
+                .map(|(id, enabled)| format!(
+                    "{id} {}",
+                    if *enabled { "enabled" } else { "disabled" }
+                ))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
         self.save_session()?;
         let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
-        Ok((payload.clone(), vec![self.event("plan_checks_updated", payload)?]))
+        Ok((
+            payload.clone(),
+            vec![self.event("plan_checks_updated", payload)?],
+        ))
     }
 
     fn rename_plan_entity(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let trace = crate::plan::edit_trace::PlanEditTrace::new(Arc::clone(&self.trace), &self.session.id, "plan.entity.rename", &params);
+        let trace = crate::plan::edit_trace::PlanEditTrace::new(
+            Arc::clone(&self.trace),
+            &self.session.id,
+            "plan.entity.rename",
+            &params,
+        );
         let mutation = trace.stage("rename.total");
         let preflight = trace.stage("rename.preflight");
         let plan_id = required_text(&params, "plan_id")?;
         let symbol = params.get("symbol").and_then(Value::as_str);
-        let entity_name = params.get("entity_name").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let entity_name = params
+            .get("entity_name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let new_name = required_text(&params, "name")?;
         anyhow::ensure!(!new_name.trim().is_empty(), "entity name cannot be empty");
         let mut plan = self
@@ -5929,19 +7739,50 @@ Planning continuation: turn {} of {}.",
             );
         }
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
-            anyhow::ensure!(plan.review_digest.as_deref() == Some(expected), "plan changed before rename");
-            anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&document)?) == expected, "working plan changed before rename");
+            anyhow::ensure!(
+                plan.review_digest.as_deref() == Some(expected),
+                "plan changed before rename"
+            );
+            anyhow::ensure!(
+                crate::plan::digest(&serde_json::to_vec(&document)?) == expected,
+                "working plan changed before rename"
+            );
         }
         preflight.complete(json!({"version":document.version}));
         let (previous_name, document, rendered, digest) = if let Some(identity) = symbol {
-            anyhow::ensure!(params.get("expected_version").and_then(Value::as_u64) == Some(document.version), "rename requires the current plan version");
-            self.plan_file.rename_symbol(&self.session.id, &plan.id, document.version, identity, &new_name, Some(&trace))?
+            anyhow::ensure!(
+                params.get("expected_version").and_then(Value::as_u64) == Some(document.version),
+                "rename requires the current plan version"
+            );
+            self.plan_file.rename_symbol(
+                &self.session.id,
+                &plan.id,
+                document.version,
+                identity,
+                &new_name,
+                Some(&trace),
+            )?
         } else {
-            let previous = document.entity_changes.iter().find(|entity| entity.name == entity_name)
-                .map(|entity| entity.name.clone()).with_context(|| format!("program entity `{entity_name}` does not exist"))?;
-            let result = self.plan_file.rename_added_entity(&self.session.id, &plan.id, &entity_name, new_name.clone())?;
+            let previous = document
+                .entity_changes
+                .iter()
+                .find(|entity| entity.name == entity_name)
+                .map(|entity| entity.name.clone())
+                .with_context(|| format!("program entity `{entity_name}` does not exist"))?;
+            let result = self.plan_file.rename_added_entity(
+                &self.session.id,
+                &plan.id,
+                &entity_name,
+                new_name.clone(),
+            )?;
             let rendered = self.plan_file.render_review(&result.document)?;
-            let (document, rendered, digest) = self.plan_file.persist_review_draft(&self.session.id, &plan.id, result.document, rendered, Some(&trace))?;
+            let (document, rendered, digest) = self.plan_file.persist_review_draft(
+                &self.session.id,
+                &plan.id,
+                result.document,
+                rendered,
+                Some(&trace),
+            )?;
             (previous, document, rendered, digest)
         };
         let records = trace.stage("rename.persist_records");
@@ -5971,22 +7812,42 @@ Planning continuation: turn {} of {}.",
         ))
     }
 
-    fn finalize_review_draft(&mut self, plan: &mut PlanRecord, reviewed: &crate::plan::review_source::PlanReviewSource) -> Result<()> {
-        if plan.submitted_version == Some(reviewed.document.version) { return Ok(()); }
-        anyhow::ensure!(plan.document_version == reviewed.document.version,
-            "plan version changed before the review decision");
-        let revision = plan.model_revision.checked_add(1).context("plan revision exhausted")?;
-        self.plan_file.submit_reviewed_revision(&self.session.id, &plan.id, revision, reviewed)?;
+    fn finalize_review_draft(
+        &mut self,
+        plan: &mut PlanRecord,
+        reviewed: &crate::plan::review_source::PlanReviewSource,
+    ) -> Result<()> {
+        if plan.submitted_version == Some(reviewed.document.version) {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            plan.document_version == reviewed.document.version,
+            "plan version changed before the review decision"
+        );
+        let revision = plan
+            .model_revision
+            .checked_add(1)
+            .context("plan revision exhausted")?;
+        self.plan_file
+            .submit_reviewed_revision(&self.session.id, &plan.id, revision, reviewed)?;
         plan.model_revision = revision;
         plan.submitted_version = Some(reviewed.document.version);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(plan)?;
         self.store.save_plan_lifecycle(&PlanLifecycleRecord {
-            title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::RevisionCreated, model_revision: revision, user_revision: plan.user_revision + 1,
-            overall_comment: Some(plan.manual_changes.join("\n")), annotation: Vec::new(),
-            question: None, answer: None, created_at_ms: self.clock.now_ms(),
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
+            id: Uuid::new_v4().to_string(),
+            session_id: self.session.id.clone(),
+            plan_id: plan.id.clone(),
+            kind: PlanLifecycleKind::RevisionCreated,
+            model_revision: revision,
+            user_revision: plan.user_revision + 1,
+            overall_comment: Some(plan.manual_changes.join("\n")),
+            annotation: Vec::new(),
+            question: None,
+            answer: None,
+            created_at_ms: self.clock.now_ms(),
         })?;
         Ok(())
     }
@@ -6043,21 +7904,42 @@ Planning continuation: turn {} of {}.",
             .review_digest
             .clone()
             .context("submitted plan digest is missing")?;
-        let overall_comment = params.get("comment").and_then(Value::as_str)
-            .map(str::trim).filter(|comment| !comment.is_empty()).map(str::to_owned);
+        let overall_comment = params
+            .get("comment")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|comment| !comment.is_empty())
+            .map(str::to_owned);
         if let Some(expected) = params.get("digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == digest,
                 "plan changed after the accept action began"
             );
         }
-        anyhow::ensure!(!self.refresh_check_review(&plan.id)?, "Configured checks changed. Reopen /plan to review them before acceptance.");
+        anyhow::ensure!(
+            !self.refresh_check_review(&plan.id)?,
+            "Configured checks changed. Reopen /plan to review them before acceptance."
+        );
         let reviewed = self.observer.capture_plan_review(&plan.id, &digest)?;
         let accepted_document = &reviewed.document;
         let accepted_render = &reviewed.rendered;
-        anyhow::ensure!(accepted_document.design.is_some(), "execution requires a semantic plan");
-        anyhow::ensure!(!self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.plan_id == plan.id), "execution already exists. Use /goal resume to continue it");
-        accepted_document.design.as_ref().unwrap().check_workspace(Path::new(&self.session.workspace))?;
+        anyhow::ensure!(
+            accepted_document.design.is_some(),
+            "execution requires a semantic plan"
+        );
+        anyhow::ensure!(
+            !self
+                .store
+                .list_plan_execution(&self.session.id)?
+                .iter()
+                .any(|execution| execution.plan_id == plan.id),
+            "execution already exists. Use /goal resume to continue it"
+        );
+        accepted_document
+            .design
+            .as_ref()
+            .unwrap()
+            .check_workspace(Path::new(&self.session.workspace))?;
         if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,
@@ -6069,8 +7951,14 @@ Planning continuation: turn {} of {}.",
             self.validate_plan_executor(&executor).await?;
         }
         if self.session.plan_compact {
-            anyhow::ensure!(self.capability.native_compact, "current backend does not support context compaction");
-            anyhow::ensure!(self.session.backend_session_id.is_some(), "current session has no provider conversation to compact");
+            anyhow::ensure!(
+                self.capability.native_compact,
+                "current backend does not support context compaction"
+            );
+            anyhow::ensure!(
+                self.session.backend_session_id.is_some(),
+                "current session has no provider conversation to compact"
+            );
         }
         let mut selection_events = self.select_review_task(&plan).await?;
         let compact_event = if self.session.plan_compact {
@@ -6083,15 +7971,24 @@ Planning continuation: turn {} of {}.",
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
         plan.acceptance = None;
-        if plan.state != PlanState::Accepted { PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?; }
+        if plan.state != PlanState::Accepted {
+            PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?;
+        }
 
         let objective = format!("Complete accepted plan: {}", plan.title);
         let now_ms = self.clock.now_ms();
         let goal = GoalRecord {
-            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), objective,
+            id: Uuid::new_v4().to_string(),
+            session_id: self.session.id.clone(),
+            objective,
             state: GoalState::Active,
-            continuation: crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
-            native: false, created_at_ms: now_ms, updated_at_ms: now_ms,
+            continuation: crate::session::continuation::ContinuationBudget::new(
+                self.goal_max_turns,
+                2,
+            ),
+            native: false,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
         };
         self.session.goal_id = Some(goal.id.clone());
         let lifecycle = PlanLifecycleRecord {
@@ -6113,14 +8010,30 @@ Planning continuation: turn {} of {}.",
         let planning_backend_session_id = self.session.backend_session_id.clone();
         if self.session.plan_executor.enabled {
             let executor = &self.session.plan_executor;
-            self.session.model = executor.model.clone().context("plan executor model is not configured")?;
+            self.session.model = executor
+                .model
+                .clone()
+                .context("plan executor model is not configured")?;
             self.session.resolved_model = Some(self.session.model.clone());
-            self.session.effort = executor.effort.clone().context("plan executor thinking is not configured")?;
+            self.session.effort = executor
+                .effort
+                .clone()
+                .context("plan executor thinking is not configured")?;
             self.session.context_window = None;
         }
         self.session.execution_mode = execution_mode;
-        let mut task = self.current_task()?.filter(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
-            .unwrap_or_else(|| crate::task::TaskRecord::new(self.session.id.clone(), plan.title.clone(), crate::task::TaskKind::Execute, execution_mode, now_ms));
+        let mut task = self
+            .current_task()?
+            .filter(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
+            .unwrap_or_else(|| {
+                crate::task::TaskRecord::new(
+                    self.session.id.clone(),
+                    plan.title.clone(),
+                    crate::task::TaskKind::Execute,
+                    execution_mode,
+                    now_ms,
+                )
+            });
         task.kind = crate::task::TaskKind::Execute;
         task.operation_id = self.active_operation_id.clone();
         task.phase = "implement".into();
@@ -6132,24 +8045,50 @@ Planning continuation: turn {} of {}.",
         self.session.current_task_id = Some(task.id.clone());
         let execution_created_at_ms = self.clock.now_ms();
         let mut execution_record = PlanExecutionRecord {
-            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(), goal_id: goal.id.clone(), baseline_checkpoint: None, state: PlanExecutionState::Active,
-            implementation_report: None, phase: crate::plan::PlanPhase::Implement, original_revision: plan.model_revision,
-            revision: plan.model_revision, generation: 0, planning_backend_session_id,
+            id: Uuid::new_v4().to_string(),
+            session_id: self.session.id.clone(),
+            plan_id: plan.id.clone(),
+            goal_id: goal.id.clone(),
+            baseline_checkpoint: None,
+            state: PlanExecutionState::Active,
+            implementation_report: None,
+            phase: crate::plan::PlanPhase::Implement,
+            original_revision: plan.model_revision,
+            revision: plan.model_revision,
+            generation: 0,
+            planning_backend_session_id,
             execution_backend_session_id: self.session.backend_session_id.clone(),
-            lifecycle: Vec::new(), findings: Vec::new(), progress: Default::default(),
-            verification: Vec::new(), check_runs: Vec::new(), revision_history: Vec::new(), approval_comments: overall_comment.iter().cloned().collect(), pending_revision_reason: None,
-            review_paused: false, observed_source: Default::default(), observed_generation: 0,
-            observed_check: Default::default(), created_at_ms: execution_created_at_ms, completed_at_ms: None,
+            lifecycle: Vec::new(),
+            findings: Vec::new(),
+            progress: Default::default(),
+            verification: Vec::new(),
+            check_runs: Vec::new(),
+            revision_history: Vec::new(),
+            approval_comments: overall_comment.iter().cloned().collect(),
+            pending_revision_reason: None,
+            review_paused: false,
+            observed_source: Default::default(),
+            observed_generation: 0,
+            observed_check: Default::default(),
+            created_at_ms: execution_created_at_ms,
+            completed_at_ms: None,
         };
         execution_record.progress = Default::default();
         execution_record.observed_source = execution_record.progress.source_digest.clone();
-        self.store.accept_task(&self.session, &task, &goal, &plan, &execution_record, &lifecycle, &self.client_id)?;
+        self.store.accept_task(
+            &self.session,
+            &task,
+            &goal,
+            &plan,
+            &execution_record,
+            &lifecycle,
+            &self.client_id,
+        )?;
         selection_events.extend(compact_event);
         let mut pre_execution_event = selection_events;
         self.emit_live(
             BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_plan_lifecycle".into(),
@@ -6171,14 +8110,23 @@ Planning continuation: turn {} of {}.",
         )
         .await?;
         let execution_prompt = PlanPrompt::with_manual_changes(
-            PlanPrompt::execution(&execution_record, PlanExecutionPromptKind::Start, &accepted_document.execution_json(execution_record.phase)?),
-            &plan.manual_changes);
+            PlanPrompt::execution(
+                &execution_record,
+                PlanExecutionPromptKind::Start,
+                &accepted_document.execution_json(execution_record.phase)?,
+            ),
+            &plan.manual_changes,
+        );
         let mut admission = ExchangeAdmission::execution(
-            String::new(), plan.id.clone(),
-            execution_record.id.clone(), goal.id.clone());
+            String::new(),
+            plan.id.clone(),
+            execution_record.id.clone(),
+            goal.id.clone(),
+        );
         admission.lifecycle = Some(WorkflowActivity::Implementing.event(LifecycleAction::Started));
         admission.plan_event_id = Some(lifecycle.id.clone());
-        let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
+        let execution = self
+            .run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
         execution_record = self
@@ -6189,11 +8137,14 @@ Planning continuation: turn {} of {}.",
         self.store.save_plan_execution(&execution_record)?;
         let (mut result, mut event) = match execution {
             Ok(result) => result,
-            Err(error) if error.downcast_ref::<TurnCancelled>().is_some()
-                && !self.turn_cancellation.restart.load(Ordering::Acquire) => {
-                (serde_json::to_value(self.snapshot()?)?, vec![
-                    self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?,
-                ])
+            Err(error)
+                if error.downcast_ref::<TurnCancelled>().is_some()
+                    && !self.turn_cancellation.restart.load(Ordering::Acquire) =>
+            {
+                (
+                    serde_json::to_value(self.snapshot()?)?,
+                    vec![self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?],
+                )
             }
             Err(error) => {
                 if error.downcast_ref::<TurnCancelled>().is_some()
@@ -6208,7 +8159,7 @@ Planning continuation: turn {} of {}.",
                 execution_record.state = PlanExecutionState::Paused;
                 self.store.save_plan_execution(&execution_record)?;
                 let backend_event = BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "error".into(),
@@ -6235,7 +8186,10 @@ Planning continuation: turn {} of {}.",
         };
         event.splice(0..0, pre_execution_event);
         if execution_succeeded {
-            event.insert(0, self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?);
+            event.insert(
+                0,
+                self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?,
+            );
         }
         event.insert(
             0,
@@ -6270,7 +8224,9 @@ Planning continuation: turn {} of {}.",
             .and_then(Value::as_str)
             .or(plan.review_digest.as_deref())
             .context("submitted plan digest is missing")?;
-        let reviewed = self.observer.capture_plan_review(&plan.id, expected_digest)?;
+        let reviewed = self
+            .observer
+            .capture_plan_review(&plan.id, expected_digest)?;
         if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,
@@ -6296,29 +8252,58 @@ Planning continuation: turn {} of {}.",
         let document_json = document.model_json()?;
         self.finalize_review_draft(&mut plan, &reviewed)?;
         plan.user_revision += 1;
-        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
-            .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
-            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
-            execution.findings.push(format!("Revise the pending design using this review feedback: {}\n{}", overall_comment.as_deref().unwrap_or_default(), feedback));
+        if let Some(mut execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| {
+                execution.plan_id == plan.id && execution.pending_revision_reason.is_some()
+            })
+        {
+            let mut goal = self
+                .store
+                .load_goal(&execution.goal_id)?
+                .context("execution goal is missing")?;
+            execution.findings.push(format!(
+                "Revise the pending design using this review feedback: {}\n{}",
+                overall_comment.as_deref().unwrap_or_default(),
+                feedback
+            ));
             execution.pending_revision_reason = None;
             plan.state = PlanState::Revising;
             let resume = execution.review_paused;
             execution.review_paused = false;
-            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
+            if resume {
+                execution.state = PlanExecutionState::Active;
+                goal.resume(self.clock.now_ms());
+            }
             execution.generation += 1;
-            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase { title: "Plan revision changes requested".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
-            let mut events = vec![self.event("plan_changes_requested", json!({"plan":plan,"execution":execution}))?];
-            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            execution.append_lifecycle(
+                self.plan_exchange_anchor(&plan.id)?,
+                self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase {
+                    title: "Plan revision changes requested".into(),
+                    phase: execution.phase,
+                    revision: execution.revision,
+                    state: execution.state,
+                },
+            );
+            self.store
+                .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
+            let mut events = vec![self.event(
+                "plan_changes_requested",
+                json!({"plan":plan,"execution":execution}),
+            )?];
+            if resume {
+                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
+            }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
         let mut selection_events = self.select_review_task(&plan).await?;
-        let instruction = PlanPrompt::with_manual_changes(PlanPrompt::revision(
-            &document_json,
-            &feedback,
-            overall_comment.as_deref(),
-        ), &plan.manual_changes);
+        let instruction = PlanPrompt::with_manual_changes(
+            PlanPrompt::revision(&document_json, &feedback, overall_comment.as_deref()),
+            &plan.manual_changes,
+        );
         plan.acceptance = None;
         PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
         plan.generation.reset();
@@ -6348,7 +8333,8 @@ Planning continuation: turn {} of {}.",
         let review_prompt = overall_comment.clone().unwrap_or_default();
         let mut admission = ExchangeAdmission::plan(review_prompt, Some(plan.id.clone()), true);
         admission.plan_event_id = Some(lifecycle.id.clone());
-        match self.run_planning_interaction(instruction, Some(admission))
+        match self
+            .run_planning_interaction(instruction, Some(admission))
             .await
         {
             Ok((mut result, mut event)) => {
@@ -6368,29 +8354,67 @@ Planning continuation: turn {} of {}.",
             .store
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
-            .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
-            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
-            let accepted = self.plan_file.restore_revision(&self.session.id, &plan.id, execution.revision)?;
+        anyhow::ensure!(
+            plan.session_id == self.session.id,
+            "plan belongs to another session"
+        );
+        if let Some(mut execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| {
+                execution.plan_id == plan.id && execution.pending_revision_reason.is_some()
+            })
+        {
+            let mut goal = self
+                .store
+                .load_goal(&execution.goal_id)?
+                .context("execution goal is missing")?;
+            let accepted =
+                self.plan_file
+                    .restore_revision(&self.session.id, &plan.id, execution.revision)?;
             plan.state = PlanState::Accepted;
             plan.document_version = accepted.version;
             plan.title = accepted.title;
             plan.review_digest = plan.accepted_digest.clone();
-            execution.revision_history.push(crate::plan::execution::ExecutionRevision {
-                revision: plan.model_revision, reason: execution.pending_revision_reason.take().unwrap(),
-                approval: "rejected".into(), recorded_at_ms: self.clock.now_ms(),
-            });
-            execution.findings.push("The user rejected the proposed revision. Match the current accepted design.".into());
+            execution
+                .revision_history
+                .push(crate::plan::execution::ExecutionRevision {
+                    revision: plan.model_revision,
+                    reason: execution.pending_revision_reason.take().unwrap(),
+                    approval: "rejected".into(),
+                    recorded_at_ms: self.clock.now_ms(),
+                });
+            execution.findings.push(
+                "The user rejected the proposed revision. Match the current accepted design."
+                    .into(),
+            );
             let resume = execution.review_paused;
             execution.review_paused = false;
-            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
+            if resume {
+                execution.state = PlanExecutionState::Active;
+                goal.resume(self.clock.now_ms());
+            }
             execution.generation += 1;
-            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
-                PlanExecutionLifecycleEvent::Phase { title: "Plan revision rejected".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
-            let mut events = vec![self.event("plan_revision_rejected", json!({"plan":plan,"execution":execution}))?];
-            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            execution.append_lifecycle(
+                self.plan_exchange_anchor(&plan.id)?,
+                self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase {
+                    title: "Plan revision rejected".into(),
+                    phase: execution.phase,
+                    revision: execution.revision,
+                    state: execution.state,
+                },
+            );
+            self.store
+                .save_execution_transition(&execution, &goal, Some(&plan), None, None)?;
+            let mut events = vec![self.event(
+                "plan_revision_rejected",
+                json!({"plan":plan,"execution":execution}),
+            )?];
+            if resume {
+                events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?);
+            }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
         PlanStateMachine::apply(&mut plan, PlanEvent::Cancelled, self.clock.now_ms())?;
@@ -6421,8 +8445,12 @@ Planning continuation: turn {} of {}.",
             }
         }
 
-        if let Some(mut task) = self.store.list_task(&self.session.id)?.into_iter()
-            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str())) {
+        if let Some(mut task) = self
+            .store
+            .list_task(&self.session.id)?
+            .into_iter()
+            .find(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
+        {
             task.status = crate::task::TaskStatus::Cancelled;
             task.reason = Some("Plan cancelled by user".into());
             task.generation += 1;
@@ -6444,7 +8472,8 @@ Planning continuation: turn {} of {}.",
     }
 
     async fn retry_plan(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
-        let plan_id = self.current_plan_id()?
+        let plan_id = self
+            .current_plan_id()?
             .context("no failed plan can be retried")?;
         let mut plan = self
             .store
@@ -6452,9 +8481,11 @@ Planning continuation: turn {} of {}.",
             .context("failed plan record is missing")?;
         if plan.state == PlanState::ConfiguringChecks {
             let task = self.current_task()?.context("pending plan has no task")?;
-            return self.transition_task(json!({
-                "action": "resume", "task_id": task.id,
-            })).await;
+            return self
+                .transition_task(json!({
+                    "action": "resume", "task_id": task.id,
+                }))
+                .await;
         }
         anyhow::ensure!(
             plan.state == PlanState::Failed,
@@ -6489,21 +8520,76 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     fn read_plan_declaration(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let plan_id = required_text(&params, "plan_id")?;
         let path = required_text(&params, "path")?;
-        let revision: u32 = serde_json::from_value(params.get("revision").context("missing revision")?.clone())?;
-        let baseline = params.get("baseline").and_then(Value::as_bool).unwrap_or(false);
-        let plan = self.store.load_plan(&plan_id)?.context("plan artifact not found")?;
-        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
-        let document = self.plan_file.read_submitted_document(&self.session.id, &plan_id, revision)?;
-        let design = document.design.context("plan has no declaration snapshot")?;
-        let text = if params.get("document").and_then(Value::as_bool).unwrap_or(false) {
-            design.document.sections().into_iter().find(|section| section.title == path)
-                .context("unknown plan overview section")?.text
+        let revision: u32 =
+            serde_json::from_value(params.get("revision").context("missing revision")?.clone())?;
+        let baseline = params
+            .get("baseline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let plan = self
+            .store
+            .load_plan(&plan_id)?
+            .context("plan artifact not found")?;
+        anyhow::ensure!(
+            plan.session_id == self.session.id,
+            "plan belongs to another session"
+        );
+        let document =
+            self.plan_file
+                .read_submitted_document(&self.session.id, &plan_id, revision)?;
+        let design = document
+            .design
+            .context("plan has no declaration snapshot")?;
+        let text = if params
+            .get("document")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            design
+                .document
+                .sections()
+                .into_iter()
+                .find(|section| section.title == path)
+                .context("unknown plan overview section")?
+                .text
         } else if baseline {
-            crate::plan::calls::present(&path, &design.baseline.get(&path).context("declaration baseline not found")?.text, design.baseline_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text.clone()
+            crate::plan::calls::present(
+                &path,
+                &design
+                    .baseline
+                    .get(&path)
+                    .context("declaration baseline not found")?
+                    .text,
+                design
+                    .baseline_calls
+                    .get(&path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?
+            .declaration
+            .text
+            .clone()
         } else {
-            crate::plan::calls::present(&path, design.proposed.get(&path).context("proposed declaration not found")?, design.proposed_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text.clone()
+            crate::plan::calls::present(
+                &path,
+                design
+                    .proposed
+                    .get(&path)
+                    .context("proposed declaration not found")?,
+                design
+                    .proposed_calls
+                    .get(&path)
+                    .map(Vec::as_slice)
+                    .unwrap_or_default(),
+            )?
+            .declaration
+            .text
+            .clone()
         };
-        Ok((json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }), Vec::new()))
+        Ok((
+            json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }),
+            Vec::new(),
+        ))
     }
 
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6512,18 +8598,37 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.select_execution_mode(json!({"mode":self.session.default_write_permission}))?;
         let now_ms = self.clock.now_ms();
         let goal = GoalRecord {
-            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), objective: objective.clone(),
+            id: Uuid::new_v4().to_string(),
+            session_id: self.session.id.clone(),
+            objective: objective.clone(),
             state: GoalState::Active,
-            continuation: crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
-            native: self.capability.native_goal, created_at_ms: now_ms, updated_at_ms: now_ms,
+            continuation: crate::session::continuation::ContinuationBudget::new(
+                self.goal_max_turns,
+                2,
+            ),
+            native: self.capability.native_goal,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
         };
-        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), objective.clone(), crate::task::TaskKind::Goal, self.session.execution_mode, now_ms);
+        let mut task = crate::task::TaskRecord::new(
+            self.session.id.clone(),
+            objective.clone(),
+            crate::task::TaskKind::Goal,
+            self.session.execution_mode,
+            now_ms,
+        );
         task.operation_id = self.active_operation_id.clone();
         task.goal_id = Some(goal.id.clone());
         task.begin(now_ms)?;
         self.session.goal_id = Some(goal.id.clone());
         self.session.current_task_id = Some(task.id.clone());
-        self.store.select_task(&self.session, Some(&task), Some(&goal), None, &self.client_id)?;
+        self.store.select_task(
+            &self.session,
+            Some(&task),
+            Some(&goal),
+            None,
+            &self.client_id,
+        )?;
         let prompt = if goal.native {
             format!("/goal {objective}")
         } else {
@@ -6569,13 +8674,20 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     async fn pause_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
-        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
+        if let Some(mut execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| execution.goal_id == goal.id)
+        {
             execution.review_paused = false;
             self.store.save_plan_execution(&execution)?;
         }
         if goal.state == GoalState::Paused {
-            return Ok((serde_json::to_value(&goal)?,
-                vec![self.event("goal_changed", serde_json::to_value(goal)?)?]));
+            return Ok((
+                serde_json::to_value(&goal)?,
+                vec![self.event("goal_changed", serde_json::to_value(goal)?)?],
+            ));
         }
         anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
         self.sync_native_goal(&goal, "paused").await?;
@@ -6589,16 +8701,32 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         ))
     }
 
-    async fn resume_goal(&mut self, message: Option<String>, lifecycle: Option<String>, continuation: Option<String>) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn resume_goal(
+        &mut self,
+        message: Option<String>,
+        lifecycle: Option<String>,
+        continuation: Option<String>,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
-        if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
-            anyhow::ensure!(execution.pending_revision_reason.is_none(), "review the pending plan revision before resuming execution");
+        if let Some(execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
+            .find(|execution| execution.goal_id == goal.id)
+        {
+            anyhow::ensure!(
+                execution.pending_revision_reason.is_none(),
+                "review the pending plan revision before resuming execution"
+            );
         }
         anyhow::ensure!(
             matches!(
                 goal.state,
-                GoalState::Paused | GoalState::Stalled | GoalState::Blocked
-                    | GoalState::UsageLimited | GoalState::BudgetLimited
+                GoalState::Paused
+                    | GoalState::Stalled
+                    | GoalState::Blocked
+                    | GoalState::UsageLimited
+                    | GoalState::BudgetLimited
             ),
             "goal cannot resume from its current state"
         );
@@ -6607,14 +8735,24 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .await
             .context("finish previous exchange before resuming goal")?;
         if self.turn_cancellation.requested.load(Ordering::Acquire)
-            || !matches!(*self.turn_cancellation.cleanup.borrow(), ExecutionCleanup::Idle)
+            || !matches!(
+                *self.turn_cancellation.cleanup.borrow(),
+                ExecutionCleanup::Idle
+            )
         {
             return Err(anyhow::Error::new(TurnCancelled));
         }
         goal.resume(self.clock.now_ms());
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal).await?;
-        if self.store.list_plan_execution(&self.session.id)?.iter().any(|record| record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking) {
+        if self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .iter()
+            .any(|record| {
+                record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking
+            })
+        {
             finalization_event.extend(self.run_checks().await?);
             goal = self.active_goal()?;
             if goal.state != GoalState::Active {
@@ -6628,17 +8766,16 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         } else {
             PromptMode::GoalContinuation
         };
-        let mut prompt = plan_prompt
-            .unwrap_or_else(|| {
-                if goal.native {
-                    "/goal resume".to_owned()
-                } else {
-                    format!(
-                        "/goal resume\nContinue working toward this goal: {}",
-                        goal.objective
-                    )
-                }
-            });
+        let mut prompt = plan_prompt.unwrap_or_else(|| {
+            if goal.native {
+                "/goal resume".to_owned()
+            } else {
+                format!(
+                    "/goal resume\nContinue working toward this goal: {}",
+                    goal.objective
+                )
+            }
+        });
         if let Some(text) = message.as_deref() {
             prompt.push_str("\n\nAdditional user instructions:\n");
             prompt.push_str(text);
@@ -6666,14 +8803,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             })
             .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
         if control_resume {
-            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| resumed_phase
-                .map(|phase| WorkflowActivity::from(phase).event(LifecycleAction::Resumed))
-                .unwrap_or_else(|| WorkflowActivity::Goal.event(LifecycleAction::Resumed))));
+            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| {
+                resumed_phase
+                    .map(|phase| WorkflowActivity::from(phase).event(LifecycleAction::Resumed))
+                    .unwrap_or_else(|| WorkflowActivity::Goal.event(LifecycleAction::Resumed))
+            }));
         }
-        match self
-            .run_interaction(prompt, mode, Some(admission))
-            .await
-        {
+        match self.run_interaction(prompt, mode, Some(admission)).await {
             Ok((result, mut event)) => {
                 event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
                 finalization_event.extend(event);
@@ -6704,16 +8840,29 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let mut event = Vec::new();
         for mut exchange in self.store.list_exchange(&self.session.id)? {
             if exchange.goal_id.as_deref() != Some(goal.id.as_str())
-                || !matches!(exchange.state, ExchangeState::Running | ExchangeState::Finalizing)
+                || !matches!(
+                    exchange.state,
+                    ExchangeState::Running | ExchangeState::Finalizing
+                )
             {
                 continue;
             }
-            let outcome = exchange.finalization_outcome.unwrap_or(ExchangeState::Cancelled);
-            self.capture_final_checkpoint(&mut exchange, outcome).await?;
-            if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == exchange.id) {
+            let outcome = exchange
+                .finalization_outcome
+                .unwrap_or(ExchangeState::Cancelled);
+            self.capture_final_checkpoint(&mut exchange, outcome)
+                .await?;
+            if self
+                .exchange_runtime
+                .as_ref()
+                .is_some_and(|runtime| runtime.exchange_id == exchange.id)
+            {
                 self.exchange_runtime = None;
             }
-            event.push(self.event("exchange_complete", json!({"id":exchange.id,"state":exchange.state}))?);
+            event.push(self.event(
+                "exchange_complete",
+                json!({"id":exchange.id,"state":exchange.state}),
+            )?);
         }
         self.sync_plan_execution(&goal).await?;
         self.session.goal_id = None;
@@ -6726,9 +8875,18 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let goal = self.active_goal()?;
         anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
         let mut check_events = Vec::new();
-        if self.store.list_plan_execution(&self.session.id)?.iter().any(|record| record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking) {
+        if self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .iter()
+            .any(|record| {
+                record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking
+            })
+        {
             check_events = self.run_checks().await?;
-            if self.active_goal()?.state != GoalState::Active { return Ok((json!({"checks_finished":true}),check_events)); }
+            if self.active_goal()?.state != GoalState::Active {
+                return Ok((json!({"checks_finished":true}), check_events));
+            }
         }
         let goal = self.active_goal()?;
         let plan_prompt = self.plan_goal_prompt(&goal, PlanExecutionPromptKind::Continue)?;
@@ -6737,23 +8895,36 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         } else {
             PromptMode::GoalContinuation
         };
-        let prompt = plan_prompt
-            .unwrap_or_else(|| {
-                if goal.native {
-                    "/goal resume".to_owned()
-                } else {
-                    format!("Continue working toward this goal: {}", goal.objective)
-                }
-            });
-        let admission = if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
+        let prompt = plan_prompt.unwrap_or_else(|| {
+            if goal.native {
+                "/goal resume".to_owned()
+            } else {
+                format!("Continue working toward this goal: {}", goal.objective)
+            }
+        });
+        let admission = if let Some(execution) = self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .into_iter()
             .find(|execution| execution.goal_id == goal.id)
         {
-            let previous_phase = self.store.list_exchange(&self.session.id)?.last()
+            let previous_phase = self
+                .store
+                .list_exchange(&self.session.id)?
+                .last()
                 .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
             let activity = WorkflowActivity::from(execution.phase);
-            let action = if previous_phase == Some(execution.phase) { LifecycleAction::Continued } else { LifecycleAction::Started };
+            let action = if previous_phase == Some(execution.phase) {
+                LifecycleAction::Continued
+            } else {
+                LifecycleAction::Started
+            };
             let mut admission = ExchangeAdmission::execution(
-                String::new(), execution.plan_id, execution.id, goal.id.clone());
+                String::new(),
+                execution.plan_id,
+                execution.id,
+                goal.id.clone(),
+            );
             admission.lifecycle = Some(activity.event(action));
             admission
         } else {
@@ -6764,11 +8935,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if let Some(mut previous) = self.store.list_exchange(&self.session.id)?.pop()
             && previous.state == ExchangeState::Running
         {
-            self.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await?;
+            self.capture_final_checkpoint(&mut previous, ExchangeState::Complete)
+                .await?;
         }
         let (result, mut events) = self.run_interaction(prompt, mode, Some(admission)).await?;
         check_events.append(&mut events);
-        Ok((result,check_events))
+        Ok((result, check_events))
     }
 
     async fn apply_goal_evidence(
@@ -6783,7 +8955,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .store
             .load_goal(&goal_id)?
             .context("active goal record is missing")?;
-        if self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.goal_id == goal.id) {
+        if self
+            .store
+            .list_plan_execution(&self.session.id)?
+            .iter()
+            .any(|execution| execution.goal_id == goal.id)
+        {
             evidence.structured_complete = false;
         }
         let continuing = match goal.observe(evidence, self.clock.now_ms()) {
@@ -6893,8 +9070,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
-            "child execution must settle before workspace rollback");
+        anyhow::ensure!(
+            self.agent_coordinator.active_count() == 0,
+            "child execution must settle before workspace rollback"
+        );
         let exchange_id = required_text(&params, "exchange_id")?;
         let exchange_id = self
             .store
@@ -6984,13 +9163,19 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn apply_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        match params.get("scope").and_then(Value::as_str).unwrap_or("workspace") {
+        match params
+            .get("scope")
+            .and_then(Value::as_str)
+            .unwrap_or("workspace")
+        {
             "conversation" => return self.rollback_conversation(params).await,
-            "workspace" => {},
+            "workspace" => {}
             _ => anyhow::bail!("unknown rollback scope"),
         }
-        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
-            "child execution must settle before workspace rollback");
+        anyhow::ensure!(
+            self.agent_coordinator.active_count() == 0,
+            "child execution must settle before workspace rollback"
+        );
         let preview_id = required_text(&params, "preview_id")?;
         let objects = self.store.objects.clone();
         let session_id = self.session.id.clone();
@@ -7042,36 +9227,61 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         &mut self,
         mut journal: crate::checkpoint::RestoreJournal,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        let events = self.finish_conversation_rollback(&journal.preview.exchange_ids).await?;
+        let events = self
+            .finish_conversation_rollback(&journal.preview.exchange_ids)
+            .await?;
         journal.state = crate::checkpoint::RestoreState::Complete;
         journal.save(&self.store.objects)?;
         Ok((json!({"restored":true}), events))
     }
 
     async fn rollback_conversation(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
-            "child execution must settle before conversation rollback");
+        anyhow::ensure!(
+            self.agent_coordinator.active_count() == 0,
+            "child execution must settle before conversation rollback"
+        );
         self.require_restore_recovered()?;
         let requested = required_text(&params, "exchange_id")?;
         let target = self.store.checkpoint_owner(&self.session.id, &requested)?;
         let expected_latest = required_text(&params, "latest_exchange_id")?;
         let exchanges = self.store.list_exchange(&self.session.id)?;
-        anyhow::ensure!(exchanges.last().is_some_and(|exchange| exchange.id == expected_latest),
-            "conversation changed; select the rollback interaction again");
-        let position = exchanges.iter().position(|exchange| exchange.id == target)
+        anyhow::ensure!(
+            exchanges
+                .last()
+                .is_some_and(|exchange| exchange.id == expected_latest),
+            "conversation changed; select the rollback interaction again"
+        );
+        let position = exchanges
+            .iter()
+            .position(|exchange| exchange.id == target)
             .context("rollback interaction disappeared")?;
-        anyhow::ensure!(exchanges[position].disposition == crate::exchange::HistoryDisposition::Current,
-            "selected interaction has already been rolled back");
-        anyhow::ensure!(exchanges.iter().all(|exchange| exchange.completed_at_ms.is_some()),
-            "cancel or finish active work before conversation rollback");
-        let ids = exchanges[position..].iter().map(|exchange| exchange.id.clone()).collect::<Vec<_>>();
-        self.store.require_settled_exchange_tree(&self.session.id, &ids)?;
+        anyhow::ensure!(
+            exchanges[position].disposition == crate::exchange::HistoryDisposition::Current,
+            "selected interaction has already been rolled back"
+        );
+        anyhow::ensure!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.completed_at_ms.is_some()),
+            "cancel or finish active work before conversation rollback"
+        );
+        let ids = exchanges[position..]
+            .iter()
+            .map(|exchange| exchange.id.clone())
+            .collect::<Vec<_>>();
+        self.store
+            .require_settled_exchange_tree(&self.session.id, &ids)?;
         let events = self.finish_conversation_rollback(&ids).await?;
         Ok((json!({"restored":true,"scope":"conversation"}), events))
     }
 
-    async fn finish_conversation_rollback(&mut self, exchange_ids: &[String]) -> Result<Vec<SessionEvent>> {
-        let Some(first) = exchange_ids.first() else { return Ok(Vec::new()); };
+    async fn finish_conversation_rollback(
+        &mut self,
+        exchange_ids: &[String],
+    ) -> Result<Vec<SessionEvent>> {
+        let Some(first) = exchange_ids.first() else {
+            return Ok(Vec::new());
+        };
         let mut session = self.session.clone();
         if session.goal_id.is_some() {
             let mut goal = self.active_goal()?;
@@ -7081,8 +9291,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.store.save_goal(&goal)?;
             session.goal_id = None;
         }
-        let replacement = crate::backend::build(self.backend_launch.clone(),
-            self.permission_coordinator.clone(), self.trace.clone(), self.data_root.clone())?;
+        let replacement = crate::backend::build(
+            self.backend_launch.clone(),
+            self.permission_coordinator.clone(),
+            self.trace.clone(),
+            self.data_root.clone(),
+        )?;
         self.backend.shutdown().await?;
         self.backend = Arc::from(replacement);
         session.backend_session_id = None;
@@ -7095,24 +9309,54 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.store.record_rollback(&session, exchange_ids)?;
         self.session = session;
         self.context_usage_fresh = false;
-        let exchange = self.store.list_exchange(&self.session.id)?.into_iter()
-            .find(|exchange| &exchange.id == first).context("rolled-back interaction disappeared")?;
-        Ok(vec![self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?])
+        let exchange = self
+            .store
+            .list_exchange(&self.session.id)?
+            .into_iter()
+            .find(|exchange| &exchange.id == first)
+            .context("rolled-back interaction disappeared")?;
+        Ok(vec![self.event(
+            "interaction_rolled_back",
+            serde_json::to_value(exchange)?,
+        )?])
     }
 
-    fn rollback_context(&self, current_exchange: &str, input: BackendInput) -> Result<BackendInput> {
+    fn rollback_context(
+        &self,
+        current_exchange: &str,
+        input: BackendInput,
+    ) -> Result<BackendInput> {
         let exchanges = self.store.list_exchange(&self.session.id)?;
-        if !exchanges.iter().any(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current) {
+        if !exchanges
+            .iter()
+            .any(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+        {
             return Ok(input);
         }
-        let retained = exchanges.iter().filter(|exchange| exchange.id != current_exchange
-            && exchange.disposition == crate::exchange::HistoryDisposition::Current).collect::<Vec<_>>();
+        let retained = exchanges
+            .iter()
+            .filter(|exchange| {
+                exchange.id != current_exchange
+                    && exchange.disposition == crate::exchange::HistoryDisposition::Current
+            })
+            .collect::<Vec<_>>();
         let history = serde_json::to_string(&retained)?;
-        let context = format!("The conversation was rolled back. Use only this retained conversation history as prior context. The current workspace files are authoritative.\n{history}\n\nCurrent request:\n");
+        let context = format!(
+            "The conversation was rolled back. Use only this retained conversation history as prior context. The current workspace files are authoritative.\n{history}\n\nCurrent request:\n"
+        );
         Ok(match input {
-            BackendInput::Text { text, attachments } => BackendInput::Text { text:format!("{context}{text}"), attachments },
-            BackendInput::Skill { name, arguments, attachments } => BackendInput::Skill {
-                name, arguments:format!("{context}{arguments}"), attachments,
+            BackendInput::Text { text, attachments } => BackendInput::Text {
+                text: format!("{context}{text}"),
+                attachments,
+            },
+            BackendInput::Skill {
+                name,
+                arguments,
+                attachments,
+            } => BackendInput::Skill {
+                name,
+                arguments: format!("{context}{arguments}"),
+                attachments,
             },
         })
     }
@@ -7282,7 +9526,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .load_session(&session_id)?
             .context("session not found")?;
         if let Some(expected) = params.get("expected_name").and_then(Value::as_str) {
-            anyhow::ensure!(session.name == expected, "Session name changed during generation");
+            anyhow::ensure!(
+                session.name == expected,
+                "Session name changed during generation"
+            );
         }
         session.name = name;
         let created_at_ms = self.clock.now_ms();
@@ -7304,64 +9551,116 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn configuration_progress(&mut self, state: &str) -> Result<()> {
-        let Some(operation_id) = self.active_operation_id.clone() else { return Ok(()); };
-        self.emit_backend_event(BackendEvent {
-            received_at_ms: None, address: None, turn_boundary: None,
-            kind: "configuration_progress".into(), text: None,
-            data: json!({"operation_id": operation_id, "state": state}),
-            activity: None, summary: None, task_update: None,
-        }, &mut Vec::new()).await
+        let Some(operation_id) = self.active_operation_id.clone() else {
+            return Ok(());
+        };
+        self.emit_backend_event(
+            BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "configuration_progress".into(),
+                text: None,
+                data: json!({"operation_id": operation_id, "state": state}),
+                activity: None,
+                summary: None,
+                task_update: None,
+            },
+            &mut Vec::new(),
+        )
+        .await
     }
 
     async fn configure_session(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let mut resource_selection = None;
         if params.get("settings_revision").is_some() {
             let (root, _, _) = self.lease_identity();
-            let settings = crate::settings::SettingsStore::open(&root)?
-                .get(&self.session.workspace, &self.session.id, &self.session.backend)?;
-            anyhow::ensure!(params["settings_revision"].as_u64() == Some(settings.revision), "settings revision was superseded");
-            params["access"] = serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
+            let settings = crate::settings::SettingsStore::open(&root)?.get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.backend,
+            )?;
+            anyhow::ensure!(
+                params["settings_revision"].as_u64() == Some(settings.revision),
+                "settings revision was superseded"
+            );
+            params["access"] =
+                serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
             params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
-            params["default_write_permission"] = serde_json::to_value(settings.desired.default_write_permission.unwrap_or(PermissionMode::Write))?;
+            params["default_write_permission"] = serde_json::to_value(
+                settings
+                    .desired
+                    .default_write_permission
+                    .unwrap_or(PermissionMode::Write),
+            )?;
             params["plan_permission"] = serde_json::to_value(settings.desired.plan_permission)?;
-            params["plan_compact"] = json!(settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact);
-            params["plan_auto_approve_revisions"] = json!(settings.desired.plan_auto_approve_revisions.unwrap_or(true));
-            params["approval_timeout"] = serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
-            params["answer_timeout"] = serde_json::to_value(settings.desired.answer_timeout.unwrap_or_default())?;
+            params["plan_compact"] = json!(
+                settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact
+            );
+            params["plan_auto_approve_revisions"] =
+                json!(settings.desired.plan_auto_approve_revisions.unwrap_or(true));
+            params["approval_timeout"] =
+                serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
+            params["answer_timeout"] =
+                serde_json::to_value(settings.desired.answer_timeout.unwrap_or_default())?;
             let desired = serde_json::to_value(&settings.desired)?;
             for (key, value) in desired.as_object().context("settings must be an object")? {
-                if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" { params[key] = value.clone(); }
+                if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" {
+                    params[key] = value.clone();
+                }
             }
             resource_selection = Some(settings.desired);
         }
         let mut configured = self.session.clone();
-        let check_timing = params.get("check_timing")
-            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone())).transpose()?;
+        let check_timing = params
+            .get("check_timing")
+            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone()))
+            .transpose()?;
         if let Some(value) = params.get("auto_compaction") {
             let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
             policy.validate(configured.context_usage.as_ref())?;
-            anyhow::ensure!(!policy.enabled || self.capability.native_compact, "This backend does not support automatic compaction");
+            anyhow::ensure!(
+                !policy.enabled || self.capability.native_compact,
+                "This backend does not support automatic compaction"
+            );
             configured.auto_compaction = policy;
         }
-        (configured.approval_timeout, configured.answer_timeout) = self.permission_coordinator.input_timeouts(&self.session.id)?;
-        let access = params.get("access")
+        (configured.approval_timeout, configured.answer_timeout) = self
+            .permission_coordinator
+            .input_timeouts(&self.session.id)?;
+        let access = params
+            .get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
-            .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
+            .transpose()?
+            .map(crate::session::AccessPolicy::validate)
+            .transpose()?;
         if let Some(value) = params.get("shell") {
             configured.shell = serde_json::from_value(value.clone())?;
             configured.shell.executable()?;
         }
         if let Some(value) = params.get("default_write_permission") {
             let permission: PermissionMode = serde_json::from_value(value.clone())?;
-            anyhow::ensure!(permission.is_write_default(), "default write permission must be Write or YOLO");
+            anyhow::ensure!(
+                permission.is_write_default(),
+                "default write permission must be Write or YOLO"
+            );
             configured.default_write_permission = permission;
         }
         if let Some(value) = params.get("plan_permission") {
             configured.plan_permission = serde_json::from_value(value.clone())?;
         }
-        if let Some(value) = params.get("approval_timeout") { configured.approval_timeout = serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?; }
-        if let Some(value) = params.get("answer_timeout") { configured.answer_timeout = serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?; }
-        let requested_service_tier = params.get("service_tier")
+        if let Some(value) = params.get("approval_timeout") {
+            configured.approval_timeout =
+                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
+                    .validate()?;
+        }
+        if let Some(value) = params.get("answer_timeout") {
+            configured.answer_timeout =
+                serde_json::from_value::<crate::session::InputTimeout>(value.clone())?
+                    .validate()?;
+        }
+        let requested_service_tier = params
+            .get("service_tier")
             .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
             .transpose()?;
         if let Some(tier) = requested_service_tier {
@@ -7370,7 +9669,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 crate::backend::ServiceTier::Fast => self.capability.fast_mode,
                 crate::backend::ServiceTier::Ultrafast => self.capability.ultrafast_mode,
             };
-            anyhow::ensure!(supported, "current backend does not support the requested service tier");
+            anyhow::ensure!(
+                supported,
+                "current backend does not support the requested service tier"
+            );
         }
         let requested_model = params.get("model").and_then(Value::as_str);
         let requested_effort = params.get("effort").and_then(Value::as_str);
@@ -7380,19 +9682,35 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let mut plan_compact = self.session.plan_compact;
         if let Some(enabled) = params.get("plan_compact").and_then(Value::as_bool) {
             if enabled {
-                anyhow::ensure!(self.capability.native_compact, "current backend does not support context compaction");
+                anyhow::ensure!(
+                    self.capability.native_compact,
+                    "current backend does not support context compaction"
+                );
             }
             plan_compact = enabled;
         }
         if let Some(enabled) = params.get("plan_executor_enabled").and_then(Value::as_bool) {
             if enabled {
-                anyhow::ensure!(self.capability.model_selection, "current backend does not support model selection");
+                anyhow::ensure!(
+                    self.capability.model_selection,
+                    "current backend does not support model selection"
+                );
                 if plan_executor.model.is_none() {
-                    let active_model = self.session.resolved_model.clone().unwrap_or_else(|| self.session.model.clone());
+                    let active_model = self
+                        .session
+                        .resolved_model
+                        .clone()
+                        .unwrap_or_else(|| self.session.model.clone());
                     let selected_model = if active_model == "default" {
-                        self.backend.model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
-                            .await?.into_iter().find(|candidate| candidate.is_default)
-                            .context("the backend has no default model")?.id
+                        self.backend
+                            .model_list(
+                                self.backend_request(BackendInput::from_text(""), PromptMode::Chat),
+                            )
+                            .await?
+                            .into_iter()
+                            .find(|candidate| candidate.is_default)
+                            .context("the backend has no default model")?
+                            .id
                     } else {
                         active_model
                     };
@@ -7403,15 +9721,23 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             plan_executor.enabled = enabled;
         }
         if let Some(model) = params.get("plan_executor_model").and_then(Value::as_str) {
-            anyhow::ensure!(!model.trim().is_empty(), "plan executor model cannot be empty");
+            anyhow::ensure!(
+                !model.trim().is_empty(),
+                "plan executor model cannot be empty"
+            );
             plan_executor.model = Some(model.to_owned());
         }
         if let Some(effort) = params.get("plan_executor_effort").and_then(Value::as_str) {
-            anyhow::ensure!(!effort.trim().is_empty(), "plan executor thinking cannot be empty");
+            anyhow::ensure!(
+                !effort.trim().is_empty(),
+                "plan executor thinking cannot be empty"
+            );
             plan_executor.effort = Some(effort.to_owned());
         }
-        if params.get("plan_executor_model").is_some() || params.get("plan_executor_effort").is_some()
-            || params.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true) {
+        if params.get("plan_executor_model").is_some()
+            || params.get("plan_executor_effort").is_some()
+            || params.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true)
+        {
             self.validate_plan_executor(&plan_executor).await?;
         }
         if validate_selection
@@ -7488,28 +9814,55 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         configured.plan_executor = plan_executor;
         configured.plan_compact = plan_compact;
-        if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
+        if let Some(enabled) = params
+            .get("plan_auto_approve_revisions")
+            .and_then(Value::as_bool)
+        {
+            configured.plan_auto_approve_revisions = enabled;
+        }
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
-        let status_thoughts = params.get("status_thoughts")
-            .map(|value| serde_json::from_value::<bool>(value.clone())).transpose()?;
-        let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled())
-            || lsp_tools.is_some_and(|enabled|enabled != self.lsp.enabled(&self.session.id));
-        if let Some(access) = access { configured.access = access; }
-        configured.access = crate::backend::BackendKind::parse(&configured.backend)?.resolve_access(configured.access);
+        let status_thoughts = params
+            .get("status_thoughts")
+            .map(|value| serde_json::from_value::<bool>(value.clone()))
+            .transpose()?;
+        let delegation_registry_changed = subagent_tools
+            .is_some_and(|enabled| enabled != self.agent_coordinator.enabled())
+            || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id));
+        if let Some(access) = access {
+            configured.access = access;
+        }
+        configured.access = crate::backend::BackendKind::parse(&configured.backend)?
+            .resolve_access(configured.access);
         if let Some(selection) = resource_selection {
-            self.backend.reconcile_settings(BackendCatalogRequest {
-                execution_owner: None,
-                harness_session_id:configured.id.clone(),workspace:configured.workspace.clone(),
-                access:configured.access.clone(),execution_mode:configured.execution_mode,
-                backend_session_id:configured.backend_session_id.clone(),
-            }, &selection).await?;
+            self.backend
+                .reconcile_settings(
+                    BackendCatalogRequest {
+                        execution_owner: None,
+                        harness_session_id: configured.id.clone(),
+                        workspace: configured.workspace.clone(),
+                        access: configured.access.clone(),
+                        execution_mode: configured.execution_mode,
+                        backend_session_id: configured.backend_session_id.clone(),
+                    },
+                    &selection,
+                )
+                .await?;
         }
         let previous = std::mem::replace(&mut self.session, configured);
-        self.permission_coordinator.configure_input_timeouts(&self.session.id, self.session.approval_timeout, self.session.answer_timeout)?;
+        self.permission_coordinator.configure_input_timeouts(
+            &self.session.id,
+            self.session.approval_timeout,
+            self.session.answer_timeout,
+        )?;
         if let Err(error) = self.save_session() {
-            self.permission_coordinator.configure_input_timeouts(&previous.id, previous.approval_timeout, previous.answer_timeout)?;
-            self.session = previous; return Err(error);
+            self.permission_coordinator.configure_input_timeouts(
+                &previous.id,
+                previous.approval_timeout,
+                previous.answer_timeout,
+            )?;
+            self.session = previous;
+            return Err(error);
         }
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
@@ -7517,35 +9870,102 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.save_preference(update_model_preference)?;
         if params.get("settings_revision").is_none() {
             let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
-            let snapshot = settings.get(&self.session.workspace,&self.session.id,&self.session.backend)?;
-            let scope = if params.get("auto_compaction").is_some() { crate::settings::SettingScope::Session } else { crate::settings::SettingScope::Global };
-            let mut portable = settings.layer_settings(scope,&self.session.workspace,&self.session.id)?;
+            let snapshot = settings.get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.backend,
+            )?;
+            let scope = if params.get("auto_compaction").is_some() {
+                crate::settings::SettingScope::Session
+            } else {
+                crate::settings::SettingScope::Global
+            };
+            let mut portable =
+                settings.layer_settings(scope, &self.session.workspace, &self.session.id)?;
             let mut changed = false;
-            if params.get("access").is_some() { portable.access = Some(self.session.access.clone()); changed = true; }
-            if params.get("shell").is_some() { portable.shell = Some(self.session.shell); changed = true; }
+            if params.get("access").is_some() {
+                portable.access = Some(self.session.access.clone());
+                changed = true;
+            }
+            if params.get("shell").is_some() {
+                portable.shell = Some(self.session.shell);
+                changed = true;
+            }
             if let Some(value) = check_timing {
                 portable.check_timing = Some(value);
                 changed = true;
             }
-            if params.get("default_write_permission").is_some() { portable.default_write_permission = Some(self.session.default_write_permission); changed = true; }
-            if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
-            if params.get("auto_compaction").is_some() { portable.auto_compaction = Some(self.session.auto_compaction.clone()); changed = true; }
-            if params.get("plan_compact").is_some() { portable.plan_compact = Some(self.session.plan_compact); changed = true; }
-            if params.get("plan_auto_approve_revisions").is_some() { portable.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions); changed = true; }
-            if params.get("approval_timeout").is_some() { portable.approval_timeout = Some(self.session.approval_timeout); changed = true; }
-            if params.get("answer_timeout").is_some() { portable.answer_timeout = Some(self.session.answer_timeout); changed = true; }
-            if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
-            if let Some(enabled) = lsp_tools {portable.lsp_tools = Some(enabled);changed = true;}
-            if let Some(enabled) = status_thoughts {portable.status_thoughts = Some(enabled);changed = true;}
-            let revision = if changed { settings.update(snapshot.revision,scope,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
-            if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
+            if params.get("default_write_permission").is_some() {
+                portable.default_write_permission = Some(self.session.default_write_permission);
+                changed = true;
+            }
+            if params.get("plan_permission").is_some() {
+                portable.plan_permission = self.session.plan_permission;
+                changed = true;
+            }
+            if params.get("auto_compaction").is_some() {
+                portable.auto_compaction = Some(self.session.auto_compaction.clone());
+                changed = true;
+            }
+            if params.get("plan_compact").is_some() {
+                portable.plan_compact = Some(self.session.plan_compact);
+                changed = true;
+            }
+            if params.get("plan_auto_approve_revisions").is_some() {
+                portable.plan_auto_approve_revisions =
+                    Some(self.session.plan_auto_approve_revisions);
+                changed = true;
+            }
+            if params.get("approval_timeout").is_some() {
+                portable.approval_timeout = Some(self.session.approval_timeout);
+                changed = true;
+            }
+            if params.get("answer_timeout").is_some() {
+                portable.answer_timeout = Some(self.session.answer_timeout);
+                changed = true;
+            }
+            if let Some(enabled) = subagent_tools {
+                portable.subagent_tools = Some(enabled);
+                changed = true;
+            }
+            if let Some(enabled) = lsp_tools {
+                portable.lsp_tools = Some(enabled);
+                changed = true;
+            }
+            if let Some(enabled) = status_thoughts {
+                portable.status_thoughts = Some(enabled);
+                changed = true;
+            }
+            let revision = if changed {
+                settings.update(
+                    snapshot.revision,
+                    scope,
+                    &self.session.workspace,
+                    &self.session.id,
+                    &portable,
+                )?
+            } else {
+                snapshot.revision
+            };
+            if update_model_preference
+                || params.get("service_tier").is_some()
+                || params.get("plan_executor_enabled").is_some()
+            {
                 settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
                     "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
             }
         }
-        if let Some(enabled) = subagent_tools {self.agent_coordinator.set_enabled(enabled);}
-        if let Some(enabled) = lsp_tools {self.lsp.set_enabled(&self.session.id, enabled);}
-        if let Some(enabled) = status_thoughts {self.observer.status_thoughts.store(enabled, Ordering::Relaxed);}
+        if let Some(enabled) = subagent_tools {
+            self.agent_coordinator.set_enabled(enabled);
+        }
+        if let Some(enabled) = lsp_tools {
+            self.lsp.set_enabled(&self.session.id, enabled);
+        }
+        if let Some(enabled) = status_thoughts {
+            self.observer
+                .status_thoughts
+                .store(enabled, Ordering::Relaxed);
+        }
         if delegation_registry_changed && params.get("settings_revision").is_none() {
             self.backend.cleanup_execution(&self.session.id).await?;
         }
@@ -7556,14 +9976,36 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn validate_plan_executor(&mut self, executor: &PlanExecutor) -> Result<()> {
-        anyhow::ensure!(self.capability.model_selection, "current backend does not support model selection");
-        let model = executor.model.as_deref().context("plan executor model is not configured")?;
-        let effort = executor.effort.as_deref().context("plan executor thinking is not configured")?;
-        let model_list = self.backend.model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat)).await?;
-        let selected = model_list.iter().find(|candidate| candidate.id == model)
-            .with_context(|| format!("plan executor model {model} is unavailable for this backend"))?;
-        anyhow::ensure!(selected.reasoning.is_empty() || selected.reasoning.iter().any(|candidate| candidate == effort),
-            "plan executor thinking {effort} is unavailable for model {model}");
+        anyhow::ensure!(
+            self.capability.model_selection,
+            "current backend does not support model selection"
+        );
+        let model = executor
+            .model
+            .as_deref()
+            .context("plan executor model is not configured")?;
+        let effort = executor
+            .effort
+            .as_deref()
+            .context("plan executor thinking is not configured")?;
+        let model_list = self
+            .backend
+            .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+            .await?;
+        let selected = model_list
+            .iter()
+            .find(|candidate| candidate.id == model)
+            .with_context(|| {
+                format!("plan executor model {model} is unavailable for this backend")
+            })?;
+        anyhow::ensure!(
+            selected.reasoning.is_empty()
+                || selected
+                    .reasoning
+                    .iter()
+                    .any(|candidate| candidate == effort),
+            "plan executor thinking {effort} is unavailable for model {model}"
+        );
         Ok(())
     }
 
@@ -7586,23 +10028,35 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     /// Resolve persisted ownership across primary and child-agent exchanges.
-    fn compaction_exchange_owner(&self, compaction: &crate::backend::Compaction) -> Result<Option<Exchange>> {
+    fn compaction_exchange_owner(
+        &self,
+        compaction: &crate::backend::Compaction,
+    ) -> Result<Option<Exchange>> {
         let mut exchange_list = self.store.list_exchange(&self.session.id)?;
         for agent in self.store.list_agent_run(&self.session.id)? {
             exchange_list.extend(self.store.list_agent_exchange(&agent.id)?);
         }
         Ok(exchange_list.into_iter().find(|exchange| {
-            exchange.node_list.iter().any(|node| matches!(node,
+            exchange.node_list.iter().any(|node| {
+                matches!(node,
                 ExchangeNode::Compaction { compaction: existing, .. }
-                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id))
+                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+            })
         }))
     }
 
     /// Merge active and background notifications into their persisted timeline owner.
-    fn retain_external_compaction(&mut self, mut compaction: crate::backend::Compaction, now_ms: i64) -> Result<()> {
+    fn retain_external_compaction(
+        &mut self,
+        mut compaction: crate::backend::Compaction,
+        now_ms: i64,
+    ) -> Result<()> {
         if compaction.state == crate::backend::CompactionState::Running
-            && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str()) {
-            compaction.result.context_tokens_before = compaction.result.context_tokens_before
+            && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        {
+            compaction.result.context_tokens_before = compaction
+                .result
+                .context_tokens_before
                 .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
         }
         self.save_session()?;
@@ -7610,20 +10064,33 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             exchange.observe_compaction(compaction, now_ms);
             self.store.save_exchange(&exchange)?;
         } else {
-            let existing = self.store.list_session_event(&self.session.id)?.into_iter().find(|record| {
-                matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
+            let existing = self
+                .store
+                .list_session_event(&self.session.id)?
+                .into_iter()
+                .find(|record| {
+                    matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
                     if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
-            });
+                });
             let record = if let Some(mut record) = existing {
-                if let SessionEventKind::Compaction { compaction: existing } = &mut record.detail {
+                if let SessionEventKind::Compaction {
+                    compaction: existing,
+                } = &mut record.detail
+                {
                     existing.observe(compaction, now_ms);
                 }
                 record
             } else {
                 SessionEventRecord {
-                    id: format!("{}:compaction:{}:{}", self.session.id, compaction.thread_id, compaction.id),
-                    session_id: self.session.id.clone(), created_at_ms: now_ms,
-                    detail: SessionEventKind::Compaction { compaction: compaction.observed(now_ms) },
+                    id: format!(
+                        "{}:compaction:{}:{}",
+                        self.session.id, compaction.thread_id, compaction.id
+                    ),
+                    session_id: self.session.id.clone(),
+                    created_at_ms: now_ms,
+                    detail: SessionEventKind::Compaction {
+                        compaction: compaction.observed(now_ms),
+                    },
                 }
             };
             self.store.save_session_event(&record)?;
@@ -7632,13 +10099,22 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     /// Retain session notifications after provider execution has released the broker.
-    pub(crate) fn observe_external_compaction(&mut self, event: BackendEvent) -> Result<Vec<SessionEvent>> {
+    pub(crate) fn observe_external_compaction(
+        &mut self,
+        event: BackendEvent,
+    ) -> Result<Vec<SessionEvent>> {
         let Some(compaction) = event.compaction()? else {
-            return Ok(vec![self.event("backend_event", serde_json::to_value(event)?)?]);
+            return Ok(vec![
+                self.event("backend_event", serde_json::to_value(event)?)?,
+            ]);
         };
         self.retain_external_compaction(compaction, event.observed_at_ms(self.clock.now_ms()))?;
         let patch = self.reconcile_timeline()?;
-        Ok(if patch.is_empty() { Vec::new() } else { vec![self.event("document_changed", patch.notification())?] })
+        Ok(if patch.is_empty() {
+            Vec::new()
+        } else {
+            vec![self.event("document_changed", patch.notification())?]
+        })
     }
 
     async fn compact_session(&mut self, manual: bool) -> Result<(Value, Vec<SessionEvent>)> {
@@ -7653,9 +10129,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let now_ms = self.clock.now_ms();
         let mut compaction = crate::backend::Compaction {
             id: Uuid::new_v4().to_string(),
-            thread_id: self.session.backend_session_id.clone().expect("validated provider conversation"),
+            thread_id: self
+                .session
+                .backend_session_id
+                .clone()
+                .expect("validated provider conversation"),
             state: crate::backend::CompactionState::Running,
-            manual, started_at_ms: Some(now_ms), completed_at_ms: None,
+            manual,
+            started_at_ms: Some(now_ms),
+            completed_at_ms: None,
             result: crate::backend::CompactionResult {
                 context_tokens_before: self.session.context_usage.as_ref().map(|usage| usage.used),
                 ..Default::default()
@@ -7663,8 +10145,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         };
         let mut record = SessionEventRecord {
             id: format!("{}:compaction:{}", self.session.id, compaction.id),
-            session_id: self.session.id.clone(), created_at_ms: now_ms,
-            detail: SessionEventKind::Compaction { compaction: compaction.clone() },
+            session_id: self.session.id.clone(),
+            created_at_ms: now_ms,
+            detail: SessionEventKind::Compaction {
+                compaction: compaction.clone(),
+            },
         };
         self.store.save_session_event(&record)?;
         let mut event = Vec::new();
@@ -7690,7 +10175,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 return Err(error);
             }
         };
-        let observed = output.event.iter().rev().find_map(|event| event.compaction().ok().flatten());
+        let observed = output
+            .event
+            .iter()
+            .rev()
+            .find_map(|event| event.compaction().ok().flatten());
         let context_tokens_before = compaction.result.context_tokens_before;
         if let Some(observed) = observed {
             compaction.state = observed.state;
@@ -7700,10 +10189,18 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         compaction.result.context_tokens_before = context_tokens_before;
         if compaction.state == crate::backend::CompactionState::Completed {
-            compaction.result.context_tokens_after = output.metrics.context_usage.as_ref().map(|usage| usage.used);
+            compaction.result.context_tokens_after = output
+                .metrics
+                .context_usage
+                .as_ref()
+                .map(|usage| usage.used);
         }
         let failed = compaction.state == crate::backend::CompactionState::Failed;
-        let failure = compaction.result.error.clone().unwrap_or_else(|| "Provider compaction failed".into());
+        let failure = compaction
+            .result
+            .error
+            .clone()
+            .unwrap_or_else(|| "Provider compaction failed".into());
         record.detail = SessionEventKind::Compaction { compaction };
         self.store.save_session_event(&record)?;
         self.capability = output.capability.clone();
@@ -7713,7 +10210,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.session.backend_session_id = Some(backend_session_id);
         }
         if let Some(context_usage) = output.metrics.context_usage {
-            let size = self.session.context_usage.as_ref()
+            let size = self
+                .session
+                .context_usage
+                .as_ref()
                 .map_or(context_usage.size, |current| current.size);
             self.session.context_usage = ContextUsage::reported(context_usage.used, size);
         }
@@ -7729,10 +10229,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.emit_timeline_patch(patch, &mut event).await?;
         anyhow::ensure!(!failed, "{failure}");
         event.push(self.event("context_compacted", serde_json::to_value(&snapshot)?)?);
-        Ok((
-            serde_json::to_value(&snapshot)?,
-            event,
-        ))
+        Ok((serde_json::to_value(&snapshot)?, event))
     }
 
     fn snapshot_for_session(&mut self, session: HarnessSession) -> Result<BrokerSnapshot> {
@@ -7755,8 +10252,16 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
-            input: if self.submitted_attachments.is_empty() { input } else { input.with_attachments(self.submitted_attachments.clone()) },
-            mode: if self.session.background.is_some() { PromptMode::Background } else { mode },
+            input: if self.submitted_attachments.is_empty() {
+                input
+            } else {
+                input.with_attachments(self.submitted_attachments.clone())
+            },
+            mode: if self.session.background.is_some() {
+                PromptMode::Background
+            } else {
+                mode
+            },
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
@@ -7764,7 +10269,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             access: self.session.access.clone(),
             execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
-            control_context: self.control_turn_context(if self.session.background.is_some() { PromptMode::Background } else { mode }),
+            control_context: self.control_turn_context(if self.session.background.is_some() {
+                PromptMode::Background
+            } else {
+                mode
+            }),
         }
     }
 
@@ -7777,7 +10286,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     fn save_session(&mut self) -> Result<()> {
-        (self.session.approval_timeout, self.session.answer_timeout) = self.permission_coordinator.input_timeouts(&self.session.id)?;
+        (self.session.approval_timeout, self.session.answer_timeout) = self
+            .permission_coordinator
+            .input_timeouts(&self.session.id)?;
         let now_ms = self.clock.now_ms();
         self.session.acquire_lease(&self.client_id, now_ms)?;
         self.session.updated_at_ms = now_ms;
@@ -7786,7 +10297,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     fn save_preference(&mut self, update_model_preference: bool) -> Result<()> {
-        if self.session.background.is_some() { return Ok(()); }
+        if self.session.background.is_some() {
+            return Ok(());
+        }
         let previous = self
             .store
             .load_preference(&self.session.workspace, &self.session.backend)?;
@@ -7798,11 +10311,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 preference.model_setting = previous.model_setting;
             }
         }
-        self.store.save_preference(
-            &self.session.workspace,
-            &self.session.backend,
-            &preference,
-        )
+        self.store
+            .save_preference(&self.session.workspace, &self.session.backend, &preference)
     }
 
     fn refresh_lease(&mut self) -> Result<()> {
@@ -7903,7 +10413,8 @@ fn admit_addressless_turn(
     if event.address.is_some() || !owns_content {
         return Ok(());
     }
-    let address = synthetic_turn.clone()
+    let address = synthetic_turn
+        .clone()
         .unwrap_or_else(|| crate::backend::ProviderAddress {
             owner: None,
             thread_id: format!("harness:{}", exchange.agent_id),
@@ -8065,45 +10576,111 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for AutomaticCheckBackend {
-        fn checkpoint_tool_gate(&self) -> bool { true }
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Automatic check fixture".into(), capability: crate::backend::mock_capability() }
+        fn checkpoint_tool_gate(&self) -> bool {
+            true
         }
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
-        async fn has_active_turn(&self, _: &str) -> bool { false }
-        async fn cleanup_execution(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
-        async fn active_session_id_for(&self, _: &str) -> Option<String> { None }
-        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> { Ok(false) }
-        async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
-            if let Some(checkpoint) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref()) {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Automatic check fixture".into(),
+                capability: crate::backend::mock_capability(),
+            }
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn has_active_turn(&self, _: &str) -> bool {
+            false
+        }
+        async fn cleanup_execution(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn cancel_session(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn active_session_id_for(&self, _: &str) -> Option<String> {
+            None
+        }
+        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
+            Ok(false)
+        }
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            if let Some(checkpoint) = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.checkpoint.as_ref())
+            {
                 checkpoint.wait().await?;
             }
             let turn = self.turns.fetch_add(1, Ordering::SeqCst);
             if turn == 0 || self.repair {
-                std::fs::write(Path::new(&request.workspace).join("seed.txt"), if turn > 0 { "fixed" } else { "broken" })?;
+                std::fs::write(
+                    Path::new(&request.workspace).join("seed.txt"),
+                    if turn > 0 { "fixed" } else { "broken" },
+                )?;
             }
             if turn == 0 && self.explicit {
                 let context = request.control_context.as_ref().unwrap();
-                let advertised = crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), true);
+                let advertised = crate::control_tools::ControlToolRegistry
+                    .definition_list_for_context(Some(context), true);
                 assert!(advertised.iter().any(|tool| tool.name == "checks_run"));
-                assert!(!crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), false).iter().any(|tool| tool.name.starts_with("checks_")));
-                let scope = request.control_context.as_ref().unwrap().checks.as_ref().unwrap();
-                let started: Value = serde_json::from_str(&scope.invoke("checks_run", json!({"ids":["verify"]})).await?)?;
+                assert!(
+                    !crate::control_tools::ControlToolRegistry
+                        .definition_list_for_context(Some(context), false)
+                        .iter()
+                        .any(|tool| tool.name.starts_with("checks_"))
+                );
+                let scope = request
+                    .control_context
+                    .as_ref()
+                    .unwrap()
+                    .checks
+                    .as_ref()
+                    .unwrap();
+                let started: Value = serde_json::from_str(
+                    &scope
+                        .invoke("checks_run", json!({"ids":["verify"]}))
+                        .await?,
+                )?;
                 loop {
-                    let run: Value = serde_json::from_str(&scope.invoke("checks_status", json!({"run_id":started["run_id"],"wait_ms":30000})).await?)?;
-                    if run["state"] != "running" { break; }
+                    let run: Value = serde_json::from_str(
+                        &scope
+                            .invoke(
+                                "checks_status",
+                                json!({"run_id":started["run_id"],"wait_ms":30000}),
+                            )
+                            .await?,
+                    )?;
+                    if run["state"] != "running" {
+                        break;
+                    }
                 }
             }
             if let Some(sink) = sink {
                 let address = crate::backend::ProviderAddress {
-                    owner: Some(request.owner()?), thread_id: "automatic-check-stream".into(), turn_id: turn.to_string(),
+                    owner: Some(request.owner()?),
+                    thread_id: "automatic-check-stream".into(),
+                    turn_id: turn.to_string(),
                 };
                 for (kind, boundary, text) in [
-                    ("turn_started", Some(crate::backend::TurnBoundary::Started), None),
+                    (
+                        "turn_started",
+                        Some(crate::backend::TurnBoundary::Started),
+                        None,
+                    ),
                     ("assistant_message", None, Some("")),
                     ("assistant_message", None, Some("Check repair response")),
-                    ("turn_completed", Some(crate::backend::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed }), None),
+                    (
+                        "turn_completed",
+                        Some(crate::backend::TurnBoundary::Finished {
+                            outcome: crate::turn::TurnOutcome::Completed,
+                        }),
+                        None,
+                    ),
                 ] {
                     sink.send_wait(BackendEvent {
                         received_at_ms: None, address: Some(address.clone()), turn_boundary: boundary,
@@ -8118,40 +10695,87 @@ mod test {
 
     #[tokio::test]
     async fn automatic_checks_preserve_the_queue_baseline_and_timing() -> Result<()> {
-        for timing in [crate::checks::CheckTiming::AfterQueue, crate::checks::CheckTiming::BetweenWork] {
+        for timing in [
+            crate::checks::CheckTiming::AfterQueue,
+            crate::checks::CheckTiming::BetweenWork,
+        ] {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             broker.session.execution_mode = PermissionMode::Yolo;
             broker.session.shell = crate::session::CheckShell::Nushell;
-            broker.configure_session(json!({"check_timing":timing})).await?;
+            broker
+                .configure_session(json!({"check_timing":timing}))
+                .await?;
             assert_eq!(broker.snapshot()?.check_timing, timing);
             let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            broker.backend = Arc::new(AutomaticCheckBackend { turns: turns.clone(), repair: false, explicit: false });
+            broker.backend = Arc::new(AutomaticCheckBackend {
+                turns: turns.clone(),
+                repair: false,
+                explicit: false,
+            });
             std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
                 "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
                 "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
             }]}}).to_string())?;
             broker.observer.completion_queue.update(1, true)?;
-            broker.run_interaction("First queued edit".into(), PromptMode::Chat,
-                Some(ExchangeAdmission::chat("First queued edit".into()))).await?;
-            let first_owner = broker.store.list_exchange(&broker.session.id)?.last().unwrap().check_owner.clone();
+            broker
+                .run_interaction(
+                    "First queued edit".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat("First queued edit".into())),
+                )
+                .await?;
+            let first_owner = broker
+                .store
+                .list_exchange(&broker.session.id)?
+                .last()
+                .unwrap()
+                .check_owner
+                .clone();
             let first_history = broker.check_runner.snapshot()?.history;
-            assert_eq!(first_history.len(), usize::from(timing == crate::checks::CheckTiming::BetweenWork));
+            assert_eq!(
+                first_history.len(),
+                usize::from(timing == crate::checks::CheckTiming::BetweenWork)
+            );
             broker.observer.completion_queue.update(2, false)?;
             broker.observer.completion_queue.update(1, true)?;
-            broker.run_interaction("Last queued item without edits".into(), PromptMode::Chat,
-                Some(ExchangeAdmission::chat("Last queued item without edits".into()))).await?;
+            broker
+                .run_interaction(
+                    "Last queued item without edits".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(
+                        "Last queued item without edits".into(),
+                    )),
+                )
+                .await?;
             let history = broker.check_runner.snapshot()?.history;
-            assert_eq!(history.iter().flat_map(|run| &run.commands)
-                .filter(|command| command.state == crate::checks::CheckState::Passed).count(), 1);
+            assert_eq!(
+                history
+                    .iter()
+                    .flat_map(|run| &run.commands)
+                    .filter(|command| command.state == crate::checks::CheckState::Passed)
+                    .count(),
+                1
+            );
             assert!(!broker.snapshot()?.checks_deferred);
             if timing == crate::checks::CheckTiming::AfterQueue {
-                assert_eq!(broker.store.list_exchange(&broker.session.id)?.last().unwrap().check_owner, first_owner);
+                assert_eq!(
+                    broker
+                        .store
+                        .list_exchange(&broker.session.id)?
+                        .last()
+                        .unwrap()
+                        .check_owner,
+                    first_owner
+                );
             }
             assert_eq!(turns.load(Ordering::SeqCst), 2);
-            let reopened = crate::settings::SettingsStore::open(data.path())?
-                .get(&broker.session.workspace, &broker.session.id, &broker.session.backend)?;
+            let reopened = crate::settings::SettingsStore::open(data.path())?.get(
+                &broker.session.workspace,
+                &broker.session.id,
+                &broker.session.backend,
+            )?;
             assert_eq!(reopened.desired.check_timing, Some(timing));
         }
         Ok(())
@@ -8165,19 +10789,41 @@ mod test {
         broker.session.execution_mode = PermissionMode::Yolo;
         broker.session.shell = crate::session::CheckShell::Nushell;
         let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        broker.backend = Arc::new(AutomaticCheckBackend { turns: turns.clone(), repair: false, explicit: false });
+        broker.backend = Arc::new(AutomaticCheckBackend {
+            turns: turns.clone(),
+            repair: false,
+            explicit: false,
+        });
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
             "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
             "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
         }]}}).to_string())?;
-        assert_eq!(broker.snapshot()?.check_timing, crate::checks::CheckTiming::AfterQueue);
+        assert_eq!(
+            broker.snapshot()?.check_timing,
+            crate::checks::CheckTiming::AfterQueue
+        );
         broker.observer.completion_queue.update(1, true)?;
-        broker.run_interaction("Queued edit".into(), PromptMode::Chat,
-            Some(ExchangeAdmission::chat("Queued edit".into()))).await?;
+        broker
+            .run_interaction(
+                "Queued edit".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Queued edit".into())),
+            )
+            .await?;
         assert!(broker.snapshot()?.checks_deferred);
         broker.observer.completion_queue.update(2, false)?;
-        let result = broker.dispatch(Request { id: 1, method: "checks.complete".into(), params: json!({}) }).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "checks.complete".into(),
+                params: json!({}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         assert_eq!(broker.check_runner.snapshot()?.history.len(), 1);
         assert!(!broker.snapshot()?.checks_deferred);
         assert_eq!(turns.load(Ordering::SeqCst), 1);
@@ -8259,62 +10905,137 @@ mod test {
             broker.session.execution_mode = PermissionMode::Yolo;
             broker.session.shell = crate::session::CheckShell::Nushell;
             let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-            broker.backend = Arc::new(AutomaticCheckBackend { turns: turns.clone(), repair, explicit: true });
+            broker.backend = Arc::new(AutomaticCheckBackend {
+                turns: turns.clone(),
+                repair,
+                explicit: true,
+            });
             std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{"id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,"trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }"}}]}}).to_string())?;
-            let result = tokio::time::timeout(std::time::Duration::from_secs(10), broker.run_interaction("Change source".into(), PromptMode::Chat, Some(ExchangeAdmission::chat("Change source".into())))).await.context("automatic repair did not settle within ten seconds")??;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                broker.run_interaction(
+                    "Change source".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat("Change source".into())),
+                ),
+            )
+            .await
+            .context("automatic repair did not settle within ten seconds")??;
             assert_eq!(turns.load(Ordering::SeqCst), 2);
             let exchanges = broker.store.list_exchange(&broker.session.id)?;
-            assert_eq!(exchanges.len(), 1, "automatic repair must remain in the original exchange");
+            assert_eq!(
+                exchanges.len(),
+                1,
+                "automatic repair must remain in the original exchange"
+            );
             assert_eq!(exchanges[0].prompt, "Change source");
             assert_eq!(exchanges[0].turn.len(), 2);
             let history = broker.check_runner.history()?;
-            assert!(history.iter().all(|run| run.exchange_id.as_deref() == Some(exchanges[0].id.as_str())));
+            assert!(
+                history
+                    .iter()
+                    .all(|run| run.exchange_id.as_deref() == Some(exchanges[0].id.as_str()))
+            );
             let timeline = broker.snapshot()?.timeline;
-            assert!(!timeline.iter().any(|entry| matches!(entry, TimelineEntry::Checks { .. })));
-            let attached = timeline.iter().find_map(|entry| match entry {
-                TimelineEntry::Exchange { exchange, check_runs, .. } if exchange.id == exchanges[0].id => Some(check_runs),
-                _ => None,
-            }).unwrap();
+            assert!(
+                !timeline
+                    .iter()
+                    .any(|entry| matches!(entry, TimelineEntry::Checks { .. }))
+            );
+            let attached = timeline
+                .iter()
+                .find_map(|entry| match entry {
+                    TimelineEntry::Exchange {
+                        exchange,
+                        check_runs,
+                        ..
+                    } if exchange.id == exchanges[0].id => Some(check_runs),
+                    _ => None,
+                })
+                .unwrap();
             assert_eq!(attached.len(), history.len());
-            assert_eq!(history.iter().flat_map(|run| &run.commands).filter(|command| command.started_at_ms.is_some()).count(), if repair { 2 } else { 1 });
-            assert_eq!(result.0["automatic_checks"].get("blocked").is_some(), !repair);
+            assert_eq!(
+                history
+                    .iter()
+                    .flat_map(|run| &run.commands)
+                    .filter(|command| command.started_at_ms.is_some())
+                    .count(),
+                if repair { 2 } else { 1 }
+            );
+            assert_eq!(
+                result.0["automatic_checks"].get("blocked").is_some(),
+                !repair
+            );
         }
         Ok(())
     }
 
     #[tokio::test]
-    async fn automatic_checks_wait_for_goal_completion_and_do_not_consume_questions() -> Result<()> {
+    async fn automatic_checks_wait_for_goal_completion_and_do_not_consume_questions() -> Result<()>
+    {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{"id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"trigger":{"kind":"any_change"},"all":{"command":"print ok"}}]}}).to_string())?;
-        let checkpoint = broker.checkpoint.as_ref().unwrap().capture(&broker.store.objects, &broker.repositories, &broker.session.id, 1).await?;
-        broker.check_runner.begin_changes("goal-gate".into(), &checkpoint)?;
+        let checkpoint = broker
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .capture(
+                &broker.store.objects,
+                &broker.repositories,
+                &broker.session.id,
+                1,
+            )
+            .await?;
+        broker
+            .check_runner
+            .begin_changes("goal-gate".into(), &checkpoint)?;
         std::fs::write(repository.path().join("seed.txt"), "changed")?;
-        let mut goal = GoalRecord { id:"goal-gate".into(),session_id:broker.session.id.clone(),objective:"Verify completion".into(),state:GoalState::Active,continuation:Default::default(),native:false,created_at_ms:1,updated_at_ms:1 };
+        let mut goal = GoalRecord {
+            id: "goal-gate".into(),
+            session_id: broker.session.id.clone(),
+            objective: "Verify completion".into(),
+            state: GoalState::Active,
+            continuation: Default::default(),
+            native: false,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
         broker.session.goal_id = Some(goal.id.clone());
         broker.store.save_goal(&goal)?;
         let mut exchange = completed_interaction("goal-turn", &broker.session.id, Vec::new());
         exchange.goal_id = Some(goal.id.clone());
         exchange.check_owner = Some(goal.id.clone());
         broker.store.save_exchange(&exchange)?;
-        broker.settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation).await?;
+        broker
+            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
+            .await?;
         assert!(broker.check_runner.history()?.is_empty());
         goal.state = GoalState::Paused;
         broker.store.save_goal(&goal)?;
-        broker.settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation).await?;
+        broker
+            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
+            .await?;
         assert!(broker.check_runner.history()?.is_empty());
         goal.state = GoalState::Complete;
         broker.store.save_goal(&goal)?;
         exchange.awaiting_input = true;
         broker.store.save_exchange(&exchange)?;
-        broker.settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation).await?;
+        broker
+            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
+            .await?;
         assert!(broker.check_runner.history()?.is_empty());
         exchange.awaiting_input = false;
         broker.store.save_exchange(&exchange)?;
-        broker.settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation).await?;
+        broker
+            .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
+            .await?;
         assert_eq!(broker.check_runner.history()?.len(), 1);
-        assert_eq!(broker.check_runner.history()?[0].state, crate::checks::CheckState::Passed);
+        assert_eq!(
+            broker.check_runner.history()?[0].state,
+            crate::checks::CheckState::Passed
+        );
         Ok(())
     }
 
@@ -8331,7 +11052,10 @@ mod test {
         ));
         let bytes = std::mem::size_of_val(future.as_ref().get_ref());
         eprintln!("interaction inline bytes: {bytes}");
-        assert!(bytes <= 16 * 1024, "interaction retains {bytes} inline bytes");
+        assert!(
+            bytes <= 16 * 1024,
+            "interaction retains {bytes} inline bytes"
+        );
     }
 
     struct CheckpointBackend {
@@ -8480,26 +11204,47 @@ mod test {
     }
 
     #[tokio::test]
-    async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization() -> Result<()> {
+    async fn native_abort_completion_rewinds_before_pending_checkpoint_finalization() -> Result<()>
+    {
         for (cleanup_before_completion, visible_output, restore_prompt) in [
-            (true, false, true), (false, false, true),
-            (true, true, true), (false, true, true),
-            (true, false, false), (false, false, false),
+            (true, false, true),
+            (false, false, true),
+            (true, true, true),
+            (false, true, true),
+            (true, false, false),
+            (false, false, false),
         ] {
             let repository = repository();
             let data = tempfile::tempdir()?;
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             let backend = Arc::new(CleanupRetryBackend {
-                started: Notify::new(), complete: Notify::new(), settled: Notify::new(),
-                attempt: std::sync::atomic::AtomicUsize::new(1), visible_output,
+                started: Notify::new(),
+                complete: Notify::new(),
+                settled: Notify::new(),
+                attempt: std::sync::atomic::AtomicUsize::new(1),
+                visible_output,
             });
             broker.backend = backend.clone();
             broker.capability.native_turn_rollback = true;
             let repositories = Arc::clone(&broker.repositories);
-            let handle = repositories.open(repository.path().to_owned()).await?.context("fixture repository")?;
-            let operation = repositories.writes.admit(vec![forge_git::mutation::MutationScope::WorktreeFiles(
-                handle.identity.worktree.clone().context("fixture worktree")?)], 0)?;
-            let held = repositories.writes.start(operation)?.context("fixture mutation admission")?;
+            let handle = repositories
+                .open(repository.path().to_owned())
+                .await?
+                .context("fixture repository")?;
+            let operation = repositories.writes.admit(
+                vec![forge_git::mutation::MutationScope::WorktreeFiles(
+                    handle
+                        .identity
+                        .worktree
+                        .clone()
+                        .context("fixture worktree")?,
+                )],
+                0,
+            )?;
+            let held = repositories
+                .writes
+                .start(operation)?
+                .context("fixture mutation admission")?;
             let cancellation = broker.turn_cancellation();
             cancellation.arm(true);
             let session_id = broker.session.id.clone();
@@ -8517,14 +11262,21 @@ mod test {
                 cancellation.request(restore_prompt);
                 Ok::<_, anyhow::Error>(())
             };
-            let execution = broker.run_interaction("Cancel after native dispatch".into(), PromptMode::Chat,
-                Some(ExchangeAdmission::chat("Cancel after native dispatch".into())));
+            let execution = broker.run_interaction(
+                "Cancel after native dispatch".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat(
+                    "Cancel after native dispatch".into(),
+                )),
+            );
             let result = tokio::time::timeout(std::time::Duration::from_millis(200), async {
                 tokio::join!(execution, cancel)
-            }).await;
+            })
+            .await;
             held.finish(forge_git::mutation::OperationCompletion::Completed)?;
             repositories.writes.take_receipt(operation);
-            let (result, cancelled) = result.context("native abort completion waited for checkpoint finalization")?;
+            let (result, cancelled) =
+                result.context("native abort completion waited for checkpoint finalization")?;
             cancelled?;
             let error = result.unwrap_err();
             let exchange = broker.store.list_exchange(&broker.session.id)?;
@@ -8539,8 +11291,11 @@ mod test {
                 assert!(exchange[0].checkpoint_after.is_none());
                 assert!(exchange[0].finalization_error.is_none());
                 if visible_output {
-                    assert!(exchange[0].turn.iter().any(|turn| turn.messages().iter()
-                        .any(|message| message.text() == "Partial response")));
+                    assert!(exchange[0].turn.iter().any(|turn| {
+                        turn.messages()
+                            .iter()
+                            .any(|message| message.text() == "Partial response")
+                    }));
                 }
             }
             assert!(broker.exchange_runtime.is_none());
@@ -8558,19 +11313,40 @@ mod test {
         let document = forge_buffer::identity::DocumentId("checkpoint-transcript".into());
         {
             let mut presentation = broker.presentation.lock().unwrap();
-            presentation.open(document.clone(), forge_buffer::identity::ViewId("checkpoint-view".into()),
-                forge_buffer::width::WidthProfile::default())?;
+            presentation.open(
+                document.clone(),
+                forge_buffer::identity::ViewId("checkpoint-view".into()),
+                forge_buffer::width::WidthProfile::default(),
+            )?;
             presentation.begin_submission(&document, 1, "Capture before my first tool")?;
         }
         broker.prompt_admission = Some((document, 1));
         let (sink, mut stream) = crate::backend::events::channel();
         broker.event_sink = Some(sink);
-        broker.backend = Arc::new(CheckpointBackend { started: started.clone(), tool_ran: tool_ran.clone(), active: Default::default() });
+        broker.backend = Arc::new(CheckpointBackend {
+            started: started.clone(),
+            tool_ran: tool_ran.clone(),
+            active: Default::default(),
+        });
         let repositories = broker.repositories.clone();
-        let handle = repositories.open(repository.path().to_owned()).await?.context("fixture repository")?;
-        let operation = repositories.writes.admit(vec![forge_git::mutation::MutationScope::WorktreeFiles(
-            handle.identity.worktree.clone().context("fixture worktree")?)], 0)?;
-        let held = repositories.writes.start(operation)?.context("fixture mutation admission")?;
+        let handle = repositories
+            .open(repository.path().to_owned())
+            .await?
+            .context("fixture repository")?;
+        let operation = repositories.writes.admit(
+            vec![forge_git::mutation::MutationScope::WorktreeFiles(
+                handle
+                    .identity
+                    .worktree
+                    .clone()
+                    .context("fixture worktree")?,
+            )],
+            0,
+        )?;
+        let held = repositories
+            .writes
+            .start(operation)?
+            .context("fixture mutation admission")?;
         let session_id = broker.session.id.clone();
         let observe = async {
             tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await?;
@@ -8580,48 +11356,87 @@ mod test {
                 accepted |= event.kind == "prompt_submission" && event.data["state"] == "accepted";
                 projected |= event.kind == "document_changed";
             }
-            assert!(accepted, "composer acceptance waited for checkpoint capture");
-            assert!(projected, "timeline did not project before checkpoint capture");
+            assert!(
+                accepted,
+                "composer acceptance waited for checkpoint capture"
+            );
+            assert!(
+                projected,
+                "timeline did not project before checkpoint capture"
+            );
             let store = SqliteStore::open(data.path())?;
             let exchange = store.list_exchange(&session_id)?;
             assert_eq!(exchange.len(), 1);
             assert_eq!(exchange[0].prompt, "Capture before my first tool");
             assert!(exchange[0].checkpoint_before.is_none());
             assert!(!tool_ran.load(Ordering::SeqCst));
-            assert_eq!(std::fs::read_to_string(repository.path().join("seed.txt"))?, "seed\n");
+            assert_eq!(
+                std::fs::read_to_string(repository.path().join("seed.txt"))?,
+                "seed\n"
+            );
             held.finish(forge_git::mutation::OperationCompletion::Completed)?;
             repositories.writes.take_receipt(operation);
             Ok::<_, anyhow::Error>(())
         };
         let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
-            tokio::join!(broker.run_interaction("Capture before my first tool".into(), PromptMode::Chat,
-                Some(ExchangeAdmission::chat("Capture before my first tool".into()))), observe)
-        }).await?;
+            tokio::join!(
+                broker.run_interaction(
+                    "Capture before my first tool".into(),
+                    PromptMode::Chat,
+                    Some(ExchangeAdmission::chat(
+                        "Capture before my first tool".into()
+                    ))
+                ),
+                observe
+            )
+        })
+        .await?;
         observed?;
         result?;
         assert!(tool_ran.load(Ordering::SeqCst));
-        let exchange = broker.store.list_exchange(&session_id)?.pop().context("completed fixture exchange")?;
-        let before = broker.store.load_checkpoint(exchange.checkpoint_before.as_deref().context("before id")?)?.context("before checkpoint")?;
-        assert!(!before.file.iter().any(|file|file.path == "seed.txt"));
-        let after = broker.store.load_checkpoint(exchange.checkpoint_after.as_deref().context("after id")?)?.context("after checkpoint")?;
-        assert!(after.file.iter().any(|file|file.path == "seed.txt"));
+        let exchange = broker
+            .store
+            .list_exchange(&session_id)?
+            .pop()
+            .context("completed fixture exchange")?;
+        let before = broker
+            .store
+            .load_checkpoint(exchange.checkpoint_before.as_deref().context("before id")?)?
+            .context("before checkpoint")?;
+        assert!(!before.file.iter().any(|file| file.path == "seed.txt"));
+        let after = broker
+            .store
+            .load_checkpoint(exchange.checkpoint_after.as_deref().context("after id")?)?
+            .context("after checkpoint")?;
+        assert!(after.file.iter().any(|file| file.path == "seed.txt"));
         Ok(())
     }
 
     #[tokio::test]
-    async fn initial_checkpoint_failure_can_finalize_without_replaying_provider_work() -> Result<()> {
+    async fn initial_checkpoint_failure_can_finalize_without_replaying_provider_work() -> Result<()>
+    {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let occupied: Vec<_> = (0..4).map(|_|broker.repositories.reads.submit(0, |_|Ok(())).unwrap()).collect();
-        let error = broker.run_interaction("blocked acquisition".into(), PromptMode::Chat,
-            Some(ExchangeAdmission::chat("blocked acquisition".into()))).await.unwrap_err();
+        let occupied: Vec<_> = (0..4)
+            .map(|_| broker.repositories.reads.submit(0, |_| Ok(())).unwrap())
+            .collect();
+        let error = broker
+            .run_interaction(
+                "blocked acquisition".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("blocked acquisition".into())),
+            )
+            .await
+            .unwrap_err();
         assert!(format!("{error:#}").contains("capacity is full"));
         let failed = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(failed.len(), 1);
         assert_eq!(failed[0].state, ExchangeState::Finalizing);
         assert!(failed[0].checkpoint_before.is_none());
-        for task in occupied { task.finish().await?; }
+        for task in occupied {
+            task.finish().await?;
+        }
         broker.retry_finalization().await?;
         let settled = broker.store.list_exchange(&broker.session.id)?;
         assert_eq!(settled[0].state, ExchangeState::Failed);
@@ -8636,13 +11451,17 @@ mod test {
     async fn settle_managed_children(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
         let mut revision = broker.agent_coordinator.subscribe();
         let mut event = Vec::new();
-        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 event.extend(broker.drain_agent_commands(None).await?);
-                if broker.agent_coordinator.active_count() == 0 {return Ok::<_,anyhow::Error>(());}
+                if broker.agent_coordinator.active_count() == 0 {
+                    return Ok::<_, anyhow::Error>(());
+                }
                 revision.changed().await.context("child lane closed")?;
             }
-        }).await.context("managed child did not settle within five seconds")??;
+        })
+        .await
+        .context("managed child did not settle within five seconds")??;
         Ok(event)
     }
 
@@ -8650,86 +11469,192 @@ mod test {
     async fn manual_child_admission_streams_and_followup_reuses_only_child_history() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(),data.path(),false);
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.backend_session_id = Some("root-history".into());
         assert!(!broker.agent_coordinator.enabled());
-        let (admitted,_) = broker.start_agent(json!({"profile":"worker","text":"CHILD_FIRST"})).await?;
-        let agent_id = admitted["agent"]["id"].as_str().context("admission has no child identity")?.to_owned();
-        assert_eq!(admitted["status"],"admitted");
+        let (admitted, _) = broker
+            .start_agent(json!({"profile":"worker","text":"CHILD_FIRST"}))
+            .await?;
+        let agent_id = admitted["agent"]["id"]
+            .as_str()
+            .context("admission has no child identity")?
+            .to_owned();
+        assert_eq!(admitted["status"], "admitted");
         let event = settle_managed_children(&mut broker).await?;
-        assert!(event.iter().any(|event|event.event == "document_changed" || event.payload["kind"] == "document_changed"),
-            "child events did not update the shared document: {:?}",event.iter().map(|event|(&event.event,&event.payload["kind"])).collect::<Vec<_>>());
+        assert!(
+            event.iter().any(|event| event.event == "document_changed"
+                || event.payload["kind"] == "document_changed"),
+            "child events did not update the shared document: {:?}",
+            event
+                .iter()
+                .map(|event| (&event.event, &event.payload["kind"]))
+                .collect::<Vec<_>>()
+        );
         let child = broker.agent_coordinator.resolve(&agent_id)?;
         assert!(child.provider_thread_id.is_some());
-        assert_ne!(child.provider_thread_id.as_deref(),Some("root-history"));
-        assert_eq!(broker.session.backend_session_id.as_deref(),Some("root-history"));
+        assert_ne!(child.provider_thread_id.as_deref(), Some("root-history"));
+        assert_eq!(
+            broker.session.backend_session_id.as_deref(),
+            Some("root-history")
+        );
         let exchange = broker.store.list_agent_exchange(&agent_id)?;
-        assert_eq!(exchange.len(),1);
-        assert_eq!(exchange[0].state,ExchangeState::Complete);
-        assert!(exchange[0].turn.iter().flat_map(|turn|turn.messages()).any(|message|message.text().contains("CHILD_FIRST")));
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].state, ExchangeState::Complete);
+        assert!(
+            exchange[0]
+                .turn
+                .iter()
+                .flat_map(|turn| turn.messages())
+                .any(|message| message.text().contains("CHILD_FIRST"))
+        );
         let sender = broker.agent_coordinator.sender();
-        let request = crate::agent::AgentRequest {operation_id:"followup".into(),source:crate::agent::AgentSource::User,
-            operation:crate::agent::AgentOperation::Followup {target:agent_id.clone(),message:"CHILD_SECOND".into()}};
-        let response = tokio::spawn(async move {sender.request(request).await});
+        let request = crate::agent::AgentRequest {
+            operation_id: "followup".into(),
+            source: crate::agent::AgentSource::User,
+            operation: crate::agent::AgentOperation::Followup {
+                target: agent_id.clone(),
+                message: "CHILD_SECOND".into(),
+            },
+        };
+        let response = tokio::spawn(async move { sender.request(request).await });
         tokio::task::yield_now().await;
         broker.drain_agent_commands(None).await?;
-        assert_eq!(response.await??["agent"]["id"],agent_id);
+        assert_eq!(response.await??["agent"]["id"], agent_id);
         settle_managed_children(&mut broker).await?;
         let exchange = broker.store.list_agent_exchange(&agent_id)?;
-        assert_eq!(exchange.len(),2);
-        assert!(exchange.iter().all(|exchange|exchange.state == ExchangeState::Complete));
-        assert_eq!(broker.agent_coordinator.snapshot(None).len(),1);
-        assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(),2);
+        assert_eq!(exchange.len(), 2);
+        assert!(
+            exchange
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Complete)
+        );
+        assert_eq!(broker.agent_coordinator.snapshot(None).len(), 1);
+        assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(), 2);
         Ok(())
     }
 
-    struct DelegatingRootBackend {turn:AtomicU64}
+    struct DelegatingRootBackend {
+        turn: AtomicU64,
+    }
 
     #[async_trait::async_trait]
     impl Backend for DelegatingRootBackend {
-        fn descriptor(&self) -> crate::backend::BackendDescriptor {crate::backend::BackendDescriptor {kind:crate::backend::BackendKind::Mock,
-            label:"Mock".into(),capability:crate::backend::mock_capability()}}
-        async fn shutdown(&self) -> Result<()> {Ok(())}
-        async fn has_active_turn(&self,_session_id:&str) -> bool {true}
-        async fn cancel_session(&self,_session_id:&str) -> Result<()> {Ok(())}
-        async fn cleanup_execution(&self,_session_id:&str) -> Result<()> {Ok(())}
-        async fn active_session_id_for(&self,_session_id:&str) -> Option<String> {Some("parent-history".into())}
-        async fn prompt_stream(&self,request:BackendRequest,sink:Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
-            let turn = self.turn.fetch_add(1,Ordering::AcqRel);
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock".into(),
+                capability: crate::backend::mock_capability(),
+            }
+        }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            true
+        }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            Some("parent-history".into())
+        }
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            let turn = self.turn.fetch_add(1, Ordering::AcqRel);
             if turn == 0 {
-                let scope = request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("root has no authenticated agent lane")?;
-                let response = scope.invoke("agent_spawn",json!({"profile":"worker","text":"CHILD_RESULT"})).await?;
+                let scope = request
+                    .control_context
+                    .as_ref()
+                    .and_then(|context| context.agent.as_ref())
+                    .context("root has no authenticated agent lane")?;
+                let response = scope
+                    .invoke(
+                        "agent_spawn",
+                        json!({"profile":"worker","text":"CHILD_RESULT"}),
+                    )
+                    .await?;
                 assert!(response.contains("admitted"));
             } else {
-                anyhow::ensure!(turn == 1,"parent continuation duplicated");
-                anyhow::ensure!(request.backend_session_id.as_deref() == Some("parent-history"),"parent lost its conversation");
-                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),"parent continuation omitted child result");
+                anyhow::ensure!(turn == 1, "parent continuation duplicated");
+                anyhow::ensure!(
+                    request.backend_session_id.as_deref() == Some("parent-history"),
+                    "parent lost its conversation"
+                );
+                anyhow::ensure!(
+                    matches!(&request.input,BackendInput::Text {text, ..} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),
+                    "parent continuation omitted child result"
+                );
             }
-            if let Some(sink) = sink {sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,kind:"assistant_message".into(),
-                text:Some(if turn == 0 {"Waiting for child"} else {"SYNTHESIZED_RESULT"}.into()),data:Value::Null,activity:None,summary:None,task_update:None}).await?;}
-            Ok(crate::backend::BackendOutput {backend_session_id:Some("parent-history".into()),capability:self.descriptor().capability,..Default::default()})
+            if let Some(sink) = sink {
+                sink.send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some(
+                        if turn == 0 {
+                            "Waiting for child"
+                        } else {
+                            "SYNTHESIZED_RESULT"
+                        }
+                        .into(),
+                    ),
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            }
+            Ok(crate::backend::BackendOutput {
+                backend_session_id: Some("parent-history".into()),
+                capability: self.descriptor().capability,
+                ..Default::default()
+            })
         }
     }
 
     #[tokio::test]
-    async fn model_child_completes_through_the_active_root_lane_and_continues_the_same_exchange() -> Result<()> {
+    async fn model_child_completes_through_the_active_root_lane_and_continues_the_same_exchange()
+    -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
-        let mut broker = planning_question_broker(repository.path(),data.path(),false);
-        let backend = Arc::new(DelegatingRootBackend {turn:AtomicU64::new(0)});
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let backend = Arc::new(DelegatingRootBackend {
+            turn: AtomicU64::new(0),
+        });
         broker.backend = backend.clone();
         broker.agent_coordinator.set_enabled(true);
-        tokio::time::timeout(std::time::Duration::from_secs(5),broker.run_interaction("Root request".into(),PromptMode::Chat,
-            Some(ExchangeAdmission::chat("Root request".into())))).await??;
-        assert_eq!(backend.turn.load(Ordering::Acquire),2);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            broker.run_interaction(
+                "Root request".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Root request".into())),
+            ),
+        )
+        .await??;
+        assert_eq!(backend.turn.load(Ordering::Acquire), 2);
         let exchange = broker.store.list_exchange(&broker.session.id)?;
-        assert_eq!(exchange.len(),1);
-        assert_eq!(exchange[0].state,ExchangeState::Complete);
-        assert!(exchange[0].turn.iter().flat_map(|turn|turn.messages()).any(|message|message.text().contains("SYNTHESIZED_RESULT")));
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].state, ExchangeState::Complete);
+        assert!(
+            exchange[0]
+                .turn
+                .iter()
+                .flat_map(|turn| turn.messages())
+                .any(|message| message.text().contains("SYNTHESIZED_RESULT"))
+        );
         let task = broker.store.list_agent_task(&broker.session.id)?;
-        assert_eq!(task.len(),1);
+        assert_eq!(task.len(), 1);
         assert!(task[0].parent_reported);
-        assert_eq!(task[0].parent_exchange_id,exchange[0].id);
+        assert_eq!(task[0].parent_exchange_id, exchange[0].id);
         Ok(())
     }
 
@@ -8739,15 +11664,23 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let preferences = crate::settings::PortableSettings {
-            access: Some(crate::session::AccessPolicy::default()), ..Default::default()
+            access: Some(crate::session::AccessPolicy::default()),
+            ..Default::default()
         };
         for provider in ["copilot", "claude", "antigravity", "mock", "codex"] {
             broker.session.backend = provider.into();
             broker.session.access.sandbox = true;
             preferences.apply(&mut broker.session, true).unwrap();
             assert_eq!(broker.session.access.sandbox, provider == "codex");
-            broker.configure_session(json!({"access":crate::session::AccessPolicy::default()})).await.unwrap();
-            let stored = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+            broker
+                .configure_session(json!({"access":crate::session::AccessPolicy::default()}))
+                .await
+                .unwrap();
+            let stored = broker
+                .store
+                .load_session(&broker.session.id)
+                .unwrap()
+                .unwrap();
             assert_eq!(stored.access.sandbox, provider == "codex");
         }
         assert!(preferences.access.unwrap().sandbox);
@@ -8764,17 +11697,38 @@ mod test {
             writable_directory: vec![writable.path().to_string_lossy().into_owned()],
             ..Default::default()
         };
-        broker.configure_session(json!({"access":policy})).await.unwrap();
-        let stored = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        broker
+            .configure_session(json!({"access":policy}))
+            .await
+            .unwrap();
+        let stored = broker
+            .store
+            .load_session(&broker.session.id)
+            .unwrap()
+            .unwrap();
         assert!(!stored.access.sandbox);
         assert_eq!(stored.access.writable_directory.len(), 1);
         assert_eq!(stored.execution_mode, PermissionMode::Read);
-        let preference = broker.store.load_preference(&stored.workspace, &stored.backend).unwrap().unwrap();
+        let preference = broker
+            .store
+            .load_preference(&stored.workspace, &stored.backend)
+            .unwrap()
+            .unwrap();
         assert_eq!(preference.access, stored.access);
-        broker.select_execution_mode(json!({"mode":"yolo"})).unwrap();
+        broker
+            .select_execution_mode(json!({"mode":"yolo"}))
+            .unwrap();
         assert_eq!(broker.session.access, stored.access);
-        assert!(broker.configure_session(json!({"default_write_permission":"yolo","effort":""})).await.is_err());
-        assert_eq!(broker.session.default_write_permission, PermissionMode::Write);
+        assert!(
+            broker
+                .configure_session(json!({"default_write_permission":"yolo","effort":""}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            broker.session.default_write_permission,
+            PermissionMode::Write
+        );
         assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"windows_sandbox":"elevated"}})).await.is_err());
         assert_eq!(broker.session.access, stored.access);
     }
@@ -8785,18 +11739,33 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.create_task(TaskKind::Plan, "First".into(), None, None).unwrap();
+        broker
+            .create_task(TaskKind::Plan, "First".into(), None, None)
+            .unwrap();
         let first = broker.session.current_task_id.clone().unwrap();
         broker.pause_task(false).await.unwrap();
-        broker.create_task(TaskKind::Plan, "Second".into(), None, None).unwrap();
+        broker
+            .create_task(TaskKind::Plan, "Second".into(), None, None)
+            .unwrap();
         let second = broker.session.current_task_id.clone().unwrap();
         broker.pause_task(true).await.unwrap();
         let tasks = broker.store.list_task(&broker.session.id).unwrap();
         assert_eq!(tasks.len(), 2);
-        assert_eq!(tasks.iter().find(|task| task.id == first).unwrap().status, TaskStatus::Paused);
-        assert_eq!(tasks.iter().find(|task| task.id == second).unwrap().status, TaskStatus::Cancelled);
+        assert_eq!(
+            tasks.iter().find(|task| task.id == first).unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            tasks.iter().find(|task| task.id == second).unwrap().status,
+            TaskStatus::Cancelled
+        );
         assert!(broker.session.current_task_id.is_none());
-        assert!(broker.transition_task(json!({"action":"resume","task_id":second})).await.is_err());
+        assert!(
+            broker
+                .transition_task(json!({"action":"resume","task_id":second}))
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -8806,53 +11775,120 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let goal = broker.create_goal("Persist goal".into(), false).unwrap();
-        broker.create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id)).unwrap();
+        broker
+            .create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id))
+            .unwrap();
         broker.pause_task(false).await.unwrap();
-        broker.transition_task(json!({"action":"permission","mode":"write"})).await.unwrap();
+        broker
+            .transition_task(json!({"action":"permission","mode":"write"}))
+            .await
+            .unwrap();
         let task = broker.current_task().unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Paused);
         assert_eq!(task.permission, PermissionMode::Write);
         assert_eq!(task.last_write_permission, PermissionMode::Write);
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn restart_recovers_clear_without_replaying_or_deleting_task_history() {
-        use crate::task::{TaskKind, TaskStatus, TaskOperation};
+        use crate::task::{TaskKind, TaskOperation, TaskStatus};
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
+        broker
+            .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
+            .unwrap();
         let operation = TaskOperation {
-            id: "clear-before-shutdown".into(), session_id: broker.session.id.clone(),
-            action: json!({"action":"clear"}), state: "accepted".into(), error: None, exchange_id: None,
-            created_at_ms: 1, resume_after_transition: false,
+            id: "clear-before-shutdown".into(),
+            session_id: broker.session.id.clone(),
+            action: json!({"action":"clear"}),
+            state: "accepted".into(),
+            error: None,
+            exchange_id: None,
+            created_at_ms: 1,
+            resume_after_transition: false,
         };
         broker.store.admit_task_operation(&operation).unwrap();
-        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
-        let session = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)
+            .unwrap();
+        let session = broker
+            .store
+            .load_session(&broker.session.id)
+            .unwrap()
+            .unwrap();
         assert!(session.current_task_id.is_none());
-        assert_eq!(broker.store.list_task(&session.id).unwrap()[0].status, TaskStatus::Cancelled);
+        assert_eq!(
+            broker.store.list_task(&session.id).unwrap()[0].status,
+            TaskStatus::Cancelled
+        );
         assert!(broker.store.list_exchange(&session.id).unwrap().is_empty());
-        assert_eq!(broker.store.load_task_operation(&session.id, &operation.id).unwrap().unwrap().state, "outcome_unknown");
+        assert_eq!(
+            broker
+                .store
+                .load_task_operation(&session.id, &operation.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            "outcome_unknown"
+        );
     }
 
     #[test]
     fn task_operations_deduplicate_and_survive_runtime_recovery_without_replay() {
-        use crate::task::{TaskKind, TaskStatus, TaskOperation};
+        use crate::task::{TaskKind, TaskOperation, TaskStatus};
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
-        let mut operation = TaskOperation { id: "original".into(), session_id: broker.session.id.clone(), action: json!({"action":"plan","text":"Original"}), state: "running".into(), error: None, exchange_id: None, created_at_ms: 1, resume_after_transition: false };
+        broker
+            .create_task(TaskKind::Plan, "Interrupted".into(), None, None)
+            .unwrap();
+        let mut operation = TaskOperation {
+            id: "original".into(),
+            session_id: broker.session.id.clone(),
+            action: json!({"action":"plan","text":"Original"}),
+            state: "running".into(),
+            error: None,
+            exchange_id: None,
+            created_at_ms: 1,
+            resume_after_transition: false,
+        };
         assert!(broker.store.admit_task_operation(&operation).unwrap());
         assert!(!broker.store.admit_task_operation(&operation).unwrap());
         operation.action["text"] = json!("Changed");
         assert!(broker.store.admit_task_operation(&operation).is_err());
-        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
-        assert_eq!(broker.current_task().unwrap().unwrap().status, TaskStatus::Paused);
-        assert_eq!(broker.store.load_task_operation(&broker.session.id, "original").unwrap().unwrap().state, "outcome_unknown");
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)
+            .unwrap();
+        assert_eq!(
+            broker.current_task().unwrap().unwrap().status,
+            TaskStatus::Paused
+        );
+        assert_eq!(
+            broker
+                .store
+                .load_task_operation(&broker.session.id, "original")
+                .unwrap()
+                .unwrap()
+                .state,
+            "outcome_unknown"
+        );
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -8867,12 +11903,20 @@ mod test {
         })).unwrap();
         broker.store.save_exchange(&exchange).unwrap();
         let operation = crate::task::TaskOperation {
-            id:"failed-operation".into(), session_id:broker.session.id.clone(),
-            action:json!({"action":"plan"}), state:"failed".into(), error:Some("provider failed".into()),
-            exchange_id:Some(exchange.id.clone()), created_at_ms:1, resume_after_transition:false,
+            id: "failed-operation".into(),
+            session_id: broker.session.id.clone(),
+            action: json!({"action":"plan"}),
+            state: "failed".into(),
+            error: Some("provider failed".into()),
+            exchange_id: Some(exchange.id.clone()),
+            created_at_ms: 1,
+            resume_after_transition: false,
         };
         broker.store.admit_task_operation(&operation).unwrap();
-        assert_eq!(broker.snapshot().unwrap().task_operation.unwrap()["error"], "provider failed");
+        assert_eq!(
+            broker.snapshot().unwrap().task_operation.unwrap()["error"],
+            "provider failed"
+        );
         exchange.id = "next-exchange".into();
         exchange.ordinal = 2;
         exchange.state = ExchangeState::Complete;
@@ -8880,37 +11924,93 @@ mod test {
         exchange.completed_at_ms = Some(4);
         broker.store.save_exchange(&exchange).unwrap();
         assert!(broker.snapshot().unwrap().task_operation.is_none());
-        assert_eq!(broker.store.load_task_operation(&broker.session.id, &operation.id).unwrap().unwrap().error,
-            Some("provider failed".into()));
+        assert_eq!(
+            broker
+                .store
+                .load_task_operation(&broker.session.id, &operation.id)
+                .unwrap()
+                .unwrap()
+                .error,
+            Some("provider failed".into())
+        );
     }
 
     use super::*;
 
     #[cfg(windows)]
-    fn check_fixture(repository: &Path, data: &Path, commands: Vec<String>, manual: bool) -> HarnessBroker {
-        let mut broker=planning_question_broker(repository,data,false);
-        let mut document=crate::plan::test_fixture("check-plan","Check fixture");
-        let mut design=crate::plan::DeclarationDesign::default();
-        design.document.objective="Check accepted commands".into();
-        design.document.background="A repository fixture".into();
-        design.document.design="Harness owns the command gate".into();
-        let config = crate::checks::CheckConfig {version:2,definitions:commands.into_iter().enumerate().map(|(index,command)| crate::checks::CheckDefinition {
-            auto: true,
-            id:format!("check-{index}"),name:format!("Check {index}"),category:crate::checks::CheckCategory::Check,enabled:true,
-            area:"Fixture".into(),trigger:crate::checks::CheckTrigger::AnyChange,scope:Default::default(),directory:".".into(),
-            all:crate::checks::CheckOperation { args: None, package_manager: None,command},files:None,cases:None,depends_on:Vec::new()
-        }).collect()};
-        std::fs::write(repository.join(".forge.json"),serde_json::to_vec(&json!({"checks":config})).unwrap()).unwrap();
-        design.document.verification=if manual { vec!["Observe manual result".into()] } else { Vec::new() };
-        design.proposed.insert(".gitignore".into(),"/target/\n".into());
-        document.design=Some(design);
-        broker.plan_file.write_working_document(&broker.session.id,"check-plan",&document).unwrap();
-        broker.plan_file.submit_document_revision(&broker.session.id,"check-plan",1,1).unwrap();
-        std::fs::write(repository.join(".gitignore"),"/target/\n").unwrap();
-        let goal=GoalRecord { id:"check-goal".into(),session_id:broker.session.id.clone(),objective:"Run checks".into(),
-            state:GoalState::Active,continuation:Default::default(),native:false,created_at_ms:1,updated_at_ms:1 };
+    fn check_fixture(
+        repository: &Path,
+        data: &Path,
+        commands: Vec<String>,
+        manual: bool,
+    ) -> HarnessBroker {
+        let mut broker = planning_question_broker(repository, data, false);
+        let mut document = crate::plan::test_fixture("check-plan", "Check fixture");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Check accepted commands".into();
+        design.document.background = "A repository fixture".into();
+        design.document.design = "Harness owns the command gate".into();
+        let config = crate::checks::CheckConfig {
+            version: 2,
+            definitions: commands
+                .into_iter()
+                .enumerate()
+                .map(|(index, command)| crate::checks::CheckDefinition {
+                    auto: true,
+                    id: format!("check-{index}"),
+                    name: format!("Check {index}"),
+                    category: crate::checks::CheckCategory::Check,
+                    enabled: true,
+                    area: "Fixture".into(),
+                    trigger: crate::checks::CheckTrigger::AnyChange,
+                    scope: Default::default(),
+                    directory: ".".into(),
+                    all: crate::checks::CheckOperation {
+                        args: None,
+                        package_manager: None,
+                        command,
+                    },
+                    files: None,
+                    cases: None,
+                    depends_on: Vec::new(),
+                })
+                .collect(),
+        };
+        std::fs::write(
+            repository.join(".forge.json"),
+            serde_json::to_vec(&json!({"checks":config})).unwrap(),
+        )
+        .unwrap();
+        design.document.verification = if manual {
+            vec!["Observe manual result".into()]
+        } else {
+            Vec::new()
+        };
+        design
+            .proposed
+            .insert(".gitignore".into(), "/target/\n".into());
+        document.design = Some(design);
+        broker
+            .plan_file
+            .write_working_document(&broker.session.id, "check-plan", &document)
+            .unwrap();
+        broker
+            .plan_file
+            .submit_document_revision(&broker.session.id, "check-plan", 1, 1)
+            .unwrap();
+        std::fs::write(repository.join(".gitignore"), "/target/\n").unwrap();
+        let goal = GoalRecord {
+            id: "check-goal".into(),
+            session_id: broker.session.id.clone(),
+            objective: "Run checks".into(),
+            state: GoalState::Active,
+            continuation: Default::default(),
+            native: false,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        };
         broker.store.save_goal(&goal).unwrap();
-        broker.session.goal_id=Some(goal.id.clone());
+        broker.session.goal_id = Some(goal.id.clone());
         broker.save_session().unwrap();
         let execution:PlanExecutionRecord=serde_json::from_value(json!({
             "id":"check-execution","session_id":broker.session.id,"plan_id":"check-plan","goal_id":goal.id,
@@ -8926,123 +12026,270 @@ mod test {
     #[cfg(windows)]
     #[tokio::test]
     async fn harness_checks_own_exit_codes_output_and_manual_gate_without_model_turns() {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),vec![
-            "Write-Output 'accepted stdout'; [Console]::Error.WriteLine('accepted stderr')".into(),"exit 7".into(),"Write-Output 'last check'".into()
-        ],true);
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = check_fixture(
+            repository.path(),
+            data.path(),
+            vec![
+                "Write-Output 'accepted stdout'; [Console]::Error.WriteLine('accepted stderr')"
+                    .into(),
+                "exit 7".into(),
+                "Write-Output 'last check'".into(),
+            ],
+            true,
+        );
         broker.run_checks().await.unwrap();
-        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.phase,crate::plan::PlanPhase::Resolve);
-        let run=&execution.check_runs[0];
-        assert_eq!(run.commands[1].exit_code,Some(7));
-        assert_eq!(run.commands[2].state,crate::checks::CheckState::Passed);
-        assert!(std::fs::read_to_string(&run.commands[0].stdout).unwrap().contains("accepted stdout"));
-        assert!(std::fs::read_to_string(&run.commands[0].stderr).unwrap().contains("accepted stderr"));
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        let execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.phase, crate::plan::PlanPhase::Resolve);
+        let run = &execution.check_runs[0];
+        assert_eq!(run.commands[1].exit_code, Some(7));
+        assert_eq!(run.commands[2].state, crate::checks::CheckState::Passed);
+        assert!(
+            std::fs::read_to_string(&run.commands[0].stdout)
+                .unwrap()
+                .contains("accepted stdout")
+        );
+        assert!(
+            std::fs::read_to_string(&run.commands[0].stderr)
+                .unwrap()
+                .contains("accepted stderr")
+        );
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
         assert!(execution.verification.is_empty());
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn harness_checks_reject_unplanned_public_api_without_manual_verification() {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),Vec::new(),false);
-        let baseline=crate::checkpoint::GitCheckpoint::new(&broker.session.workspace)
-            .capture(&broker.store.objects,&broker.repositories,&broker.session.id,1).await.unwrap();
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = check_fixture(repository.path(), data.path(), Vec::new(), false);
+        let baseline = crate::checkpoint::GitCheckpoint::new(&broker.session.workspace)
+            .capture(
+                &broker.store.objects,
+                &broker.repositories,
+                &broker.session.id,
+                1,
+            )
+            .await
+            .unwrap();
         broker.store.save_checkpoint(&baseline).unwrap();
-        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        execution.baseline_checkpoint=Some(baseline.id.clone());
+        let mut execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        execution.baseline_checkpoint = Some(baseline.id.clone());
         broker.store.save_plan_execution(&execution).unwrap();
-        std::fs::write(repository.path().join("extra.rs"),"pub fn unplanned() {}\n").unwrap();
+        std::fs::write(
+            repository.path().join("extra.rs"),
+            "pub fn unplanned() {}\n",
+        )
+        .unwrap();
         broker.run_checks().await.unwrap();
-        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.phase,crate::plan::PlanPhase::Resolve);
+        let execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.phase, crate::plan::PlanPhase::Resolve);
         assert!(!execution.check_runs[0].progress.different.is_empty());
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn harness_checks_pass_before_manual_verification() {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output 'passed'".into()],true);
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = check_fixture(
+            repository.path(),
+            data.path(),
+            vec!["Write-Output 'passed'".into()],
+            true,
+        );
         broker.run_checks().await.unwrap();
-        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.phase,crate::plan::PlanPhase::Verify);
-        assert_eq!(execution.check_runs[0].state,crate::checks::CheckState::Passed);
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        let execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.phase, crate::plan::PlanPhase::Verify);
+        assert_eq!(
+            execution.check_runs[0].state,
+            crate::checks::CheckState::Passed
+        );
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn detached_check_recovery_retains_saved_output_and_pauses_the_gate() {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output retained".into()],true);
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = check_fixture(
+            repository.path(),
+            data.path(),
+            vec!["Write-Output retained".into()],
+            true,
+        );
         broker.run_checks().await.unwrap();
-        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        execution.phase=crate::plan::PlanPhase::Checking;
-        let run=&mut execution.check_runs[0];
-        run.state=crate::checks::CheckState::Running;
-        run.commands[0].state=crate::checks::CheckState::Running;
-        run.commands[0].output_bytes=0;
-        let output=run.commands[0].output.clone();
+        let mut execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        execution.phase = crate::plan::PlanPhase::Checking;
+        let run = &mut execution.check_runs[0];
+        run.state = crate::checks::CheckState::Running;
+        run.commands[0].state = crate::checks::CheckState::Running;
+        run.commands[0].output_bytes = 0;
+        let output = run.commands[0].output.clone();
         broker.store.save_plan_execution(&execution).unwrap();
-        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
-        let recovered=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(recovered.state,PlanExecutionState::Paused);
-        assert_eq!(recovered.phase,crate::plan::PlanPhase::Checking);
-        assert_eq!(recovered.check_runs[0].state,crate::checks::CheckState::Interrupted);
-        assert_eq!(recovered.check_runs[0].commands[0].state,crate::checks::CheckState::Interrupted);
-        assert_eq!(recovered.check_runs[0].commands[0].output_bytes,std::fs::metadata(&output).unwrap().len());
-        assert!(std::fs::read_to_string(output).unwrap().contains("retained"));
-        assert_eq!(broker.active_goal().unwrap().state,GoalState::Paused);
+        broker
+            .store
+            .interrupt_detached_execution(&broker.session.id)
+            .unwrap();
+        let recovered = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(recovered.state, PlanExecutionState::Paused);
+        assert_eq!(recovered.phase, crate::plan::PlanPhase::Checking);
+        assert_eq!(
+            recovered.check_runs[0].state,
+            crate::checks::CheckState::Interrupted
+        );
+        assert_eq!(
+            recovered.check_runs[0].commands[0].state,
+            crate::checks::CheckState::Interrupted
+        );
+        assert_eq!(
+            recovered.check_runs[0].commands[0].output_bytes,
+            std::fs::metadata(&output).unwrap().len()
+        );
+        assert!(
+            std::fs::read_to_string(output)
+                .unwrap()
+                .contains("retained")
+        );
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn harness_checks_complete_without_a_manual_exchange_when_no_actions_apply() {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output complete".into()],false);
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = check_fixture(
+            repository.path(),
+            data.path(),
+            vec!["Write-Output complete".into()],
+            false,
+        );
         broker.run_checks().await.unwrap();
-        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.state,PlanExecutionState::Complete);
-        assert_eq!(broker.active_goal().unwrap().state,GoalState::Complete);
+        let execution = broker
+            .store
+            .load_plan_execution("check-execution")
+            .unwrap()
+            .unwrap();
+        assert_eq!(execution.state, PlanExecutionState::Complete);
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Complete);
         assert!(execution.check_runs[0].completed_plan.is_some());
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        assert!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[cfg(windows)]
     #[tokio::test]
     async fn harness_check_cancellation_preserves_results_and_resumes_interrupted_command() {
-        for changed in [false,true] {
-        let repository=repository(); let data=tempfile::tempdir().unwrap();
-        let mut broker=check_fixture(repository.path(),data.path(),vec!["New-Item target -ItemType Directory -Force | Out-Null; Add-Content target/completed.txt first".into(),
+        for changed in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker=check_fixture(repository.path(),data.path(),vec!["New-Item target -ItemType Directory -Force | Out-Null; Add-Content target/completed.txt first".into(),
             "Set-Content target/started.txt started; if (-not (Test-Path target/resume.txt)) { Start-Sleep 30 }; Write-Output resumed".into()],true);
-        let cancellation=broker.turn_cancellation();
-        let marker=repository.path().join("target/started.txt");
-        let cancel=tokio::spawn(async move {
-            tokio::time::timeout(std::time::Duration::from_secs(10),async {
-                while !marker.is_file() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
-            }).await.unwrap();
-            cancellation.request(false);
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(15),broker.run_checks()).await.unwrap().unwrap();
-        cancel.await.unwrap();
-        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.state,PlanExecutionState::Paused);
-        assert_eq!(execution.check_runs[0].commands[1].state,crate::checks::CheckState::Interrupted);
-        // Reuse is intentionally rejected when user changes workspace contents.
-        std::fs::write(repository.path().join("target/resume.txt"),"resume").unwrap();
-        if changed { std::fs::write(repository.path().join("extra.rs"),"fn helper() {}\n").unwrap(); }
-        broker.turn_cancellation.arm(false);
-        execution.state=PlanExecutionState::Active;
-        broker.store.save_plan_execution(&execution).unwrap();
-        let mut goal=broker.active_goal().unwrap(); goal.resume(100);broker.store.save_goal(&goal).unwrap();
-        broker.run_checks().await.unwrap();
-        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
-        assert_eq!(execution.phase,crate::plan::PlanPhase::Verify);
-        assert_eq!(execution.check_runs.len(),if changed {2} else {1});
-        assert_eq!(std::fs::read_to_string(repository.path().join("target/completed.txt")).unwrap().lines().count(),if changed {2} else {1});
+            let cancellation = broker.turn_cancellation();
+            let marker = repository.path().join("target/started.txt");
+            let cancel = tokio::spawn(async move {
+                tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                    while !marker.is_file() {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                })
+                .await
+                .unwrap();
+                cancellation.request(false);
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(15), broker.run_checks())
+                .await
+                .unwrap()
+                .unwrap();
+            cancel.await.unwrap();
+            let mut execution = broker
+                .store
+                .load_plan_execution("check-execution")
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.state, PlanExecutionState::Paused);
+            assert_eq!(
+                execution.check_runs[0].commands[1].state,
+                crate::checks::CheckState::Interrupted
+            );
+            // Reuse is intentionally rejected when user changes workspace contents.
+            std::fs::write(repository.path().join("target/resume.txt"), "resume").unwrap();
+            if changed {
+                std::fs::write(repository.path().join("extra.rs"), "fn helper() {}\n").unwrap();
+            }
+            broker.turn_cancellation.arm(false);
+            execution.state = PlanExecutionState::Active;
+            broker.store.save_plan_execution(&execution).unwrap();
+            let mut goal = broker.active_goal().unwrap();
+            goal.resume(100);
+            broker.store.save_goal(&goal).unwrap();
+            broker.run_checks().await.unwrap();
+            let execution = broker
+                .store
+                .load_plan_execution("check-execution")
+                .unwrap()
+                .unwrap();
+            assert_eq!(execution.phase, crate::plan::PlanPhase::Verify);
+            assert_eq!(execution.check_runs.len(), if changed { 2 } else { 1 });
+            assert_eq!(
+                std::fs::read_to_string(repository.path().join("target/completed.txt"))
+                    .unwrap()
+                    .lines()
+                    .count(),
+                if changed { 2 } else { 1 }
+            );
         }
     }
 
@@ -9051,17 +12298,48 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let result = broker.dispatch(Request { id:1,method:"prompt.submit".into(),params:json!({"text":"/plan add coverage"}) }).await;
-        assert!(result.response.error().is_none(), "{:?}",result.response.error());
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"/plan add coverage"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        let before = broker.plan_file.read_working_document(&broker.session.id,&plan.id).unwrap();
+        let before = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)
+            .unwrap();
         std::fs::write(repository.path().join(".forge.json"),serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
             "id":"unit","name":"Unit tests","area":"Core","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"exit 0"}
         }]}})).unwrap()).unwrap();
         assert!(broker.refresh_check_review(&plan.id).unwrap());
-        let after = broker.plan_file.read_working_document(&broker.session.id,&plan.id).unwrap();
-        assert_eq!(before.design.as_ref().unwrap().document,after.design.as_ref().unwrap().document);
-        assert_eq!(after.design.as_ref().unwrap().check_configuration.as_ref().unwrap().config.definitions[0].id,"unit");
+        let after = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)
+            .unwrap();
+        assert_eq!(
+            before.design.as_ref().unwrap().document,
+            after.design.as_ref().unwrap().document
+        );
+        assert_eq!(
+            after
+                .design
+                .as_ref()
+                .unwrap()
+                .check_configuration
+                .as_ref()
+                .unwrap()
+                .config
+                .definitions[0]
+                .id,
+            "unit"
+        );
         assert!(!broker.refresh_check_review(&plan.id).unwrap());
     }
 
@@ -9070,11 +12348,23 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let result = broker.dispatch(Request { id: 1, method: "prompt.submit".into(),
-            params: json!({"text":"/plan add test coverage"}) }).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"/plan add test coverage"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let mut plan = broker.snapshot().unwrap().active_plan.unwrap();
-        let mut document = broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap();
+        let mut document = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)
+            .unwrap();
         document.design.as_mut().unwrap().document.tests = serde_json::from_value(json!([
             {"file":"src/game.rs","cases":[
                 {"name":"first","change":"new","description":"First expected result"},
@@ -9083,31 +12373,74 @@ mod test {
                 {"name":"first","change":"new","description":"Separate file"},
                 {"name":"fourth","change":"modified","description":"Fourth result"},
                 {"name":"keep","change":"reused","description":"Existing coverage"}]}
-        ])).unwrap();
-        let (_, _, checksum) = broker.plan_file.submit_validated_document_revision(&broker.session.id,
-            &plan.id, plan.model_revision, document.version, document.clone()).unwrap();
+        ]))
+        .unwrap();
+        let (_, _, checksum) = broker
+            .plan_file
+            .submit_validated_document_revision(
+                &broker.session.id,
+                &plan.id,
+                plan.model_revision,
+                document.version,
+                document.clone(),
+            )
+            .unwrap();
         plan.review_digest = Some(checksum.clone());
         broker.store.save_plan(&plan).unwrap();
-        let source = broker.observer.capture_plan_review(&plan.id, &checksum).unwrap();
+        let source = broker
+            .observer
+            .capture_plan_review(&plan.id, &checksum)
+            .unwrap();
         let review = crate::plan::review_document::PlanReviewDocument::new(
-            forge_buffer::identity::DocumentId("delete-tests".into()), forge_buffer::identity::ViewId("view".into()),
-            source, Default::default(), None).unwrap();
+            forge_buffer::identity::DocumentId("delete-tests".into()),
+            forge_buffer::identity::ViewId("view".into()),
+            source,
+            Default::default(),
+            None,
+        )
+        .unwrap();
         let store = crate::plan::review_document::PlanReviewStore::default();
-        let admission = store.admit(forge_buffer::identity::DocumentId("delete-tests".into())).unwrap();
+        let admission = store
+            .admit(forge_buffer::identity::DocumentId("delete-tests".into()))
+            .unwrap();
         let opened = store.insert(review, admission).unwrap();
-        assert!(opened["source_edit"]["upsert"].as_array().unwrap().iter().any(|row| row["test"]["name"] == "fourth"));
+        assert!(
+            opened["source_edit"]["upsert"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["test"]["name"] == "fourth")
+        );
         let mut annotation = Vec::new();
         for name in ["keep", "fourth"] {
-            let line = opened["source_edit"]["upsert"].as_array().unwrap().iter()
-                .find(|row| row["test"]["name"] == name).unwrap()["source_line"].as_u64().unwrap() as u32;
+            let line = opened["source_edit"]["upsert"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["test"]["name"] == name)
+                .unwrap()["source_line"]
+                .as_u64()
+                .unwrap() as u32;
             annotation.push(crate::plan::ReviewAnnotation {
-                id: name.into(), parent_id: None,
-                source: crate::plan::PlanAnnotationInput { start_line: line, end_line: line, body: format!("Review {name}") },
-                anchor: None, kind: crate::plan::ReviewAnnotationKind::Comment, reply: None,
+                id: name.into(),
+                parent_id: None,
+                source: crate::plan::PlanAnnotationInput {
+                    start_line: line,
+                    end_line: line,
+                    body: format!("Review {name}"),
+                },
+                anchor: None,
+                kind: crate::plan::ReviewAnnotationKind::Comment,
+                reply: None,
             });
         }
-        store.save_annotations(&forge_buffer::identity::DocumentId("delete-tests".into()),
-            opened["saved_source_digest"].as_str().unwrap(), annotation).unwrap();
+        store
+            .save_annotations(
+                &forge_buffer::identity::DocumentId("delete-tests".into()),
+                opened["saved_source_digest"].as_str().unwrap(),
+                annotation,
+            )
+            .unwrap();
         let selected = json!([
             {"file":"src/game.rs","name":"first"}, {"file":"src/game.rs","name":"second"},
             {"file":"tests/game.rs","name":"first"}, {"file":"tests/game.rs","name":"fourth"}
@@ -9116,165 +12449,449 @@ mod test {
         let mut invalid = params.clone();
         invalid["tests"][3]["name"] = json!("missing");
         assert!(broker.delete_plan_tests(invalid).is_err());
-        assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), document);
+        assert_eq!(
+            broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)
+                .unwrap(),
+            document
+        );
         let (result, _) = broker.delete_plan_tests(params.clone()).unwrap();
-        let updated = broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap();
+        let updated = broker
+            .plan_file
+            .read_working_document(&broker.session.id, &plan.id)
+            .unwrap();
         let tests = &updated.design.as_ref().unwrap().document.tests;
         assert_eq!(tests.len(), 1);
         assert_eq!(tests[0].file, "tests/game.rs");
         assert_eq!(tests[0].cases.len(), 1);
         assert_eq!(tests[0].cases[0].name, "keep");
-        assert_eq!(document.design.as_ref().unwrap().proposed, updated.design.as_ref().unwrap().proposed);
+        assert_eq!(
+            document.design.as_ref().unwrap().proposed,
+            updated.design.as_ref().unwrap().proposed
+        );
         assert_eq!(updated.version, document.version + 1);
         assert_eq!(result["plan"]["model_revision"], plan.model_revision);
         assert_eq!(result["plan"]["user_revision"], plan.user_revision);
-        assert_eq!(result["plan"]["submitted_version"], serde_json::to_value(plan.submitted_version).unwrap());
+        assert_eq!(
+            result["plan"]["submitted_version"],
+            serde_json::to_value(plan.submitted_version).unwrap()
+        );
         assert!(result.get("lifecycle").is_none());
-        assert!(broker.delete_plan_tests(params).unwrap_err().to_string().contains("plan changed"));
-        assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), updated);
+        assert!(
+            broker
+                .delete_plan_tests(params)
+                .unwrap_err()
+                .to_string()
+                .contains("plan changed")
+        );
+        assert_eq!(
+            broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)
+                .unwrap(),
+            updated
+        );
         let reopened: PlanRecord = serde_json::from_value(result["plan"].clone()).unwrap();
-        let source = broker.observer.capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap()).unwrap();
+        let source = broker
+            .observer
+            .capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap())
+            .unwrap();
         assert!(source.rendered.markdown.contains("keep"));
         let review = crate::plan::review_document::PlanReviewDocument::new(
-            forge_buffer::identity::DocumentId("after-delete".into()), forge_buffer::identity::ViewId("after-view".into()),
-            source, Default::default(), None).unwrap();
-        let admission = store.admit(forge_buffer::identity::DocumentId("after-delete".into())).unwrap();
+            forge_buffer::identity::DocumentId("after-delete".into()),
+            forge_buffer::identity::ViewId("after-view".into()),
+            source,
+            Default::default(),
+            None,
+        )
+        .unwrap();
+        let admission = store
+            .admit(forge_buffer::identity::DocumentId("after-delete".into()))
+            .unwrap();
         let opened = store.insert(review, admission).unwrap();
         assert_eq!(opened["annotation"].as_array().unwrap().len(), 1);
         assert_eq!(opened["annotation"][0]["id"], "keep");
-        let line = opened["annotation"][0]["source"]["start_line"].as_u64().unwrap();
-        assert!(opened["source_edit"]["upsert"].as_array().unwrap().iter().any(|row| row["source_line"] == line && row["test"]["name"] == "keep"));
+        let line = opened["annotation"][0]["source"]["start_line"]
+            .as_u64()
+            .unwrap();
+        assert!(
+            opened["source_edit"]["upsert"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|row| row["source_line"] == line && row["test"]["name"] == "keep")
+        );
         assert!(!repository.path().join("src/game.rs").exists());
-        broker.delete_plan_tests(json!({"plan_id":plan.id,"digest":reopened.review_digest,
-            "expected_version":updated.version,"tests":[{"file":"tests/game.rs","name":"keep"}]})).unwrap();
-        assert!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap()
-            .design.unwrap().document.tests.is_empty());
+        broker
+            .delete_plan_tests(json!({"plan_id":plan.id,"digest":reopened.review_digest,
+            "expected_version":updated.version,"tests":[{"file":"tests/game.rs","name":"keep"}]}))
+            .unwrap();
+        assert!(
+            broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)
+                .unwrap()
+                .design
+                .unwrap()
+                .document
+                .tests
+                .is_empty()
+        );
         let draft = broker.store.load_plan(&plan.id).unwrap().unwrap();
-        let saved_revision = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision).unwrap();
+        let saved_revision = broker
+            .plan_file
+            .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision)
+            .unwrap();
         assert_eq!(saved_revision, document);
-        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
-        broker.capability.execution_mode_list = vec![PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo];
-        broker.begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest})).await.unwrap();
+        assert!(
+            broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
+                .is_err()
+        );
+        broker.capability.execution_mode_list = vec![
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ];
+        broker
+            .begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest}))
+            .await
+            .unwrap();
         broker.cancel_plan_acceptance().unwrap();
-        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
-        let invalid = broker.dispatch(Request { id: 2, method: "plan.accept".into(),
-            params: json!({"plan_id":plan.id,"digest":"stale","execution_mode":"write"}) }).await;
+        assert!(
+            broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
+                .is_err()
+        );
+        let invalid = broker
+            .dispatch(Request {
+                id: 2,
+                method: "plan.accept".into(),
+                params: json!({"plan_id":plan.id,"digest":"stale","execution_mode":"write"}),
+            })
+            .await;
         assert!(invalid.response.error().is_some());
-        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
-        broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: plan.model_revision + 1 });
+        assert!(
+            broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1)
+                .is_err()
+        );
+        broker.backend = Arc::new(SemanticExecutionBackend {
+            turn: Default::default(),
+            revision: plan.model_revision + 1,
+        });
         let accepted = broker.dispatch(Request { id: 3, method: "plan.accept".into(),
             params: json!({"plan_id":plan.id,"digest":draft.review_digest,"execution_mode":"write"}) }).await;
-        assert!(accepted.response.error().is_none(), "{:?}", accepted.response.error());
+        assert!(
+            accepted.response.error().is_none(),
+            "{:?}",
+            accepted.response.error()
+        );
         let finalized = broker.store.load_plan(&plan.id).unwrap().unwrap();
         assert_eq!(finalized.model_revision, plan.model_revision + 1);
         assert_eq!(finalized.user_revision, plan.user_revision + 1);
         assert_eq!(finalized.accepted_digest, draft.review_digest);
         assert_eq!(finalized.manual_changes, draft.manual_changes);
-        assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, finalized.model_revision).unwrap(),
-            broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap());
-        assert_eq!(broker.store.list_plan_lifecycle(&broker.session.id).unwrap().iter()
-            .filter(|record| record.kind == PlanLifecycleKind::RevisionCreated).count(), 1);
+        assert_eq!(
+            broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, finalized.model_revision)
+                .unwrap(),
+            broker
+                .plan_file
+                .read_working_document(&broker.session.id, &plan.id)
+                .unwrap()
+        );
+        assert_eq!(
+            broker
+                .store
+                .list_plan_lifecycle(&broker.session.id)
+                .unwrap()
+                .iter()
+                .filter(|record| record.kind == PlanLifecycleKind::RevisionCreated)
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
     async fn declaration_design_acceptance_executes_verifies_resolves_and_completes() {
         let repository = repository();
         crate::checks::configure_fixture(repository.path());
-        std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
+        std::fs::write(repository.path().join("lib.rs"), "pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
         let initialize = InitializeRequest {
             background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
-            data_root:data.path().to_string_lossy().into_owned(),permission_file:None,
-            workspace:repository.path().to_string_lossy().into_owned(),client_id:"design-test".into(),
-            backend:BackendLaunch { kind:"mock".into(),command:vec!["mock".into()] },model:"mock-model".into(),effort:"medium".into(),session_id:None,new_session_name:None,goal_max_turns:20,lease_conflict_action:None,
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: repository.path().to_string_lossy().into_owned(),
+            client_id: "design-test".into(),
+            backend: BackendLaunch {
+                kind: "mock".into(),
+                command: vec!["mock".into()],
+            },
+            model: "mock-model".into(),
+            effort: "medium".into(),
+            session_id: None,
+            new_session_name: None,
+            goal_max_turns: 20,
+            lease_conflict_action: None,
         };
-        let mut broker = HarnessBroker::initialize_with_clock(initialize.clone(),Box::new(FixedClock(100))).unwrap();
-        let result = broker.dispatch(Request { id:1,method:"prompt.submit".into(),params:json!({"text":"/plan add a reusable API"}) }).await;
-        assert!(result.response.error().is_none(),"{:?}",result.response.error());
+        let mut broker =
+            HarnessBroker::initialize_with_clock(initialize.clone(), Box::new(FixedClock(100)))
+                .unwrap();
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"/plan add a reusable API"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
-        assert_eq!(plan.state,PlanState::AwaitingReview);
-        let source = broker.observer.capture_plan_review(&plan.id,plan.review_digest.as_deref().unwrap()).unwrap();
+        assert_eq!(plan.state, PlanState::AwaitingReview);
+        let source = broker
+            .observer
+            .capture_plan_review(&plan.id, plan.review_digest.as_deref().unwrap())
+            .unwrap();
         assert!(source.rendered.markdown.contains("requested_change"));
-        let line = source.rendered.navigation.anchor.iter().find(|anchor| matches!(anchor.target,crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().line;
+        let line = source
+            .rendered
+            .navigation
+            .anchor
+            .iter()
+            .find(|anchor| {
+                matches!(
+                    anchor.target,
+                    crate::plan::PlanReviewTarget::Declaration { .. }
+                )
+            })
+            .unwrap()
+            .line;
         let result = broker.dispatch(Request { id:2,method:"plan.request_changes".into(),params:json!({"plan_id":plan.id,"comment":"Refine the API name","annotations":[{"start_line":line,"end_line":line,"body":"Use reviewed_change"}]}) }).await;
-        assert!(result.response.error().is_none(),"{:?}",result.response.error());
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let mut revised = broker.snapshot().unwrap().active_plan.unwrap();
-        assert_eq!(revised.model_revision,2);
-        revised.manual_changes = vec!["Renamed requested_change to reviewed_change".into(),
-            "Removed planned tests: tests/change.rs::obsolete_case".into()];
+        assert_eq!(revised.model_revision, 2);
+        revised.manual_changes = vec![
+            "Renamed requested_change to reviewed_change".into(),
+            "Removed planned tests: tests/change.rs::obsolete_case".into(),
+        ];
         broker.store.save_plan(&revised).unwrap();
-        let source = broker.observer.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
+        let source = broker
+            .observer
+            .capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap())
+            .unwrap();
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
-        for (path, expected) in [("Objective", &overview.objective), ("Design", &overview.design),
-            ("Verification", &overview.verification.iter().map(|action|format!("- {action}")).collect::<Vec<_>>().join("\n"))] {
-            let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
-                "revision":2,"document":true,"path":path})).unwrap();
+        for (path, expected) in [
+            ("Objective", &overview.objective),
+            ("Design", &overview.design),
+            (
+                "Verification",
+                &overview
+                    .verification
+                    .iter()
+                    .map(|action| format!("- {action}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
+        ] {
+            let (snapshot, _) = broker
+                .read_plan_declaration(json!({"plan_id":revised.id,
+                "revision":2,"document":true,"path":path}))
+                .unwrap();
             assert_eq!(snapshot["text"].as_str().unwrap(), expected);
         }
-        assert!(broker.read_plan_declaration(json!({"plan_id":revised.id,
-            "revision":2,"document":true,"path":"unknown"})).is_err());
+        assert!(
+            broker
+                .read_plan_declaration(json!({"plan_id":revised.id,
+            "revision":2,"document":true,"path":"unknown"}))
+                .is_err()
+        );
         let session_id = broker.session.id.clone();
         drop(broker);
         let mut initialize = initialize;
         initialize.session_id = Some(session_id);
-        let mut broker = HarnessBroker::initialize_with_clock(initialize,Box::new(FixedClock(200))).unwrap();
-        assert_eq!(broker.snapshot().unwrap().active_plan.as_ref().unwrap().state,PlanState::AwaitingReview);
+        let mut broker =
+            HarnessBroker::initialize_with_clock(initialize, Box::new(FixedClock(200))).unwrap();
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .active_plan
+                .as_ref()
+                .unwrap()
+                .state,
+            PlanState::AwaitingReview
+        );
         let result = broker.dispatch(Request { id:3,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest,"comment":"  \n "}) }).await;
-        assert!(result.response.error().is_none(),"{:?}",result.response.error());
-        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.unwrap().overall_comment, None);
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .active_plan
+                .unwrap()
+                .acceptance
+                .unwrap()
+                .overall_comment,
+            None
+        );
         let reviewer_comment = "Preserve the public API name during execution";
         let result = broker.dispatch(Request { id:4,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest,"comment":reviewer_comment}) }).await;
-        assert!(result.response.error().is_none(),"{:?}",result.response.error());
-        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.unwrap().overall_comment.as_deref(), Some(reviewer_comment));
-        let planning_exchange_id = broker.store.list_exchange(&broker.session.id).unwrap()
-            .last().unwrap().id.clone();
-        broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 2 });
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .active_plan
+                .unwrap()
+                .acceptance
+                .unwrap()
+                .overall_comment
+                .as_deref(),
+            Some(reviewer_comment)
+        );
+        let planning_exchange_id = broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .last()
+            .unwrap()
+            .id
+            .clone();
+        broker.backend = Arc::new(SemanticExecutionBackend {
+            turn: Default::default(),
+            revision: 2,
+        });
         let result = broker.transition_task(json!({"action":"execute","plan_id":revised.id,"digest":revised.review_digest,"comment":null})).await;
         let (result, _) = result.unwrap();
         assert_eq!(result["manual_changes"], json!(revised.manual_changes));
         let snapshot = broker.snapshot().unwrap();
-        let acceptance = broker.store.list_plan_lifecycle(&broker.session.id).unwrap()
-            .into_iter().find(|event| event.kind == PlanLifecycleKind::Accepted).unwrap();
-        assert_eq!(acceptance.overall_comment.as_deref(), Some(reviewer_comment));
-        assert_ne!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
+        let acceptance = broker
+            .store
+            .list_plan_lifecycle(&broker.session.id)
+            .unwrap()
+            .into_iter()
+            .find(|event| event.kind == PlanLifecycleKind::Accepted)
+            .unwrap();
+        assert_eq!(
+            acceptance.overall_comment.as_deref(),
+            Some(reviewer_comment)
+        );
+        assert_ne!(
+            acceptance.anchor.as_ref().unwrap().exchange_id,
+            planning_exchange_id
+        );
         assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
-        assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Checking);
+        assert_eq!(
+            snapshot.goal_execution.as_ref().unwrap().phase,
+            crate::plan::PlanPhase::Checking
+        );
         let execution_id = snapshot.goal_execution.unwrap().id;
-        let persisted_execution = broker.store.load_plan_execution(&execution_id).unwrap().unwrap();
+        let persisted_execution = broker
+            .store
+            .load_plan_execution(&execution_id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted_execution.approval_comments, [reviewer_comment]);
         broker.pause_goal().await.unwrap();
-        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
+        assert_eq!(
+            broker.snapshot().unwrap().goal_execution.unwrap().phase,
+            crate::plan::PlanPhase::Checking
+        );
         let mut resumed = InitializeRequest {
             background: None,
             backend_launch_by_provider: Default::default(),
             config_dir: None,
-            data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
-            workspace:repository.path().to_string_lossy().into_owned(), client_id:"design-test".into(),
-            backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:Some(broker.session.id.clone()), new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: repository.path().to_string_lossy().into_owned(),
+            client_id: "design-test".into(),
+            backend: BackendLaunch {
+                kind: "mock".into(),
+                command: vec!["mock".into()],
+            },
+            model: "mock-model".into(),
+            effort: "medium".into(),
+            session_id: Some(broker.session.id.clone()),
+            new_session_name: None,
+            goal_max_turns: 20,
+            lease_conflict_action: None,
         };
         drop(broker);
-        let mut broker = HarnessBroker::initialize_with_clock(resumed.clone(), Box::new(FixedClock(300))).unwrap();
-        assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
-        broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(1), revision:2 });
+        let mut broker =
+            HarnessBroker::initialize_with_clock(resumed.clone(), Box::new(FixedClock(300)))
+                .unwrap();
+        assert_eq!(
+            broker.snapshot().unwrap().goal.unwrap().state,
+            GoalState::Paused
+        );
+        broker.backend = Arc::new(SemanticExecutionBackend {
+            turn: std::sync::atomic::AtomicUsize::new(1),
+            revision: 2,
+        });
         broker.resume_goal(None, None, None).await.unwrap();
-        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Resolve);
+        assert_eq!(
+            broker.snapshot().unwrap().goal_execution.unwrap().phase,
+            crate::plan::PlanPhase::Resolve
+        );
         resumed.session_id = Some(broker.session.id.clone());
         drop(broker);
-        let mut broker = HarnessBroker::initialize_with_clock(resumed, Box::new(FixedClock(400))).unwrap();
+        let mut broker =
+            HarnessBroker::initialize_with_clock(resumed, Box::new(FixedClock(400))).unwrap();
         let recovered = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(recovered.approval_comments, [reviewer_comment]);
         assert_eq!(recovered.phase, crate::plan::PlanPhase::Resolve);
         assert_eq!(recovered.state, PlanExecutionState::Paused);
-        assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
-        broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(2), revision:2 });
+        assert_eq!(
+            broker.snapshot().unwrap().goal.unwrap().state,
+            GoalState::Paused
+        );
+        broker.backend = Arc::new(SemanticExecutionBackend {
+            turn: std::sync::atomic::AtomicUsize::new(2),
+            revision: 2,
+        });
         broker.resume_goal(None, None, None).await.unwrap();
         for expected in [crate::plan::PlanPhase::Verify] {
-            let result = broker.dispatch(Request { id:5, method:"goal.continue".into(), params:json!({}) }).await;
-            assert!(result.response.error().is_none(), "{:?}", result.response.error());
-            assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, expected);
+            let result = broker
+                .dispatch(Request {
+                    id: 5,
+                    method: "goal.continue".into(),
+                    params: json!({}),
+                })
+                .await;
+            assert!(
+                result.response.error().is_none(),
+                "{:?}",
+                result.response.error()
+            );
+            assert_eq!(
+                broker.snapshot().unwrap().goal_execution.unwrap().phase,
+                expected
+            );
         }
         let snapshot = broker.snapshot().unwrap();
         assert_eq!(snapshot.goal.unwrap().state, GoalState::Complete);
@@ -9282,82 +12899,210 @@ mod test {
         assert_eq!(execution.id, execution_id);
         assert_eq!(execution.state, PlanExecutionState::Complete);
         assert_eq!(execution.verification.len(), 2);
-        let report = broker.plan_file.implementation_report(execution.implementation_report.as_ref().unwrap()).unwrap();
+        let report = broker
+            .plan_file
+            .implementation_report(execution.implementation_report.as_ref().unwrap())
+            .unwrap();
         assert_eq!(report.original_revision, 2);
         assert_eq!(report.accepted_revision, 2);
-        assert!(report.file.iter().any(|file| file.path == "unexpected.rs" && !file.internal.is_empty()));
+        assert!(
+            report
+                .file
+                .iter()
+                .any(|file| file.path == "unexpected.rs" && !file.internal.is_empty())
+        );
         assert!(execution.baseline_checkpoint.is_some());
-        assert_eq!(std::fs::read_to_string(repository.path().join("lib.rs")).unwrap(),"pub struct Existing;\n");
-        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap().into_iter()
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("lib.rs")).unwrap(),
+            "pub struct Existing;\n"
+        );
+        let exchanges = broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .into_iter()
             .filter(|exchange| exchange.execution_id.as_deref() == Some(&execution_id))
             .collect::<Vec<_>>();
         assert_eq!(exchanges.len(), 4);
-        assert_eq!(exchanges.iter().map(|exchange| exchange.execution_phase.as_ref().unwrap().phase)
-            .collect::<Vec<_>>(), vec![crate::plan::PlanPhase::Implement, crate::plan::PlanPhase::Verify,
-                crate::plan::PlanPhase::Resolve, crate::plan::PlanPhase::Verify]);
-        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete));
-        assert_eq!(exchanges.iter().map(|exchange| &exchange.id).collect::<HashSet<_>>().len(), 4);
-        assert_eq!(exchanges.iter().map(|exchange| exchange.metrics.request_count).collect::<Vec<_>>(), vec![1, 1, 1, 1]);
-        assert_eq!(exchanges.iter().map(|exchange| exchange.usage().input).collect::<Vec<_>>(),
-            vec![Some(100), Some(101), Some(102), Some(103)]);
-        assert_eq!(exchanges.iter().map(|exchange| exchange.usage().output).collect::<Vec<_>>(),
-            vec![Some(20), Some(21), Some(22), Some(23)]);
-        assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
-            .filter(|tool| tool.title == "Observe fixture").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
-        assert_eq!(exchanges[0].lifecycle.as_deref(), Some("Plan implementation started"));
-        assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Plan verification started"));
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange.execution_phase.as_ref().unwrap().phase)
+                .collect::<Vec<_>>(),
+            vec![
+                crate::plan::PlanPhase::Implement,
+                crate::plan::PlanPhase::Verify,
+                crate::plan::PlanPhase::Resolve,
+                crate::plan::PlanPhase::Verify
+            ]
+        );
+        assert!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Complete)
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| &exchange.id)
+                .collect::<HashSet<_>>()
+                .len(),
+            4
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange.metrics.request_count)
+                .collect::<Vec<_>>(),
+            vec![1, 1, 1, 1]
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange.usage().input)
+                .collect::<Vec<_>>(),
+            vec![Some(100), Some(101), Some(102), Some(103)]
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange.usage().output)
+                .collect::<Vec<_>>(),
+            vec![Some(20), Some(21), Some(22), Some(23)]
+        );
+        assert_eq!(
+            exchanges
+                .iter()
+                .map(|exchange| exchange
+                    .turn
+                    .iter()
+                    .flat_map(|turn| turn.tools())
+                    .filter(|tool| tool.title == "Observe fixture")
+                    .count())
+                .collect::<Vec<_>>(),
+            vec![0, 1, 0, 1]
+        );
+        assert_eq!(
+            exchanges[0].lifecycle.as_deref(),
+            Some("Plan implementation started")
+        );
+        assert_eq!(
+            exchanges[3].lifecycle.as_deref(),
+            Some("Plan verification started")
+        );
         let snapshot = broker.snapshot().unwrap();
-        let acceptance_owner = snapshot.timeline.iter().filter_map(|entry| match entry {
-            crate::timeline::TimelineEntry::Exchange { exchange, .. }
-                if exchange.node_list.iter().any(|node| matches!(node,
+        let acceptance_owner = snapshot
+            .timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                crate::timeline::TimelineEntry::Exchange { exchange, .. }
+                    if exchange.node_list.iter().any(|node| {
+                        matches!(node,
                     crate::exchange::ExchangeNode::PlanEvent { event }
-                    if event.id == acceptance.id)) => Some(exchange.id.as_str()),
-            _ => None,
-        }).collect::<Vec<_>>();
+                    if event.id == acceptance.id)
+                    }) =>
+                {
+                    Some(exchange.id.as_str())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         assert_eq!(acceptance_owner, vec![exchanges[0].id.as_str()]);
         let text = timeline_text(&snapshot);
-        assert!(text.find("Plan accepted:").unwrap() < text.find("Plan implementation started").unwrap());
-        for label in ["Plan accepted:", "Implemented", "Verification failed", "Resolved", "Verified", "Verification passed", "Plan complete:"] {
+        assert!(
+            text.find("Plan accepted:").unwrap()
+                < text.find("Plan implementation started").unwrap()
+        );
+        for label in [
+            "Plan accepted:",
+            "Implemented",
+            "Verification failed",
+            "Resolved",
+            "Verified",
+            "Verification passed",
+            "Plan complete:",
+        ] {
             assert!(text.contains(label), "missing {label}: {text}");
         }
         let failed_phase = exchanges[1].execution_phase.as_ref().unwrap();
-        assert!(failed_phase.summary.as_ref().is_some_and(|summary| !summary.is_empty()));
+        assert!(
+            failed_phase
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.is_empty())
+        );
         assert!(!failed_phase.findings.is_empty());
         assert!(text.contains(&failed_phase.findings[0]));
         let passed_phase = exchanges[3].execution_phase.as_ref().unwrap();
         assert!(passed_phase.findings.is_empty());
-        assert!(passed_phase.summary.as_ref().is_some_and(|summary| !summary.is_empty()));
+        assert!(
+            passed_phase
+                .summary
+                .as_ref()
+                .is_some_and(|summary| !summary.is_empty())
+        );
         assert_eq!(text.matches("Plan accepted:").count(), 1);
-        assert!(!text.contains("Accept plan:") && !text.contains("Execution started") && !text.contains("Plan turn complete"));
-        let review = broker.observer.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
-        assert!(review.execution_review.unwrap().contains("Verification assessments"));
+        assert!(
+            !text.contains("Accept plan:")
+                && !text.contains("Execution started")
+                && !text.contains("Plan turn complete")
+        );
+        let review = broker
+            .observer
+            .capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap())
+            .unwrap();
+        assert!(
+            review
+                .execution_review
+                .unwrap()
+                .contains("Verification assessments")
+        );
     }
 
     struct NoProgressExecutionBackend;
 
-    struct StoppedExecutionBackend { cancelled: bool }
+    struct StoppedExecutionBackend {
+        cancelled: bool,
+    }
 
     #[async_trait::async_trait]
     impl Backend for StoppedExecutionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, _: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
-            if self.cancelled { return Err(anyhow::Error::new(TurnCancelled)) }
+        async fn prompt_stream(
+            &self,
+            _: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            if self.cancelled {
+                return Err(anyhow::Error::new(TurnCancelled));
+            }
             anyhow::bail!("provider connection lost")
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
@@ -9371,20 +13116,47 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.backend = Arc::from(crate::backend::build(
-                BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone(),
-            ).unwrap());
-            broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+            broker.backend = Arc::from(
+                crate::backend::build(
+                    BackendLaunch {
+                        kind: "mock".into(),
+                        command: vec!["mock".into()],
+                    },
+                    Arc::clone(&broker.permission_coordinator),
+                    Arc::clone(&broker.trace),
+                    broker.data_root.clone(),
+                )
+                .unwrap(),
+            );
+            broker
+                .submit_prompt(json!({"text":"/plan add a reusable API"}))
+                .await
+                .unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
-            let (result, _) = broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            let (result, _) = broker
+                .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+                .await
+                .unwrap();
             assert_eq!(result["execution_error"].as_str().is_some(), !cancelled);
             let history = broker.store.list_exchange(&broker.session.id).unwrap();
             let stopped = history.last().unwrap();
-            assert_eq!(stopped.state, if cancelled { ExchangeState::Cancelled } else { ExchangeState::Failed });
-            assert_eq!(stopped.execution_phase.as_ref().unwrap().phase, crate::plan::PlanPhase::Implement);
-            assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
+            assert_eq!(
+                stopped.state,
+                if cancelled {
+                    ExchangeState::Cancelled
+                } else {
+                    ExchangeState::Failed
+                }
+            );
+            assert_eq!(
+                stopped.execution_phase.as_ref().unwrap().phase,
+                crate::plan::PlanPhase::Implement
+            );
+            assert_eq!(
+                broker.snapshot().unwrap().goal.unwrap().state,
+                GoalState::Paused
+            );
             let text = timeline_text(&broker.snapshot().unwrap());
             assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
             assert_eq!(text.matches("Plan accepted:").count(), 1);
@@ -9393,39 +13165,90 @@ mod test {
             broker.resume_goal(None, None, None).await.unwrap();
             let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
             assert_ne!(resumed.last().unwrap().id, stopped_id);
-            assert_eq!(resumed.last().unwrap().execution_phase.as_ref().unwrap().phase, crate::plan::PlanPhase::Implement);
-            assert_eq!(timeline_text(&broker.snapshot().unwrap()).matches("Plan accepted:").count(), 1);
+            assert_eq!(
+                resumed
+                    .last()
+                    .unwrap()
+                    .execution_phase
+                    .as_ref()
+                    .unwrap()
+                    .phase,
+                crate::plan::PlanPhase::Implement
+            );
+            assert_eq!(
+                timeline_text(&broker.snapshot().unwrap())
+                    .matches("Plan accepted:")
+                    .count(),
+                1
+            );
         }
     }
 
     #[async_trait::async_trait]
     impl Backend for NoProgressExecutionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
             let context = request.control_context.unwrap();
             let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
             let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
-            runtime.invoke(crate::control_tools::ControlToolInvocation { name:"plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
-            assert!(runtime.invoke(crate::control_tools::ControlToolInvocation { name:"goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
-            Ok(crate::backend::BackendOutput { evidence:crate::goal::TurnEvidence { tool_called:true, structured_complete:true, ..Default::default() }, ..Default::default() })
+            runtime
+                .invoke(crate::control_tools::ControlToolInvocation {
+                    name: "plan_read".into(),
+                    arguments: json!({"plan_id":plan_id}),
+                })
+                .await?;
+            assert!(
+                runtime
+                    .invoke(crate::control_tools::ControlToolInvocation {
+                        name: "goal_complete".into(),
+                        arguments: json!({"summary":"premature"})
+                    })
+                    .await
+                    .is_err()
+            );
+            Ok(crate::backend::BackendOutput {
+                evidence: crate::goal::TurnEvidence {
+                    tool_called: true,
+                    structured_complete: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("test backend cannot fork")
+        }
     }
 
     #[tokio::test]
@@ -9433,41 +13256,95 @@ mod test {
         let repository = repository();
         crate::checks::configure_fixture(repository.path());
         let data = tempfile::tempdir().unwrap();
-        let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
-            background: None,
-            backend_launch_by_provider: Default::default(),
-            config_dir: None,
-            data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
-            workspace:repository.path().to_string_lossy().into_owned(), client_id:"guard-test".into(),
-            backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
-        }, Box::new(FixedClock(100))).unwrap();
-        broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                background: None,
+                backend_launch_by_provider: Default::default(),
+                config_dir: None,
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "guard-test".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "medium".into(),
+                session_id: None,
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(100)),
+        )
+        .unwrap();
+        broker
+            .submit_prompt(json!({"text":"/plan add a reusable API"}))
+            .await
+            .unwrap();
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         broker.backend = Arc::new(NoProgressExecutionBackend);
-        let (_, first) = broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
-        assert!(first.iter().any(|event| event.event == "goal_continue_requested"));
+        let (_, first) = broker
+            .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+            .await
+            .unwrap();
+        assert!(
+            first
+                .iter()
+                .any(|event| event.event == "goal_continue_requested")
+        );
         let (_, second) = broker.continue_goal().await.unwrap();
-        assert!(!second.iter().any(|event| event.event == "goal_continue_requested"));
+        assert!(
+            !second
+                .iter()
+                .any(|event| event.event == "goal_continue_requested")
+        );
         let stalled = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(stalled.state, PlanExecutionState::Stalled);
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
-        assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 2);
-        let attempts = broker.store.list_exchange(&broker.session.id).unwrap().into_iter()
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .goal
+                .unwrap()
+                .continuation
+                .turn_count,
+            2
+        );
+        let attempts = broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .into_iter()
             .filter(|exchange| exchange.execution_id.as_deref() == Some(&stalled.id))
             .collect::<Vec<_>>();
         assert_eq!(attempts.len(), 2);
         assert_ne!(attempts[0].id, attempts[1].id);
         assert_eq!(attempts[0].state, ExchangeState::Complete);
         assert_eq!(attempts[0].execution_phase.as_ref().unwrap().outcome, None);
-        assert_eq!(attempts[1].lifecycle.as_deref(), Some("Plan implementation continued"));
+        assert_eq!(
+            attempts[1].lifecycle.as_deref(),
+            Some("Plan implementation continued")
+        );
         assert_eq!(attempts[0].goal_id, attempts[1].goal_id);
         broker.resume_goal(None, None, None).await.unwrap();
         let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(resumed.id, stalled.id);
         assert_eq!(resumed.state, PlanExecutionState::Active);
         assert_eq!(resumed.phase, stalled.phase);
-        assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 1);
+        assert_eq!(
+            broker
+                .snapshot()
+                .unwrap()
+                .goal
+                .unwrap()
+                .continuation
+                .turn_count,
+            1
+        );
     }
 
     struct RevisionExecutionBackend;
@@ -9475,53 +13352,105 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for RevisionExecutionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
-            let context = request.control_context.context("missing execution context")?;
+            let context = request
+                .control_context
+                .context("missing execution context")?;
             let document = context.plan_document.as_ref().unwrap();
             let plan_id = document.plan_id.clone();
             let version = document.version;
             let description = &document.design.as_ref().unwrap().document.design;
             let before = serde_json::to_string(description)?;
-            let after = serde_json::to_string(&format!("{description} Preserve score reset behavior."))?;
-            std::fs::write(Path::new(&request.workspace).join("added.rs"), "pub fn extra() {}\n")?;
-            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n+Algorithm\n+  return 0\n*** End Patch");
+            let after =
+                serde_json::to_string(&format!("{description} Preserve score reset behavior."))?;
+            std::fs::write(
+                Path::new(&request.workspace).join("added.rs"),
+                "pub fn extra() {}\n",
+            )?;
+            let patch = format!(
+                "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n+Algorithm\n+  return 0\n*** End Patch"
+            );
             let mut runtime = ControlToolRuntime::new(context);
-            runtime.invoke(ControlToolInvocation { name:"design_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
+            runtime
+                .invoke(ControlToolInvocation {
+                    name: "design_patch".into(),
+                    arguments: json!({"plan_id":plan_id,"expected_version":version,"patch":patch}),
+                })
+                .await?;
             let result = runtime.invoke(ControlToolInvocation { name:"plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
-            assert!(!runtime.execution_finished(), "revision review must retain the provider turn");
+            assert!(
+                !runtime.execution_finished(),
+                "revision review must retain the provider turn"
+            );
             let response: Value = serde_json::from_str(&result.message)?;
-            assert!(response.get("document").is_none(), "internal canonical source must not inflate tool output");
+            assert!(
+                response.get("document").is_none(),
+                "internal canonical source must not inflate tool output"
+            );
             if response["plan_state"] == "accepted" && response["revision"] == 2 {
-                assert_eq!(response["approval_comments"], json!(["Keep this approved scope"]),
-                    "live plan_submit response must include the accepted reviewer note");
+                assert_eq!(
+                    response["approval_comments"],
+                    json!(["Keep this approved scope"]),
+                    "live plan_submit response must include the accepted reviewer note"
+                );
             }
-            let read = runtime.invoke(ControlToolInvocation { name:"plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
+            let read = runtime
+                .invoke(ControlToolInvocation {
+                    name: "plan_read".into(),
+                    arguments: json!({"plan_id":plan_id}),
+                })
+                .await?;
             let state: Value = serde_json::from_str(&read.message)?;
-            assert_eq!(state["execution"]["generation"], response["generation"], "the next tool must use the reviewed generation");
-            let canonical = runtime.invoke(ControlToolInvocation { name:"plan_read".into(),
-                arguments:json!({"plan_id":plan_id,"path":"plan.json"}) }).await?;
+            assert_eq!(
+                state["execution"]["generation"], response["generation"],
+                "the next tool must use the reviewed generation"
+            );
+            let canonical = runtime
+                .invoke(ControlToolInvocation {
+                    name: "plan_read".into(),
+                    arguments: json!({"plan_id":plan_id,"path":"plan.json"}),
+                })
+                .await?;
             let rejected = response["plan_state"] == "accepted" && response["revision"] == 1;
-            assert_eq!(canonical.message.contains("score reset"), !rejected,
-                "the running provider must adopt the reviewed canonical document");
+            assert_eq!(
+                canonical.message.contains("score reset"),
+                !rejected,
+                "the running provider must adopt the reviewed canonical document"
+            );
             Ok(crate::backend::BackendOutput {
-                backend_session_id:Some("revision-execution".into()),
+                backend_session_id: Some("revision-execution".into()),
                 capability: crate::backend::BackendCapability {
                     execution_mode_list: vec![PermissionMode::Write],
                     ..Default::default()
@@ -9529,31 +13458,75 @@ mod test {
                 ..Default::default()
             })
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("test backend cannot fork")
+        }
     }
 
     #[tokio::test]
     async fn execution_revisions_preserve_the_original_and_respect_review_and_user_pause() {
-        for decision in ["automatic", "accept", "recovered_accept", "recovered_interrupted", "recovered_cancelled", "recovered_failed", "paused_accept", "reject", "changes"] {
+        for decision in [
+            "automatic",
+            "accept",
+            "recovered_accept",
+            "recovered_interrupted",
+            "recovered_cancelled",
+            "recovered_failed",
+            "paused_accept",
+            "reject",
+            "changes",
+        ] {
             let repository = repository();
             crate::checks::configure_fixture(repository.path());
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
-                data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
-                workspace:repository.path().to_string_lossy().into_owned(), client_id:"revision-test".into(),
-                backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
+                config_dir: None,
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: repository.path().to_string_lossy().into_owned(),
+                client_id: "revision-test".into(),
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "medium".into(),
+                session_id: None,
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
             };
-            let mut broker = HarnessBroker::initialize_with_clock(initialize, Box::new(FixedClock(100))).unwrap();
-            let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(), params:json!({"text":"/plan add a reusable API"}) }).await;
-            assert!(planned.response.error().is_none(), "{:?}", planned.response.error());
+            let mut broker =
+                HarnessBroker::initialize_with_clock(initialize, Box::new(FixedClock(100)))
+                    .unwrap();
+            let planned = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "prompt.submit".into(),
+                    params: json!({"text":"/plan add a reusable API"}),
+                })
+                .await;
+            assert!(
+                planned.response.error().is_none(),
+                "{:?}",
+                planned.response.error()
+            );
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
-            let original = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap();
+            let original = broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, 1)
+                .unwrap();
             broker.session.plan_auto_approve_revisions = decision == "automatic";
-            broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 1 });
-            broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            broker.backend = Arc::new(SemanticExecutionBackend {
+                turn: Default::default(),
+                revision: 1,
+            });
+            broker
+                .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+                .await
+                .unwrap();
             broker.continue_goal().await.unwrap();
             broker.backend = Arc::new(RevisionExecutionBackend);
             let review = Arc::clone(&broker.revision_review);
@@ -9567,10 +13540,23 @@ mod test {
                 }
             };
             let (accepted, ()) = tokio::join!(
-                broker.dispatch(Request { id:2, method:"goal.continue".into(), params:json!({}) }),
+                broker.dispatch(Request {
+                    id: 2,
+                    method: "goal.continue".into(),
+                    params: json!({})
+                }),
                 stop_pending,
             );
-            assert!(accepted.response.error().is_none() || (decision != "automatic" && accepted.response.error().is_some_and(|error| error.code == "turn_cancelled")), "{decision}: {:?}", accepted.response.error());
+            assert!(
+                accepted.response.error().is_none()
+                    || (decision != "automatic"
+                        && accepted
+                            .response
+                            .error()
+                            .is_some_and(|error| error.code == "turn_cancelled")),
+                "{decision}: {:?}",
+                accepted.response.error()
+            );
             let execution = broker.snapshot().unwrap().goal_execution.unwrap();
             assert_eq!(execution.original_revision, 1);
             assert_eq!(execution.phase, crate::plan::PlanPhase::Resolve);
@@ -9581,14 +13567,29 @@ mod test {
                 assert_eq!(execution.revision_history[0].approval, "automatic");
                 let rendered = timeline_text(&broker.snapshot().unwrap());
                 assert!(rendered.contains("Plan revision requested"), "{rendered}");
-                assert!(rendered.contains("Plan revision accepted (auto)"), "{rendered}");
+                assert!(
+                    rendered.contains("Plan revision accepted (auto)"),
+                    "{rendered}"
+                );
             } else {
                 assert_eq!(execution.revision, 1);
                 assert_eq!(execution.state, PlanExecutionState::Paused);
-                assert!(broker.resume_goal(None, None, None).await.unwrap_err().to_string().contains("review the pending"));
+                assert!(
+                    broker
+                        .resume_goal(None, None, None)
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("review the pending")
+                );
                 cancellation.arm(false);
                 if decision.starts_with("recovered_") {
-                    let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    let mut previous = broker
+                        .store
+                        .list_exchange(&broker.session.id)
+                        .unwrap()
+                        .pop()
+                        .unwrap();
                     let outcome = match decision {
                         "recovered_interrupted" => ExchangeState::Interrupted,
                         "recovered_cancelled" => ExchangeState::Cancelled,
@@ -9602,47 +13603,149 @@ mod test {
                 }
                 if decision == "paused_accept" {
                     broker.pause_task(false).await.unwrap();
-                    let before = broker.store.list_exchange(&broker.session.id).unwrap().len();
-                    let resumed = broker.dispatch(Request { id:3, method:"task.transition".into(), params:json!({"action":"resume"}) }).await;
-                    assert!(resumed.response.error().is_none(), "{:?}", resumed.response.error());
-                    assert_eq!(broker.current_task().unwrap().unwrap().status, crate::task::TaskStatus::Waiting);
-                    assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), before,
-                        "pending revision resume started provider work before review");
+                    let before = broker
+                        .store
+                        .list_exchange(&broker.session.id)
+                        .unwrap()
+                        .len();
+                    let resumed = broker
+                        .dispatch(Request {
+                            id: 3,
+                            method: "task.transition".into(),
+                            params: json!({"action":"resume"}),
+                        })
+                        .await;
+                    assert!(
+                        resumed.response.error().is_none(),
+                        "{:?}",
+                        resumed.response.error()
+                    );
+                    assert_eq!(
+                        broker.current_task().unwrap().unwrap().status,
+                        crate::task::TaskStatus::Waiting
+                    );
+                    assert_eq!(
+                        broker
+                            .store
+                            .list_exchange(&broker.session.id)
+                            .unwrap()
+                            .len(),
+                        before,
+                        "pending revision resume started provider work before review"
+                    );
                 }
-                let events = if decision == "reject" { broker.cancel_plan(json!({"plan_id":plan.id})).unwrap().1 }
-                    else if decision == "changes" { broker.request_plan_changes(json!({"plan_id":plan.id,"comment":"Retain the approved scope"})).await.unwrap().1 }
-                    else { broker.begin_plan_acceptance(json!({"plan_id":plan.id})).await.unwrap().1 };
+                let events = if decision == "reject" {
+                    broker.cancel_plan(json!({"plan_id":plan.id})).unwrap().1
+                } else if decision == "changes" {
+                    broker
+                        .request_plan_changes(
+                            json!({"plan_id":plan.id,"comment":"Retain the approved scope"}),
+                        )
+                        .await
+                        .unwrap()
+                        .1
+                } else {
+                    broker
+                        .begin_plan_acceptance(json!({"plan_id":plan.id}))
+                        .await
+                        .unwrap()
+                        .1
+                };
                 let updated = broker.snapshot().unwrap().goal_execution.unwrap();
                 assert_eq!(updated.id, execution_id);
                 assert_eq!(updated.phase, execution.phase);
-                assert_eq!(updated.revision, if matches!(decision, "reject" | "changes") { 1 } else { 2 });
+                assert_eq!(
+                    updated.revision,
+                    if matches!(decision, "reject" | "changes") {
+                        1
+                    } else {
+                        2
+                    }
+                );
                 assert!(updated.pending_revision_reason.is_none());
-                assert_eq!(events.iter().any(|event| event.event == "goal_continue_requested"), decision != "paused_accept");
-                assert_eq!(updated.state, if decision == "paused_accept" { PlanExecutionState::Paused } else { PlanExecutionState::Active });
+                assert_eq!(
+                    events
+                        .iter()
+                        .any(|event| event.event == "goal_continue_requested"),
+                    decision != "paused_accept"
+                );
+                assert_eq!(
+                    updated.state,
+                    if decision == "paused_accept" {
+                        PlanExecutionState::Paused
+                    } else {
+                        PlanExecutionState::Active
+                    }
+                );
                 if decision == "reject" {
                     let restored = broker.store.load_plan(&plan.id).unwrap().unwrap();
-                    let source = broker.observer.capture_plan_review(&plan.id, restored.review_digest.as_deref().unwrap()).unwrap();
+                    let source = broker
+                        .observer
+                        .capture_plan_review(&plan.id, restored.review_digest.as_deref().unwrap())
+                        .unwrap();
                     assert_eq!(source.document, original);
                     assert_eq!(updated.revision_history[0].approval, "rejected");
                 }
-                if decision == "changes" { assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::Revising); }
+                if decision == "changes" {
+                    assert_eq!(
+                        broker.snapshot().unwrap().active_plan.unwrap().state,
+                        PlanState::Revising
+                    );
+                }
                 if decision != "paused_accept" {
-                    let previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    let previous = broker
+                        .store
+                        .list_exchange(&broker.session.id)
+                        .unwrap()
+                        .pop()
+                        .unwrap();
                     broker.backend = Arc::new(NoProgressExecutionBackend);
                     broker.continue_goal().await.unwrap();
-                    let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    let continued = broker
+                        .store
+                        .list_exchange(&broker.session.id)
+                        .unwrap()
+                        .pop()
+                        .unwrap();
                     assert_ne!(continued.id, previous.id);
-                    assert_eq!(continued.lifecycle.as_deref(), Some("Plan resolution continued"));
-                    assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
+                    assert_eq!(
+                        continued.lifecycle.as_deref(),
+                        Some("Plan resolution continued")
+                    );
+                    assert_eq!(
+                        continued.execution_id.as_deref(),
+                        Some(execution_id.as_str())
+                    );
                     assert_eq!(continued.kind, ExchangeKind::PlanExecution);
                 }
             }
-            assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap(), original);
-            let revised = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 2).unwrap().design.unwrap();
+            assert_eq!(
+                broker
+                    .plan_file
+                    .read_submitted_document(&broker.session.id, &plan.id, 1)
+                    .unwrap(),
+                original
+            );
+            let revised = broker
+                .plan_file
+                .read_submitted_document(&broker.session.id, &plan.id, 2)
+                .unwrap()
+                .design
+                .unwrap();
             assert!(revised.document.design.contains("score reset"));
             assert!(revised.proposed.contains_key("added.rs"));
-            assert!(!revised.baseline.contains_key("added.rs"), "implemented additions must not become the original baseline");
-            assert!(broker.observer.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
+            assert!(
+                !revised.baseline.contains_key("added.rs"),
+                "implemented additions must not become the original baseline"
+            );
+            assert!(
+                broker
+                    .observer
+                    .execution_review(&plan.id)
+                    .unwrap()
+                    .unwrap()
+                    .contains("Original approved revision: 1")
+            );
         }
     }
 
@@ -9662,7 +13765,9 @@ mod test {
                 }
                 tokio::task::yield_now().await;
             }
-        }).await.expect("provider must reach review without finishing its turn")
+        })
+        .await
+        .expect("provider must reach review without finishing its turn")
     }
 
     #[tokio::test]
@@ -9671,15 +13776,32 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            broker.backend = Arc::from(crate::backend::build(
-                BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone(),
-            ).unwrap());
-            broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+            broker.backend = Arc::from(
+                crate::backend::build(
+                    BackendLaunch {
+                        kind: "mock".into(),
+                        command: vec!["mock".into()],
+                    },
+                    Arc::clone(&broker.permission_coordinator),
+                    Arc::clone(&broker.trace),
+                    broker.data_root.clone(),
+                )
+                .unwrap(),
+            );
+            broker
+                .submit_prompt(json!({"text":"/plan add a reusable API"}))
+                .await
+                .unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.session.plan_auto_approve_revisions = false;
-            broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 1 });
-            broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            broker.backend = Arc::new(SemanticExecutionBackend {
+                turn: Default::default(),
+                revision: 1,
+            });
+            broker
+                .accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"}))
+                .await
+                .unwrap();
             broker.continue_goal().await.unwrap();
             broker.backend = Arc::new(RevisionExecutionBackend);
             let review = Arc::clone(&broker.revision_review);
@@ -9688,82 +13810,161 @@ mod test {
             let before = broker.store.list_exchange(&session_id).unwrap().len();
             let decide = async {
                 let source = wait_for_revision_review(&review, &files, &session_id, &plan.id).await;
-                assert!(source.document.design.as_ref().unwrap().document.design.contains("score reset"));
+                assert!(
+                    source
+                        .document
+                        .design
+                        .as_ref()
+                        .unwrap()
+                        .document
+                        .design
+                        .contains("score reset")
+                );
                 assert!(review.capture(&plan.id, "stale", None).await.is_err());
-                assert!(review.decide(HarnessMethod::PlanAcceptanceBegin,
-                    json!({"plan_id":plan.id,"digest":"stale"})).await.is_err());
+                assert!(
+                    review
+                        .decide(
+                            HarnessMethod::PlanAcceptanceBegin,
+                            json!({"plan_id":plan.id,"digest":"stale"})
+                        )
+                        .await
+                        .is_err()
+                );
                 let (method, params) = match decision {
-                    "accept" => (HarnessMethod::PlanAcceptanceBegin, json!({"plan_id":plan.id,"comment":"Keep this approved scope"})),
+                    "accept" => (
+                        HarnessMethod::PlanAcceptanceBegin,
+                        json!({"plan_id":plan.id,"comment":"Keep this approved scope"}),
+                    ),
                     "reject" => (HarnessMethod::PlanCancel, json!({"plan_id":plan.id})),
-                    _ => (HarnessMethod::PlanRequestChanges, json!({"plan_id":plan.id,"comment":"Retain the approved scope"})),
+                    _ => (
+                        HarnessMethod::PlanRequestChanges,
+                        json!({"plan_id":plan.id,"comment":"Retain the approved scope"}),
+                    ),
                 };
                 let (_, events) = review.decide(method, params).await.unwrap().unwrap();
-                assert!(events.iter().all(|event| event.event != "goal_continue_requested"));
+                assert!(
+                    events
+                        .iter()
+                        .all(|event| event.event != "goal_continue_requested")
+                );
                 if decision == "accept" {
                     assert!(events.iter().any(|event| event.event == "backend_event"
-                        && event.payload["data"]["lifecycle"]["overall_comment"] == "Keep this approved scope"));
+                        && event.payload["data"]["lifecycle"]["overall_comment"]
+                            == "Keep this approved scope"));
                     assert!(events.iter().any(|event| event.event == "plan_accepted"
-                        && event.payload["lifecycle"]["overall_comment"] == "Keep this approved scope"));
+                        && event.payload["lifecycle"]["overall_comment"]
+                            == "Keep this approved scope"));
                 }
             };
             let (accepted, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
                 tokio::join!(broker.continue_goal(), decide)
-            }).await.expect("a live review must resume its waiting provider");
+            })
+            .await
+            .expect("a live review must resume its waiting provider");
             accepted.unwrap();
             let exchanges = broker.store.list_exchange(&session_id).unwrap();
-            assert_eq!(exchanges.len(), before + 1, "review must not start a continuation exchange");
-            assert!(review.capture(&plan.id, "unused", None).await.unwrap().is_none());
+            assert_eq!(
+                exchanges.len(),
+                before + 1,
+                "review must not start a continuation exchange"
+            );
+            assert!(
+                review
+                    .capture(&plan.id, "unused", None)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
             let execution = broker.snapshot().unwrap().goal_execution.unwrap();
             assert!(execution.pending_revision_reason.is_none());
             assert_eq!(execution.revision, if decision == "accept" { 2 } else { 1 });
             if decision == "accept" {
                 let response = broker.revision_review_response(&execution.id).unwrap();
-                assert_eq!(response["approval_comments"], json!(["Keep this approved scope"]));
+                assert_eq!(
+                    response["approval_comments"],
+                    json!(["Keep this approved scope"])
+                );
                 assert_eq!(execution.revision_history.last().unwrap().approval, "user");
             }
             let rendered = timeline_text(&broker.snapshot().unwrap());
             assert!(rendered.contains("Plan revision requested"), "{rendered}");
-            assert!(!rendered.contains("Plan implementation continued"), "{rendered}");
+            assert!(
+                !rendered.contains("Plan implementation continued"),
+                "{rendered}"
+            );
         }
     }
 
-    struct SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize, revision: u32 }
+    struct SemanticExecutionBackend {
+        turn: std::sync::atomic::AtomicUsize,
+        revision: u32,
+    }
 
     #[async_trait::async_trait]
     impl Backend for SemanticExecutionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
             let address = crate::backend::ProviderAddress {
                 owner: None,
-                thread_id: "semantic-execution".into(), turn_id: format!("phase-{turn}"),
+                thread_id: "semantic-execution".into(),
+                turn_id: format!("phase-{turn}"),
             };
-            sink.as_ref().unwrap().send_wait(BackendEvent {
-                received_at_ms: None, address: Some(address.clone()),
-                turn_boundary: Some(crate::backend::TurnBoundary::Started),
-                kind: "turn_started".into(), text: None, data: Value::Null,
-                activity: None, summary: None, task_update: None,
-            }).await?;
-            let context = request.control_context.clone().context("missing control context")?;
+            sink.as_ref()
+                .unwrap()
+                .send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: Some(address.clone()),
+                    turn_boundary: Some(crate::backend::TurnBoundary::Started),
+                    kind: "turn_started".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            let context = request
+                .control_context
+                .clone()
+                .context("missing control context")?;
             let document = context.plan_document.clone().unwrap();
-            let handoff: Value = serde_json::from_str(&document.execution_json(context.execution.as_ref().unwrap().phase)?).unwrap();
+            let handoff: Value = serde_json::from_str(
+                &document.execution_json(context.execution.as_ref().unwrap().phase)?,
+            )
+            .unwrap();
             if turn == 0 || turn == 2 {
                 assert!(handoff["document"].get("verification").is_none());
                 assert!(handoff["document"].get("tests").is_some());
@@ -9771,7 +13972,11 @@ mod test {
                 assert!(handoff["document"].get("verification").is_some());
             }
             let mut runtime = ControlToolRuntime::new(context);
-            let phase = match turn { 0 => "implement", 2 => "resolve", _ => "verify" };
+            let phase = match turn {
+                0 => "implement",
+                2 => "resolve",
+                _ => "verify",
+            };
             let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
             if turn == 0 {
                 let rejected = runtime.invoke(ControlToolInvocation { name: "design_patch".into(), arguments: json!({
@@ -9782,12 +13987,41 @@ mod test {
                     std::fs::create_dir_all(path.parent().unwrap())?;
                     std::fs::write(path, overview.replace("();", "() {}"))?;
                 }
-                std::fs::write(Path::new(&request.workspace).join("unexpected.rs"), "fn unexpected() {}")?;
+                std::fs::write(
+                    Path::new(&request.workspace).join("unexpected.rs"),
+                    "fn unexpected() {}",
+                )?;
             } else if phase == "verify" {
                 let id = format!("check-{turn}");
-                sink.as_ref().unwrap().send_wait(BackendEvent {
-            received_at_ms: None, address:Some(address.clone()), turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
-                    activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"Observe fixture".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
+                sink.as_ref()
+                    .unwrap()
+                    .send_wait(BackendEvent {
+                        received_at_ms: None,
+                        address: Some(address.clone()),
+                        turn_boundary: None,
+                        kind: "tool".into(),
+                        text: None,
+                        data: Value::Null,
+                        activity: Some(crate::backend::ToolActivity {
+                            id: id.clone(),
+                            kind: crate::backend::ToolActivityKind::Command,
+                            title: "Observe fixture".into(),
+                            output: Some(
+                                if turn == 1 {
+                                    "round reset failed"
+                                } else {
+                                    "all checks passed"
+                                }
+                                .into(),
+                            ),
+                            status: Some("completed".into()),
+                            change: Default::default(),
+                            output_delta: false,
+                        }),
+                        summary: None,
+                        task_update: None,
+                    })
+                    .await?;
                 let checks = document.design.as_ref().unwrap().document.verification.iter().map(String::as_str)
                     .map(str::trim).filter(|line| !line.is_empty()).map(|command| json!({
                         "category":"manual", "label":command,
@@ -9798,57 +14032,141 @@ mod test {
                 arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"checks":checks,"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
             }
             if phase == "verify" {
-                let read = runtime.invoke(ControlToolInvocation {
-                    name: "plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
-                }).await.unwrap();
+                let read = runtime
+                    .invoke(ControlToolInvocation {
+                        name: "plan_read".into(),
+                        arguments: json!({"plan_id":document.plan_id}),
+                    })
+                    .await
+                    .unwrap();
                 let inspection: Value = serde_json::from_str(&read.message).unwrap();
-                let available = inspection["execution"]["verification_evidence"].as_array().unwrap();
-                let reference = available.iter().find(|evidence| evidence["id"] == format!("check-{turn}")).unwrap();
+                let available = inspection["execution"]["verification_evidence"]
+                    .as_array()
+                    .unwrap();
+                let reference = available
+                    .iter()
+                    .find(|evidence| evidence["id"] == format!("check-{turn}"))
+                    .unwrap();
                 assert_eq!(reference["title"], "Observe fixture");
                 assert_eq!(inspection["execution"]["phase"], "verify");
                 let mut invalid = arguments.clone();
                 invalid["verification"]["evidence"] = json!(["unobserved-check"]);
-                assert!(runtime.invoke(ControlToolInvocation { name:"plan_phase_done".into(), arguments:invalid }).await.unwrap_err().to_string().contains("not a completed tool result"));
+                assert!(
+                    runtime
+                        .invoke(ControlToolInvocation {
+                            name: "plan_phase_done".into(),
+                            arguments: invalid
+                        })
+                        .await
+                        .unwrap_err()
+                        .to_string()
+                        .contains("not a completed tool result")
+                );
                 if turn == 3 {
                     let mut reused = arguments.clone();
                     reused["verification"]["evidence"] = json!(["check-1"]);
-                    assert!(runtime.invoke(ControlToolInvocation { name:"plan_phase_done".into(), arguments:reused }).await.unwrap_err().to_string().contains("reused verification evidence"));
+                    assert!(
+                        runtime
+                            .invoke(ControlToolInvocation {
+                                name: "plan_phase_done".into(),
+                                arguments: reused
+                            })
+                            .await
+                            .unwrap_err()
+                            .to_string()
+                            .contains("reused verification evidence")
+                    );
                 }
             }
-            let invocation = ControlToolInvocation { name:"plan_phase_done".into(), arguments };
+            let invocation = ControlToolInvocation {
+                name: "plan_phase_done".into(),
+                arguments,
+            };
             let first = runtime.invoke(invocation.clone()).await?;
             let repeated = runtime.invoke(invocation).await?;
             assert_eq!(first.message, repeated.message);
-            assert!(runtime.invoke(ControlToolInvocation { name:"goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
-            sink.as_ref().unwrap().send_wait(BackendEvent {
-                received_at_ms: None, address: Some(address.clone()), turn_boundary: None,
-                kind: "usage".into(), text: None,
-                data: json!({"id":format!("usage-{turn}"), "usage": {
+            assert!(
+                runtime
+                    .invoke(ControlToolInvocation {
+                        name: "goal_complete".into(),
+                        arguments: json!({"summary":"premature"})
+                    })
+                    .await
+                    .is_err()
+            );
+            sink.as_ref()
+                .unwrap()
+                .send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: Some(address.clone()),
+                    turn_boundary: None,
+                    kind: "usage".into(),
+                    text: None,
+                    data: json!({"id":format!("usage-{turn}"), "usage": {
                     "input":100 + turn, "cached_input":10, "reasoning":2, "output":20 + turn
                 }, "cumulative": null, "cumulative_total": null}),
-                activity: None, summary: None, task_update: None,
-            }).await?;
-            sink.as_ref().unwrap().send_wait(BackendEvent {
-                received_at_ms: None, address: Some(address),
-                turn_boundary: Some(crate::backend::TurnBoundary::Finished {
-                    outcome: crate::turn::TurnOutcome::Completed,
-                }),
-                kind: "turn_completed".into(), text: None, data: Value::Null,
-                activity: None, summary: None, task_update: None,
-            }).await?;
-            Ok(crate::backend::BackendOutput { backend_session_id:Some("semantic-execution".into()), capability: crate::backend::BackendCapability { execution_mode_list: vec![PermissionMode::Write], ..Default::default() }, ..Default::default() })
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            sink.as_ref()
+                .unwrap()
+                .send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: Some(address),
+                    turn_boundary: Some(crate::backend::TurnBoundary::Finished {
+                        outcome: crate::turn::TurnOutcome::Completed,
+                    }),
+                    kind: "turn_completed".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            Ok(crate::backend::BackendOutput {
+                backend_session_id: Some("semantic-execution".into()),
+                capability: crate::backend::BackendCapability {
+                    execution_mode_list: vec![PermissionMode::Write],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
         }
-        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("test backend cannot fork")
+        }
     }
 
     /// Render persisted timeline state through the native document projection.
     fn timeline_text(snapshot: &BrokerSnapshot) -> String {
-        snapshot.timeline.iter().flat_map(|entry| {
-            let rendered = crate::buffer::projection::project(entry, &Default::default(), false, &Default::default(), &Default::default()).unwrap();
-            rendered.entry.block.into_iter().flat_map(|block|
-                (0..block.text.row_count()).map(|row| block.text.row(row).unwrap().to_owned()).collect::<Vec<_>>()
-            ).collect::<Vec<_>>()
-        }).collect::<Vec<_>>().join("\n")
+        snapshot
+            .timeline
+            .iter()
+            .flat_map(|entry| {
+                let rendered = crate::buffer::projection::project(
+                    entry,
+                    &Default::default(),
+                    false,
+                    &Default::default(),
+                    &Default::default(),
+                )
+                .unwrap();
+                rendered
+                    .entry
+                    .block
+                    .into_iter()
+                    .flat_map(|block| {
+                        (0..block.text.row_count())
+                            .map(|row| block.text.row(row).unwrap().to_owned())
+                            .collect::<Vec<_>>()
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 
     #[test]
@@ -9873,7 +14191,8 @@ mod test {
         Exchange {
             lifecycle: None,
             mode: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: HarnessSession::primary_agent_id(session_id),
             id: id.into(),
@@ -9917,19 +14236,28 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for SaturatingBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -9939,7 +14267,7 @@ mod test {
             let event_sink = event_sink.unwrap();
             for sequence in 0..384 {
                 let event = BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -9982,9 +14310,9 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = HarnessBroker::initialize_with_clock(
                 InitializeRequest {
-            background: None,
+                    background: None,
                     backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                    config_dir: None,
                     data_root: data.path().to_string_lossy().into_owned(),
                     permission_file: None,
                     workspace: repository.path().to_string_lossy().into_owned(),
@@ -10038,9 +14366,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -10087,8 +14415,13 @@ mod test {
             let consume = async move {
                 let mut notifications = 0;
                 while let Some(event) = stream.recv().await.unwrap() {
-                    assert_ne!(event.kind, "assistant_message", "source content escaped its Rust owner");
-                    if event.kind == "document_changed" { notifications += 1; }
+                    assert_ne!(
+                        event.kind, "assistant_message",
+                        "source content escaped its Rust owner"
+                    );
+                    if event.kind == "document_changed" {
+                        notifications += 1;
+                    }
                 }
                 assert!(notifications > 0);
             };
@@ -10128,21 +14461,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for RestartBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -10151,7 +14495,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
             let mut event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: Some(crate::backend::ProviderAddress {
                     owner: None,
                     thread_id: "restart-thread".into(),
@@ -10171,7 +14515,10 @@ mod test {
                 self.cancellation.request_restart();
                 return std::future::pending().await;
             }
-            assert_eq!(request.backend_session_id.as_deref(), Some("restart-thread"));
+            assert_eq!(
+                request.backend_session_id.as_deref(),
+                Some("restart-thread")
+            );
             assert_eq!(request.execution_mode, PermissionMode::Write);
             assert!(request.input.text().contains("Read to Write"));
             assert!(request.input.text().contains("saved approval rules"));
@@ -10222,8 +14569,20 @@ mod test {
             }
         );
         assert!(before[0].checkpoint_after.is_none());
-        assert_eq!(broker.session.backend_session_id.as_deref(), Some("restart-thread"));
-        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().backend_session_id.as_deref(), Some("restart-thread"));
+        assert_eq!(
+            broker.session.backend_session_id.as_deref(),
+            Some("restart-thread")
+        );
+        assert_eq!(
+            broker
+                .store
+                .load_session(&broker.session.id)
+                .unwrap()
+                .unwrap()
+                .backend_session_id
+                .as_deref(),
+            Some("restart-thread")
+        );
         broker.turn_cancellation.arm(false);
         broker
             .transition_task(json!({"action": "permission", "mode": "write", "resume": true}))
@@ -10290,21 +14649,36 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for CleanupRetryBackend {
-        fn checkpoint_tool_gate(&self) -> bool { true }
+        fn checkpoint_tool_gate(&self) -> bool {
+            true
+        }
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> { Ok(true) }
+        async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> {
+            Ok(true)
+        }
 
         async fn prompt_stream(
             &self,
@@ -10351,7 +14725,9 @@ mod test {
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.create_goal("Complete implementation".into(), false).unwrap();
+        broker
+            .create_goal("Complete implementation".into(), false)
+            .unwrap();
         let mut exchange = completed_interaction("paused-restart", &broker.session.id, Vec::new());
         exchange.state = ExchangeState::Running;
         exchange.completed_at_ms = None;
@@ -10361,7 +14737,14 @@ mod test {
         let stopped = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stopped[0].state, ExchangeState::Cancelled);
         broker.cancel_settled_execution().await.unwrap();
-        assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
+        assert_eq!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[cfg(windows)]
@@ -10372,20 +14755,35 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut goal = broker.create_goal("Finish implementation".into(), false).unwrap();
+        let mut goal = broker
+            .create_goal("Finish implementation".into(), false)
+            .unwrap();
         goal.state = GoalState::Paused;
         broker.store.save_goal(&goal).unwrap();
         let before = GitCheckpoint::new(repository.path())
-            .capture(&broker.store.objects, &broker.repositories, &broker.session.id, 1)
+            .capture(
+                &broker.store.objects,
+                &broker.repositories,
+                &broker.session.id,
+                1,
+            )
             .await
             .unwrap();
-        let mut exchange = completed_interaction("locked-checkpoint", &broker.session.id, Vec::new());
+        let mut exchange =
+            completed_interaction("locked-checkpoint", &broker.session.id, Vec::new());
         exchange.state = ExchangeState::Finalizing;
         exchange.completed_at_ms = None;
         exchange.finalization_outcome = Some(ExchangeState::Cancelled);
         exchange.checkpoint_before = Some(before.id.clone());
-        broker.store.save_checkpoint_exchange(&before, &exchange).unwrap();
-        std::fs::write(repository.path().join("seed.txt"), "changed after checkpoint\n").unwrap();
+        broker
+            .store
+            .save_checkpoint_exchange(&before, &exchange)
+            .unwrap();
+        std::fs::write(
+            repository.path().join("seed.txt"),
+            "changed after checkpoint\n",
+        )
+        .unwrap();
         let locked = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)
@@ -10401,9 +14799,23 @@ mod test {
         drop(locked);
 
         broker.turn_cancellation.request(false);
-        assert!(broker.resume_goal(None, None, None).await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
+        assert!(
+            broker
+                .resume_goal(None, None, None)
+                .await
+                .unwrap_err()
+                .downcast_ref::<TurnCancelled>()
+                .is_some()
+        );
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
-        assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
+        assert_eq!(
+            broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .len(),
+            1
+        );
         broker.turn_cancellation.arm(false);
         let (_, event) = broker.resume_goal(None, None, None).await.unwrap();
         assert_eq!(event[0].event, "goal_changed");
@@ -10482,14 +14894,30 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.name.clear();
-        broker.interaction_for_turn("  Explain\n this repository  ", true, 100).await.unwrap();
+        broker
+            .interaction_for_turn("  Explain\n this repository  ", true, 100)
+            .await
+            .unwrap();
         assert_eq!(broker.session.name, "Explain this repository");
-        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
-            "Explain this repository");
-        broker.interaction_for_turn("Another prompt", true, 101).await.unwrap();
+        assert_eq!(
+            broker
+                .store
+                .load_session(&broker.session.id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "Explain this repository"
+        );
+        broker
+            .interaction_for_turn("Another prompt", true, 101)
+            .await
+            .unwrap();
         assert_eq!(broker.session.name, "Explain this repository");
         broker.session.name = "My explicit name".into();
-        broker.interaction_for_turn("Do not replace this name", true, 102).await.unwrap();
+        broker
+            .interaction_for_turn("Do not replace this name", true, 102)
+            .await
+            .unwrap();
         assert_eq!(broker.session.name, "My explicit name");
     }
 
@@ -10499,10 +14927,20 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.name.clear();
-        broker.interaction_for_turn("/plan convert to rust", true, 100).await.unwrap();
+        broker
+            .interaction_for_turn("/plan convert to rust", true, 100)
+            .await
+            .unwrap();
         assert_eq!(broker.session.name, "convert to rust");
-        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
-            "convert to rust");
+        assert_eq!(
+            broker
+                .store
+                .load_session(&broker.session.id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "convert to rust"
+        );
     }
 
     #[tokio::test]
@@ -10511,10 +14949,24 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.name.clear();
-        broker.interaction_for_turn("/plan convert a rather long repository from TypeScript to Rust", true, 100).await.unwrap();
+        broker
+            .interaction_for_turn(
+                "/plan convert a rather long repository from TypeScript to Rust",
+                true,
+                100,
+            )
+            .await
+            .unwrap();
         assert_eq!(broker.session.name, "convert a rather long reposito");
-        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
-            "convert a rather long reposito");
+        assert_eq!(
+            broker
+                .store
+                .load_session(&broker.session.id)
+                .unwrap()
+                .unwrap()
+                .name,
+            "convert a rather long reposito"
+        );
     }
 
     #[tokio::test]
@@ -10522,19 +14974,37 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut exchange, _, _) = broker.interaction_for_turn("retain this request", true, 100)
-            .await.unwrap();
-        let baseline = broker.checkpoint.as_ref().unwrap()
-            .capture(&broker.store.objects, &broker.repositories, &broker.session.id, 100)
-            .await.unwrap();
+        let (mut exchange, _, _) = broker
+            .interaction_for_turn("retain this request", true, 100)
+            .await
+            .unwrap();
+        let baseline = broker
+            .checkpoint
+            .as_ref()
+            .unwrap()
+            .capture(
+                &broker.store.objects,
+                &broker.repositories,
+                &broker.session.id,
+                100,
+            )
+            .await
+            .unwrap();
         let baseline_id = baseline.id.clone();
         let gate = crate::checkpoint::ToolGate::new().unwrap();
-        gate.complete(Err("provider turn ended before checkpoint admission completed".into())).unwrap();
+        gate.complete(Err(
+            "provider turn ended before checkpoint admission completed".into(),
+        ))
+        .unwrap();
         let (complete, completed) = tokio::sync::oneshot::channel();
         broker.exchange_runtime = Some(ExchangeRuntime {
-            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async move {
-                completed.await.context("initial checkpoint fixture owner disappeared")?
-            }))),
+            checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(
+                async move {
+                    completed
+                        .await
+                        .context("initial checkpoint fixture owner disappeared")?
+                },
+            ))),
             tool_gate: Some(gate.clone()),
             exchange_id: exchange.id.clone(),
             synthetic_turn: None,
@@ -10551,25 +15021,50 @@ mod test {
             collecting.await.unwrap();
         }
         assert!(!gate.ready());
-        assert!(gate.wait().await.unwrap_err().to_string().contains("provider turn ended"));
-        assert_eq!(exchange.checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+        assert!(
+            gate.wait()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("provider turn ended")
+        );
+        assert_eq!(
+            exchange.checkpoint_before.as_deref(),
+            Some(baseline_id.as_str())
+        );
         assert_eq!(
             broker.store.list_exchange(&broker.session.id).unwrap()[0].checkpoint_before,
             Some(baseline_id.clone())
         );
         assert!(broker.exchange_runtime.is_none());
         assert!(exchange.execution_started_at_ms.is_none());
-        std::fs::write(repository.path().join("seed.txt"), "changed after baseline\n").unwrap();
+        std::fs::write(
+            repository.path().join("seed.txt"),
+            "changed after baseline\n",
+        )
+        .unwrap();
         broker.resume_exchange_runtime(&exchange).unwrap();
-        broker.collect_active_initial_checkpoint(&mut exchange).await.unwrap();
+        broker
+            .collect_active_initial_checkpoint(&mut exchange)
+            .await
+            .unwrap();
         exchange.resume(102).unwrap();
-        broker.capture_final_checkpoint(&mut exchange, ExchangeState::Complete).await.unwrap();
-        assert_eq!(exchange.checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+        broker
+            .capture_final_checkpoint(&mut exchange, ExchangeState::Complete)
+            .await
+            .unwrap();
+        assert_eq!(
+            exchange.checkpoint_before.as_deref(),
+            Some(baseline_id.as_str())
+        );
         assert_ne!(exchange.checkpoint_after, exchange.checkpoint_before);
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(persisted.len(), 1);
         assert_eq!(persisted[0].state, ExchangeState::Complete);
-        assert_eq!(persisted[0].checkpoint_before.as_deref(), Some(baseline_id.as_str()));
+        assert_eq!(
+            persisted[0].checkpoint_before.as_deref(),
+            Some(baseline_id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -10577,8 +15072,10 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let (mut exchange, _, _) = broker.interaction_for_turn("retain the failed barrier", true, 100)
-            .await.unwrap();
+        let (mut exchange, _, _) = broker
+            .interaction_for_turn("retain the failed barrier", true, 100)
+            .await
+            .unwrap();
         let gate = crate::checkpoint::ToolGate::new().unwrap();
         broker.exchange_runtime = Some(ExchangeRuntime {
             checkpoint: Some(crate::checkpoint::CheckpointTask(tokio::spawn(async {
@@ -10591,21 +15088,48 @@ mod test {
             retraction_eligible: true,
             active_wait: None,
         });
-        let failure = broker.park_exchange_for_restart(&mut exchange).await.unwrap_err();
-        assert!(failure.to_string().contains("initial checkpoint fixture failed"));
-        assert!(gate.wait().await.unwrap_err().to_string().contains("initial checkpoint fixture failed"));
+        let failure = broker
+            .park_exchange_for_restart(&mut exchange)
+            .await
+            .unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("initial checkpoint fixture failed")
+        );
+        assert!(
+            gate.wait()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("initial checkpoint fixture failed")
+        );
         assert!(!gate.ready());
         assert!(exchange.checkpoint_before.is_none());
         assert_eq!(exchange.state, ExchangeState::Finalizing);
-        assert!(exchange.finalization_error.as_deref().unwrap().contains("initial checkpoint fixture failed"));
+        assert!(
+            exchange
+                .finalization_error
+                .as_deref()
+                .unwrap()
+                .contains("initial checkpoint fixture failed")
+        );
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(persisted[0].state, ExchangeState::Finalizing);
         assert_eq!(persisted[0].finalization_error, exchange.finalization_error);
-        assert!(broker.exchange_runtime.as_ref().unwrap().checkpoint.is_none());
+        assert!(
+            broker
+                .exchange_runtime
+                .as_ref()
+                .unwrap()
+                .checkpoint
+                .is_none()
+        );
     }
 
     #[tokio::test]
-    async fn conversation_rollback_preserves_files_and_restarts_with_retained_context() -> Result<()> {
+    async fn conversation_rollback_preserves_files_and_restarts_with_retained_context() -> Result<()>
+    {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -10619,22 +15143,59 @@ mod test {
         broker.store.save_exchange(&second)?;
         broker.session.backend_session_id = Some("old-provider-history".into());
         broker.save_session()?;
-        std::fs::write(repository.path().join("seed.txt"), "Keep these file changes\n")?;
-        std::fs::write(repository.path().join("new-file.txt"), "Keep this new file\n")?;
-        let mut params = json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"stale"});
+        std::fs::write(
+            repository.path().join("seed.txt"),
+            "Keep these file changes\n",
+        )?;
+        std::fs::write(
+            repository.path().join("new-file.txt"),
+            "Keep this new file\n",
+        )?;
+        let mut params =
+            json!({"scope":"conversation","exchange_id":"removed","latest_exchange_id":"stale"});
         assert!(broker.apply_rollback(params.clone()).await.is_err());
-        assert_eq!(broker.store.list_exchange(&broker.session.id)?[1].disposition, crate::exchange::HistoryDisposition::Current);
+        assert_eq!(
+            broker.store.list_exchange(&broker.session.id)?[1].disposition,
+            crate::exchange::HistoryDisposition::Current
+        );
         params["latest_exchange_id"] = json!("removed");
         let (result, events) = broker.apply_rollback(params).await?;
         assert_eq!(result["scope"], "conversation");
-        assert!(events.iter().any(|event| event.event == "interaction_rolled_back"));
-        assert_eq!(std::fs::read_to_string(repository.path().join("seed.txt"))?, "Keep these file changes\n");
-        assert_eq!(std::fs::read_to_string(repository.path().join("new-file.txt"))?, "Keep this new file\n");
-        assert!(crate::checkpoint::RestoreJournal::progress(&broker.store.objects, &broker.session.id)?.is_none());
-        assert!(broker.store.load_session(&broker.session.id)?.unwrap().backend_session_id.is_none());
-        assert!(!broker.snapshot()?.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == "removed")));
-        let input = broker.rollback_context("new-request", BackendInput::from_text("CURRENT_REQUEST"))?;
-        let BackendInput::Text { text, .. } = input else { unreachable!() };
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "interaction_rolled_back")
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("seed.txt"))?,
+            "Keep these file changes\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(repository.path().join("new-file.txt"))?,
+            "Keep this new file\n"
+        );
+        assert!(
+            crate::checkpoint::RestoreJournal::progress(&broker.store.objects, &broker.session.id)?
+                .is_none()
+        );
+        assert!(
+            broker
+                .store
+                .load_session(&broker.session.id)?
+                .unwrap()
+                .backend_session_id
+                .is_none()
+        );
+        assert!(
+            !broker.snapshot()?.timeline.iter().any(
+                |entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == "removed")
+            )
+        );
+        let input =
+            broker.rollback_context("new-request", BackendInput::from_text("CURRENT_REQUEST"))?;
+        let BackendInput::Text { text, .. } = input else {
+            unreachable!()
+        };
         assert!(text.contains("KEEP_THIS_CONTEXT") && text.contains("CURRENT_REQUEST"));
         assert!(!text.contains("DROP_THIS_CONTEXT"));
         Ok(())
@@ -10656,7 +15217,10 @@ mod test {
                 .await
                 .unwrap();
             let mut runtime = broker.exchange_runtime.take().unwrap();
-            broker.collect_initial_checkpoint(&mut runtime, &mut exchange).await.unwrap();
+            broker
+                .collect_initial_checkpoint(&mut runtime, &mut exchange)
+                .await
+                .unwrap();
             broker.exchange_runtime = Some(runtime);
             std::fs::write(repository.path().join("seed.txt"), content).unwrap();
             broker
@@ -10675,9 +15239,15 @@ mod test {
             "first\n"
         );
         let visible = broker.snapshot().unwrap().timeline;
-        assert!(visible.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[0])));
-        assert!(!visible.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[1])),
-            "rollback must remove the reverted request instead of leaving a timeline tombstone");
+        assert!(visible.iter().any(
+            |entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[0])
+        ));
+        assert!(
+            !visible.iter().any(
+                |entry| matches!(entry, TimelineEntry::Exchange { id, .. } if id == &exchange_id[1])
+            ),
+            "rollback must remove the reverted request instead of leaving a timeline tombstone"
+        );
         assert!(
             broker
                 .rollback_exchange(json!({"exchange_id":exchange_id[1]}))
@@ -10702,8 +15272,15 @@ mod test {
             history[1].disposition,
             crate::exchange::HistoryDisposition::Superseded
         );
-        assert!(!broker.snapshot().unwrap().timeline.iter().any(|entry| matches!(entry, TimelineEntry::Exchange { .. })),
-            "rolled-back and superseded requests must stay out of the rebuilt timeline");
+        assert!(
+            !broker
+                .snapshot()
+                .unwrap()
+                .timeline
+                .iter()
+                .any(|entry| matches!(entry, TimelineEntry::Exchange { .. })),
+            "rolled-back and superseded requests must stay out of the rebuilt timeline"
+        );
     }
 
     #[test]
@@ -10751,21 +15328,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for FailingBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -10791,21 +15379,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for InvalidControlOutputBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -10814,7 +15413,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send(BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -10852,21 +15451,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for ParentBoundaryBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -10875,7 +15485,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             let event_list = vec![
                 BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -10886,7 +15496,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),
@@ -10897,7 +15507,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),
@@ -10908,7 +15518,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -10968,42 +15578,75 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for PlanDiscussionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>)
-            -> Result<crate::backend::BackendOutput> {
-            use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, apply_invocation};
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            use crate::control_tools::{
+                ControlToolInvocation, ControlToolRuntime, apply_invocation,
+            };
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
-            assert_eq!(request.mode, if turn == 4 { PromptMode::Plan } else { PromptMode::PlanDiscussion });
+            assert_eq!(
+                request.mode,
+                if turn == 4 {
+                    PromptMode::Plan
+                } else {
+                    PromptMode::PlanDiscussion
+                }
+            );
             assert_eq!(request.execution_mode, PermissionMode::Read);
             if turn < 4 {
-                assert!(request.input.text().contains("Answer questions without editing or resubmitting"));
+                assert!(
+                    request
+                        .input
+                        .text()
+                        .contains("Answer questions without editing or resubmitting")
+                );
             }
             let context = request.control_context.clone().unwrap();
             let document = context.plan_document.as_ref().unwrap().clone();
             let mut runtime = ControlToolRuntime::new(context);
             let mut output = crate::backend::BackendOutput::default();
-            let read = runtime.invoke(ControlToolInvocation {
-                name: "plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
-            }).await?;
+            let read = runtime
+                .invoke(ControlToolInvocation {
+                    name: "plan_read".into(),
+                    arguments: json!({"plan_id":document.plan_id}),
+                })
+                .await?;
             apply_invocation(&read.invocation.unwrap(), &mut output)?;
             match turn {
                 0 | 2 => {}
-                1 => output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into())),
+                1 => {
+                    output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into()))
+                }
                 3 => {
                     let edit = runtime.invoke(ControlToolInvocation {
                         name: "design_patch".into(),
@@ -11030,31 +15673,72 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.submit_prompt_inner(json!({"text":"/plan preserve review ownership"})).await.unwrap();
+        broker
+            .submit_prompt_inner(json!({"text":"/plan preserve review ownership"}))
+            .await
+            .unwrap();
         let current = broker.snapshot().unwrap().active_plan.unwrap();
         let mut older = current.clone();
         older.id = "older-review".into();
         broker.store.save_plan(&older).unwrap();
         let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
-        for params in [json!({"plan_id":older.id}), json!({"plan_id":older.id,"revision":older.model_revision})] {
-            let result = broker.dispatch(Request { id:1,method:"plan.get".into(),params }).await;
-            assert!(result.response.error().is_none(), "{:?}",result.response.error());
-            assert_eq!(result.response.result().unwrap()["id"], older.id);
-            assert_eq!(broker.current_plan_id().unwrap().as_deref(), Some(current.id.as_str()));
-            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected);
-        }
-        for (method,params) in [
-            ("plan.get",json!({"plan_id":"missing"})),
-            ("session.preview",json!({"session_id":"missing"})),
-            ("plan.declaration",json!({"plan_id":"missing","path":"src/lib.rs","revision":1})),
+        for params in [
+            json!({"plan_id":older.id}),
+            json!({"plan_id":older.id,"revision":older.model_revision}),
         ] {
-            let result = broker.dispatch(Request { id:2,method:method.into(),params }).await;
+            let result = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "plan.get".into(),
+                    params,
+                })
+                .await;
+            assert!(
+                result.response.error().is_none(),
+                "{:?}",
+                result.response.error()
+            );
+            assert_eq!(result.response.result().unwrap()["id"], older.id);
+            assert_eq!(
+                broker.current_plan_id().unwrap().as_deref(),
+                Some(current.id.as_str())
+            );
+            assert_eq!(
+                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                selected
+            );
+        }
+        for (method, params) in [
+            ("plan.get", json!({"plan_id":"missing"})),
+            ("session.preview", json!({"session_id":"missing"})),
+            (
+                "plan.declaration",
+                json!({"plan_id":"missing","path":"src/lib.rs","revision":1}),
+            ),
+        ] {
+            let result = broker
+                .dispatch(Request {
+                    id: 2,
+                    method: method.into(),
+                    params,
+                })
+                .await;
             assert!(result.response.error().is_some(), "{method}");
-            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected, "{method}");
-            assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::AwaitingReview);
+            assert_eq!(
+                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                selected,
+                "{method}"
+            );
+            assert_eq!(
+                broker.snapshot().unwrap().active_plan.unwrap().state,
+                PlanState::AwaitingReview
+            );
         }
         assert!(broker.observer.plan(json!({"plan_id":older.id})).is_ok());
-        assert_eq!(broker.current_plan_id().unwrap().as_deref(), Some(current.id.as_str()));
+        assert_eq!(
+            broker.current_plan_id().unwrap().as_deref(),
+            Some(current.id.as_str())
+        );
     }
 
     #[tokio::test]
@@ -11062,17 +15746,34 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.create_task(crate::task::TaskKind::Goal, "Unrelated work".into(), None, None).unwrap();
+        broker
+            .create_task(
+                crate::task::TaskKind::Goal,
+                "Unrelated work".into(),
+                None,
+                None,
+            )
+            .unwrap();
         let selected = serde_json::to_value(broker.current_task().unwrap()).unwrap();
-        for (method,params) in [
-            ("session.preview",json!({"session_id":"missing"})),
-            ("plan.get",json!({"plan_id":"missing"})),
-            ("session.rename",json!({})),
-            ("exchange.comment.save",json!({})),
+        for (method, params) in [
+            ("session.preview", json!({"session_id":"missing"})),
+            ("plan.get", json!({"plan_id":"missing"})),
+            ("session.rename", json!({})),
+            ("exchange.comment.save", json!({})),
         ] {
-            let result = broker.dispatch(Request { id:1,method:method.into(),params }).await;
+            let result = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: method.into(),
+                    params,
+                })
+                .await;
             assert!(result.response.error().is_some(), "{method}");
-            assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected, "{method}");
+            assert_eq!(
+                serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+                selected,
+                "{method}"
+            );
         }
     }
 
@@ -11081,27 +15782,56 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.submit_prompt_inner(json!({"text":"/plan build a scene"})).await.unwrap();
+        broker
+            .submit_prompt_inner(json!({"text":"/plan build a scene"}))
+            .await
+            .unwrap();
         let before = broker.snapshot().unwrap().active_plan.unwrap();
-        let backend = Arc::new(PlanDiscussionBackend { turn: std::sync::atomic::AtomicUsize::new(0) });
+        let backend = Arc::new(PlanDiscussionBackend {
+            turn: std::sync::atomic::AtomicUsize::new(0),
+        });
         broker.backend = backend.clone();
-        broker.submit_prompt_inner(json!({"text":"Why this design?"})).await.unwrap();
+        broker
+            .submit_prompt_inner(json!({"text":"Why this design?"}))
+            .await
+            .unwrap();
         let snapshot = broker.snapshot().unwrap();
         let discussed = snapshot.active_plan.unwrap();
         assert_eq!(discussed.state, PlanState::AwaitingReview);
         assert_eq!(discussed.model_revision, before.model_revision);
         assert_eq!(discussed.document_version, before.document_version);
         assert_eq!(discussed.review_digest, before.review_digest);
-        assert_eq!(snapshot.exchange.last().unwrap().plan_id.as_deref(), Some(before.id.as_str()));
+        assert_eq!(
+            snapshot.exchange.last().unwrap().plan_id.as_deref(),
+            Some(before.id.as_str())
+        );
         assert_eq!(snapshot.exchange.last().unwrap().kind, ExchangeKind::Chat);
 
-        broker.submit_prompt_inner(json!({"text":"Add interactive controls"})).await.unwrap();
+        broker
+            .submit_prompt_inner(json!({"text":"Add interactive controls"}))
+            .await
+            .unwrap();
         let interaction = broker.active_interaction_elicitation().unwrap();
-        let question_id = interaction.elicitation.as_ref().unwrap().question_set.questions[0].id.clone();
-        broker.ask_question(json!({"question_id":question_id,"text":"What do you recommend?"})).await.unwrap();
-        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::AwaitingReview);
-        broker.answer_question(json!({"question_id":question_id,
-            "response":{"kind":"other","text":"Keyboard controls"}})).unwrap();
+        let question_id = interaction
+            .elicitation
+            .as_ref()
+            .unwrap()
+            .question_set
+            .questions[0]
+            .id
+            .clone();
+        broker
+            .ask_question(json!({"question_id":question_id,"text":"What do you recommend?"}))
+            .await
+            .unwrap();
+        assert_eq!(
+            broker.snapshot().unwrap().active_plan.unwrap().state,
+            PlanState::AwaitingReview
+        );
+        broker
+            .answer_question(json!({"question_id":question_id,
+            "response":{"kind":"other","text":"Keyboard controls"}}))
+            .unwrap();
         broker.continue_question().await.unwrap();
         let snapshot = broker.snapshot().unwrap();
         let revised = snapshot.active_plan.unwrap();
@@ -11111,7 +15841,10 @@ mod test {
         assert_eq!(revised.document_version, before.document_version + 1);
         let exchange = snapshot.exchange.last().unwrap();
         assert_ne!(exchange.id, interaction.id);
-        assert_eq!(exchange.lifecycle.as_deref(), Some("Plan revision continued"));
+        assert_eq!(
+            exchange.lifecycle.as_deref(),
+            Some("Plan revision continued")
+        );
         assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
         assert_eq!(exchange.state, ExchangeState::Complete);
         assert!(!exchange.awaiting_input);
@@ -11120,30 +15853,71 @@ mod test {
 
     #[tokio::test]
     async fn review_questions_use_main_conversation_and_persist_in_timeline_without_revising() {
+        use crate::plan::review_document::PlanReviewDocument;
         use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
         use forge_buffer::input::DocumentInput;
-        use crate::plan::review_document::PlanReviewDocument;
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = crate::backend::build(broker.backend_launch.clone(),
-            Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone()).unwrap().into();
-        broker.submit_prompt_inner(json!({"text":"/plan revise the API"})).await.unwrap();
+        broker.backend = crate::backend::build(
+            broker.backend_launch.clone(),
+            Arc::clone(&broker.permission_coordinator),
+            Arc::clone(&broker.trace),
+            broker.data_root.clone(),
+        )
+        .unwrap()
+        .into();
+        broker
+            .submit_prompt_inner(json!({"text":"/plan revise the API"}))
+            .await
+            .unwrap();
         let before = broker.snapshot().unwrap().active_plan.unwrap();
         let thread = broker.session.backend_session_id.clone();
-        let source = broker.plan_file.capture_review_source(&broker.session.id, &before.id,
-            Some(before.model_revision), before.review_digest.as_deref().unwrap()).unwrap();
-        let line = source.rendered.navigation.anchor.iter()
-            .find(|anchor| matches!(anchor.target, crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().line;
+        let source = broker
+            .plan_file
+            .capture_review_source(
+                &broker.session.id,
+                &before.id,
+                Some(before.model_revision),
+                before.review_digest.as_deref().unwrap(),
+            )
+            .unwrap();
+        let line = source
+            .rendered
+            .navigation
+            .anchor
+            .iter()
+            .find(|anchor| {
+                matches!(
+                    anchor.target,
+                    crate::plan::PlanReviewTarget::Declaration { .. }
+                )
+            })
+            .unwrap()
+            .line;
         let digest = source.saved_digest.clone();
         let id = DocumentId("review-question".into());
         let view = ViewId("view".into());
-        let review = PlanReviewDocument::new(id.clone(), view.clone(), source,
-            forge_buffer::width::WidthProfile::default(), None).unwrap();
+        let review = PlanReviewDocument::new(
+            id.clone(),
+            view.clone(),
+            source,
+            forge_buffer::width::WidthProfile::default(),
+            None,
+        )
+        .unwrap();
         let snapshot = review.snapshot();
         let target = snapshot.block[0].metadata.target[0].clone();
-        let input = DocumentInput { document:id.clone(),revision:snapshot.revision,view,sequence:InputSequence(1),
-            action:"plan.questions.answer".into(),block:snapshot.block[0].id.clone(),position:target.range.start,target:Some(target.id) };
+        let input = DocumentInput {
+            document: id.clone(),
+            revision: snapshot.revision,
+            view,
+            sequence: InputSequence(1),
+            action: "plan.questions.answer".into(),
+            block: snapshot.block[0].id.clone(),
+            position: target.range.start,
+            target: Some(target.id),
+        };
         let admission = broker.plan_review.admit(id.clone()).unwrap();
         broker.plan_review.insert(review, admission).unwrap();
         let params = json!({"review":input,"draft_source_digest":digest,"draft_annotation":[{
@@ -11152,73 +15926,164 @@ mod test {
         let mut other = before.clone();
         other.id = "different-current-plan".into();
         broker.store.save_plan(&other).unwrap();
-        broker.create_task(crate::task::TaskKind::Plan, "Different task".into(), Some(other.id.clone()), None).unwrap();
+        broker
+            .create_task(
+                crate::task::TaskKind::Plan,
+                "Different task".into(),
+                Some(other.id.clone()),
+                None,
+            )
+            .unwrap();
         let selected_task = serde_json::to_value(broker.current_task().unwrap()).unwrap();
-        let result = broker.dispatch(Request { id:2,method:"plan.questions.answer".into(),params:params.clone() }).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "plan.questions.answer".into(),
+                params: params.clone(),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let snapshot = broker.snapshot().unwrap();
         let after = snapshot.active_plan.as_ref().unwrap();
         assert_eq!(after.id, other.id);
-        assert_eq!(snapshot.exchange.last().unwrap().plan_id.as_deref(), Some(before.id.as_str()));
-        assert_eq!(serde_json::to_value(broker.current_task().unwrap()).unwrap(), selected_task);
+        assert_eq!(
+            snapshot.exchange.last().unwrap().plan_id.as_deref(),
+            Some(before.id.as_str())
+        );
+        assert_eq!(
+            serde_json::to_value(broker.current_task().unwrap()).unwrap(),
+            selected_task
+        );
         assert_eq!(after.review_digest, before.review_digest);
         assert_eq!(after.model_revision, before.model_revision);
         assert_eq!(broker.session.backend_session_id, thread);
         assert_eq!(snapshot.exchange.last().unwrap().prompt, "Why this API?");
-        assert!(timeline_text(&snapshot).contains("This declaration defines the proposed interface"));
-        assert!(result.response.result().unwrap()["annotation"][0]["reply"]["body"].as_str().unwrap().contains("This declaration"));
+        assert!(
+            timeline_text(&snapshot).contains("This declaration defines the proposed interface")
+        );
+        assert!(
+            result.response.result().unwrap()["annotation"][0]["reply"]["body"]
+                .as_str()
+                .unwrap()
+                .contains("This declaration")
+        );
         let count = snapshot.exchange.len();
         let mut params = params;
         params["review"]["sequence"] = json!(2);
-        let repeated = broker.dispatch(Request { id:3,method:"plan.questions.answer".into(),params }).await;
+        let repeated = broker
+            .dispatch(Request {
+                id: 3,
+                method: "plan.questions.answer".into(),
+                params,
+            })
+            .await;
         assert!(repeated.response.error().is_none());
         assert_eq!(broker.snapshot().unwrap().exchange.len(), count);
     }
 
-    fn submit_test_plan(request: &BackendRequest, output: &mut crate::backend::BackendOutput, overview: &str) {
-        let document = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).expect("planning context retains the design");
+    fn submit_test_plan(
+        request: &BackendRequest,
+        output: &mut crate::backend::BackendOutput,
+        overview: &str,
+    ) {
+        let document = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.plan_document.as_ref())
+            .expect("planning context retains the design");
         let design = document.design.as_ref().expect("declaration design");
         let path = "src/migration.rs";
-        let text = format!("/// {}\npub fn migrate();\nAlgorithm\n  return\n",overview.replace('\n'," "));
+        let text = format!(
+            "/// {}\npub fn migrate();\nAlgorithm\n  return\n",
+            overview.replace('\n', " ")
+        );
         let patch = if design.proposed.contains_key(path) {
             let document = design.read(Some(path), false).unwrap();
             let previous = document["text"].as_str().unwrap();
-            format!("*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",previous.lines().map(|line| format!("-{line}\n")).collect::<String>(),text.lines().map(|line| format!("+{line}\n")).collect::<String>())
-        } else { format!("*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",text.lines().map(|line| format!("+{line}\n")).collect::<String>()) };
-        let previous_metadata = serde_json::to_string_pretty(&design.document).unwrap()
-            .lines().map(|line| format!("-{line}\n")).collect::<String>();
+            format!(
+                "*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",
+                previous
+                    .lines()
+                    .map(|line| format!("-{line}\n"))
+                    .collect::<String>(),
+                text.lines()
+                    .map(|line| format!("+{line}\n"))
+                    .collect::<String>()
+            )
+        } else {
+            format!(
+                "*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",
+                text.lines()
+                    .map(|line| format!("+{line}\n"))
+                    .collect::<String>()
+            )
+        };
+        let previous_metadata = serde_json::to_string_pretty(&design.document)
+            .unwrap()
+            .lines()
+            .map(|line| format!("-{line}\n"))
+            .collect::<String>();
         let mut metadata = design.document.clone();
         metadata.objective = "Implement the migration strategy.".into();
         metadata.background = "The fixture contains the original implementation.".into();
         metadata.requirements = vec!["Preserve the migration contract.".into()];
         metadata.design = overview.into();
-        let proposed_metadata = serde_json::to_string_pretty(&metadata).unwrap()
-            .lines().map(|line| format!("+{line}\n")).collect::<String>();
+        let proposed_metadata = serde_json::to_string_pretty(&metadata)
+            .unwrap()
+            .lines()
+            .map(|line| format!("+{line}\n"))
+            .collect::<String>();
         let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{previous_metadata}{proposed_metadata}*** End Patch"));
-        let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Migration plan".into()),source_digests:Default::default() };
-        let changed = document.patch_design(Path::new(&request.workspace), change.clone()).unwrap();
+        let change = crate::plan::DesignPatchRequest {
+            plan_id: document.plan_id.clone(),
+            expected_version: document.version,
+            patch,
+            title: Some("Migration plan".into()),
+            source_digests: Default::default(),
+        };
+        let changed = document
+            .patch_design(Path::new(&request.workspace), change.clone())
+            .unwrap();
         output.design_patch.push(change);
-        output.plan_submit = Some(crate::backend::PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:changed.version });
+        output.plan_submit = Some(crate::backend::PlanSubmitRequest {
+            plan_id: document.plan_id.clone(),
+            expected_version: changed.version,
+        });
     }
 
     #[async_trait::async_trait]
     impl Backend for MutableQuestionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11233,11 +16098,13 @@ mod test {
                     question: "Which migration should the implementation use?".into(),
                     options: vec![
                         crate::plan::PlanQuestionOption {
-                            recommended: false, label: "Staged".into(),
+                            recommended: false,
+                            label: "Staged".into(),
                             description: "Preserve compatibility temporarily.".into(),
                         },
                         crate::plan::PlanQuestionOption {
-                            recommended: false, label: "Immediate".into(),
+                            recommended: false,
+                            label: "Immediate".into(),
                             description: "Replace the old format now.".into(),
                         },
                     ],
@@ -11258,18 +16125,21 @@ mod test {
                 let mut replacement = question_set();
                 replacement.questions[0].options = vec![
                     crate::plan::PlanQuestionOption {
-                        recommended: false, label: "Safe".into(),
+                        recommended: false,
+                        label: "Safe".into(),
                         description: "Retain compatibility.".into(),
                     },
                     crate::plan::PlanQuestionOption {
-                        recommended: false, label: "Fast".into(),
+                        recommended: false,
+                        label: "Fast".into(),
                         description: "Prefer immediate cleanup.".into(),
                     },
                 ];
                 output.plan_question = Some(replacement);
             } else if request_text.contains("User follow-up:\nuse staged") {
                 output.question_answer = Some(PlanQuestionAnswer {
-                    source: crate::session::ResolutionSource::User, question_id: "migration".into(),
+                    source: crate::session::ResolutionSource::User,
+                    question_id: "migration".into(),
                     response: PlanQuestionResponse::Selected {
                         option: "Staged".into(),
                         feedback: None,
@@ -11310,21 +16180,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for RepeatedQuestionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11350,11 +16231,13 @@ mod test {
                         question: "Which migration should the implementation use?".into(),
                         options: vec![
                             crate::plan::PlanQuestionOption {
-                                recommended: false, label: "Staged".into(),
+                                recommended: false,
+                                label: "Staged".into(),
                                 description: "Preserve compatibility temporarily.".into(),
                             },
                             crate::plan::PlanQuestionOption {
-                                recommended: false, label: "Immediate".into(),
+                                recommended: false,
+                                label: "Immediate".into(),
                                 description: "Replace the old format now.".into(),
                             },
                         ],
@@ -11384,21 +16267,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for RetryPlanBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11408,7 +16302,10 @@ mod test {
             let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut output = crate::backend::BackendOutput {
                 backend_session_id: Some("retry-plan".into()),
-                capability: BackendCapability { execution_mode_list: vec![PermissionMode::Read], ..Default::default() },
+                capability: BackendCapability {
+                    execution_mode_list: vec![PermissionMode::Read],
+                    ..Default::default()
+                },
                 runtime: crate::backend::BackendRuntime {
                     provider: "Retry plan test".into(),
                     model: Some(request.model.clone()),
@@ -11434,21 +16331,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for RepeatedPlanEditBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11491,21 +16399,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for PlanningQuestionBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11519,7 +16438,7 @@ mod test {
                 "The plan is ready for review."
             };
             let event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -11540,11 +16459,13 @@ mod test {
                     question: text.into(),
                     options: vec![
                         crate::plan::PlanQuestionOption {
-                            recommended: false, label: "Staged".into(),
+                            recommended: false,
+                            label: "Staged".into(),
                             description: "Support both formats temporarily.".into(),
                         },
                         crate::plan::PlanQuestionOption {
-                            recommended: false, label: "Immediate".into(),
+                            recommended: false,
+                            label: "Immediate".into(),
                             description: "Remove the old format now.".into(),
                         },
                     ],
@@ -11587,21 +16508,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for NestedWriteBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11609,7 +16541,7 @@ mod test {
             event_sink: Option<BackendEventSink>,
         ) -> Result<crate::backend::BackendOutput> {
             let commentary = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -11628,7 +16560,7 @@ mod test {
                 }],
             };
             let file_started = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -11647,7 +16579,7 @@ mod test {
                 task_update: None,
             };
             let started = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -11674,7 +16606,7 @@ mod test {
                 "provider edit\n",
             )?;
             let file_completed = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -11703,7 +16635,7 @@ mod test {
             std::fs::create_dir_all(&ignored)?;
             std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
             let completed = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -11722,7 +16654,7 @@ mod test {
                 task_update: None,
             };
             let response = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -11770,21 +16702,32 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for TaskUpdateBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         async fn prompt_stream(
             &self,
@@ -11792,7 +16735,7 @@ mod test {
             event_sink: Option<BackendEventSink>,
         ) -> Result<crate::backend::BackendOutput> {
             let task_event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "plan".into(),
@@ -11815,7 +16758,7 @@ mod test {
                 }),
             };
             let response = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -11864,14 +16807,17 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "test-client".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
                 model: "mock-model".into(),
                 effort: "low".into(),
                 session_id: None,
@@ -11880,23 +16826,37 @@ mod test {
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(100)),
-        ).unwrap();
-        let rejected = broker.configure_session(json!({
-            "plan_executor_model": "unknown-model", "plan_executor_effort": "high"
-        })).await;
+        )
+        .unwrap();
+        let rejected = broker
+            .configure_session(json!({
+                "plan_executor_model": "unknown-model", "plan_executor_effort": "high"
+            }))
+            .await;
         assert!(rejected.is_err());
         assert!(broker.session.plan_executor.model.is_none());
-        broker.configure_session(json!({
-            "plan_executor_model": "mock-model", "plan_executor_effort": "high",
-            "plan_executor_enabled": true, "plan_compact": true
-        })).await.unwrap();
+        broker
+            .configure_session(json!({
+                "plan_executor_model": "mock-model", "plan_executor_effort": "high",
+                "plan_executor_enabled": true, "plan_compact": true
+            }))
+            .await
+            .unwrap();
         assert_eq!(broker.session.model, "mock-model");
         assert_eq!(broker.session.effort, "low");
         broker.session.backend_session_id = Some("mock-session".into());
         let (_, events) = broker.compact_session(true).await.unwrap();
-        assert!(events.iter().any(|event| event.event == "context_compacted"));
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event == "context_compacted")
+        );
         assert_eq!(broker.session.effort, "low");
-        let preference = broker.store.load_preference(&broker.session.workspace, "mock").unwrap().unwrap();
+        let preference = broker
+            .store
+            .load_preference(&broker.session.workspace, "mock")
+            .unwrap()
+            .unwrap();
         assert_eq!(preference.effort, "low");
         assert!(preference.plan_compact);
         assert!(preference.plan_executor.enabled);
@@ -11905,14 +16865,17 @@ mod test {
         drop(broker);
         let next = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "next-client".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
                 model: "mock-model".into(),
                 effort: "medium".into(),
                 session_id: None,
@@ -11921,7 +16884,8 @@ mod test {
                 lease_conflict_action: None,
             },
             Box::new(FixedClock(200)),
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(next.session.effort, "low");
         assert!(next.session.plan_executor.enabled);
     }
@@ -11951,7 +16915,9 @@ mod test {
             access: Default::default(),
             shell: Default::default(),
             execution_mode: PermissionMode::Read,
-            current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
+            current_task_id: None,
+            default_write_permission: PermissionMode::Write,
+            plan_permission: None,
             created_at_ms: 0,
             updated_at_ms: 0,
             goal_id: None,
@@ -11960,7 +16926,9 @@ mod test {
             native_fork: false,
             native_compact: false,
             context_usage: None,
-            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
+            background: None,
+            auto_compaction: Default::default(),
+            last_compaction_turn: None,
         };
         assert!(acquire_lease(&mut session, "two", 10).is_err());
         assert!(acquire_lease(&mut session, "two", 21).is_ok());
@@ -12036,9 +17004,9 @@ mod test {
         crate::checks::configure_fixture(repository);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data_root.to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.to_string_lossy().into_owned(),
@@ -12090,7 +17058,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "agent_lifecycle".into(),
@@ -12116,19 +17084,40 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let lifecycle = AgentLifecycleEvent {
-            operation:"subagent_spawned".into(), starts_child:true,
-            parent_thread_id:Some("root".into()), provider_thread_id:Some("native-child".into()),
-            turn_id:Some("native-child-turn".into()), definition:Some("Reviewer".into()),
-            nickname:Some("Review worker".into()), task:Some("Inspect the selected change".into()),
-            status:AgentExecutionState::Running,
+            operation: "subagent_spawned".into(),
+            starts_child: true,
+            parent_thread_id: Some("root".into()),
+            provider_thread_id: Some("native-child".into()),
+            turn_id: Some("native-child-turn".into()),
+            definition: Some("Reviewer".into()),
+            nickname: Some("Review worker".into()),
+            task: Some("Inspect the selected change".into()),
+            status: AgentExecutionState::Running,
         };
         let mut events = Vec::new();
-        let spawned = broker.apply_agent_lifecycle(&BackendEvent { received_at_ms:None,
-            address:None, turn_boundary:None, kind:"agent_lifecycle".into(), text:None,
-            data:serde_json::to_value(lifecycle).unwrap(), activity:None, summary:None, task_update:None },
-            Some("parent-exchange"), &mut events).await.unwrap();
+        let spawned = broker
+            .apply_agent_lifecycle(
+                &BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "agent_lifecycle".into(),
+                    text: None,
+                    data: serde_json::to_value(lifecycle).unwrap(),
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+                Some("parent-exchange"),
+                &mut events,
+            )
+            .await
+            .unwrap();
         let saved = broker.store.list_agent_run(&broker.session.id).unwrap();
-        let child = saved.iter().filter(|agent| !agent.is_primary()).collect::<Vec<_>>();
+        let child = saved
+            .iter()
+            .filter(|agent| !agent.is_primary())
+            .collect::<Vec<_>>();
         assert!(spawned.is_none());
         assert!(child.is_empty());
         assert!(events.is_empty());
@@ -12162,7 +17151,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "agent_lifecycle".into(),
@@ -12199,7 +17188,8 @@ mod test {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.model = "default".into();
         broker.session.resolved_model = None;
-        let mut exchange = completed_interaction("runtime-identity", &broker.session.id, Vec::new());
+        let mut exchange =
+            completed_interaction("runtime-identity", &broker.session.id, Vec::new());
         exchange.state = ExchangeState::Running;
         exchange.completed_at_ms = None;
         let mut runtime = ExchangeRuntime {
@@ -12212,18 +17202,29 @@ mod test {
             active_wait: None,
         };
         let mut events = Vec::new();
-        broker.process_backend_event(
-            &mut runtime,
-            &mut exchange,
-            crate::backend::BackendRuntime {
-                provider: "Codex CLI".into(),
-                model: Some("resolved-model".into()),
-            }.resolved_event(),
-            &mut events,
-        ).await.unwrap();
+        broker
+            .process_backend_event(
+                &mut runtime,
+                &mut exchange,
+                crate::backend::BackendRuntime {
+                    provider: "Codex CLI".into(),
+                    model: Some("resolved-model".into()),
+                }
+                .resolved_event(),
+                &mut events,
+            )
+            .await
+            .unwrap();
 
-        assert_eq!(broker.session.resolved_model.as_deref(), Some("resolved-model"));
-        let persisted = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        assert_eq!(
+            broker.session.resolved_model.as_deref(),
+            Some("resolved-model")
+        );
+        let persisted = broker
+            .store
+            .load_session(&broker.session.id)
+            .unwrap()
+            .unwrap();
         assert_eq!(persisted.resolved_model.as_deref(), Some("resolved-model"));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload["kind"], "runtime_resolved");
@@ -12307,34 +17308,83 @@ mod test {
         assert_eq!(persisted[0].node_list.len(), 2);
         assert!(!runtime.retraction_eligible);
         let compaction = crate::backend::Compaction {
-            id: "native-compaction".into(), thread_id: "parent".into(),
-            state: crate::backend::CompactionState::Running, manual: false,
-            started_at_ms: None, completed_at_ms: None, result: Default::default(),
+            id: "native-compaction".into(),
+            thread_id: "parent".into(),
+            state: crate::backend::CompactionState::Running,
+            manual: false,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: Default::default(),
         };
         let mut notification = BackendEvent::from_compaction(compaction.clone(), None);
         notification.received_at_ms = Some(200);
-        broker.process_backend_event(&mut runtime, &mut exchange, notification, &mut events).await.unwrap();
+        broker
+            .process_backend_event(&mut runtime, &mut exchange, notification, &mut events)
+            .await
+            .unwrap();
         let position = exchange.node_list.len() - 1;
         let original_id = exchange.node_list[position].id().to_owned();
         let mut unrelated = compaction.clone();
         unrelated.thread_id = "unrelated".into();
-        broker.process_backend_event(&mut runtime, &mut exchange,
-            BackendEvent::from_compaction(unrelated, None), &mut events).await.unwrap();
+        broker
+            .process_backend_event(
+                &mut runtime,
+                &mut exchange,
+                BackendEvent::from_compaction(unrelated, None),
+                &mut events,
+            )
+            .await
+            .unwrap();
         assert_eq!(exchange.node_list.len(), 3);
-        broker.process_backend_event(&mut runtime, &mut exchange, BackendEvent {
-            received_at_ms: Some(300), address: Some(ProviderAddress { owner: None, thread_id:"parent".into(), turn_id:"native".into() }),
-            turn_boundary: Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Interrupted }),
-            kind:"turn_completed".into(), text:None, data:Value::Null, activity:None, summary:None, task_update:None,
-        }, &mut events).await.unwrap();
-        let ExchangeNode::Compaction { compaction: pending, .. } = &exchange.node_list[position] else { panic!("compaction row missing") };
+        broker
+            .process_backend_event(
+                &mut runtime,
+                &mut exchange,
+                BackendEvent {
+                    received_at_ms: Some(300),
+                    address: Some(ProviderAddress {
+                        owner: None,
+                        thread_id: "parent".into(),
+                        turn_id: "native".into(),
+                    }),
+                    turn_boundary: Some(TurnBoundary::Finished {
+                        outcome: crate::turn::TurnOutcome::Interrupted,
+                    }),
+                    kind: "turn_completed".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+                &mut events,
+            )
+            .await
+            .unwrap();
+        let ExchangeNode::Compaction {
+            compaction: pending,
+            ..
+        } = &exchange.node_list[position]
+        else {
+            panic!("compaction row missing")
+        };
         assert_eq!(pending.state, crate::backend::CompactionState::Unconfirmed);
         let mut completed = compaction;
         completed.state = crate::backend::CompactionState::Completed;
         completed.result.summary_content = Some("Retain the original task.".into());
         let mut notification = BackendEvent::from_compaction(completed, None);
         notification.received_at_ms = Some(400);
-        broker.process_backend_event(&mut runtime, &mut exchange, notification, &mut events).await.unwrap();
-        let ExchangeNode::Compaction { compaction: completed, .. } = &exchange.node_list[position] else { panic!("compaction position changed") };
+        broker
+            .process_backend_event(&mut runtime, &mut exchange, notification, &mut events)
+            .await
+            .unwrap();
+        let ExchangeNode::Compaction {
+            compaction: completed,
+            ..
+        } = &exchange.node_list[position]
+        else {
+            panic!("compaction position changed")
+        };
         assert_eq!(completed.state, crate::backend::CompactionState::Completed);
         assert_eq!(completed.started_at_ms, Some(200));
         assert_eq!(completed.completed_at_ms, Some(400));
@@ -12485,7 +17535,10 @@ mod test {
         let second = planning_question_broker(second_repository.path(), data.path(), false);
         assert_eq!(
             second.snapshot().unwrap().prompt_history,
-            vec![crate::attachment::PromptDraft { text: "inspect the architecture".into(), attachments: Vec::new() }]
+            vec![crate::attachment::PromptDraft {
+                text: "inspect the architecture".into(),
+                attachments: Vec::new()
+            }]
         );
     }
 
@@ -12538,23 +17591,54 @@ mod test {
         let data = tempfile::tempdir()?;
         let broker = planning_question_broker(repository.path(), data.path(), false);
         let (sink, _events) = crate::backend::events::channel();
-        let (scope, _lease) = crate::checks::CheckToolScope::open(Arc::clone(&broker.check_runner), crate::checks::CheckAuthority {
-            task_id: None, shell: broker.session.shell, mode: PromptMode::Chat,
-            permission: PermissionMode::Yolo, permissions: Arc::clone(&broker.permission_coordinator),
-            address: crate::backend::ProviderAddress {owner: None, thread_id: broker.session.id.clone(), turn_id: "editing-test".into()},
-            authorization_sink: sink, editing: Arc::clone(&broker.observer.check_editing),
-            setup: false, setup_reviewed: false, can_run: true,
-            agent: Arc::clone(&broker.agent_coordinator), cancelled: Arc::new(AtomicBool::new(false)), sink: None,
-        });
-        let request = || -> Result<Value> { Ok(json!({
-            "expected_revision": broker.check_runner.catalog(None)?["revision"],
-            "config": {"version": 2, "definitions": []}
-        })) };
-        assert!(scope.invoke("checks_configure", request()?).await.unwrap_err().to_string().contains("disabled"));
+        let (scope, _lease) = crate::checks::CheckToolScope::open(
+            Arc::clone(&broker.check_runner),
+            crate::checks::CheckAuthority {
+                task_id: None,
+                shell: broker.session.shell,
+                mode: PromptMode::Chat,
+                permission: PermissionMode::Yolo,
+                permissions: Arc::clone(&broker.permission_coordinator),
+                address: crate::backend::ProviderAddress {
+                    owner: None,
+                    thread_id: broker.session.id.clone(),
+                    turn_id: "editing-test".into(),
+                },
+                authorization_sink: sink,
+                editing: Arc::clone(&broker.observer.check_editing),
+                setup: false,
+                setup_reviewed: false,
+                can_run: true,
+                agent: Arc::clone(&broker.agent_coordinator),
+                cancelled: Arc::new(AtomicBool::new(false)),
+                sink: None,
+            },
+        );
+        let request = || -> Result<Value> {
+            Ok(json!({
+                "expected_revision": broker.check_runner.catalog(None)?["revision"],
+                "config": {"version": 2, "definitions": []}
+            }))
+        };
+        assert!(
+            scope
+                .invoke("checks_configure", request()?)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
         broker.observer.set_check_editing(true)?;
         scope.invoke("checks_configure", request()?).await?;
         broker.observer.set_check_editing(false)?;
-        assert!(scope.invoke("checks_configure", request()?).await.unwrap_err().to_string().contains("disabled"));
+        assert!(
+            scope
+                .invoke("checks_configure", request()?)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("disabled")
+        );
         assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
         Ok(())
     }
@@ -12593,7 +17677,14 @@ mod test {
             .unwrap();
 
         assert_eq!(broker.continued_check_setup(&admission).unwrap(), None);
-        assert!(broker.check_runner.history().unwrap().iter().all(|run| run.commands.is_empty()));
+        assert!(
+            broker
+                .check_runner
+                .history()
+                .unwrap()
+                .iter()
+                .all(|run| run.commands.is_empty())
+        );
     }
 
     #[tokio::test]
@@ -12676,9 +17767,14 @@ mod test {
             })
             .await;
         assert!(continued.response.error().is_none());
-        assert!(continued.event.iter().filter(|event| event.event == "document_changed")
-            .any(|event| event.payload.to_string().contains("\"kind\":\"working\"")),
-            "resuming a chat clarification must restore the Working footer in live patches");
+        assert!(
+            continued
+                .event
+                .iter()
+                .filter(|event| event.event == "document_changed")
+                .any(|event| event.payload.to_string().contains("\"kind\":\"working\"")),
+            "resuming a chat clarification must restore the Working footer in live patches"
+        );
         assert!(broker.snapshot().unwrap().active_elicitation.is_none());
         let completed = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(completed.len(), 1);
@@ -12701,22 +17797,48 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), true);
-        let result = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
-            params:json!({"text":"prompt me with a multiple-choice question"}) }).await;
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"prompt me with a multiple-choice question"}),
+            })
+            .await;
         assert!(result.response.error().is_none());
-        let mut interaction = broker.find_active_interaction_elicitation().unwrap().unwrap();
-        interaction.elicitation.as_mut().unwrap().deadline = Some(serde_json::from_value(json!({"expires_at_ms":-1})).unwrap());
+        let mut interaction = broker
+            .find_active_interaction_elicitation()
+            .unwrap()
+            .unwrap();
+        interaction.elicitation.as_mut().unwrap().deadline =
+            Some(serde_json::from_value(json!({"expires_at_ms":-1})).unwrap());
         broker.store.save_exchange(&interaction).unwrap();
         let mut deadline = None;
-        let request = broker.expire_input(&mut deadline).unwrap().expect("overdue request");
+        let request = broker
+            .expire_input(&mut deadline)
+            .unwrap()
+            .expect("overdue request");
         assert_eq!(request.method, "question.continue");
         let result = broker.dispatch(request).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
-        assert!(broker.find_active_interaction_elicitation().unwrap().is_none());
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
+        assert!(
+            broker
+                .find_active_interaction_elicitation()
+                .unwrap()
+                .is_none()
+        );
         assert!(broker.expire_input(&mut deadline).unwrap().is_none());
         let saved = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert!(saved.iter().flat_map(|exchange| &exchange.node_list).any(|node| matches!(node,
-            ExchangeNode::ExchangeInput { prompt } if prompt.text.contains("[automatic timeout]"))));
+        assert!(
+            saved
+                .iter()
+                .flat_map(|exchange| &exchange.node_list)
+                .any(|node| matches!(node,
+            ExchangeNode::ExchangeInput { prompt } if prompt.text.contains("[automatic timeout]")))
+        );
     }
 
     #[tokio::test]
@@ -12727,39 +17849,88 @@ mod test {
             "data_root":data.path(),"workspace":repository.path(),"client_id":"automatic-compaction",
             "backend":{"kind":"mock","command":[]},"model":"mock-model","effort":"low"
         }))?)?;
-        let result = broker.dispatch(Request { id:1,method:"prompt.submit".into(),params:json!({"text":"First turn"}) }).await;
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"First turn"}),
+            })
+            .await;
         assert!(result.response.error().is_none());
-        broker.session.auto_compaction = crate::session::AutoCompaction {enabled:true,threshold_tokens:40_000};
-        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.session.auto_compaction = crate::session::AutoCompaction {
+            enabled: true,
+            threshold_tokens: 40_000,
+        };
+        broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
         broker.context_usage_fresh = false;
         broker.auto_compact().await?;
-        assert!(broker.store.list_session_event(&broker.session.id)?.is_empty());
+        assert!(
+            broker
+                .store
+                .list_session_event(&broker.session.id)?
+                .is_empty()
+        );
         broker.context_usage_fresh = true;
         broker.auto_compact().await?;
         let records = broker.store.list_session_event(&broker.session.id)?;
-        assert_eq!(records.len(),1);
-        let SessionEventKind::Compaction {compaction} = &records[0].detail else {panic!("missing compaction")};
+        assert_eq!(records.len(), 1);
+        let SessionEventKind::Compaction { compaction } = &records[0].detail else {
+            panic!("missing compaction")
+        };
         assert!(!compaction.manual);
-        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
         broker.auto_compact().await?;
-        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),1);
-        let result = broker.dispatch(Request {id:2,method:"prompt.submit".into(),params:json!({"text":"Second turn"})}).await;
+        assert_eq!(
+            broker.store.list_session_event(&broker.session.id)?.len(),
+            1
+        );
+        let result = broker
+            .dispatch(Request {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({"text":"Second turn"}),
+            })
+            .await;
         assert!(result.response.error().is_none());
-        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
         broker.context_usage_fresh = true;
         broker.auto_compact().await?;
-        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),2);
-        let result = broker.dispatch(Request {id:3,method:"prompt.submit".into(),params:json!({"text":"Third turn"})}).await;
+        assert_eq!(
+            broker.store.list_session_event(&broker.session.id)?.len(),
+            2
+        );
+        let result = broker
+            .dispatch(Request {
+                id: 3,
+                method: "prompt.submit".into(),
+                params: json!({"text":"Third turn"}),
+            })
+            .await;
         assert!(result.response.error().is_none());
-        broker.store.save_session_event(&SessionEventRecord {id:"native-running".into(),session_id:broker.session.id.clone(),created_at_ms:1,
-            detail:SessionEventKind::Compaction {compaction:crate::backend::Compaction {
-                id:"native-running".into(),thread_id:broker.session.backend_session_id.clone().unwrap(),state:crate::backend::CompactionState::Running,
-                manual:false,started_at_ms:Some(1),completed_at_ms:None,result:Default::default(),
-            }}})?;
-        broker.session.context_usage = ContextUsage::reported(50_000,100_000);
+        broker.store.save_session_event(&SessionEventRecord {
+            id: "native-running".into(),
+            session_id: broker.session.id.clone(),
+            created_at_ms: 1,
+            detail: SessionEventKind::Compaction {
+                compaction: crate::backend::Compaction {
+                    id: "native-running".into(),
+                    thread_id: broker.session.backend_session_id.clone().unwrap(),
+                    state: crate::backend::CompactionState::Running,
+                    manual: false,
+                    started_at_ms: Some(1),
+                    completed_at_ms: None,
+                    result: Default::default(),
+                },
+            },
+        })?;
+        broker.session.context_usage = ContextUsage::reported(50_000, 100_000);
         broker.context_usage_fresh = true;
         broker.auto_compact().await?;
-        assert_eq!(broker.store.list_session_event(&broker.session.id)?.len(),3,"native compaction must exclude another request");
+        assert_eq!(
+            broker.store.list_session_event(&broker.session.id)?.len(),
+            3,
+            "native compaction must exclude another request"
+        );
         Ok(())
     }
 
@@ -12769,9 +17940,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12814,8 +17985,16 @@ mod test {
             .await;
 
         assert!(compacted.response.error().is_none());
-        let statuses = compacted.event.iter().filter(|event| event.event == "document_changed")
-            .filter_map(|event| event.payload.pointer("/status/kind").and_then(Value::as_str))
+        let statuses = compacted
+            .event
+            .iter()
+            .filter(|event| event.event == "document_changed")
+            .filter_map(|event| {
+                event
+                    .payload
+                    .pointer("/status/kind")
+                    .and_then(Value::as_str)
+            })
             .collect::<Vec<_>>();
         assert_eq!(statuses, ["compacting", "idle"]);
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("Context compacted"));
@@ -12836,10 +18015,17 @@ mod test {
                 .len(),
             interaction_count
         );
-        assert!(compacted.event.iter().any(|event| event.event == "context_compacted"));
+        assert!(
+            compacted
+                .event
+                .iter()
+                .any(|event| event.event == "context_compacted")
+        );
         let records = broker.store.list_session_event(&broker.session.id).unwrap();
         assert_eq!(records.len(), 1);
-        let SessionEventKind::Compaction { compaction } = &records[0].detail else { panic!("compaction record missing") };
+        let SessionEventKind::Compaction { compaction } = &records[0].detail else {
+            panic!("compaction record missing")
+        };
         assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
         assert!(compaction.manual);
         assert_eq!(compaction.result.context_tokens_before, Some(50_000));
@@ -12847,39 +18033,70 @@ mod test {
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("50.0k → 20.0k tokens"));
         for (state, heading) in [
             (crate::backend::CompactionState::Running, None),
-            (crate::backend::CompactionState::Failed, Some("Context compaction failed")),
-            (crate::backend::CompactionState::Unconfirmed, Some("Context compaction completion unconfirmed")),
-            (crate::backend::CompactionState::Completed, Some("Context compacted")),
+            (
+                crate::backend::CompactionState::Failed,
+                Some("Context compaction failed"),
+            ),
+            (
+                crate::backend::CompactionState::Unconfirmed,
+                Some("Context compaction completion unconfirmed"),
+            ),
+            (
+                crate::backend::CompactionState::Completed,
+                Some("Context compacted"),
+            ),
         ] {
             let mut record = records[0].clone();
-            let SessionEventKind::Compaction { compaction } = &mut record.detail else { unreachable!() };
+            let SessionEventKind::Compaction { compaction } = &mut record.detail else {
+                unreachable!()
+            };
             compaction.state = state;
             broker.store.save_session_event(&record).unwrap();
             let snapshot = broker.snapshot().unwrap();
             let text = timeline_text(&snapshot);
             if let Some(heading) = heading {
-                assert!(matches!(snapshot.status, crate::session::state_machine::SessionPhase::Idle));
+                assert!(matches!(
+                    snapshot.status,
+                    crate::session::state_machine::SessionPhase::Idle
+                ));
                 assert!(text.contains(heading));
             } else {
-                assert!(matches!(snapshot.status,
-                    crate::session::state_machine::SessionPhase::Compacting { started_at_ms: 100 }));
-                assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::SessionEvent { .. })));
+                assert!(matches!(
+                    snapshot.status,
+                    crate::session::state_machine::SessionPhase::Compacting { started_at_ms: 100 }
+                ));
+                assert!(
+                    !snapshot
+                        .timeline
+                        .iter()
+                        .any(|entry| matches!(entry, TimelineEntry::SessionEvent { .. }))
+                );
                 assert!(text.contains("Compacting"));
             }
         }
 
-        let mut exchange = broker.store.list_exchange(&broker.session.id).unwrap().remove(0);
+        let mut exchange = broker
+            .store
+            .list_exchange(&broker.session.id)
+            .unwrap()
+            .remove(0);
         let automatic = crate::backend::Compaction {
-            id: "background".into(), thread_id: broker.session.backend_session_id.clone().unwrap(),
-            state: crate::backend::CompactionState::Running, manual:false,
-            started_at_ms:None, completed_at_ms:None, result:Default::default(),
+            id: "background".into(),
+            thread_id: broker.session.backend_session_id.clone().unwrap(),
+            state: crate::backend::CompactionState::Running,
+            manual: false,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: Default::default(),
         };
         exchange.observe_compaction(automatic.clone(), 200);
         let position = exchange.node_list.len() - 1;
         broker.store.save_exchange(&exchange).unwrap();
         let running = broker.snapshot().unwrap();
-        assert!(matches!(running.status,
-            crate::session::state_machine::SessionPhase::Compacting { started_at_ms: 200 }));
+        assert!(matches!(
+            running.status,
+            crate::session::state_machine::SessionPhase::Compacting { started_at_ms: 200 }
+        ));
         let running_text = timeline_text(&running);
         assert!(running_text.contains("Compacting"));
         assert!(!running_text.contains("Compacting context"));
@@ -12887,41 +18104,85 @@ mod test {
         completion.state = crate::backend::CompactionState::Completed;
         completion.result.summary_content = Some("Retain the original constraints.".into());
         let update = BackendEvent::from_compaction(completion, None);
-        let mut current = completed_interaction("next-compaction-exchange", &broker.session.id, Vec::new());
+        let mut current =
+            completed_interaction("next-compaction-exchange", &broker.session.id, Vec::new());
         current.ordinal = interaction_count as u64 + 1;
         current.state = ExchangeState::Running;
         current.completed_at_ms = None;
         broker.store.save_exchange(&current).unwrap();
         let mut runtime = ExchangeRuntime {
-            exchange_id:current.id.clone(), synthetic_turn:None, task:TaskTracker::default(),
-            checkpoint:None, tool_gate:None,
-            retraction_eligible:true, active_wait:None,
+            exchange_id: current.id.clone(),
+            synthetic_turn: None,
+            task: TaskTracker::default(),
+            checkpoint: None,
+            tool_gate: None,
+            retraction_eligible: true,
+            active_wait: None,
         };
         let (sink, mut stream) = crate::backend::events::channel();
         broker.event_sink = Some(sink);
         let mut events = Vec::new();
-        broker.process_backend_event(&mut runtime, &mut current, update.clone(), &mut events).await.unwrap();
-        assert!(current.node_list.is_empty(), "background completion entered the next exchange");
+        broker
+            .process_backend_event(&mut runtime, &mut current, update.clone(), &mut events)
+            .await
+            .unwrap();
+        assert!(
+            current.node_list.is_empty(),
+            "background completion entered the next exchange"
+        );
         let notification = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
-            .await.expect("cross-turn compaction patch was not delivered").unwrap().unwrap();
+            .await
+            .expect("cross-turn compaction patch was not delivered")
+            .unwrap()
+            .unwrap();
         assert_eq!(notification.kind, "document_changed");
         assert!(events.is_empty());
         broker.event_sink = None;
-        assert!(broker.observe_external_compaction(update.clone()).unwrap().is_empty());
-        assert!(broker.observe_external_compaction(update).unwrap().is_empty());
+        assert!(
+            broker
+                .observe_external_compaction(update.clone())
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            broker
+                .observe_external_compaction(update)
+                .unwrap()
+                .is_empty()
+        );
         let restored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(restored.len(), interaction_count + 1);
-        let ExchangeNode::Compaction { compaction, .. } = &restored[0].node_list[position] else { panic!("original compaction position lost") };
+        let ExchangeNode::Compaction { compaction, .. } = &restored[0].node_list[position] else {
+            panic!("original compaction position lost")
+        };
         assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
-        assert_eq!(compaction.result.summary_content.as_deref(), Some("Retain the original constraints."));
-        assert_eq!(broker.store.list_session_event(&broker.session.id).unwrap().len(), 1);
-        assert!(matches!(broker.snapshot().unwrap().status,
-            crate::session::state_machine::SessionPhase::Working { .. }));
+        assert_eq!(
+            compaction.result.summary_content.as_deref(),
+            Some("Retain the original constraints.")
+        );
+        assert_eq!(
+            broker
+                .store
+                .list_session_event(&broker.session.id)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(matches!(
+            broker.snapshot().unwrap().status,
+            crate::session::state_machine::SessionPhase::Working { .. }
+        ));
 
-        let mut record = broker.store.list_session_event(&broker.session.id).unwrap().remove(0);
+        let mut record = broker
+            .store
+            .list_session_event(&broker.session.id)
+            .unwrap()
+            .remove(0);
         record.id = "late-manual-compaction".into();
         record.created_at_ms = 300;
-        let SessionEventKind::Compaction { compaction } = &mut record.detail else { unreachable!() };
+        let SessionEventKind::Compaction { compaction } = &mut record.detail else {
+            unreachable!()
+        };
         compaction.id = "late-manual-compaction".into();
         compaction.started_at_ms = Some(300);
         compaction.completed_at_ms = Some(400);
@@ -12929,38 +18190,81 @@ mod test {
         broker.store.save_session_event(&record).unwrap();
         for used in [32_000, 64_000] {
             let usage_event = BackendEvent {
-                received_at_ms: None, address: None, turn_boundary: None,
-                kind: "context_usage".into(), text: None,
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "context_usage".into(),
+                text: None,
                 data: serde_json::to_value(ContextUsage::reported(used, 100_000).unwrap()).unwrap(),
-                activity: None, summary: None, task_update: None,
+                activity: None,
+                summary: None,
+                task_update: None,
             };
-            broker.process_backend_event(&mut runtime, &mut current, usage_event, &mut events).await.unwrap();
+            broker
+                .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
+                .await
+                .unwrap();
         }
-        let record = broker.store.list_session_event(&broker.session.id).unwrap().pop().unwrap();
-        let SessionEventKind::Compaction { compaction } = &record.detail else { unreachable!() };
+        let record = broker
+            .store
+            .list_session_event(&broker.session.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        let SessionEventKind::Compaction { compaction } = &record.detail else {
+            unreachable!()
+        };
         assert_eq!(compaction.result.context_tokens_before, Some(50_000));
         assert_eq!(compaction.result.context_tokens_after, Some(32_000));
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("50.0k → 32.0k tokens"));
 
         let automatic = crate::backend::Compaction {
-            id: "current-compaction".into(), thread_id: broker.session.backend_session_id.clone().unwrap(),
-            state: crate::backend::CompactionState::Running, manual: false,
-            started_at_ms: None, completed_at_ms: None, result: Default::default(),
+            id: "current-compaction".into(),
+            thread_id: broker.session.backend_session_id.clone().unwrap(),
+            state: crate::backend::CompactionState::Running,
+            manual: false,
+            started_at_ms: None,
+            completed_at_ms: None,
+            result: Default::default(),
         };
-        broker.process_backend_event(&mut runtime, &mut current,
-            BackendEvent::from_compaction(automatic.clone(), None), &mut events).await.unwrap();
+        broker
+            .process_backend_event(
+                &mut runtime,
+                &mut current,
+                BackendEvent::from_compaction(automatic.clone(), None),
+                &mut events,
+            )
+            .await
+            .unwrap();
         let mut completed = automatic;
         completed.state = crate::backend::CompactionState::Completed;
-        broker.process_backend_event(&mut runtime, &mut current,
-            BackendEvent::from_compaction(completed, None), &mut events).await.unwrap();
+        broker
+            .process_backend_event(
+                &mut runtime,
+                &mut current,
+                BackendEvent::from_compaction(completed, None),
+                &mut events,
+            )
+            .await
+            .unwrap();
         let usage_event = BackendEvent {
-            received_at_ms: None, address: None, turn_boundary: None,
-            kind: "context_usage".into(), text: None,
+            received_at_ms: None,
+            address: None,
+            turn_boundary: None,
+            kind: "context_usage".into(),
+            text: None,
             data: serde_json::to_value(ContextUsage::reported(12_000, 100_000).unwrap()).unwrap(),
-            activity: None, summary: None, task_update: None,
+            activity: None,
+            summary: None,
+            task_update: None,
         };
-        broker.process_backend_event(&mut runtime, &mut current, usage_event, &mut events).await.unwrap();
-        let ExchangeNode::Compaction { compaction, .. } = current.node_list.last().unwrap() else { unreachable!() };
+        broker
+            .process_backend_event(&mut runtime, &mut current, usage_event, &mut events)
+            .await
+            .unwrap();
+        let ExchangeNode::Compaction { compaction, .. } = current.node_list.last().unwrap() else {
+            unreachable!()
+        };
         assert_eq!(compaction.result.context_tokens_before, Some(64_000));
         assert_eq!(compaction.result.context_tokens_after, Some(12_000));
         assert!(timeline_text(&broker.snapshot().unwrap()).contains("64.0k → 12.0k tokens"));
@@ -13020,7 +18324,10 @@ mod test {
             permission_file: None,
             workspace: workspace.path().to_string_lossy().into_owned(),
             client_id: "source-client".into(),
-            backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+            backend: BackendLaunch {
+                kind: "mock".into(),
+                command: vec!["mock".into()],
+            },
             model: "mock-model".into(),
             effort: "low".into(),
             session_id: None,
@@ -13028,32 +18335,62 @@ mod test {
             goal_max_turns: 20,
             lease_conflict_action: None,
         };
-        let mut source = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100))).unwrap();
+        let mut source =
+            HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100)))
+                .unwrap();
         source.release_lease().unwrap();
         request.client_id = "destination-client".into();
         request.new_session_name = Some(String::new());
-        let newest = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(110))).unwrap();
+        let newest =
+            HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(110)))
+                .unwrap();
         assert_ne!(source.session.id, newest.session.id);
         request.new_session_name = None;
         request.session_id = Some(source.session.id.clone());
 
         let mut incompatible = request.clone();
         incompatible.workspace = other_workspace.path().to_string_lossy().into_owned();
-        let failure = HarnessBroker::initialize_with_clock(incompatible, Box::new(FixedClock(120))).err().unwrap();
+        let failure = HarnessBroker::initialize_with_clock(incompatible, Box::new(FixedClock(120)))
+            .err()
+            .unwrap();
         assert!(failure.to_string().contains("different workspace"));
-        assert!(source.store.load_session(&source.session.id).unwrap().unwrap().lease_owner.is_none());
+        assert!(
+            source
+                .store
+                .load_session(&source.session.id)
+                .unwrap()
+                .unwrap()
+                .lease_owner
+                .is_none()
+        );
 
-        let mut stored = source.store.load_session(&source.session.id).unwrap().unwrap();
+        let mut stored = source
+            .store
+            .load_session(&source.session.id)
+            .unwrap()
+            .unwrap();
         stored.backend = "copilot".into();
         source.store.save_session(&stored).unwrap();
-        let failure = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(130))).err().unwrap();
+        let failure =
+            HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(130)))
+                .err()
+                .unwrap();
         assert!(failure.to_string().contains("different configured backend"));
-        assert!(source.store.load_session(&source.session.id).unwrap().unwrap().lease_owner.is_none());
+        assert!(
+            source
+                .store
+                .load_session(&source.session.id)
+                .unwrap()
+                .unwrap()
+                .lease_owner
+                .is_none()
+        );
         stored.backend = "mock".into();
         stored.workspace = format!("{}//./", stored.workspace);
         source.store.save_session(&stored).unwrap();
 
-        let resumed = HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();
+        let resumed =
+            HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();
         assert_eq!(resumed.session.id, source.session.id);
         assert_eq!(resumed.session.name, "source");
         assert_eq!(resumed.store.list_session(None).unwrap().len(), 2);
@@ -13065,9 +18402,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13174,7 +18511,13 @@ mod test {
         let timeline = child_controller.snapshot().unwrap().timeline;
         assert_eq!(timeline.len(), 2);
         assert!(matches!(&timeline[0], TimelineEntry::SessionEvent { .. }));
-        assert!(matches!(&timeline[1], TimelineEntry::Status { status: SessionPhase::Idle, .. }));
+        assert!(matches!(
+            &timeline[1],
+            TimelineEntry::Status {
+                status: SessionPhase::Idle,
+                ..
+            }
+        ));
         let failed_preparation = prepare_provider_fork(
             data.path(),
             "fork-client",
@@ -13214,9 +18557,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13257,12 +18600,28 @@ mod test {
             .await;
         assert!(configured.response.error().is_none());
         for invalid in [json!("warp"), json!(true), json!(null)] {
-            assert!(broker.configure_session(json!({"service_tier":invalid})).await.is_err());
-            assert_eq!(broker.session.service_tier, crate::backend::ServiceTier::Ultrafast);
+            assert!(
+                broker
+                    .configure_session(json!({"service_tier":invalid}))
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                broker.session.service_tier,
+                crate::backend::ServiceTier::Ultrafast
+            );
         }
         broker.capability.ultrafast_mode = false;
-        assert!(broker.configure_session(json!({"service_tier":"ultrafast"})).await.is_err());
-        assert_eq!(broker.session.service_tier, crate::backend::ServiceTier::Ultrafast);
+        assert!(
+            broker
+                .configure_session(json!({"service_tier":"ultrafast"}))
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            broker.session.service_tier,
+            crate::backend::ServiceTier::Ultrafast
+        );
         broker.capability.ultrafast_mode = true;
 
         broker
@@ -13319,9 +18678,9 @@ mod test {
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13366,16 +18725,29 @@ mod test {
         }));
         let stale = broker.rename_session(json!({ "session_id": session["id"],
             "name": "Generated name", "expected_name": "Previous name" }));
-        assert!(stale.unwrap_err().to_string().contains("changed during generation"));
-        assert_eq!(broker.store.load_session(session["id"].as_str().unwrap()).unwrap().unwrap().name, "Architecture review");
+        assert!(
+            stale
+                .unwrap_err()
+                .to_string()
+                .contains("changed during generation")
+        );
+        assert_eq!(
+            broker
+                .store
+                .load_session(session["id"].as_str().unwrap())
+                .unwrap()
+                .unwrap()
+                .name,
+            "Architecture review"
+        );
         drop(broker);
 
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13396,7 +18768,10 @@ mod test {
         .unwrap();
         assert_eq!(restarted.session.model, "gpt-5.6");
         assert_eq!(restarted.session.effort, "low");
-        assert_eq!(restarted.session.service_tier, crate::backend::ServiceTier::Ultrafast);
+        assert_eq!(
+            restarted.session.service_tier,
+            crate::backend::ServiceTier::Ultrafast
+        );
         assert_eq!(restarted.session.execution_mode, PermissionMode::Write);
         assert!(
             !restarted
@@ -13428,7 +18803,10 @@ mod test {
             permission_file: None,
             workspace: repository.path().to_string_lossy().into_owned(),
             client_id: "provider-default-test".into(),
-            backend: BackendLaunch { kind: "codex".into(), command: vec!["codex".into(), "app-server".into()] },
+            backend: BackendLaunch {
+                kind: "codex".into(),
+                command: vec!["codex".into(), "app-server".into()],
+            },
             model: "original-model".into(),
             effort: "medium".into(),
             session_id: None,
@@ -13436,7 +18814,9 @@ mod test {
             goal_max_turns: 20,
             lease_conflict_action: None,
         };
-        let initial = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100))).unwrap();
+        let initial =
+            HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100)))
+                .unwrap();
         let original_id = initial.session.id.clone();
         let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
         settings.save_provider(0, "codex", &json!({
@@ -13444,10 +18824,18 @@ mod test {
         })).unwrap();
         drop(initial);
 
-        let mut resumed = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(200))).unwrap();
+        let mut resumed =
+            HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(200)))
+                .unwrap();
         assert_eq!(resumed.session.id, original_id);
         assert_eq!(resumed.session.model, "original-model");
-        let created = resumed.dispatch(Request { id: 1, method: "session.new".into(), params: json!({}) }).await;
+        let created = resumed
+            .dispatch(Request {
+                id: 1,
+                method: "session.new".into(),
+                params: json!({}),
+            })
+            .await;
         let child = &created.response.result().unwrap()["session"];
         assert_eq!(child["model"], "preferred-model");
         assert_eq!(child["effort"], "high");
@@ -13455,16 +18843,29 @@ mod test {
         assert_eq!(child["service_tier"], "fast");
         assert_eq!(child["execution_mode"], "read");
 
-        let fresh = HarnessBroker::initialize_with_clock(InitializeRequest {
-            background: None,
-            workspace: other_repository.path().to_string_lossy().into_owned(),
-            ..request
-        }, Box::new(FixedClock(300))).unwrap();
+        let fresh = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                background: None,
+                workspace: other_repository.path().to_string_lossy().into_owned(),
+                ..request
+            },
+            Box::new(FixedClock(300)),
+        )
+        .unwrap();
         assert_eq!(fresh.session.model, "preferred-model");
-        assert_eq!(fresh.session.resolved_model.as_deref(), Some("preferred-model"));
+        assert_eq!(
+            fresh.session.resolved_model.as_deref(),
+            Some("preferred-model")
+        );
         assert_eq!(fresh.session.effort, "high");
-        assert_eq!(fresh.session.context_window.as_deref(), Some("long_context"));
-        assert_eq!(fresh.session.service_tier, crate::backend::ServiceTier::Fast);
+        assert_eq!(
+            fresh.session.context_window.as_deref(),
+            Some("long_context")
+        );
+        assert_eq!(
+            fresh.session.service_tier,
+            crate::backend::ServiceTier::Fast
+        );
     }
 
     #[tokio::test]
@@ -13473,9 +18874,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13532,9 +18933,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13590,7 +18991,13 @@ mod test {
         let result = preview.response.result().expect("session preview");
         assert_eq!(result["session"]["id"], source_session_id);
         assert!(result.get("exchange").is_none() && result.get("timeline").is_none());
-        assert!(result["lines"].as_array().unwrap().iter().any(|line| line.as_str().unwrap().contains("preserve preview history")));
+        assert!(
+            result["lines"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|line| line.as_str().unwrap().contains("preserve preview history"))
+        );
         let persisted = broker
             .store
             .load_session(&source_session_id)
@@ -13606,9 +19013,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13652,9 +19059,9 @@ mod test {
 
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13744,7 +19151,12 @@ mod test {
         assert!(original_exchange.execution_started_at_ms.is_none());
         assert!(
             broker
-                .append_plan_feedback("unrelated-plan", "wrong owner".into(), crate::exchange::InputIntent::Clarification, None)
+                .append_plan_feedback(
+                    "unrelated-plan",
+                    "wrong owner".into(),
+                    crate::exchange::InputIntent::Clarification,
+                    None
+                )
                 .is_err()
         );
         assert_eq!(
@@ -13821,13 +19233,18 @@ mod test {
                 .iter()
                 .any(|event| event.event == "plan_question_answered")
         );
-        assert!(completed.event.iter().filter(|event| event.event == "document_changed")
-            .any(|event| {
-                let payload = event.payload.to_string();
-                payload.contains("\"kind\":\"working\"")
-                    || payload.contains("\"kind\":\"retrying_plan_generation\"")
-            }),
-            "resuming plan feedback must restore an active footer in live patches");
+        assert!(
+            completed
+                .event
+                .iter()
+                .filter(|event| event.event == "document_changed")
+                .any(|event| {
+                    let payload = event.payload.to_string();
+                    payload.contains("\"kind\":\"working\"")
+                        || payload.contains("\"kind\":\"retrying_plan_generation\"")
+                }),
+            "resuming plan feedback must restore an active footer in live patches"
+        );
         assert!(
             completed
                 .event
@@ -13861,12 +19278,19 @@ mod test {
         assert!(completed_exchange.checkpoint_after.is_some());
         assert!(
             broker
-                .append_plan_feedback(&plan.id, "late feedback".into(), crate::exchange::InputIntent::Clarification, None)
+                .append_plan_feedback(
+                    &plan.id,
+                    "late feedback".into(),
+                    crate::exchange::InputIntent::Clarification,
+                    None
+                )
                 .is_err()
         );
         assert_eq!(completed_snapshot.exchange[0].plan_id, Some(plan.id));
-        assert!(completed_snapshot.timeline.iter().all(|entry| matches!(entry,
-            TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. })));
+        assert!(completed_snapshot.timeline.iter().all(|entry| matches!(
+            entry,
+            TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. }
+        )));
         let lifecycle = broker
             .store
             .list_plan_lifecycle(&broker.session.id)
@@ -13942,7 +19366,10 @@ mod test {
             2,
             "automatic retries must follow the answered exchange as a separate attempt"
         );
-        assert_eq!(snapshot.exchange[1].lifecycle.as_deref(), Some("Planning continued"));
+        assert_eq!(
+            snapshot.exchange[1].lifecycle.as_deref(),
+            Some("Planning continued")
+        );
         assert_eq!(
             broker
                 .store
@@ -14020,13 +19447,26 @@ mod test {
         assert_eq!(submitted.state, PlanState::AwaitingReview);
         assert_eq!(submitted.generation.budget.turn_count, 1);
         let mut interrupted = submitted;
-        PlanStateMachine::apply(&mut interrupted, PlanEvent::TransitionFailed, broker.clock.now_ms()).unwrap();
+        PlanStateMachine::apply(
+            &mut interrupted,
+            PlanEvent::TransitionFailed,
+            broker.clock.now_ms(),
+        )
+        .unwrap();
         broker.store.save_plan(&interrupted).unwrap();
         broker.pause_task(false).await.unwrap();
-        let resumed = broker.dispatch(Request {
-            id: 4, method: "prompt.submit".into(), params: json!({"text":"continue the existing design"}),
-        }).await;
-        assert!(resumed.response.error().is_none(), "{:?}", resumed.response.error());
+        let resumed = broker
+            .dispatch(Request {
+                id: 4,
+                method: "prompt.submit".into(),
+                params: json!({"text":"continue the existing design"}),
+            })
+            .await;
+        assert!(
+            resumed.response.error().is_none(),
+            "{:?}",
+            resumed.response.error()
+        );
         let recovered = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(recovered.id, plan_id);
         assert_eq!(recovered.state, PlanState::AwaitingReview);
@@ -14040,21 +19480,46 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), structured);
             broker.session.execution_mode = PermissionMode::Write;
-            let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
-                params:json!({"text":"/plan migrate"}) }).await;
+            let planned = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "prompt.submit".into(),
+                    params: json!({"text":"/plan migrate"}),
+                })
+                .await;
             assert!(planned.response.error().is_none());
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
-            assert!(matches!(plan.state, PlanState::AwaitingInput | PlanState::AwaitingReview));
-            let cancelled = broker.dispatch(Request { id:2, method:"plan.cancel".into(), params:json!({"plan_id":plan.id}) }).await;
+            assert!(matches!(
+                plan.state,
+                PlanState::AwaitingInput | PlanState::AwaitingReview
+            ));
+            let cancelled = broker
+                .dispatch(Request {
+                    id: 2,
+                    method: "plan.cancel".into(),
+                    params: json!({"plan_id":plan.id}),
+                })
+                .await;
             assert!(cancelled.response.error().is_none());
             let snapshot = broker.snapshot().unwrap();
             assert!(snapshot.active_plan.is_none());
             assert_eq!(broker.session.execution_mode, PermissionMode::Write);
             assert!(snapshot.active_elicitation.is_none());
-            assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Status { .. })));
-            assert!(broker.store.list_exchange(&broker.session.id).unwrap().iter()
-                .filter(|exchange| exchange.plan_id.as_deref() == Some(&plan.id))
-                .all(|exchange| exchange.completed_at_ms.is_some() && !exchange.awaiting_input));
+            assert!(
+                !snapshot
+                    .timeline
+                    .iter()
+                    .any(|entry| matches!(entry, TimelineEntry::Status { .. }))
+            );
+            assert!(
+                broker
+                    .store
+                    .list_exchange(&broker.session.id)
+                    .unwrap()
+                    .iter()
+                    .filter(|exchange| exchange.plan_id.as_deref() == Some(&plan.id))
+                    .all(|exchange| exchange.completed_at_ms.is_some() && !exchange.awaiting_input)
+            );
         }
     }
 
@@ -14167,36 +19632,86 @@ mod test {
 
     #[tokio::test]
     async fn clarification_after_review_reopens_the_answer_without_continuing() {
-        for prompt in ["ask which migration to use", "/plan migrate the event format"] {
+        for prompt in [
+            "ask which migration to use",
+            "/plan migrate the event format",
+        ] {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = mutable_question_broker(repository.path(), data.path());
-            let result = broker.dispatch(Request { id: 1, method: "prompt.submit".into(),
-                params: json!({"text": prompt}) }).await;
+            let result = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "prompt.submit".into(),
+                    params: json!({"text": prompt}),
+                })
+                .await;
             assert!(result.response.error().is_none());
-            let question_id = broker.snapshot().unwrap().active_elicitation.unwrap()
-                .elicitation.question_set.questions[0].id.clone();
+            let question_id = broker
+                .snapshot()
+                .unwrap()
+                .active_elicitation
+                .unwrap()
+                .elicitation
+                .question_set
+                .questions[0]
+                .id
+                .clone();
             let result = broker.dispatch(Request { id: 2, method: "question.answer".into(),
                 params: json!({"question_id":question_id, "response":{"kind":"selected","option":"Staged"}}) }).await;
             assert!(result.response.error().is_none());
-            assert!(broker.snapshot().unwrap().active_elicitation.unwrap().elicitation.current_question().is_none());
-            let result = broker.dispatch(Request { id: 3, method: "question.ask".into(),
-                params: json!({"question_id":question_id,"text":"what do you mean?"}) }).await;
-            assert!(result.response.error().is_none(), "{:?}", result.response.error());
+            assert!(
+                broker
+                    .snapshot()
+                    .unwrap()
+                    .active_elicitation
+                    .unwrap()
+                    .elicitation
+                    .current_question()
+                    .is_none()
+            );
+            let result = broker
+                .dispatch(Request {
+                    id: 3,
+                    method: "question.ask".into(),
+                    params: json!({"question_id":question_id,"text":"what do you mean?"}),
+                })
+                .await;
+            assert!(
+                result.response.error().is_none(),
+                "{:?}",
+                result.response.error()
+            );
             let snapshot = broker.snapshot().unwrap();
             let elicitation = snapshot.active_elicitation.unwrap().elicitation;
             assert!(elicitation.answer.is_empty());
             assert_eq!(elicitation.current_question().unwrap().id, question_id);
             assert_eq!(snapshot.exchange.len(), 1);
             assert!(snapshot.exchange[0].completed_at_ms.is_none());
-            let input = snapshot.exchange[0].node_list.iter().find_map(|node| match node {
-                ExchangeNode::ExchangeInput { prompt } if prompt.intent == crate::exchange::InputIntent::Clarification => Some(prompt),
-                _ => None,
-            }).unwrap();
-            let target = input.question.as_ref().expect("clarification must retain its question target");
-            assert_eq!(target.question_id.as_deref(),Some(question_id.as_str()));
-            assert_eq!(target.set_id,elicitation.question_set.id);
-            assert!(!result.event.iter().any(|event| event.event == "question_answered"));
+            let input = snapshot.exchange[0]
+                .node_list
+                .iter()
+                .find_map(|node| match node {
+                    ExchangeNode::ExchangeInput { prompt }
+                        if prompt.intent == crate::exchange::InputIntent::Clarification =>
+                    {
+                        Some(prompt)
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            let target = input
+                .question
+                .as_ref()
+                .expect("clarification must retain its question target");
+            assert_eq!(target.question_id.as_deref(), Some(question_id.as_str()));
+            assert_eq!(target.set_id, elicitation.question_set.id);
+            assert!(
+                !result
+                    .event
+                    .iter()
+                    .any(|event| event.event == "question_answered")
+            );
         }
     }
 
@@ -14435,13 +19950,25 @@ mod test {
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].prompt, "/plan migrate the event format");
-        assert!(exchanges[1].prompt.is_empty(), "internal continuation appeared as user input");
-        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Planning continued"));
+        assert!(
+            exchanges[1].prompt.is_empty(),
+            "internal continuation appeared as user input"
+        );
+        assert_eq!(
+            exchanges[1].lifecycle.as_deref(),
+            Some("Planning continued")
+        );
         assert_ne!(exchanges[0].id, exchanges[1].id);
-        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete
-            && exchange.completed_at_ms.is_some() && exchange.turn.len() == 1
-            && exchange.plan_id.as_deref() == Some(plan.id.as_str())));
-        let restored: Vec<Exchange> = serde_json::from_value(serde_json::to_value(&exchanges).unwrap()).unwrap();
+        assert!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Complete
+                    && exchange.completed_at_ms.is_some()
+                    && exchange.turn.len() == 1
+                    && exchange.plan_id.as_deref() == Some(plan.id.as_str()))
+        );
+        let restored: Vec<Exchange> =
+            serde_json::from_value(serde_json::to_value(&exchanges).unwrap()).unwrap();
         assert_eq!(restored[1].lifecycle.as_deref(), Some("Planning continued"));
         assert_eq!(restored[0].turn.len(), 1);
         assert_eq!(restored[1].turn.len(), 1);
@@ -14487,32 +20014,57 @@ mod test {
     #[async_trait::async_trait]
     impl Backend for NativeContinuationBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, _request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
-            use crate::backend::{ProviderAddress, TurnBoundary};
+        async fn prompt_stream(
+            &self,
+            _request: BackendRequest,
+            sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
             use crate::backend::usage::{TokenUsage, UsageUpdate};
+            use crate::backend::{ProviderAddress, TurnBoundary};
             let sink = sink.unwrap();
             for ordinal in 1..=2 {
-                let address = ProviderAddress { owner: None, thread_id: "native-goal-thread".into(), turn_id: format!("turn-{ordinal}") };
+                let address = ProviderAddress {
+                    owner: None,
+                    thread_id: "native-goal-thread".into(),
+                    turn_id: format!("turn-{ordinal}"),
+                };
                 let mut event = BackendEvent {
-                    received_at_ms: None, address: Some(address.clone()),
-                    turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(),
-                    text: None, data: Value::Null, activity: None, summary: None, task_update: None,
+                    received_at_ms: None,
+                    address: Some(address.clone()),
+                    turn_boundary: Some(TurnBoundary::Started),
+                    kind: "turn_started".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
                 };
                 sink.send_wait(event.clone()).await?;
                 sink.send_wait(event.clone()).await?;
@@ -14526,17 +20078,30 @@ mod test {
                 event.kind = "usage".into();
                 event.text = None;
                 event.data = serde_json::to_value(UsageUpdate {
-                    id: format!("request-{ordinal}"), cumulative: None, cumulative_total: None,
-                    usage: TokenUsage { input: Some(100 * ordinal), cached_input: Some(0),
-                        reasoning: Some(10), output: Some(20) },
+                    id: format!("request-{ordinal}"),
+                    cumulative: None,
+                    cumulative_total: None,
+                    usage: TokenUsage {
+                        input: Some(100 * ordinal),
+                        cached_input: Some(0),
+                        reasoning: Some(10),
+                        output: Some(20),
+                    },
                 })?;
                 sink.send_wait(event.clone()).await?;
                 if ordinal == 2 {
                     let mut late = event.clone();
                     late.address.as_mut().unwrap().turn_id = "turn-1".into();
                     late.data = serde_json::to_value(UsageUpdate {
-                        id: "late-request".into(), cumulative: None, cumulative_total: None,
-                        usage: TokenUsage { input: Some(50), cached_input: Some(0), reasoning: Some(0), output: Some(5) },
+                        id: "late-request".into(),
+                        cumulative: None,
+                        cumulative_total: None,
+                        usage: TokenUsage {
+                            input: Some(50),
+                            cached_input: Some(0),
+                            reasoning: Some(0),
+                            output: Some(5),
+                        },
                     })?;
                     sink.send_wait(late.clone()).await?;
                     sink.send_wait(late).await?;
@@ -14548,7 +20113,9 @@ mod test {
                 }
                 event.kind = "turn_completed".into();
                 event.data = Value::Null;
-                event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+                event.turn_boundary = Some(TurnBoundary::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                });
                 sink.send_wait(event).await?;
             }
             let mut output = crate::backend::BackendOutput::default();
@@ -14557,7 +20124,10 @@ mod test {
             Ok(output)
         }
 
-        async fn fork(&self, _request: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+        async fn fork(
+            &self,
+            _request: BackendForkRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
             anyhow::bail!("native continuation fixture does not fork")
         }
     }
@@ -14568,14 +20138,24 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.capability.native_goal = true;
-        broker.backend = Arc::new(NativeContinuationBackend { cancel_continuation: false });
-        broker.set_goal(json!({"objective":"complete two native turns"})).await.unwrap();
+        broker.backend = Arc::new(NativeContinuationBackend {
+            cancel_continuation: false,
+        });
+        broker
+            .set_goal(json!({"objective":"complete two native turns"}))
+            .await
+            .unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].prompt, "/goal complete two native turns");
         assert_eq!(exchanges[1].prompt, "");
         assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
-        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete && exchange.turn.len() == 1));
+        assert!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Complete
+                    && exchange.turn.len() == 1)
+        );
         assert_eq!(exchanges[0].usage().input, Some(150));
         assert_eq!(exchanges[1].usage().input, Some(200));
         assert_eq!(exchanges[0].metrics.request_count, 2);
@@ -14585,7 +20165,10 @@ mod test {
         let session_id = broker.session.id.clone();
         drop(broker);
         let store = SqliteStore::open(data.path()).unwrap();
-        assert_eq!(serde_json::to_value(store.list_exchange(&session_id).unwrap()).unwrap(), retained);
+        assert_eq!(
+            serde_json::to_value(store.list_exchange(&session_id).unwrap()).unwrap(),
+            retained
+        );
     }
 
     #[tokio::test]
@@ -14593,17 +20176,35 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        broker.backend = Arc::new(NativeSettlementBackend { inner: broker.backend.clone(), state: GoalState::Active });
-        broker.set_goal(json!({"objective":"complete a continued goal"})).await.unwrap();
+        broker.backend = Arc::new(NativeSettlementBackend {
+            inner: broker.backend.clone(),
+            state: GoalState::Active,
+        });
+        broker
+            .set_goal(json!({"objective":"complete a continued goal"}))
+            .await
+            .unwrap();
         broker.continue_goal().await.unwrap();
-        broker.backend = Arc::new(NativeSettlementBackend { inner: broker.backend.clone(), state: GoalState::Complete });
+        broker.backend = Arc::new(NativeSettlementBackend {
+            inner: broker.backend.clone(),
+            state: GoalState::Complete,
+        });
         broker.continue_goal().await.unwrap();
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 3);
-        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete && exchange.turn.len() == 1));
-        assert!(exchanges[1..].iter().all(|exchange| exchange.prompt.is_empty()
-            && exchange.lifecycle.as_deref() == Some("Goal continued")
-            && exchange.goal_id == exchanges[0].goal_id));
+        assert!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Complete
+                    && exchange.turn.len() == 1)
+        );
+        assert!(
+            exchanges[1..]
+                .iter()
+                .all(|exchange| exchange.prompt.is_empty()
+                    && exchange.lifecycle.as_deref() == Some("Goal continued")
+                    && exchange.goal_id == exchanges[0].goal_id)
+        );
     }
 
     #[tokio::test]
@@ -14613,8 +20214,13 @@ mod test {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let backend = broker.backend.clone();
         broker.capability.native_goal = true;
-        broker.backend = Arc::new(NativeContinuationBackend { cancel_continuation: true });
-        let error = broker.set_goal(json!({"objective":"interrupt the second native turn"})).await.unwrap_err();
+        broker.backend = Arc::new(NativeContinuationBackend {
+            cancel_continuation: true,
+        });
+        let error = broker
+            .set_goal(json!({"objective":"interrupt the second native turn"}))
+            .await
+            .unwrap_err();
         assert!(error.downcast_ref::<TurnCancelled>().is_some());
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(exchanges.len(), 2);
@@ -14622,74 +20228,139 @@ mod test {
         assert_eq!(exchanges[1].state, ExchangeState::Cancelled);
         assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
-        broker.backend = Arc::new(NativeSettlementBackend { inner: backend, state: GoalState::Complete });
+        broker.backend = Arc::new(NativeSettlementBackend {
+            inner: backend,
+            state: GoalState::Complete,
+        });
         broker.resume_goal(None, None, None).await.unwrap();
         let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(resumed.len(), 3);
         assert_eq!(resumed[2].lifecycle.as_deref(), Some("Goal resumed"));
-        assert_eq!(serde_json::to_value(&resumed[..2]).unwrap(), serde_json::to_value(exchanges).unwrap());
+        assert_eq!(
+            serde_json::to_value(&resumed[..2]).unwrap(),
+            serde_json::to_value(exchanges).unwrap()
+        );
     }
 
     #[async_trait::async_trait]
     impl Backend for NativeSettlementBackend {
         fn descriptor(&self) -> crate::backend::BackendDescriptor {
-            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
-                capability: crate::backend::mock_capability() }
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Mock,
+                label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability(),
+            }
         }
 
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
-        async fn prompt_stream(&self, request: BackendRequest, event_sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            event_sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
             let mut output = self.inner.prompt_stream(request, event_sink).await?;
             output.evidence.native_state = Some(self.state);
             output.evidence.tool_called = true;
             Ok(output)
         }
 
-        async fn fork(&self, request: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+        async fn fork(
+            &self,
+            request: BackendForkRequest,
+        ) -> Result<crate::backend::BackendForkResult> {
             self.inner.fork(request).await
         }
     }
 
     #[tokio::test]
     async fn native_goal_settlement_persists_without_requesting_continuation() {
-        for state in [GoalState::Paused, GoalState::Complete, GoalState::Blocked,
-            GoalState::UsageLimited, GoalState::BudgetLimited, GoalState::Cleared] {
+        for state in [
+            GoalState::Paused,
+            GoalState::Complete,
+            GoalState::Blocked,
+            GoalState::UsageLimited,
+            GoalState::BudgetLimited,
+            GoalState::Cleared,
+        ] {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
-                data_root: data.path().to_string_lossy().into_owned(), permission_file: None,
+                config_dir: None,
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "native-settlement-test".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                model: "mock-model".into(), effort: "medium".into(), session_id: None,
-                new_session_name: None, goal_max_turns: 20, lease_conflict_action: None,
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "medium".into(),
+                session_id: None,
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
             };
-            let mut broker = HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(100))).unwrap();
-            broker.backend = Arc::new(NativeSettlementBackend { inner: broker.backend.clone(), state });
-            let (_, event) = broker.set_goal(json!({"objective":"native settlement fixture"})).await.unwrap();
-            assert!(!event.iter().any(|event| event.event == "goal_continue_requested"));
+            let mut broker =
+                HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(100)))
+                    .unwrap();
+            broker.backend = Arc::new(NativeSettlementBackend {
+                inner: broker.backend.clone(),
+                state,
+            });
+            let (_, event) = broker
+                .set_goal(json!({"objective":"native settlement fixture"}))
+                .await
+                .unwrap();
+            assert!(
+                !event
+                    .iter()
+                    .any(|event| event.event == "goal_continue_requested")
+            );
             assert!(event.iter().any(|event| event.event == "goal_changed"));
             assert_eq!(broker.active_goal().unwrap().state, state);
             assert_eq!(broker.active_goal().unwrap().continuation.turn_count, 0);
-            let exchange = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
-            let suspended = matches!(state, GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited);
-            assert_eq!(exchange.state, if suspended { ExchangeState::Running }
-                else if state == GoalState::Cleared { ExchangeState::Cancelled }
-                else { ExchangeState::Complete });
+            let exchange = broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .pop()
+                .unwrap();
+            let suspended = matches!(
+                state,
+                GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited
+            );
+            assert_eq!(
+                exchange.state,
+                if suspended {
+                    ExchangeState::Running
+                } else if state == GoalState::Cleared {
+                    ExchangeState::Cancelled
+                } else {
+                    ExchangeState::Complete
+                }
+            );
             assert_eq!(exchange.checkpoint_after.is_none(), suspended);
             if state == GoalState::Paused {
                 broker.clock = Box::new(FixedClock(500));
@@ -14698,11 +20369,23 @@ mod test {
             }
             let goal = serde_json::to_value(broker.active_goal().unwrap()).unwrap();
             drop(broker);
-            let mut reopened = HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(900))).unwrap();
-            assert_eq!(serde_json::to_value(reopened.active_goal().unwrap()).unwrap(), goal);
-            if matches!(state, GoalState::Paused | GoalState::Blocked | GoalState::UsageLimited | GoalState::BudgetLimited) {
+            let mut reopened =
+                HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(900)))
+                    .unwrap();
+            assert_eq!(
+                serde_json::to_value(reopened.active_goal().unwrap()).unwrap(),
+                goal
+            );
+            if matches!(
+                state,
+                GoalState::Paused
+                    | GoalState::Blocked
+                    | GoalState::UsageLimited
+                    | GoalState::BudgetLimited
+            ) {
                 reopened.backend = Arc::new(NativeSettlementBackend {
-                    inner: reopened.backend.clone(), state: GoalState::Complete,
+                    inner: reopened.backend.clone(),
+                    state: GoalState::Complete,
                 });
                 reopened.resume_goal(None, None, None).await.unwrap();
                 assert_eq!(reopened.active_goal().unwrap().state, GoalState::Complete);
@@ -14722,14 +20405,17 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "clear-goal-test".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
                 model: "mock-model".into(),
                 effort: "medium".into(),
                 session_id: None,
@@ -14737,9 +20423,19 @@ mod test {
                 goal_max_turns: 20,
                 lease_conflict_action: None,
             };
-            let mut broker = HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(100))).unwrap();
-            broker.set_goal(json!({ "objective": "continue this work" })).await.unwrap();
-            let before = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+            let mut broker =
+                HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(100)))
+                    .unwrap();
+            broker
+                .set_goal(json!({ "objective": "continue this work" }))
+                .await
+                .unwrap();
+            let before = broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .pop()
+                .unwrap();
             assert_eq!(before.state, ExchangeState::Running);
             assert!(before.checkpoint_before.is_some());
             assert!(before.checkpoint_after.is_none());
@@ -14749,7 +20445,10 @@ mod test {
             broker.clock = Box::new(FixedClock(500));
             let terminal_before = if let Some(outcome) = terminal_outcome {
                 let mut exchange = before.clone();
-                broker.capture_final_checkpoint(&mut exchange, outcome).await.unwrap();
+                broker
+                    .capture_final_checkpoint(&mut exchange, outcome)
+                    .await
+                    .unwrap();
                 broker.exchange_runtime = None;
                 Some(serde_json::to_value(exchange).unwrap())
             } else {
@@ -14761,7 +20460,12 @@ mod test {
                 broker.store.save_exchange(&damaged).unwrap();
                 assert!(broker.clear_goal().await.is_err());
                 assert_eq!(broker.active_goal().unwrap().state, GoalState::Cleared);
-                let mut failed = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                let mut failed = broker
+                    .store
+                    .list_exchange(&broker.session.id)
+                    .unwrap()
+                    .pop()
+                    .unwrap();
                 assert_eq!(failed.state, ExchangeState::Finalizing);
                 assert!(failed.finalization_error.is_some());
                 assert_eq!(failed.finalization_outcome, Some(ExchangeState::Cancelled));
@@ -14769,13 +20473,26 @@ mod test {
                 broker.store.save_exchange(&failed).unwrap();
             }
             let (_, events) = broker.clear_goal().await.unwrap();
-            let settled = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
-            assert_eq!(settled.state, terminal_outcome.unwrap_or(ExchangeState::Cancelled));
+            let settled = broker
+                .store
+                .list_exchange(&broker.session.id)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                settled.state,
+                terminal_outcome.unwrap_or(ExchangeState::Cancelled)
+            );
             assert!(settled.checkpoint_after.is_some());
             assert_eq!(settled.turn.len(), before.turn.len());
             assert_eq!(settled.turn[0].state(), before.turn[0].state());
             assert_eq!(settled.elapsed(90_000), before.elapsed(500));
-            assert_eq!(events.iter().any(|event| event.event == "exchange_complete"), terminal_outcome.is_none());
+            assert_eq!(
+                events
+                    .iter()
+                    .any(|event| event.event == "exchange_complete"),
+                terminal_outcome.is_none()
+            );
             if let Some(terminal_before) = terminal_before {
                 assert_eq!(serde_json::to_value(&settled).unwrap(), terminal_before);
             }
@@ -14783,10 +20500,20 @@ mod test {
             assert!(broker.exchange_runtime.is_none());
             let session_id = broker.session.id.clone();
             drop(broker);
-            let reopened = HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(900))).unwrap();
+            let reopened =
+                HarnessBroker::initialize_with_clock(initialize(), Box::new(FixedClock(900)))
+                    .unwrap();
             assert_eq!(reopened.session.id, session_id);
-            let restored = reopened.store.list_exchange(&session_id).unwrap().pop().unwrap();
-            assert_eq!(serde_json::to_value(restored).unwrap(), serde_json::to_value(settled).unwrap());
+            let restored = reopened
+                .store
+                .list_exchange(&session_id)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(restored).unwrap(),
+                serde_json::to_value(settled).unwrap()
+            );
         }
     }
 
@@ -14796,9 +20523,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14845,9 +20572,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14890,9 +20617,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14964,33 +20691,55 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
                 client_id: "reported-edits-test".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                model: "mock-model".into(), effort: "low".into(), session_id: None,
-                new_session_name: None, goal_max_turns: 20, lease_conflict_action: None,
+                backend: BackendLaunch {
+                    kind: "mock".into(),
+                    command: vec!["mock".into()],
+                },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: None,
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
             },
             Box::new(FixedClock(300)),
-        ).unwrap();
+        )
+        .unwrap();
         broker.backend = Arc::new(NestedWriteBackend);
-        let result = broker.dispatch(Request {
-            id: 1, method: "prompt.submit".into(), params: json!({"text":"create a module"}),
-        }).await;
-        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let result = broker
+            .dispatch(Request {
+                id: 1,
+                method: "prompt.submit".into(),
+                params: json!({"text":"create a module"}),
+            })
+            .await;
+        assert!(
+            result.response.error().is_none(),
+            "{:?}",
+            result.response.error()
+        );
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
         let exchange = &exchanges[0];
         assert_eq!(exchange.state, ExchangeState::Complete);
         assert!(exchange.checkpoint_before.is_none() && exchange.checkpoint_after.is_none());
         assert!(exchange.checkpoint_diff_text.is_none());
         assert!(!exchange.attributed_matches_checkpoint);
-        let diff = exchange.attributed_diff_text.as_deref().expect("persisted reported edits");
+        let diff = exchange
+            .attributed_diff_text
+            .as_deref()
+            .expect("persisted reported edits");
         assert!(diff.contains("seed.txt") && diff.contains("+provider edit"));
-        assert!(!diff.contains("apps/new/deep/module/lib.rs"), "command edits have no provider provenance");
+        assert!(
+            !diff.contains("apps/new/deep/module/lib.rs"),
+            "command edits have no provider provenance"
+        );
         assert!(!workspace.path().join(".git").exists());
     }
 
@@ -15003,9 +20752,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -15081,9 +20830,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -15111,10 +20860,15 @@ mod test {
             .interaction_for_turn("not started", true, 300)
             .await
             .unwrap();
-        broker.start_exchange_runtime(&mut rejected, 300).await.unwrap();
+        broker
+            .start_exchange_runtime(&mut rejected, 300)
+            .await
+            .unwrap();
         let mut runtime = broker.exchange_runtime.take().unwrap();
         let captured = (&mut runtime.checkpoint.as_mut().unwrap().0).await.unwrap();
-        let error = broker.finish_initial_checkpoint(&mut runtime, &mut rejected, captured).unwrap_err();
+        let error = broker
+            .finish_initial_checkpoint(&mut runtime, &mut rejected, captured)
+            .unwrap_err();
         assert!(error.to_string().contains("capacity is full"));
         assert!(runtime.tool_gate.as_ref().unwrap().wait().await.is_err());
         assert!(rejected.checkpoint_before.is_none());
@@ -15159,9 +20913,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -15193,22 +20947,25 @@ mod test {
                 },
                 1,
             );
-            turn.record_tool(&crate::backend::ToolActivity {
-                id: format!("{id}:change"),
-                kind: crate::backend::ToolActivityKind::FileChange,
-                title: "file changes".into(),
-                output: None,
-                output_delta: false,
-                status: Some("completed".into()),
-                change: crate::backend::ProviderChangeSet {
-                    file: vec![crate::backend::ProviderFileChange {
-                        path: path.into(),
-                        move_path: None,
-                        kind: crate::backend::ProviderChangeKind::Add,
-                        diff: "child".into(),
-                    }],
+            turn.record_tool(
+                &crate::backend::ToolActivity {
+                    id: format!("{id}:change"),
+                    kind: crate::backend::ToolActivityKind::FileChange,
+                    title: "file changes".into(),
+                    output: None,
+                    output_delta: false,
+                    status: Some("completed".into()),
+                    change: crate::backend::ProviderChangeSet {
+                        file: vec![crate::backend::ProviderFileChange {
+                            path: path.into(),
+                            move_path: None,
+                            kind: crate::backend::ProviderChangeKind::Add,
+                            diff: "child".into(),
+                        }],
+                    },
                 },
-            }, 1)
+                1,
+            )
             .unwrap();
             turn.finish(crate::turn::TurnOutcome::Completed, 2).unwrap();
             exchange.turn.push(turn);
@@ -15250,8 +21007,14 @@ mod test {
         );
         parent_interaction.state = ExchangeState::Running;
         parent_interaction.completed_at_ms = None;
-        broker.capture_final_checkpoint(&mut parent_interaction, ExchangeState::Complete).await.unwrap();
-        let diff = parent_interaction.attributed_diff_text.as_deref().expect("reported child edits");
+        broker
+            .capture_final_checkpoint(&mut parent_interaction, ExchangeState::Complete)
+            .await
+            .unwrap();
+        let diff = parent_interaction
+            .attributed_diff_text
+            .as_deref()
+            .expect("reported child edits");
         assert!(diff.contains("child.rs") && !diff.contains("unrelated.rs"));
     }
 
@@ -15261,9 +21024,9 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-            background: None,
+                background: None,
                 backend_launch_by_provider: Default::default(),
-            config_dir: None,
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),

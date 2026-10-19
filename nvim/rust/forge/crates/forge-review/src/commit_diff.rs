@@ -284,11 +284,7 @@ mod tests {
             store.get(&commit.commit, "src/lib.rs").unwrap().subject,
             subject
         );
-        assert!(
-            store
-                .retain_subject(&commit, "src/other.rs".into())
-                .is_ok()
-        );
+        assert!(store.retain_subject(&commit, "src/other.rs".into()).is_ok());
         assert!(
             store
                 .retain_expanded(&commit, "src/lib.rs".into(), vec![0; 256])

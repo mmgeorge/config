@@ -78,9 +78,18 @@ impl SectionProjection {
             for block in &original.block {
                 nodes.register(block)?;
             }
-            let mut rendered = project(original, source.document.revision().0, &HashMap::new(), &HashMap::new())?;
+            let mut rendered = project(
+                original,
+                source.document.revision().0,
+                &HashMap::new(),
+                &HashMap::new(),
+            )?;
             for block in &mut rendered.block {
-                if source.document.block(&block.id).is_some_and(|source| source.text == block.text) {
+                if source
+                    .document
+                    .block(&block.id)
+                    .is_some_and(|source| source.text == block.text)
+                {
                     complete.insert(block.id.clone());
                 }
                 nodes.project(block);
@@ -111,83 +120,148 @@ impl SectionProjection {
         let mut splices = Vec::new();
         let mut node_updates = Vec::new();
         for change in std::mem::take(&mut source.body_dirty) {
-            if source.dirty.contains(&change.owner) { continue; }
-            let call = change.anchor.0.strip_suffix(":preview")
+            if source.dirty.contains(&change.owner) {
+                continue;
+            }
+            let call = change
+                .anchor
+                .0
+                .strip_suffix(":preview")
                 .or_else(|| change.anchor.0.split_once(":output:").map(|(call, _)| call))
                 .or_else(|| change.anchor.0.strip_suffix(":hidden"));
             let node_id = call.map(|call| format!("{call}:tool"));
-            let mut heading = node_id.as_ref().and_then(|id|
-                self.document.document.block(&BlockId(id.clone())).cloned());
-            if let Some(id) = &node_id { self.nodes.advance(id)?; }
-            if self.document.document.block_index(&change.anchor).is_none() { continue; }
-            if change.removed.iter().any(|id| !self.complete.contains(id)) {
-                if let Some(id) = node_id { self.pending.insert(id); }
-                else { source.dirty.insert(change.owner); }
+            let mut heading = node_id
+                .as_ref()
+                .and_then(|id| self.document.document.block(&BlockId(id.clone())).cloned());
+            if let Some(id) = &node_id {
+                self.nodes.advance(id)?;
+            }
+            if self.document.document.block_index(&change.anchor).is_none() {
                 continue;
             }
-            let blocks = change.inserted.iter().map(|id| {
-                source.document.block(id).cloned().context("streaming splice source is missing")
-            }).collect::<Result<Vec<_>>>()?;
-            let removed_bytes: usize = change.removed.iter().filter_map(|id| self.document.document.block(id))
-                .map(|block| block.text.byte_count()).sum();
+            if change.removed.iter().any(|id| !self.complete.contains(id)) {
+                if let Some(id) = node_id {
+                    self.pending.insert(id);
+                } else {
+                    source.dirty.insert(change.owner);
+                }
+                continue;
+            }
+            let blocks = change
+                .inserted
+                .iter()
+                .map(|id| {
+                    source
+                        .document
+                        .block(id)
+                        .cloned()
+                        .context("streaming splice source is missing")
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let removed_bytes: usize = change
+                .removed
+                .iter()
+                .filter_map(|id| self.document.document.block(id))
+                .map(|block| block.text.byte_count())
+                .sum();
             let inserted_bytes: usize = blocks.iter().map(|block| block.text.byte_count()).sum();
             if let Some(heading) = &mut heading {
                 let node = heading.metadata.node.as_mut().expect("tool heading node");
                 let next_bytes = node.loaded_bytes.saturating_sub(removed_bytes) + inserted_bytes;
-                let maximum = self.quota.get(&node.id.0).map_or(PAGE_BYTES, |quota|quota.bytes);
+                let maximum = self
+                    .quota
+                    .get(&node.id.0)
+                    .map_or(PAGE_BYTES, |quota| quota.bytes);
                 if next_bytes > maximum {
                     self.pending.insert(node.id.0.clone());
                     continue;
                 }
                 node.loaded_bytes = next_bytes;
-                let removed_rows: usize = change.removed.iter().filter_map(|id| self.document.document.block(id))
-                    .map(|block|block.text.row_count()).sum();
+                let removed_rows: usize = change
+                    .removed
+                    .iter()
+                    .filter_map(|id| self.document.document.block(id))
+                    .map(|block| block.text.row_count())
+                    .sum();
                 node.loaded_rows = node.loaded_rows.saturating_sub(removed_rows)
-                    + blocks.iter().map(|block|block.text.row_count()).sum::<usize>();
-                let maximum_rows = self.quota.get(&node.id.0).map_or(48, |quota|quota.rows);
+                    + blocks
+                        .iter()
+                        .map(|block| block.text.row_count())
+                        .sum::<usize>();
+                let maximum_rows = self.quota.get(&node.id.0).map_or(48, |quota| quota.rows);
                 if node.loaded_rows > maximum_rows {
                     self.pending.insert(node.id.0.clone());
                     continue;
                 }
                 self.nodes.project(heading);
             }
-            for id in &change.removed { self.complete.remove(id); }
-            for id in &change.inserted { self.complete.insert(id.clone()); }
-            splices.push(TranscriptChange::ToolBody { owner: change.owner, anchor: change.anchor,
-                removed: change.removed.len(), block: blocks });
-            if let Some(heading) = heading { node_updates.push(heading); }
+            for id in &change.removed {
+                self.complete.remove(id);
+            }
+            for id in &change.inserted {
+                self.complete.insert(id.clone());
+            }
+            splices.push(TranscriptChange::ToolBody {
+                owner: change.owner,
+                anchor: change.anchor,
+                removed: change.removed.len(),
+                block: blocks,
+            });
+            if let Some(heading) = heading {
+                node_updates.push(heading);
+            }
         }
         let changed_blocks = std::mem::take(&mut source.block_dirty);
         let mut direct = node_updates;
         for id in changed_blocks {
-            let Some(owner) = source.block_owner(&id) else { continue; };
-            if source.dirty.contains(owner) { continue; }
-            let Some(previous) = self.document.document.block(&id) else { continue; };
+            let Some(owner) = source.block_owner(&id) else {
+                continue;
+            };
+            if source.dirty.contains(owner) {
+                continue;
+            }
+            let Some(previous) = self.document.document.block(&id) else {
+                continue;
+            };
             if !self.complete.contains(&id) {
                 source.dirty.insert(owner.to_owned());
                 continue;
             }
-            let Some(current) = source.document.block(&id) else { continue; };
-            if current.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message) {
+            let Some(current) = source.document.block(&id) else {
+                continue;
+            };
+            if current
+                .metadata
+                .node
+                .as_ref()
+                .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
+            {
                 if current.metadata.fold.is_empty() != previous.metadata.fold.is_empty() {
                     source.dirty.insert(owner.to_owned());
                     continue;
                 }
                 if !current.metadata.fold.is_empty() {
                     self.nodes.register(current)?;
-                    self.pending.insert(current.metadata.node.as_ref().unwrap().id.0.clone());
+                    self.pending
+                        .insert(current.metadata.node.as_ref().unwrap().id.0.clone());
                     continue;
                 }
             }
             if let (Some(node), Some(prior)) = (&current.metadata.node, &previous.metadata.node)
-                && node.kind == forge_buffer::node::NodeKind::Tool && node.more && !prior.more {
+                && node.kind == forge_buffer::node::NodeKind::Tool
+                && node.more
+                && !prior.more
+            {
                 self.nodes.register(current)?;
                 self.pending.insert(node.id.0.clone());
                 continue;
             }
             let mut block = current.clone();
             block.metadata.fold.clone_from(&previous.metadata.fold);
-            block.metadata.section.clone_from(&previous.metadata.section);
+            block
+                .metadata
+                .section
+                .clone_from(&previous.metadata.section);
             if let (Some(node), Some(prior)) = (&mut block.metadata.node, &previous.metadata.node) {
                 node.loaded_rows = prior.loaded_rows;
                 node.loaded_bytes = prior.loaded_bytes;
@@ -209,7 +283,9 @@ impl SectionProjection {
                 continue;
             }
             #[cfg(test)]
-            { self.projected_entries += 1; }
+            {
+                self.projected_entries += 1;
+            }
             let original = source.source_entry(id)?;
             for block in &original.block {
                 self.nodes.register(&block)?;
@@ -220,7 +296,12 @@ impl SectionProjection {
             );
             projected.insert(
                 id.clone(),
-                project(original, self.document.document.revision().0 + 1, &self.nodes.choice, &self.quota)?,
+                project(
+                    original,
+                    self.document.document.revision().0 + 1,
+                    &self.nodes.choice,
+                    &self.quota,
+                )?,
             );
         }
         for id in &dirty {
@@ -240,11 +321,12 @@ impl SectionProjection {
         for section in retired_sections {
             if !self.owner.contains_key(&section) {
                 self.quota.remove(&section);
-
             }
         }
         for entry in projected.values_mut() {
-            for block in &mut entry.block { self.nodes.project(block); }
+            for block in &mut entry.block {
+                self.nodes.project(block);
+            }
         }
         let displaced: HashSet<String> = projected
             .values()
@@ -259,23 +341,38 @@ impl SectionProjection {
             .collect();
         let mut patch = Vec::new();
         for change in splices {
-            let TranscriptChange::ToolBody { owner, .. } = &change else { unreachable!() };
-            if !dirty.contains(owner) { patch.extend(self.document.tool_layout(vec![change])?); }
+            let TranscriptChange::ToolBody { owner, .. } = &change else {
+                unreachable!()
+            };
+            if !dirty.contains(owner) {
+                patch.extend(self.document.tool_layout(vec![change])?);
+            }
         }
         for mut block in direct {
-            if source.block_owner(&block.id).is_some_and(|owner| !dirty.contains(owner)) {
+            if source
+                .block_owner(&block.id)
+                .is_some_and(|owner| !dirty.contains(owner))
+            {
                 if let Some(current) = self.document.document.block(&block.id) {
                     block.metadata.fold.clone_from(&current.metadata.fold);
                 }
-                if let Some(update) = self.document.append(block)? { patch.push(update); }
+                if let Some(update) = self.document.append(block)? {
+                    patch.push(update);
+                }
             }
         }
         for entry in projected.values() {
             if let Ok(previous) = self.document.source_entry(&entry.id) {
-                for block in previous.block { self.complete.remove(&block.id); }
+                for block in previous.block {
+                    self.complete.remove(&block.id);
+                }
             }
             for block in &entry.block {
-                if source.document.block(&block.id).is_some_and(|source| source.text == block.text) {
+                if source
+                    .document
+                    .block(&block.id)
+                    .is_some_and(|source| source.text == block.text)
+                {
                     self.complete.insert(block.id.clone());
                 }
             }
@@ -348,38 +445,80 @@ impl SectionProjection {
                 }])?);
             }
         }
-        let mut pending = std::mem::take(&mut self.pending).into_iter().filter_map(|id| {
-            let anchor = self.nodes.anchor(&id)?;
-            let start = source.document.block_index(anchor)?;
-            let end = source.document.block(anchor)?.metadata.fold.iter().find(|fold| fold.id.0 == id)
-                .and_then(|fold| source.document.block_index(&fold.end.block)).unwrap_or(start);
-            Some((start, end, id))
-        }).collect::<Vec<_>>();
+        let mut pending = std::mem::take(&mut self.pending)
+            .into_iter()
+            .filter_map(|id| {
+                let anchor = self.nodes.anchor(&id)?;
+                let start = source.document.block_index(anchor)?;
+                let end = source
+                    .document
+                    .block(anchor)?
+                    .metadata
+                    .fold
+                    .iter()
+                    .find(|fold| fold.id.0 == id)
+                    .and_then(|fold| source.document.block_index(&fold.end.block))
+                    .unwrap_or(start);
+                Some((start, end, id))
+            })
+            .collect::<Vec<_>>();
         pending.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
         let mut covered = None;
         for (source_start, source_end, id) in pending {
-            if covered.is_some_and(|end| source_start <= end) { continue; }
+            if covered.is_some_and(|end| source_start <= end) {
+                continue;
+            }
             covered = Some(source_end);
-            let mut candidate = project(Self::subtree(&self.nodes, source, &id)?,
-                self.document.document.revision().0 + 1, &self.nodes.choice, &self.quota)?;
-            if dirty.contains(&candidate.id) { continue; }
-            let Some(anchor) = self.nodes.anchor(&id) else { continue; };
-            let Some(previous) = self.document.document.block(anchor) else { continue; };
-            let start = self.document.document.block_index(anchor).context("loaded node anchor disappeared")?;
-            let end = previous.metadata.fold.iter().find(|fold| fold.id.0 == id)
-                .and_then(|fold| self.document.document.block_index(&fold.end.block)).unwrap_or(start);
+            let mut candidate = project(
+                Self::subtree(&self.nodes, source, &id)?,
+                self.document.document.revision().0 + 1,
+                &self.nodes.choice,
+                &self.quota,
+            )?;
+            if dirty.contains(&candidate.id) {
+                continue;
+            }
+            let Some(anchor) = self.nodes.anchor(&id) else {
+                continue;
+            };
+            let Some(previous) = self.document.document.block(anchor) else {
+                continue;
+            };
+            let start = self
+                .document
+                .document
+                .block_index(anchor)
+                .context("loaded node anchor disappeared")?;
+            let end = previous
+                .metadata
+                .fold
+                .iter()
+                .find(|fold| fold.id.0 == id)
+                .and_then(|fold| self.document.document.block_index(&fold.end.block))
+                .unwrap_or(start);
             let removed = end + 1 - start;
-            for block in self.document.document.blocks(self.document.document.revision(), start..end + 1)? {
+            for block in self
+                .document
+                .document
+                .blocks(self.document.document.revision(), start..end + 1)?
+            {
                 self.complete.remove(&block.id);
             }
             for block in &mut candidate.block {
                 self.nodes.project(block);
-                if source.document.block(&block.id).is_some_and(|original| original.text == block.text) {
+                if source
+                    .document
+                    .block(&block.id)
+                    .is_some_and(|original| original.text == block.text)
+                {
                     self.complete.insert(block.id.clone());
                 }
             }
             patch.extend(self.document.tool_layout(vec![TranscriptChange::ToolBody {
-                owner: candidate.id, anchor: anchor.clone(), removed, block: candidate.block,
+                owner: candidate.id,
+                anchor: anchor.clone(),
+                removed,
+                block: candidate.block,
             }])?);
         }
         for id in dirty {
@@ -392,15 +531,35 @@ impl SectionProjection {
         Ok(patch)
     }
 
-    fn subtree<'source>(nodes: &super::nodes::NodeMap, document: &'source TranscriptDocument, id: &str) -> Result<TranscriptSource<'source>> {
+    fn subtree<'source>(
+        nodes: &super::nodes::NodeMap,
+        document: &'source TranscriptDocument,
+        id: &str,
+    ) -> Result<TranscriptSource<'source>> {
         let anchor = nodes.anchor(id).context("node anchor is unavailable")?;
-        let block = document.document.block(anchor).context("node source disappeared")?;
-        let start = document.document.block_index(anchor).context("node source position disappeared")?;
-        let end = block.metadata.fold.iter().find(|fold| fold.id.0 == id)
-            .and_then(|fold| document.document.block_index(&fold.end.block)).unwrap_or(start);
+        let block = document
+            .document
+            .block(anchor)
+            .context("node source disappeared")?;
+        let start = document
+            .document
+            .block_index(anchor)
+            .context("node source position disappeared")?;
+        let end = block
+            .metadata
+            .fold
+            .iter()
+            .find(|fold| fold.id.0 == id)
+            .and_then(|fold| document.document.block_index(&fold.end.block))
+            .unwrap_or(start);
         Ok(TranscriptSource {
-            id: document.block_owner(anchor).context("node owner disappeared")?,
-            block: document.document.blocks(document.document.revision(), start..end + 1)?.collect(),
+            id: document
+                .block_owner(anchor)
+                .context("node owner disappeared")?,
+            block: document
+                .document
+                .blocks(document.document.revision(), start..end + 1)?
+                .collect(),
         })
     }
 
@@ -412,7 +571,11 @@ impl SectionProjection {
     /// Drops intent only when a canonical entry is deleted, not when the scope changes.
     pub fn retire_entry(&mut self, id: &str) {
         if let Some(nodes) = self.entry_sections.get(id) {
-            for node in nodes { self.nodes.retire(node); self.quota.remove(node); self.pending.remove(node); }
+            for node in nodes {
+                self.nodes.retire(node);
+                self.quota.remove(node);
+                self.pending.remove(node);
+            }
         }
     }
 
@@ -424,7 +587,9 @@ impl SectionProjection {
         self.view.remove(view);
         if self.view.is_empty() {
             for id in self.nodes.choice.keys() {
-                if let Some(owner) = self.owner.get(id) { source.dirty.insert(owner.clone()); }
+                if let Some(owner) = self.owner.get(id) {
+                    source.dirty.insert(owner.clone());
+                }
             }
             self.nodes.choice.clear();
             self.nodes.intent_sequence.clear();
@@ -433,17 +598,32 @@ impl SectionProjection {
     }
 
     /// Shared explicit choices survive parent closure and scope switches.
-    pub fn expansion(&self, id: &str) -> Option<bool> { self.nodes.choice.get(id).copied() }
+    pub fn expansion(&self, id: &str) -> Option<bool> {
+        self.nodes.choice.get(id).copied()
+    }
 
     /// Rejects retired identities before any source materialization can occur.
     pub fn admit(&self, view: &ViewId, sequence: u64, id: &str, generation: u64) -> Result<bool> {
         let last = self.view.get(view).context("node view is closed")?;
-        ensure!(sequence <= forge_buffer::MAX_COUNTER, "node sequence exhausted");
-        if sequence <= *last || self.nodes.intent_sequence.get(id).is_some_and(|prior| sequence <= *prior) { return Ok(false); }
-        ensure!(self.nodes.generation(id) == Some(generation), "node belongs to a retired content generation");
+        ensure!(
+            sequence <= forge_buffer::MAX_COUNTER,
+            "node sequence exhausted"
+        );
+        if sequence <= *last
+            || self
+                .nodes
+                .intent_sequence
+                .get(id)
+                .is_some_and(|prior| sequence <= *prior)
+        {
+            return Ok(false);
+        }
+        ensure!(
+            self.nodes.generation(id) == Some(generation),
+            "node belongs to a retired content generation"
+        );
         Ok(true)
     }
-
 
     pub fn set(
         &mut self,
@@ -456,19 +636,33 @@ impl SectionProjection {
         page: Option<(usize, WidthProfile)>,
     ) -> Result<()> {
         let last = self.view.get(&view).context("section view is closed")?;
-        ensure!(sequence <= forge_buffer::MAX_COUNTER, "section sequence exhausted");
+        ensure!(
+            sequence <= forge_buffer::MAX_COUNTER,
+            "section sequence exhausted"
+        );
         if sequence <= *last || (more && (!expanded || self.nodes.choice.get(id) == Some(&false))) {
             return Ok(());
         }
-        self.owner.get(id).context("section is no longer available")?;
+        self.owner
+            .get(id)
+            .context("section is no longer available")?;
         let children = self.file.get(id);
         let file = children.is_some();
         let paged = file || self.nodes.kind(id) == Some(forge_buffer::node::NodeKind::Tool);
         let affected = self.nodes.file_owner(id).to_owned();
-        let loaded = if more { Some(Self::subtree(&self.nodes, &self.document, &affected)?) } else { None };
+        let loaded = if more {
+            Some(Self::subtree(&self.nodes, &self.document, &affected)?)
+        } else {
+            None
+        };
         if let Some(loaded) = &loaded {
-            if !loaded.block.iter().any(|block| block.metadata.section.iter()
-                .any(|section| section.id.0 == id && section.more)) {
+            if !loaded.block.iter().any(|block| {
+                block
+                    .metadata
+                    .section
+                    .iter()
+                    .any(|section| section.id.0 == id && section.more)
+            }) {
                 *self.view.get_mut(&view).expect("validated section view") = sequence;
                 return Ok(());
             }
@@ -528,34 +722,38 @@ impl SectionProjection {
         };
         let previous_intent = self.nodes.choice.get(id).copied();
         let previous_quota = self.quota.get(id).cloned();
-        if !more { self.nodes.choice.insert(id.into(), expanded); }
-        if !expanded { self.quota.remove(id); }
+        if !more {
+            self.nodes.choice.insert(id.into(), expanded);
+        }
+        if !expanded {
+            self.quota.remove(id);
+        }
         let prepared = (|| -> Result<TranscriptEntry> {
-        let next_quota = &mut self.quota;
-        if expanded {
-            let quota = next_quota.entry(id.into()).or_insert_with(|| {
-                if paged {
-                    let (rows, width) = page.clone().unwrap_or((48, WidthProfile::default()));
-                    PageQuota {
-                        bytes: PAGE_BYTES,
-                        rows,
-                        width: Some(width),
+            let next_quota = &mut self.quota;
+            if expanded {
+                let quota = next_quota.entry(id.into()).or_insert_with(|| {
+                    if paged {
+                        let (rows, width) = page.clone().unwrap_or((48, WidthProfile::default()));
+                        PageQuota {
+                            bytes: PAGE_BYTES,
+                            rows,
+                            width: Some(width),
+                        }
+                    } else {
+                        PageQuota::bytes(PAGE_BYTES)
                     }
-                } else {
-                    PageQuota::bytes(PAGE_BYTES)
-                }
-            });
-            if more {
-                if paged && quota.width.is_some() {
-                    let (rows, width) = page.unwrap_or((48, WidthProfile::default()));
-                    quota.rows = quota.rows.max(loaded_rows).saturating_add(rows);
-                    quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
-                    quota.width = Some(width);
-                } else {
-                    quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
+                });
+                if more {
+                    if paged && quota.width.is_some() {
+                        let (rows, width) = page.unwrap_or((48, WidthProfile::default()));
+                        quota.rows = quota.rows.max(loaded_rows).saturating_add(rows);
+                        quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
+                        quota.width = Some(width);
+                    } else {
+                        quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
+                    }
                 }
             }
-        }
             let candidate = project(
                 Self::subtree(&self.nodes, source, &affected)?,
                 self.document.document.revision().0 + 1,
@@ -565,21 +763,40 @@ impl SectionProjection {
             if let Some(loaded) = &loaded {
                 let before = page_boundary(&loaded.block, id);
                 let after = page_boundary(&candidate.block.iter().collect::<Vec<_>>(), id);
-                ensure!(after.is_none() || after != before, "section loading made no progress; reopen the section to retry");
+                ensure!(
+                    after.is_none() || after != before,
+                    "section loading made no progress; reopen the section to retry"
+                );
             }
             Ok(candidate)
         })();
         match prepared {
-            Ok(_) => {},
+            Ok(_) => {}
             Err(error) => {
-            match previous_intent { Some(value) => { self.nodes.choice.insert(id.into(), value); }, None => { self.nodes.choice.remove(id); } }
-            match previous_quota { Some(value) => { self.quota.insert(id.into(), value); }, None => { self.quota.remove(id); } }
-            return Err(error);
+                match previous_intent {
+                    Some(value) => {
+                        self.nodes.choice.insert(id.into(), value);
+                    }
+                    None => {
+                        self.nodes.choice.remove(id);
+                    }
+                }
+                match previous_quota {
+                    Some(value) => {
+                        self.quota.insert(id.into(), value);
+                    }
+                    None => {
+                        self.quota.remove(id);
+                    }
+                }
+                return Err(error);
             }
         };
         *self.view.get_mut(&view).expect("validated section view") = sequence;
         if !expanded {
-            for child in self.nodes.descendants(id) { self.quota.remove(&child); }
+            for child in self.nodes.descendants(id) {
+                self.quota.remove(&child);
+            }
         }
         self.nodes.intent_sequence.insert(id.into(), sequence);
         self.pending.insert(affected);
@@ -588,9 +805,17 @@ impl SectionProjection {
 }
 
 fn page_boundary(blocks: &[&BufferBlock], id: &str) -> Option<(BlockId, usize)> {
-    let boundary = blocks.iter().position(|block| block.metadata.section.iter()
-        .any(|section| section.id.0 == id && section.more))?;
-    blocks[..boundary].iter().rev().find(|block| block.text.row_count() > 0)
+    let boundary = blocks.iter().position(|block| {
+        block
+            .metadata
+            .section
+            .iter()
+            .any(|section| section.id.0 == id && section.more)
+    })?;
+    blocks[..boundary]
+        .iter()
+        .rev()
+        .find(|block| block.text.row_count() > 0)
         .map(|block| (block.id.clone(), block.text.byte_count()))
 }
 
@@ -603,7 +828,8 @@ fn index(
     for (start, block) in entry.block.iter().enumerate() {
         if let Some(node) = &block.metadata.node
             && node.kind != forge_buffer::node::NodeKind::Message
-            && !block.metadata.fold.iter().any(|fold| fold.id == node.id) {
+            && !block.metadata.fold.iter().any(|fold| fold.id == node.id)
+        {
             owner.insert(node.id.0.clone(), entry.id.to_owned());
             sections.push(node.id.0.clone());
         }
@@ -630,8 +856,15 @@ fn index(
 }
 
 pub(crate) fn preview(entry: TranscriptEntry) -> Result<TranscriptEntry> {
-    project(TranscriptSource { id: &entry.id, block: entry.block.iter().collect() },
-        0, &HashMap::new(), &HashMap::new())
+    project(
+        TranscriptSource {
+            id: &entry.id,
+            block: entry.block.iter().collect(),
+        },
+        0,
+        &HashMap::new(),
+        &HashMap::new(),
+    )
 }
 
 fn project(
@@ -684,8 +917,13 @@ fn render(
             return Ok(true);
         }
         let source_block = source[cursor];
-        if source_block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
-            && !source_block.metadata.fold.is_empty() {
+        if source_block
+            .metadata
+            .node
+            .as_ref()
+            .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Message)
+            && !source_block.metadata.fold.is_empty()
+        {
             let id = &source_block.metadata.node.as_ref().unwrap().id.0;
             let block = super::message::project(source_block, intent.get(id).copied())?;
             budget.consume(std::slice::from_ref(&block))?;
@@ -720,27 +958,36 @@ fn render(
             let child_budget = if within_file {
                 remaining
             } else {
-                quota
-                    .get(id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        let mut budget = PageQuota::bytes(PAGE_BYTES);
-                        if source_block.metadata.node.as_ref().is_some_and(|node|
-                            node.kind == forge_buffer::node::NodeKind::Tool) {
-                            budget.rows = 48;
-                        }
-                        budget
-                    })
+                quota.get(id).cloned().unwrap_or_else(|| {
+                    let mut budget = PageQuota::bytes(PAGE_BYTES);
+                    if source_block
+                        .metadata
+                        .node
+                        .as_ref()
+                        .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)
+                    {
+                        budget.rows = 48;
+                    }
+                    budget
+                })
             };
-            let compact_tools = source_block.metadata.node.as_ref().is_some_and(|node|
+            let compact_tools = source_block.metadata.node.as_ref().is_some_and(|node| {
                 node.kind == forge_buffer::node::NodeKind::ToolGroup
-                    && node.default_display == forge_buffer::node::NodeDisplay::Preview);
+                    && node.default_display == forge_buffer::node::NodeDisplay::Preview
+            });
             let child_start = if compact_tools {
-                (cursor + 1..after).rev().find(|index| source[*index].metadata.node.as_ref()
-                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool
-                        && node.parent.as_ref().is_some_and(|parent| parent.0 == *id)))
+                (cursor + 1..after)
+                    .rev()
+                    .find(|index| {
+                        source[*index].metadata.node.as_ref().is_some_and(|node| {
+                            node.kind == forge_buffer::node::NodeKind::Tool
+                                && node.parent.as_ref().is_some_and(|parent| parent.0 == *id)
+                        })
+                    })
                     .unwrap_or(cursor + 1)
-            } else { cursor + 1 };
+            } else {
+                cursor + 1
+            };
             let more = expanded
                 && (render(
                     source,
@@ -754,7 +1001,11 @@ fn render(
                     child_budget,
                     within_file || file,
                     if file { Some(id.as_str()) } else { parent_file },
-                )? || source_block.metadata.node.as_ref().is_some_and(|node| node.more));
+                )? || source_block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.more));
             let boundary = more && !within_file;
             if boundary {
                 output.push(BufferBlock {
@@ -789,9 +1040,20 @@ fn render(
                 },
             };
             fold.closed = !expanded;
-            if output[heading + 1..].iter().any(|block| block.text.row_count() > 0) { output[heading].metadata.fold.push(fold); }
-            let loaded_rows = output[heading + 1..].iter().map(|block|block.text.row_count()).sum();
-            let loaded_bytes = output[heading + 1..].iter().map(|block|block.text.byte_count()).sum();
+            if output[heading + 1..]
+                .iter()
+                .any(|block| block.text.row_count() > 0)
+            {
+                output[heading].metadata.fold.push(fold);
+            }
+            let loaded_rows = output[heading + 1..]
+                .iter()
+                .map(|block| block.text.row_count())
+                .sum();
+            let loaded_bytes = output[heading + 1..]
+                .iter()
+                .map(|block| block.text.byte_count())
+                .sum();
             if let Some(node) = &mut output[heading].metadata.node {
                 node.resolve(intent.get(id).copied());
                 if expanded && compact_tools {
@@ -837,8 +1099,10 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
     if source.text.row_count() == 0 {
         return Ok(source.clone());
     }
-    if budget.width.is_none() && source.text.byte_count() <= budget.bytes
-        && source.text.row_count() <= budget.rows {
+    if budget.width.is_none()
+        && source.text.byte_count() <= budget.bytes
+        && source.text.row_count() <= budget.rows
+    {
         return Ok(source.clone());
     }
     let mut rows = Vec::new();
@@ -888,22 +1152,71 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
         id: source.id.clone(),
         text: BufferText::from_rows(&rows)?,
         metadata: BlockMetadata {
-            status: metadata.status.as_ref().filter(|status| status.row < rows.len()).cloned(),
+            status: metadata
+                .status
+                .as_ref()
+                .filter(|status| status.row < rows.len())
+                .cloned(),
             node: metadata.node.clone(),
             content_node: metadata.content_node.clone(),
             section: metadata.section.clone(),
             collapse: metadata.collapse.clone(),
             layout: metadata.layout.clone(),
             markdown: metadata.markdown,
-            target: metadata.target.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            decoration: metadata.decoration.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            visible_decoration: metadata.visible_decoration.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            source_highlight: metadata.source_highlight.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            conceal: metadata.conceal.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            source_overlay: metadata.source_overlay.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            editable_region: metadata.editable_region.iter().filter(|item| item.range.end <= end).cloned().collect(),
-            fold: metadata.fold.iter().filter(|item| item.end.block == source.id && item.end.position <= end).cloned().collect(),
-            gutter: metadata.gutter.iter().filter(|item| item.position.row < rows.len() && item.position <= end).cloned().collect(),
+            target: metadata
+                .target
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            decoration: metadata
+                .decoration
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            visible_decoration: metadata
+                .visible_decoration
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            source_highlight: metadata
+                .source_highlight
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            conceal: metadata
+                .conceal
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            source_overlay: metadata
+                .source_overlay
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            editable_region: metadata
+                .editable_region
+                .iter()
+                .filter(|item| item.range.end <= end)
+                .cloned()
+                .collect(),
+            fold: metadata
+                .fold
+                .iter()
+                .filter(|item| item.end.block == source.id && item.end.position <= end)
+                .cloned()
+                .collect(),
+            gutter: metadata
+                .gutter
+                .iter()
+                .filter(|item| item.position.row < rows.len() && item.position <= end)
+                .cloned()
+                .collect(),
         },
     })
 }
@@ -916,7 +1229,10 @@ mod tests {
 
     fn owned_entry(source: &TranscriptDocument, id: &str) -> Result<TranscriptEntry> {
         let entry = source.source_entry(id)?;
-        Ok(TranscriptEntry { id: entry.id.to_owned(), block: entry.block.into_iter().cloned().collect() })
+        Ok(TranscriptEntry {
+            id: entry.id.to_owned(),
+            block: entry.block.into_iter().cloned().collect(),
+        })
     }
 
     #[test]
@@ -1036,8 +1352,13 @@ mod tests {
         let mut blocks = source()?.snapshot()?.block;
         blocks[1].text = BufferText::from_rows(["x".repeat(16 * 1024 * 1024 + 2 * PAGE_BYTES)])?;
         let mut source = TranscriptDocument::initialize(
-            DocumentId("large-source".into()), "session".into(), 0,
-            vec![TranscriptEntry { id: "entry".into(), block: blocks }],
+            DocumentId("large-source".into()),
+            "session".into(),
+            0,
+            vec![TranscriptEntry {
+                id: "entry".into(),
+                block: blocks,
+            }],
         )?;
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
         let view = ViewId("view".into());
@@ -1045,13 +1366,30 @@ mod tests {
         visible.quota_for_test("tools", 16 * 1024 * 1024);
         visible.set(&mut source, view.clone(), 1, "tools", true, false, None)?;
         visible.refresh(&mut source)?;
-        let before = visible.document.document.block(&BlockId("body".into())).unwrap().text.byte_count();
+        let before = visible
+            .document
+            .document
+            .block(&BlockId("body".into()))
+            .unwrap()
+            .text
+            .byte_count();
         visible.set(&mut source, view, 2, "tools", true, true, None)?;
         visible.refresh(&mut source)?;
-        let after = visible.document.document.block(&BlockId("body".into())).unwrap().text.byte_count();
+        let after = visible
+            .document
+            .document
+            .block(&BlockId("body".into()))
+            .unwrap()
+            .text
+            .byte_count();
         assert!(after > before && after > 16 * 1024 * 1024);
-        assert!(visible.document.snapshot()?.block.iter().any(|block|
-            block.metadata.section.iter().any(|section| section.id.0 == "tools" && section.more)));
+        assert!(visible.document.snapshot()?.block.iter().any(|block| {
+            block
+                .metadata
+                .section
+                .iter()
+                .any(|section| section.id.0 == "tools" && section.more)
+        }));
         Ok(())
     }
 
@@ -1168,12 +1506,23 @@ mod tests {
         visible.refresh(&mut source)?;
         let assert_parent_endpoint = |visible: &SectionProjection| -> Result<()> {
             let snapshot = visible.document.snapshot()?;
-            let parent = snapshot.block.iter().find(|block| block.id.0 == "outer").unwrap();
+            let parent = snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "outer")
+                .unwrap();
             let last = snapshot.block.last().unwrap();
-            assert_eq!(parent.metadata.fold[0].end, BlockAnchor {
-                block: last.id.clone(),
-                position: TextPosition { row: last.text.row_count(), column: 0 },
-            }, "expanding the final child must extend the enclosing exchange");
+            assert_eq!(
+                parent.metadata.fold[0].end,
+                BlockAnchor {
+                    block: last.id.clone(),
+                    position: TextPosition {
+                        row: last.text.row_count(),
+                        column: 0
+                    },
+                },
+                "expanding the final child must extend the enclosing exchange"
+            );
             Ok(())
         };
         assert_parent_endpoint(&visible)?;
@@ -1209,7 +1558,15 @@ mod tests {
             40000
         );
         for (sequence, expanded) in [(4, false), (5, true)] {
-            visible.set(&mut source, view.clone(), sequence, "tools", expanded, false, None)?;
+            visible.set(
+                &mut source,
+                view.clone(),
+                sequence,
+                "tools",
+                expanded,
+                false,
+                None,
+            )?;
             visible.refresh(&mut source)?;
             assert_parent_endpoint(&visible)?;
         }
@@ -1269,10 +1626,15 @@ mod tests {
         for block in &first.block {
             if let Some(node) = &block.metadata.node
                 && node.kind == forge_buffer::node::NodeKind::Hunk
-                && first_body.iter().any(|body| body.metadata.content_node.as_ref() == Some(&node.id))
+                && first_body
+                    .iter()
+                    .any(|body| body.metadata.content_node.as_ref() == Some(&node.id))
             {
-                assert_eq!(node.display, forge_buffer::node::NodeDisplay::Full,
-                    "a materialized hunk must not advertise a collapsed heading");
+                assert_eq!(
+                    node.display,
+                    forge_buffer::node::NodeDisplay::Full,
+                    "a materialized hunk must not advertise a collapsed heading"
+                );
             }
         }
         assert!(
@@ -1390,10 +1752,22 @@ mod tests {
         )?;
         visible.refresh(&mut source)?;
         let reopened = visible.document.snapshot()?;
-        assert!(reopened.block.iter().all(|block| block.id.0 != "changes:file:0:hunk:0:rows:0"),
-            "reopening a parent discarded the child's explicit closure");
-        let reopened_count = reopened.block.iter().filter(|block| block.id.0.contains(":rows:")).count();
-        assert!(reopened_count > 0 && reopened_count < 8, "reopening should restore the first page only");
+        assert!(
+            reopened
+                .block
+                .iter()
+                .all(|block| block.id.0 != "changes:file:0:hunk:0:rows:0"),
+            "reopening a parent discarded the child's explicit closure"
+        );
+        let reopened_count = reopened
+            .block
+            .iter()
+            .filter(|block| block.id.0.contains(":rows:"))
+            .count();
+        assert!(
+            reopened_count > 0 && reopened_count < 8,
+            "reopening should restore the first page only"
+        );
         Ok(())
     }
 

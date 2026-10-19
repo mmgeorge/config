@@ -9,7 +9,6 @@ use serde_json::Value;
 
 use super::ReviewService;
 
-
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, PartialOrd, Ord)]
 #[serde(rename_all = "snake_case")]
 pub enum ReviewSectionKind {

@@ -186,7 +186,9 @@ impl RemoteQueue {
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("GitHub operation identity exhausted"))?;
         self.input_bytes
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| bytes.checked_add(retained_bytes))
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
+                bytes.checked_add(retained_bytes)
+            })
             .map_err(|_| anyhow::anyhow!("GitHub mutation input accounting overflow"))?;
         state.next = id;
         state.admitted += 1;
@@ -325,7 +327,9 @@ impl RemoteOperation {
 
 impl Drop for RemoteOperation {
     fn drop(&mut self) {
-        self.queue.input_bytes.fetch_sub(self.retained_bytes, Ordering::AcqRel);
+        self.queue
+            .input_bytes
+            .fetch_sub(self.retained_bytes, Ordering::AcqRel);
         self.queue
             .complete(&self.resource, &self.scope, self.id, self.completion);
     }

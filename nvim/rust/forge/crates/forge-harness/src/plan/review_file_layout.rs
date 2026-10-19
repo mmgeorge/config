@@ -90,7 +90,10 @@ pub(super) fn order(design: &DeclarationDesign, included: &HashSet<String>) -> V
         edge.insert(path.clone(), outgoing);
     }
 
-    let changed = design.changed_paths().into_iter().chain(included.iter().cloned());
+    let changed = design
+        .changed_paths()
+        .into_iter()
+        .chain(included.iter().cloned());
     let destination = design.moved.values().collect::<HashSet<_>>();
     let mut changed_identity = HashMap::<String, ReviewFile>::new();
     for path in changed {

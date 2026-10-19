@@ -24,7 +24,13 @@ async fn retained_input_bytes_account_for_large_waiting_work_until_completion() 
     let second = queue
         .enqueue(key.clone(), RemoteIntent::Mutation, 8 * 1024 * 1024)
         .unwrap();
-    let independent = queue.enqueue(resource("github.com", 2), RemoteIntent::Mutation, 16 * 1024 * 1024 + 1).unwrap();
+    let independent = queue
+        .enqueue(
+            resource("github.com", 2),
+            RemoteIntent::Mutation,
+            16 * 1024 * 1024 + 1,
+        )
+        .unwrap();
     assert_eq!(queue.retained_bytes(), 32 * 1024 * 1024 + 1);
     assert!(
         queue

@@ -17,14 +17,12 @@ async fn composite_review_preserves_diff_source_coordinates_and_annotation_reflo
         .await
         .unwrap();
     let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
-    let syntax = forge_diff::syntax::SyntaxEngine::new(
-        Arc::new(forge_diff::workers::AnalysisPool::new(
-            forge_diff::workers::PoolLimits {
-                workers: 1,
-                jobs: 2,
-            },
-        )),
-    );
+    let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(
+        forge_diff::workers::AnalysisPool::new(forge_diff::workers::PoolLimits {
+            workers: 1,
+            jobs: 2,
+        }),
+    ));
     service
         .project_review(&input, &annotation, &mut change, &diff, &syntax)
         .await
@@ -129,9 +127,12 @@ async fn composite_review_drains_all_chunks_with_an_anchor_after_the_first_chunk
         .await
         .unwrap();
     let diff = forge_diff::engine::DiffEngine::new(Default::default(), 1);
-    let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(forge_diff::workers::AnalysisPool::new(
-        forge_diff::workers::PoolLimits { workers: 1, jobs: 2 },
-    )));
+    let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(
+        forge_diff::workers::AnalysisPool::new(forge_diff::workers::PoolLimits {
+            workers: 1,
+            jobs: 2,
+        }),
+    ));
     service
         .project_review(&input, &annotation, &mut change, &diff, &syntax)
         .await
@@ -188,7 +189,9 @@ async fn fixture(stale: bool) -> (tempfile::TempDir, WalkthroughService, Documen
         git(directory.path(), &["commit", "-m", "base"]);
         let head = git(directory.path(), &["rev-parse", "HEAD"]);
         (directory, head)
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     let store = Arc::new(RepositoryStore::default());
     let repository = store
         .open(directory.path().to_owned())

@@ -22,14 +22,19 @@ pub enum ConfigurationFormat {
 impl ConfigurationFormat {
     /// Decode TypeScript configuration without discarding comments manually.
     pub fn json_value(text: &str) -> Result<serde_json::Value, SyntaxError> {
-        jsonc_parser::parse_to_serde_value::<serde_json::Value>(text, &jsonc_parser::ParseOptions::default())
-            .map_err(|error| SyntaxError::Query(error.to_string()))
+        jsonc_parser::parse_to_serde_value::<serde_json::Value>(
+            text,
+            &jsonc_parser::ParseOptions::default(),
+        )
+        .map_err(|error| SyntaxError::Query(error.to_string()))
     }
     /// Select a configuration format by extension or recognized configuration filename.
     pub fn for_path(path: &str) -> Option<Self> {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();
         let name = normalized.rsplit('/').next()?;
-        if name == ".gitignore" { return Some(Self::Gitignore); }
+        if name == ".gitignore" {
+            return Some(Self::Gitignore);
+        }
         let extension = name.rsplit_once('.')?.1;
         match extension {
             "json"
@@ -74,7 +79,9 @@ impl ConfigurationFormat {
         };
         match self {
             Self::Gitignore => {
-                if text.contains('\0') { return Err(invalid("NUL is not allowed".into())); }
+                if text.contains('\0') {
+                    return Err(invalid("NUL is not allowed".into()));
+                }
             }
             Self::Json => {
                 serde_json::from_str::<serde_json::Value>(text)
@@ -136,7 +143,10 @@ mod tests {
     #[test]
     fn configuration_preserves_values_layout_visibility_and_navigation() {
         for (path, text) in [
-            (".gitignore", "# Build output\r\n/target/\r\n!Cargo.lock\r\n\\#literal\r\ncache\\ \r\n"),
+            (
+                ".gitignore",
+                "# Build output\r\n/target/\r\n!Cargo.lock\r\n\\#literal\r\ncache\\ \r\n",
+            ),
             ("nested/.gitignore", "*.tmp\n!keep.tmp\n"),
             (
                 "package.json",

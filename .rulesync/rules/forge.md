@@ -18,6 +18,13 @@ Space toggles that state. Keep enablement out of editable text columns. Tab sele
 the next editable field, and the left/right arrows change the focused value.
 Use the checks and MCP pickers as the existing interaction references.
 
+For grouped settings, reuse `views/picker` structured fields with stable row and
+field IDs. The shared picker owns Tab/Shift-Tab focus, arrows for values, Space for
+`●`/`○` toggles, Enter for editing or opening, and the selected field explanation.
+Views supply values and persistence callbacks. Keep headings non-selectable and
+retain field focus across asynchronous updates. Do not implement these controls
+again in each settings view.
+
 ## No Arbitrary Content-Size Limits
 
 Never reject, truncate, disable, or leave loading a valid file, document, plan,

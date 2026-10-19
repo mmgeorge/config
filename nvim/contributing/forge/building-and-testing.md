@@ -293,3 +293,22 @@ session compaction overrides, and the read-only native timeline. The existing
 Run the `background::tests` and `compaction` filters in `forge-harness`, plus the
 `commit_message::` filter in `forge`. Provider authentication is unnecessary for these
 fixtures. Report real Codex or Copilot requests separately from mock-provider evidence.
+
+## Grouped configuration controls
+
+Run the shared picker and settings fixtures after changing field layout, focus,
+or configuration actions. Use a 60-second external deadline per fixture.
+
+```text
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/picker.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/picker_fields.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/harness_settings.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/harness_commit_settings.lua
+nvim --headless -u NONE --cmd "set rtp^=./nvim" -l nvim/tests/forge/commit_settings_host.lua
+```
+
+The field fixture exercises stable focus, disabled actions, boolean key separation,
+selected help, and complete Unicode values across narrow wrapping. The settings
+fixtures cover existing mutation paths and Background preference isolation. The
+host fixture saves and reopens preferences through separate Forge processes.
+Inspect `/config` in a fresh interactive host at wide and narrow terminal sizes.

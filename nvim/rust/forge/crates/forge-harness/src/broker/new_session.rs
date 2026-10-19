@@ -1,4 +1,4 @@
-use crate::session::{PermissionMode, HarnessSession, ProviderForkState, SessionStore};
+use crate::session::{HarnessSession, PermissionMode, ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -40,22 +40,49 @@ pub fn prepare_new_session(
         backend_session_id: None,
         provider_checkpoint_id: None,
         provider_fork_state: ProviderForkState::Ready,
-        model: preference.as_ref().map_or_else(|| source.model.clone(), |value| value.model.clone()),
+        model: preference
+            .as_ref()
+            .map_or_else(|| source.model.clone(), |value| value.model.clone()),
         provider_label: source.provider_label,
         resolved_model: None,
-        effort: preference.as_ref().map_or_else(|| source.effort.clone(), |value| value.effort.clone()),
-        plan_executor: preference.as_ref().map_or(source.plan_executor, |value| value.plan_executor.clone()),
-        plan_compact: preference.as_ref().map_or(source.plan_compact, |value| value.plan_compact),
-        plan_auto_approve_revisions: preference.as_ref().map_or(source.plan_auto_approve_revisions, |value| value.plan_auto_approve_revisions),
+        effort: preference
+            .as_ref()
+            .map_or_else(|| source.effort.clone(), |value| value.effort.clone()),
+        plan_executor: preference
+            .as_ref()
+            .map_or(source.plan_executor, |value| value.plan_executor.clone()),
+        plan_compact: preference
+            .as_ref()
+            .map_or(source.plan_compact, |value| value.plan_compact),
+        plan_auto_approve_revisions: preference
+            .as_ref()
+            .map_or(source.plan_auto_approve_revisions, |value| {
+                value.plan_auto_approve_revisions
+            }),
         approval_timeout: source.approval_timeout,
         answer_timeout: source.answer_timeout,
-        context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
-            .and_then(|setting| setting.context_window.clone()).or(source.context_window),
+        context_window: preference
+            .as_ref()
+            .and_then(|value| value.model_setting.get(&value.model))
+            .and_then(|setting| setting.context_window.clone())
+            .or(source.context_window),
         service_tier: source.service_tier,
-        access: preference.as_ref().map_or_else(|| source.access.clone(), |value| value.access.clone()),
-        shell: preference.as_ref().map_or(source.shell, |value| value.shell),
+        access: preference
+            .as_ref()
+            .map_or_else(|| source.access.clone(), |value| value.access.clone()),
+        shell: preference
+            .as_ref()
+            .map_or(source.shell, |value| value.shell),
         execution_mode: PermissionMode::Read,
-        current_task_id: None, default_write_permission: preference.as_ref().map_or(source.default_write_permission, |value| value.default_write_permission), plan_permission: preference.as_ref().map_or(source.plan_permission, |value| value.plan_permission),
+        current_task_id: None,
+        default_write_permission: preference
+            .as_ref()
+            .map_or(source.default_write_permission, |value| {
+                value.default_write_permission
+            }),
+        plan_permission: preference
+            .as_ref()
+            .map_or(source.plan_permission, |value| value.plan_permission),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         goal_id: None,
@@ -64,10 +91,16 @@ pub fn prepare_new_session(
         native_fork: false,
         native_compact,
         context_usage: None,
-            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
+        background: None,
+        auto_compaction: Default::default(),
+        last_compaction_turn: None,
     };
-    let shared = crate::settings::SettingsStore::open(data_root)?.get(&child.workspace,&child.id,&child.backend)?;
-    shared.desired.apply(&mut child,native_compact)?;
+    let shared = crate::settings::SettingsStore::open(data_root)?.get(
+        &child.workspace,
+        &child.id,
+        &child.backend,
+    )?;
+    shared.desired.apply(&mut child, native_compact)?;
     shared.apply_provider_defaults(&mut child)?;
     store.save_session(&child)?;
     Ok(child)

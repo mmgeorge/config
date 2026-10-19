@@ -45,7 +45,8 @@ fn paired_reads_preserve_both_failures_and_streams() {
             ..limits()
         },
         || Ok(()),
-    ).unwrap();
+    )
+    .unwrap();
     for output in [first, second] {
         assert_eq!(output.status.code(), Some(7));
         assert!(output.stdout.ends_with(b"saved stdout\n"));
@@ -61,10 +62,14 @@ fn paired_reads_cancel_both_children_before_returning() {
         fixture("command_child_wait"),
         limits(),
         || {
-            anyhow::ensure!(started.elapsed() < Duration::from_millis(100), "cancel pair");
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_millis(100),
+                "cancel pair"
+            );
             Ok(())
         },
-    ).unwrap_err();
+    )
+    .unwrap_err();
     assert!(error.to_string().contains("cancel pair"));
     assert!(started.elapsed() < Duration::from_secs(2));
 }
@@ -78,7 +83,11 @@ fn complete_stdout_and_stderr_cross_former_stream_caps_without_truncation() {
         let started = Instant::now();
         let output = read_command(&mut fixture(child), limits(), || Ok(())).unwrap();
         assert!(output.status.success());
-        let bytes = if stream == "stdout" { &output.stdout } else { &output.stderr };
+        let bytes = if stream == "stdout" {
+            &output.stdout
+        } else {
+            &output.stderr
+        };
         assert!(bytes.iter().filter(|byte| **byte == b'x').count() >= 512 * 1024);
         assert!(started.elapsed() < Duration::from_secs(5));
     }

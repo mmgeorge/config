@@ -42,7 +42,12 @@ impl Fixture {
     }
 
     async fn text(&self, path: &str, old: &str, new: &str) -> String {
-        prompt(&mut [self.file(path, old, new).await], &self.syntax, MAX_INPUT_BYTES).await
+        prompt(
+            &mut [self.file(path, old, new).await],
+            &self.syntax,
+            MAX_INPUT_BYTES,
+        )
+        .await
     }
 }
 
@@ -426,8 +431,12 @@ async fn oversized_first_line_stops_before_emitting_an_empty_file_section() {
             .await,
         fixture.file("b.txt", "", "later\n").await,
     ];
-    let output = prompt(&mut files, &fixture.syntax,
-        MAX_INPUT_BYTES - TextGeneration::CommitMessage.instructions().len()).await;
+    let output = prompt(
+        &mut files,
+        &fixture.syntax,
+        MAX_INPUT_BYTES - TextGeneration::CommitMessage.instructions().len(),
+    )
+    .await;
     assert!(output.len() + TextGeneration::CommitMessage.instructions().len() <= MAX_INPUT_BYTES);
     assert!(output.contains("  a.txt (+1 -0)") && output.contains("  b.txt (+1 -0)"));
     assert!(

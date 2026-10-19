@@ -31,15 +31,20 @@ impl BackendKind {
     }
 
     /// Resolve requested isolation for the selected provider without changing shared preferences.
-    pub(crate) fn resolve_access(self, mut access: crate::session::AccessPolicy) -> crate::session::AccessPolicy {
+    pub(crate) fn resolve_access(
+        self,
+        mut access: crate::session::AccessPolicy,
+    ) -> crate::session::AccessPolicy {
         access.sandbox &= self.supports_sandbox();
         access
     }
 
     /// Reject OS isolation requests that this provider cannot enforce.
     pub(crate) fn validate_access(self, access: &crate::session::AccessPolicy) -> Result<()> {
-        anyhow::ensure!(!access.sandbox || self.supports_sandbox(),
-            "This provider cannot enforce Forge's OS sandbox");
+        anyhow::ensure!(
+            !access.sandbox || self.supports_sandbox(),
+            "This provider cannot enforce Forge's OS sandbox"
+        );
         Ok(())
     }
 
@@ -142,7 +147,9 @@ pub struct BackendRequest {
 
 impl BackendRequest {
     /// Resolve the independent runtime without changing the visible settings scope.
-    pub fn runtime_key(&self) -> Result<String> {Ok(self.owner()?.runtime_key())}
+    pub fn runtime_key(&self) -> Result<String> {
+        Ok(self.owner()?.runtime_key())
+    }
     /// Validate the provider runtime key before admission or cancellation routing.
     pub fn owner(&self) -> Result<ExecutionOwner> {
         ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
@@ -175,38 +182,77 @@ pub struct BackendEvent {
 impl BackendEvent {
     /// Decode the provider-neutral compaction lifecycle payload.
     pub(crate) fn compaction(&self) -> Result<Option<Compaction>> {
-        if self.kind != "compaction" { return Ok(None); }
+        if self.kind != "compaction" {
+            return Ok(None);
+        }
         Ok(Some(serde_json::from_value(self.data.clone())?))
     }
 
     /// Publish one typed compaction update through the shared event transport.
-    pub(crate) fn from_compaction(compaction: Compaction, address: Option<ProviderAddress>) -> Self {
+    pub(crate) fn from_compaction(
+        compaction: Compaction,
+        address: Option<ProviderAddress>,
+    ) -> Self {
         Self {
-            received_at_ms: None, address, turn_boundary: None,
-            kind: "compaction".into(), text: None,
+            received_at_ms: None,
+            address,
+            turn_boundary: None,
+            kind: "compaction".into(),
+            text: None,
             data: serde_json::to_value(compaction).expect("compaction is JSON serializable"),
-            activity: None, summary: None, task_update: None,
+            activity: None,
+            summary: None,
+            task_update: None,
         }
     }
     pub(crate) fn tool_output_delta(&self) -> Option<&str> {
-        if self.turn_boundary.is_some() || self.summary.is_some() || self.task_update.is_some()
-            || self.text.is_some() { return None; }
-        self.activity.as_ref().filter(|activity|activity.output_delta && activity.change.is_empty()
-            && activity.status.as_deref().is_none_or(|status| status == "inProgress"))
-            .and_then(|activity|activity.output.as_deref())
+        if self.turn_boundary.is_some()
+            || self.summary.is_some()
+            || self.task_update.is_some()
+            || self.text.is_some()
+        {
+            return None;
+        }
+        self.activity
+            .as_ref()
+            .filter(|activity| {
+                activity.output_delta
+                    && activity.change.is_empty()
+                    && activity
+                        .status
+                        .as_deref()
+                        .is_none_or(|status| status == "inProgress")
+            })
+            .and_then(|activity| activity.output.as_deref())
     }
 
     pub(crate) fn message_delta(&self) -> Option<&str> {
-        if self.turn_boundary.is_some() || self.summary.is_some() || self.task_update.is_some()
-            || self.activity.is_some() || self.message_snapshot()
-            || !matches!(self.kind.as_str(),"assistant_message" | "reasoning" | "reasoning_summary") { return None; }
+        if self.turn_boundary.is_some()
+            || self.summary.is_some()
+            || self.task_update.is_some()
+            || self.activity.is_some()
+            || self.message_snapshot()
+            || !matches!(
+                self.kind.as_str(),
+                "assistant_message" | "reasoning" | "reasoning_summary"
+            )
+        {
+            return None;
+        }
         self.text.as_deref()
     }
 
     pub(crate) fn observed_at_ms(&self, fallback: i64) -> i64 {
-        ["/params/completedAtMs", "/params/startedAtMs", "/emittedAtMs", "/forge_received_at_ms"]
-            .into_iter().find_map(|path| self.data.pointer(path).and_then(Value::as_i64))
-            .or(self.received_at_ms).unwrap_or(fallback)
+        [
+            "/params/completedAtMs",
+            "/params/startedAtMs",
+            "/emittedAtMs",
+            "/forge_received_at_ms",
+        ]
+        .into_iter()
+        .find_map(|path| self.data.pointer(path).and_then(Value::as_i64))
+        .or(self.received_at_ms)
+        .unwrap_or(fallback)
     }
 
     /// Borrow the provider message identity shared by lifecycle and delta events.
@@ -321,36 +367,62 @@ impl ToolActivity {
     /// Returns `None` for an empty name or invalid encoded JSON.
     pub(super) fn call_title(name: &str, arguments: &Value) -> Option<String> {
         let name = name.split_whitespace().collect::<Vec<_>>().join(" ");
-        if name.is_empty() { return None; }
+        if name.is_empty() {
+            return None;
+        }
         let arguments = match arguments {
             Value::String(encoded) => serde_json::from_str(encoded).ok()?,
             arguments => arguments.clone(),
         };
         let mut arguments = Self::redact_arguments(&arguments);
         arguments.sort_all_objects();
-        Some(format!("{name}({})", serde_json::to_string(&arguments).ok()?))
+        Some(format!(
+            "{name}({})",
+            serde_json::to_string(&arguments).ok()?
+        ))
     }
 
     fn redact_arguments(value: &Value) -> Value {
         match value {
-            Value::Array(values) => Value::Array(values.iter().map(Self::redact_arguments).collect()),
-            Value::Object(values) => Value::Object(values.iter().map(|(key, value)| {
-                let value = if Self::sensitive_argument(key) {
-                    Value::String("[REDACTED]".into())
-                } else {
-                    Self::redact_arguments(value)
-                };
-                (key.clone(), value)
-            }).collect()),
+            Value::Array(values) => {
+                Value::Array(values.iter().map(Self::redact_arguments).collect())
+            }
+            Value::Object(values) => Value::Object(
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        let value = if Self::sensitive_argument(key) {
+                            Value::String("[REDACTED]".into())
+                        } else {
+                            Self::redact_arguments(value)
+                        };
+                        (key.clone(), value)
+                    })
+                    .collect(),
+            ),
             _ => value.clone(),
         }
     }
 
     fn sensitive_argument(key: &str) -> bool {
-        matches!(key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
-            "token" | "apikey" | "key" | "secret" | "password" | "passphrase"
-                | "authorization" | "bearer" | "cookie" | "session" | "credential"
-                | "accesstoken" | "refreshtoken" | "clientsecret" | "privatekey")
+        matches!(
+            key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
+            "token"
+                | "apikey"
+                | "key"
+                | "secret"
+                | "password"
+                | "passphrase"
+                | "authorization"
+                | "bearer"
+                | "cookie"
+                | "session"
+                | "credential"
+                | "accesstoken"
+                | "refreshtoken"
+                | "clientsecret"
+                | "privatekey"
+        )
     }
 }
 
@@ -527,7 +599,9 @@ pub struct BackendModel {
 #[async_trait]
 pub trait Backend: Send + Sync {
     /// Reports whether every local tool waits on the request's checkpoint barrier.
-    fn checkpoint_tool_gate(&self) -> bool { false }
+    fn checkpoint_tool_gate(&self) -> bool {
+        false
+    }
 
     /// Inspect or explicitly install the selected provider runtime without creating a conversation.
     async fn setup(&self, _request: BackendCatalogRequest, _install: bool) -> Result<Value> {
@@ -545,7 +619,11 @@ pub trait Backend: Send + Sync {
     }
 
     /// Reconcile portable resource selection before reporting configuration as applied.
-    async fn reconcile_settings(&self, _request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
+    async fn reconcile_settings(
+        &self,
+        _request: BackendCatalogRequest,
+        setting: &crate::settings::PortableSettings,
+    ) -> Result<()> {
         if !setting.skill.is_empty() || !setting.mcp.is_empty() {
             return Err(UnsupportedCapability("resource_selection").into());
         }
@@ -575,7 +653,10 @@ pub trait Backend: Send + Sync {
     }
 
     /// Query live provider shells independently of prompt execution and exchange completion.
-    async fn background_terminals(&self, _request: BackendCatalogRequest) -> Result<terminal::TerminalSnapshot> {
+    async fn background_terminals(
+        &self,
+        _request: BackendCatalogRequest,
+    ) -> Result<terminal::TerminalSnapshot> {
         Err(UnsupportedCapability("background_terminals").into())
     }
 
@@ -585,7 +666,14 @@ pub trait Backend: Send + Sync {
     }
 
     /// Generate text independently of the main provider conversation.
-    async fn generate_text(&self, _request: BackendCatalogRequest, _purpose: TextGeneration, _model: &str, _reasoning_effort: Option<&str>, _history: &str) -> Result<String> {
+    async fn generate_text(
+        &self,
+        _request: BackendCatalogRequest,
+        _purpose: TextGeneration,
+        _model: &str,
+        _reasoning_effort: Option<&str>,
+        _history: &str,
+    ) -> Result<String> {
         Err(UnsupportedCapability("text_generation").into())
     }
 
@@ -610,7 +698,10 @@ pub trait Backend: Send + Sync {
     }
 
     /// List configured servers without waiting for their startup handshakes.
-    async fn mcp_configuration(&self, _request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+    async fn mcp_configuration(
+        &self,
+        _request: BackendCatalogRequest,
+    ) -> Result<Vec<McpDefinition>> {
         Err(UnsupportedCapability("mcp_catalog").into())
     }
 
@@ -659,7 +750,10 @@ pub trait Backend: Send + Sync {
     }
 
     /// Subscribe once to session compaction that can outlive an active provider turn.
-    async fn compaction_stream(&self, _session_id: &str) -> Result<Option<events::BackendEventStream>> {
+    async fn compaction_stream(
+        &self,
+        _session_id: &str,
+    ) -> Result<Option<events::BackendEventStream>> {
         Ok(None)
     }
 
@@ -719,7 +813,10 @@ pub fn build(
             acp::AcpBackend::new(kind, launch.command, permission_coordinator, settings_root)?,
         )),
         BackendKind::Mock => Ok(Box::new(MockBackend {
-            lsp_probe: launch.command.first().is_some_and(|value| value == "lsp-tools"),
+            lsp_probe: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "lsp-tools"),
             delay: match launch.command.first().map(String::as_str) {
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
@@ -742,9 +839,15 @@ pub fn build(
                 .is_some_and(|value| value == "fork-blocking")
                 .then_some(Duration::from_secs(3)),
             steering_by_session: Default::default(),
-            permission: launch.command.first().is_some_and(|value| value == "approval-blocking")
+            permission: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "approval-blocking")
                 .then_some(permission_coordinator),
-            retained_control: launch.command.first().is_some_and(|value| value == "retained-control")
+            retained_control: launch
+                .command
+                .first()
+                .is_some_and(|value| value == "retained-control")
                 .then(Default::default),
         })),
     }
@@ -752,7 +855,11 @@ pub fn build(
 
 struct MockBackend {
     lsp_probe: bool,
-    retained_control: Option<std::sync::Mutex<std::collections::HashMap<String, crate::control_tools::ControlTurnContext>>>,
+    retained_control: Option<
+        std::sync::Mutex<
+            std::collections::HashMap<String, crate::control_tools::ControlTurnContext>,
+        >,
+    >,
     permission: Option<std::sync::Arc<approval::PermissionCoordinator>>,
     delay: Option<Duration>,
     emit_before_delay: bool,
@@ -781,29 +888,52 @@ impl MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
-    async fn shutdown(&self) -> Result<()> { Ok(()) }
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
 
-    async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+    async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
 
-    async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+    async fn has_active_turn(&self, _session_id: &str) -> bool {
+        false
+    }
 
-    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+    async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+        None
+    }
 
-
-    async fn background_terminals(&self, _request: BackendCatalogRequest) -> Result<terminal::TerminalSnapshot> {
+    async fn background_terminals(
+        &self,
+        _request: BackendCatalogRequest,
+    ) -> Result<terminal::TerminalSnapshot> {
         Ok(terminal::TerminalSnapshot::default())
     }
 
     async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
         Ok(())
     }
-    async fn generate_text(&self, _request: BackendCatalogRequest, purpose: TextGeneration, _model: &str, _reasoning_effort: Option<&str>, _history: &str) -> Result<String> {
-        if let Some(delay) = self.delay { tokio::time::sleep(delay).await; }
+    async fn generate_text(
+        &self,
+        _request: BackendCatalogRequest,
+        purpose: TextGeneration,
+        _model: &str,
+        _reasoning_effort: Option<&str>,
+        _history: &str,
+    ) -> Result<String> {
+        if let Some(delay) = self.delay {
+            tokio::time::sleep(delay).await;
+        }
         purpose.validate(match purpose {
-            TextGeneration::Recap => "The current request is recorded. Review the next proposed change.",
+            TextGeneration::Recap => {
+                "The current request is recorded. Review the next proposed change."
+            }
             TextGeneration::SessionName => "Review proposed changes",
             TextGeneration::CommitMessage => "feat: describe repository changes",
-            TextGeneration::PullRequestDescription => "Describes the repository changes for reviewers.",
+            TextGeneration::PullRequestDescription => {
+                "Describes the repository changes for reviewers."
+            }
         })
     }
     fn descriptor(&self) -> BackendDescriptor {
@@ -820,8 +950,11 @@ impl Backend for MockBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         if let Some(retained) = &self.retained_control
-            && let Some(context) = &request.control_context {
-            retained.lock().expect("mock control context poisoned")
+            && let Some(context) = &request.control_context
+        {
+            retained
+                .lock()
+                .expect("mock control context poisoned")
                 .insert(request.runtime_key()?, context.clone());
         }
         if self.lsp_probe
@@ -839,58 +972,118 @@ impl Backend for MockBackend {
                 .context("LSP fixture requires tool name")?;
             let invocation = crate::control_tools::ControlToolInvocation { name, arguments };
             let text = match crate::control_tools::ControlToolExecutor::new(context)
-                .execute(invocation).await.and_then(|outcome| outcome.result)
+                .execute(invocation)
+                .await
+                .and_then(|outcome| outcome.result)
             {
                 Ok(result) => result.message,
                 Err(error) => format!("LSP error: {error:#}"),
             };
-            let event = BackendEvent { received_at_ms: None, address: None, turn_boundary: None,
-                kind: "assistant_message".into(), text: Some(text), data: Value::Null,
-                activity: None, summary: None, task_update: None };
-            if let Some(sink) = event_sink { sink.send_wait(event.clone()).await?; }
-            return Ok(BackendOutput { event: vec![event], capability: mock_capability(), ..Default::default() });
+            let event = BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "assistant_message".into(),
+                text: Some(text),
+                data: Value::Null,
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            if let Some(sink) = event_sink {
+                sink.send_wait(event.clone()).await?;
+            }
+            return Ok(BackendOutput {
+                event: vec![event],
+                capability: mock_capability(),
+                ..Default::default()
+            });
         }
         let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
         if let Some(context) = request.control_context.as_ref()
-            && context.checks.as_ref().is_some_and(|scope| scope.setup_reviewed().is_some()) {
-            let advertised = crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(context), true);
-            anyhow::ensure!(advertised.iter().any(|tool| tool.name == "checks_list")
-                && advertised.iter().any(|tool| tool.name == "checks_configure"),
-                "check setup requires advertised list and configuration tools");
+            && context
+                .checks
+                .as_ref()
+                .is_some_and(|scope| scope.setup_reviewed().is_some())
+        {
+            let advertised = crate::control_tools::ControlToolRegistry
+                .definition_list_for_context(Some(context), true);
+            anyhow::ensure!(
+                advertised.iter().any(|tool| tool.name == "checks_list")
+                    && advertised
+                        .iter()
+                        .any(|tool| tool.name == "checks_configure"),
+                "check setup requires advertised list and configuration tools"
+            );
         }
-        if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
-            && scope.setup_reviewed() == Some(false) {
-            let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
+        if let Some(scope) = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.checks.as_ref())
+            && scope.setup_reviewed() == Some(false)
+        {
+            let catalog: Value =
+                serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
             let rejected = scope.invoke("checks_configure", serde_json::json!({
                 "expected_revision": catalog["revision"], "config": {"version":2,"definitions":[]}
             })).await;
-            anyhow::ensure!(rejected.is_err(), "setup published before the user answered");
+            anyhow::ensure!(
+                rejected.is_err(),
+                "setup published before the user answered"
+            );
             return Ok(BackendOutput { plan_question: Some(crate::plan::PlanQuestionSet::freeform(
                 "Which functional areas and suites should run automatically, and should routine coverage be targeted or full?".into())), ..Default::default() });
         }
-        if let Some(scope) = request.control_context.as_ref().and_then(|context| context.checks.as_ref())
-            && scope.setup_reviewed() == Some(true) {
-            let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
-            let config = if catalog["snapshot"]["config"].is_object() { catalog["snapshot"]["config"].clone() }
-                else { serde_json::json!({"version":2,"definitions":[]}) };
-            scope.invoke("checks_configure", serde_json::json!({
-                "expected_revision": catalog["revision"], "config": config,
-            })).await?;
+        if let Some(scope) = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.checks.as_ref())
+            && scope.setup_reviewed() == Some(true)
+        {
+            let catalog: Value =
+                serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
+            let config = if catalog["snapshot"]["config"].is_object() {
+                catalog["snapshot"]["config"].clone()
+            } else {
+                serde_json::json!({"version":2,"definitions":[]})
+            };
+            scope
+                .invoke(
+                    "checks_configure",
+                    serde_json::json!({
+                        "expected_revision": catalog["revision"], "config": config,
+                    }),
+                )
+                .await?;
         }
         if let Some(permission) = &self.permission {
-            let resolution = permission.authorize_callback(request.execution_mode, true,
-                crate::permissions::matcher::PermissionRequest {
-                    id: "mock-approval".into(), provider: "Mock".into(), reason: None,
-                    target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
-                        command: "mock-probe".into(), shell: None,
-                    }],
-                }, Some(ProviderAddress { owner: Some(request.owner()?),
-                    thread_id: request.harness_session_id.clone(), turn_id: "mock-turn".into() }),
-                event_sink.as_ref()).await?;
-            anyhow::ensure!(resolution == approval::ApprovalResolution::AllowOnce,
-                "mock approval was not allowed");
+            let resolution = permission
+                .authorize_callback(
+                    request.execution_mode,
+                    true,
+                    crate::permissions::matcher::PermissionRequest {
+                        id: "mock-approval".into(),
+                        provider: "Mock".into(),
+                        reason: None,
+                        target_list: vec![crate::permissions::matcher::PermissionTarget::Command {
+                            command: "mock-probe".into(),
+                            shell: None,
+                        }],
+                    },
+                    Some(ProviderAddress {
+                        owner: Some(request.owner()?),
+                        thread_id: request.harness_session_id.clone(),
+                        turn_id: "mock-turn".into(),
+                    }),
+                    event_sink.as_ref(),
+                )
+                .await?;
+            anyhow::ensure!(
+                resolution == approval::ApprovalResolution::AllowOnce,
+                "mock approval was not allowed"
+            );
         }
         let event = BackendEvent {
             received_at_ms: None,
@@ -899,7 +1092,9 @@ impl Backend for MockBackend {
             kind: "assistant_message".into(),
             text: Some(if request.mode == PromptMode::PlanQuestion {
                 "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
-            } else { format!("Mock response: {}", request.input.text()) }),
+            } else {
+                format!("Mock response: {}", request.input.text())
+            }),
             data: Value::Null,
             activity: None,
             summary: None,
@@ -930,61 +1125,147 @@ impl Backend for MockBackend {
             }
         }
         if request.mode == PromptMode::Plan {
-            if let Some(document) = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).filter(|document| document.design.is_some()) {
+            if let Some(document) = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.plan_document.as_ref())
+                .filter(|document| document.design.is_some())
+            {
                 let path = "src/change.rs";
                 let design = document.design.as_ref().unwrap();
                 let mut source_digests = std::collections::BTreeMap::new();
-                let patch = if design.proposed.contains_key(path) || std::path::Path::new(&request.workspace).join(path).is_file() {
-                    let inspected = design.inspect(std::path::Path::new(&request.workspace), Some(path), false)?;
+                let patch = if design.proposed.contains_key(path)
+                    || std::path::Path::new(&request.workspace)
+                        .join(path)
+                        .is_file()
+                {
+                    let inspected = design.inspect(
+                        std::path::Path::new(&request.workspace),
+                        Some(path),
+                        false,
+                    )?;
                     if let Some(digest) = inspected["source_digest"].as_str() {
                         source_digests.insert(path.into(), digest.into());
                     }
-                    let text = inspected["text"].as_str().ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
-                    let removed = text.lines().map(|line| format!("-{line}\n")).collect::<String>();
-                    let original = design.baseline.get(path).map(|file| file.text.as_str()).unwrap_or(text);
+                    let text = inspected["text"]
+                        .as_str()
+                        .ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
+                    let removed = text
+                        .lines()
+                        .map(|line| format!("-{line}\n"))
+                        .collect::<String>();
+                    let original = design
+                        .baseline
+                        .get(path)
+                        .map(|file| file.text.as_str())
+                        .unwrap_or(text);
                     let behavior = if original.contains("pub fn reviewed_change(") {
                         "Change\n  Preserve the requested behavior."
                     } else {
                         "Algorithm\n  return"
                     };
-                    let behavior = behavior.lines().map(|line| format!("+{line}\n")).collect::<String>();
-                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n{behavior}*** End Patch")
-                } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n+Algorithm\n+  return\n*** End Patch") };
+                    let behavior = behavior
+                        .lines()
+                        .map(|line| format!("+{line}\n"))
+                        .collect::<String>();
+                    format!(
+                        "*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n{behavior}*** End Patch"
+                    )
+                } else {
+                    format!(
+                        "*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n+Algorithm\n+  return\n*** End Patch"
+                    )
+                };
                 let mut patch = patch;
                 let mut configuration = design.proposed.clone();
-                for path in ["Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj", ".gitignore"] {
-                    if !configuration.contains_key(path) && !design.baseline.contains_key(path)
-                        && std::path::Path::new(&request.workspace).join(path).is_file()
+                for path in [
+                    "Cargo.toml",
+                    "package.json",
+                    "tsconfig.json",
+                    "ci.yaml",
+                    "App.csproj",
+                    ".gitignore",
+                ] {
+                    if !configuration.contains_key(path)
+                        && !design.baseline.contains_key(path)
+                        && std::path::Path::new(&request.workspace)
+                            .join(path)
+                            .is_file()
                     {
-                        let inspected = design.inspect(std::path::Path::new(&request.workspace), Some(path), false)?;
-                        configuration.insert(path.into(), inspected["text"].as_str().unwrap().into());
-                        source_digests.insert(path.into(), inspected["source_digest"].as_str().unwrap().into());
+                        let inspected = design.inspect(
+                            std::path::Path::new(&request.workspace),
+                            Some(path),
+                            false,
+                        )?;
+                        configuration
+                            .insert(path.into(), inspected["text"].as_str().unwrap().into());
+                        source_digests.insert(
+                            path.into(),
+                            inspected["source_digest"].as_str().unwrap().into(),
+                        );
                     }
                 }
                 for (path, configuration) in &configuration {
-                    if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() { continue; }
+                    if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() {
+                        continue;
+                    }
                     let updated = configuration.replacen("\"0.1.0\"", "\"0.2.0\"", 1);
                     if updated != *configuration {
-                        let removed = configuration.lines().map(|line| format!("-{line}\n")).collect::<String>();
-                        let added = updated.lines().map(|line| format!("+{line}\n")).collect::<String>();
-                        patch = patch.replace("*** End Patch", &format!("*** Update File: {path}\n@@\n{removed}{added}*** End Patch"));
+                        let removed = configuration
+                            .lines()
+                            .map(|line| format!("-{line}\n"))
+                            .collect::<String>();
+                        let added = updated
+                            .lines()
+                            .map(|line| format!("+{line}\n"))
+                            .collect::<String>();
+                        patch = patch.replace(
+                            "*** End Patch",
+                            &format!("*** Update File: {path}\n@@\n{removed}{added}*** End Patch"),
+                        );
                     }
                 }
-                let metadata = serde_json::to_string_pretty(&design.document)?.lines().map(|line| format!("-{line}\n")).collect::<String>();
+                let metadata = serde_json::to_string_pretty(&design.document)?
+                    .lines()
+                    .map(|line| format!("-{line}\n"))
+                    .collect::<String>();
                 let mut revised_metadata = design.document.clone();
                 revised_metadata.objective = "Revise the registry interface.".into();
-                revised_metadata.background = "The registry owns published handles used by its callers.".into();
-                revised_metadata.requirements = vec!["Preserve the registry ownership boundary.".into()];
-                revised_metadata.design = "Revise the registry interface while preserving its ownership boundary.".into();
-                revised_metadata.verification=vec!["Confirm the requested interface behaves as designed.".into()];
-                let added = serde_json::to_string_pretty(&revised_metadata)?.lines().map(|line| format!("+{line}\n")).collect::<String>();
-                let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"));
-                let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()),source_digests };
-                let proposed = document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
+                revised_metadata.background =
+                    "The registry owns published handles used by its callers.".into();
+                revised_metadata.requirements =
+                    vec!["Preserve the registry ownership boundary.".into()];
+                revised_metadata.design =
+                    "Revise the registry interface while preserving its ownership boundary.".into();
+                revised_metadata.verification =
+                    vec!["Confirm the requested interface behaves as designed.".into()];
+                let added = serde_json::to_string_pretty(&revised_metadata)?
+                    .lines()
+                    .map(|line| format!("+{line}\n"))
+                    .collect::<String>();
+                let patch = patch.replace(
+                    "*** End Patch",
+                    &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"),
+                );
+                let change = crate::plan::DesignPatchRequest {
+                    plan_id: document.plan_id.clone(),
+                    expected_version: document.version,
+                    patch,
+                    title: Some("Design the requested change".into()),
+                    source_digests,
+                };
+                let proposed = document
+                    .patch_design(std::path::Path::new(&request.workspace), change.clone())?;
                 return Ok(BackendOutput {
-                    backend_session_id:request.backend_session_id.or(Some("mock-session".into())),
-                    design_patch:vec![change],plan_submit:Some(PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:proposed.version }),
-                    structured_plan:true,capability:mock_capability(),..Default::default()
+                    backend_session_id: request.backend_session_id.or(Some("mock-session".into())),
+                    design_patch: vec![change],
+                    plan_submit: Some(PlanSubmitRequest {
+                        plan_id: document.plan_id.clone(),
+                        expected_version: proposed.version,
+                    }),
+                    structured_plan: true,
+                    capability: mock_capability(),
+                    ..Default::default()
                 });
             }
         }
@@ -1271,12 +1552,24 @@ impl Backend for MockBackend {
 
     async fn compact(&self, request: BackendCompactionRequest) -> Result<BackendOutput> {
         let compaction = Compaction {
-            id: request.id, thread_id: request.request.backend_session_id.clone().unwrap_or_default(),
-            state: CompactionState::Completed, manual:true, started_at_ms:None, completed_at_ms:None,
+            id: request.id,
+            thread_id: request
+                .request
+                .backend_session_id
+                .clone()
+                .unwrap_or_default(),
+            state: CompactionState::Completed,
+            manual: true,
+            started_at_ms: None,
+            completed_at_ms: None,
             result: CompactionResult {
-                summary_content: Some("Mock compacted context preserves the conversation constraints.".into()),
-                pre_compaction_tokens: Some(80_000), post_compaction_tokens: Some(20_000),
-                tokens_removed: Some(60_000), ..Default::default()
+                summary_content: Some(
+                    "Mock compacted context preserves the conversation constraints.".into(),
+                ),
+                pre_compaction_tokens: Some(80_000),
+                post_compaction_tokens: Some(20_000),
+                tokens_removed: Some(60_000),
+                ..Default::default()
             },
         };
         let request = request.request;
@@ -1335,7 +1628,12 @@ pub(crate) fn mock_capability() -> BackendCapability {
         os_sandbox: BackendKind::Mock.supports_sandbox(),
         native_fork: true,
         native_compact: true,
-        compaction: CompactionCapability { lifecycle: true, background: false, summary: true, metrics: true },
+        compaction: CompactionCapability {
+            lifecycle: true,
+            background: false,
+            summary: true,
+            metrics: true,
+        },
         native_steer: true,
         native_turn_rollback: true,
         native_goal: true,
@@ -1359,18 +1657,29 @@ pub(crate) fn mock_capability() -> BackendCapability {
 mod test {
     #[test]
     fn sandbox_allowlist_preserves_codex_preferences_and_disables_other_providers() {
-        for provider in [super::BackendKind::Codex, super::BackendKind::Copilot,
-            super::BackendKind::Claude, super::BackendKind::Antigravity, super::BackendKind::Mock] {
+        for provider in [
+            super::BackendKind::Codex,
+            super::BackendKind::Copilot,
+            super::BackendKind::Claude,
+            super::BackendKind::Antigravity,
+            super::BackendKind::Mock,
+        ] {
             let requested = crate::session::AccessPolicy::default();
             let effective = provider.resolve_access(requested.clone());
-            assert_eq!(provider.supports_sandbox(), provider == super::BackendKind::Codex);
+            assert_eq!(
+                provider.supports_sandbox(),
+                provider == super::BackendKind::Codex
+            );
             assert_eq!(effective.sandbox, provider.supports_sandbox());
             assert!(requested.sandbox);
             assert_eq!(effective.write_access, requested.write_access);
             assert_eq!(effective.writable_directory, requested.writable_directory);
             assert_eq!(effective.windows_sandbox, requested.windows_sandbox);
             provider.validate_access(&effective).unwrap();
-            let disabled = crate::session::AccessPolicy { sandbox: false, ..requested };
+            let disabled = crate::session::AccessPolicy {
+                sandbox: false,
+                ..requested
+            };
             assert!(!provider.resolve_access(disabled).sandbox);
         }
     }

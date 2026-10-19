@@ -83,11 +83,19 @@ pub struct VerificationCheck {
 impl VerificationReport {
     /// Validate check identities and evidence before a phase transition is committed.
     pub(crate) fn validate_checks(&self, actions: &[String]) -> Result<()> {
-        ensure!(self.checks.len() == actions.len(), "report every accepted manual verification action");
+        ensure!(
+            self.checks.len() == actions.len(),
+            "report every accepted manual verification action"
+        );
         for (check, action) in self.checks.iter().zip(actions) {
-            ensure!(check.category == VerificationCategory::Manual && check.label == *action,
-                "verification must contain only accepted manual actions in order");
-            ensure!(!check.summary.trim().is_empty(), "manual result requires observations");
+            ensure!(
+                check.category == VerificationCategory::Manual && check.label == *action,
+                "verification must contain only accepted manual actions in order"
+            );
+            ensure!(
+                !check.summary.trim().is_empty(),
+                "manual result requires observations"
+            );
         }
         Ok(())
     }
@@ -158,16 +166,32 @@ impl SemanticProgress {
                     .different
                     .push(format!("{path}: planned deletion still exists")),
                 (Some(expected), None) => {
-                    progress.declaration_changes.push(super::conformance::declaration_mismatch(
-                        &path, "Missing file", expected, "", "missing planned file")?);
+                    progress
+                        .declaration_changes
+                        .push(super::conformance::declaration_mismatch(
+                            &path,
+                            "Missing file",
+                            expected,
+                            "",
+                            "missing planned file",
+                        )?);
                     progress.missing.push(path);
                 }
                 (Some(expected), Some(source)) => {
-                    match super::conformance::inspect_in_workspace(workspace, &path, expected, &source) {
+                    match super::conformance::inspect_in_workspace(
+                        workspace, &path, expected, &source,
+                    ) {
                         Ok((differences, changes)) => {
                             progress.declaration_changes.extend(changes);
-                            if differences.is_empty() { progress.matched.push(path); }
-                            else { progress.different.extend(differences.into_iter().map(|difference| format!("{path}: {difference}"))); }
+                            if differences.is_empty() {
+                                progress.matched.push(path);
+                            } else {
+                                progress.different.extend(
+                                    differences
+                                        .into_iter()
+                                        .map(|difference| format!("{path}: {difference}")),
+                                );
+                            }
                         }
                         Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
                     }
@@ -215,8 +239,13 @@ pub struct ExecutionRevision {
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Describes a durable execution event for the native timeline.
 pub enum PlanExecutionLifecycleEvent {
-    Completed { title: String },
-    Failed { title: String, reason: String },
+    Completed {
+        title: String,
+    },
+    Failed {
+        title: String,
+        reason: String,
+    },
     Phase {
         title: String,
         phase: PlanPhase,
@@ -299,7 +328,10 @@ impl PlanExecutionRecord {
             self.pending_revision_reason.is_none(),
             "a plan revision awaits review"
         );
-        ensure!(self.phase != PlanPhase::Checking, "Checking is owned by Harness, not the model");
+        ensure!(
+            self.phase != PlanPhase::Checking,
+            "Checking is owned by Harness, not the model"
+        );
         if self.phase != PlanPhase::Verify {
             ensure!(
                 request.verification.is_none(),
@@ -312,8 +344,13 @@ impl PlanExecutionRecord {
                 .context("Verify requires a verification assessment")?;
             match report.outcome {
                 VerificationOutcome::Passed => {
-                    ensure!(report.checks.iter().all(|check| check.outcome == VerificationOutcome::Passed),
-                        "a passed assessment cannot contain failed or blocked checks");
+                    ensure!(
+                        report
+                            .checks
+                            .iter()
+                            .all(|check| check.outcome == VerificationOutcome::Passed),
+                        "a passed assessment cannot contain failed or blocked checks"
+                    );
                     ensure!(
                         report.findings.is_empty(),
                         "a passed assessment cannot retain unresolved findings"
@@ -337,14 +374,21 @@ impl PlanExecutionRecord {
                             .findings
                             .iter()
                             .any(|finding| !finding.trim().is_empty())
-                            || report.checks.iter().any(|check| check.outcome == VerificationOutcome::Failed),
+                            || report
+                                .checks
+                                .iter()
+                                .any(|check| check.outcome == VerificationOutcome::Failed),
                         "failed verification requires concrete findings"
                     );
                     self.phase = PlanPhase::Resolve;
                     self.findings = report.findings.clone();
-                    self.findings.extend(report.checks.iter()
-                        .filter(|check| check.outcome != VerificationOutcome::Passed)
-                        .map(|check| format!("{}: {}", check.label, check.summary)));
+                    self.findings.extend(
+                        report
+                            .checks
+                            .iter()
+                            .filter(|check| check.outcome != VerificationOutcome::Passed)
+                            .map(|check| format!("{}: {}", check.label, check.summary)),
+                    );
                     self.findings.extend(progress.findings());
                 }
                 VerificationOutcome::Blocked => {
@@ -393,14 +437,18 @@ impl PlanExecutionRecord {
             PlanPhase::Resolve => {
                 "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Constructs/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with plan_phase_done so Harness can run declarations and automated checks again. Do not run those checks yourself."
             }
-            PlanPhase::Checking => "Harness runs declarations and accepted checks locally. No model turn is admitted for this phase.",
+            PlanPhase::Checking => {
+                "Harness runs declarations and accepted checks locally. No model turn is admitted for this phase."
+            }
             PlanPhase::Verify => {
                 "Perform only the accepted plan's manual verification actions, in order. Harness has already passed declarations and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked with observations and tool evidence. Report blockers honestly. Send observed defects to Resolve. Retrieve exact evidence IDs with plan_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
             " Report verification.checks with one entry per accepted manual verification action, in plan order. Each entry contains category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
-        } else { "" };
+        } else {
+            ""
+        };
         format!(
             "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with plan_read. Call plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call goal_complete for this execution.",
             self.phase, self.revision
@@ -459,13 +507,22 @@ pub struct ExecutionControlSender {
 impl ExecutionControlSender {
     /// Reject plan mutations outside Resolve before draft parsing or side effects.
     pub fn require_revision_phase(&self) -> Result<()> {
-        ensure!(self.phase == PlanPhase::Resolve, "plan revisions are only allowed in Resolve; finish {} and let Verify collect deviations", self.phase.label());
+        ensure!(
+            self.phase == PlanPhase::Resolve,
+            "plan revisions are only allowed in Resolve; finish {} and let Verify collect deviations",
+            self.phase.label()
+        );
         Ok(())
     }
 
     /// Await a committed broker result before acknowledging the provider's request.
     pub async fn send(&self, operation: ExecutionOperation) -> Result<Value> {
-        if matches!(&operation, ExecutionOperation::Draft(_) | ExecutionOperation::Submit { .. }) { self.require_revision_phase()?; }
+        if matches!(
+            &operation,
+            ExecutionOperation::Draft(_) | ExecutionOperation::Submit { .. }
+        ) {
+            self.require_revision_phase()?;
+        }
         let (response, receive) = oneshot::channel();
         self.sender
             .send(ExecutionControl {
@@ -494,7 +551,7 @@ mod tests {
         assert!(report.validate_checks(&["Open window".into()]).is_ok());
         assert!(report.validate_checks(&["Resize window".into()]).is_err());
         assert!(report.validate_checks(&[]).is_err());
-        report.checks[0].category=VerificationCategory::Automated;
+        report.checks[0].category = VerificationCategory::Automated;
         assert!(report.validate_checks(&["Open window".into()]).is_err());
     }
 
@@ -538,7 +595,9 @@ mod tests {
         let mut record = execution();
         record.revision = 3;
         record.findings.push("Reset still retains score".into());
-        record.approval_comments.push("Preserve the public API name".into());
+        record
+            .approval_comments
+            .push("Preserve the public API name".into());
         let persisted = serde_json::to_vec(&record).unwrap();
         let mut record: PlanExecutionRecord = serde_json::from_slice(&persisted).unwrap();
         assert_eq!(record.approval_comments, ["Preserve the public API name"]);
@@ -546,8 +605,14 @@ mod tests {
             record.phase = phase;
             for (kind, prefix) in [
                 (PlanExecutionPromptKind::Start, "Start the Execute task"),
-                (PlanExecutionPromptKind::Continue, "Continue the same Execute task"),
-                (PlanExecutionPromptKind::ResumeAfterInterruption, "Resume the same Execute task after interruption"),
+                (
+                    PlanExecutionPromptKind::Continue,
+                    "Continue the same Execute task",
+                ),
+                (
+                    PlanExecutionPromptKind::ResumeAfterInterruption,
+                    "Resume the same Execute task after interruption",
+                ),
             ] {
                 let prompt = PlanPrompt::execution(&record, kind, "accepted document");
                 assert!(prompt.starts_with(prefix));
@@ -558,13 +623,21 @@ mod tests {
                 assert!(prompt.ends_with("accepted document"));
                 if phase == PlanPhase::Implement {
                     assert!(prompt.contains("Do not edit or submit the plan, reconcile declaration metadata, or run builds"));
-                    assert!(prompt.contains("Harness runs validation and conformance assessment in Checking"));
+                    assert!(prompt.contains(
+                        "Harness runs validation and conformance assessment in Checking"
+                    ));
                 } else if phase == PlanPhase::Verify {
-                    assert!(prompt.contains("Perform only the accepted plan's manual verification actions"));
+                    assert!(
+                        prompt.contains(
+                            "Perform only the accepted plan's manual verification actions"
+                        )
+                    );
                     assert!(!prompt.contains("Do not run builds"));
                 }
                 if kind == PlanExecutionPromptKind::ResumeAfterInterruption {
-                    assert!(prompt.contains("Do not assume interruption rolled back changes or stopped a command"));
+                    assert!(prompt.contains(
+                        "Do not assume interruption rolled back changes or stopped a command"
+                    ));
                 }
             }
         }
@@ -597,20 +670,47 @@ mod tests {
     #[test]
     fn implementation_defers_all_conformance_to_verification() {
         let mut execution = execution();
-        let mismatch = SemanticProgress { missing: vec!["main.rs".into()], ..Default::default() };
-        execution.finish_phase(done(PlanPhase::Implement, None), mismatch.clone(), 1).unwrap();
+        let mismatch = SemanticProgress {
+            missing: vec!["main.rs".into()],
+            ..Default::default()
+        };
+        execution
+            .finish_phase(done(PlanPhase::Implement, None), mismatch.clone(), 1)
+            .unwrap();
         assert_eq!(execution.phase, PlanPhase::Checking);
-        execution.phase=PlanPhase::Verify;
-        execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), mismatch.clone(), 2).unwrap();
+        execution.phase = PlanPhase::Verify;
+        execution
+            .finish_phase(
+                done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                mismatch.clone(),
+                2,
+            )
+            .unwrap();
         assert_eq!(execution.phase, PlanPhase::Resolve);
         assert_eq!(execution.findings, ["main.rs: missing planned file"]);
-        execution.finish_phase(done(PlanPhase::Resolve, None), mismatch, 3).unwrap();
+        execution
+            .finish_phase(done(PlanPhase::Resolve, None), mismatch, 3)
+            .unwrap();
         assert_eq!(execution.phase, PlanPhase::Checking);
-        execution.phase=PlanPhase::Verify;
-        execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), SemanticProgress::default(), 4).unwrap();
+        execution.phase = PlanPhase::Verify;
+        execution
+            .finish_phase(
+                done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                SemanticProgress::default(),
+                4,
+            )
+            .unwrap();
         assert_eq!(execution.state, PlanExecutionState::Complete);
         assert_eq!(execution.completed_at_ms, Some(4));
-        assert!(execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), SemanticProgress::default(), 5).is_err());
+        assert!(
+            execution
+                .finish_phase(
+                    done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
+                    SemanticProgress::default(),
+                    5
+                )
+                .is_err()
+        );
     }
 
     #[test]
@@ -648,7 +748,7 @@ mod tests {
                 )
                 .is_err()
         );
-        execution.phase=PlanPhase::Verify;
+        execution.phase = PlanPhase::Verify;
         execution
             .finish_phase(
                 done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
@@ -673,7 +773,7 @@ mod tests {
                 1,
             )
             .unwrap();
-        execution.phase=PlanPhase::Verify;
+        execution.phase = PlanPhase::Verify;
         execution
             .finish_phase(
                 done(PlanPhase::Verify, Some(VerificationOutcome::Blocked)),
@@ -696,8 +796,16 @@ mod tests {
         let (file, _) = design.source(workspace.path(), "counter.rs").unwrap();
         design.proposed.insert("counter.rs".into(), file.text);
         std::fs::write(&path, "/// Changed documentation.\npub struct Counter { pub value: i32 }\npub fn run(count: i32) {}\n").unwrap();
-        assert!(SemanticProgress::scan(&design, workspace.path()).unwrap().conforms());
-        std::fs::write(&path, "pub struct Counter { pub value: bool }\npub fn run(count: bool) {}\n").unwrap();
+        assert!(
+            SemanticProgress::scan(&design, workspace.path())
+                .unwrap()
+                .conforms()
+        );
+        std::fs::write(
+            &path,
+            "pub struct Counter { pub value: bool }\npub fn run(count: bool) {}\n",
+        )
+        .unwrap();
         let progress = SemanticProgress::scan(&design, workspace.path()).unwrap();
         assert_eq!(progress.different.len(), 2);
     }
@@ -814,11 +922,22 @@ mod revision_policy_tests {
     fn stale_tools_cannot_revise_outside_resolve() {
         let (sender, _receiver) = mpsc::channel(1);
         for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
-            let control = ExecutionControlSender { phase, execution_id: "e".into(), generation: 1, sender: sender.clone() };
-            assert_eq!(control.require_revision_phase().is_ok(), phase == PlanPhase::Resolve);
+            let control = ExecutionControlSender {
+                phase,
+                execution_id: "e".into(),
+                generation: 1,
+                sender: sender.clone(),
+            };
+            assert_eq!(
+                control.require_revision_phase().is_ok(),
+                phase == PlanPhase::Resolve
+            );
             let tools = crate::control_tools::ControlToolRegistry.definition_list_for(Some(phase));
             for name in ["design_patch", "plan_submit"] {
-                assert_eq!(tools.iter().any(|tool| tool.name == name), phase == PlanPhase::Resolve);
+                assert_eq!(
+                    tools.iter().any(|tool| tool.name == name),
+                    phase == PlanPhase::Resolve
+                );
             }
         }
     }

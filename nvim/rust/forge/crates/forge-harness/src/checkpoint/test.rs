@@ -11,8 +11,19 @@ fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     for name in ["edited.asset", "deleted.asset", "renamed.asset"] {
         fs::write(root.join(name), "original asset\n").unwrap();
     }
-    git(root, &["-c", "filter.lfs.process=", "-c", "filter.lfs.clean=", "-c",
-        "filter.lfs.required=false", "add", "."]);
+    git(
+        root,
+        &[
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".",
+        ],
+    );
     git(root, &["commit", "-qm", "LFS fixtures"]);
     git(root, &["config", "filter.lfs.process", ""]);
     git(root, &["config", "filter.lfs.clean", "false"]);
@@ -21,7 +32,9 @@ fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
-    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
     assert!(before.file.is_empty());
     assert_eq!(before.excluded.len(), 3);
     assert!(before.read(&objects, "edited.asset").unwrap().is_none());
@@ -30,28 +43,62 @@ fn checkpoints_ignore_lfs_assets_in_capture_read_diff_and_restore() {
     fs::remove_file(root.join("deleted.asset")).unwrap();
     fs::rename(root.join("renamed.asset"), root.join("replacement.asset")).unwrap();
     fs::write(root.join("untracked.asset"), "untracked asset\n").unwrap();
-    let lfs_only = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    let lfs_only = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
     assert!(lfs_only.file.is_empty());
     assert!(lfs_only.excluded.contains("untracked.asset"));
     assert!(before.changed_paths(&lfs_only).unwrap().is_empty());
     fs::write(root.join("tracked.txt"), "changed\n").unwrap();
-    let after = checkpoint.capture_native(&objects, "session", 2, || Ok(())).unwrap();
+    let after = checkpoint
+        .capture_native(&objects, "session", 2, || Ok(()))
+        .unwrap();
     assert_eq!(before.changed_paths(&after).unwrap(), vec!["tracked.txt"]);
-    assert_eq!(after.file.iter().map(|file| file.path.as_str()).collect::<Vec<_>>(), vec!["tracked.txt"]);
+    assert_eq!(
+        after
+            .file
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tracked.txt"]
+    );
     let preview = RestorePreview::prepare(&objects, root, &after, &before).unwrap();
-    assert_eq!(preview.path.iter().map(|entry| entry.path.as_str()).collect::<Vec<_>>(), vec!["tracked.txt"]);
-    RestoreJournal::begin(&objects, preview).unwrap().apply(&objects, &mut || Ok(())).unwrap();
-    assert_eq!(fs::read_to_string(root.join("tracked.txt")).unwrap(), "before\n");
-    assert_eq!(fs::read_to_string(root.join("edited.asset")).unwrap(), "new asset bytes\n");
+    assert_eq!(
+        preview
+            .path
+            .iter()
+            .map(|entry| entry.path.as_str())
+            .collect::<Vec<_>>(),
+        vec!["tracked.txt"]
+    );
+    RestoreJournal::begin(&objects, preview)
+        .unwrap()
+        .apply(&objects, &mut || Ok(()))
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(root.join("tracked.txt")).unwrap(),
+        "before\n"
+    );
+    assert_eq!(
+        fs::read_to_string(root.join("edited.asset")).unwrap(),
+        "new asset bytes\n"
+    );
     assert!(!root.join("deleted.asset").exists());
     assert!(root.join("replacement.asset").exists());
     assert!(root.join("untracked.asset").exists());
 
     fs::write(root.join(".gitattributes"), "*.asset -filter\n").unwrap();
     assert!(before.read(&objects, "edited.asset").unwrap().is_none());
-    let after_rules = checkpoint.capture_native(&objects, "session", 3, || Ok(())).unwrap();
+    let after_rules = checkpoint
+        .capture_native(&objects, "session", 3, || Ok(()))
+        .unwrap();
     let preview = RestorePreview::prepare(&objects, root, &after_rules, &lfs_only).unwrap();
-    assert!(!preview.path.iter().any(|entry| lfs_only.excluded.contains(&entry.path)));
+    assert!(
+        !preview
+            .path
+            .iter()
+            .any(|entry| lfs_only.excluded.contains(&entry.path))
+    );
 }
 
 #[test]
@@ -65,14 +112,23 @@ fn older_checkpoint_overrides_do_not_restore_current_lfs_assets() {
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
-    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
     fs::write(root.join("legacy.asset"), "modified\n").unwrap();
-    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    let after = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
     assert!(after.file.iter().any(|file| file.path == "legacy.asset"));
     fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
     assert!(after.read(&objects, "legacy.asset").unwrap().is_none());
     assert!(before.changed_paths(&after).unwrap().is_empty());
-    assert!(RestorePreview::prepare(&objects, root, &after, &before).unwrap().path.is_empty());
+    assert!(
+        RestorePreview::prepare(&objects, root, &after, &before)
+            .unwrap()
+            .path
+            .is_empty()
+    );
 }
 
 #[test]
@@ -83,11 +139,21 @@ fn clean_checkout_preserves_physical_line_endings_and_invalidates_reuse() {
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
-    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
-    assert_eq!(before.read(&objects, "tracked.txt").unwrap().unwrap(), b"before\n");
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
+    assert_eq!(
+        before.read(&objects, "tracked.txt").unwrap().unwrap(),
+        b"before\n"
+    );
     fs::write(root.join("tracked.txt"), b"before\r\n").unwrap();
-    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
-    assert_eq!(after.read(&objects, "tracked.txt").unwrap().unwrap(), b"before\r\n");
+    let after = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
+    assert_eq!(
+        after.read(&objects, "tracked.txt").unwrap().unwrap(),
+        b"before\r\n"
+    );
     assert_ne!(before.id, after.id);
     assert_eq!(before.changed_paths(&after).unwrap(), vec!["tracked.txt"]);
 }
@@ -98,15 +164,26 @@ fn global_attribute_changes_invalidate_cached_checkpoint_ownership() {
     let root = repository.path();
     let attributes = root.join(".git/global-attributes");
     fs::write(&attributes, "").unwrap();
-    git(root, &["config", "core.attributesfile", attributes.to_str().unwrap()]);
+    git(
+        root,
+        &[
+            "config",
+            "core.attributesfile",
+            attributes.to_str().unwrap(),
+        ],
+    );
     fs::write(root.join("new.asset"), "asset bytes\n").unwrap();
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
-    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
     assert_eq!(before.file.len(), 1);
     fs::write(&attributes, "*.asset filter=lfs\n").unwrap();
-    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    let after = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
     assert!(after.file.is_empty());
     assert!(after.excluded.contains("new.asset"));
     assert!(before.changed_paths(&after).unwrap().is_empty());
@@ -120,14 +197,21 @@ fn restore_rejects_a_saved_journal_when_its_path_becomes_lfs() {
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
     let checkpoint = GitCheckpoint::new(root);
-    let before = checkpoint.capture_native(&objects, "session", 0, || Ok(())).unwrap();
+    let before = checkpoint
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
     fs::write(root.join("new.asset"), "asset bytes\n").unwrap();
-    let after = checkpoint.capture_native(&objects, "session", 1, || Ok(())).unwrap();
+    let after = checkpoint
+        .capture_native(&objects, "session", 1, || Ok(()))
+        .unwrap();
     let preview = RestorePreview::prepare(&objects, root, &after, &before).unwrap();
     let mut journal = RestoreJournal::begin(&objects, preview).unwrap();
     fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
     let error = journal.apply(&objects, &mut || Ok(())).unwrap_err();
-    assert!(error.to_string().contains("excluded by Git LFS"), "{error:#}");
+    assert!(
+        error.to_string().contains("excluded by Git LFS"),
+        "{error:#}"
+    );
     assert_eq!(fs::read(root.join("new.asset")).unwrap(), b"asset bytes\n");
 }
 
@@ -142,11 +226,19 @@ fn private_checkpoint_index_preserves_a_split_index_and_staged_content() {
     fs::write(root.join("tracked.txt"), "unstaged\n").unwrap();
     let data = tempfile::tempdir().unwrap();
     let objects = ObjectStore::open(data.path()).unwrap();
-    let record = GitCheckpoint::new(root).capture_native(&objects, "session", 0, || Ok(())).unwrap();
-    assert_eq!(record.read(&objects, "tracked.txt").unwrap().unwrap(), b"unstaged\n");
+    let record = GitCheckpoint::new(root)
+        .capture_native(&objects, "session", 0, || Ok(()))
+        .unwrap();
+    assert_eq!(
+        record.read(&objects, "tracked.txt").unwrap().unwrap(),
+        b"unstaged\n"
+    );
     assert_eq!(fs::read(root.join(".git/index")).unwrap(), index);
-    let staged = std::process::Command::new("git").current_dir(root)
-        .args(["show", ":tracked.txt"]).output().unwrap();
+    let staged = std::process::Command::new("git")
+        .current_dir(root)
+        .args(["show", ":tracked.txt"])
+        .output()
+        .unwrap();
     assert!(staged.status.success());
     assert_eq!(staged.stdout, b"staged\n");
 }
@@ -158,33 +250,65 @@ async fn reuses_unchanged_checkpoint_and_detects_external_dirty_edits() {
     let store = SqliteStore::open(data.path()).unwrap();
     let repositories = Arc::new(RepositoryStore::default());
     let checkpoint = GitCheckpoint::new(repository.path());
-    let original = checkpoint.capture(&store.objects, &repositories, "reuse", 1).await.unwrap();
+    let original = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 1)
+        .await
+        .unwrap();
     fs::write(repository.path().join("ignored.tmp"), "ignored").unwrap();
-    let reused = checkpoint.capture(&store.objects, &repositories, "reuse", 2).await.unwrap();
+    let reused = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 2)
+        .await
+        .unwrap();
     assert_eq!(reused.id, original.id);
     assert_eq!(reused.created_at_ms, 1);
 
     let path = repository.path().join("tracked.txt");
     fs::write(&path, "first!\n").unwrap();
-    let dirty = checkpoint.capture(&store.objects, &repositories, "reuse", 3).await.unwrap();
+    let dirty = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 3)
+        .await
+        .unwrap();
     let modified = fs::metadata(&path).unwrap().modified().unwrap();
     fs::write(&path, "second\n").unwrap();
-    fs::File::options().write(true).open(&path).unwrap()
-        .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
-    let edited = checkpoint.capture(&store.objects, &repositories, "reuse", 4).await.unwrap();
-    assert_ne!(edited.id, dirty.id, "same-length edits with restored mtime must invalidate reuse");
-    let captured = edited.file.iter().find(|file|file.path == "tracked.txt").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let edited = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 4)
+        .await
+        .unwrap();
+    assert_ne!(
+        edited.id, dirty.id,
+        "same-length edits with restored mtime must invalidate reuse"
+    );
+    let captured = edited
+        .file
+        .iter()
+        .find(|file| file.path == "tracked.txt")
+        .unwrap();
     assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"second\n");
 
     fs::write(repository.path().join("new.txt"), "external").unwrap();
-    let added = checkpoint.capture(&store.objects, &repositories, "reuse", 5).await.unwrap();
+    let added = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 5)
+        .await
+        .unwrap();
     assert_ne!(added.id, edited.id);
     fs::remove_file(path).unwrap();
-    let removed = checkpoint.capture(&store.objects, &repositories, "reuse", 6).await.unwrap();
+    let removed = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 6)
+        .await
+        .unwrap();
     assert!(removed.deleted.contains(&"tracked.txt".to_owned()));
     git(repository.path(), &["add", "."]);
     git(repository.path(), &["commit", "-qm", "external changes"]);
-    let committed = checkpoint.capture(&store.objects, &repositories, "reuse", 7).await.unwrap();
+    let committed = checkpoint
+        .capture(&store.objects, &repositories, "reuse", 7)
+        .await
+        .unwrap();
     assert_ne!(committed.head, removed.head);
     assert_ne!(committed.id, removed.id);
 }
@@ -233,10 +357,7 @@ async fn capture_waits_for_each_repository_scope_before_reading() {
             .find(|file| file.path == "tracked.txt")
             .unwrap();
         assert_eq!(
-            store
-                .objects
-                .get(&tracked.object_id)
-                .unwrap(),
+            store.objects.get(&tracked.object_id).unwrap(),
             content.as_bytes()
         );
         assert_eq!(repositories.writes.usage().operations, 0);
@@ -418,10 +539,18 @@ async fn admitted_capture_honors_cancellation_but_accepts_repository_invalidatio
             .finish()
             .await;
         if invalidate {
-            assert!(result.is_ok(), "repository invalidation must not fail capture: {result:?}");
+            assert!(
+                result.is_ok(),
+                "repository invalidation must not fail capture: {result:?}"
+            );
         } else {
             assert!(result.unwrap_err().to_string().contains("cancelled"));
-            assert!(store.objects.get(&crate::plan::digest(b"before\n")).is_err());
+            assert!(
+                store
+                    .objects
+                    .get(&crate::plan::digest(b"before\n"))
+                    .is_err()
+            );
         }
         assert_eq!(repositories.writes.usage().operations, 0);
         assert_eq!(repositories.writes.usage().input_bytes, 0);
@@ -576,22 +705,42 @@ fn capture_keeps_read_content_without_retrying_after_a_later_edit() {
     fs::write(&path, b"first capture\n").unwrap();
     let identity = crate::plan::digest(b"first capture\n");
     let mut changed = false;
-    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !changed && store.objects.get(&identity).is_ok() {
-            fs::write(&path, b"settled capture\n")?;
-            changed = true;
-        }
-        Ok(())
-    }).unwrap();
+    let record = checkpoint
+        .capture_native(&store.objects, "session", 1, || {
+            if !changed && store.objects.get(&identity).is_ok() {
+                fs::write(&path, b"settled capture\n")?;
+                changed = true;
+            }
+            Ok(())
+        })
+        .unwrap();
     assert!(changed);
-    let captured = record.file.iter().find(|file| file.path == "tracked.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"first capture\n");
+    let captured = record
+        .file
+        .iter()
+        .find(|file| file.path == "tracked.txt")
+        .unwrap();
+    assert_eq!(
+        store.objects.get(&captured.object_id).unwrap(),
+        b"first capture\n"
+    );
     assert!(checkpoint.cache.lock().unwrap().is_none());
-    let current = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
+    let current = checkpoint
+        .capture_native(&store.objects, "session", 2, || Ok(()))
+        .unwrap();
     assert_ne!(current.id, record.id);
-    let captured = current.file.iter().find(|file| file.path == "tracked.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"settled capture\n");
-    let reused = checkpoint.capture_native(&store.objects, "session", 3, || Ok(())).unwrap();
+    let captured = current
+        .file
+        .iter()
+        .find(|file| file.path == "tracked.txt")
+        .unwrap();
+    assert_eq!(
+        store.objects.get(&captured.object_id).unwrap(),
+        b"settled capture\n"
+    );
+    let reused = checkpoint
+        .capture_native(&store.objects, "session", 3, || Ok(()))
+        .unwrap();
     assert_eq!(reused.id, current.id);
     assert_eq!(reused.created_at_ms, 2);
 }
@@ -608,15 +757,17 @@ fn capture_accepts_an_index_refresh_without_changing_staging() {
     let original = fs::read(&index).unwrap();
     let modified = fs::metadata(&index).unwrap().modified().unwrap();
     let mut refreshed = false;
-    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !refreshed && store.objects.get(&identity).is_ok() {
-            fs::File::options().write(true).open(&index)?.set_times(
-                fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
-            )?;
-            refreshed = true;
-        }
-        Ok(())
-    }).unwrap();
+    let record = checkpoint
+        .capture_native(&store.objects, "session", 1, || {
+            if !refreshed && store.objects.get(&identity).is_ok() {
+                fs::File::options().write(true).open(&index)?.set_times(
+                    fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+                )?;
+                refreshed = true;
+            }
+            Ok(())
+        })
+        .unwrap();
     assert!(refreshed);
     assert_eq!(fs::read(index).unwrap(), original);
     assert!(record.file.iter().any(|file| file.path == "tracked.txt"));
@@ -635,18 +786,32 @@ fn capture_defers_edits_outside_the_initial_status_inventory_to_the_next_checkpo
     fs::write(repository.path().join("tracked.txt"), b"first\n").unwrap();
     let identity = crate::plan::digest(b"first\n");
     let mut changed = false;
-    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
-        if !changed && store.objects.get(&identity).is_ok() {
-            fs::write(&later, b"current version\n")?;
-            changed = true;
-        }
-        Ok(())
-    }).unwrap();
+    let record = checkpoint
+        .capture_native(&store.objects, "session", 1, || {
+            if !changed && store.objects.get(&identity).is_ok() {
+                fs::write(&later, b"current version\n")?;
+                changed = true;
+            }
+            Ok(())
+        })
+        .unwrap();
     assert!(changed);
-    assert_eq!(record.read(&store.objects, "z-later.txt").unwrap().unwrap(), b"old\n");
-    let next = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
-    let captured = next.file.iter().find(|file| file.path == "z-later.txt").unwrap();
-    assert_eq!(store.objects.get(&captured.object_id).unwrap(), b"current version\n");
+    assert_eq!(
+        record.read(&store.objects, "z-later.txt").unwrap().unwrap(),
+        b"old\n"
+    );
+    let next = checkpoint
+        .capture_native(&store.objects, "session", 2, || Ok(()))
+        .unwrap();
+    let captured = next
+        .file
+        .iter()
+        .find(|file| file.path == "z-later.txt")
+        .unwrap();
+    assert_eq!(
+        store.objects.get(&captured.object_id).unwrap(),
+        b"current version\n"
+    );
     assert_eq!(record.changed_paths(&next).unwrap(), vec!["z-later.txt"]);
 }
 
@@ -659,10 +824,7 @@ fn capture_cancellation_after_object_publication_returns_no_record() {
     fs::write(repository.path().join("tracked.txt"), b"changed\n").unwrap();
     let identity = crate::plan::digest(b"changed\n");
     let result = checkpoint.capture_native(&store.objects, "session", 1, || {
-        anyhow::ensure!(
-            store.objects.get(&identity).is_err(),
-            "capture cancelled"
-        );
+        anyhow::ensure!(store.objects.get(&identity).is_err(), "capture cancelled");
         Ok(())
     });
     assert!(
@@ -675,10 +837,7 @@ fn capture_cancellation_after_object_publication_returns_no_record() {
         fs::read(repository.path().join("tracked.txt")).unwrap(),
         b"changed\n"
     );
-    assert_eq!(
-        store.objects.get(&identity).unwrap(),
-        b"changed\n"
-    );
+    assert_eq!(store.objects.get(&identity).unwrap(), b"changed\n");
     assert!(
         checkpoint
             .capture_native(&store.objects, "session", 2, || Ok(()))
@@ -1264,10 +1423,7 @@ async fn oversized_checkpoint_sources_report_unavailable_without_hiding_other_ch
         )
         .await
         .unwrap();
-    let large = store
-        .objects
-        .put(&vec![b'x'; 8 * 1024 * 1024 + 1])
-        .unwrap();
+    let large = store.objects.put(&vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
     after.file.push(CheckpointFile {
         mode: 0o100644,
         path: "large.txt".into(),
@@ -1474,10 +1630,7 @@ fn clean_checkpoint_keeps_git_baseline_without_duplicate_objects() {
         0
     );
     assert_eq!(
-        checkpoint
-            .read(&objects, "tracked.txt")
-            .unwrap()
-            .unwrap(),
+        checkpoint.read(&objects, "tracked.txt").unwrap().unwrap(),
         b"before\n"
     );
 }
@@ -1856,10 +2009,7 @@ fn raw_path_and_symlink_checkpoint_does_not_follow_external_content() {
         .capture_native(&objects, "session", 0, || Ok(()))
         .unwrap();
     let key = forge_git::checkpoint::path_key(name.as_bytes());
-    assert_eq!(
-        captured.read(&objects, &key).unwrap().unwrap(),
-        b"exact"
-    );
+    assert_eq!(captured.read(&objects, &key).unwrap().unwrap(), b"exact");
     assert_eq!(
         captured.read(&objects, "link").unwrap().unwrap(),
         b"/outside/never-read"
@@ -1888,8 +2038,5 @@ fn sparse_checkout_does_not_record_omitted_files_as_deletions() {
         .capture_native(&objects, "session", 0, || Ok(()))
         .unwrap();
     assert!(captured.deleted.is_empty());
-    assert_eq!(
-        captured.read(&objects, "omit/b").unwrap().unwrap(),
-        b"omit"
-    );
+    assert_eq!(captured.read(&objects, "omit/b").unwrap().unwrap(), b"omit");
 }

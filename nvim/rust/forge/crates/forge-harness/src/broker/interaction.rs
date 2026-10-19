@@ -251,18 +251,28 @@ impl HarnessBroker {
         self.backend.prepare_turn(&self.session.id).await?;
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission.map(|value| value.prompt.as_str()).unwrap_or(text);
-        let automatic_repair = admission.is_some_and(|admission| admission.automatic_owner.is_some());
+        let automatic_repair =
+            admission.is_some_and(|admission| admission.automatic_owner.is_some());
         if automatic_repair {
-            let mut previous = self.store.list_exchange(&self.session.id)?.pop()
+            let mut previous = self
+                .store
+                .list_exchange(&self.session.id)?
+                .pop()
                 .context("automatic repair has no originating exchange")?;
-            anyhow::ensure!(previous.check_owner.as_ref() == admission.and_then(|admission| admission.check_owner.as_ref()),
-                "automatic repair check ownership changed");
+            anyhow::ensure!(
+                previous.check_owner.as_ref()
+                    == admission.and_then(|admission| admission.check_owner.as_ref()),
+                "automatic repair check ownership changed"
+            );
             previous.repair_checks(now_ms)?;
             self.store.save_exchange(&previous)?;
         }
         let (mut interaction, new_interaction, mut event) = Box::pin(self.interaction_for_turn(
-            admitted_prompt, admission.is_some() && !automatic_repair, now_ms,
-        )).await?;
+            admitted_prompt,
+            admission.is_some() && !automatic_repair,
+            now_ms,
+        ))
+        .await?;
         interaction.mode = Some(self.session.execution_mode);
         if new_interaction && let Some(admission) = admission {
             if self.check_setup {

@@ -78,18 +78,19 @@ impl PackageCatalog {
         let packages = match manager {
             PackageManager::Cargo => {
                 let mut args = toolchain.into_iter().map(str::to_owned).collect::<Vec<_>>();
-                args.extend([
-                    "metadata", "--format-version", "1", "--no-deps", "--offline", "--locked",
-                ].map(str::to_owned));
-                let output = super::invocation::capture(
-                    "cargo",
-                    &args,
-                    &directory,
-                    None,
-                    None,
-                    30,
-                )
-                .await?;
+                args.extend(
+                    [
+                        "metadata",
+                        "--format-version",
+                        "1",
+                        "--no-deps",
+                        "--offline",
+                        "--locked",
+                    ]
+                    .map(str::to_owned),
+                );
+                let output =
+                    super::invocation::capture("cargo", &args, &directory, None, None, 30).await?;
                 #[derive(Deserialize)]
                 struct Metadata {
                     packages: Vec<CargoPackage>,
@@ -371,10 +372,7 @@ fn relative(root: &Path, path: &Path) -> Result<String> {
     Ok(if path.is_empty() { ".".into() } else { path })
 }
 
-fn scan(
-    directory: &Path,
-    manifests: &mut Vec<PathBuf>,
-) -> Result<()> {
+fn scan(directory: &Path, manifests: &mut Vec<PathBuf>) -> Result<()> {
     for entry in std::fs::read_dir(directory)? {
         let entry = entry?;
         if entry.file_type()?.is_dir()

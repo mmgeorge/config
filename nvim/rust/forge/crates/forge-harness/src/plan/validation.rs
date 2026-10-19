@@ -592,7 +592,13 @@ impl<'a> PlanValidator<'a> {
                         .into_iter()
                         .chain(std::iter::once(file.change.path()))
                     {
-                        let normalized = path.replace('\\', "/").split('/').filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>().join("/").to_lowercase();
+                        let normalized = path
+                            .replace('\\', "/")
+                            .split('/')
+                            .filter(|part| !part.is_empty() && *part != ".")
+                            .collect::<Vec<_>>()
+                            .join("/")
+                            .to_lowercase();
                         if let Some(previous) = file_owner.insert(normalized, task.id.as_str()) {
                             if previous != task.id {
                                 self.push(
@@ -908,7 +914,10 @@ impl<'a> PlanValidator<'a> {
                     && matches!(
                         (member.kind, callable.kind),
                         (super::MemberKind::Method, super::PlanCallableKind::Method)
-                            | (super::MemberKind::Function, super::PlanCallableKind::Function)
+                            | (
+                                super::MemberKind::Function,
+                                super::PlanCallableKind::Function
+                            )
                     )
             }) {
                 return true;
@@ -1216,18 +1225,23 @@ mod test {
     #[test]
     fn submission_resolves_nested_flow_callables_against_declared_members() {
         let mut document = test_fixture("plan", "Validate member references.");
-        document.entity_changes[0].members.push(serde_json::from_value(serde_json::json!({
-            "action":"add", "kind":"method", "name":"setup_scene",
-            "description":"Create the scene.", "visibility":"private",
-            "parameters":[]
-        })).unwrap());
+        document.entity_changes[0].members.push(
+            serde_json::from_value(serde_json::json!({
+                "action":"add", "kind":"method", "name":"setup_scene",
+                "description":"Create the scene.", "visibility":"private",
+                "parameters":[]
+            }))
+            .unwrap(),
+        );
         let call: super::PlanFlowEdge = serde_json::from_value(serde_json::json!({
             "relation":"call", "target":{"kind":"planned_entity","entity":"PlanDocument"},
             "callable":{"kind":"method","name":"initialize"}, "expansion":[], "branches":[]
-        })).unwrap();
+        }))
+        .unwrap();
         document.flows[0].edges[0].expansion = vec![call.clone()];
         document.flows[0].edges[0].branches = vec![super::PlanFlowBranch {
-            condition: "When startup completes".into(), edges: vec![call],
+            condition: "When startup completes".into(),
+            edges: vec![call],
         }];
         super::validate_plan_edit(&document).unwrap();
         let error = super::validate_plan_submission(&document).unwrap_err();
@@ -1236,14 +1250,29 @@ mod test {
             "flows[0].edges[0].expansion[0].callable",
             "flows[0].edges[0].branches[0].edges[0].callable",
         ] {
-            assert!(error.violation.iter().any(|violation| violation.path == path
-                && violation.message.contains("initialize")), "{error}");
+            assert!(
+                error
+                    .violation
+                    .iter()
+                    .any(|violation| violation.path == path
+                        && violation.message.contains("initialize")),
+                "{error}"
+            );
         }
         document.flows[0].edges[0].branches.clear();
-        document.flows[0].edges[0].expansion[0].callable.as_mut().unwrap().name = "setup_scene".into();
+        document.flows[0].edges[0].expansion[0]
+            .callable
+            .as_mut()
+            .unwrap()
+            .name = "setup_scene".into();
         super::validate_plan_submission(&document).unwrap();
         document.entity_changes[0].members[0].kind = MemberKind::Function;
-        assert!(super::validate_plan_submission(&document).unwrap_err().to_string().contains("setup_scene"));
+        assert!(
+            super::validate_plan_submission(&document)
+                .unwrap_err()
+                .to_string()
+                .contains("setup_scene")
+        );
         document.entity_changes[0].members[0].kind = MemberKind::Method;
         document.entity_changes[0].members[0].action = ChangeAction::Remove;
         assert!(super::validate_plan_submission(&document).is_err());
@@ -1255,22 +1284,38 @@ mod test {
         let mut contract = document.entity_changes[0].clone();
         contract.name = "SceneContract".into();
         contract.kind = super::EntityKind::Trait;
-        contract.members.push(serde_json::from_value(serde_json::json!({
-            "action":"add", "kind":"method", "name":"setup_scene",
-            "description":"Create the scene.", "visibility":"public", "parameters":[]
-        })).unwrap());
-        contract.extends = Some(super::EntityReference::PlannedEntity { entity: "PlanDocument".into() });
-        document.entity_changes[0].conforms_to.push(super::EntityReference::PlannedEntity {
-            entity: contract.name.clone(),
+        contract.members.push(
+            serde_json::from_value(serde_json::json!({
+                "action":"add", "kind":"method", "name":"setup_scene",
+                "description":"Create the scene.", "visibility":"public", "parameters":[]
+            }))
+            .unwrap(),
+        );
+        contract.extends = Some(super::EntityReference::PlannedEntity {
+            entity: "PlanDocument".into(),
         });
+        document.entity_changes[0]
+            .conforms_to
+            .push(super::EntityReference::PlannedEntity {
+                entity: contract.name.clone(),
+            });
         document.entity_changes.push(contract);
-        let validator = super::PlanValidator::new(&document, super::PlanValidationPhase::Submission);
-        assert!(validator.declares_callable("PlanDocument", &PlanCallable {
-            kind: PlanCallableKind::Method, name: "setup_scene".into(),
-        }));
-        assert!(!validator.declares_callable("PlanDocument", &PlanCallable {
-            kind: PlanCallableKind::Method, name: "initialize".into(),
-        }));
+        let validator =
+            super::PlanValidator::new(&document, super::PlanValidationPhase::Submission);
+        assert!(validator.declares_callable(
+            "PlanDocument",
+            &PlanCallable {
+                kind: PlanCallableKind::Method,
+                name: "setup_scene".into(),
+            }
+        ));
+        assert!(!validator.declares_callable(
+            "PlanDocument",
+            &PlanCallable {
+                kind: PlanCallableKind::Method,
+                name: "initialize".into(),
+            }
+        ));
     }
 
     #[test]

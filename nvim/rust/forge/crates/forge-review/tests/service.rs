@@ -268,11 +268,7 @@ impl forge_github::review_api::GithubReviewRemote for TestRemote {
 
 #[tokio::test]
 async fn editable_description_keeps_markdown_source_and_typescript_syntax() {
-    use forge_diff::{
-        cache::CacheLimits,
-        engine::DiffEngine,
-        syntax::{SyntaxEngine},
-    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     let remote = remote();
     let source = "# Description\n\n**Bold** text and [a link](https://example.com).\n\n```ts\ninterface TestValue {\n  Foobar: number,\n  Test: number;\n  NextValue: number\n}\n```\n\nFollowing paragraph.\n";
     remote.state.lock().unwrap().body = Some(source.into());
@@ -1347,11 +1343,7 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
 
 #[tokio::test]
 async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
-    use forge_diff::{
-        cache::CacheLimits,
-        engine::DiffEngine,
-        syntax::{SyntaxEngine},
-    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
     let remote = remote();
@@ -1556,11 +1548,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
 
 #[tokio::test]
 async fn batched_file_sections_remain_stable_and_move_viewed_files() {
-    use forge_diff::{
-        cache::CacheLimits,
-        engine::DiffEngine,
-        syntax::{SyntaxEngine},
-    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
 
@@ -2149,7 +2137,12 @@ async fn document_identity_cannot_alias_a_replacement_host() {
     let original = first.open_pr(remote.clone(), target()).await.unwrap();
     let reopened = replacement.open_pr(remote, target()).await.unwrap();
     assert_ne!(original.document, reopened.document);
-    assert!(replacement.save(&original.document, vec![], vec![]).await.is_err());
+    assert!(
+        replacement
+            .save(&original.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     assert!(replacement.snapshot(&original.document).is_err());
 }
 
@@ -2239,7 +2232,10 @@ async fn acknowledged_local_text_survives_document_and_service_replacement() {
     );
     assert!(body.dirty);
     assert!(
-        replacement.save(&reopened.document, vec![], vec![]).await.is_err(),
+        replacement
+            .save(&reopened.document, vec![], vec![])
+            .await
+            .is_err(),
         "reopened remote conflict was overwritten"
     );
     assert!(remote.writes.lock().unwrap().is_empty());
@@ -2289,7 +2285,12 @@ async fn uncertain_pr_capture_survives_restart_and_settles_without_reposting() {
         .find(|field| field.region.0 == "body")
         .unwrap();
     assert_eq!(body.sequence, EditSequence(200));
-    assert!(replacement.save(&reopened.document, vec![], vec![]).await.is_err());
+    assert!(
+        replacement
+            .save(&reopened.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     let settled = replacement.reconcile(&reopened.document).await.unwrap();
     assert!(!settled.uncertain);
     let body = settled
@@ -2326,7 +2327,12 @@ async fn unsent_conversation_identity_and_body_survive_restart_without_remote_cr
     let first = ReviewService::new(github(&remote));
     let original = first.open_pr(remote.clone(), target()).await.unwrap();
     let draft = first
-        .comment(&original.document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &original.document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -2346,7 +2352,9 @@ async fn unsent_conversation_identity_and_body_survive_restart_without_remote_cr
     let restored = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Snapshot {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot {
                 comment: draft.comment,
             },
         )
@@ -2368,7 +2376,12 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
     let first = ReviewService::new(github(&remote));
     let opened = first.open_pr(remote.clone(), target()).await.unwrap();
     let draft = first
-        .comment(&opened.document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &opened.document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -2377,7 +2390,9 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
     let uncertain = first
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -2392,7 +2407,9 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
     let restored = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Snapshot {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot {
                 comment: draft.comment,
             },
         )
@@ -2405,7 +2422,9 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
         replacement
             .comment(
                 &reopened.document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: draft.comment,
                     action: CommentSaveAction::Save
                 }
@@ -2416,7 +2435,9 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
     let linked = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Recover {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Recover {
                 comment: draft.comment,
                 resolution: Some(RecoveryResolution::Link { remote_id: 123 }),
             },
@@ -2434,7 +2455,9 @@ async fn unknown_creation_links_after_restart_without_reposting_and_keeps_newer_
     replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -2454,7 +2477,12 @@ async fn explicit_creation_closure_keeps_captured_and_newer_text_without_remote_
     let service = ReviewService::new(github.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
     let draft = service
-        .comment(&opened.document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &opened.document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -2463,7 +2491,9 @@ async fn explicit_creation_closure_keeps_captured_and_newer_text_without_remote_
     let uncertain = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -2507,7 +2537,9 @@ async fn explicit_creation_closure_keeps_captured_and_newer_text_without_remote_
     let closed = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::Recover {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Recover {
                 comment: draft.comment,
                 resolution: Some(RecoveryResolution::CloseUnknown),
             },
@@ -2594,7 +2626,12 @@ async fn held_save_keeps_newer_native_edits_and_batches_dirty_fields() {
     let document = initial.document.clone();
     let saving = tokio::spawn(async move { owner.save(&document, vec![], vec![]).await });
     entered(&remote).await;
-    assert!(service.save(&initial.document, vec![], vec![]).await.is_err());
+    assert!(
+        service
+            .save(&initial.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     let before = service.snapshot(&initial.document).unwrap();
     let body = before
         .field
@@ -2623,7 +2660,12 @@ async fn held_save_keeps_newer_native_edits_and_batches_dirty_fields() {
     };
     assert!(
         service
-            .comment(&initial.document, vec![rejected_comment], vec![], load_comment())
+            .comment(
+                &initial.document,
+                vec![rejected_comment],
+                vec![],
+                load_comment()
+            )
             .await
             .is_err()
     );
@@ -2658,7 +2700,10 @@ async fn held_save_keeps_newer_native_edits_and_batches_dirty_fields() {
     assert_eq!(result.snapshot.field[1].baseline, "Î»\n  body\n");
     assert_eq!(remote.writes.lock().unwrap().len(), 1);
     remote.hold.store(false, Ordering::Release);
-    let result = service.save(&initial.document, vec![], vec![]).await.unwrap();
+    let result = service
+        .save(&initial.document, vec![], vec![])
+        .await
+        .unwrap();
     assert!(result.snapshot.field.iter().all(|field| !field.dirty));
     let recorded = remote.writes.lock().unwrap();
     let PullRequestMutation::Edit(edit) = &recorded[1] else {
@@ -2675,14 +2720,22 @@ async fn unknown_write_reconciles_without_reposting_or_clobbering_text() {
     let initial = service.open_pr(remote.clone(), target()).await.unwrap();
     change(&service, &initial.document, "body", "submitted").await;
     remote.uncertain.store(true, Ordering::Release);
-    let result = service.save(&initial.document, vec![], vec![]).await.unwrap();
+    let result = service
+        .save(&initial.document, vec![], vec![])
+        .await
+        .unwrap();
     assert!(result.snapshot.uncertain);
     assert_eq!(
         result.remote.unwrap().outcome,
         PullRequestOutcome::OutcomeUnknown
     );
     change(&service, &initial.document, "body", "newer").await;
-    assert!(service.save(&initial.document, vec![], vec![]).await.is_err());
+    assert!(
+        service
+            .save(&initial.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     let reconciled = service.reconcile(&initial.document).await.unwrap();
     assert!(!reconciled.uncertain);
     assert_eq!(reconciled.field[1].baseline, "submitted");
@@ -2724,11 +2777,19 @@ async fn rejection_retains_baseline_and_invalid_title_never_writes() {
     let service = ReviewService::new(github(&remote));
     let initial = service.open_pr(remote.clone(), target()).await.unwrap();
     change(&service, &initial.document, "title", "").await;
-    assert!(service.save(&initial.document, vec![], vec![]).await.is_err());
+    assert!(
+        service
+            .save(&initial.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     assert!(remote.writes.lock().unwrap().is_empty());
     change(&service, &initial.document, "title", "Rejected title").await;
     remote.reject.store(true, Ordering::Release);
-    let result = service.save(&initial.document, vec![], vec![]).await.unwrap();
+    let result = service
+        .save(&initial.document, vec![], vec![])
+        .await
+        .unwrap();
     assert_eq!(result.remote.unwrap().outcome, PullRequestOutcome::Rejected);
     assert!(result.snapshot.field[0].dirty);
     assert!(!result.snapshot.saving && !result.snapshot.uncertain);
@@ -2766,7 +2827,12 @@ async fn remote_panic_reconciles_observed_state_without_reposting() {
     let initial = service.open_pr(remote.clone(), target()).await.unwrap();
     change(&service, &initial.document, "body", "not confirmed").await;
     remote.panic.store(true, Ordering::Release);
-    assert!(service.save(&initial.document, vec![], vec![]).await.is_err());
+    assert!(
+        service
+            .save(&initial.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     let snapshot = service.snapshot(&initial.document).unwrap();
     assert!(snapshot.uncertain && !snapshot.saving);
     assert_eq!(snapshot.field[1].text, "not confirmed");
@@ -2920,7 +2986,9 @@ async fn held_comment_save_advances_only_submitted_baseline_and_preserves_newer_
         worker
             .comment(
                 &identity,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment,
                     action: CommentSaveAction::Save,
                 },
@@ -2929,7 +2997,12 @@ async fn held_comment_save_advances_only_submitted_baseline_and_preserves_newer_
     });
     remote.entered.acquire().await.unwrap().forget();
     let held = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::Snapshot { comment })
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot { comment },
+        )
         .await
         .unwrap()
         .snapshot;
@@ -2951,7 +3024,9 @@ async fn held_comment_save_advances_only_submitted_baseline_and_preserves_newer_
     let restored = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Snapshot { comment },
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot { comment },
         )
         .await
         .unwrap()
@@ -2983,7 +3058,9 @@ async fn uncertain_comment_save_survives_pr_reconciliation_and_does_not_repost()
     let result = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: loaded.comment,
                 action: CommentSaveAction::Save,
             },
@@ -2995,12 +3072,19 @@ async fn uncertain_comment_save_survives_pr_reconciliation_and_does_not_repost()
     edit_comment(&service, &result.snapshot, "newer").await;
     assert!(service.reconcile(&document).await.unwrap().uncertain);
     assert!(service.save(&document, vec![], vec![]).await.is_err());
-    assert!(service.comment(&document, vec![], vec![], load_comment()).await.is_err());
+    assert!(
+        service
+            .comment(&document, vec![], vec![], load_comment())
+            .await
+            .is_err()
+    );
     assert!(
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: loaded.comment,
                     action: CommentSaveAction::Save
                 }
@@ -3011,7 +3095,9 @@ async fn uncertain_comment_save_survives_pr_reconciliation_and_does_not_repost()
     let settled = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Reconcile {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Reconcile {
                 comment: loaded.comment,
             },
         )
@@ -3049,7 +3135,9 @@ async fn closed_comment_receiver_and_document_retain_native_mutation_until_settl
         worker
             .comment(
                 &identity,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: loaded.comment,
                     action: CommentSaveAction::Delete,
                 },
@@ -3100,7 +3188,12 @@ async fn comment_panic_retains_unknown_capture_and_foreign_load_is_rejected() {
     if let ReviewCommentCommand::Load { target, .. } = &mut invalid {
         target.pull_request.number = 8;
     }
-    assert!(service.comment(&document, vec![], vec![], invalid).await.is_err());
+    assert!(
+        service
+            .comment(&document, vec![], vec![], invalid)
+            .await
+            .is_err()
+    );
     let loaded = service
         .comment(&document, vec![], vec![], load_comment())
         .await
@@ -3112,7 +3205,9 @@ async fn comment_panic_retains_unknown_capture_and_foreign_load_is_rejected() {
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: loaded.comment,
                     action: CommentSaveAction::Save
                 }
@@ -3123,7 +3218,9 @@ async fn comment_panic_retains_unknown_capture_and_foreign_load_is_rejected() {
     let snapshot = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Snapshot {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot {
                 comment: loaded.comment,
             },
         )
@@ -3137,7 +3234,9 @@ async fn comment_panic_retains_unknown_capture_and_foreign_load_is_rejected() {
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Reconcile {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Reconcile {
                     comment: loaded.comment
                 }
             )
@@ -3166,7 +3265,9 @@ async fn comment_panic_retains_unknown_capture_and_foreign_load_is_rejected() {
     let snapshot = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Reconcile {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Reconcile {
                 comment: loaded.comment,
             },
         )
@@ -3208,7 +3309,9 @@ async fn comment_refresh_conflict_requires_revision_checked_resolution() {
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: loaded.comment,
                     action: CommentSaveAction::Save
                 }
@@ -3220,7 +3323,9 @@ async fn comment_refresh_conflict_requires_revision_checked_resolution() {
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Resolve {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Resolve {
                     comment: loaded.comment,
                     base: loaded.revision,
                     choice: ConflictResolution::KeepLocal
@@ -3232,7 +3337,9 @@ async fn comment_refresh_conflict_requires_revision_checked_resolution() {
     let resolved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Resolve {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Resolve {
                 comment: loaded.comment,
                 base: refreshed.revision,
                 choice: ConflictResolution::KeepLocal,
@@ -3249,7 +3356,9 @@ async fn comment_refresh_conflict_requires_revision_checked_resolution() {
     let saved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: loaded.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3272,7 +3381,12 @@ async fn conversation_creation_adopts_identity_and_preserves_newer_draft_text() 
         .unwrap()
         .document;
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3286,7 +3400,9 @@ async fn conversation_creation_adopts_identity_and_preserves_newer_draft_text() 
         worker
             .comment(
                 &identity,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment,
                     action: CommentSaveAction::Save,
                 },
@@ -3295,7 +3411,12 @@ async fn conversation_creation_adopts_identity_and_preserves_newer_draft_text() 
     });
     entered(&remote).await;
     let held = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::Snapshot { comment })
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot { comment },
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3312,7 +3433,9 @@ async fn conversation_creation_adopts_identity_and_preserves_newer_draft_text() 
     let edited = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment,
                 action: CommentSaveAction::Save,
             },
@@ -3325,7 +3448,9 @@ async fn conversation_creation_adopts_identity_and_preserves_newer_draft_text() 
     let deleted = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment,
                 action: CommentSaveAction::Delete,
             },
@@ -3349,7 +3474,12 @@ async fn conversation_creation_uncertainty_cannot_adopt_an_unrelated_observation
         .unwrap()
         .document;
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3358,7 +3488,9 @@ async fn conversation_creation_uncertainty_cannot_adopt_an_unrelated_observation
     let saved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3374,19 +3506,28 @@ async fn conversation_creation_uncertainty_cannot_adopt_an_unrelated_observation
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Reconcile {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Reconcile {
                     comment: draft.comment
                 }
             )
             .await
             .is_err()
     );
-    assert!(service.comment(&document, vec![], vec![], load_comment()).await.is_err());
+    assert!(
+        service
+            .comment(&document, vec![], vec![], load_comment())
+            .await
+            .is_err()
+    );
     assert!(
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: draft.comment,
                     action: CommentSaveAction::Save
                 }
@@ -3397,7 +3538,9 @@ async fn conversation_creation_uncertainty_cannot_adopt_an_unrelated_observation
     let retained = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Snapshot {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot {
                 comment: draft.comment,
             },
         )
@@ -3420,7 +3563,12 @@ async fn rejected_conversation_creation_keeps_draft_available_for_explicit_retry
         .unwrap()
         .document;
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3428,7 +3576,9 @@ async fn rejected_conversation_creation_keeps_draft_available_for_explicit_retry
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: draft.comment,
                     action: CommentSaveAction::Save
                 }
@@ -3440,7 +3590,9 @@ async fn rejected_conversation_creation_keeps_draft_available_for_explicit_retry
         service
             .comment(
                 &document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: draft.comment,
                     action: CommentSaveAction::Delete
                 }
@@ -3453,7 +3605,9 @@ async fn rejected_conversation_creation_keeps_draft_available_for_explicit_retry
     let rejected = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3467,7 +3621,9 @@ async fn rejected_conversation_creation_keeps_draft_available_for_explicit_retry
     let saved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3492,7 +3648,12 @@ async fn conversation_creation_survives_caller_and_document_closure() {
         .unwrap()
         .document;
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3504,7 +3665,9 @@ async fn conversation_creation_survives_caller_and_document_closure() {
         worker
             .comment(
                 &identity,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: draft.comment,
                     action: CommentSaveAction::Save,
                 },
@@ -3555,7 +3718,12 @@ async fn conversation_creation_preflight_failure_releases_capture_without_writin
         .unwrap()
         .document;
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3564,7 +3732,9 @@ async fn conversation_creation_preflight_failure_releases_capture_without_writin
     let rejected = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3581,7 +3751,9 @@ async fn conversation_creation_preflight_failure_releases_capture_without_writin
     let saved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3618,7 +3790,12 @@ async fn mutation_admission_failure_preserves_unwritten_pr_comment_and_creation_
             .unwrap()
             .snapshot;
         let draft = service
-            .comment(&second, vec![], vec![], ReviewCommentCommand::DraftConversation)
+            .comment(
+                &second,
+                vec![],
+                vec![],
+                ReviewCommentCommand::DraftConversation,
+            )
             .await
             .unwrap()
             .snapshot;
@@ -3630,7 +3807,14 @@ async fn mutation_admission_failure_preserves_unwritten_pr_comment_and_creation_
         } else {
             change(&service, &first, "title", "first title").await;
             remote.uncertain.store(true, Ordering::Release);
-            assert!(service.save(&first, vec![], vec![]).await.unwrap().snapshot.uncertain);
+            assert!(
+                service
+                    .save(&first, vec![], vec![])
+                    .await
+                    .unwrap()
+                    .snapshot
+                    .uncertain
+            );
         }
         let failure = service.save(&second, vec![], vec![]).await.unwrap_err();
         assert!(
@@ -3642,7 +3826,9 @@ async fn mutation_admission_failure_preserves_unwritten_pr_comment_and_creation_
             let failure = service
                 .comment(
                     &second,
-                    vec![], vec![], ReviewCommentCommand::Save {
+                    vec![],
+                    vec![],
+                    ReviewCommentCommand::Save {
                         comment,
                         action: CommentSaveAction::Save,
                     },
@@ -3651,7 +3837,12 @@ async fn mutation_admission_failure_preserves_unwritten_pr_comment_and_creation_
                 .unwrap_err();
             assert!(failure.is::<MutationNotStarted>());
             let snapshot = service
-                .comment(&second, vec![], vec![], ReviewCommentCommand::Snapshot { comment })
+                .comment(
+                    &second,
+                    vec![],
+                    vec![],
+                    ReviewCommentCommand::Snapshot { comment },
+                )
                 .await
                 .unwrap()
                 .snapshot;
@@ -3707,7 +3898,12 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
         last_line: 5,
     };
     let draft = service
-        .comment(&document, vec![], vec![], ReviewCommentCommand::DraftInline { anchor })
+        .comment(
+            &document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftInline { anchor },
+        )
         .await
         .unwrap()
         .snapshot;
@@ -3715,7 +3911,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let saved = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3727,7 +3925,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let reply = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::DraftReply {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftReply {
                 parent: saved.comment,
             },
         )
@@ -3737,7 +3937,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let repeated = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::DraftReply {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftReply {
                 parent: saved.comment,
             },
         )
@@ -3765,7 +3967,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let restored = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::DraftReply {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftReply {
                 parent: saved.comment,
             },
         )
@@ -3778,7 +3982,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let saved_reply = service
         .comment(
             &document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: reply.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3794,7 +4000,9 @@ async fn inline_and_reply_creation_retain_native_anchors_and_distinct_endpoints(
     let next_reply = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::DraftReply {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftReply {
                 parent: saved.comment,
             },
         )
@@ -3829,7 +4037,12 @@ async fn materialized_comment_creation_edit_and_delete_publish_only_owned_blocks
         .await
         .unwrap();
     let draft = service
-        .comment(&opened.document, vec![], vec![], ReviewCommentCommand::DraftConversation)
+        .comment(
+            &opened.document,
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftConversation,
+        )
         .await
         .unwrap();
     let patch = draft
@@ -3852,7 +4065,9 @@ async fn materialized_comment_creation_edit_and_delete_publish_only_owned_blocks
     let saved = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.snapshot.comment,
                 action: CommentSaveAction::Save,
             },
@@ -3864,7 +4079,9 @@ async fn materialized_comment_creation_edit_and_delete_publish_only_owned_blocks
     let deleted = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::Save {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Save {
                 comment: draft.snapshot.comment,
                 action: CommentSaveAction::Delete,
             },
@@ -3981,7 +4198,9 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
     let loaded = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::LoadThreadComment {
+            vec![],
+            vec![],
+            ReviewCommentCommand::LoadThreadComment {
                 thread_node_id: "THREAD_1".into(),
                 comment_node_id: "COMMENT_THREAD".into(),
             },
@@ -4011,7 +4230,9 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
         service
             .comment(
                 &opened.document,
-                vec![], vec![], ReviewCommentCommand::Save {
+                vec![],
+                vec![],
+                ReviewCommentCommand::Save {
                     comment: loaded.snapshot.comment,
                     action: CommentSaveAction::Save,
                 }
@@ -4023,7 +4244,9 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
         service
             .comment(
                 &opened.document,
-                vec![], vec![], ReviewCommentCommand::LoadThreadComment {
+                vec![],
+                vec![],
+                ReviewCommentCommand::LoadThreadComment {
                     thread_node_id: "THREAD_1".into(),
                     comment_node_id: "FOREIGN".into(),
                 }
@@ -4034,7 +4257,9 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
     let reply = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::DraftReply {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftReply {
                 parent: loaded.snapshot.comment,
             },
         )
@@ -4134,7 +4359,9 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
     let second = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::LoadThreadComment {
+            vec![],
+            vec![],
+            ReviewCommentCommand::LoadThreadComment {
                 thread_node_id: "THREAD_1".into(),
                 comment_node_id: "COMMENT_SECOND".into(),
             },
@@ -4148,11 +4375,7 @@ async fn retained_thread_comment_import_uses_native_membership_and_readonly_mark
 
 #[tokio::test]
 async fn immutable_file_analysis_uses_merge_base_and_fork_head_sources() {
-    use forge_diff::{
-        cache::CacheLimits,
-        engine::DiffEngine,
-        syntax::{SyntaxEngine},
-    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
     let remote = remote();
@@ -4353,7 +4576,9 @@ async fn explicit_local_comment_capture_saves_and_reopens_with_its_client_identi
     let restored = replacement
         .comment(
             &reopened.document,
-            vec![], vec![], ReviewCommentCommand::Snapshot {
+            vec![],
+            vec![],
+            ReviewCommentCommand::Snapshot {
                 comment: saved.comment,
             },
         )
@@ -4381,7 +4606,9 @@ async fn unknown_batched_submission_blocks_repost_and_explicit_rejection_settles
     let draft = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::DraftInline {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftInline {
                 anchor: CommentAnchor {
                     revision: "b".repeat(40),
                     path: "src/lib.rs".into(),
@@ -4457,7 +4684,9 @@ async fn mismatched_batched_recovery_capture_is_rejected() {
     let draft = service
         .comment(
             &opened.document,
-            vec![], vec![], ReviewCommentCommand::DraftInline {
+            vec![],
+            vec![],
+            ReviewCommentCommand::DraftInline {
                 anchor: CommentAnchor {
                     revision: "b".repeat(40),
                     path: "src/lib.rs".into(),
@@ -4577,11 +4806,7 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
         input::DocumentInput,
         width::WidthProfile,
     };
-    use forge_diff::{
-        cache::CacheLimits,
-        engine::DiffEngine,
-        syntax::{SyntaxEngine},
-    };
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
 
@@ -5136,7 +5361,14 @@ async fn reviewer_self_selection_rejects_all_writes_before_admission() {
     assert!(remote.reviewer_writes.lock().unwrap().is_empty());
     assert!(!service.snapshot(&document).unwrap().uncertain);
     change(&service, &document, "reviewers", "@bob").await;
-    assert!(!service.save(&document, vec![], vec![]).await.unwrap().snapshot.uncertain);
+    assert!(
+        !service
+            .save(&document, vec![], vec![])
+            .await
+            .unwrap()
+            .snapshot
+            .uncertain
+    );
     service.close();
 }
 
@@ -5146,7 +5378,14 @@ async fn reviewer_partial_outcome_recovers_observed_baseline_and_allows_another_
     let (service, document) = reviewer_document(&remote).await;
     change(&service, &document, "reviewers", "@bob").await;
     remote.uncertain.store(true, Ordering::Release);
-    assert!(service.save(&document, vec![], vec![]).await.unwrap().snapshot.uncertain);
+    assert!(
+        service
+            .save(&document, vec![], vec![])
+            .await
+            .unwrap()
+            .snapshot
+            .uncertain
+    );
     change(&service, &document, "reviewers", "@carol").await;
     remote
         .section_page
@@ -5168,7 +5407,14 @@ async fn reviewer_partial_outcome_recovers_observed_baseline_and_allows_another_
     assert_eq!(reviewer.text, "@carol");
     assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
     remote.uncertain.store(false, Ordering::Release);
-    assert!(!service.save(&document, vec![], vec![]).await.unwrap().snapshot.uncertain);
+    assert!(
+        !service
+            .save(&document, vec![], vec![])
+            .await
+            .unwrap()
+            .snapshot
+            .uncertain
+    );
     assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 2);
     service.close();
 }
@@ -5179,13 +5425,25 @@ async fn uncertain_reviewer_save_restores_and_reconciles_without_reposting() {
     let (service, document) = reviewer_document(&remote).await;
     change(&service, &document, "reviewers", "@BOB").await;
     remote.uncertain.store(true, Ordering::Release);
-    assert!(service.save(&document, vec![], vec![]).await.unwrap().snapshot.uncertain);
+    assert!(
+        service
+            .save(&document, vec![], vec![])
+            .await
+            .unwrap()
+            .snapshot
+            .uncertain
+    );
     change(&service, &document, "reviewers", "@carol").await;
     service.close_document(&document).unwrap();
     let replacement = ReviewService::new(github(&remote));
     let restored = replacement.open_pr(remote.clone(), target()).await.unwrap();
     assert!(restored.uncertain);
-    assert!(replacement.save(&restored.document, vec![], vec![]).await.is_err());
+    assert!(
+        replacement
+            .save(&restored.document, vec![], vec![])
+            .await
+            .is_err()
+    );
     remote
         .section_page
         .lock()

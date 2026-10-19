@@ -4,7 +4,7 @@ use crate::backend::{
     BackendTimingRecord, PromptMode,
 };
 use crate::session::{
-    PermissionMode, HarnessSession, ProviderForkPoint, ProviderForkState, SessionStore,
+    HarnessSession, PermissionMode, ProviderForkPoint, ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
 use crate::timeline::{SessionEventKind, SessionEventRecord};
@@ -51,7 +51,8 @@ pub fn prepare_provider_fork(
         source.backend == configured_backend,
         "source session uses a different configured backend"
     );
-    source.access = crate::backend::BackendKind::parse(&source.backend)?.resolve_access(source.access);
+    source.access =
+        crate::backend::BackendKind::parse(&source.backend)?.resolve_access(source.access);
 
     let target_session_id = Uuid::new_v4().to_string();
     let fork_point = ProviderForkPoint {

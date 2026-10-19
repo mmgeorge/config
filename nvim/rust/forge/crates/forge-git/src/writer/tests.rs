@@ -1337,12 +1337,10 @@ async fn consumer_settlement_failure_preserves_confirmed_git_completion() {
         .await
         .unwrap();
     intent
-        .set_settlement_handler(
-            Arc::new(|outcome| {
-                assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-                anyhow::bail!("private metadata unavailable")
-            }),
-        )
+        .set_settlement_handler(Arc::new(|outcome| {
+            assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
+            anyhow::bail!("private metadata unavailable")
+        }))
         .unwrap();
     let outcome = service.submit(intent).unwrap().finish().await.unwrap();
     assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);

@@ -7,7 +7,10 @@ use anyhow::{Context, Result, ensure};
 use forge_diff::engine::DiffEngine;
 use forge_diff::syntax::SyntaxEngine;
 use forge_git::store::RepositoryStore;
-use forge_harness::{backend::TextGeneration, service::{HarnessService, TextGenerationConfig}};
+use forge_harness::{
+    backend::TextGeneration,
+    service::{HarnessService, TextGenerationConfig},
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore};
@@ -120,20 +123,39 @@ impl GenerationService {
             !(preview || context_only) || request.generation.is_none(),
             "prompt preview does not accept provider configuration"
         );
-        ensure!((context_only || pull_request) == (request.comparison == Comparison::PullRequest),
-            "pull request comparison requires PR context or generation");
-        ensure!(pull_request == request.input.is_some(), "only PR generation accepts prepared input");
+        ensure!(
+            (context_only || pull_request) == (request.comparison == Comparison::PullRequest),
+            "pull request comparison requires PR context or generation"
+        );
+        ensure!(
+            pull_request == request.input.is_some(),
+            "only PR generation accepts prepared input"
+        );
         if context_only {
-            ensure!(request.base.is_some() && request.head.is_some(), "pull request context requires base and head");
-            ensure!(request.max_bytes.is_some_and(|limit| limit > 0 && limit <= super::excerpt::MAX_INPUT_BYTES),
-                "invalid pull request context byte limit");
+            ensure!(
+                request.base.is_some() && request.head.is_some(),
+                "pull request context requires base and head"
+            );
+            ensure!(
+                request
+                    .max_bytes
+                    .is_some_and(|limit| limit > 0 && limit <= super::excerpt::MAX_INPUT_BYTES),
+                "invalid pull request context byte limit"
+            );
         } else if pull_request {
-            ensure!(request.head.is_some(), "PR generation requires the captured head");
-            ensure!(request.base.is_none() && request.max_bytes.is_none(),
-                "PR generation accepts prepared evidence, not context options");
+            ensure!(
+                request.head.is_some(),
+                "PR generation requires the captured head"
+            );
+            ensure!(
+                request.base.is_none() && request.max_bytes.is_none(),
+                "PR generation accepts prepared evidence, not context options"
+            );
         } else {
-            ensure!(request.base.is_none() && request.head.is_none() && request.max_bytes.is_none(),
-                "generation does not accept pull request context options");
+            ensure!(
+                request.base.is_none() && request.head.is_none() && request.max_bytes.is_none(),
+                "generation does not accept pull request context options"
+            );
         }
         let _permit = Arc::new(GenerationPermit {
             permit: Some(
@@ -144,22 +166,50 @@ impl GenerationService {
             completed: Arc::clone(&self.completed),
         });
         if pull_request {
-            let input = request.input.context("PR generation requires prepared input")?;
-            ensure!(!input.trim().is_empty(), "PR generation input cannot be empty");
-            let context = forge_harness::background::BackgroundContext::read(&self.repository, &request.workspace).await?;
-            ensure!(context.head == request.head, "repository HEAD changed before PR generation; run the command again");
-            let generated = harness.background.generate(forge_harness::background::BackgroundRequest {
-                purpose: TextGeneration::PullRequestDescription,
-                config: request.generation.context("Missing Background provider configuration")?,
-                context, input, delivery,
-            }).await?;
-            return Ok(GenerationResponse { session_id: Some(generated.session_id), state: "ready".into(),
-                message: Some(generated.text), source_requests: 0, diff_pairs: 0, prompt: None });
+            let input = request
+                .input
+                .context("PR generation requires prepared input")?;
+            ensure!(
+                !input.trim().is_empty(),
+                "PR generation input cannot be empty"
+            );
+            let context = forge_harness::background::BackgroundContext::read(
+                &self.repository,
+                &request.workspace,
+            )
+            .await?;
+            ensure!(
+                context.head == request.head,
+                "repository HEAD changed before PR generation; run the command again"
+            );
+            let generated = harness
+                .background
+                .generate(forge_harness::background::BackgroundRequest {
+                    purpose: TextGeneration::PullRequestDescription,
+                    config: request
+                        .generation
+                        .context("Missing Background provider configuration")?,
+                    context,
+                    input,
+                    delivery,
+                })
+                .await?;
+            return Ok(GenerationResponse {
+                session_id: Some(generated.session_id),
+                state: "ready".into(),
+                message: Some(generated.text),
+                source_requests: 0,
+                diff_pairs: 0,
+                prompt: None,
+            });
         }
         let context =
             match context::collect(&self.repository, &self.diff, &self.syntax, &request).await {
                 Ok(context) => context,
-                Err(failure) if context_only && failure.is::<forge_git::revision::comparison::MergeConflict>() => {
+                Err(failure)
+                    if context_only
+                        && failure.is::<forge_git::revision::comparison::MergeConflict>() =>
+                {
                     return Ok(GenerationResponse {
                         session_id: None,
                         state: "conflicts".into(),
@@ -199,8 +249,16 @@ impl GenerationService {
         }
         let prompt = context.prompt.as_deref().unwrap_or_default();
         if preview || context_only {
-            let system = if context_only { "" } else { forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE };
-            let user = if context_only { prompt.to_owned() } else { TextGeneration::CommitMessage.background_input(prompt) };
+            let system = if context_only {
+                ""
+            } else {
+                forge_harness::backend::BACKGROUND_SYSTEM_MESSAGE
+            };
+            let user = if context_only {
+                prompt.to_owned()
+            } else {
+                TextGeneration::CommitMessage.background_input(prompt)
+            };
             response.prompt = Some(PromptPreview {
                 system,
                 input_bytes: system.len() + user.len(),
@@ -209,12 +267,20 @@ impl GenerationService {
             });
             return Ok(response);
         }
-        let generated = harness.background.generate(forge_harness::background::BackgroundRequest {
-            purpose: TextGeneration::CommitMessage,
-            config: request.generation.context("Missing Background provider configuration")?,
-            context: context.background.context("Missing Background Git context")?,
-            input: prompt.to_owned(), delivery,
-        }).await?;
+        let generated = harness
+            .background
+            .generate(forge_harness::background::BackgroundRequest {
+                purpose: TextGeneration::CommitMessage,
+                config: request
+                    .generation
+                    .context("Missing Background provider configuration")?,
+                context: context
+                    .background
+                    .context("Missing Background Git context")?,
+                input: prompt.to_owned(),
+                delivery,
+            })
+            .await?;
         response.session_id = Some(generated.session_id);
         let message = generated.text;
         response.message = Some(message);

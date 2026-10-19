@@ -1,3 +1,4 @@
+use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::approval::PermissionCoordinator;
 #[cfg(test)]
@@ -8,9 +9,9 @@ use crate::backend::{
     ToolActivityKind,
 };
 use crate::control_tools::{
-    ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext, apply_invocation,
+    ControlToolExecutor, ControlToolInvocation, ControlToolRegistry, ControlTurnContext,
+    apply_invocation,
 };
-use super::request_execution::{ExecutedRequest, RequestExecutor};
 use crate::session::{ContextUsage, PermissionMode};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
@@ -34,39 +35,65 @@ struct McpContext {
 
 impl McpContext {
     fn normalize(&mut self, message: &mut Value) {
-        let method = message.get("method").and_then(Value::as_str).unwrap_or_default().to_owned();
-        let Some(params) = message.get_mut("params") else { return; };
+        let method = message
+            .get("method")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let Some(params) = message.get_mut("params") else {
+            return;
+        };
         if params.pointer("/item/type").and_then(Value::as_str) == Some("mcpToolCall") {
             if let Some(server) = params.pointer_mut("/item/server")
-                && let Some(name) = server.as_str().and_then(|name| self.binding.get(name)) {
+                && let Some(name) = server.as_str().and_then(|name| self.binding.get(name))
+            {
                 *server = json!(name);
             }
             if let Some(id) = params.pointer("/item/id").and_then(Value::as_str) {
                 if method == "item/started" {
-                    self.call.insert(id.to_owned(), json!({
-                        "thread":params["threadId"], "turn":params["turnId"],
-                        "server":params["item"]["server"], "tool":params["item"]["tool"]
-                    }));
+                    self.call.insert(
+                        id.to_owned(),
+                        json!({
+                            "thread":params["threadId"], "turn":params["turnId"],
+                            "server":params["item"]["server"], "tool":params["item"]["tool"]
+                        }),
+                    );
                 } else if method == "item/completed" {
                     self.call.remove(id);
                 }
             }
         }
-        if method != "mcpServer/elicitation/request" { return; }
-        if let Some(server) = params.get_mut("serverName")
-            && let Some(name) = server.as_str().and_then(|name| self.binding.get(name)) {
-            *server = json!(name);
-        }
-        if let Some(meta) = params.get("_meta").cloned() { params["meta"] = meta; }
-        if params.pointer("/meta/codex_approval_kind").and_then(Value::as_str) != Some("mcp_tool_call") {
+        if method != "mcpServer/elicitation/request" {
             return;
         }
-        let matching: Vec<_> = self.call.values().filter(|call| {
-            call["thread"] == params["threadId"] && call["turn"] == params["turnId"]
-                && call["server"] == params["serverName"]
-        }).collect();
-        if matching.len() == 1 && params.pointer("/meta/toolName").is_none()
-            && params.pointer("/meta/tool_name").is_none() {
+        if let Some(server) = params.get_mut("serverName")
+            && let Some(name) = server.as_str().and_then(|name| self.binding.get(name))
+        {
+            *server = json!(name);
+        }
+        if let Some(meta) = params.get("_meta").cloned() {
+            params["meta"] = meta;
+        }
+        if params
+            .pointer("/meta/codex_approval_kind")
+            .and_then(Value::as_str)
+            != Some("mcp_tool_call")
+        {
+            return;
+        }
+        let matching: Vec<_> = self
+            .call
+            .values()
+            .filter(|call| {
+                call["thread"] == params["threadId"]
+                    && call["turn"] == params["turnId"]
+                    && call["server"] == params["serverName"]
+            })
+            .collect();
+        if matching.len() == 1
+            && params.pointer("/meta/toolName").is_none()
+            && params.pointer("/meta/tool_name").is_none()
+        {
             params["meta"]["toolName"] = matching[0]["tool"].clone();
         }
     }
@@ -217,7 +244,10 @@ pub(super) enum ReceivedMessage {
 impl ReceivedMessage {
     /// Returns provider routing metadata regardless of execution stage.
     pub(super) fn message(&self) -> &Value {
-        match self { Self::Provider(message) => message, Self::Request(request) => &request.message }
+        match self {
+            Self::Provider(message) => message,
+            Self::Request(request) => &request.message,
+        }
     }
 }
 
@@ -264,7 +294,14 @@ impl CodexJsonRpc {
             workspace: workspace.to_owned(),
             execution_mode,
             planning_feedback: false,
-            request_executor: Arc::new(tokio::sync::Mutex::new(RequestExecutor::new(workspace.to_owned(), execution_mode, permission_coordinator.clone(), event_sink.clone(), trace.clone(), session_id.clone()))),
+            request_executor: Arc::new(tokio::sync::Mutex::new(RequestExecutor::new(
+                workspace.to_owned(),
+                execution_mode,
+                permission_coordinator.clone(),
+                event_sink.clone(),
+                trace.clone(),
+                session_id.clone(),
+            ))),
             request_tasks: tokio::task::JoinSet::new(),
             control_executor: None,
             pending_requests: HashMap::new(),
@@ -277,13 +314,16 @@ impl CodexJsonRpc {
             requests_cancelled: false,
             trace,
             session_id,
-            execution_owner:None,
+            execution_owner: None,
         })
     }
 
     /// Bind provider permission callbacks before starting or resuming a conversation.
     pub async fn set_execution_owner(&mut self, owner: crate::backend::ExecutionOwner) {
-        self.request_executor.lock().await.set_owner(Some(owner.clone()));
+        self.request_executor
+            .lock()
+            .await
+            .set_owner(Some(owner.clone()));
         self.execution_owner = Some(owner);
     }
 
@@ -301,7 +341,11 @@ impl CodexJsonRpc {
         self.control_executor = None;
         self.accepted_control_invocation_key_set.clear();
         self.mcp.call.clear();
-        self.request_executor.lock().await.reset(workspace.to_owned(), execution_mode, self.event_sink.clone());
+        self.request_executor.lock().await.reset(
+            workspace.to_owned(),
+            execution_mode,
+            self.event_sink.clone(),
+        );
     }
 
     /// Isolate preparation traffic until the current provider turn is admitted.
@@ -376,15 +420,31 @@ impl CodexJsonRpc {
     }
 
     /// Applies completed request effects without stopping the provider frame reader.
-    pub async fn publish_received(&mut self, received: ReceivedMessage, output: &mut BackendOutput) -> Result<Value> {
+    pub async fn publish_received(
+        &mut self,
+        received: ReceivedMessage,
+        output: &mut BackendOutput,
+    ) -> Result<Value> {
         match received {
             ReceivedMessage::Provider(message) => self.publish_message(message, output).await,
             ReceivedMessage::Request(result) => {
                 let message = result.message.clone();
                 self.complete_provider_request(*result, output).await?;
-                if self.activity_publication && !rejects_question_resolution(self.planning_feedback,
-                    message["method"].as_str().unwrap_or_default(), &message) {
-                    normalize_event_in_workspace(&message, output, self.event_sink.as_ref(), &self.workspace, false).await;
+                if self.activity_publication
+                    && !rejects_question_resolution(
+                        self.planning_feedback,
+                        message["method"].as_str().unwrap_or_default(),
+                        &message,
+                    )
+                {
+                    normalize_event_in_workspace(
+                        &message,
+                        output,
+                        self.event_sink.as_ref(),
+                        &self.workspace,
+                        false,
+                    )
+                    .await;
                 }
                 Ok(message)
             }
@@ -400,7 +460,9 @@ impl CodexJsonRpc {
     /// Revokes local tool authority without delaying the native interrupt message.
     pub(super) fn cancel_request_work(&mut self) {
         self.requests_cancelled = true;
-        if let Some(executor) = &self.control_executor { executor.cancel(); }
+        if let Some(executor) = &self.control_executor {
+            executor.cancel();
+        }
         self.control_completion = None;
         self.request_tasks.abort_all();
     }
@@ -414,15 +476,20 @@ impl CodexJsonRpc {
                     self.complete_provider_request(result, output).await?;
                 }
                 Err(error) if error.is_cancelled() => {}
-                Err(error) => return Err(error).context("provider request worker failed during cleanup"),
+                Err(error) => {
+                    return Err(error).context("provider request worker failed during cleanup");
+                }
             }
         }
         let pending = std::mem::take(&mut self.pending_requests);
         for (_, message) in pending {
             self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
-                "error":{"code":-32001,"message":"Provider execution was cancelled"}})).await?;
+                "error":{"code":-32001,"message":"Provider execution was cancelled"}}))
+                .await?;
         }
-        if let Some(executor) = &self.control_executor { executor.close().await; }
+        if let Some(executor) = &self.control_executor {
+            executor.close().await;
+        }
         Ok(())
     }
 
@@ -445,30 +512,43 @@ impl CodexJsonRpc {
         if message.get("id").is_some() && message.get("method").is_some() {
             if self.requests_cancelled {
                 self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
-                    "error":{"code":-32001,"message":"Provider execution was cancelled"}})).await?;
+                    "error":{"code":-32001,"message":"Provider execution was cancelled"}}))
+                    .await?;
                 return Ok(message);
             }
             let executor = self.request_executor.clone();
             let request = message.clone();
             let approval = method != "item/tool/call";
-            let ordered = if approval { None } else {
+            let ordered = if approval {
+                None
+            } else {
                 let (completed, next) = tokio::sync::oneshot::channel();
                 let previous = self.control_completion.replace(next);
                 Some((previous, completed))
             };
-            let mut independent = RequestExecutor::new(self.workspace.clone(), self.execution_mode,
-                self.permission_coordinator.clone(), self.event_sink.clone(), self.trace.clone(), self.session_id.clone());
+            let mut independent = RequestExecutor::new(
+                self.workspace.clone(),
+                self.execution_mode,
+                self.permission_coordinator.clone(),
+                self.event_sink.clone(),
+                self.trace.clone(),
+                self.session_id.clone(),
+            );
             independent.set_owner(self.execution_owner.clone());
             let received_at = Instant::now();
             let task = self.request_tasks.spawn(async move {
                 if let Some((previous, completed)) = ordered {
-                    if let Some(previous) = previous && previous.await.is_err() {
+                    if let Some(previous) = previous
+                        && previous.await.is_err()
+                    {
                         return ExecutedRequest::cancelled(request);
                     }
                     let mut result = executor.lock().await.execute(request, received_at).await;
                     result.control_completion = Some(completed);
                     result
-                } else { independent.execute(request, received_at).await }
+                } else {
+                    independent.execute(request, received_at).await
+                }
             });
             self.pending_requests.insert(task.id(), message.clone());
             return Ok(message);
@@ -526,9 +606,21 @@ impl CodexJsonRpc {
             .context("write shared Codex app-server JSON-RPC request")
     }
 
-    async fn complete_provider_request(&mut self, completed: ExecutedRequest, output: &mut BackendOutput) -> Result<bool> {
-        let ExecutedRequest { message, response, trace_context, invocation, source_digests,
-            has_runtime, execution_finished, control_completion } = completed;
+    async fn complete_provider_request(
+        &mut self,
+        completed: ExecutedRequest,
+        output: &mut BackendOutput,
+    ) -> Result<bool> {
+        let ExecutedRequest {
+            message,
+            response,
+            trace_context,
+            invocation,
+            source_digests,
+            has_runtime,
+            execution_finished,
+            control_completion,
+        } = completed;
         let serialization_started_at = Instant::now();
         let encoded_response = match serde_json::to_string(&response) {
             Ok(encoded) => encoded,
@@ -611,30 +703,63 @@ impl CodexJsonRpc {
             }
         }
         write_result?;
-        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(&message)), Some("plan_phase_done")) && execution_finished {
+        if response_success
+            && matches!(
+                control_tool_name(
+                    message
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default(),
+                    message.get("params").unwrap_or(&message)
+                ),
+                Some("plan_phase_done")
+            )
+            && execution_finished
+        {
             let params = message.get("params").unwrap_or(&message);
-            if let (Some(thread), Some(turn)) = (params.get("threadId").and_then(Value::as_str), params.get("turnId").and_then(Value::as_str)) {
-                self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn})).await?;
+            if let (Some(thread), Some(turn)) = (
+                params.get("threadId").and_then(Value::as_str),
+                params.get("turnId").and_then(Value::as_str),
+            ) {
+                self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn}))
+                    .await?;
             }
         }
-        if self.activity_publication && should_apply_control_request_semantics(
-            &message, &mut self.accepted_control_invocation_key_set, response_success,
-        ) {
+        if self.activity_publication
+            && should_apply_control_request_semantics(
+                &message,
+                &mut self.accepted_control_invocation_key_set,
+                response_success,
+            )
+        {
             if has_runtime {
-                if let Some(invocation) = invocation { apply_invocation(&invocation, output)?; }
-            } else { apply_control_request_result(&message, output, response_success)?; }
-            if let (Some(digests), Some(request)) = (source_digests, output.design_patch.last_mut()) {
+                if let Some(invocation) = invocation {
+                    apply_invocation(&invocation, output)?;
+                }
+            } else {
+                apply_control_request_result(&message, output, response_success)?;
+            }
+            if let (Some(digests), Some(request)) = (source_digests, output.design_patch.last_mut())
+            {
                 request.source_digests = digests;
             }
         }
-        if let Some(completed) = control_completion { let _ = completed.send(()); }
+        if let Some(completed) = control_completion {
+            let _ = completed.send(());
+        }
         Ok(response_success)
     }
 
     #[cfg(test)]
     async fn respond_to_provider_request(&mut self, message: &Value) -> Result<bool> {
-        let result = self.request_executor.lock().await.execute(message.clone(), Instant::now()).await;
-        self.complete_provider_request(result, &mut BackendOutput::default()).await
+        let result = self
+            .request_executor
+            .lock()
+            .await
+            .execute(message.clone(), Instant::now())
+            .await;
+        self.complete_provider_request(result, &mut BackendOutput::default())
+            .await
     }
 
     #[cfg(test)]
@@ -648,41 +773,41 @@ impl CodexJsonRpc {
 }
 
 async fn receive_provider_message(
-    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>, trace: &TraceStore, session_id: &str,
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    trace: &TraceStore,
+    session_id: &str,
 ) -> Result<Value> {
-        let encoded = loop {
-            let frame = socket
-                .next()
-                .await
-                .context("shared Codex app-server closed before completing the request")??;
-            match frame {
-                Message::Text(text) => break text.to_string(),
-                Message::Binary(bytes) => {
-                    break String::from_utf8(bytes.to_vec())
-                        .context("decode shared Codex app-server binary frame")?;
-                }
-                Message::Ping(payload) => {
-                    socket.send(Message::Pong(payload)).await?;
-                }
-                Message::Pong(_) => {}
-                Message::Close(close) => {
-                    anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
-                }
-                Message::Frame(_) => {}
+    let encoded = loop {
+        let frame = socket
+            .next()
+            .await
+            .context("shared Codex app-server closed before completing the request")??;
+        match frame {
+            Message::Text(text) => break text.to_string(),
+            Message::Binary(bytes) => {
+                break String::from_utf8(bytes.to_vec())
+                    .context("decode shared Codex app-server binary frame")?;
             }
-        };
-        trace.record(
-            session_id,
-            "model.received_raw",
-            json!({ "bytes": encoded.len() }),
-        );
-        let message: Value = serde_json::from_str(&encoded)
-            .context("decode backend JSON-RPC message")?;
-        trace
-            .record_ref(session_id, "model.received", &message);
-        Ok(message)
+            Message::Ping(payload) => {
+                socket.send(Message::Pong(payload)).await?;
+            }
+            Message::Pong(_) => {}
+            Message::Close(close) => {
+                anyhow::bail!("shared Codex app-server closed the session channel: {close:?}")
+            }
+            Message::Frame(_) => {}
+        }
+    };
+    trace.record(
+        session_id,
+        "model.received_raw",
+        json!({ "bytes": encoded.len() }),
+    );
+    let message: Value =
+        serde_json::from_str(&encoded).context("decode backend JSON-RPC message")?;
+    trace.record_ref(session_id, "model.received", &message);
+    Ok(message)
 }
-
 
 fn apply_control_request_result(
     message: &Value,
@@ -719,7 +844,11 @@ fn should_apply_control_request_semantics(
         .is_none_or(|key| accepted_control_invocation_key_set.insert(key))
 }
 
-pub(super) fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Value) -> bool {
+pub(super) fn rejects_question_resolution(
+    planning_feedback: bool,
+    method: &str,
+    value: &Value,
+) -> bool {
     let params = value.get("params").unwrap_or(value);
     planning_feedback
         && matches!(
@@ -807,7 +936,11 @@ async fn normalize_event_in_workspace(
         &params,
         &["/turnId", "/turn_id", "/turn/id"],
     ))
-    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress { owner: None, thread_id, turn_id });
+    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress {
+        owner: None,
+        thread_id,
+        turn_id,
+    });
     let text = first_text(&params);
     let method_lower = method.to_ascii_lowercase();
     let encoded = params.to_string().to_ascii_lowercase();
@@ -817,16 +950,31 @@ async fn normalize_event_in_workspace(
     if matches!(method_lower.as_str(), "item/started" | "item/completed")
         && params.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction")
     {
-        let Some(id) = params.pointer("/item/id").and_then(Value::as_str) else { return; };
-        let Some(thread_id) = pointer_string(&params, &["/threadId", "/thread_id"]) else { return; };
-        let event = BackendEvent::from_compaction(crate::backend::Compaction {
-            id: id.to_owned(), thread_id,
-            state: if method_lower == "item/started" { crate::backend::CompactionState::Running }
-                else { crate::backend::CompactionState::Completed },
-            manual: false, started_at_ms: None, completed_at_ms: None,
-            result: crate::backend::CompactionResult::default(),
-        }, address);
-        if let Some(event_sink) = event_sink { let _ = event_sink.send_wait(event.clone()).await; }
+        let Some(id) = params.pointer("/item/id").and_then(Value::as_str) else {
+            return;
+        };
+        let Some(thread_id) = pointer_string(&params, &["/threadId", "/thread_id"]) else {
+            return;
+        };
+        let event = BackendEvent::from_compaction(
+            crate::backend::Compaction {
+                id: id.to_owned(),
+                thread_id,
+                state: if method_lower == "item/started" {
+                    crate::backend::CompactionState::Running
+                } else {
+                    crate::backend::CompactionState::Completed
+                },
+                manual: false,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: crate::backend::CompactionResult::default(),
+            },
+            address,
+        );
+        if let Some(event_sink) = event_sink {
+            let _ = event_sink.send_wait(event.clone()).await;
+        }
         append_output_event(output, event);
         return;
     }
@@ -889,7 +1037,7 @@ async fn normalize_event_in_workspace(
     if !agent_lifecycle_list.is_empty() {
         for lifecycle in agent_lifecycle_list {
             let event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "agent_lifecycle".into(),
@@ -915,7 +1063,7 @@ async fn normalize_event_in_workspace(
             && let Some(update) = usage_update(&params)
         {
             let event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: address.clone(),
                 turn_boundary: None,
                 kind: "usage".into(),
@@ -933,7 +1081,7 @@ async fn normalize_event_in_workspace(
         if let Some(context_usage) = context_usage(&params) {
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: address.clone(),
                 turn_boundary: None,
                 kind: "context_usage".into(),
@@ -1384,19 +1532,29 @@ fn is_tool_lifecycle_event(method_lower: &str, params: &Value) -> bool {
     let item = envelope.get("item").unwrap_or(envelope);
     let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
     match item_type.to_ascii_lowercase().as_str() {
-        "usermessage" | "agentmessage" | "reasoning" | "plan" | "contextcompaction"
-        | "enteredreviewmode" | "exitedreviewmode" | "collabagenttoolcall"
-        | "subagentactivity" | "error" => false,
+        "usermessage"
+        | "agentmessage"
+        | "reasoning"
+        | "plan"
+        | "contextcompaction"
+        | "enteredreviewmode"
+        | "exitedreviewmode"
+        | "collabagenttoolcall"
+        | "subagentactivity"
+        | "error" => false,
         "commandexecution" | "command_execution" | "filechange" | "file_change"
         | "dynamictoolcall" | "mcptoolcall" => true,
-        _ if !item_type.is_empty()
-            && matches!(method_lower, "item/started" | "item/completed") => {
-            item.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+        _ if !item_type.is_empty() && matches!(method_lower, "item/started" | "item/completed") => {
+            item.get("id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| !id.is_empty())
         }
-        _ => method_lower.starts_with("item/")
-            && (method_lower.contains("tool")
-                || method_lower.contains("commandexecution")
-                || method_lower.contains("filechange")),
+        _ => {
+            method_lower.starts_with("item/")
+                && (method_lower.contains("tool")
+                    || method_lower.contains("commandexecution")
+                    || method_lower.contains("filechange"))
+        }
     }
 }
 
@@ -1415,7 +1573,13 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
     ["tool", "name", "toolName", "tool_name"]
         .into_iter()
         .find_map(|key| item.get(key).and_then(Value::as_str))
-        .filter(|name| *name == "harness_plan_edit" || ControlToolRegistry.definition_list().iter().any(|definition|definition.name == *name))
+        .filter(|name| {
+            *name == "harness_plan_edit"
+                || ControlToolRegistry
+                    .definition_list()
+                    .iter()
+                    .any(|definition| definition.name == *name)
+        })
 }
 
 fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
@@ -1444,7 +1608,10 @@ fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
     }
 }
 
-pub(super) fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolInvocation>> {
+pub(super) fn control_invocation(
+    method: &str,
+    value: &Value,
+) -> Result<Option<ControlToolInvocation>> {
     let Some(control_name) = control_tool_name(method, value) else {
         return Ok(None);
     };
@@ -1459,11 +1626,20 @@ pub(super) fn control_invocation(method: &str, value: &Value) -> Result<Option<C
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
     if let Some(compaction) = event.compaction().ok().flatten() {
         if let Some(previous) = output.event.iter_mut().find(|previous| {
-            previous.compaction().ok().flatten().is_some_and(|existing|
-                existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+            previous
+                .compaction()
+                .ok()
+                .flatten()
+                .is_some_and(|existing| {
+                    existing.id == compaction.id && existing.thread_id == compaction.thread_id
+                })
         }) {
-            if previous.compaction().ok().flatten().is_some_and(|existing|
-                existing.state == crate::backend::CompactionState::Running) {
+            if previous
+                .compaction()
+                .ok()
+                .flatten()
+                .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
+            {
                 *previous = event;
             }
             return;
@@ -1682,23 +1858,32 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         .unwrap_or_else(|| match kind {
             ToolActivityKind::Command => "command".into(),
             ToolActivityKind::FileChange => "file changes".into(),
-            ToolActivityKind::ToolCall if generic_item => item.get("type")
+            ToolActivityKind::ToolCall if generic_item => item
+                .get("type")
                 .and_then(tool_title)
                 .unwrap_or_else(|| "tool".into()),
             ToolActivityKind::ToolCall => "tool".into(),
         });
     let output = if generic_item {
-        method_lower.ends_with("/completed")
+        method_lower
+            .ends_with("/completed")
             .then(|| serde_json::to_string_pretty(item).ok())
             .flatten()
             .map(strip_ansi_escapes::strip_str)
     } else {
         mcp_tool_output(item)
             .or_else(|| {
-                item.get("contentItems").and_then(Value::as_array).map(|contents| {
-                    contents.iter().filter_map(first_text)
-                        .map(strip_ansi_escapes::strip_str).collect::<Vec<_>>().join("\n")
-                }).filter(|text| !text.is_empty())
+                item.get("contentItems")
+                    .and_then(Value::as_array)
+                    .map(|contents| {
+                        contents
+                            .iter()
+                            .filter_map(first_text)
+                            .map(strip_ansi_escapes::strip_str)
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    })
+                    .filter(|text| !text.is_empty())
             })
             .or_else(|| {
                 item.get("aggregatedOutput")
@@ -1717,27 +1902,32 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
                     })
             })
     };
-    let status = item.get("success").and_then(Value::as_bool)
-        .filter(|success| !success).map(|_| "failed".to_owned()).or_else(|| item
-        .get("status")
-        .or_else(|| envelope.get("status"))
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    let status = item
+        .get("success")
+        .and_then(Value::as_bool)
+        .filter(|success| !success)
+        .map(|_| "failed".to_owned())
         .or_else(|| {
-            method_lower
-                .ends_with("/completed")
-                .then(|| "completed".to_owned())
-        })
-        .or_else(|| {
-            method_lower
-                .ends_with("/started")
-                .then(|| "inProgress".to_owned())
-        })
-        .or_else(|| {
-            method_lower
-                .eq("item/mcptoolcall/progress")
-                .then(|| "inProgress".to_owned())
-        }));
+            item.get("status")
+                .or_else(|| envelope.get("status"))
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    method_lower
+                        .ends_with("/completed")
+                        .then(|| "completed".to_owned())
+                })
+                .or_else(|| {
+                    method_lower
+                        .ends_with("/started")
+                        .then(|| "inProgress".to_owned())
+                })
+                .or_else(|| {
+                    method_lower
+                        .eq("item/mcptoolcall/progress")
+                        .then(|| "inProgress".to_owned())
+                })
+        });
     Some(ToolActivity {
         id,
         kind,
@@ -1839,12 +2029,19 @@ fn tool_title(value: &Value) -> Option<String> {
     match value {
         Value::String(title) => compact_tool_title(title),
         Value::Array(part_list) => {
-            let arguments = part_list.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
-            let interpreter = crate::permissions::shell::CommandShell::from_executable(arguments.first()?);
+            let arguments = part_list
+                .iter()
+                .map(Value::as_str)
+                .collect::<Option<Vec<_>>>()?;
+            let interpreter =
+                crate::permissions::shell::CommandShell::from_executable(arguments.first()?);
             if interpreter != crate::permissions::shell::CommandShell::Unknown {
-                if let Some(marker) = arguments.iter().position(|argument| matches!(argument.to_ascii_lowercase().as_str(),
-                    "-command" | "--commands" | "-c" | "-lc" | "-ic" | "-lic"))
-                    && let Some(script) = arguments.get(marker + 1)
+                if let Some(marker) = arguments.iter().position(|argument| {
+                    matches!(
+                        argument.to_ascii_lowercase().as_str(),
+                        "-command" | "--commands" | "-c" | "-lc" | "-ic" | "-lic"
+                    )
+                }) && let Some(script) = arguments.get(marker + 1)
                     && marker + 2 == arguments.len()
                 {
                     let display = crate::permissions::command::display_command(script, interpreter);
@@ -1893,47 +2090,82 @@ fn generic_tool_title(item: &Value) -> Option<String> {
 fn builtin_tool_title(item: &Value) -> Option<String> {
     match item.get("type")?.as_str()? {
         "webSearch" => web_tool_title(item),
-        "sleep" => Some(format!("Wait · {}s",
-            Duration::from_millis(item.get("durationMs")?.as_u64()?).as_secs_f64())),
+        "sleep" => Some(format!(
+            "Wait · {}s",
+            Duration::from_millis(item.get("durationMs")?.as_u64()?).as_secs_f64()
+        )),
         _ => None,
     }
 }
 
 fn web_tool_title(item: &Value) -> Option<String> {
     let Some(action) = item.get("action").filter(|action| !action.is_null()) else {
-        return Some(item.get("query").and_then(Value::as_str)
-            .filter(|query| !query.trim().is_empty())
-            .and_then(|query| compact_tool_title(&format!("Web Search · {query}")))
-            .unwrap_or_else(|| "Web Search".into()));
+        return Some(
+            item.get("query")
+                .and_then(Value::as_str)
+                .filter(|query| !query.trim().is_empty())
+                .and_then(|query| compact_tool_title(&format!("Web Search · {query}")))
+                .unwrap_or_else(|| "Web Search".into()),
+        );
     };
-    let url = action.get("url").and_then(Value::as_str)
+    let url = action
+        .get("url")
+        .and_then(Value::as_str)
         .filter(|url| !url.trim().is_empty())
-        .map(|url| url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url));
+        .map(|url| {
+            url.strip_prefix("https://")
+                .or_else(|| url.strip_prefix("http://"))
+                .unwrap_or(url)
+        });
     match action.get("type")?.as_str()? {
         "search" => {
-            let mut queries: Vec<&str> = action.get("queries").and_then(Value::as_array)
-                .into_iter().flatten().filter_map(Value::as_str)
-                .filter(|query| !query.trim().is_empty()).collect();
+            let mut queries: Vec<&str> = action
+                .get("queries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .filter(|query| !query.trim().is_empty())
+                .collect();
             if queries.is_empty() {
-                queries.extend(action.get("query").and_then(Value::as_str)
-                    .or_else(|| item.get("query").and_then(Value::as_str))
-                    .filter(|query| !query.trim().is_empty()));
+                queries.extend(
+                    action
+                        .get("query")
+                        .and_then(Value::as_str)
+                        .or_else(|| item.get("query").and_then(Value::as_str))
+                        .filter(|query| !query.trim().is_empty()),
+                );
             }
             let first = queries.first()?;
             let remaining = queries.len() - 1;
-            let suffix = if remaining == 0 { String::new() }
-                else { format!(" · +{remaining} {}", if remaining == 1 { "query" } else { "queries" }) };
+            let suffix = if remaining == 0 {
+                String::new()
+            } else {
+                format!(
+                    " · +{remaining} {}",
+                    if remaining == 1 { "query" } else { "queries" }
+                )
+            };
             compact_tool_title(&format!("Web Search · {first}{suffix}"))
         }
         "openPage" => {
-            let url = url.or_else(|| item.get("query").and_then(Value::as_str)
-                .filter(|url| !url.trim().is_empty())
-                .map(|url| url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url)))?;
+            let url = url.or_else(|| {
+                item.get("query")
+                    .and_then(Value::as_str)
+                    .filter(|url| !url.trim().is_empty())
+                    .map(|url| {
+                        url.strip_prefix("https://")
+                            .or_else(|| url.strip_prefix("http://"))
+                            .unwrap_or(url)
+                    })
+            })?;
             compact_tool_title(&format!("Open web · {url}"))
         }
         "findInPage" => {
             let pattern = action.get("pattern")?.as_str()?;
-            if pattern.trim().is_empty() { return None; }
+            if pattern.trim().is_empty() {
+                return None;
+            }
             let pattern = serde_json::to_string(pattern).ok()?;
             let suffix = url.map_or(String::new(), |url| format!(" · {url}"));
             compact_tool_title(&format!("Find in page · {pattern}{suffix}"))
@@ -1970,7 +2202,10 @@ fn mcp_tool_output(item: &Value) -> Option<String> {
 fn format_mcp_text(text: &str) -> String {
     let text = strip_ansi_escapes::strip_str(text);
     serde_json::from_str::<Value>(&text)
-        .and_then(|mut value| { value.sort_all_objects(); serde_json::to_string_pretty(&value) })
+        .and_then(|mut value| {
+            value.sort_all_objects();
+            serde_json::to_string_pretty(&value)
+        })
         .unwrap_or(text)
 }
 
@@ -2041,24 +2276,37 @@ mod test {
         use super::*;
         let fixture = tempfile::tempdir()?;
         let workspace = fixture.path().to_string_lossy().into_owned();
-        std::fs::write(fixture.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
-            "id":"manual", "name":"Manual", "area":"Tests", "category":"test", "enabled":true,
-            "auto":false, "trigger":{"kind":"manual"}, "all":{"command":"print selected"}
-        }]}}).to_string())?;
+        std::fs::write(
+            fixture.path().join(".forge.json"),
+            json!({"checks":{"version":2,"definitions":[{
+                "id":"manual", "name":"Manual", "area":"Tests", "category":"test", "enabled":true,
+                "auto":false, "trigger":{"kind":"manual"}, "all":{"command":"print selected"}
+            }]}})
+            .to_string(),
+        )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             for id in 1..=3 {
-                let response: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                let response: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(response["id"], id);
                 assert_eq!(response["result"]["success"], true, "{response}");
             }
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
-            PermissionCoordinator::transient(&workspace)?, None,
-            Arc::new(TraceStore::open(fixture.path())?), "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?,
+            None,
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        )
+        .await?;
         let mut document = crate::plan::test_fixture("plan", "Initial");
         document.version = 4;
         document.design = Some(crate::plan::DeclarationDesign::default());
@@ -2069,10 +2317,22 @@ mod test {
         process.set_control_context(context).await;
         let mut output = BackendOutput::default();
         for (id, tool, arguments) in [
-            (1, "plan_checks_add", json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]})),
-            (2, "design_patch", json!({"plan_id":"plan","expected_version":5,
-                "patch":"*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Restart fixture\",\n*** End Patch"})),
-            (3, "plan_checks_add", json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]})),
+            (
+                1,
+                "plan_checks_add",
+                json!({"plan_id":"plan","expected_version":4,"check_ids":["manual"]}),
+            ),
+            (
+                2,
+                "design_patch",
+                json!({"plan_id":"plan","expected_version":5,
+                "patch":"*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Restart fixture\",\n*** End Patch"}),
+            ),
+            (
+                3,
+                "plan_checks_add",
+                json!({"plan_id":"plan","expected_version":6,"check_ids":["manual"]}),
+            ),
         ] {
             process.publish_message(json!({"id":id,"method":"item/tool/call","params":{
                 "threadId":"thread","turnId":"turn","callId":format!("call-{id}"),"tool":tool,"arguments":arguments
@@ -2084,14 +2344,21 @@ mod test {
             document = document.patch_design(fixture.path(), patch)?;
         }
         assert_eq!(document.version, 6);
-        assert_eq!(document.design.as_ref().unwrap().document.checks, ["manual"]);
-        assert_eq!(document.design.as_ref().unwrap().document.objective, "Restart fixture");
+        assert_eq!(
+            document.design.as_ref().unwrap().document.checks,
+            ["manual"]
+        );
+        assert_eq!(
+            document.design.as_ref().unwrap().document.objective,
+            "Restart fixture"
+        );
         tokio::time::timeout(Duration::from_secs(2), server).await??;
         Ok(())
     }
 
     #[tokio::test]
-    async fn shell_parse_errors_reach_provider_and_corrected_calls_reuse_connection() -> Result<()> {
+    async fn shell_parse_errors_reach_provider_and_corrected_calls_reuse_connection() -> Result<()>
+    {
         use super::*;
         let fixture = tempfile::tempdir()?;
         let workspace = fixture.path().to_string_lossy().into_owned();
@@ -2100,35 +2367,76 @@ mod test {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let failure: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let failure: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(failure["id"], 1);
-            assert!(failure["error"]["message"].as_str().unwrap().contains("shell_command_parse_error"));
+            assert!(
+                failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("shell_command_parse_error")
+            );
             assert!(failure.get("result").is_none());
-            let inner_failure: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            let inner_failure: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(inner_failure["id"], 2);
-            assert!(inner_failure["error"]["message"].as_str().unwrap().contains("shell_command_parse_error"));
-            let corrected: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert!(
+                inner_failure["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("shell_command_parse_error")
+            );
+            let corrected: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
             assert_eq!(corrected["id"], 3);
             assert_eq!(corrected["result"]["decision"], "accept");
         });
         let coordinator = PermissionCoordinator::transient(&workspace)?;
         let (sink, mut stream) = crate::backend::events::channel();
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Yolo,
-            coordinator.clone(), Some(sink), Arc::new(TraceStore::open(fixture.path())?), "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Yolo,
+            coordinator.clone(),
+            Some(sink),
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        )
+        .await?;
         for (id, command, accepted) in [
             (1, "pwsh -c 'unfinished".to_owned(), false),
-            (2, shlex::try_join(["pwsh", "-c", "probe 'unfinished"]).unwrap(), false),
-            (3, shlex::try_join(["pwsh", "-c", r#"probe "timeline|markdown|table|wrap""#]).unwrap(), true),
+            (
+                2,
+                shlex::try_join(["pwsh", "-c", "probe 'unfinished"]).unwrap(),
+                false,
+            ),
+            (
+                3,
+                shlex::try_join(["pwsh", "-c", r#"probe "timeline|markdown|table|wrap""#]).unwrap(),
+                true,
+            ),
         ] {
             let message = json!({"id":id, "method":"item/commandExecution/requestApproval",
                 "params":{"threadId":"thread","turnId":"turn","command":command,"shell":"powershell"}});
-            assert_eq!(process.respond_to_provider_request(&message).await?, accepted);
+            assert_eq!(
+                process.respond_to_provider_request(&message).await?,
+                accepted
+            );
             assert!(coordinator.pending_list()?.is_empty());
             let event = stream.try_recv();
             if id == 2 {
                 let event = event?;
                 assert_eq!(event.kind, "error");
-                assert!(event.text.as_deref().unwrap().contains("shell_command_parse_error"));
+                assert!(
+                    event
+                        .text
+                        .as_deref()
+                        .unwrap()
+                        .contains("shell_command_parse_error")
+                );
                 assert_eq!(event.address.unwrap().turn_id, "turn");
                 assert!(stream.try_recv().is_err());
             } else {
@@ -2143,15 +2451,19 @@ mod test {
     fn every_registered_dynamic_tool_reaches_control_dispatch() {
         for definition in crate::control_tools::ControlToolRegistry.definition_list() {
             let request = serde_json::json!({"tool":definition.name,"arguments":{}});
-            let invocation = super::control_invocation("item/tool/call",&request).unwrap().unwrap();
-            assert_eq!(invocation.name,definition.name);
+            let invocation = super::control_invocation("item/tool/call", &request)
+                .unwrap()
+                .unwrap();
+            assert_eq!(invocation.name, definition.name);
         }
     }
     #[test]
     fn mcp_approval_uses_current_metadata_and_canonical_tool_identity() {
         use super::*;
         let mut context = McpContext::default();
-        context.binding.insert("native_alias".into(), "shared-server".into());
+        context
+            .binding
+            .insert("native_alias".into(), "shared-server".into());
         let mut started = json!({"method":"item/started", "params":{
             "threadId":"thread", "turnId":"turn", "item":{
                 "type":"mcpToolCall", "id":"call", "server":"native_alias", "tool":"verify"
@@ -2165,25 +2477,47 @@ mod test {
         }});
         let mut normalized = request.clone();
         context.normalize(&mut normalized);
-        assert_eq!(normalized["params"]["meta"]["codex_approval_kind"], "mcp_tool_call");
-        assert_eq!(permission_from_provider("mcpServer/elicitation/request", &normalized, ".").unwrap().target_list,
-            vec![crate::permissions::matcher::PermissionTarget::Mcp { target:"shared-server/verify".into() }]);
+        assert_eq!(
+            normalized["params"]["meta"]["codex_approval_kind"],
+            "mcp_tool_call"
+        );
+        assert_eq!(
+            permission_from_provider("mcpServer/elicitation/request", &normalized, ".")
+                .unwrap()
+                .target_list,
+            vec![crate::permissions::matcher::PermissionTarget::Mcp {
+                target: "shared-server/verify".into()
+            }]
+        );
         let mut completed = started.clone();
         completed["method"] = json!("item/completed");
         context.normalize(&mut completed);
         let mut later = request;
         context.normalize(&mut later);
-        assert!(later.pointer("/params/meta/toolName").is_none(), "completed calls cannot authorize later tools");
+        assert!(
+            later.pointer("/params/meta/toolName").is_none(),
+            "completed calls cannot authorize later tools"
+        );
     }
 
     #[tokio::test]
     async fn compaction_lifecycle_is_neither_assistant_text_nor_a_tool() {
         let mut output = super::BackendOutput::default();
-        for method in ["item/started", "item/completed", "item/started", "item/completed"] {
-            super::normalize_event(&serde_json::json!({
-                "method":method, "params":{"threadId":"thread", "turnId":"turn",
-                    "item":{"type":"contextCompaction","id":"compact"}}
-            }), &mut output, None).await;
+        for method in [
+            "item/started",
+            "item/completed",
+            "item/started",
+            "item/completed",
+        ] {
+            super::normalize_event(
+                &serde_json::json!({
+                    "method":method, "params":{"threadId":"thread", "turnId":"turn",
+                        "item":{"type":"contextCompaction","id":"compact"}}
+                }),
+                &mut output,
+                None,
+            )
+            .await;
         }
         assert_eq!(output.event.len(), 1);
         let compaction = output.event[0].compaction().unwrap().unwrap();
@@ -2200,40 +2534,76 @@ mod test {
         let workspace = fixture.path().to_string_lossy().into_owned();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let request: Value = serde_json::from_str(
-                socket.next().await.unwrap().unwrap().to_text().unwrap(),
-            ).unwrap();
-            assert_eq!(request["method"], "thread/backgroundTerminals/list");
-            socket.send(Message::Text(json!({
+        let server =
+            tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "thread/backgroundTerminals/list");
+                socket.send(Message::Text(json!({
                 "id": 90, "method": "item/tool/call",
                 "params": {"threadId":"thread", "turnId":"turn", "callId":"phase",
                     "tool":"plan_phase_done",
                     "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
             }).to_string().into())).await.unwrap();
-            socket.send(Message::Text(json!({
-                "id": request["id"], "result":{"terminals":[]}
-            }).to_string().into())).await.unwrap();
-            assert!(tokio::time::timeout(Duration::from_millis(100), socket.next()).await.is_err(),
-                "a catalog connection must leave broadcast controls to the turn owner");
-        });
+                socket
+                    .send(Message::Text(
+                        json!({
+                            "id": request["id"], "result":{"terminals":[]}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(100), socket.next())
+                        .await
+                        .is_err(),
+                    "a catalog connection must leave broadcast controls to the turn owner"
+                );
+            });
         let mut process = CodexJsonRpc::connect(
-            &endpoint, &workspace, PermissionMode::Read,
-            PermissionCoordinator::transient(&workspace)?, None,
-            Arc::new(TraceStore::open(fixture.path())?), "session".into(),
-        ).await?;
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?,
+            None,
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        )
+        .await?;
         process.set_activity_publication(false);
         let mut output = BackendOutput::default();
-        process.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), &mut output).await?;
+        process
+            .request(
+                "thread/backgroundTerminals/list",
+                json!({"threadId":"thread"}),
+                &mut output,
+            )
+            .await?;
         tokio::time::timeout(Duration::from_secs(2), server).await??;
-        let failure = process.request_executor.lock().await.execute(json!({
-            "id":91, "method":"item/tool/call", "params":{"tool":"plan_phase_done",
-                "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
-        }), Instant::now()).await;
+        let failure = process
+            .request_executor
+            .lock()
+            .await
+            .execute(
+                json!({
+                    "id":91, "method":"item/tool/call", "params":{"tool":"plan_phase_done",
+                        "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
+                }),
+                Instant::now(),
+            )
+            .await;
         assert_eq!(failure.response["result"]["success"], false);
-        assert!(failure.response.to_string().contains("active execution control context"));
+        assert!(
+            failure
+                .response
+                .to_string()
+                .contains("active execution control context")
+        );
         Ok(())
     }
 
@@ -2447,7 +2817,7 @@ mod test {
         .await;
 
         assert_eq!(output.design_patch.len(), 1);
-        assert_eq!(output.design_patch[0].patch,"corrected");
+        assert_eq!(output.design_patch[0].patch, "corrected");
     }
 
     #[tokio::test]
@@ -2758,7 +3128,8 @@ mod test {
             Some(sink),
             Arc::new(TraceStore::open(fixture.path())?),
             "session".into(),
-        ).await?;
+        )
+        .await?;
         let _server_socket = server.await?;
         let mut output = BackendOutput::default();
         let mut turn = crate::turn::Turn::new(
@@ -2778,20 +3149,25 @@ mod test {
             ("read-2", "item/completed", "completed", 5000),
             ("read-2", "item/completed", "completed", 6000),
         ] {
-            process.publish_message(json!({
-                "method": method,
-                "params": {
-                    "threadId": "thread",
-                    "turnId": "turn",
-                    "item": {
-                        "id": call_id,
-                        "type": "dynamicToolCall",
-                        "tool": "plan_read",
-                        "arguments": { "plan_id": "plan", "path": "plan.json" },
-                        "status": status
-                    }
-                }
-            }), &mut output).await?;
+            process
+                .publish_message(
+                    json!({
+                        "method": method,
+                        "params": {
+                            "threadId": "thread",
+                            "turnId": "turn",
+                            "item": {
+                                "id": call_id,
+                                "type": "dynamicToolCall",
+                                "tool": "plan_read",
+                                "arguments": { "plan_id": "plan", "path": "plan.json" },
+                                "status": status
+                            }
+                        }
+                    }),
+                    &mut output,
+                )
+                .await?;
             let event = stream.try_recv()?;
             let activity = event.activity.expect("published tool lifecycle");
             assert_eq!(activity.id, call_id);
@@ -2800,10 +3176,7 @@ mod test {
         }
         let tool = turn.tools().collect::<Vec<_>>();
         assert_eq!(tool.len(), 2);
-        for (call_id, started, completed) in [
-            ("read-1", 1000, 2000),
-            ("read-2", 3000, 5000),
-        ] {
+        for (call_id, started, completed) in [("read-1", 1000, 2000), ("read-2", 3000, 5000)] {
             let tool = tool.iter().find(|tool| tool.id == call_id).unwrap();
             assert_eq!(tool.started_at_ms, Some(started));
             assert_eq!(tool.completed_at_ms, Some(completed));
@@ -2841,7 +3214,10 @@ mod test {
             .as_ref()
             .expect("control tool activity");
         assert_eq!(activity.id, "plan-edit-1");
-        assert_eq!(activity.title, "harness_plan_edit({\"expected_version\":1,\"plan\":{\"overview\":\"Updated overview\"},\"plan_id\":\"plan-1\"})");
+        assert_eq!(
+            activity.title,
+            "harness_plan_edit({\"expected_version\":1,\"plan\":{\"overview\":\"Updated overview\"},\"plan_id\":\"plan-1\"})"
+        );
         assert_eq!(activity.status.as_deref(), Some("completed"));
         assert_eq!(activity.output.as_deref(), Some("Plan edit accepted."));
     }
@@ -3182,13 +3558,26 @@ mod test {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         for (id, action, expected_title) in [
-            ("search-1", json!({ "type": "search", "queries": ["engine documentation", "engine pricing"] }),
-                "Web Search · engine documentation · +1 query"),
-            ("open-1", json!({ "type": "openPage", "url": "https://example.com/docs" }), "Open web · example.com/docs"),
-            ("find-1", json!({ "type": "findInPage", "url": "https://example.com/docs", "pattern": "royalty" }),
-                "Find in page · \"royalty\" · example.com/docs"),
-            ("find-2", json!({ "type": "findInPage", "url": null, "pattern": "royalty" }),
-                "Find in page · \"royalty\""),
+            (
+                "search-1",
+                json!({ "type": "search", "queries": ["engine documentation", "engine pricing"] }),
+                "Web Search · engine documentation · +1 query",
+            ),
+            (
+                "open-1",
+                json!({ "type": "openPage", "url": "https://example.com/docs" }),
+                "Open web · example.com/docs",
+            ),
+            (
+                "find-1",
+                json!({ "type": "findInPage", "url": "https://example.com/docs", "pattern": "royalty" }),
+                "Find in page · \"royalty\" · example.com/docs",
+            ),
+            (
+                "find-2",
+                json!({ "type": "findInPage", "url": null, "pattern": "royalty" }),
+                "Find in page · \"royalty\"",
+            ),
         ] {
             let result = json!({
                 "type": "webSearch", "id": id, "query": "engine documentation",
@@ -3197,15 +3586,24 @@ mod test {
                     "url": "https://example.com/docs", "snippet": "Tool documentation" }]
             });
             for (method, item, now_ms) in [
-                ("item/started", json!({ "type": "webSearch", "id": id,
-                    "query": "", "action": null, "results": null }), 1000),
+                (
+                    "item/started",
+                    json!({ "type": "webSearch", "id": id,
+                    "query": "", "action": null, "results": null }),
+                    1000,
+                ),
                 ("item/completed", result.clone(), 2000),
             ] {
-                normalize_event(&json!({ "method": method, "params": {
-                    "threadId": "child-thread", "turnId": "child-turn", "item": item,
-                    "startedAtMs": 1000,
-                    "completedAtMs": (method == "item/completed").then_some(now_ms)
-                }}), &mut output, Some(&event_sink)).await;
+                normalize_event(
+                    &json!({ "method": method, "params": {
+                        "threadId": "child-thread", "turnId": "child-turn", "item": item,
+                        "startedAtMs": 1000,
+                        "completedAtMs": (method == "item/completed").then_some(now_ms)
+                    }}),
+                    &mut output,
+                    Some(&event_sink),
+                )
+                .await;
                 let event = event_stream.try_recv()?;
                 assert_eq!(event.kind, "tool");
                 assert_eq!(event.address.as_ref(), Some(&address));
@@ -3217,7 +3615,10 @@ mod test {
                     assert_eq!(tool.title, expected_title);
                 }
             }
-            let tool = turn.tools().find(|tool| tool.id == id).expect("persisted web activity");
+            let tool = turn
+                .tools()
+                .find(|tool| tool.id == id)
+                .expect("persisted web activity");
             assert_eq!(tool.title, expected_title);
             assert_eq!(tool.status, "completed");
             assert_eq!(tool.started_at_ms, Some(1000));
@@ -3229,27 +3630,61 @@ mod test {
         assert!(output.evidence.tool_called);
         let restored: crate::turn::Turn = serde_json::from_value(serde_json::to_value(&turn)?)?;
         assert_eq!(restored.tools().count(), 4);
-        assert!(restored.tools().all(|tool| tool.output.contains("Tool documentation")
-            && !tool.title.starts_with("webSearch(")));
+        assert!(
+            restored
+                .tools()
+                .all(|tool| tool.output.contains("Tool documentation")
+                    && !tool.title.starts_with("webSearch("))
+        );
         Ok(())
     }
 
     #[tokio::test]
     async fn builtin_titles_handle_sleep_and_web_fallbacks_without_aliasing_mcp() {
         for (item, expected) in [
-            (json!({"type":"sleep", "durationMs":20000}), Some("Wait · 20s")),
-            (json!({"type":"sleep", "durationMs":1500}), Some("Wait · 1.5s")),
+            (
+                json!({"type":"sleep", "durationMs":20000}),
+                Some("Wait · 20s"),
+            ),
+            (
+                json!({"type":"sleep", "durationMs":1500}),
+                Some("Wait · 1.5s"),
+            ),
             (json!({"type":"sleep"}), None),
-            (json!({"type":"webSearch", "query":"", "action":null, "results":null}), Some("Web Search")),
+            (
+                json!({"type":"webSearch", "query":"", "action":null, "results":null}),
+                Some("Web Search"),
+            ),
             (json!({"type":"webSearch"}), Some("Web Search")),
-            (json!({"type":"webSearch", "query":"documentation", "action":null}), Some("Web Search · documentation")),
-            (json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}), Some("Web Search · documentation")),
-            (json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}), Some("Web Search · documentation")),
-            (json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}), Some("Web Search · one · +2 queries")),
-            (json!({"type":"webSearch", "query":"https://example.com", "action":{"type":"openPage","url":null}}), Some("Open web · example.com")),
+            (
+                json!({"type":"webSearch", "query":"documentation", "action":null}),
+                Some("Web Search · documentation"),
+            ),
+            (
+                json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}),
+                Some("Web Search · documentation"),
+            ),
+            (
+                json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}),
+                Some("Web Search · documentation"),
+            ),
+            (
+                json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}),
+                Some("Web Search · one · +2 queries"),
+            ),
+            (
+                json!({"type":"webSearch", "query":"https://example.com", "action":{"type":"openPage","url":null}}),
+                Some("Open web · example.com"),
+            ),
             (json!({"type":"webSearch", "action":{"type":"other"}}), None),
-            (json!({"type":"webSearch", "action":{"type":"search","queries":[]}}), None),
-            (json!({"type":"mcpToolCall", "server":"webSearch", "tool":"search","arguments":{"query":"documentation"}}), None),
+            (
+                json!({"type":"webSearch", "action":{"type":"search","queries":[]}}),
+                None,
+            ),
+            (
+                json!({"type":"mcpToolCall", "server":"webSearch", "tool":"search","arguments":{"query":"documentation"}}),
+                None,
+            ),
         ] {
             assert_eq!(builtin_tool_title(&item).as_deref(), expected, "{item}");
         }
@@ -3261,7 +3696,13 @@ mod test {
         let activity = output.event[0].activity.as_ref().unwrap();
         assert!(activity.title.starts_with("webSearch("));
         assert!(activity.title.contains("Retained result"));
-        assert!(activity.output.as_ref().unwrap().contains("Retained result"));
+        assert!(
+            activity
+                .output
+                .as_ref()
+                .unwrap()
+                .contains("Retained result")
+        );
     }
 
     #[tokio::test]
@@ -3273,20 +3714,35 @@ mod test {
                 "result": { "type": "error", "message": "structured result", "items": [1, 2],
                     "credentials": [{ "access_token": "nested-private-value" }] }
             });
-            normalize_event(&json!({ "method": "item/completed", "params": {
-                "item": item
-            }}), &mut output, None).await;
+            normalize_event(
+                &json!({ "method": "item/completed", "params": {
+                    "item": item
+                }}),
+                &mut output,
+                None,
+            )
+            .await;
             assert_eq!(output.event.len(), 1);
             assert_eq!(output.event[0].kind, "tool");
             let activity = output.event[0].activity.as_ref().unwrap();
-            let title_payload = activity.title.strip_prefix("futureBuiltin(").unwrap()
-                .strip_suffix(')').unwrap();
+            let title_payload = activity
+                .title
+                .strip_prefix("futureBuiltin(")
+                .unwrap()
+                .strip_suffix(')')
+                .unwrap();
             let mut expected = item.clone();
             expected["arguments"]["api_key"] = json!("[REDACTED]");
             expected["result"]["credentials"][0]["access_token"] = json!("[REDACTED]");
-            assert_eq!(serde_json::from_str::<Value>(title_payload).unwrap(), expected);
+            assert_eq!(
+                serde_json::from_str::<Value>(title_payload).unwrap(),
+                expected
+            );
             assert_eq!(activity.status.as_deref(), Some(status));
-            assert_eq!(serde_json::from_str::<Value>(activity.output.as_deref().unwrap()).unwrap(), item);
+            assert_eq!(
+                serde_json::from_str::<Value>(activity.output.as_deref().unwrap()).unwrap(),
+                item
+            );
             assert!(output.evidence.tool_called);
         }
     }
@@ -3294,20 +3750,37 @@ mod test {
     #[tokio::test]
     async fn codex_builtin_activity_excludes_non_tools_and_nested_payload_types() {
         let mut output = BackendOutput::default();
-        for item_type in ["userMessage", "agentMessage", "reasoning", "plan",
-            "enteredReviewMode", "exitedReviewMode", "collabAgentToolCall", "subAgentActivity"] {
-            normalize_event(&json!({ "method": "item/completed", "params": {
-                "item": { "type": item_type, "id": "non-tool", "text": "Tool documentation",
-                    "payload": { "type": "mcpToolCall", "tool": "nested" } }
-            }}), &mut output, None).await;
+        for item_type in [
+            "userMessage",
+            "agentMessage",
+            "reasoning",
+            "plan",
+            "enteredReviewMode",
+            "exitedReviewMode",
+            "collabAgentToolCall",
+            "subAgentActivity",
+        ] {
+            normalize_event(
+                &json!({ "method": "item/completed", "params": {
+                    "item": { "type": item_type, "id": "non-tool", "text": "Tool documentation",
+                        "payload": { "type": "mcpToolCall", "tool": "nested" } }
+                }}),
+                &mut output,
+                None,
+            )
+            .await;
         }
         for params in [
             json!({ "item": { "type": "futureBuiltin" } }),
             json!({ "item": { "type": "futureBuiltin", "id": "" } }),
             json!({ "item": { "id": "untyped", "payload": { "type": "mcpToolCall" } } }),
         ] {
-            normalize_event(&json!({ "method": "item/completed", "params": params }),
-                &mut output, None).await;
+            normalize_event(
+                &json!({ "method": "item/completed", "params": params }),
+                &mut output,
+                None,
+            )
+            .await;
         }
         assert!(!output.evidence.tool_called);
         assert!(output.event.iter().all(|event| event.activity.is_none()));
@@ -3535,10 +4008,18 @@ mod test {
     #[tokio::test]
     async fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
         for (path, workspace, expected) in [
-            ("C:\\workspace\\src\\main.rs", "C:\\workspace", "src/main.rs"),
+            (
+                "C:\\workspace\\src\\main.rs",
+                "C:\\workspace",
+                "src/main.rs",
+            ),
             ("/workspace/src/main.rs", "/workspace", "src/main.rs"),
             ("src/main.rs", "/workspace", "src/main.rs"),
-            ("C:\\workspace-other\\src\\main.rs", "C:\\workspace", "C:/workspace-other/src/main.rs"),
+            (
+                "C:\\workspace-other\\src\\main.rs",
+                "C:\\workspace",
+                "C:/workspace-other/src/main.rs",
+            ),
         ] {
             let mut output = BackendOutput::default();
             normalize_event_in_workspace(
@@ -3696,10 +4177,16 @@ mod test {
 
     #[test]
     fn argv_command_titles_hide_launchers_without_losing_script_boundaries() {
-        for (executable, marker) in [("C:\\Program Files\\PowerShell\\7\\pwsh.exe","-Command"),
-            ("/bin/bash","-lc"),("/bin/zsh","-ic"),("/opt/homebrew/bin/nu","--commands")] {
-            assert_eq!(tool_title(&json!([executable,marker,"probe 'a path'; probe λ"])).as_deref(),
-                Some("probe 'a path'; probe λ"));
+        for (executable, marker) in [
+            ("C:\\Program Files\\PowerShell\\7\\pwsh.exe", "-Command"),
+            ("/bin/bash", "-lc"),
+            ("/bin/zsh", "-ic"),
+            ("/opt/homebrew/bin/nu", "--commands"),
+        ] {
+            assert_eq!(
+                tool_title(&json!([executable, marker, "probe 'a path'; probe λ"])).as_deref(),
+                Some("probe 'a path'; probe λ")
+            );
         }
     }
 

@@ -43,7 +43,9 @@ pub enum PlanReviewReferenceKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target_type", rename_all = "snake_case")]
 pub enum PlanReviewTarget {
-    InlineSymbol { name: String },
+    InlineSymbol {
+        name: String,
+    },
     Check {
         id: String,
     },
@@ -329,10 +331,7 @@ impl PlanRenderer {
     }
 
     fn finish(self) -> Result<RenderedPlan> {
-        anyhow::ensure!(
-            !self.exhausted,
-            "plan rendering exceeds 128 diagram levels"
-        );
+        anyhow::ensure!(!self.exhausted, "plan rendering exceeds 128 diagram levels");
         debug_assert_eq!(
             self.line.iter().filter(|line| !line.is_empty()).count(),
             self.navigation.anchor.len()
@@ -389,7 +388,10 @@ pub fn render_plan(document: &PlanDocument) -> Result<RenderedPlan> {
 
 /// Render one plan against its repository root so file status reflects the worktree.
 pub fn render_plan_at(document: &PlanDocument, workspace: &Path) -> Result<RenderedPlan> {
-    if document.design.is_some() { document.validate()?; return super::design_review::render(document); }
+    if document.design.is_some() {
+        document.validate()?;
+        return super::design_review::render(document);
+    }
     validate_plan_render(document)?;
     let graph = PlanGraph::new(document);
     let mut renderer = PlanRenderer::new(document);
@@ -1349,7 +1351,11 @@ fn append_diagram_member(
     if cell_list.exhausted {
         return;
     }
-    let declaration = format!("{} {}", visibility_marker(member.visibility), member_signature(member));
+    let declaration = format!(
+        "{} {}",
+        visibility_marker(member.visibility),
+        member_signature(member)
+    );
     if !matches!(member.kind, MemberKind::Method | MemberKind::Function)
         || member.parameters.is_empty()
         || indent.chars().count() + declaration.chars().count() <= width
@@ -1358,14 +1364,20 @@ fn append_diagram_member(
         return;
     }
     cell_list.push(DiagramCell {
-        text: format!("{indent}{} {}(", visibility_marker(member.visibility), member.name),
+        text: format!(
+            "{indent}{} {}(",
+            visibility_marker(member.visibility),
+            member.name
+        ),
         anchor: anchor.clone(),
     });
     cell_list.extend(member.parameters.iter().map(|parameter| DiagramCell {
         text: format!("{indent}    {}: {},", parameter.name, parameter.type_name),
         anchor: anchor.clone(),
     }));
-    let return_type = member.return_type.as_deref()
+    let return_type = member
+        .return_type
+        .as_deref()
         .map(|value| format!(": {value}"))
         .unwrap_or_default();
     cell_list.push(DiagramCell {
@@ -1534,7 +1546,8 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
             };
             let label = document.task_label(&task.id).unwrap();
             let heading = format!("   {branch} {label}. ");
-            let content_prefix = format!("   {continuation}{}", " ".repeat(label.chars().count() + 2));
+            let content_prefix =
+                format!("   {continuation}{}", " ".repeat(label.chars().count() + 2));
             renderer.push_wrapped(
                 [&heading, &content_prefix],
                 &task.title,
@@ -1930,7 +1943,10 @@ mod test {
         assert_eq!(renderer.finish().unwrap().markdown.len(), 65537);
         let mut renderer = PlanRenderer::new(&document);
         renderer.section("x".repeat(8 * 1024 * 1024), PlanSection::Title, "/title");
-        assert_eq!(renderer.finish().unwrap().markdown.len(), 8 * 1024 * 1024 + 1);
+        assert_eq!(
+            renderer.finish().unwrap().markdown.len(),
+            8 * 1024 * 1024 + 1
+        );
         let mut renderer = PlanRenderer::new(&document);
         renderer.section("\n".repeat(65536), PlanSection::Overview, "/overview");
         assert_eq!(renderer.finish().unwrap().markdown.lines().count(), 65537);
@@ -2133,10 +2149,22 @@ mod test {
             visibility: Some(Visibility::Public),
             type_name: None,
             parameters: vec![
-                FunctionParameter { name: "time".into(), type_name: "Res<Time>".into() },
-                FunctionParameter { name: "config".into(), type_name: "Res<ArenaConfig>".into() },
-                FunctionParameter { name: "progress".into(), type_name: "Res<ArenaProgress>".into() },
-                FunctionParameter { name: "players".into(), type_name: "Query<(&PlayerMotion, &mut Transform), With<Player>>".into() },
+                FunctionParameter {
+                    name: "time".into(),
+                    type_name: "Res<Time>".into(),
+                },
+                FunctionParameter {
+                    name: "config".into(),
+                    type_name: "Res<ArenaConfig>".into(),
+                },
+                FunctionParameter {
+                    name: "progress".into(),
+                    type_name: "Res<ArenaProgress>".into(),
+                },
+                FunctionParameter {
+                    name: "players".into(),
+                    type_name: "Query<(&PlayerMotion, &mut Transform), With<Player>>".into(),
+                },
             ],
             return_type: Some("Result<(), Error>".into()),
         }];
@@ -2152,22 +2180,43 @@ mod test {
             "      players: Query<(&PlayerMotion, &mut Transform), With<Player>>,",
             "    ): Result<(), Error>",
         ];
-        assert!(rendered.markdown.contains(&expected.join("\n")), "{}", rendered.markdown);
+        assert!(
+            rendered.markdown.contains(&expected.join("\n")),
+            "{}",
+            rendered.markdown
+        );
         for (index, line) in rendered.markdown.lines().enumerate() {
             if expected.contains(&line) {
                 let anchor = rendered.navigation.resolve_line(index as u32 + 1).unwrap();
                 assert_eq!(anchor.json_path, "/entity_changes/0/members/0");
-                assert!(matches!(anchor.target, PlanReviewTarget::EntityMember { .. }));
+                assert!(matches!(
+                    anchor.target,
+                    PlanReviewTarget::EntityMember { .. }
+                ));
             }
         }
         let member = &document.entity_changes[0].members[0];
         let indent = "    ";
-        let exact_width = format!("{indent}+ {}", member_signature(member)).chars().count();
+        let exact_width = format!("{indent}+ {}", member_signature(member))
+            .chars()
+            .count();
         let mut cells = RenderRows::default();
-        append_diagram_member(&mut cells, indent, member, exact_width, object_model_anchor());
+        append_diagram_member(
+            &mut cells,
+            indent,
+            member,
+            exact_width,
+            object_model_anchor(),
+        );
         assert_eq!(cells.row.len(), 1);
         let mut cells = RenderRows::default();
-        append_diagram_member(&mut cells, indent, member, exact_width - 1, object_model_anchor());
+        append_diagram_member(
+            &mut cells,
+            indent,
+            member,
+            exact_width - 1,
+            object_model_anchor(),
+        );
         assert_eq!(cells.row[0].text, "    + move_player(");
         assert_eq!(cells.row[1].text, "        time: Res<Time>,");
         assert_eq!(cells.row.last().unwrap().text, "      ): Result<(), Error>");
@@ -2411,7 +2460,10 @@ mod test {
             .next()
             .expect("task body");
 
-        assert!(task_markdown.contains("          Give planning one owner.\n          ├─ file src/plan.rs"));
+        assert!(
+            task_markdown
+                .contains("          Give planning one owner.\n          ├─ file src/plan.rs")
+        );
         assert!(
             task_markdown
                 .lines()

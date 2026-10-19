@@ -82,8 +82,7 @@ impl GhDirectory {
                         "creation branch changed during context capture"
                     );
                     ensure!(
-                        !branch.is_empty()
-                            && !branch.chars().any(char::is_control),
+                        !branch.is_empty() && !branch.chars().any(char::is_control),
                         "invalid creation branch"
                     );
                     ensure!(

@@ -121,13 +121,8 @@ impl IssueDocument {
         budget: EditBudget,
     ) -> Result<Self> {
         validate_detail(&repository, &node_id, &detail)?;
-        let mut edits = EditStore::new(
-            id.clone(),
-            EditLimits {
-                pending_saves: 3,
-            },
-            budget.clone(),
-        )?;
+        let mut edits =
+            EditStore::new(id.clone(), EditLimits { pending_saves: 3 }, budget.clone())?;
         edits.insert(
             RegionId("title".into()),
             RegionRevision(0),
@@ -307,9 +302,7 @@ impl IssueDocument {
         let id = self.edits.document_id().clone();
         let mut edits = EditStore::new(
             id.clone(),
-            EditLimits {
-                pending_saves: 3,
-            },
+            EditLimits { pending_saves: 3 },
             self.budget.clone(),
         )?;
         let mut pending = Vec::new();
@@ -317,8 +310,7 @@ impl IssueDocument {
             let field = draft.field.get(name).context("issue draft field missing")?;
             ensure!(
                 field.sequence <= forge_buffer::MAX_COUNTER
-                    && (name == "body"
-                        || !field.text.contains(['\n', '\r'])),
+                    && (name == "body" || !field.text.contains(['\n', '\r'])),
                 "invalid issue draft field"
             );
             let region = RegionId(name.into());
@@ -432,10 +424,7 @@ impl IssueDocument {
         }
         let captured = self.edits.prepare_capture(capture, &[])?;
         let title = captured.snapshot(&RegionId("title".into()))?;
-        ensure!(
-            !title.text.trim().is_empty(),
-            "invalid issue title"
-        );
+        ensure!(!title.text.trim().is_empty(), "invalid issue title");
         assignee_logins(captured.snapshot(&RegionId("assignees".into()))?.text)?;
         let changes = ISSUE_FIELD
             .iter()
@@ -521,10 +510,7 @@ impl IssueDocument {
         if !title.dirty && !body.dirty && !assignees.dirty {
             return Ok(None);
         }
-        ensure!(
-            !title.text.trim().is_empty(),
-            "invalid issue title"
-        );
+        ensure!(!title.text.trim().is_empty(), "invalid issue title");
         let current = assignee_logins(assignees.text)?;
         let baseline = assignee_logins(assignees.baseline)?;
         let add_assignees = current
@@ -609,10 +595,7 @@ fn validate_detail(
             && node_id.bytes().all(|byte| byte.is_ascii_graphic()),
         "invalid issue node identity"
     );
-    ensure!(
-        !detail.title.contains(['\n', '\r']),
-        "invalid issue title"
-    );
+    ensure!(!detail.title.contains(['\n', '\r']), "invalid issue title");
     Ok(())
 }
 
@@ -739,9 +722,18 @@ mod tests {
         assert!(serde_json::to_vec(&draft).unwrap().len() > 8 * 1024 * 1024);
         let mut reopened = issue_document();
         reopened.restore_draft(&draft).unwrap();
-        assert_eq!(reopened.edits.snapshot(&RegionId("body".into())).unwrap().text, body);
+        assert_eq!(
+            reopened
+                .edits
+                .snapshot(&RegionId("body".into()))
+                .unwrap()
+                .text,
+            body
+        );
         let mutation = reopened.begin_save().unwrap().unwrap();
-        assert!(matches!(mutation, ReviewMutation::IssueEdit { body: Some(captured), .. } if captured == body));
+        assert!(
+            matches!(mutation, ReviewMutation::IssueEdit { body: Some(captured), .. } if captured == body)
+        );
     }
 
     #[test]
@@ -843,20 +835,28 @@ mod tests {
     #[test]
     fn failed_issue_capture_preserves_fields_and_projection() {
         let mut document = issue_document();
-        let index = document.buffer.block_index(&BlockId("region:body".into())).unwrap();
-        document.buffer.edit_many(vec![forge_buffer::sequence::SequenceEdit {
-            range: index..index + 1,
-            block: vec![],
-        }]).unwrap();
+        let index = document
+            .buffer
+            .block_index(&BlockId("region:body".into()))
+            .unwrap();
+        document
+            .buffer
+            .edit_many(vec![forge_buffer::sequence::SequenceEdit {
+                range: index..index + 1,
+                block: vec![],
+            }])
+            .unwrap();
         let before = serde_json::to_value(document.snapshot()).unwrap();
         let draft = document.draft_payload().unwrap();
-        let failure = document.capture_draft(vec![RegionEdit {
-            document: DocumentId("issue-document".into()),
-            region: RegionId("body".into()),
-            base: RegionRevision(0),
-            sequence: EditSequence(1),
-            text: "candidate\r\nλ\n".into(),
-        }]).unwrap_err();
+        let failure = document
+            .capture_draft(vec![RegionEdit {
+                document: DocumentId("issue-document".into()),
+                region: RegionId("body".into()),
+                base: RegionRevision(0),
+                sequence: EditSequence(1),
+                text: "candidate\r\nλ\n".into(),
+            }])
+            .unwrap_err();
         assert!(failure.to_string().contains("issue field is missing"));
         assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
         assert_eq!(document.draft_payload().unwrap(), draft);
@@ -868,19 +868,26 @@ mod tests {
             let mut document = issue_document();
             let before = serde_json::to_value(document.snapshot()).unwrap();
             let draft = document.draft_payload().unwrap();
-            assert!(document.capture_draft(vec![RegionEdit {
-                document: DocumentId("issue-document".into()),
-                region: RegionId("body".into()),
-                base: RegionRevision(0),
-                sequence: EditSequence(1),
-                text: "candidate body".into(),
-            }, RegionEdit {
-                document: DocumentId("issue-document".into()),
-                region: RegionId(region.into()),
-                base: RegionRevision(0),
-                sequence: EditSequence(2),
-                text: text.into(),
-            }]).is_err());
+            assert!(
+                document
+                    .capture_draft(vec![
+                        RegionEdit {
+                            document: DocumentId("issue-document".into()),
+                            region: RegionId("body".into()),
+                            base: RegionRevision(0),
+                            sequence: EditSequence(1),
+                            text: "candidate body".into(),
+                        },
+                        RegionEdit {
+                            document: DocumentId("issue-document".into()),
+                            region: RegionId(region.into()),
+                            base: RegionRevision(0),
+                            sequence: EditSequence(2),
+                            text: text.into(),
+                        }
+                    ])
+                    .is_err()
+            );
             assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
             assert_eq!(document.draft_payload().unwrap(), draft);
         }
@@ -890,7 +897,12 @@ mod tests {
     fn issue_field_metadata_retains_saved_baseline_during_local_capture() {
         let mut document = issue_document();
         edit(&mut document, "body", 0, 1, "local\r\nλ\n");
-        let field = document.fields().unwrap().into_iter().find(|field| field.region.0 == "body").unwrap();
+        let field = document
+            .fields()
+            .unwrap()
+            .into_iter()
+            .find(|field| field.region.0 == "body")
+            .unwrap();
         assert_eq!(field.baseline, "exact\r\nbody\n");
         assert!(field.dirty);
         let encoded = serde_json::to_value(field).unwrap();

@@ -209,10 +209,7 @@ impl CommentStore {
                 self.validate_capture(edits, &draft.region)?;
                 continue;
             }
-            ensure!(
-                next_comment < MAX_COUNTER,
-                "comment identity exhausted"
-            );
+            ensure!(next_comment < MAX_COUNTER, "comment identity exhausted");
             next_comment += 1;
             prepared.push((
                 CommentId(next_comment),
@@ -265,11 +262,7 @@ impl CommentStore {
             .map(|(identity, record)| (*identity, record))
     }
 
-    pub fn new(
-        document: DocumentId,
-        target: PullRequestTarget,
-        mode: ReviewMode,
-    ) -> Result<Self> {
+    pub fn new(document: DocumentId, target: PullRequestTarget, mode: ReviewMode) -> Result<Self> {
         document.validate()?;
         target.validate()?;
         Ok(Self {

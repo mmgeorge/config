@@ -137,8 +137,9 @@ impl ReviewReadRequest {
             "invalid GitHub document number"
         );
         ensure!(
-            self.cursor.as_ref().is_none_or(|cursor| !cursor.is_empty()
-                && !cursor.contains(['\n', '\r', '\0'])),
+            self.cursor
+                .as_ref()
+                .is_none_or(|cursor| !cursor.is_empty() && !cursor.contains(['\n', '\r', '\0'])),
             "invalid GitHub document cursor"
         );
         if let ReviewSection::ThreadComments { thread_node_id } = &self.view {

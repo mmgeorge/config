@@ -948,7 +948,9 @@ mod tests {
         let IssueResult::Details(details) = service
             .execute(
                 store.clone(),
-                IssueOperation::Details { number: vec![7; 101] },
+                IssueOperation::Details {
+                    number: vec![7; 101],
+                },
             )
             .await
             .unwrap()

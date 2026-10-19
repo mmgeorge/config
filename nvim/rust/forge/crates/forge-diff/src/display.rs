@@ -22,7 +22,12 @@ pub struct DisplayHunk {
 impl DisplayHunk {
     /// Describes caller-supplied context without associating executable raw edits.
     pub fn context(old_lines: Range<usize>, new_lines: Range<usize>) -> Self {
-        Self { raw_ids: Vec::new(), old_lines, new_lines, raw_range: 0..0 }
+        Self {
+            raw_ids: Vec::new(),
+            old_lines,
+            new_lines,
+            raw_range: 0..0,
+        }
     }
 }
 
@@ -230,7 +235,10 @@ impl DisplayCursor {
 
     /// Groups nearby changes and emits shared scope boundaries once per file.
     /// Context coordinates and byte ranges must address this cursor's source pair.
-    pub fn with_context(mut self, context_at: impl Fn(SourceSide, usize) -> Option<HunkContext>) -> Self {
+    pub fn with_context(
+        mut self,
+        context_at: impl Fn(SourceSide, usize) -> Option<HunkContext>,
+    ) -> Self {
         let old_offset = source_offsets(self.diff.source().old.bytes());
         let new_offset = source_offsets(self.diff.source().new.bytes());
         let mut group: Vec<DisplayHunk> = Vec::new();
@@ -423,14 +431,30 @@ impl DisplayCursor {
                 if !chunk.rows.is_empty() && charge > byte_limit.saturating_sub(chunk.text_bytes) {
                     break;
                 }
-                if chunk.decorations == decoration_limit { break; }
+                if chunk.decorations == decoration_limit {
+                    break;
+                }
                 if let Some(old) = gap.old {
-                    let byte = line_range(self.diff.source().old.bytes(), self.previous_old.unwrap().byte).1;
-                    self.previous_old = Some(SourcePosition { line: old.line, byte });
+                    let byte = line_range(
+                        self.diff.source().old.bytes(),
+                        self.previous_old.unwrap().byte,
+                    )
+                    .1;
+                    self.previous_old = Some(SourcePosition {
+                        line: old.line,
+                        byte,
+                    });
                 }
                 if let Some(new) = gap.new {
-                    let byte = line_range(self.diff.source().new.bytes(), self.previous_new.unwrap().byte).1;
-                    self.previous_new = Some(SourcePosition { line: new.line, byte });
+                    let byte = line_range(
+                        self.diff.source().new.bytes(),
+                        self.previous_new.unwrap().byte,
+                    )
+                    .1;
+                    self.previous_new = Some(SourcePosition {
+                        line: new.line,
+                        byte,
+                    });
                 }
                 self.gap_emitted = true;
                 chunk.text_bytes += charge;
@@ -482,10 +506,16 @@ impl DisplayCursor {
             }
             self.previous_group = Some(self.group_index);
             if let Some(old) = candidate.old {
-                self.previous_old = Some(SourcePosition { line: old.line, byte: candidate.advance_old });
+                self.previous_old = Some(SourcePosition {
+                    line: old.line,
+                    byte: candidate.advance_old,
+                });
             }
             if let Some(new) = candidate.new {
-                self.previous_new = Some(SourcePosition { line: new.line, byte: candidate.advance_new });
+                self.previous_new = Some(SourcePosition {
+                    line: new.line,
+                    byte: candidate.advance_new,
+                });
             }
             self.gap_emitted = false;
             if let Some(before) = candidate.structural_before {
@@ -509,27 +539,55 @@ impl DisplayCursor {
     }
 
     fn gap_row(&self, next: &Candidate) -> Option<DisplayRow> {
-        if self.gap_emitted || self.previous_group != Some(self.group_index) { return None; }
+        if self.gap_emitted || self.previous_group != Some(self.group_index) {
+            return None;
+        }
         let distance = |previous: Option<SourcePosition>, next: Option<SourceCoordinate>| {
-            previous.zip(next).map(|(previous, next)| next.line.saturating_sub(previous.line + 1))
+            previous
+                .zip(next)
+                .map(|(previous, next)| next.line.saturating_sub(previous.line + 1))
         };
         let old_gap = distance(self.previous_old, next.old);
         let new_gap = distance(self.previous_new, next.new);
-        if !old_gap.is_some_and(|gap| gap > 0) && !new_gap.is_some_and(|gap| gap > 0) { return None; }
+        if !old_gap.is_some_and(|gap| gap > 0) && !new_gap.is_some_and(|gap| gap > 0) {
+            return None;
+        }
         let (text, old, new) = if old_gap == Some(1) && new_gap == Some(1) {
             let previous = self.previous_old.unwrap();
             let range = line_range(self.diff.source().old.bytes(), previous.byte).0;
-            (self.diff.source().old.text()[range].to_owned(),
-                Some(SourceCoordinate { side: SourceSide::Old, line: previous.line + 1, byte_column: 0 }),
-                Some(SourceCoordinate { side: SourceSide::New, line: self.previous_new.unwrap().line + 1, byte_column: 0 }))
+            (
+                self.diff.source().old.text()[range].to_owned(),
+                Some(SourceCoordinate {
+                    side: SourceSide::Old,
+                    line: previous.line + 1,
+                    byte_column: 0,
+                }),
+                Some(SourceCoordinate {
+                    side: SourceSide::New,
+                    line: self.previous_new.unwrap().line + 1,
+                    byte_column: 0,
+                }),
+            )
         } else {
-            let source = if next.kind == RowKind::Added { self.diff.source().new.text() } else { self.diff.source().old.text() };
+            let source = if next.kind == RowKind::Added {
+                self.diff.source().new.text()
+            } else {
+                self.diff.source().old.text()
+            };
             let text = &source[next.bytes.clone()];
             let indent = &text[..text.len() - text.trim_start().len()];
             (format!("{indent}..."), None, None)
         };
-        Some(DisplayRow { group_index: self.group_index, text, kind: RowKind::Context,
-            old, new, raw_id: None, emphasis: Vec::new(), emphasis_fallback: None })
+        Some(DisplayRow {
+            group_index: self.group_index,
+            text,
+            kind: RowKind::Context,
+            old,
+            new,
+            raw_id: None,
+            emphasis: Vec::new(),
+            emphasis_fallback: None,
+        })
     }
 
     fn row_emphasis(
@@ -729,7 +787,12 @@ mod selected_group_tests {
         });
         assert_eq!(chunk.rows.len(), 2);
         assert_eq!(chunk.rows[0].old.unwrap().line, 80);
-        assert!(chunk.rows.iter().any(|row| row.text == "selected change" && row.new.unwrap().line == 80));
+        assert!(
+            chunk
+                .rows
+                .iter()
+                .any(|row| row.text == "selected change" && row.new.unwrap().line == 80)
+        );
         let chunk = cursor.next_rows(ChunkLimits::default());
         assert!(chunk.rows.is_empty());
         assert!(!chunk.rows.iter().any(|row| row.text == "first change"));

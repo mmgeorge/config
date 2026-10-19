@@ -288,7 +288,8 @@ impl ReviewService {
                     kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
                     number: target.number,
                 };
-                service.github
+                service
+                    .github
                     .review_draft_write(resource.clone(), draft)
                     .await?;
                 let mut dispatch_attempted = false;

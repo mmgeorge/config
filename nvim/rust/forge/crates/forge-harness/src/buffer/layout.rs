@@ -29,39 +29,51 @@ impl<'exchange> ExchangeLayout<'exchange> {
             .iter()
             .filter(|node| !questions.nested.contains(node.id()))
             .collect::<Vec<_>>();
-        activity.retain(|node| {
-            match node {
-                ExchangeNode::PlanEvent { event } => match &event.content {
-                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                        if event.node_count == 0 && matches!(lifecycle.kind,
-                            crate::plan::PlanLifecycleKind::Accepted | crate::plan::PlanLifecycleKind::ChangesRequested) => {
-                        opening.push(*node);
-                        false
-                    }
-                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                        if matches!(lifecycle.kind, crate::plan::PlanLifecycleKind::Created
-                            | crate::plan::PlanLifecycleKind::RevisionCreated) => {
-                        results.push(*node);
-                        false
-                    }
-                    crate::plan::PlanEventContent::Execution { event }
-                        if matches!(event, crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }) => {
-                        conclusion.push(*node);
-                        false
-                    }
-                    crate::plan::PlanEventContent::Execution { .. } | crate::plan::PlanEventContent::Resolution { .. } => {
-                        results.push(*node);
-                        false
-                    }
-                    _ => true,
-                },
-                ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
+        activity.retain(|node| match node {
+            ExchangeNode::PlanEvent { event } => match &event.content {
+                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                    if event.node_count == 0
+                        && matches!(
+                            lifecycle.kind,
+                            crate::plan::PlanLifecycleKind::Accepted
+                                | crate::plan::PlanLifecycleKind::ChangesRequested
+                        ) =>
+                {
+                    opening.push(*node);
+                    false
+                }
+                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                    if matches!(
+                        lifecycle.kind,
+                        crate::plan::PlanLifecycleKind::Created
+                            | crate::plan::PlanLifecycleKind::RevisionCreated
+                    ) =>
+                {
+                    results.push(*node);
+                    false
+                }
+                crate::plan::PlanEventContent::Execution { event }
+                    if matches!(
+                        event,
+                        crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
+                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
+                    ) =>
+                {
+                    conclusion.push(*node);
+                    false
+                }
+                crate::plan::PlanEventContent::Execution { .. }
+                | crate::plan::PlanEventContent::Resolution { .. } => {
                     results.push(*node);
                     false
                 }
                 _ => true,
+            },
+            ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
+                results.push(*node);
+                false
             }
+            _ => true,
         });
         let mut response_position = activity.len();
         for (position, node) in activity.iter().enumerate() {

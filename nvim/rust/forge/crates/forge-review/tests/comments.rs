@@ -19,12 +19,7 @@ fn stores(mode: ReviewMode) -> (CommentStore, EditStore) {
     let document = DocumentId("review".into());
     (
         CommentStore::new(document.clone(), target(), mode).unwrap(),
-        EditStore::new(
-            document,
-            EditLimits::default(),
-            EditBudget::default(),
-        )
-        .unwrap(),
+        EditStore::new(document, EditLimits::default(), EditBudget::default()).unwrap(),
     )
 }
 
@@ -376,12 +371,7 @@ fn complete_comment_text_and_occurrences_have_no_admission_cap() {
     let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
-    let mut comments = CommentStore::new(
-        document,
-        target(),
-        ReviewMode::Overview,
-    )
-    .unwrap();
+    let mut comments = CommentStore::new(document, target(), ReviewMode::Overview).unwrap();
     let text = "x".repeat(9 * 1024 * 1024);
     let (comment, _) = comments.merge(&mut edits, remote(&text)).unwrap();
     assert_eq!(comment, CommentId(1));
@@ -392,7 +382,9 @@ fn complete_comment_text_and_occurrences_have_no_admission_cap() {
         .add_occurrence(comment, OccurrenceKind::Inline)
         .unwrap();
     for _ in 0..5000 {
-        comments.add_occurrence(comment, OccurrenceKind::Inline).unwrap();
+        comments
+            .add_occurrence(comment, OccurrenceKind::Inline)
+            .unwrap();
     }
     comments.remove_occurrence(first).unwrap();
     let second = comments
@@ -400,7 +392,9 @@ fn complete_comment_text_and_occurrences_have_no_admission_cap() {
         .unwrap();
     assert_ne!(first, second);
     comments.remove_occurrence(second).unwrap();
-    comments.add_occurrence(comment, OccurrenceKind::Inline).unwrap();
+    comments
+        .add_occurrence(comment, OccurrenceKind::Inline)
+        .unwrap();
     assert_eq!(budget.retained_bytes(), text.len());
     assert_eq!(comments.body(&edits, comment).unwrap().text, text);
 }
@@ -654,12 +648,7 @@ fn save_receipt_retains_its_shared_budget_after_document_drop() {
     let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
-    let mut comments = CommentStore::new(
-        document,
-        target(),
-        ReviewMode::Overview,
-    )
-    .unwrap();
+    let mut comments = CommentStore::new(document, target(), ReviewMode::Overview).unwrap();
     let comment = comments.draft(&mut edits, Some(anchor())).unwrap();
     change(&comments, &mut edits, comment, "submitted");
     let save = comments
@@ -684,12 +673,7 @@ fn invalid_observation_keeps_uncertain_capture_and_identity() {
     let budget = EditBudget::default();
     let mut edits =
         EditStore::new(document.clone(), EditLimits::default(), budget.clone()).unwrap();
-    let mut comments = CommentStore::new(
-        document,
-        target(),
-        ReviewMode::Overview,
-    )
-    .unwrap();
+    let mut comments = CommentStore::new(document, target(), ReviewMode::Overview).unwrap();
     let (comment, _) = comments.merge(&mut edits, remote("old")).unwrap();
     change(&comments, &mut edits, comment, "local");
     let save = comments

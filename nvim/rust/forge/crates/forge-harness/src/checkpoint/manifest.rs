@@ -2,7 +2,10 @@ use crate::storage::objects::ObjectStore;
 use anyhow::{Context, Result};
 use forge_git::checkpoint::{BaseFile, CheckoutRule};
 use serde::{Deserialize, Serialize};
-use std::{collections::{BTreeMap, BTreeSet}, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    path::Path,
+};
 
 type ResolvedFileMap = BTreeMap<String, ResolvedFile>;
 
@@ -57,16 +60,37 @@ pub(super) struct ResolvedFile {
 
 impl CheckpointRecord {
     /// Identifies selected package inputs without invalidating them for unrelated packages.
-    pub(crate) fn check_identity(&self, directory: Option<&str>, extra: &[String]) -> Result<String> {
-        let files = self.resolved()?.into_iter().filter(|(path, _)| directory.is_none_or(|directory| directory == "." || path == directory || path.starts_with(&format!("{directory}/")) || extra.contains(path))).collect::<BTreeMap<_, _>>();
+    pub(crate) fn check_identity(
+        &self,
+        directory: Option<&str>,
+        extra: &[String],
+    ) -> Result<String> {
+        let files = self
+            .resolved()?
+            .into_iter()
+            .filter(|(path, _)| {
+                directory.is_none_or(|directory| {
+                    directory == "."
+                        || path == directory
+                        || path.starts_with(&format!("{directory}/"))
+                        || extra.contains(path)
+                })
+            })
+            .collect::<BTreeMap<_, _>>();
         Ok(crate::plan::digest(&serde_json::to_vec(&files)?))
     }
 
     /// Select changed paths using content identities without loading whole file contents.
     pub fn changed_paths(&self, other: &Self) -> Result<Vec<String>> {
         let (before, after) = self.resolve_pair(other)?;
-        Ok(before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>()
-            .into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect())
+        Ok(before
+            .keys()
+            .chain(after.keys())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .filter(|path| before.get(*path) != after.get(*path))
+            .cloned()
+            .collect())
     }
 
     /// Resolves metadata without loading any file contents.
@@ -84,7 +108,10 @@ impl CheckpointRecord {
         let paths = before.keys().chain(after.keys()).cloned().collect();
         let mut excluded = forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &paths)?;
         if self.workspace != other.workspace {
-            excluded.extend(forge_git::checkpoint::lfs_paths(Path::new(&other.workspace), &paths)?);
+            excluded.extend(forge_git::checkpoint::lfs_paths(
+                Path::new(&other.workspace),
+                &paths,
+            )?);
         }
         before.retain(|path, _| !other.excluded.contains(path) && !excluded.contains(path));
         after.retain(|path, _| !self.excluded.contains(path) && !excluded.contains(path));
@@ -153,14 +180,16 @@ impl CheckpointRecord {
     /// Retrieves one captured source, including clean files supplied by the Git baseline.
     pub fn read(&self, objects: &ObjectStore, path: &str) -> Result<Option<Vec<u8>>> {
         if self.excluded.contains(path)
-            || forge_git::checkpoint::lfs_paths(Path::new(&self.workspace), &BTreeSet::from([path.to_owned()]))?.contains(path)
+            || forge_git::checkpoint::lfs_paths(
+                Path::new(&self.workspace),
+                &BTreeSet::from([path.to_owned()]),
+            )?
+            .contains(path)
         {
             return Ok(None);
         }
         if let Some(file) = self.file.iter().find(|file| file.path == path) {
-            return Ok(Some(
-                objects.get(&file.object_id)?,
-            ));
+            return Ok(Some(objects.get(&file.object_id)?));
         }
         if self.deleted.iter().any(|deleted| deleted == path) {
             return Ok(None);
@@ -174,18 +203,15 @@ impl CheckpointRecord {
             return Ok(None);
         };
         file.checkout = self.checkout.get(path).cloned().unwrap_or_default();
-        Ok(Some(
-            forge_git::checkpoint::read_blob(Path::new(&self.workspace), &file)?,
-        ))
+        Ok(Some(forge_git::checkpoint::read_blob(
+            Path::new(&self.workspace),
+            &file,
+        )?))
     }
 }
 
 impl ResolvedFile {
-    pub(super) fn read(
-        &self,
-        objects: &ObjectStore,
-        root: &Path,
-    ) -> Result<Vec<u8>> {
+    pub(super) fn read(&self, objects: &ObjectStore, root: &Path) -> Result<Vec<u8>> {
         match &self.source {
             Content::Stored(identity) => objects.get(identity),
             Content::Git(file) => forge_git::checkpoint::read_blob(root, file)

@@ -1,9 +1,6 @@
 mod support;
 
-use forge_git::{
-    completion::RevisionBackend,
-    store::RepositoryStore,
-};
+use forge_git::{completion::RevisionBackend, store::RepositoryStore};
 use std::{fs, path::Path, sync::Arc};
 use support::git;
 
@@ -26,10 +23,7 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
     );
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let candidates = repository
-        .refresh_revisions(&store)
-        .await
-        .unwrap();
+    let candidates = repository.refresh_revisions(&store).await.unwrap();
     let expected = git(
         root,
         &[
@@ -52,10 +46,7 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
         &repository.current_revisions().unwrap()
     ));
     git(root, &["branch", "added", "HEAD"]);
-    let refreshed = repository
-        .refresh_revisions(&store)
-        .await
-        .unwrap();
+    let refreshed = repository.refresh_revisions(&store).await.unwrap();
     assert!(refreshed.revision > candidates.revision);
     assert_ne!(refreshed.reference_digest, candidates.reference_digest);
     assert!(refreshed.values.contains(&b"added".to_vec()));
@@ -69,15 +60,9 @@ async fn failed_refresh_preserves_previously_accepted_candidates() {
     initialize(root);
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let accepted = repository
-        .refresh_revisions(&store)
-        .await
-        .unwrap();
+    let accepted = repository.refresh_revisions(&store).await.unwrap();
     fs::write(root.join(".git/refs/heads/broken"), b"not-an-object\n").unwrap();
-    let failure = repository
-        .refresh_revisions(&store)
-        .await
-        .unwrap_err();
+    let failure = repository.refresh_revisions(&store).await.unwrap_err();
     assert!(failure.to_string().contains("enumerate revision reference"));
     assert!(Arc::ptr_eq(
         &accepted,
@@ -98,10 +83,7 @@ async fn unborn_and_bare_repositories_return_valid_snapshots() {
             git(&root, &["init", "--quiet"]);
         }
         let repository = store.open(root).await.unwrap().unwrap();
-        let candidates = repository
-            .refresh_revisions(&store)
-            .await
-            .unwrap();
+        let candidates = repository.refresh_revisions(&store).await.unwrap();
         assert!(candidates.values.is_empty());
     }
 }
@@ -126,14 +108,8 @@ async fn linked_worktree_storage_invalidation_clears_each_candidate_cache() {
     let store = RepositoryStore::default();
     let main = store.open(root).await.unwrap().unwrap();
     let linked = store.open(linked).await.unwrap().unwrap();
-    let first = main
-        .refresh_revisions(&store)
-        .await
-        .unwrap();
-    let second = linked
-        .refresh_revisions(&store)
-        .await
-        .unwrap();
+    let first = main.refresh_revisions(&store).await.unwrap();
+    let second = linked.refresh_revisions(&store).await.unwrap();
     assert_eq!(first.values, second.values);
     store.invalidate_storage(&main.identity.storage).unwrap();
     assert!(main.current_revisions().is_none());

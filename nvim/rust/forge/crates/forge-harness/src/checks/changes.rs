@@ -22,14 +22,34 @@ pub(super) struct CheckChanges {
 impl CheckChanges {
     /// Returns the identity whose initial checkpoint owns current changes.
     pub(super) fn owner(&self) -> Result<Option<String>> {
-        Ok(self.baseline.lock().map_err(|_| anyhow::anyhow!("check baseline lock poisoned"))?.as_ref().map(|baseline| baseline.owner.clone()))
+        Ok(self
+            .baseline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check baseline lock poisoned"))?
+            .as_ref()
+            .map(|baseline| baseline.owner.clone()))
     }
 
     /// Captures inputs through the same repository boundary as task applicability.
     pub(super) async fn snapshot(&self) -> Result<Option<CheckpointRecord>> {
-        let baseline = self.baseline.lock().map_err(|_| anyhow::anyhow!("check baseline lock poisoned"))?.clone();
-        let Some(baseline) = baseline else { return Ok(None); };
-        Ok(Some(self.checkpoint.capture(&self.objects, &self.repositories, &baseline.checkpoint.session_id, super::supervisor::now_ms()).await?))
+        let baseline = self
+            .baseline
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check baseline lock poisoned"))?
+            .clone();
+        let Some(baseline) = baseline else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.checkpoint
+                .capture(
+                    &self.objects,
+                    &self.repositories,
+                    &baseline.checkpoint.session_id,
+                    super::supervisor::now_ms(),
+                )
+                .await?,
+        ))
     }
 
     /// Restores the exact task baseline without substituting the Git index or HEAD.

@@ -19,17 +19,17 @@ use std::time::Instant;
 use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
-mod request_execution;
 mod process;
-mod text_generation;
-mod runtime;
+mod request_execution;
 mod resources;
+mod runtime;
 mod security;
+mod text_generation;
 mod turn_coordinator;
 
 use json_rpc::CodexJsonRpc;
-use runtime::CodexRuntime;
 use resources::CodexResources;
+use runtime::CodexRuntime;
 use security::CodexSecurity;
 
 struct CodexConnection {
@@ -78,7 +78,12 @@ fn capability() -> BackendCapability {
         os_sandbox: BackendKind::Codex.supports_sandbox(),
         native_fork: true,
         native_compact: true,
-        compaction: super::CompactionCapability { lifecycle: true, background: false, summary: false, metrics: false },
+        compaction: super::CompactionCapability {
+            lifecycle: true,
+            background: false,
+            summary: false,
+            metrics: false,
+        },
         native_steer: true,
         native_turn_rollback: true,
         native_goal: true,
@@ -132,9 +137,7 @@ impl CodexBackend {
             "Codex backend requires harness.backends.codex.command"
         );
         Ok(Self {
-            runtime: CodexRuntime::new(
-                command.clone(),
-            ),
+            runtime: CodexRuntime::new(command.clone()),
             command,
             settings_root,
             resource_by_session: Mutex::new(HashMap::new()),
@@ -172,8 +175,15 @@ impl CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<CodexConnection> {
         let process_started = Instant::now();
-        let resources = if request.mode == PromptMode::Background { None } else { self.resources(&Self::catalog_from_request(request)).await? };
-        let runtime = resources.as_ref().map(|resources|&resources.runtime).unwrap_or(&self.runtime);
+        let resources = if request.mode == PromptMode::Background {
+            None
+        } else {
+            self.resources(&Self::catalog_from_request(request)).await?
+        };
+        let runtime = resources
+            .as_ref()
+            .map(|resources| &resources.runtime)
+            .unwrap_or(&self.runtime);
         let mut process = runtime
             .connect(
                 &request.workspace,
@@ -208,28 +218,59 @@ impl CodexBackend {
     }
 
     fn catalog_from_request(request: &BackendRequest) -> BackendCatalogRequest {
-        BackendCatalogRequest { execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),
-            workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,
-            backend_session_id:request.backend_session_id.clone() }
+        BackendCatalogRequest {
+            execution_owner: request.execution_owner.clone(),
+            harness_session_id: request.harness_session_id.clone(),
+            workspace: request.workspace.clone(),
+            access: request.access.clone(),
+            execution_mode: request.execution_mode,
+            backend_session_id: request.backend_session_id.clone(),
+        }
     }
 
-    async fn resources(&self, request: &BackendCatalogRequest) -> Result<Option<Arc<CodexResources>>> {
-        let Some(root) = &self.settings_root else { return Ok(None); };
+    async fn resources(
+        &self,
+        request: &BackendCatalogRequest,
+    ) -> Result<Option<Arc<CodexResources>>> {
+        let Some(root) = &self.settings_root else {
+            return Ok(None);
+        };
         let mut resources = self.resource_by_session.lock().await;
-        if let Some(resources) = resources.get(&request.runtime_key()?) { return Ok(Some(resources.clone())); }
+        if let Some(resources) = resources.get(&request.runtime_key()?) {
+            return Ok(Some(resources.clone()));
+        }
         let configured = Arc::new(CodexResources::new(root, request, self.command.clone())?);
         resources.insert(request.runtime_key()?, configured.clone());
         Ok(Some(configured))
     }
 
-    async fn configured_parameters(&self, mut parameter: Value, request: &BackendRequest,
-        process: &mut CodexJsonRpc, output: &mut BackendOutput) -> Result<Value> {
+    async fn configured_parameters(
+        &self,
+        mut parameter: Value,
+        request: &BackendRequest,
+        process: &mut CodexJsonRpc,
+        output: &mut BackendOutput,
+    ) -> Result<Value> {
         parameter["config"]["model_reasoning_summary"] = json!("concise");
         if request.mode == PromptMode::Background {
-            let native = process.request("config/read", json!({"includeLayers":false,"cwd":request.workspace}), output).await?;
+            let native = process
+                .request(
+                    "config/read",
+                    json!({"includeLayers":false,"cwd":request.workspace}),
+                    output,
+                )
+                .await?;
             let mut config = text_generation::tool_free_config();
-            let servers = native.pointer("/config/mcp_servers").and_then(Value::as_object).map(|servers| servers.keys()
-                .map(|name| (name.clone(),json!({"enabled":false}))).collect::<serde_json::Map<String,Value>>()).unwrap_or_default();
+            let servers = native
+                .pointer("/config/mcp_servers")
+                .and_then(Value::as_object)
+                .map(|servers| {
+                    servers
+                        .keys()
+                        .map(|name| (name.clone(), json!({"enabled":false})))
+                        .collect::<serde_json::Map<String, Value>>()
+                })
+                .unwrap_or_default();
             config["mcp_servers"] = Value::Object(servers);
             config["model_reasoning_effort"] = json!(request.effort);
             config["model_reasoning_summary"] = json!("concise");
@@ -243,46 +284,95 @@ impl CodexBackend {
             return Ok(parameter);
         }
         if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
-            let mut config = resources.configure(process,output,&request.workspace).await?;
+            let mut config = resources
+                .configure(process, output, &request.workspace)
+                .await?;
             if let Some(existing) = parameter.get("config").and_then(Value::as_object) {
-                config.as_object_mut().expect("resource configuration is an object").extend(existing.clone());
+                config
+                    .as_object_mut()
+                    .expect("resource configuration is an object")
+                    .extend(existing.clone());
             }
             parameter["config"] = config;
         }
-        if let Some(gate) = request.control_context.as_ref().and_then(|context|context.checkpoint.as_ref()) {
+        if let Some(gate) = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.checkpoint.as_ref())
+        {
             if parameter.pointer("/config/hooks").is_none() {
-                let native = process.request("config/read", json!({"cwd":request.workspace,"includeLayers":false}), output).await?;
-                parameter["config"]["hooks"] = native.pointer("/config/hooks").filter(|value|value.is_object()).cloned().unwrap_or(json!({}));
+                let native = process
+                    .request(
+                        "config/read",
+                        json!({"cwd":request.workspace,"includeLayers":false}),
+                        output,
+                    )
+                    .await?;
+                parameter["config"]["hooks"] = native
+                    .pointer("/config/hooks")
+                    .filter(|value| value.is_object())
+                    .cloned()
+                    .unwrap_or(json!({}));
             }
-            let hooks = parameter["config"]["hooks"].as_object_mut().context("Codex hooks configuration is not an object")?;
-            if hooks.get("PreToolUse").is_none_or(Value::is_null) { hooks.insert("PreToolUse".into(), json!([])); }
-            let pre_tool = hooks.entry("PreToolUse").or_insert_with(||json!([]))
-                .as_array_mut().context("Codex PreToolUse configuration is not an array")?;
-            if !gate.ready() { pre_tool.push(gate.hook()?); }
+            let hooks = parameter["config"]["hooks"]
+                .as_object_mut()
+                .context("Codex hooks configuration is not an object")?;
+            if hooks.get("PreToolUse").is_none_or(Value::is_null) {
+                hooks.insert("PreToolUse".into(), json!([]));
+            }
+            let pre_tool = hooks
+                .entry("PreToolUse")
+                .or_insert_with(|| json!([]))
+                .as_array_mut()
+                .context("Codex PreToolUse configuration is not an array")?;
+            if !gate.ready() {
+                pre_tool.push(gate.hook()?);
+            }
             parameter["config"]["features.hooks"] = json!(true);
         }
         Ok(parameter)
     }
 
-    async fn load_thread(&self, process: &mut CodexJsonRpc, output: &mut BackendOutput,
-        request: &BackendRequest, ephemeral: bool, dynamic_tool: Vec<Value>) -> Result<String> {
+    async fn load_thread(
+        &self,
+        process: &mut CodexJsonRpc,
+        output: &mut BackendOutput,
+        request: &BackendRequest,
+        ephemeral: bool,
+        dynamic_tool: Vec<Value>,
+    ) -> Result<String> {
         let (method, parameter) = match &request.backend_session_id {
-            Some(thread) => ("thread/resume", json!({"threadId":thread,"cwd":request.workspace,
+            Some(thread) => (
+                "thread/resume",
+                json!({"threadId":thread,"cwd":request.workspace,
                 "config":{"model_reasoning_effort":request.effort},
-                "developerInstructions":request.system_message(),"serviceTier":request.service_tier})),
-            None => ("thread/start", json!({"cwd":request.workspace,"ephemeral":ephemeral,
+                "developerInstructions":request.system_message(),"serviceTier":request.service_tier}),
+            ),
+            None => (
+                "thread/start",
+                json!({"cwd":request.workspace,"ephemeral":ephemeral,
                 "experimentalRawEvents":false,"historyMode":"legacy",
                 "developerInstructions":request.system_message(),"dynamicTools":dynamic_tool,
-                "serviceTier":request.service_tier})),
+                "serviceTier":request.service_tier}),
+            ),
         };
-        let parameter = Self::with_model(Self::secure_thread(parameter,request),&request.model);
-        let parameter = self.configured_parameters(parameter,request,process,output).await?;
-        let response = process.request(method,parameter,output).await?;
-        let thread = response.pointer("/thread/id").or_else(||response.get("threadId"))
-            .or_else(||response.get("thread_id")).and_then(Value::as_str).map(str::to_owned)
-            .or(request.backend_session_id.clone()).context("Codex thread response omitted thread id")?;
+        let parameter = Self::with_model(Self::secure_thread(parameter, request), &request.model);
+        let parameter = self
+            .configured_parameters(parameter, request, process, output)
+            .await?;
+        let response = process.request(method, parameter, output).await?;
+        let thread = response
+            .pointer("/thread/id")
+            .or_else(|| response.get("threadId"))
+            .or_else(|| response.get("thread_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or(request.backend_session_id.clone())
+            .context("Codex thread response omitted thread id")?;
         if request.mode != PromptMode::Background {
-            if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? { resources.retain_thread(&thread).await; }
+            if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
+                resources.retain_thread(&thread).await;
+            }
         }
         Ok(thread)
     }
@@ -300,11 +390,12 @@ impl CodexBackend {
             .get(&request.runtime_key()?)
             .cloned()
         {
-            connection.lock().await.process.set_request_context(
-                &request.workspace,
-                request.execution_mode,
-                event_sink,
-            ).await;
+            connection
+                .lock()
+                .await
+                .process
+                .set_request_context(&request.workspace, request.execution_mode, event_sink)
+                .await;
             return Ok(connection);
         }
         let connection = Arc::new(Mutex::new(self.connect(request, output, event_sink).await?));
@@ -324,7 +415,8 @@ impl CodexBackend {
     }
 
     fn apply_security(params: &mut Value, request: &BackendRequest) {
-        CodexSecurity::new(request.execution_mode, &request.access).apply_turn(params, &request.workspace);
+        CodexSecurity::new(request.execution_mode, &request.access)
+            .apply_turn(params, &request.workspace);
     }
 
     fn secure(mut params: Value, request: &BackendRequest) -> Value {
@@ -333,7 +425,8 @@ impl CodexBackend {
     }
 
     fn secure_thread(mut params: Value, request: &BackendRequest) -> Value {
-        CodexSecurity::new(request.execution_mode, &request.access).apply_thread(&mut params, &request.workspace);
+        CodexSecurity::new(request.execution_mode, &request.access)
+            .apply_thread(&mut params, &request.workspace);
         params["config"]["agents.enabled"] = json!(false);
         params
     }
@@ -421,10 +514,7 @@ impl CodexBackend {
         let mut retries_remaining = 4;
         loop {
             let id = process
-                .send_request(
-                    "thread/resume",
-                    json!({ "threadId": thread_id }),
-                )
+                .send_request("thread/resume", json!({ "threadId": thread_id }))
                 .await
                 .context("load Codex thread for background terminal request")?;
             let (message, result) = loop {
@@ -488,8 +578,8 @@ impl CodexBackend {
             })
             .filter_map(|skill| {
                 Some(SkillDefinition {
-                    scope:None,
-                    resource_id:None,
+                    scope: None,
+                    resource_id: None,
                     name: skill.get("name")?.as_str()?.to_owned(),
                     description: skill
                         .get("description")
@@ -675,8 +765,9 @@ impl CodexBackend {
                     .unwrap_or("unknown")
                     .to_owned();
                 Some(McpDefinition {
-                    scope:None, source_path:None,
-                    resource_id:None,
+                    scope: None,
+                    source_path: None,
+                    resource_id: None,
                     name,
                     transport,
                     enabled,
@@ -841,7 +932,10 @@ impl CodexBackend {
             let received = process.receive_message().await?;
             let message = match received {
                 json_rpc::ReceivedMessage::Provider(message) => message,
-                completed => { process.publish_received(completed, output).await?; continue; }
+                completed => {
+                    process.publish_received(completed, output).await?;
+                    continue;
+                }
             };
             if let Some(result) =
                 CodexJsonRpc::request_result(&message, request_id, "thread/goal/set")
@@ -924,7 +1018,10 @@ impl CodexBackend {
             let received = process.receive_message().await?;
             let message = match received {
                 json_rpc::ReceivedMessage::Provider(message) => message,
-                completed => { process.publish_received(completed, output).await?; continue; }
+                completed => {
+                    process.publish_received(completed, output).await?;
+                    continue;
+                }
             };
             if let Some(response) = CodexJsonRpc::request_result(&message, request_id, "turn/start")
             {
@@ -941,10 +1038,15 @@ impl CodexBackend {
                 process.set_activity_publication(true);
                 if !provider_turn_started {
                     // Acknowledged input can join a turn whose start event preceded this request.
-                    process.publish_message(json!({
-                        "method": "turn/started",
-                        "params": { "threadId": thread_id, "turn": { "id": turn_id } }
-                    }), output).await?;
+                    process
+                        .publish_message(
+                            json!({
+                                "method": "turn/started",
+                                "params": { "threadId": thread_id, "turn": { "id": turn_id } }
+                            }),
+                            output,
+                        )
+                        .await?;
                 }
                 let mut admitted_message_list = Vec::new();
                 let mut admitted = continuing_exchange;
@@ -957,7 +1059,9 @@ impl CodexBackend {
                         message.pointer("/params/threadId").and_then(Value::as_str);
                     if message_thread == Some(thread_id) && message_turn == Some(turn_id) {
                         admitted = true;
-                        provider_turn_started |= message.get("method").and_then(Value::as_str)
+                        provider_turn_started |= message
+                            .get("method")
+                            .and_then(Value::as_str)
                             .is_some_and(|method| method.starts_with("item/"));
                     } else if !admitted
                         || (message_thread == Some(thread_id) && message_turn.is_some())
@@ -979,23 +1083,54 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
-    fn checkpoint_tool_gate(&self) -> bool { true }
+    fn checkpoint_tool_gate(&self) -> bool {
+        true
+    }
 
-    async fn reconcile_settings(&self, request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
+    async fn reconcile_settings(
+        &self,
+        request: BackendCatalogRequest,
+        setting: &crate::settings::PortableSettings,
+    ) -> Result<()> {
         if self.settings_root.is_none() {
-            anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "Codex resource configuration requires the Forge settings store");
+            anyhow::ensure!(
+                setting.skill.is_empty() && setting.mcp.is_empty(),
+                "Codex resource configuration requires the Forge settings store"
+            );
             return Ok(());
         }
-        let next = Arc::new(CodexResources::new(self.settings_root.as_ref().expect("settings root checked"), &request, self.command.clone())?);
+        let next = Arc::new(CodexResources::new(
+            self.settings_root.as_ref().expect("settings root checked"),
+            &request,
+            self.command.clone(),
+        )?);
         self.cleanup_execution(&request.runtime_key()?).await?;
-        self.connection_by_session.lock().await.remove(&request.runtime_key()?);
-        if let Some(resources) = self.resource_by_session.lock().await.remove(&request.runtime_key()?) {
+        self.connection_by_session
+            .lock()
+            .await
+            .remove(&request.runtime_key()?);
+        if let Some(resources) = self
+            .resource_by_session
+            .lock()
+            .await
+            .remove(&request.runtime_key()?)
+        {
             resources.runtime.shutdown().await?;
         }
-        self.resource_by_session.lock().await.insert(request.runtime_key()?,next);
+        self.resource_by_session
+            .lock()
+            .await
+            .insert(request.runtime_key()?, next);
         let backend_request = Self::catalog_backend_request(&request);
-        let (mut process,mut output) = self.catalog_process(&request).await?;
-        self.load_thread(&mut process,&mut output,&backend_request,true,Vec::new()).await?;
+        let (mut process, mut output) = self.catalog_process(&request).await?;
+        self.load_thread(
+            &mut process,
+            &mut output,
+            &backend_request,
+            true,
+            Vec::new(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1007,11 +1142,15 @@ impl Backend for CodexBackend {
         reasoning_effort: Option<&str>,
         history: &str,
     ) -> Result<String> {
-        self.trace.record(&request.harness_session_id, "codex.generation.request", json!({
-            "purpose": purpose.name(),
-            "model":model,
-            "reasoning_effort":reasoning_effort,
-        }));
+        self.trace.record(
+            &request.harness_session_id,
+            "codex.generation.request",
+            json!({
+                "purpose": purpose.name(),
+                "model":model,
+                "reasoning_effort":reasoning_effort,
+            }),
+        );
         let (mut process, mut output) = self.catalog_process(&request).await?;
         text_generation::generate(
             &mut process,
@@ -1048,7 +1187,10 @@ impl Backend for CodexBackend {
         mut request: BackendCatalogRequest,
     ) -> Result<super::terminal::TerminalSnapshot> {
         let runtime_key = request.runtime_key()?;
-        request.backend_session_id = self.active_session_id_for(&runtime_key).await.or(request.backend_session_id);
+        request.backend_session_id = self
+            .active_session_id_for(&runtime_key)
+            .await
+            .or(request.backend_session_id);
         let Some(thread_id) = request.backend_session_id.clone() else {
             return Ok(super::terminal::TerminalSnapshot {
                 supported: true,
@@ -1056,52 +1198,72 @@ impl Backend for CodexBackend {
                 terminal: Vec::new(),
             });
         };
-        let slot = self.terminal_connection_by_session.lock().await
-            .entry(runtime_key).or_insert_with(|| Arc::new(Mutex::new(None))).clone();
+        let slot = self
+            .terminal_connection_by_session
+            .lock()
+            .await
+            .entry(runtime_key)
+            .or_insert_with(|| Arc::new(Mutex::new(None)))
+            .clone();
         let mut connection = slot.lock().await;
-        if connection.as_ref().is_none_or(|connection| connection.thread_id != thread_id) {
+        if connection
+            .as_ref()
+            .is_none_or(|connection| connection.thread_id != thread_id)
+        {
             *connection = None;
-            let Some((process, output, thread_id)) = self.terminal_connection(request).await? else {
+            let Some((process, output, thread_id)) = self.terminal_connection(request).await?
+            else {
                 anyhow::bail!("Codex thread disappeared while opening terminal inventory");
             };
-            *connection = Some(TerminalConnection { process, output, thread_id });
+            *connection = Some(TerminalConnection {
+                process,
+                output,
+                thread_id,
+            });
         }
-        let TerminalConnection { process, output, thread_id } = connection.as_mut().unwrap();
+        let TerminalConnection {
+            process,
+            output,
+            thread_id,
+        } = connection.as_mut().unwrap();
         let result = async {
-        let mut snapshot = super::terminal::TerminalSnapshot {
-            supported: true,
-            starting: false,
-            terminal: Vec::new(),
-        };
-        let mut cursor: Option<String> = None;
-        let mut seen_cursors = std::collections::HashSet::new();
-        loop {
-            let result = process
-                .request(
-                    "thread/backgroundTerminals/list",
-                    json!({"threadId": thread_id, "limit": 100, "cursor": cursor}),
-                    output,
-                )
-                .await?;
-            snapshot
-                .terminal
-                .extend(super::terminal::TerminalSnapshot::parse(&result, false)?.terminal);
-            let next = result
-                .get("nextCursor")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            let Some(next) = next else {
-                break;
+            let mut snapshot = super::terminal::TerminalSnapshot {
+                supported: true,
+                starting: false,
+                terminal: Vec::new(),
             };
-            anyhow::ensure!(
-                seen_cursors.insert(next.clone()),
-                "background terminal pagination did not advance"
-            );
-            cursor = Some(next);
+            let mut cursor: Option<String> = None;
+            let mut seen_cursors = std::collections::HashSet::new();
+            loop {
+                let result = process
+                    .request(
+                        "thread/backgroundTerminals/list",
+                        json!({"threadId": thread_id, "limit": 100, "cursor": cursor}),
+                        output,
+                    )
+                    .await?;
+                snapshot
+                    .terminal
+                    .extend(super::terminal::TerminalSnapshot::parse(&result, false)?.terminal);
+                let next = result
+                    .get("nextCursor")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                let Some(next) = next else {
+                    break;
+                };
+                anyhow::ensure!(
+                    seen_cursors.insert(next.clone()),
+                    "background terminal pagination did not advance"
+                );
+                cursor = Some(next);
+            }
+            Ok(snapshot)
         }
-        Ok(snapshot)
-        }.await;
-        if result.is_err() { *connection = None; }
+        .await;
+        if result.is_err() {
+            *connection = None;
+        }
         result
     }
 
@@ -1131,8 +1293,14 @@ impl Backend for CodexBackend {
         mut request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Codex)?;
-        let _directories = self.permission_coordinator.directories(self.settings_root.as_deref(), &request)?;
+        let skills = self.permission_coordinator.skills(
+            self.settings_root.as_deref(),
+            &request,
+            super::BackendKind::Codex,
+        )?;
+        let _directories = self
+            .permission_coordinator
+            .directories(self.settings_root.as_deref(), &request)?;
         let event_sink = skills.sink(event_sink);
         let mut active_steering = self
             .activate_turn_control(&request.runtime_key()?, event_sink.clone())
@@ -1160,7 +1328,8 @@ impl Backend for CodexBackend {
                 .then(|| super::mock_plan_document_from_prompt(&request_text))
                 .flatten();
         }
-        let dynamic_tool_definition = ControlToolRegistry.definition_list_for_context(Some(&control_context),request.owner()?.is_root());
+        let dynamic_tool_definition = ControlToolRegistry
+            .definition_list_for_context(Some(&control_context), request.owner()?.is_root());
         process.set_control_context(control_context).await;
         request.model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
@@ -1182,16 +1351,29 @@ impl Backend for CodexBackend {
                 })
             })
             .collect::<Vec<_>>();
-        let thread_id = self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?;
+        let thread_id = self
+            .load_thread(process, &mut output, &request, false, dynamic_tool_list)
+            .await?;
         if request.backend_session_id.is_some()
-            && let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref())
+            && let Some(gate) = request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.checkpoint.as_ref())
             && !gate.ready()
         {
             // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
-            let terminals = process.request("thread/backgroundTerminals/list",
-                json!({"threadId":thread_id,"limit":1}), &mut output).await
+            let terminals = process
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId":thread_id,"limit":1}),
+                    &mut output,
+                )
+                .await
                 .and_then(|value| super::terminal::TerminalSnapshot::parse(&value, false));
-            if !terminals.as_ref().is_ok_and(|snapshot| snapshot.terminal.is_empty()) {
+            if !terminals
+                .as_ref()
+                .is_ok_and(|snapshot| snapshot.terminal.is_empty())
+            {
                 gate.wait().await?;
             }
         }
@@ -1224,10 +1406,16 @@ impl Backend for CodexBackend {
         }
         let mut input = crate::attachment::codex_input(prompt, request.input.attachments()).await?;
         if let BackendInput::Skill { name, .. } = &request.input {
-            let catalog = if let Some(resources) = self.resources(&Self::catalog_from_request(&request)).await? {
+            let catalog = if let Some(resources) = self
+                .resources(&Self::catalog_from_request(&request))
+                .await?
+            {
                 resources.catalog.skill.clone()
-            } else { Self::skill_catalog(process, &mut output, &request.workspace, true).await? };
-            let skill = catalog.into_iter()
+            } else {
+                Self::skill_catalog(process, &mut output, &request.workspace, true).await?
+            };
+            let skill = catalog
+                .into_iter()
                 .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
                 .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
             let path = skill
@@ -1237,21 +1425,26 @@ impl Backend for CodexBackend {
         }
         let native_resume = request.mode == PromptMode::GoalContinuation
             && request_text.lines().next() == Some("/goal resume");
-        let resume_message = native_resume.then(|| request_text.split_once("\n\nAdditional user instructions:\n")
-            .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
-            .map(|(_, text)| text.to_owned())).flatten();
+        let resume_message = native_resume
+            .then(|| {
+                request_text
+                    .split_once("\n\nAdditional user instructions:\n")
+                    .or_else(|| request_text.split_once("\n\nHarness transition:\n"))
+                    .map(|(_, text)| text.to_owned())
+            })
+            .flatten();
         let admission = if native_resume {
             self.resume_native_goal_turn(process, &mut output, &request, &thread_id)
                 .await?
         } else {
-            Some(self
-                .start_turn(
+            Some(
+                self.start_turn(
                     process,
                     &mut output,
                     &request,
-                        &thread_id,
-                        false,
-                        Self::with_model(
+                    &thread_id,
+                    false,
+                    Self::with_model(
                         Self::secure(
                             json!({
                                 "threadId": thread_id,
@@ -1265,7 +1458,8 @@ impl Backend for CodexBackend {
                         &request.model,
                     ),
                 )
-                .await?)
+                .await?,
+            )
         };
         let turn_id = if let Some((turn, provider_turn_started, observed_message_list)) = admission
         {
@@ -1295,7 +1489,9 @@ impl Backend for CodexBackend {
                 let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
                 delivered.context("deliver instructions to resumed native goal")?;
                 completed?
-            } else { completion.await? };
+            } else {
+                completion.await?
+            };
             let status = completed
                 .pointer("/turn/status")
                 .or_else(|| completed.get("status"))
@@ -1314,13 +1510,16 @@ impl Backend for CodexBackend {
                     .unwrap_or(current_turn_id),
             )
         } else {
-            anyhow::ensure!(resume_message.is_none(), "native goal settled before receiving the resume message");
+            anyhow::ensure!(
+                resume_message.is_none(),
+                "native goal settled before receiving the resume message"
+            );
             None
         };
-        self.active_turn_by_session.lock().await.insert(
-            request.runtime_key()?,
-            CodexTurnState::Completed,
-        );
+        self.active_turn_by_session
+            .lock()
+            .await
+            .insert(request.runtime_key()?, CodexTurnState::Completed);
         if let Some(turn_id) = turn_id {
             self.completed_turn_by_session
                 .lock()
@@ -1342,14 +1541,33 @@ impl Backend for CodexBackend {
             source_request.backend_session_id.clone(),
             request.checkpoint_id.clone(),
         ) {
-            (Some(source), Some(last_turn_id)) => ("thread/fork",
-                Self::fork_parameters(source, last_turn_id, &source_request)),
-            _ => ("thread/start", Self::with_model(Self::secure_thread(
-                json!({"cwd":source_request.workspace,"historyMode":"legacy"}),
-                &source_request), &source_request.model)),
+            (Some(source), Some(last_turn_id)) => (
+                "thread/fork",
+                Self::fork_parameters(source, last_turn_id, &source_request),
+            ),
+            _ => (
+                "thread/start",
+                Self::with_model(
+                    Self::secure_thread(
+                        json!({"cwd":source_request.workspace,"historyMode":"legacy"}),
+                        &source_request,
+                    ),
+                    &source_request.model,
+                ),
+            ),
         };
-        let parameter = self.configured_parameters(parameter,&source_request,&mut connection.process,&mut output).await?;
-        let result = connection.process.request(method,parameter,&mut output).await?;
+        let parameter = self
+            .configured_parameters(
+                parameter,
+                &source_request,
+                &mut connection.process,
+                &mut output,
+            )
+            .await?;
+        let result = connection
+            .process
+            .request(method, parameter, &mut output)
+            .await?;
         connection.timing.push(BackendTimingRecord {
             phase: "codex.thread_fork".into(),
             duration_ms: fork_started.elapsed().as_secs_f64() * 1000.0,
@@ -1361,7 +1579,10 @@ impl Backend for CodexBackend {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("Codex fork response omitted thread id")?;
-        if let Some(resources) = self.resources(&Self::catalog_from_request(&source_request)).await? {
+        if let Some(resources) = self
+            .resources(&Self::catalog_from_request(&source_request))
+            .await?
+        {
             resources.retain_thread(&backend_session_id).await;
         }
         let timing = connection.timing.clone();
@@ -1379,8 +1600,6 @@ impl Backend for CodexBackend {
         self.steering_lane(session_id).await.steer(input).await
     }
 
-
-
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
         self.steering_lane(session_id)
             .await
@@ -1389,7 +1608,10 @@ impl Backend for CodexBackend {
     }
 
     async fn cancel_session(&self, session_id: &str) -> Result<()> {
-        self.steering_lane(session_id).await.cleanup_execution().await?;
+        self.steering_lane(session_id)
+            .await
+            .cleanup_execution()
+            .await?;
         self.connection_by_session.lock().await.remove(session_id);
         Ok(())
     }
@@ -1414,7 +1636,8 @@ impl Backend for CodexBackend {
             ..BackendOutput::default()
         };
         let mut process = self.connect(&request, &mut output, None).await?.process;
-        self.load_thread(&mut process,&mut output,&request,false,Vec::new()).await?;
+        self.load_thread(&mut process, &mut output, &request, false, Vec::new())
+            .await?;
         output.metrics.context_usage = None;
         process
             .request(
@@ -1448,7 +1671,9 @@ impl Backend for CodexBackend {
     }
 
     async fn skill_list(&self, request: BackendCatalogRequest) -> Result<Vec<SkillDefinition>> {
-        if let Some(resources) = self.resources(&request).await? { return Ok(resources.catalog.skill.clone()); }
+        if let Some(resources) = self.resources(&request).await? {
+            return Ok(resources.catalog.skill.clone());
+        }
         let (mut process, mut output) = self.catalog_process(&request).await?;
         Self::skill_catalog(&mut process, &mut output, &request.workspace, true).await
     }
@@ -1459,7 +1684,10 @@ impl Backend for CodexBackend {
         name: &str,
         enabled: bool,
     ) -> Result<CatalogMutation> {
-        anyhow::ensure!(self.settings_root.is_none(), "Managed skill selection must use the shared settings operation");
+        anyhow::ensure!(
+            self.settings_root.is_none(),
+            "Managed skill selection must use the shared settings operation"
+        );
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let result = process
             .request(
@@ -1492,29 +1720,50 @@ impl Backend for CodexBackend {
         })
     }
 
-    async fn mcp_configuration(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
-        if let Some(resources) = self.resources(&request).await? { return Ok(resources.catalog.mcp.clone()); }
+    async fn mcp_configuration(
+        &self,
+        request: BackendCatalogRequest,
+    ) -> Result<Vec<McpDefinition>> {
+        if let Some(resources) = self.resources(&request).await? {
+            return Ok(resources.catalog.mcp.clone());
+        }
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        let config = process.request(
-            "config/read",
-            json!({ "cwd": request.workspace, "includeLayers": false }),
-            &mut output,
-        ).await?;
+        let config = process
+            .request(
+                "config/read",
+                json!({ "cwd": request.workspace, "includeLayers": false }),
+                &mut output,
+            )
+            .await?;
         Ok(Self::parse_mcp_catalog(&Value::Null, &config))
     }
 
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let resources = self.resources(&request).await?;
         let thread = if let Some(resources) = resources.as_ref() {
-            request.backend_session_id.clone().or(resources.thread().await)
-        } else { request.backend_session_id.clone() };
-        if resources.is_some() && thread.is_none() { return self.mcp_configuration(request).await; }
+            request
+                .backend_session_id
+                .clone()
+                .or(resources.thread().await)
+        } else {
+            request.backend_session_id.clone()
+        };
+        if resources.is_some() && thread.is_none() {
+            return self.mcp_configuration(request).await;
+        }
         let (mut process, mut output) = self.catalog_process(&request).await?;
         if let Some(resources) = resources.as_ref() {
             if resources.thread().await != thread {
                 let mut backend_request = Self::catalog_backend_request(&request);
                 backend_request.backend_session_id = thread.clone();
-                self.load_thread(&mut process,&mut output,&backend_request,true,Vec::new()).await?;
+                self.load_thread(
+                    &mut process,
+                    &mut output,
+                    &backend_request,
+                    true,
+                    Vec::new(),
+                )
+                .await?;
             }
         }
         let mut server_list = Vec::new();
@@ -1547,18 +1796,19 @@ impl Backend for CodexBackend {
         }
         let config = if let Some(resources) = resources.as_ref() {
             json!({"config":resources.configure(&mut process,&mut output,&request.workspace).await?})
-        } else { process
-            .request(
-                "config/read",
-                json!({ "cwd": request.workspace, "includeLayers": false }),
-                &mut output,
-            )
-            .await? };
-        let parsed = Self::parse_mcp_catalog(
-            &json!({ "data": server_list }),
-            &config,
-        );
-        Ok(resources.map(|resources|resources.mcp(parsed.clone())).unwrap_or(parsed))
+        } else {
+            process
+                .request(
+                    "config/read",
+                    json!({ "cwd": request.workspace, "includeLayers": false }),
+                    &mut output,
+                )
+                .await?
+        };
+        let parsed = Self::parse_mcp_catalog(&json!({ "data": server_list }), &config);
+        Ok(resources
+            .map(|resources| resources.mcp(parsed.clone()))
+            .unwrap_or(parsed))
     }
 
     async fn set_mcp_enabled(
@@ -1567,7 +1817,10 @@ impl Backend for CodexBackend {
         name: &str,
         enabled: bool,
     ) -> Result<CatalogMutation> {
-        anyhow::ensure!(self.settings_root.is_none(), "Managed MCP selection must use the shared settings operation");
+        anyhow::ensure!(
+            self.settings_root.is_none(),
+            "Managed MCP selection must use the shared settings operation"
+        );
         let restart_required = self.has_active_turn(&request.runtime_key()?).await;
         let config_name = Self::quoted_config_segment(name);
         let (mut process, mut output) = self.catalog_process(&request).await?;
@@ -1725,35 +1978,90 @@ mod test {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             for pending in [true, false] {
-                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(request["method"], "config/read");
                 let result = json!({"config":{"hooks":{"PreToolUse":[{"matcher":"user", "hooks":[
                     {"type":"command","command":"user-hook"}]}], "PostToolUse":null}}});
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).await.unwrap();
-                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(request["method"], "thread/start");
-                let hooks = request["params"]["config"]["hooks"]["PreToolUse"].as_array().unwrap();
+                let hooks = request["params"]["config"]["hooks"]["PreToolUse"]
+                    .as_array()
+                    .unwrap();
                 assert_eq!(hooks.len(), if pending { 2 } else { 1 });
                 assert_eq!(hooks[0]["hooks"][0]["command"], "user-hook");
-                if pending { assert!(hooks[1]["hooks"][0]["command"].as_str().unwrap().contains(" checkpoint-wait ")); }
+                if pending {
+                    assert!(
+                        hooks[1]["hooks"][0]["command"]
+                            .as_str()
+                            .unwrap()
+                            .contains(" checkpoint-wait ")
+                    );
+                }
                 assert_eq!(request["params"]["config"]["features.hooks"], true);
-                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"thread":{"id":"checkpoint-thread"}}}).to_string().into())).await.unwrap();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":{"thread":{"id":"checkpoint-thread"}}})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
             }
         });
         let backend = CodexBackend::new(vec!["unused".into()])?;
         let mut request = CodexBackend::catalog_backend_request(&BackendCatalogRequest {
-            execution_owner:None, harness_session_id:"checkpoint".into(), workspace:workspace.clone(),
-            access:Default::default(), execution_mode:PermissionMode::Read, backend_session_id:None,
+            execution_owner: None,
+            harness_session_id: "checkpoint".into(),
+            workspace: workspace.clone(),
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: None,
         });
         let gate = crate::checkpoint::ToolGate::new()?;
         let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
         context.checkpoint = Some(gate.clone());
         request.control_context = Some(context);
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
-            PermissionCoordinator::transient(&workspace)?, None, Arc::new(TraceStore::open(fixture.path())?), "checkpoint".into()).await?;
-        backend.load_thread(&mut process, &mut BackendOutput::default(), &request, true, Vec::new()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?,
+            None,
+            Arc::new(TraceStore::open(fixture.path())?),
+            "checkpoint".into(),
+        )
+        .await?;
+        backend
+            .load_thread(
+                &mut process,
+                &mut BackendOutput::default(),
+                &request,
+                true,
+                Vec::new(),
+            )
+            .await?;
         gate.complete(Ok(()))?;
-        backend.load_thread(&mut process, &mut BackendOutput::default(), &request, true, Vec::new()).await?;
+        backend
+            .load_thread(
+                &mut process,
+                &mut BackendOutput::default(),
+                &request,
+                true,
+                Vec::new(),
+            )
+            .await?;
         server.await?;
         Ok(())
     }
@@ -1866,10 +2174,17 @@ mod test {
         let permission = PermissionCoordinator::transient(&workspace)?;
         let trace = Arc::new(TraceStore::open(fixture.path())?);
         let backend = CodexBackend::new_with_permission_coordinator(
-            vec!["unused-provider".into()], permission.clone(), trace.clone(), None)?;
+            vec!["unused-provider".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
         let request = BackendCatalogRequest {
-            execution_owner: None, harness_session_id: "session".into(), workspace: workspace.clone(),
-            access: Default::default(), execution_mode: PermissionMode::Read,
+            execution_owner: None,
+            harness_session_id: "session".into(),
+            workspace: workspace.clone(),
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
             backend_session_id: Some("provider-thread".into()),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
@@ -1877,9 +2192,14 @@ mod test {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for (cursor, next, process_id) in [(Value::Null, json!("next"), "one"),
-                (json!("next"), Value::Null, "two"), (Value::Null, Value::Null, "three")] {
-                let message: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            for (cursor, next, process_id) in [
+                (Value::Null, json!("next"), "one"),
+                (json!("next"), Value::Null, "two"),
+                (Value::Null, Value::Null, "three"),
+            ] {
+                let message: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
                 assert_eq!(message["method"], "thread/backgroundTerminals/list");
                 assert_eq!(message["params"]["threadId"], "provider-thread");
                 assert_eq!(message["params"]["cursor"], cursor);
@@ -1888,15 +2208,34 @@ mod test {
                 }).to_string().into())).await.unwrap();
             }
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
-            permission, None, trace, "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
         process.set_activity_publication(false);
-        backend.terminal_connection_by_session.lock().await.insert(request.runtime_key()?,
+        backend.terminal_connection_by_session.lock().await.insert(
+            request.runtime_key()?,
             Arc::new(Mutex::new(Some(TerminalConnection {
-                process, output: BackendOutput::default(), thread_id: "provider-thread".into(),
-            }))));
+                process,
+                output: BackendOutput::default(),
+                thread_id: "provider-thread".into(),
+            }))),
+        );
         let first = backend.background_terminals(request.clone()).await?;
-        assert_eq!(first.terminal.iter().map(|terminal| terminal.id.as_str()).collect::<Vec<_>>(), ["one", "two"]);
+        assert_eq!(
+            first
+                .terminal
+                .iter()
+                .map(|terminal| terminal.id.as_str())
+                .collect::<Vec<_>>(),
+            ["one", "two"]
+        );
         let second = backend.background_terminals(request).await?;
         assert_eq!(second.terminal[0].id, "three");
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
@@ -2129,7 +2468,7 @@ mod test {
                 vec!["unused".into()],
                 permission.clone(),
                 trace.clone(),
-                            None,
+                None,
             )?;
             *backend.default_model.lock().await = Some("gpt-catalog-default".into());
             let expected_model = if default_model {
@@ -2142,17 +2481,31 @@ mod test {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                for method in [if resumed { "thread/resume" } else { "thread/start" }, "turn/start"] {
-                    let request: Value =
-                        serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                            .unwrap();
+                for method in [
+                    if resumed {
+                        "thread/resume"
+                    } else {
+                        "thread/start"
+                    },
+                    "turn/start",
+                ] {
+                    let request: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
                     assert_eq!(request["method"], method);
                     assert_eq!(request["params"]["model"], expected_model);
-                    assert_eq!(request["params"]["serviceTier"], serde_json::to_value(service_tier).unwrap());
+                    assert_eq!(
+                        request["params"]["serviceTier"],
+                        serde_json::to_value(service_tier).unwrap()
+                    );
                     if method == "turn/start" {
                         assert_eq!(request["params"]["summary"], "concise");
                     } else {
-                        assert_eq!(request["params"]["config"]["model_reasoning_summary"], "concise");
+                        assert_eq!(
+                            request["params"]["config"]["model_reasoning_summary"],
+                            "concise"
+                        );
                     }
                     let mut messages = vec![
                         json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
@@ -2160,14 +2513,18 @@ mod test {
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
                     ];
                     if method != "turn/start" {
-                        let instructions = request["params"]["developerInstructions"].as_str().unwrap();
-                        assert!(instructions.contains("Approval mode, filesystem access, and task are independent"));
+                        let instructions =
+                            request["params"]["developerInstructions"].as_str().unwrap();
+                        assert!(instructions.contains(
+                            "Approval mode, filesystem access, and task are independent"
+                        ));
                         assert!(instructions.contains("Effective permission: Read."));
                         assert!(instructions.contains("Answer the current user request"));
                         messages.push(
                             json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
                         );
-                        messages.push(json!({"id":request["id"],"result":{"thread":{"id":"parent"}}}));
+                        messages
+                            .push(json!({"id":request["id"],"result":{"thread":{"id":"parent"}}}));
                     } else {
                         messages.extend([
                             json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"current","status":"inProgress"}}}),
@@ -2180,8 +2537,10 @@ mod test {
                         ]);
                     }
                     for message in messages {
-                        if !sends_started && message["method"] == "turn/started"
-                            && message["params"]["turn"]["id"] == "current" {
+                        if !sends_started
+                            && message["method"] == "turn/started"
+                            && message["params"]["turn"]["id"] == "current"
+                        {
                             continue;
                         }
                         socket
@@ -2220,7 +2579,12 @@ mod test {
                         workspace,
                         input: BackendInput::from_text("new prompt"),
                         mode: PromptMode::Chat,
-                        model: if default_model { "default" } else { expected_model }.into(),
+                        model: if default_model {
+                            "default"
+                        } else {
+                            expected_model
+                        }
+                        .into(),
                         effort: "medium".into(),
                         context_window: None,
                         service_tier,
@@ -2240,11 +2604,22 @@ mod test {
             assert!(encoded.contains("CURRENT"));
             assert!(!encoded.contains("STALE"));
             assert!(!encoded.contains("\"turn_id\":\"old\""));
-            let start = output.event.iter().position(|event|
-                event.turn_boundary == Some(crate::backend::TurnBoundary::Started)).unwrap();
-            let answer = output.event.iter().position(|event|
-                event.text.as_deref() == Some("CURRENT")).unwrap();
-            assert!(start < answer, "acknowledged turns must own their response without another start notification");
+            let start = output
+                .event
+                .iter()
+                .position(|event| {
+                    event.turn_boundary == Some(crate::backend::TurnBoundary::Started)
+                })
+                .unwrap();
+            let answer = output
+                .event
+                .iter()
+                .position(|event| event.text.as_deref() == Some("CURRENT"))
+                .unwrap();
+            assert!(
+                start < answer,
+                "acknowledged turns must own their response without another start notification"
+            );
             let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
                 "id":"after-cancel", "session_id":"session", "agent_id":"primary", "ordinal":2,
                 "prompt":"what is this repo?", "kind":"chat", "state":"running",
@@ -2260,18 +2635,46 @@ mod test {
             exchange.finish(crate::exchange::ExchangeState::Complete, 7000)?;
             let rendered = crate::buffer::projection::project(
                 &crate::timeline::TimelineEntry::Exchange {
-                    id: exchange.id.clone(), created_at_ms: 0, exchange,
-                    check_runs: Vec::new(), agent_by_id: std::collections::HashMap::new(),
-                }, &forge_buffer::width::WidthProfile::default(), false, &std::collections::HashMap::new(), &std::collections::HashMap::new(),
+                    id: exchange.id.clone(),
+                    created_at_ms: 0,
+                    exchange,
+                    check_runs: Vec::new(),
+                    agent_by_id: std::collections::HashMap::new(),
+                },
+                &forge_buffer::width::WidthProfile::default(),
+                false,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
             )?;
-            assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter().any(|text| text.contains("CURRENT"))));
+            assert!(rendered.entry.block.iter().any(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|text| text.contains("CURRENT"))
+            }));
             if !sends_started {
-                println!("ACKNOWLEDGED_TURN_FIXTURE:{}", serde_json::to_string(&rendered.entry.block)?);
+                println!(
+                    "ACKNOWLEDGED_TURN_FIXTURE:{}",
+                    serde_json::to_string(&rendered.entry.block)?
+                );
             }
             backend.cancel_session("another-session").await?;
-            assert!(backend.connection_by_session.lock().await.contains_key("session"));
+            assert!(
+                backend
+                    .connection_by_session
+                    .lock()
+                    .await
+                    .contains_key("session")
+            );
             backend.cancel_session("session").await?;
-            assert!(!backend.connection_by_session.lock().await.contains_key("session"));
+            assert!(
+                !backend
+                    .connection_by_session
+                    .lock()
+                    .await
+                    .contains_key("session")
+            );
             drop(backend);
             tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
         }
@@ -2281,10 +2684,14 @@ mod test {
     #[tokio::test]
     async fn native_resume_adopts_auto_started_turn_without_explicit_start() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        for (before_ack, starts_turn, message_header) in
-            [(true, true, None), (false, true, None), (true, false, None), (false, false, None),
-             (false, true, Some("Additional user instructions")), (false, true, Some("Harness transition"))]
-        {
+        for (before_ack, starts_turn, message_header) in [
+            (true, true, None),
+            (false, true, None),
+            (true, false, None),
+            (false, false, None),
+            (false, true, Some("Additional user instructions")),
+            (false, true, Some("Harness transition")),
+        ] {
             let with_message = message_header.is_some();
             let fixture = tempfile::tempdir()?;
             let workspace = fixture.path().to_string_lossy().into_owned();
@@ -2294,7 +2701,7 @@ mod test {
                 vec!["unused".into()],
                 permission.clone(),
                 trace.clone(),
-                            None,
+                None,
             )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2350,7 +2757,11 @@ mod test {
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"resumed","status":"completed"}}}),
                     ]);
                 }
-                let deferred = if with_message { messages.split_off(messages.len() - 2) } else { Vec::new() };
+                let deferred = if with_message {
+                    messages.split_off(messages.len() - 2)
+                } else {
+                    Vec::new()
+                };
                 messages.push(json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"usageLimited"}}}));
                 if before_ack {
                     messages.push(acknowledgement);
@@ -2364,13 +2775,31 @@ mod test {
                         .unwrap();
                 }
                 if with_message {
-                    let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                    let request: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
                     assert_eq!(request["method"], "turn/steer");
                     assert_eq!(request["params"]["expectedTurnId"], "resumed");
-                    assert_eq!(request["params"]["input"][0]["text"], "Keep the original objective and add tests");
-                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"turnId":"resumed"}}).to_string().into())).await.unwrap();
+                    assert_eq!(
+                        request["params"]["input"][0]["text"],
+                        "Keep the original objective and add tests"
+                    );
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            json!({"id":request["id"],"result":{"turnId":"resumed"}})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
                     for message in deferred {
-                        socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
                     }
                 }
                 if let Some(Ok(message)) = socket.next().await {
@@ -2442,7 +2871,7 @@ mod test {
             vec!["codex".into(), "app-server".into()],
             PermissionCoordinator::transient(fixture.path())?,
             Arc::new(TraceStore::open(fixture.path())?),
-                    None,
+            None,
         )?;
         for clear in [false, true] {
             let mut control = Box::pin(backend.stop_goal_session("session", clear));
@@ -2471,7 +2900,6 @@ mod test {
         }
         Ok(())
     }
-
 
     #[tokio::test]
     async fn distinguishes_an_unsubmitted_cancel_from_a_completed_turn() {

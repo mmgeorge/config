@@ -54,7 +54,10 @@ pub fn read_command_pair(
     limits: CommandLimits,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<(Output, Output)> {
-    ensure!(!limits.timeout.is_zero(), "command timeout must be positive");
+    ensure!(
+        !limits.timeout.is_zero(),
+        "command timeout must be positive"
+    );
     check()?;
     let check = std::cell::RefCell::new(check);
     command_runtime()?.block_on(async {
@@ -147,15 +150,18 @@ fn command_runtime() -> Result<tokio::runtime::Handle> {
     if let Ok(handle) = tokio::runtime::Handle::try_current() {
         return Ok(handle);
     }
-    Ok(RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())
-    }).as_ref()
+    Ok(RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+        .as_ref()
         .map_err(|error| anyhow::anyhow!("start native command runtime: {error}"))?
-        .handle().clone())
+        .handle()
+        .clone())
 }
 
 async fn collect_async(
@@ -342,7 +348,9 @@ async fn read_stream(
             return Ok(output);
         }
         if !diagnostic {
-            output.try_reserve(received).context("reserve command output")?;
+            output
+                .try_reserve(received)
+                .context("reserve command output")?;
             output.extend_from_slice(&chunk[..received]);
         } else {
             let retained = received.min(capacity);

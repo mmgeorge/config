@@ -55,7 +55,11 @@ impl SqliteStore {
     }
 
     /// Commit rollback history and the replacement provider identity together.
-    pub(crate) fn record_rollback(&mut self, session: &crate::session::HarnessSession, roots: &[String]) -> Result<()> {
+    pub(crate) fn record_rollback(
+        &mut self,
+        session: &crate::session::HarnessSession,
+        roots: &[String],
+    ) -> Result<()> {
         use crate::exchange::HistoryDisposition;
         use rusqlite::{TransactionBehavior, params};
         let session_id = &session.id;
@@ -92,18 +96,31 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1",
-            [session_id], |row| row.get(0))?;
-        let stored = super::decode_current_session(&payload)?.context("rollback session is unavailable")?;
-        ensure!(stored.lease_owner == session.lease_owner, "Harness session lease ownership changed");
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [session_id],
+            |row| row.get(0),
+        )?;
+        let stored =
+            super::decode_current_session(&payload)?.context("rollback session is unavailable")?;
+        ensure!(
+            stored.lease_owner == session.lease_owner,
+            "Harness session lease ownership changed"
+        );
         for exchange in updates {
             transaction.execute(
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",
                 params![exchange.id, serde_json::to_string(&exchange)?],
             )?;
         }
-        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
-            params![session.id,super::encode_session(session)?,session.updated_at_ms])?;
+        transaction.execute(
+            "UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            params![
+                session.id,
+                super::encode_session(session)?,
+                session.updated_at_ms
+            ],
+        )?;
         transaction.commit()?;
         Ok(())
     }

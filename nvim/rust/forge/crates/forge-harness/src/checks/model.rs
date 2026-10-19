@@ -120,10 +120,16 @@ pub struct CheckRun {
 impl CheckRun {
     /// Ends an interrupted run once, including cancellation during check preparation.
     pub(crate) fn interrupt(&mut self) {
-        if self.state == CheckState::Interrupted { return; }
+        if self.state == CheckState::Interrupted {
+            return;
+        }
         self.state = CheckState::Interrupted;
         self.completed_at_ms = Some(super::supervisor::now_ms());
-        self.record(CheckEventKind::Interrupted, None, "Checks interrupted".into());
+        self.record(
+            CheckEventKind::Interrupted,
+            None,
+            "Checks interrupted".into(),
+        );
     }
 
     /// Select the gate result from recorded failures rather than model interpretation.
@@ -250,10 +256,15 @@ impl CheckRun {
         if skipped > 0 {
             summary.push(format!("{skipped} not run"));
         }
-        for (state, label) in [(CheckState::Interrupted, "interrupted"),
-            (CheckState::Blocked, "blocked"), (CheckState::ConfigurationError, "configuration errors")] {
+        for (state, label) in [
+            (CheckState::Interrupted, "interrupted"),
+            (CheckState::Blocked, "blocked"),
+            (CheckState::ConfigurationError, "configuration errors"),
+        ] {
             let total = count(state);
-            if total > 0 { summary.push(format!("{total} {label}")); }
+            if total > 0 {
+                summary.push(format!("{total} {label}"));
+            }
         }
         summary.join(" · ")
     }

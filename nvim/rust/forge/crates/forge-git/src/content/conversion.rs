@@ -224,9 +224,7 @@ impl ConversionSession {
             )?;
             match outcome {
                 ToGitOutcome::Unchanged(_) => None,
-                ToGitOutcome::Buffer(converted) => {
-                    Some(converted.to_vec())
-                }
+                ToGitOutcome::Buffer(converted) => Some(converted.to_vec()),
                 ToGitOutcome::Process(_) => {
                     anyhow::bail!("canonical conversion unexpectedly selected an external process")
                 }
@@ -394,10 +392,7 @@ pub(crate) fn read_info(
     match std::fs::File::open(repository.common_directory.join("info/attributes")) {
         Ok(mut file) => {
             let metadata = file.metadata()?;
-            ensure!(
-                metadata.is_file(),
-                "info attributes must be a regular file"
-            );
+            ensure!(metadata.is_file(), "info attributes must be a regular file");
             Ok(Some(super::read_exact_content(
                 &mut file,
                 usize::try_from(metadata.len()).context("attribute length overflow")?,
@@ -523,13 +518,9 @@ mod tests {
             for name in ["first", "second"] {
                 let path = RepositoryPath::new(name.as_bytes().to_vec()).unwrap();
                 let result = session
-                    .convert(
-                        &local,
-                        &repository,
-                        &path,
-                        b"one\r\n".to_vec(),
-                        &mut || Ok(()),
-                    )
+                    .convert(&local, &repository, &path, b"one\r\n".to_vec(), &mut || {
+                        Ok(())
+                    })
                     .unwrap();
                 let ConversionResult::Ready { bytes, .. } = result else {
                     panic!()

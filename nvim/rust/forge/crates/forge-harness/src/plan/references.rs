@@ -69,8 +69,15 @@ impl PlanReferenceIndex {
     }
 
     /// Index proposed usages and introduced identities without consulting uncaptured callers.
-    pub(crate) fn design(design: &super::DeclarationDesign, workspace: &std::path::Path) -> Result<Self> {
-        Self::extract(design, false, DeclarationResolver::planned(workspace, design, false)?)
+    pub(crate) fn design(
+        design: &super::DeclarationDesign,
+        workspace: &std::path::Path,
+    ) -> Result<Self> {
+        Self::extract(
+            design,
+            false,
+            DeclarationResolver::planned(workspace, design, false)?,
+        )
     }
 
     fn extract(
@@ -97,12 +104,26 @@ impl PlanReferenceIndex {
         let mut lua_function = BTreeMap::<(String, String), (u32, u32)>::new();
         let mut lua_index = BTreeMap::new();
         for (path, text) in files.iter().filter(|(path, _)| path.ends_with(".lua")) {
-            let index = std::sync::Arc::new(DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?);
+            let index = std::sync::Arc::new(
+                DeclarationIndex::extract(path, text)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+            );
             for symbol in &index.symbol {
-                lua_function.insert((path.clone(), symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join(".")), (symbol.position.line, symbol.position.column));
+                lua_function.insert(
+                    (
+                        path.clone(),
+                        symbol
+                            .scope
+                            .iter()
+                            .chain(std::iter::once(&symbol.name))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    ),
+                    (symbol.position.line, symbol.position.column),
+                );
             }
             lua_index.insert(path.clone(), index);
-
         }
         for (path, text) in &files {
             if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
@@ -110,16 +131,44 @@ impl PlanReferenceIndex {
             }
             let index = match resolver.index(path) {
                 Some(index) => index,
-                None => match lua_index.get(path) { Some(index) => index.clone(), None => std::sync::Arc::new(DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?) },
+                None => match lua_index.get(path) {
+                    Some(index) => index.clone(),
+                    None => std::sync::Arc::new(
+                        DeclarationIndex::extract(path, text)
+                            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                    ),
+                },
             };
             if !baseline {
-                let origin = design.moved.iter().find(|(_, destination)| *destination == path).map(|(source, _)| source).unwrap_or(path);
-                let previous = design.baseline.get(origin).map(|file| DeclarationIndex::extract(origin, &file.text)).transpose().map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                let existing = previous.iter().flat_map(|index| &index.symbol).map(symbol_key).collect::<BTreeSet<_>>();
-                if let Some(file) = design.baseline.get(origin) { output.baseline_digest.insert(origin.clone(), super::digest(file.text.as_bytes())); }
+                let origin = design
+                    .moved
+                    .iter()
+                    .find(|(_, destination)| *destination == path)
+                    .map(|(source, _)| source)
+                    .unwrap_or(path);
+                let previous = design
+                    .baseline
+                    .get(origin)
+                    .map(|file| DeclarationIndex::extract(origin, &file.text))
+                    .transpose()
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let existing = previous
+                    .iter()
+                    .flat_map(|index| &index.symbol)
+                    .map(symbol_key)
+                    .collect::<BTreeSet<_>>();
+                if let Some(file) = design.baseline.get(origin) {
+                    output
+                        .baseline_digest
+                        .insert(origin.clone(), super::digest(file.text.as_bytes()));
+                }
                 for symbol in &index.symbol {
                     if !symbol.parameter && !existing.contains(&symbol_key(symbol)) {
-                        output.introduced.insert((path.clone(), symbol.position.line, symbol.position.column));
+                        output.introduced.insert((
+                            path.clone(),
+                            symbol.position.line,
+                            symbol.position.column,
+                        ));
                     }
                 }
             }
@@ -127,13 +176,30 @@ impl PlanReferenceIndex {
                 if symbol.parameter && symbol.name == "Self" {
                     continue;
                 }
-                if let Some(identity) = if path.ends_with(".lua") { Some(lua_identity(path, &symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("."))) } else {
-                    let resolution = resolver.at(path, symbol.position.line, symbol.position.column);
-                    if let DeclarationResolution::Resolved { destination } = &resolution && destination.module_file {
-                        output.module_source.insert((path.clone(), symbol.position.line, symbol.position.column), destination.path.clone().into());
+                if let Some(identity) = if path.ends_with(".lua") {
+                    Some(lua_identity(
+                        path,
+                        &symbol
+                            .scope
+                            .iter()
+                            .chain(std::iter::once(&symbol.name))
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("."),
+                    ))
+                } else {
+                    let resolution =
+                        resolver.at(path, symbol.position.line, symbol.position.column);
+                    if let DeclarationResolution::Resolved { destination } = &resolution
+                        && destination.module_file
+                    {
+                        output.module_source.insert(
+                            (path.clone(), symbol.position.line, symbol.position.column),
+                            destination.path.clone().into(),
+                        );
                     }
-                    identity(resolution) }
-                {
+                    identity(resolution)
+                } {
                     output.definition.insert(
                         (path.clone(), symbol.position.line, symbol.position.column),
                         (identity, symbol.name.len()),
@@ -141,15 +207,25 @@ impl PlanReferenceIndex {
                 }
             }
             for reference in &index.reference {
-                if let Some(symbol) = if path.ends_with(".lua") { lua_target(path, &reference.path.join("."), &index, &lua_function) } else {
-                    identity(resolver.at(path, reference.position.line, reference.position.column)) }
-                {
+                if let Some(symbol) = if path.ends_with(".lua") {
+                    lua_target(path, &reference.path.join("."), &index, &lua_function)
+                } else {
+                    identity(resolver.at(path, reference.position.line, reference.position.column))
+                } {
                     output.push(
                         path,
                         side,
                         &reference.scope.join("::"),
                         &reference.path.join("::"),
-                        if index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == "Self" && symbol.position == reference.position) { "owner" } else { "type" },
+                        if index.symbol.iter().any(|symbol| {
+                            symbol.parameter
+                                && symbol.name == "Self"
+                                && symbol.position == reference.position
+                        }) {
+                            "owner"
+                        } else {
+                            "type"
+                        },
                         reference.position.line,
                         reference.position.column,
                         symbol,
@@ -212,7 +288,11 @@ impl PlanReferenceIndex {
                         side,
                         &import.scope.join("::"),
                         &import.path.join("::"),
-                        if path.ends_with(".rs") && import.export { "export" } else { "import" },
+                        if path.ends_with(".rs") && import.export {
+                            "export"
+                        } else {
+                            "import"
+                        },
                         import.position.line,
                         import.position.column,
                         symbol,
@@ -245,18 +325,50 @@ impl PlanReferenceIndex {
                     let separator = if path.ends_with(".rs") { "::" } else { "." };
                     let parts = name.split(separator).map(str::to_owned).collect::<Vec<_>>();
                     for prefix in 1..parts.len() {
-                        let target = if path.ends_with(".lua") { lua_target(path, &parts[..prefix].join(separator), &index, &lua_function) } else { identity(resolver.type_target(path, &function.owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &parts[..prefix])) };
+                        let target = if path.ends_with(".lua") {
+                            lua_target(
+                                path,
+                                &parts[..prefix].join(separator),
+                                &index,
+                                &lua_function,
+                            )
+                        } else {
+                            identity(
+                                resolver.type_target(
+                                    path,
+                                    &function
+                                        .owner
+                                        .split(separator)
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>(),
+                                    &parts[..prefix],
+                                ),
+                            )
+                        };
                         if let Some(symbol) = target {
-                            output.push(path, side, &function.owner, &parts[..prefix].join(separator), "body_qualifier", position.line, position.column, symbol);
+                            output.push(
+                                path,
+                                side,
+                                &function.owner,
+                                &parts[..prefix].join(separator),
+                                "body_qualifier",
+                                position.line,
+                                position.column,
+                                symbol,
+                            );
                         }
                     }
                     let symbol = if path.ends_with(".lua") {
                         lua_target(path, name, &index, &lua_function)
                     } else {
                         let resolution = match kind {
-                            super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, &function.owner, name),
+                            super::CallKind::Call | super::CallKind::Callback => {
+                                resolver.callable(path, &function.owner, name)
+                            }
                             super::CallKind::Value => resolver.value(path, &function.owner, name),
-                            super::CallKind::Construct => resolver.construct(path, &function.owner, name),
+                            super::CallKind::Construct => {
+                                resolver.construct(path, &function.owner, name)
+                            }
                             super::CallKind::Property => {
                                 resolver.property(path, &function.owner, name)
                             }
@@ -293,22 +405,44 @@ impl PlanReferenceIndex {
                 }
             }
             for body in calls.get(path).into_iter().flatten() {
-                let Some(super::FunctionBehavior::Algorithm(source)) = &body.behavior else { continue };
-                let Some(function) = callable.get(body.owner.as_str()) else { continue };
+                let Some(super::FunctionBehavior::Algorithm(source)) = &body.behavior else {
+                    continue;
+                };
+                let Some(function) = callable.get(body.owner.as_str()) else {
+                    continue;
+                };
                 let lines = source.lines().collect::<Vec<_>>();
-                for reference in forge_diff::syntax::algorithm_references(source).map_err(|error| anyhow::anyhow!("{error:?}"))? {
-                    let key = (path.clone(), body.owner.clone(), reference.line as u32, reference.column as u32 - 1);
+                for reference in forge_diff::syntax::algorithm_references(source)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                {
+                    let key = (
+                        path.clone(),
+                        body.owner.clone(),
+                        reference.line as u32,
+                        reference.column as u32 - 1,
+                    );
                     let length = reference.segment.len();
                     let width = lines[reference.line - 1].len();
                     let Ok(Some(super::calls::AlgorithmTarget::Reference(target))) =
-                        super::calls::resolve_algorithm_reference(path, function, body, reference) else { continue };
+                        super::calls::resolve_algorithm_reference(path, function, body, reference)
+                    else {
+                        continue;
+                    };
                     let resolution = match target.kind {
-                        super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, &body.owner, &target.name),
-                        super::CallKind::Construct => resolver.construct(path, &body.owner, &target.name),
-                        super::CallKind::Property => resolver.property(path, &body.owner, &target.name),
+                        super::CallKind::Call | super::CallKind::Callback => {
+                            resolver.callable(path, &body.owner, &target.name)
+                        }
+                        super::CallKind::Construct => {
+                            resolver.construct(path, &body.owner, &target.name)
+                        }
+                        super::CallKind::Property => {
+                            resolver.property(path, &body.owner, &target.name)
+                        }
                         super::CallKind::Value => resolver.value(path, &body.owner, &target.name),
                     };
-                    if let Some(symbol) = identity(resolution) { output.algorithm.insert(key, (symbol, length, width)); }
+                    if let Some(symbol) = identity(resolution) {
+                        output.algorithm.insert(key, (symbol, length, width));
+                    }
                 }
             }
             output.declaration.insert(path.clone(), index);
@@ -318,7 +452,9 @@ impl PlanReferenceIndex {
         for (path, index) in &output.declaration {
             let mut capture_by_owner = BTreeMap::new();
             for symbol in &index.symbol {
-                if symbol.parameter { continue; }
+                if symbol.parameter {
+                    continue;
+                }
                 let capture = match symbol.role {
                     DeclarationRole::Callable => "@function",
                     DeclarationRole::Type => "@type",
@@ -327,24 +463,46 @@ impl PlanReferenceIndex {
                     DeclarationRole::Value | DeclarationRole::Variant => "@constant",
                     DeclarationRole::Binding => "@variable",
                 };
-                capture_by_owner.insert(symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("::"), capture);
-                if let Some((identity, _)) = output.definition.get(&(path.clone(), symbol.position.line, symbol.position.column)) {
+                capture_by_owner.insert(
+                    symbol
+                        .scope
+                        .iter()
+                        .chain(std::iter::once(&symbol.name))
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join("::"),
+                    capture,
+                );
+                if let Some((identity, _)) = output.definition.get(&(
+                    path.clone(),
+                    symbol.position.line,
+                    symbol.position.column,
+                )) {
                     capture_by_identity.insert(identity.as_str(), capture);
                 }
             }
             capture_by_path.insert(path.as_str(), capture_by_owner);
         }
         for reference in &mut output.occurrence {
-            let owner = if reference.owner.is_empty() { &reference.name } else { &reference.owner };
+            let owner = if reference.owner.is_empty() {
+                &reference.name
+            } else {
+                &reference.owner
+            };
             let mut prefix = String::new();
             let parts = owner.split("::").collect::<Vec<_>>();
             for (position, part) in parts.iter().enumerate() {
-                if !prefix.is_empty() { prefix.push_str("::"); }
+                if !prefix.is_empty() {
+                    prefix.push_str("::");
+                }
                 prefix.push_str(part);
                 let capture = if reference.owner.is_empty() && position + 1 == parts.len() {
                     capture_by_identity.get(reference.symbol.as_str()).copied()
                 } else {
-                    capture_by_path.get(reference.path.as_str()).and_then(|capture| capture.get(&prefix)).copied()
+                    capture_by_path
+                        .get(reference.path.as_str())
+                        .and_then(|capture| capture.get(&prefix))
+                        .copied()
                 };
                 reference.owner_capture.push(capture);
             }
@@ -526,7 +684,6 @@ impl PlanReferenceIndex {
         Ok(Some(destination))
     }
 
-
     /// Require a unique proposed definition that has no corresponding source declaration.
     pub(crate) fn rename_definition(
         &self,
@@ -545,7 +702,10 @@ impl PlanReferenceIndex {
         let [((path, line, column), _)] = candidates.as_slice() else {
             anyhow::bail!("select a unique symbol defined in the plan");
         };
-        let index = self.declaration.get(path).ok_or_else(|| anyhow::anyhow!("selected declaration index is unavailable"))?;
+        let index = self
+            .declaration
+            .get(path)
+            .ok_or_else(|| anyhow::anyhow!("selected declaration index is unavailable"))?;
         let symbol = index
             .symbol
             .iter()
@@ -574,11 +734,28 @@ impl PlanReferenceIndex {
                 <= 1,
             "merged or overloaded definitions require a unique symbol identity before rename"
         );
-        ensure!(self.introduced.contains(&((*path).clone(), *line, *column)), "only symbols introduced by the plan can be renamed");
-        let origin = design.moved.iter().find(|(_, destination)| *destination == path).map(|(source, _)| source).unwrap_or(path);
-        if let Some(file) = design.baseline.get(origin) && self.baseline_digest.get(origin) != Some(&super::digest(file.text.as_bytes())) {
-            let previous = DeclarationIndex::extract(origin, &file.text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            ensure!(!previous.symbol.iter().any(|previous| symbol_key(previous) == symbol_key(&symbol)), "only symbols introduced by the plan can be renamed");
+        ensure!(
+            self.introduced.contains(&((*path).clone(), *line, *column)),
+            "only symbols introduced by the plan can be renamed"
+        );
+        let origin = design
+            .moved
+            .iter()
+            .find(|(_, destination)| *destination == path)
+            .map(|(source, _)| source)
+            .unwrap_or(path);
+        if let Some(file) = design.baseline.get(origin)
+            && self.baseline_digest.get(origin) != Some(&super::digest(file.text.as_bytes()))
+        {
+            let previous = DeclarationIndex::extract(origin, &file.text)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            ensure!(
+                !previous
+                    .symbol
+                    .iter()
+                    .any(|previous| symbol_key(previous) == symbol_key(&symbol)),
+                "only symbols introduced by the plan can be renamed"
+            );
         }
         Ok(((*path).clone(), symbol))
     }
@@ -628,17 +805,36 @@ impl PlanReferenceIndex {
         let design = output.design.as_mut().unwrap();
         let mut algorithm_edits = BTreeMap::<(String, String), BTreeSet<(u32, u32)>>::new();
         for ((path, owner, line, column), (target, _, _)) in &self.algorithm {
-            if target == identity { algorithm_edits.entry((path.clone(), owner.clone())).or_default().insert((*line, *column)); }
+            if target == identity {
+                algorithm_edits
+                    .entry((path.clone(), owner.clone()))
+                    .or_default()
+                    .insert((*line, *column));
+            }
         }
         for ((path, owner), positions) in algorithm_edits {
-            let body = design.proposed_calls.get_mut(&path).into_iter().flatten().find(|body| body.owner == owner)
+            let body = design
+                .proposed_calls
+                .get_mut(&path)
+                .into_iter()
+                .flatten()
+                .find(|body| body.owner == owner)
                 .ok_or_else(|| anyhow::anyhow!("Algorithm owner is unavailable"))?;
-            let Some(super::FunctionBehavior::Algorithm(source)) = &mut body.behavior else { continue };
+            let Some(super::FunctionBehavior::Algorithm(source)) = &mut body.behavior else {
+                continue;
+            };
             let mut offsets = vec![0];
-            for (offset, byte) in source.bytes().enumerate() { if byte == b'\n' { offsets.push(offset + 1); } }
+            for (offset, byte) in source.bytes().enumerate() {
+                if byte == b'\n' {
+                    offsets.push(offset + 1);
+                }
+            }
             for (line, column) in positions.into_iter().rev() {
                 let start = offsets[line as usize - 1] + column as usize;
-                ensure!(source.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()), "Algorithm rename token changed");
+                ensure!(
+                    source.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()),
+                    "Algorithm rename token changed"
+                );
                 source.replace_range(start..start + symbol.name.len(), name);
             }
         }
@@ -679,7 +875,11 @@ impl PlanReferenceIndex {
             .or_default()
             .insert((symbol.position.line, symbol.position.column));
         for reference in self.occurrence.iter().filter(|reference| {
-            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct" | "body_qualifier")
+            reference.symbol == identity
+                && !matches!(
+                    reference.kind.as_str(),
+                    "call" | "property" | "callback" | "value" | "construct" | "body_qualifier"
+                )
         }) {
             let text = &design.proposed[&reference.path];
             let row = text
@@ -716,8 +916,21 @@ impl PlanReferenceIndex {
                 }
             }
         }
-        let qualifier = self.occurrence.iter().filter(|reference| reference.kind == "body_qualifier")
-            .map(|reference| ((reference.path.as_str(), reference.owner.as_str(), reference.name.as_str()), reference.symbol.as_str())).collect::<BTreeMap<_, _>>();
+        let qualifier = self
+            .occurrence
+            .iter()
+            .filter(|reference| reference.kind == "body_qualifier")
+            .map(|reference| {
+                (
+                    (
+                        reference.path.as_str(),
+                        reference.owner.as_str(),
+                        reference.name.as_str(),
+                    ),
+                    reference.symbol.as_str(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         for (path, functions) in &mut design.proposed_calls {
             for function in functions {
                 for call in function.call.iter_mut().flatten() {
@@ -749,7 +962,14 @@ impl PlanReferenceIndex {
                         let matches = if position + 1 == parts.len() {
                             selected
                         } else {
-                            qualifier.get(&(path.as_str(), function.owner.as_str(), parts[..=position].join(separator).as_str())).copied() == Some(identity)
+                            qualifier
+                                .get(&(
+                                    path.as_str(),
+                                    function.owner.as_str(),
+                                    parts[..=position].join(separator).as_str(),
+                                ))
+                                .copied()
+                                == Some(identity)
                         };
                         if matches {
                             replacement[position] = name.into();
@@ -815,13 +1035,23 @@ impl PlanReferenceIndex {
         for (path, text) in &design.proposed {
             let previous = document.design.as_ref().unwrap();
             if previous.proposed.get(path) == Some(text)
-                && previous.proposed_calls.get(path) == design.proposed_calls.get(path) { continue; }
+                && previous.proposed_calls.get(path) == design.proposed_calls.get(path)
+            {
+                continue;
+            }
             forge_diff::syntax::DeclarationOverview::parse(path, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            let functions = design.proposed_calls.get(path).map(Vec::as_slice).unwrap_or_default();
+            let functions = design
+                .proposed_calls
+                .get(path)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
             let combined = super::calls::combined(path, text, functions)?;
             let (_, parsed) = super::calls::parse(path, &combined, functions)?;
-            ensure!(parsed.len() == functions.len(), "rename changed callable ownership");
+            ensure!(
+                parsed.len() == functions.len(),
+                "rename changed callable ownership"
+            );
         }
         output.version = output
             .version
@@ -847,8 +1077,10 @@ impl PlanReferenceIndex {
                 .occurrence
                 .iter()
                 .filter(|reference| {
-                    !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "construct" | "body_qualifier")
-                        && reference.path == *path
+                    !matches!(
+                        reference.kind.as_str(),
+                        "call" | "property" | "callback" | "value" | "construct" | "body_qualifier"
+                    ) && reference.path == *path
                         && reference.line == *line
                         && reference.column <= column
                         && column < reference.column + reference.name.len() as u32
@@ -867,13 +1099,33 @@ impl PlanReferenceIndex {
     }
 
     /// Select an Algorithm token after removing its presentation indentation.
-    pub(crate) fn selected_algorithm(&self, anchor: &PlanNavigationAnchor, row: &str, column: usize) -> Option<&str> {
-        let PlanReviewTarget::Behavior { path, owner, offset, side } = &anchor.target else { return None };
-        if side != "proposed" { return None; }
-        self.algorithm.range((path.clone(), owner.clone(), *offset, 0)..=(path.clone(), owner.clone(), *offset, u32::MAX))
+    pub(crate) fn selected_algorithm(
+        &self,
+        anchor: &PlanNavigationAnchor,
+        row: &str,
+        column: usize,
+    ) -> Option<&str> {
+        let PlanReviewTarget::Behavior {
+            path,
+            owner,
+            offset,
+            side,
+        } = &anchor.target
+        else {
+            return None;
+        };
+        if side != "proposed" {
+            return None;
+        }
+        self.algorithm
+            .range(
+                (path.clone(), owner.clone(), *offset, 0)
+                    ..=(path.clone(), owner.clone(), *offset, u32::MAX),
+            )
             .find_map(|((_, _, _, start), (symbol, length, width))| {
                 let selected = column.checked_sub(row.len().checked_sub(*width)?)?;
-                (*start as usize <= selected && selected < *start as usize + length).then_some(symbol.as_str())
+                (*start as usize <= selected && selected < *start as usize + length)
+                    .then_some(symbol.as_str())
             })
     }
 }
@@ -885,8 +1137,19 @@ fn same_scope(previous: &[String], proposed: &[String]) -> bool {
         .eq(proposed.iter().filter(|scope| !scope.starts_with("@impl:")))
 }
 
-fn symbol_key(symbol: &forge_diff::syntax::DeclarationSymbol) -> (String, forge_diff::syntax::DeclarationRole, Vec<String>) {
-    (symbol.name.clone(), symbol.role, symbol.scope.iter().filter(|scope| !scope.starts_with("@impl:")).cloned().collect())
+fn symbol_key(
+    symbol: &forge_diff::syntax::DeclarationSymbol,
+) -> (String, forge_diff::syntax::DeclarationRole, Vec<String>) {
+    (
+        symbol.name.clone(),
+        symbol.role,
+        symbol
+            .scope
+            .iter()
+            .filter(|scope| !scope.starts_with("@impl:"))
+            .cloned()
+            .collect(),
+    )
 }
 
 fn lua_symbol(
@@ -1054,12 +1317,14 @@ mod tests {
                 super::super::CallKind::Property,
             ))
             .expect("inherited aliased property should resolve");
-        let renamed = index
-            .renamed(&document, property, "total")
-            .unwrap();
+        let renamed = index.renamed(&document, property, "total").unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("total: number"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0]
+                .call
+                .as_ref()
+                .unwrap()[0]
+                .name,
             "Alias.total"
         );
         let method = index
@@ -1071,12 +1336,14 @@ mod tests {
                 super::super::CallKind::Property,
             ))
             .expect("method value should resolve");
-        let renamed = index
-            .renamed(&document, method, "dispatch")
-            .unwrap();
+        let renamed = index.renamed(&document, method, "dispatch").unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("dispatch()"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[1].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0]
+                .call
+                .as_ref()
+                .unwrap()[1]
+                .name,
             "Alias.dispatch"
         );
     }
@@ -1090,8 +1357,7 @@ mod tests {
         design.document.objective = "Add a count field".into();
         design.document.background = "The fixture contains the declarations under review.".into();
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
-        design.document.design =
-            "Preserve the property identity across calls and accesses".into();
+        design.document.design = "Preserve the property identity across calls and accesses".into();
         let baseline =
             "pub struct Client { pub existing: usize }\nimpl Client { pub fn count(&self); }\n";
         let proposed = "pub struct Client { pub existing: usize, pub count: usize }\nimpl Client { pub fn count(&self); }\npub struct Other { pub count: usize }\n";
@@ -1171,9 +1437,7 @@ mod tests {
                 .count(),
             1
         );
-        let renamed = index
-            .renamed(&document, identity, "total")
-            .unwrap();
+        let renamed = index.renamed(&document, identity, "total").unwrap();
         let design = renamed.design.as_ref().unwrap();
         assert!(design.proposed["client.rs"].contains("pub total: usize"));
         assert!(design.proposed["client.rs"].contains("fn count"));
@@ -1241,7 +1505,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![
                     super::super::CallSite {
@@ -1257,36 +1523,32 @@ mod tests {
         document.design = Some(design);
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         let identity = index.call.values().next().unwrap();
-        let renamed = index
-            .renamed(&document, identity, "dispatch")
-            .unwrap();
+        let renamed = index.renamed(&document, identity, "dispatch").unwrap();
         let design = renamed.design.unwrap();
         assert!(design.proposed["client.ts"].contains("function dispatch"));
         assert!(design.proposed["run.ts"].contains("import { dispatch }"));
         assert_eq!(
             design.proposed_calls["run.ts"][0]
-                .call.iter().flatten()
+                .call
+                .iter()
+                .flatten()
                 .map(|call| call.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["dispatch", "dispatch"]
         );
         assert_eq!(
-            document.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
+            document.design.as_ref().unwrap().proposed_calls["run.ts"][0]
+                .call
+                .as_ref()
+                .unwrap()[0]
+                .name,
             "send"
         );
-        assert!(
-            index
-                .renamed(&document, identity, "function")
-                .is_err()
-        );
+        assert!(index.renamed(&document, identity, "function").is_err());
         std::fs::write(workspace.path().join("client.ts"), "invalid source {").unwrap();
         let snapshot = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         let identity = snapshot.call.values().next().unwrap();
-        assert!(
-            snapshot
-                .renamed(&document, identity, "dispatch")
-                .is_ok()
-        );
+        assert!(snapshot.renamed(&document, identity, "dispatch").is_ok());
         document.design.as_mut().unwrap().baseline.insert(
             "client.ts".into(),
             super::super::DeclarationFile {
@@ -1318,7 +1580,11 @@ mod tests {
         );
         design.proposed_calls.insert(
             "client.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: Some(crate::plan::FunctionBehavior::Change("Stop retrying authentication failures in send.".into())),
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: Some(crate::plan::FunctionBehavior::Change(
+                    "Stop retrying authentication failures in send.".into(),
+                )),
                 owner: "send".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1331,18 +1597,18 @@ mod tests {
         document.design = Some(design);
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         let identity = index.call.values().next().unwrap();
-        assert!(
-            index
-                .renamed(&document, identity, "dispatch")
-                .is_err()
-        );
-        let renamed = index
-            .renamed(&document, identity, "deliver")
-            .unwrap();
+        assert!(index.renamed(&document, identity, "dispatch").is_err());
+        let renamed = index.renamed(&document, identity, "deliver").unwrap();
         let function = &renamed.design.as_ref().unwrap().proposed_calls["client.ts"][0];
         assert_eq!(function.owner, "deliver");
         assert_eq!(function.call.as_ref().unwrap()[0].name, "deliver");
-        assert_eq!(function.behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures in send."));
+        assert_eq!(
+            function
+                .behavior
+                .as_ref()
+                .map(crate::plan::FunctionBehavior::text),
+            Some("Stop retrying authentication failures in send.")
+        );
         assert_eq!(index.call.len(), 1);
     }
 
@@ -1353,34 +1619,90 @@ mod tests {
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "pub struct Client { pub endpoint: u32 }\npub struct Other { pub endpoint: u32 }\nimpl Client { pub fn send(&self); }\npub fn run(client: &Client, other: &Other);\n".into());
         let source = "Record Client.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0\ncreated ← Client(endpoint = 1)\nreturn \"Client.endpoint client.send()\" # Client.endpoint";
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody {
-            owner: "run".into(), evidence: None, behavior: Some(super::super::FunctionBehavior::Algorithm(source.into())),
-            call: Some([("Client::send", super::super::CallKind::Call), ("Client::endpoint", super::super::CallKind::Property),
-                ("Other::endpoint", super::super::CallKind::Property)].into_iter().map(|(name, kind)| super::super::CallSite {
-                    name: name.into(), kind, source: None, unresolved: false,
-                }).collect()),
-        }]);
+        design.proposed_calls.insert(
+            "main.rs".into(),
+            vec![super::super::FunctionBody {
+                owner: "run".into(),
+                evidence: None,
+                behavior: Some(super::super::FunctionBehavior::Algorithm(source.into())),
+                call: Some(
+                    [
+                        ("Client::send", super::super::CallKind::Call),
+                        ("Client::endpoint", super::super::CallKind::Property),
+                        ("Other::endpoint", super::super::CallKind::Property),
+                    ]
+                    .into_iter()
+                    .map(|(name, kind)| super::super::CallSite {
+                        name: name.into(),
+                        kind,
+                        source: None,
+                        unresolved: false,
+                    })
+                    .collect(),
+                ),
+            }],
+        );
         document.design = Some(design);
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         for (old, new, expected) in [
-            ("Client", "Transport", "Record Transport.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0"),
-            ("endpoint", "address", "Record Client.address\nclient.send()\nvalue ← client.address\nother.endpoint ← 0"),
-            ("send", "dispatch", "Record Client.endpoint\nclient.dispatch()\nvalue ← client.endpoint\nother.endpoint ← 0"),
+            (
+                "Client",
+                "Transport",
+                "Record Transport.endpoint\nclient.send()\nvalue ← client.endpoint\nother.endpoint ← 0",
+            ),
+            (
+                "endpoint",
+                "address",
+                "Record Client.address\nclient.send()\nvalue ← client.address\nother.endpoint ← 0",
+            ),
+            (
+                "send",
+                "dispatch",
+                "Record Client.endpoint\nclient.dispatch()\nvalue ← client.endpoint\nother.endpoint ← 0",
+            ),
         ] {
-            let symbol = index.declaration["main.rs"].symbol.iter().find(|symbol|
-                symbol.name == old && (old == "Client" || symbol.scope.iter().any(|part| part == "Client"))).unwrap();
-            let identity = &index.definition[&("main.rs".into(), symbol.position.line, symbol.position.column)].0;
+            let symbol = index.declaration["main.rs"]
+                .symbol
+                .iter()
+                .find(|symbol| {
+                    symbol.name == old
+                        && (old == "Client" || symbol.scope.iter().any(|part| part == "Client"))
+                })
+                .unwrap();
+            let identity = &index.definition[&(
+                "main.rs".into(),
+                symbol.position.line,
+                symbol.position.column,
+            )]
+                .0;
             let renamed = index.renamed(&document, identity, new).unwrap();
-            let text = renamed.design.as_ref().unwrap().proposed_calls["main.rs"][0].behavior.as_ref().unwrap().text();
+            let text = renamed.design.as_ref().unwrap().proposed_calls["main.rs"][0]
+                .behavior
+                .as_ref()
+                .unwrap()
+                .text();
             assert!(text.starts_with(expected), "{text}");
-            assert!(text.contains(match old {
-                "Client" => "created ← Transport(endpoint = 1)",
-                "endpoint" => "created ← Client(address = 1)",
-                _ => "created ← Client(endpoint = 1)",
-            }), "{text}");
-            assert!(text.ends_with("return \"Client.endpoint client.send()\" # Client.endpoint"), "{text}");
+            assert!(
+                text.contains(match old {
+                    "Client" => "created ← Transport(endpoint = 1)",
+                    "endpoint" => "created ← Client(address = 1)",
+                    _ => "created ← Client(endpoint = 1)",
+                }),
+                "{text}"
+            );
+            assert!(
+                text.ends_with("return \"Client.endpoint client.send()\" # Client.endpoint"),
+                "{text}"
+            );
         }
-        assert_eq!(document.design.as_ref().unwrap().proposed_calls["main.rs"][0].behavior.as_ref().unwrap().text(), source);
+        assert_eq!(
+            document.design.as_ref().unwrap().proposed_calls["main.rs"][0]
+                .behavior
+                .as_ref()
+                .unwrap()
+                .text(),
+            source
+        );
     }
 
     #[test]
@@ -1402,11 +1724,15 @@ mod tests {
         design.proposed_calls.insert(
             "src/lib.rs".into(),
             vec![
-                super::super::FunctionBody { evidence: None, behavior: None,
+                super::super::FunctionBody {
+                    evidence: None,
+                    behavior: None,
                     owner: "Client::send".into(),
                     call: Some(Vec::new()),
                 },
-                super::super::FunctionBody { evidence: None, behavior: None,
+                super::super::FunctionBody {
+                    evidence: None,
+                    behavior: None,
                     owner: "run".into(),
                     call: Some(vec![super::super::CallSite {
                         kind: crate::plan::CallKind::Call,
@@ -1424,9 +1750,7 @@ mod tests {
             .get(&("src/lib.rs".into(), 1, 11))
             .unwrap()
             .0;
-        let renamed = index
-            .renamed(&document, identity, "Transport")
-            .unwrap();
+        let renamed = index.renamed(&document, identity, "Transport").unwrap();
         let design = renamed.design.unwrap();
         assert!(design.proposed["src/lib.rs"].contains("impl Transport"));
         assert!(design.proposed["src/lib.rs"].contains("client: &Transport"));
@@ -1435,7 +1759,11 @@ mod tests {
             "Transport::send"
         );
         assert_eq!(
-            design.proposed_calls["src/lib.rs"][1].call.as_ref().unwrap()[0].name,
+            design.proposed_calls["src/lib.rs"][1]
+                .call
+                .as_ref()
+                .unwrap()[0]
+                .name,
             "Transport::send"
         );
     }
@@ -1465,7 +1793,9 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(),"pub struct Extra;\nimpl Extra { pub fn prepare(&self); }\npub struct Client;\nimpl Client { pub fn send(&self); }\npub fn run();\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1508,7 +1838,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1529,15 +1861,19 @@ mod tests {
         assert_eq!(destination.line, 2);
         assert!(destination.proposed);
         document.design.as_mut().unwrap().document.objective = "Rename Lua API".into();
-        document.design.as_mut().unwrap().document.background = "The fixture contains the declarations under review.".into();
-        document.design.as_mut().unwrap().document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        document.design.as_mut().unwrap().document.background =
+            "The fixture contains the declarations under review.".into();
+        document.design.as_mut().unwrap().document.requirements =
+            vec!["Preserve the declared behavior and ownership.".into()];
         document.design.as_mut().unwrap().document.design = "Update saved calls".into();
-        let renamed = index
-            .renamed(&document, identity, "deliver")
-            .unwrap();
+        let renamed = index.renamed(&document, identity, "deliver").unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.lua"].contains("M.deliver"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.lua"][0].call.as_ref().unwrap()[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.lua"][0]
+                .call
+                .as_ref()
+                .unwrap()[0]
+                .name,
             "client.deliver"
         );
     }
@@ -1557,7 +1893,9 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self, other: &Client);\n}\npub fn run(client: &Client);\npub struct Settings { pub client: Client }\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1569,10 +1907,24 @@ mod tests {
         );
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
-        let method_reference = index.occurrence.iter().find(|reference| reference.owner.ends_with("::send") && reference.kind == "type").unwrap();
-        assert_eq!(method_reference.owner_capture, vec![Some("@type"), None, Some("@function")]);
-        let property_reference = index.occurrence.iter().find(|reference| reference.owner == "Settings::client").unwrap();
-        assert_eq!(property_reference.owner_capture, vec![Some("@type"), Some("@variable.member")]);
+        let method_reference = index
+            .occurrence
+            .iter()
+            .find(|reference| reference.owner.ends_with("::send") && reference.kind == "type")
+            .unwrap();
+        assert_eq!(
+            method_reference.owner_capture,
+            vec![Some("@type"), None, Some("@function")]
+        );
+        let property_reference = index
+            .occurrence
+            .iter()
+            .find(|reference| reference.owner == "Settings::client")
+            .unwrap();
+        assert_eq!(
+            property_reference.owner_capture,
+            vec![Some("@type"), Some("@variable.member")]
+        );
         let call = index
             .call
             .get(&(
@@ -1629,7 +1981,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1664,7 +2018,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1687,25 +2043,44 @@ mod tests {
     #[test]
     fn lua_module_rename_updates_declaration_owners_and_body_qualifiers() {
         let workspace = tempfile::tempdir().unwrap();
-        let source = "local M = {}\nfunction M.run() M.other() end\nfunction M.other() end\nreturn M\n";
+        let source =
+            "local M = {}\nfunction M.run() M.other() end\nfunction M.other() end\nreturn M\n";
         let mut document = super::super::document::test_fixture("module", "Rename module");
         let mut design = super::super::DeclarationDesign::default();
-        design.proposed.insert("api.lua".into(), forge_diff::syntax::DeclarationOverview::extract("api.lua", source).unwrap());
-        design.proposed_calls.insert("api.lua".into(), super::super::calls::extract("api.lua", source).unwrap());
+        design.proposed.insert(
+            "api.lua".into(),
+            forge_diff::syntax::DeclarationOverview::extract("api.lua", source).unwrap(),
+        );
+        design.proposed_calls.insert(
+            "api.lua".into(),
+            super::super::calls::extract("api.lua", source).unwrap(),
+        );
         design.document.objective = "Rename the module".into();
         design.document.background = "The fixture contains the declarations under review.".into();
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         design.document.design = "Preserve module definitions and calls".into();
         document.design = Some(design);
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
-        let symbol = index.declaration["api.lua"].symbol.iter().find(|symbol| symbol.name == "M").unwrap();
-        let identity = &index.definition[&("api.lua".into(), symbol.position.line, symbol.position.column)].0;
+        let symbol = index.declaration["api.lua"]
+            .symbol
+            .iter()
+            .find(|symbol| symbol.name == "M")
+            .unwrap();
+        let identity = &index.definition[&(
+            "api.lua".into(),
+            symbol.position.line,
+            symbol.position.column,
+        )]
+            .0;
         let renamed = index.renamed(&document, identity, "Module").unwrap();
         let design = renamed.design.unwrap();
         assert!(design.proposed["api.lua"].contains("function Module.run"));
         assert!(design.proposed["api.lua"].contains("return Module"));
         assert_eq!(design.proposed_calls["api.lua"][0].owner, "Module.run");
-        assert_eq!(design.proposed_calls["api.lua"][0].call.as_ref().unwrap()[0].name, "Module.other");
+        assert_eq!(
+            design.proposed_calls["api.lua"][0].call.as_ref().unwrap()[0].name,
+            "Module.other"
+        );
     }
 
     #[test]
@@ -1748,7 +2123,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionBody { evidence: None, behavior: None,
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "run".into(),
                 call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
@@ -1777,15 +2154,17 @@ mod tests {
             .get(&("client.ts".into(), 1, 16))
             .unwrap()
             .0;
-        let renamed = index
-            .renamed(&document, identity, "dispatch")
-            .unwrap();
+        let renamed = index.renamed(&document, identity, "dispatch").unwrap();
         assert!(
             renamed.design.as_ref().unwrap().proposed["run.ts"].contains("import { dispatch }")
         );
         assert!(renamed.design.as_ref().unwrap().proposed["run.ts"].contains("run(send:"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0]
+                .call
+                .as_ref()
+                .unwrap()[0]
+                .name,
             "send"
         );
     }

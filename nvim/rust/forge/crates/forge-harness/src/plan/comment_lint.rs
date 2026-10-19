@@ -303,9 +303,12 @@ mod test {
         let mut design = design("lib.rs", "pub fn standard();\n", None);
         design.proposed_calls.insert(
             "lib.rs".into(),
-            vec![crate::plan::FunctionBody { evidence: None,
+            vec![crate::plan::FunctionBody {
+                evidence: None,
                 owner: "standard".into(),
-                behavior: Some(crate::plan::FunctionBehavior::Change("Returns settings without a network request.".into())),
+                behavior: Some(crate::plan::FunctionBehavior::Change(
+                    "Returns settings without a network request.".into(),
+                )),
                 call: None,
             }],
         );

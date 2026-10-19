@@ -193,7 +193,9 @@ impl ReviewService {
                 let drafted = self
                     .comment(
                         &input.document,
-                        vec![], vec![], crate::review::ReviewCommentCommand::DraftInline { anchor },
+                        vec![],
+                        vec![],
+                        crate::review::ReviewCommentCommand::DraftInline { anchor },
                     )
                     .await?;
                 if let Some(patch) = drafted.patch {
@@ -223,7 +225,9 @@ impl ReviewService {
                 let imported = self
                     .comment(
                         &input.document,
-                        vec![], vec![], crate::review::ReviewCommentCommand::LoadThreadComment {
+                        vec![],
+                        vec![],
+                        crate::review::ReviewCommentCommand::LoadThreadComment {
                             thread_node_id: thread,
                             comment_node_id: comment,
                         },
@@ -237,7 +241,9 @@ impl ReviewService {
                     match self
                         .comment(
                             &input.document,
-                            vec![], vec![], crate::review::ReviewCommentCommand::DraftReply {
+                            vec![],
+                            vec![],
+                            crate::review::ReviewCommentCommand::DraftReply {
                                 parent: selected.comment,
                             },
                         )
@@ -534,8 +540,7 @@ fn validate_browser_url(url: &str) -> Result<()> {
         .or_else(|| url.strip_prefix("http://"))
         .and_then(|remainder| remainder.split('/').next());
     ensure!(
-        !url.contains(char::is_control)
-            && authority.is_some_and(|authority| !authority.is_empty()),
+        !url.contains(char::is_control) && authority.is_some_and(|authority| !authority.is_empty()),
         "review browser target has an invalid URL"
     );
     Ok(())

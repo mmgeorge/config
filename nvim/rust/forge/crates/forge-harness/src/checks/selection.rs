@@ -48,7 +48,12 @@ impl CheckSelection {
                         !case.name.is_empty() && !case.name.contains('\0'),
                         "invalid test case name"
                     );
-                    ensure!(case.target.as_ref().is_none_or(|target| !target.is_empty() && target.len() <= 256 && !target.chars().any(char::is_control)), "invalid test target");
+                    ensure!(
+                        case.target.as_ref().is_none_or(|target| !target.is_empty()
+                            && target.len() <= 256
+                            && !target.chars().any(char::is_control)),
+                        "invalid test target"
+                    );
                 }
                 cases.sort();
                 cases.dedup();
@@ -145,12 +150,16 @@ impl RunRequest {
                             definition.id
                         );
                         CheckSelection::Cases {
-                            cases: (if definition.scope == CheckScope::NewCases { new_cases } else { cases })
-                                .unwrap_or_default()
-                                .iter()
-                                .filter(|case| definition.trigger.matches_path(&case.file))
-                                .cloned()
-                                .collect(),
+                            cases: (if definition.scope == CheckScope::NewCases {
+                                new_cases
+                            } else {
+                                cases
+                            })
+                            .unwrap_or_default()
+                            .iter()
+                            .filter(|case| definition.trigger.matches_path(&case.file))
+                            .cloned()
+                            .collect(),
                         }
                     }
                 }

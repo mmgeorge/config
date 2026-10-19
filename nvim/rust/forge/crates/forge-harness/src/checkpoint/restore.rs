@@ -427,7 +427,11 @@ fn read_actual(
 ) -> Result<Option<CheckpointFile>> {
     let path = checked_path(root, relative)?;
     ensure!(
-        !forge_git::checkpoint::lfs_paths(root, &std::collections::BTreeSet::from([relative.to_owned()]))?.contains(relative),
+        !forge_git::checkpoint::lfs_paths(
+            root,
+            &std::collections::BTreeSet::from([relative.to_owned()])
+        )?
+        .contains(relative),
         "restore path is now excluded by Git LFS: {relative}"
     );
     let metadata = match fs::symlink_metadata(&path) {

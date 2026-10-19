@@ -14,19 +14,28 @@ pub struct ExecutionOwner {
 impl ExecutionOwner {
     /// Derive an adapter lookup key while preserving legacy root-session controls.
     pub fn runtime_key(&self) -> String {
-        if self.is_root() {self.session_id.clone()} else {format!("{}:agent:{}",self.session_id,self.agent_id)}
+        if self.is_root() {
+            self.session_id.clone()
+        } else {
+            format!("{}:agent:{}", self.session_id, self.agent_id)
+        }
     }
     /// Resolve the primary conversation without selecting any child runtime.
     pub fn root(session_id: impl Into<String>) -> Self {
         let session_id = session_id.into();
-        Self { agent_id: crate::session::HarnessSession::primary_agent_id(&session_id), session_id }
+        Self {
+            agent_id: crate::session::HarnessSession::primary_agent_id(&session_id),
+            session_id,
+        }
     }
 
     /// Validate an explicit owner before using it as a provider connection key.
     pub(crate) fn resolve(owner: &Option<Self>, session_id: &str) -> anyhow::Result<Self> {
         let owner = owner.clone().unwrap_or_else(|| Self::root(session_id));
-        anyhow::ensure!(owner.session_id == session_id && !owner.agent_id.is_empty(),
-            "provider execution owner does not belong to the Harness session");
+        anyhow::ensure!(
+            owner.session_id == session_id && !owner.agent_id.is_empty(),
+            "provider execution owner does not belong to the Harness session"
+        );
         Ok(owner)
     }
 

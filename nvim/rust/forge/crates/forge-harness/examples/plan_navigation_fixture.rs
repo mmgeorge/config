@@ -81,7 +81,9 @@ fn main() -> Result<()> {
         design.baseline_calls.insert((*path).into(), bodies.clone());
         let mut proposed = bodies;
         for body in &mut proposed {
-            body.behavior = Some(forge_harness::plan::FunctionBehavior::Change("Preserve behavior while reviewing definition navigation.".into()));
+            body.behavior = Some(forge_harness::plan::FunctionBehavior::Change(
+                "Preserve behavior while reviewing definition navigation.".into(),
+            ));
         }
         design.proposed_calls.insert((*path).into(), proposed);
     }
@@ -111,14 +113,29 @@ fn main() -> Result<()> {
     }
     if arguments[4] == "tests" {
         design.proposed.get_mut("src/change.rs").unwrap().push_str("\n#[cfg(test)]\nmod tests {\n  #[test]\n  fn new_case();\n  #[test]\n  fn changed_case();\n  #[test]\n  fn reused_case();\n}\n");
-        design.baseline.get_mut("src/change.rs").unwrap().text.push_str("\n#[cfg(test)]\nmod history {\n  #[test]\n  fn removed_case();\n}\n");
+        design
+            .baseline
+            .get_mut("src/change.rs")
+            .unwrap()
+            .text
+            .push_str("\n#[cfg(test)]\nmod history {\n  #[test]\n  fn removed_case();\n}\n");
         design.proposed.get_mut("src/change.rs").unwrap().push_str("\n/// Exercises the new test-only helpers.\n#[cfg(test)]\nmod added_tests {\n  #[test]\n  fn added_case();\n}\n");
-        design.proposed_calls.get_mut("src/change.rs").unwrap().push(FunctionBody {
-            owner: "added_tests::added_case".into(), evidence: None,
-            behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm("return".into())),
-            call: Some(Vec::new()),
-        });
-        design.proposed.insert("tests/new.rs".into(), "// Planned integration test file.\n".into());
+        design
+            .proposed_calls
+            .get_mut("src/change.rs")
+            .unwrap()
+            .push(FunctionBody {
+                owner: "added_tests::added_case".into(),
+                evidence: None,
+                behavior: Some(forge_harness::plan::FunctionBehavior::Algorithm(
+                    "return".into(),
+                )),
+                call: Some(Vec::new()),
+            });
+        design.proposed.insert(
+            "tests/new.rs".into(),
+            "// Planned integration test file.\n".into(),
+        );
         design.document.tests = serde_json::from_value(serde_json::json!([
             {"file":"src/change.rs","cases":[
                 {"name":"combat::tests::new_case","change":"new","description":"Adds a scenario."},

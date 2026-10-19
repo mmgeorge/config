@@ -1,11 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 
+use super::design_document::DesignDocument;
 use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::DeclarationOverview;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use super::design_document::DesignDocument;
 
 /// Retains the immutable declaration source and workspace content identity.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -16,7 +16,8 @@ pub struct DeclarationFile {
 
 const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
-type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
+type SourceOverviewCache =
+    std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
 static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
 
 /// Owns baseline declarations and the agent's proposed file contents.
@@ -86,27 +87,52 @@ impl DeclarationDesign {
     pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
         design.check_configuration = Some(crate::checks::ConfigSnapshot::load(workspace)?);
-        design.check_configuration.as_ref().unwrap().config.validate_selection(&design.document.checks)?;
+        design
+            .check_configuration
+            .as_ref()
+            .unwrap()
+            .config
+            .validate_selection(&design.document.checks)?;
         for id in &design.document.disabled_checks {
-            anyhow::ensure!(design.check_configuration.as_ref().unwrap().config.definitions.iter().any(|check| &check.id == id), "unknown disabled planned check: {id}");
+            anyhow::ensure!(
+                design
+                    .check_configuration
+                    .as_ref()
+                    .unwrap()
+                    .config
+                    .definitions
+                    .iter()
+                    .any(|check| &check.id == id),
+                "unknown disabled planned check: {id}"
+            );
         }
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
         super::calls::validate_behaviors(&design)?;
-        let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
+        let paths = design
+            .proposed
+            .keys()
+            .filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml"))
+            .cloned()
+            .collect::<Vec<_>>();
         for path in paths {
             for directory in Path::new(&path).ancestors().skip(1) {
-                let lock = directory.join("Cargo.lock").to_string_lossy().replace('\\', "/");
+                let lock = directory
+                    .join("Cargo.lock")
+                    .to_string_lossy()
+                    .replace('\\', "/");
                 if !design.cargo_lock.contains_key(&lock)
                     && let Some(text) = workspace_source(workspace, &lock)?
                 {
-                    toml::from_str::<toml::Value>(&text).with_context(|| format!("parse {lock}"))?;
+                    toml::from_str::<toml::Value>(&text)
+                        .with_context(|| format!("parse {lock}"))?;
                     design.cargo_lock.insert(lock, text);
                 }
             }
         }
         design.validate()?;
-        let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
+        let mut resolver =
+            crate::declaration::DeclarationResolver::planned(workspace, &design, false)?;
         let report = resolver.validate(&design);
         report.ensure_valid()?;
         design.validation = Some(report);
@@ -117,8 +143,23 @@ impl DeclarationDesign {
 
     /// Identifies only the planned inputs that determine check selection.
     pub(crate) fn check_preview_fingerprint(&self) -> Result<String> {
-        let manifests: BTreeMap<_, _> = self.proposed.iter().filter(|(path, _)| path.ends_with("Cargo.toml") || path.ends_with("package.json") || path.ends_with("pnpm-workspace.yaml")).collect();
-        Ok(super::digest(&super::codec::to_vec(&(&self.check_configuration, self.changed_paths(), &self.document.tests, &self.document.checks, &self.document.disabled_checks, manifests))?))
+        let manifests: BTreeMap<_, _> = self
+            .proposed
+            .iter()
+            .filter(|(path, _)| {
+                path.ends_with("Cargo.toml")
+                    || path.ends_with("package.json")
+                    || path.ends_with("pnpm-workspace.yaml")
+            })
+            .collect();
+        Ok(super::digest(&super::codec::to_vec(&(
+            &self.check_configuration,
+            self.changed_paths(),
+            &self.document.tests,
+            &self.document.checks,
+            &self.document.disabled_checks,
+            manifests,
+        ))?))
     }
 
     /// Projects plan choices independently of repository defaults and trigger applicability.
@@ -135,7 +176,8 @@ impl DeclarationDesign {
 
     /// Rejects cached command previews after selection inputs change.
     pub(crate) fn check_preview_current(&self) -> Result<bool> {
-        Ok(!self.check_preview.is_empty() && self.check_preview_source == self.check_preview_fingerprint()?)
+        Ok(!self.check_preview.is_empty()
+            && self.check_preview_source == self.check_preview_fingerprint()?)
     }
 
     /// Initialize plan settings without discovering or extracting workspace files.
@@ -163,34 +205,89 @@ impl DeclarationDesign {
         Ok(design)
     }
 
-    pub(crate) fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
+    pub(crate) fn source(
+        &self,
+        workspace: &Path,
+        path: &str,
+    ) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
         validate_path(path)?;
-        let source = workspace_source(workspace, path)?.with_context(|| format!("declaration file does not exist: {path}"))?;
+        let source = workspace_source(workspace, path)?
+            .with_context(|| format!("declaration file does not exist: {path}"))?;
         let source_digest = super::digest(source.as_bytes());
         let key = format!("{path}:{}:{source_digest}", self.line_width);
         let cache = SOURCE_OVERVIEW_CACHE.get_or_init(Default::default);
-        let cached = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?.get(&key).cloned();
-        let overview = if let Some(overview) = cached { overview } else {
+        let cached = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?
+            .get(&key)
+            .cloned();
+        let overview = if let Some(overview) = cached {
+            overview
+        } else {
             let (text, calls) = DeclarationOverview::extract_with_calls(path, &source)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("extract {path}"))?;
             let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let calls = super::calls::from_extracted(calls);
-            let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true).map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().map(|function| function.owner).collect::<BTreeSet<_>>();
-            let calls = calls.into_iter().filter(|function| saved_owners.contains(&function.owner)).collect();
-            let overview = (DeclarationFile { text, source_digest }, calls);
-            let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
-            let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().flatten().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
-            if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 { cache.clear(); }
+            let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                .into_iter()
+                .map(|function| function.owner)
+                .collect::<BTreeSet<_>>();
+            let calls = calls
+                .into_iter()
+                .filter(|function| saved_owners.contains(&function.owner))
+                .collect();
+            let overview = (
+                DeclarationFile {
+                    text,
+                    source_digest,
+                },
+                calls,
+            );
+            let mut cache = cache
+                .lock()
+                .map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
+            let bytes = cache
+                .values()
+                .map(|(file, calls)| {
+                    file.text.len()
+                        + calls
+                            .iter()
+                            .map(|function| {
+                                function.owner.len()
+                                    + function
+                                        .call
+                                        .iter()
+                                        .flatten()
+                                        .map(|call| call.name.len() + 16)
+                                        .sum::<usize>()
+                            })
+                            .sum::<usize>()
+                })
+                .sum::<usize>();
+            if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 {
+                cache.clear();
+            }
             cache.insert(key, overview.clone());
             overview
         };
         let (file, mut calls) = overview;
-        if calls.iter().flat_map(|function| function.call.iter().flatten()).any(|reference| matches!(reference.kind, super::CallKind::Value | super::CallKind::Property | super::CallKind::Call)) {
+        if calls
+            .iter()
+            .flat_map(|function| function.call.iter().flatten())
+            .any(|reference| {
+                matches!(
+                    reference.kind,
+                    super::CallKind::Value | super::CallKind::Property | super::CallKind::Call
+                )
+            })
+        {
             let mut captured = self.clone();
             captured.proposed.insert(path.into(), file.text.clone());
-            let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &captured, false)?;
+            let mut resolver =
+                crate::declaration::DeclarationResolver::planned(workspace, &captured, false)?;
             super::calls::classify(path, &mut calls, &mut resolver);
         }
         Ok((file, calls))
@@ -198,7 +295,12 @@ impl DeclarationDesign {
 
     /// Inspect one uncaptured workspace file without changing the saved design.
     /// Captured, deleted, and moved paths always use the immutable plan snapshot.
-    pub fn inspect(&self, workspace: &Path, path: Option<&str>, baseline: bool) -> Result<serde_json::Value> {
+    pub fn inspect(
+        &self,
+        workspace: &Path,
+        path: Option<&str>,
+        baseline: bool,
+    ) -> Result<serde_json::Value> {
         if let Some(path) = path
             && path != PLAN_DOCUMENT_PATH
             && !self.baseline.contains_key(path)
@@ -206,7 +308,9 @@ impl DeclarationDesign {
         {
             let (file, calls) = self.source(workspace, path)?;
             let text = super::calls::combined(path, &file.text, &calls)?;
-            return Ok(serde_json::json!({"path":path,"side":"workspace","text":text,"source_digest":file.source_digest}));
+            return Ok(
+                serde_json::json!({"path":path,"side":"workspace","text":text,"source_digest":file.source_digest}),
+            );
         }
         self.read(path, baseline)
     }
@@ -220,7 +324,12 @@ impl DeclarationDesign {
         self.document.validate()?;
         for (path, text) in &self.cargo_lock {
             validate_relative_path(path)?;
-            ensure!(Path::new(path).file_name().is_some_and(|name| name == "Cargo.lock"), "invalid Cargo lockfile path: {path}");
+            ensure!(
+                Path::new(path)
+                    .file_name()
+                    .is_some_and(|name| name == "Cargo.lock"),
+                "invalid Cargo lockfile path: {path}"
+            );
             toml::from_str::<toml::Value>(text).with_context(|| format!("parse {path}"))?;
         }
         for (path, file) in &self.baseline {
@@ -237,11 +346,18 @@ impl DeclarationDesign {
         }
         for (files, baseline) in [(&self.baseline_calls, true), (&self.proposed_calls, false)] {
             for (path, calls) in files {
-                let text = if baseline { self.baseline.get(path).map(|file| &file.text) } else { self.proposed.get(path) }
-                    .with_context(|| format!("call metadata has no declaration file: {path}"))?;
+                let text = if baseline {
+                    self.baseline.get(path).map(|file| &file.text)
+                } else {
+                    self.proposed.get(path)
+                }
+                .with_context(|| format!("call metadata has no declaration file: {path}"))?;
                 let combined = super::calls::combined(path, text, calls)?;
                 let (_, parsed) = super::calls::parse(path, &combined, calls)?;
-                ensure!(parsed.len() == calls.len(), "call metadata has an absent or ambiguous callable: {path}");
+                ensure!(
+                    parsed.len() == calls.len(),
+                    "call metadata has an absent or ambiguous callable: {path}"
+                );
             }
         }
         for (from, to) in &self.moved {
@@ -270,7 +386,11 @@ impl DeclarationDesign {
                 .with_context(|| format!("format proposed {path}"))?;
         }
         candidate.validate()?;
-        if candidate.validation.as_ref().is_some_and(|report| report.fingerprint != crate::declaration::fingerprint(&candidate)) {
+        if candidate
+            .validation
+            .as_ref()
+            .is_some_and(|report| report.fingerprint != crate::declaration::fingerprint(&candidate))
+        {
             candidate.validation = None;
         }
         Ok(candidate)
@@ -333,9 +453,16 @@ impl DeclarationDesign {
                 self.proposed.get(path)
             }
             .with_context(|| format!("declaration file does not exist: {path}"))?;
-            let calls = if baseline { self.baseline_calls.get(path) } else { self.proposed_calls.get(path) };
-            let text = super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
-            Ok(serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}))
+            let calls = if baseline {
+                self.baseline_calls.get(path)
+            } else {
+                self.proposed_calls.get(path)
+            };
+            let text =
+                super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
+            Ok(
+                serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
+            )
         } else {
             Ok(
                 serde_json::json!({"paths":self.baseline.keys().chain(self.proposed.keys()).map(String::as_str).chain([PLAN_DOCUMENT_PATH]).collect::<BTreeSet<_>>(),"changed_paths":self.changed_paths()}),
@@ -344,7 +471,12 @@ impl DeclarationDesign {
     }
 
     /// Apply a familiar multi-file patch atomically to virtual proposed files.
-    pub fn patch(&self, workspace: &Path, source_digests: &BTreeMap<String, String>, patch: &str) -> Result<Self> {
+    pub fn patch(
+        &self,
+        workspace: &Path,
+        source_digests: &BTreeMap<String, String>,
+        patch: &str,
+    ) -> Result<Self> {
         let lines = patch.lines().collect::<Vec<_>>();
         ensure!(
             lines.first() == Some(&"*** Begin Patch") && lines.last() == Some(&"*** End Patch"),
@@ -378,13 +510,21 @@ impl DeclarationDesign {
                 );
             } else {
                 validate_path(path)?;
-                if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path) {
+                if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path)
+                {
                     if kind == "add" {
-                        ensure!(std::fs::symlink_metadata(workspace.join(path)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{path}: Add File destination already exists or cannot be inspected");
+                        ensure!(
+                            std::fs::symlink_metadata(workspace.join(path))
+                                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                            "{path}: Add File destination already exists or cannot be inspected"
+                        );
                     } else {
                         let (file, calls) = candidate.source(workspace, path)?;
                         if let Some(expected) = source_digests.get(path) {
-                            ensure!(*expected == file.source_digest, "{path}: workspace changed since inspection. Read the declaration file again.");
+                            ensure!(
+                                *expected == file.source_digest,
+                                "{path}: workspace changed since inspection. Read the declaration file again."
+                            );
                         }
                         candidate.proposed.insert(path.into(), file.text.clone());
                         if !calls.is_empty() {
@@ -410,7 +550,11 @@ impl DeclarationDesign {
                 );
                 validate_path(to)?;
                 if !candidate.baseline.contains_key(to) {
-                    ensure!(std::fs::symlink_metadata(workspace.join(to)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{to}: move destination already exists or cannot be inspected");
+                    ensure!(
+                        std::fs::symlink_metadata(workspace.join(to))
+                            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+                        "{to}: move destination already exists or cannot be inspected"
+                    );
                 }
                 ensure!(
                     to != path
@@ -434,10 +578,11 @@ impl DeclarationDesign {
             }
             let body = &lines[start..position];
             if path == PLAN_DOCUMENT_PATH {
-                let original = format!("{}\n", super::codec::to_string_pretty(&candidate.document)?);
+                let original =
+                    format!("{}\n", super::codec::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
-                candidate.document = super::codec::from_str(&text)
-                    .context("invalid plan.json document")?;
+                candidate.document =
+                    super::codec::from_str(&text).context("invalid plan.json document")?;
                 continue;
             }
             match kind {
@@ -465,20 +610,28 @@ impl DeclarationDesign {
                     }
                     let (text, calls) = super::calls::parse(path, &text, &[])?;
                     candidate.proposed.insert(path.into(), text);
-                    if !calls.is_empty() { candidate.proposed_calls.insert(path.into(), calls); }
+                    if !calls.is_empty() {
+                        candidate.proposed_calls.insert(path.into(), calls);
+                    }
                 }
                 _ => {
                     let original = candidate.proposed.get(path).with_context(|| {
                         format!("cannot update absent declaration file: {path}")
                     })?;
-                    let calls = candidate.proposed_calls.get(path).map(Vec::as_slice).unwrap_or_default();
+                    let calls = candidate
+                        .proposed_calls
+                        .get(path)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default();
                     let original = super::calls::combined(path, original, calls)?;
                     let text = patch_file(&original, body)?;
                     let (text, calls) = super::calls::parse(destination, &text, calls)?;
                     candidate.proposed.remove(path);
                     candidate.proposed_calls.remove(path);
                     candidate.proposed.insert(destination.into(), text);
-                    if !calls.is_empty() { candidate.proposed_calls.insert(destination.into(), calls); }
+                    if !calls.is_empty() {
+                        candidate.proposed_calls.insert(destination.into(), calls);
+                    }
                     if destination != path {
                         let original = candidate
                             .moved
@@ -498,14 +651,31 @@ impl DeclarationDesign {
             }
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
-        if candidate.proposed_calls.values().flatten().flat_map(|function| function.call.iter().flatten()).any(|reference| !reference.unresolved && matches!(reference.kind, super::CallKind::Value | super::CallKind::Property | super::CallKind::Call)) {
-            let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &candidate, false)?;
+        if candidate
+            .proposed_calls
+            .values()
+            .flatten()
+            .flat_map(|function| function.call.iter().flatten())
+            .any(|reference| {
+                !reference.unresolved
+                    && matches!(
+                        reference.kind,
+                        super::CallKind::Value | super::CallKind::Property | super::CallKind::Call
+                    )
+            })
+        {
+            let mut resolver =
+                crate::declaration::DeclarationResolver::planned(workspace, &candidate, false)?;
             for (path, functions) in &mut candidate.proposed_calls {
                 super::calls::classify(path, functions, &mut resolver);
             }
         }
         candidate.validate()?;
-        if candidate.proposed == self.proposed && candidate.proposed_calls == self.proposed_calls && candidate.document == self.document && candidate.moved == self.moved {
+        if candidate.proposed == self.proposed
+            && candidate.proposed_calls == self.proposed_calls
+            && candidate.document == self.document
+            && candidate.moved == self.moved
+        {
             candidate.validation = self.validation.clone();
         }
         Ok(candidate)
@@ -543,10 +713,15 @@ pub(crate) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<St
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error).with_context(|| format!("inspect {path}")),
     };
-    ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "{path}: source is not a regular file");
-    ensure!(std::fs::canonicalize(&target)?.starts_with(std::fs::canonicalize(workspace)?), "{path}: source escapes workspace");
-    let source = std::fs::read_to_string(&target)
-        .with_context(|| format!("read {path}"))?;
+    ensure!(
+        metadata.is_file() && !metadata.file_type().is_symlink(),
+        "{path}: source is not a regular file"
+    );
+    ensure!(
+        std::fs::canonicalize(&target)?.starts_with(std::fs::canonicalize(workspace)?),
+        "{path}: source escapes workspace"
+    );
+    let source = std::fs::read_to_string(&target).with_context(|| format!("read {path}"))?;
     Ok(Some(source))
 }
 
@@ -642,9 +817,17 @@ mod tests {
         std::fs::write(workspace.path().join("run.ts"), "import { worker as callback } from './api'; export function install() { register(callback); }").unwrap();
         std::fs::write(workspace.path().join("unrelated.ts"), "invalid syntax {").unwrap();
         let mut design = super::DeclarationDesign::default();
-        design.proposed.insert("api.ts".into(), "export function worker(): void;\n".into());
+        design
+            .proposed
+            .insert("api.ts".into(), "export function worker(): void;\n".into());
         let (_, functions) = design.source(workspace.path(), "run.ts").unwrap();
-        let reference = functions[0].call.as_ref().unwrap().iter().find(|reference| reference.name == "callback").unwrap();
+        let reference = functions[0]
+            .call
+            .as_ref()
+            .unwrap()
+            .iter()
+            .find(|reference| reference.name == "callback")
+            .unwrap();
         assert_eq!(reference.kind, crate::plan::CallKind::Callback);
         let (_, warmed) = design.source(workspace.path(), "run.ts").unwrap();
         assert_eq!(functions, warmed);
@@ -654,24 +837,42 @@ mod tests {
     #[test]
     fn workspace_source_preserves_complete_text_above_the_former_file_limit() {
         let workspace = tempfile::tempdir().unwrap();
-        let text = format!("// {}\nexport interface Item {{ value: string }}\n", "x".repeat(2 * 1024 * 1024));
+        let text = format!(
+            "// {}\nexport interface Item {{ value: string }}\n",
+            "x".repeat(2 * 1024 * 1024)
+        );
         std::fs::write(workspace.path().join("item.ts"), &text).unwrap();
-        assert_eq!(workspace_source(workspace.path(), "item.ts").unwrap(), Some(text));
+        assert_eq!(
+            workspace_source(workspace.path(), "item.ts").unwrap(),
+            Some(text)
+        );
     }
 
     #[test]
     fn first_edit_captures_only_its_source_and_failed_patches_publish_nothing() {
         let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("Foo.rs"), "pub struct Foo;\nimpl Foo { pub fn old(&self) {} }\n").unwrap();
+        std::fs::write(
+            workspace.path().join("Foo.rs"),
+            "pub struct Foo;\nimpl Foo { pub fn old(&self) {} }\n",
+        )
+        .unwrap();
         std::fs::write(workspace.path().join("unrelated.rs"), "invalid Rust {").unwrap();
         std::fs::write(workspace.path().join("unrelated.json"), "invalid JSON").unwrap();
         let design = DeclarationDesign::open(workspace.path()).unwrap();
-        let inspected = design.inspect(workspace.path(), Some("Foo.rs"), false).unwrap();
+        let inspected = design
+            .inspect(workspace.path(), Some("Foo.rs"), false)
+            .unwrap();
         assert!(design.baseline.is_empty() && design.proposed.is_empty());
         assert!(!inspected["text"].as_str().unwrap().contains("{}"));
-        let digests = BTreeMap::from([("Foo.rs".into(), inspected["source_digest"].as_str().unwrap().into())]);
+        let digests = BTreeMap::from([(
+            "Foo.rs".into(),
+            inspected["source_digest"].as_str().unwrap().into(),
+        )]);
         let patch = "*** Begin Patch\n*** Update File: Foo.rs\n@@\n   pub fn old(&self);\n+\n+  pub fn new(&self);\n*** End Patch";
-        let invalid = patch.replace("*** End Patch", "*** Add File: bad.rs\n+fn invalid() {}\n*** End Patch");
+        let invalid = patch.replace(
+            "*** End Patch",
+            "*** Add File: bad.rs\n+fn invalid() {}\n*** End Patch",
+        );
         assert!(design.patch(workspace.path(), &digests, &invalid).is_err());
         assert!(design.baseline.is_empty() && design.proposed.is_empty());
         let changed = design.patch(workspace.path(), &digests, patch).unwrap();
@@ -690,15 +891,30 @@ mod tests {
     fn lazy_deletes_and_moves_cannot_recapture_or_overwrite_workspace_sources() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("first.rs"), "pub struct First;\n").unwrap();
-        std::fs::write(workspace.path().join("occupied.rs"), "pub struct Occupied;\n").unwrap();
+        std::fs::write(
+            workspace.path().join("occupied.rs"),
+            "pub struct Occupied;\n",
+        )
+        .unwrap();
         let design = DeclarationDesign::open(workspace.path()).unwrap();
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Add File: occupied.rs\n+pub struct Replacement;\n*** End Patch").is_err());
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: occupied.rs\n@@\n pub struct First;\n*** End Patch").is_err());
-        let deleted = design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: first.rs\n*** End Patch").unwrap();
-        assert!(deleted.inspect(workspace.path(), Some("first.rs"), false).is_err());
+        let deleted = design
+            .patch(
+                workspace.path(),
+                &Default::default(),
+                "*** Begin Patch\n*** Delete File: first.rs\n*** End Patch",
+            )
+            .unwrap();
+        assert!(
+            deleted
+                .inspect(workspace.path(), Some("first.rs"), false)
+                .is_err()
+        );
         assert!(deleted.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n@@\n-pub struct First;\n+pub struct Recaptured;\n*** End Patch").is_err());
         let moved = design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: moved.rs\n@@\n pub struct First;\n*** End Patch").unwrap();
-        let saved: DeclarationDesign = serde_json::from_slice(&serde_json::to_vec(&moved).unwrap()).unwrap();
+        let saved: DeclarationDesign =
+            serde_json::from_slice(&serde_json::to_vec(&moved).unwrap()).unwrap();
         let restored = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: moved.rs\n*** Move to: first.rs\n@@\n pub struct First;\n*** End Patch").unwrap();
         assert!(restored.moved.is_empty());
         assert_eq!(restored.baseline, moved.baseline);
@@ -727,7 +943,11 @@ mod tests {
         assert!(design.baseline.is_empty());
         assert!(!design.proposed.contains_key("Cargo.lock"));
         assert!(
-            design.inspect(workspace.path(), Some("lib.rs"), false).unwrap()["text"].as_str().unwrap()
+            design
+                .inspect(workspace.path(), Some("lib.rs"), false)
+                .unwrap()["text"]
+                .as_str()
+                .unwrap()
                 .lines()
                 .all(|line| line.chars().count() <= 50)
         );
@@ -753,8 +973,13 @@ mod tests {
         design.document.background = "Texture requests currently run to completion.".into();
         design.document.requirements = vec!["Cancellation must prevent publication.".into()];
         let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Support cancellable texture loading.\",\n@@\n-  \"design\": \"\",\n+  \"design\": \"Add cancellable requests.\",\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
-        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        assert_eq!(changed.document.objective, "Support cancellable texture loading.");
+        let changed = design
+            .patch(workspace.path(), &Default::default(), patch)
+            .unwrap();
+        assert_eq!(
+            changed.document.objective,
+            "Support cancellable texture loading."
+        );
         assert_eq!(changed.document.design, "Add cancellable requests.");
         assert_eq!(changed.changed_paths(), vec!["src/request.rs"]);
         assert!(!changed.proposed.contains_key("plan.json"));
@@ -775,15 +1000,27 @@ mod tests {
         );
         assert!(
             design
-                .patch(workspace.path(), &Default::default(), &patch.replace("pub struct Request;", "fn invalid() {}"))
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &patch.replace("pub struct Request;", "fn invalid() {}")
+                )
                 .is_err()
         );
         assert!(design.document.design.is_empty() && design.proposed.is_empty());
         let invalid = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Change\",\n+  \"tasks\": []\n*** End Patch";
-        assert!(design.patch(workspace.path(), &Default::default(), invalid).is_err());
         assert!(
             design
-                .patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: plan.json\n*** End Patch")
+                .patch(workspace.path(), &Default::default(), invalid)
+                .is_err()
+        );
+        assert!(
+            design
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    "*** Begin Patch\n*** Delete File: plan.json\n*** End Patch"
+                )
                 .is_err()
         );
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: plan.json\n*** Move to: other.rs\n@@\n {}\n*** End Patch").is_err());
@@ -804,7 +1041,10 @@ mod tests {
         let empty = DeclarationDesign::default();
         let added = empty.patch(workspace.path(), &Default::default(),
             "*** Begin Patch\n*** Add File: .gitignore\n+# Build output\n+/target/\n+!Cargo.lock\n*** End Patch").unwrap();
-        assert_eq!(added.read(Some(".gitignore"), false).unwrap()["text"], "# Build output\n/target/\n!Cargo.lock\n");
+        assert_eq!(
+            added.read(Some(".gitignore"), false).unwrap()["text"],
+            "# Build output\n/target/\n!Cargo.lock\n"
+        );
         assert!(!workspace.path().join(".gitignore").exists());
 
         let existing = "# Keep local exceptions\n*.log\n!important.log\n";
@@ -812,43 +1052,91 @@ mod tests {
         let updated = empty.patch(workspace.path(), &Default::default(),
             "*** Begin Patch\n*** Update File: .gitignore\n@@\n !important.log\n+/target/\n*** End Patch").unwrap();
         assert_eq!(updated.baseline[".gitignore"].text, existing);
-        assert_eq!(updated.proposed[".gitignore"], format!("{existing}/target/\n"));
+        assert_eq!(
+            updated.proposed[".gitignore"],
+            format!("{existing}/target/\n")
+        );
         assert_eq!(updated.formatted().unwrap().proposed, updated.proposed);
         let mut document = crate::plan::document::test_fixture("ignore", "Ignore outputs");
         document.design = Some(updated);
-        assert!(crate::plan::render_plan_at(&document, workspace.path()).unwrap().markdown.contains("/target/"));
-        assert_eq!(std::fs::read_to_string(workspace.path().join(".gitignore")).unwrap(), existing);
+        assert!(
+            crate::plan::render_plan_at(&document, workspace.path())
+                .unwrap()
+                .markdown
+                .contains("/target/")
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(".gitignore")).unwrap(),
+            existing
+        );
     }
 
     #[test]
     fn project_checks_are_snapshotted_without_running_commands() {
         let workspace = tempfile::tempdir().unwrap();
         let config = serde_json::json!({"checks":{"version":2,"definitions":[{"id":"score","name":"Score tests","area":"Game","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"echo test > should-not-exist.txt"}}]}});
-        std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"),workspace.path());
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let store =
+            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
         crate::checks::configure_fixture(&store.workspace);
         let mut design = DeclarationDesign::default();
         design.document.objective = "Verify score resets".into();
         design.document.background = "Existing score fixture".into();
         design.document.design = "Reset score when a round starts".into();
-        design.document.verification = vec!["Start a new round and confirm the score is zero.".into()];
+        design.document.verification =
+            vec!["Start a new round and confirm the score is zero.".into()];
         let mut document = crate::plan::document::test_fixture("validation", "Score validation");
         document.design = Some(design);
-        store.write_working_document("session", "validation", &document).unwrap();
+        store
+            .write_working_document("session", "validation", &document)
+            .unwrap();
         std::fs::remove_file(workspace.path().join(".forge.json")).unwrap();
-        assert!(store.submit_document_revision("session", "validation", 1, 1).unwrap_err().to_string().contains("checks_not_configured"));
-        std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&config).unwrap()).unwrap();
-        let (submitted, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
+        assert!(
+            store
+                .submit_document_revision("session", "validation", 1, 1)
+                .unwrap_err()
+                .to_string()
+                .contains("checks_not_configured")
+        );
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&config).unwrap(),
+        )
+        .unwrap();
+        let (submitted, rendered, _) = store
+            .submit_document_revision("session", "validation", 1, 1)
+            .unwrap();
         assert!(submitted.design.unwrap().check_configuration.is_some());
-        assert!(rendered.markdown.contains("echo test > should-not-exist.txt"));
+        assert!(
+            rendered
+                .markdown
+                .contains("echo test > should-not-exist.txt")
+        );
         assert!(!workspace.path().join("should-not-exist.txt").exists());
-        assert!(serde_json::to_value(store.read_submitted_document("session", "validation", 1).unwrap().design.unwrap().document).unwrap().get("checks").is_none());
+        assert!(
+            serde_json::to_value(
+                store
+                    .read_submitted_document("session", "validation", 1)
+                    .unwrap()
+                    .design
+                    .unwrap()
+                    .document
+            )
+            .unwrap()
+            .get("checks")
+            .is_none()
+        );
     }
 
     #[test]
     fn complete_specification_survives_review_and_optional_section_removal() {
         let workspace = tempfile::tempdir().unwrap();
-        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        let store =
+            crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
         crate::checks::configure_fixture(&store.workspace);
         let empty = DeclarationDesign::default();
         let metadata = serde_json::json!({
@@ -865,30 +1153,105 @@ mod tests {
         let replace = |design: &DeclarationDesign, metadata: &serde_json::Value| {
             let before = design.read(Some("plan.json"), false).unwrap();
             let after = serde_json::to_string_pretty(metadata).unwrap();
-            format!("*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch",
-                before["text"].as_str().unwrap().lines().map(|line| format!("-{line}")).collect::<Vec<_>>().join("\n"),
-                after.lines().map(|line| format!("+{line}")).collect::<Vec<_>>().join("\n"))
+            format!(
+                "*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch",
+                before["text"]
+                    .as_str()
+                    .unwrap()
+                    .lines()
+                    .map(|line| format!("-{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                after
+                    .lines()
+                    .map(|line| format!("+{line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
         };
-        let changed = empty.patch(workspace.path(), &Default::default(), &replace(&empty, &metadata)).unwrap();
+        let changed = empty
+            .patch(
+                workspace.path(),
+                &Default::default(),
+                &replace(&empty, &metadata),
+            )
+            .unwrap();
         let mut document = crate::plan::document::test_fixture("specification", "Cancellation");
         document.design = Some(changed.clone());
-        store.write_working_document("session", "specification", &document).unwrap();
-        let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
-        let original = store.read_submitted_document("session", "specification", 1).unwrap();
-        assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
-        let headings = [" Objective ", " Usage ", " Requirements ", " Background ", " Decisions ", " Design ", " Flows ", " Changes ", " Tests · 1 new ", " Verification "];
-        let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
+        store
+            .write_working_document("session", "specification", &document)
+            .unwrap();
+        let (_, rendered, _) = store
+            .submit_document_revision("session", "specification", 1, 1)
+            .unwrap();
+        let original = store
+            .read_submitted_document("session", "specification", 1)
+            .unwrap();
+        assert_eq!(
+            serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(),
+            metadata
+        );
+        let headings = [
+            " Objective ",
+            " Usage ",
+            " Requirements ",
+            " Background ",
+            " Decisions ",
+            " Design ",
+            " Flows ",
+            " Changes ",
+            " Tests · 1 new ",
+            " Verification ",
+        ];
+        let positions = headings.map(|heading| {
+            rendered
+                .markdown
+                .lines()
+                .position(|line| line == heading)
+                .unwrap()
+        });
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
-        assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
-        assert!(rendered.markdown.contains("On cancellation requested\n  → Request.cancel\n  ↓ TextureStreaming.discard"));
-        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "verification", "tests"] {
-            assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
+        assert!(
+            rendered
+                .markdown
+                .contains("app cancel 42\nCancelled request 42")
+        );
+        assert!(rendered.markdown.contains(
+            "On cancellation requested\n  → Request.cancel\n  ↓ TextureStreaming.discard"
+        ));
+        for path in [
+            "objective",
+            "usage",
+            "requirements",
+            "background",
+            "decisions",
+            "design",
+            "flows",
+            "verification",
+            "tests",
+        ] {
+            assert!(
+                rendered
+                    .navigation
+                    .anchor
+                    .iter()
+                    .any(|anchor| anchor.json_path == format!("/design/document/{path}"))
+            );
         }
         for field in ["objective", "background", "design"] {
             let mut invalid = metadata.clone();
             invalid[field] = serde_json::json!("");
-            let incomplete = empty.patch(workspace.path(), &Default::default(), &replace(&empty, &invalid)).unwrap();
-            assert!(incomplete.document.validate_for_submission().is_err(), "{field}");
+            let incomplete = empty
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &replace(&empty, &invalid),
+                )
+                .unwrap();
+            assert!(
+                incomplete.document.validate_for_submission().is_err(),
+                "{field}"
+            );
         }
         for invalid in [
             serde_json::json!({"decision": "Choose an approach.", "rationale": ""}),
@@ -896,18 +1259,45 @@ mod tests {
         ] {
             let mut invalid_metadata = metadata.clone();
             invalid_metadata["decisions"] = serde_json::json!([invalid]);
-            assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_metadata)).is_err());
+            assert!(
+                changed
+                    .patch(
+                        workspace.path(),
+                        &Default::default(),
+                        &replace(&changed, &invalid_metadata)
+                    )
+                    .is_err()
+            );
         }
         let mut invalid_flow = metadata.clone();
         invalid_flow["flows"][0]["steps"][0]["action"] = serde_json::json!("");
-        assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_flow)).is_err());
+        assert!(
+            changed
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &replace(&changed, &invalid_flow)
+                )
+                .is_err()
+        );
         let mut nested_result = metadata.clone();
         nested_result["flows"][0]["steps"][0]["effects"] = serde_json::json!([{
             "target":"shield charges", "change":"grant", "steps":[{"action":"take_hit"}]
         }]);
-        let error = changed.patch(workspace.path(), &Default::default(), &replace(&changed, &nested_result)).unwrap_err();
+        let error = changed
+            .patch(
+                workspace.path(),
+                &Default::default(),
+                &replace(&changed, &nested_result),
+            )
+            .unwrap_err();
         assert!(format!("{error:#}").contains("unknown field"));
-        assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
+        assert_eq!(
+            store
+                .read_submitted_document("session", "specification", 1)
+                .unwrap(),
+            original
+        );
         for tests in [
             serde_json::json!([{"file":"../outside.rs", "cases":metadata["tests"][0]["cases"]}]),
             serde_json::json!([metadata["tests"][0].clone(), metadata["tests"][0].clone()]),
@@ -920,35 +1310,96 @@ mod tests {
         ] {
             let mut invalid = metadata.clone();
             invalid["tests"] = tests;
-            assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid)).is_err());
-            assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
+            assert!(
+                changed
+                    .patch(
+                        workspace.path(),
+                        &Default::default(),
+                        &replace(&changed, &invalid)
+                    )
+                    .is_err()
+            );
+            assert_eq!(
+                store
+                    .read_submitted_document("session", "specification", 1)
+                    .unwrap(),
+                original
+            );
         }
         let mut missing_inventory = metadata.clone();
         missing_inventory.as_object_mut().unwrap().remove("tests");
-        assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &missing_inventory)).is_err());
+        assert!(
+            changed
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &replace(&changed, &missing_inventory)
+                )
+                .is_err()
+        );
         let mut revised_metadata = metadata.clone();
         revised_metadata.as_object_mut().unwrap().remove("usage");
         revised_metadata["decisions"] = serde_json::json!([]);
         revised_metadata["tests"][0]["cases"][0]["change"] = serde_json::json!("reused");
         revised_metadata["requirements"] = serde_json::json!([]);
         revised_metadata["flows"] = serde_json::json!([]);
-        document.design = Some(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &revised_metadata)).unwrap());
+        document.design = Some(
+            changed
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &replace(&changed, &revised_metadata),
+                )
+                .unwrap(),
+        );
         document.version += 1;
-        store.write_working_document("session", "specification", &document).unwrap();
-        let (_, rendered, _) = store.submit_document_revision("session", "specification", 2, document.version).unwrap();
-        assert!(!rendered.markdown.lines().any(|line| matches!(line, " Usage " | " Requirements " | " Decisions " | " Flows ")));
-        assert!(!rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == "/design/document/requirements"));
-        let current = store.read_submitted_document("session", "specification", 2).unwrap();
-        assert!(current.design.as_ref().unwrap().document.requirements.is_empty());
-        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
+        store
+            .write_working_document("session", "specification", &document)
+            .unwrap();
+        let (_, rendered, _) = store
+            .submit_document_revision("session", "specification", 2, document.version)
+            .unwrap();
+        assert!(!rendered.markdown.lines().any(|line| matches!(
+            line,
+            " Usage " | " Requirements " | " Decisions " | " Flows "
+        )));
+        assert!(
+            !rendered
+                .navigation
+                .anchor
+                .iter()
+                .any(|anchor| anchor.json_path == "/design/document/requirements")
+        );
+        let current = store
+            .read_submitted_document("session", "specification", 2)
+            .unwrap();
+        assert!(
+            current
+                .design
+                .as_ref()
+                .unwrap()
+                .document
+                .requirements
+                .is_empty()
+        );
+        let delta =
+            crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
         assert!(delta.files.is_empty());
-        assert!(delta.document.contains("a/Usage b/Usage") && delta.document.contains("a/Decisions b/Decisions"));
+        assert!(
+            delta.document.contains("a/Usage b/Usage")
+                && delta.document.contains("a/Decisions b/Decisions")
+        );
         assert!(delta.document.contains("a/Requirements b/Requirements"));
         assert!(delta.document.contains("a/Flows b/Flows"));
         assert!(delta.document.contains("a/Tests b/Tests"));
         assert!(rendered.markdown.contains("Tests · 1 reused"));
         assert!(!rendered.markdown.contains("= tests::cancellation"));
-        assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
+        assert_eq!(
+            store
+                .read_submitted_document("session", "specification", 1)
+                .unwrap(),
+            original
+        );
     }
 
     #[test]
@@ -978,40 +1429,68 @@ mod tests {
                     let storage = tempfile::tempdir().unwrap();
                     let source = source.replace('\n', newline);
                     std::fs::write(workspace.path().join(path), &source).unwrap();
-                    let initial = DeclarationDesign { line_width: width, ..Default::default() };
+                    let initial = DeclarationDesign {
+                        line_width: width,
+                        ..Default::default()
+                    };
                     let (_, expected) = initial.source(workspace.path(), path).unwrap();
-                    assert!(expected.iter().flat_map(|function| function.call.iter().flatten())
-                        .next().is_some());
-                    let inspected = initial.inspect(workspace.path(), Some(path), false).unwrap();
+                    assert!(
+                        expected
+                            .iter()
+                            .flat_map(|function| function.call.iter().flatten())
+                            .next()
+                            .is_some()
+                    );
+                    let inspected = initial
+                        .inspect(workspace.path(), Some(path), false)
+                        .unwrap();
                     assert!(initial.baseline.is_empty());
                     let first_line = inspected["text"].as_str().unwrap().lines().next().unwrap();
                     let comment = if path.ends_with(".lua") { "--" } else { "//" };
                     let patch = format!(
                         "*** Begin Patch\n*** Update File: {path}\n@@\n+{comment} Reviewed boundary.\n {first_line}\n*** End Patch"
                     );
-                    let changed = initial.patch(workspace.path(), &Default::default(), &patch)
+                    let changed = initial
+                        .patch(workspace.path(), &Default::default(), &patch)
                         .unwrap_or_else(|error| panic!("{path}, width {width}: {error:#}"));
                     assert_eq!(changed.baseline_calls[path], expected);
                     assert_eq!(changed.proposed_calls[path], expected);
                     let mut document = crate::plan::document::test_fixture("boundary", "Boundary");
                     document.design = Some(changed.clone());
                     let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
-                    store.write_working_document("session", "boundary", &document).unwrap();
-                    let reopened = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
-                    let saved = reopened.read_working_document("session", "boundary").unwrap();
+                    store
+                        .write_working_document("session", "boundary", &document)
+                        .unwrap();
+                    let reopened =
+                        crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+                    let saved = reopened
+                        .read_working_document("session", "boundary")
+                        .unwrap();
                     assert_eq!(saved, document);
                     let saved_design = saved.design.unwrap();
                     let follow_up = format!(
                         "*** Begin Patch\n*** Update File: {path}\n@@\n-{comment} Reviewed boundary.\n+{comment} Confirmed boundary.\n*** End Patch"
                     );
-                    let revised = saved_design.patch(workspace.path(), &Default::default(), &follow_up).unwrap();
+                    let revised = saved_design
+                        .patch(workspace.path(), &Default::default(), &follow_up)
+                        .unwrap();
                     assert_eq!(revised.baseline, changed.baseline);
                     assert_eq!(revised.proposed_calls[path], expected);
                     document.version += 1;
                     document.design = Some(revised.formatted().unwrap());
-                    reopened.write_working_document("session", "boundary", &document).unwrap();
-                    assert_eq!(reopened.read_working_document("session", "boundary").unwrap(), document);
-                    assert_eq!(std::fs::read_to_string(workspace.path().join(path)).unwrap(), source);
+                    reopened
+                        .write_working_document("session", "boundary", &document)
+                        .unwrap();
+                    assert_eq!(
+                        reopened
+                            .read_working_document("session", "boundary")
+                            .unwrap(),
+                        document
+                    );
+                    assert_eq!(
+                        std::fs::read_to_string(workspace.path().join(path)).unwrap(),
+                        source
+                    );
                 }
             }
         }
@@ -1064,7 +1543,11 @@ mod tests {
         assert!(restored.moved.is_empty());
         assert!(restored.changed_paths().is_empty());
         let deleted = design
-            .patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: second.rs\n*** End Patch")
+            .patch(
+                workspace.path(),
+                &Default::default(),
+                "*** Begin Patch\n*** Delete File: second.rs\n*** End Patch",
+            )
             .unwrap();
         assert!(deleted.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: second.rs\n@@\n pub struct Contract;\n*** End Patch").is_err());
     }
@@ -1085,12 +1568,18 @@ mod tests {
             .proposed
             .insert("lib.rs".into(), "pub struct Before;\n".into());
         let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-pub struct Before;\n+pub struct After;\n*** Add File: extra.lua\n+function M.get(id)\n*** End Patch";
-        let updated = design.patch(workspace.path(), &Default::default(), patch).unwrap();
+        let updated = design
+            .patch(workspace.path(), &Default::default(), patch)
+            .unwrap();
         assert_eq!(updated.proposed["lib.rs"], "pub struct After;\n");
         assert!(updated.check_workspace(workspace.path()).is_ok());
         assert!(
             design
-                .patch(workspace.path(), &Default::default(), &patch.replace("+function M.get(id)", "+function M.get(id) return id end"))
+                .patch(
+                    workspace.path(),
+                    &Default::default(),
+                    &patch.replace("+function M.get(id)", "+function M.get(id) return id end")
+                )
                 .is_err()
         );
         assert_eq!(design.proposed["lib.rs"], "pub struct Before;\n");
@@ -1099,53 +1588,129 @@ mod tests {
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Add File: ../escape.rs\n+pub struct Escaped;\n*** End Patch").is_err());
     }
 }
-    #[test]
-    fn change_only_patch_captures_one_file_and_preserves_source_evidence() {
-        let workspace = tempfile::tempdir().unwrap();
-        let source = "pub fn run() { before(); before(); }\n";
-        std::fs::write(workspace.path().join("main.rs"), source).unwrap();
-        std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
-        let design = DeclarationDesign::default();
-        let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n pub fn run();\n+Change\n+  Stop retrying authentication failures.\n Calls\n*** End Patch";
-        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        assert_eq!(changed.baseline.len(), 1);
-        assert_eq!(changed.baseline["main.rs"].text, changed.proposed["main.rs"]);
-        assert_eq!(changed.changed_paths(), vec!["main.rs".to_owned()]);
-        assert_eq!(changed.baseline_calls["main.rs"][0].call, changed.proposed_calls["main.rs"][0].call);
-        assert_eq!(changed.baseline_calls["main.rs"][0].behavior, None);
-        assert_eq!(changed.proposed_calls["main.rs"][0].behavior.as_ref().map(crate::plan::FunctionBehavior::text), Some("Stop retrying authentication failures."));
-        assert_eq!(std::fs::read_to_string(workspace.path().join("main.rs")).unwrap(), source);
-        assert!(changed.read(Some("main.rs"), false).unwrap()["text"].as_str().unwrap().contains("Change\n"));
-        let snapshot = serde_json::to_vec(&changed).unwrap();
-        let saved: DeclarationDesign = serde_json::from_slice(&snapshot).unwrap();
-        saved.validate().unwrap();
-        let moved = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n*** Move to: moved.rs\n@@\n Change\n*** End Patch").unwrap();
-        assert_eq!(moved.proposed_calls["moved.rs"], saved.proposed_calls["main.rs"]);
-        let removed = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n-Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").unwrap();
-        assert!(removed.changed_paths().is_empty());
-        assert!(saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").is_err());
-        assert_eq!(serde_json::to_vec(&saved).unwrap(), snapshot);
-    }
+#[test]
+fn change_only_patch_captures_one_file_and_preserves_source_evidence() {
+    let workspace = tempfile::tempdir().unwrap();
+    let source = "pub fn run() { before(); before(); }\n";
+    std::fs::write(workspace.path().join("main.rs"), source).unwrap();
+    std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
+    let design = DeclarationDesign::default();
+    let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n pub fn run();\n+Change\n+  Stop retrying authentication failures.\n Calls\n*** End Patch";
+    let changed = design
+        .patch(workspace.path(), &Default::default(), patch)
+        .unwrap();
+    assert_eq!(changed.baseline.len(), 1);
+    assert_eq!(
+        changed.baseline["main.rs"].text,
+        changed.proposed["main.rs"]
+    );
+    assert_eq!(changed.changed_paths(), vec!["main.rs".to_owned()]);
+    assert_eq!(
+        changed.baseline_calls["main.rs"][0].call,
+        changed.proposed_calls["main.rs"][0].call
+    );
+    assert_eq!(changed.baseline_calls["main.rs"][0].behavior, None);
+    assert_eq!(
+        changed.proposed_calls["main.rs"][0]
+            .behavior
+            .as_ref()
+            .map(crate::plan::FunctionBehavior::text),
+        Some("Stop retrying authentication failures.")
+    );
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join("main.rs")).unwrap(),
+        source
+    );
+    assert!(
+        changed.read(Some("main.rs"), false).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("Change\n")
+    );
+    let snapshot = serde_json::to_vec(&changed).unwrap();
+    let saved: DeclarationDesign = serde_json::from_slice(&snapshot).unwrap();
+    saved.validate().unwrap();
+    let moved = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n*** Move to: moved.rs\n@@\n Change\n*** End Patch").unwrap();
+    assert_eq!(
+        moved.proposed_calls["moved.rs"],
+        saved.proposed_calls["main.rs"]
+    );
+    let removed = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n-Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").unwrap();
+    assert!(removed.changed_paths().is_empty());
+    assert!(saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").is_err());
+    assert_eq!(serde_json::to_vec(&saved).unwrap(), snapshot);
+}
 
-    #[test]
-    fn lazy_call_capture_and_patch_are_atomic_and_snapshot_bound() {
-        let workspace = tempfile::tempdir().unwrap();
-        std::fs::write(workspace.path().join("main.rs"), "pub fn run() { before(); before(); }\n").unwrap();
-        std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
-        let design = DeclarationDesign::default();
-        let read = design.inspect(workspace.path(), Some("main.rs"), false).unwrap();
-        assert!(read["text"].as_str().unwrap().contains("Calls\n  before\n  before\n"));
-        assert!(design.baseline.is_empty() && design.baseline_calls.is_empty());
-        let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n Calls\n-  before\n+  after\n   before\n*** End Patch";
-        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        assert_eq!(changed.baseline_calls["main.rs"][0].call.as_ref().unwrap()[0].name, "before");
-        assert_eq!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0].name, "after");
-        assert!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0].source.is_none());
-        assert!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[1].source.is_some());
-        assert_eq!(changed.baseline.len(), 1);
-        assert!(design.patch(workspace.path(), &Default::default(), &patch.replace("+  after", "+  after(value)")).is_err());
-        assert!(design.baseline_calls.is_empty());
-        std::fs::write(workspace.path().join("main.rs"), "pub fn run() { live(); }\n").unwrap();
-        assert!(changed.inspect(workspace.path(), Some("main.rs"), true).unwrap()["text"].as_str().unwrap().contains("before"));
-        assert!(!changed.read(Some("main.rs"), false).unwrap()["text"].as_str().unwrap().contains("live"));
-    }
+#[test]
+fn lazy_call_capture_and_patch_are_atomic_and_snapshot_bound() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("main.rs"),
+        "pub fn run() { before(); before(); }\n",
+    )
+    .unwrap();
+    std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
+    let design = DeclarationDesign::default();
+    let read = design
+        .inspect(workspace.path(), Some("main.rs"), false)
+        .unwrap();
+    assert!(
+        read["text"]
+            .as_str()
+            .unwrap()
+            .contains("Calls\n  before\n  before\n")
+    );
+    assert!(design.baseline.is_empty() && design.baseline_calls.is_empty());
+    let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n Calls\n-  before\n+  after\n   before\n*** End Patch";
+    let changed = design
+        .patch(workspace.path(), &Default::default(), patch)
+        .unwrap();
+    assert_eq!(
+        changed.baseline_calls["main.rs"][0].call.as_ref().unwrap()[0].name,
+        "before"
+    );
+    assert_eq!(
+        changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0].name,
+        "after"
+    );
+    assert!(
+        changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0]
+            .source
+            .is_none()
+    );
+    assert!(
+        changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[1]
+            .source
+            .is_some()
+    );
+    assert_eq!(changed.baseline.len(), 1);
+    assert!(
+        design
+            .patch(
+                workspace.path(),
+                &Default::default(),
+                &patch.replace("+  after", "+  after(value)")
+            )
+            .is_err()
+    );
+    assert!(design.baseline_calls.is_empty());
+    std::fs::write(
+        workspace.path().join("main.rs"),
+        "pub fn run() { live(); }\n",
+    )
+    .unwrap();
+    assert!(
+        changed
+            .inspect(workspace.path(), Some("main.rs"), true)
+            .unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("before")
+    );
+    assert!(
+        !changed.read(Some("main.rs"), false).unwrap()["text"]
+            .as_str()
+            .unwrap()
+            .contains("live")
+    );
+}

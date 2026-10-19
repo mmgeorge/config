@@ -294,8 +294,15 @@ impl IssueDocumentService {
             .context("issue edit ended without durable collection")?
     }
     pub async fn save(&self, id: &DocumentId, capture: Vec<RegionEdit>) -> Result<IssueSave> {
-        ensure!(capture.iter().all(|field| &field.document == id), "capture belongs to another issue");
-        let bytes = capture.iter().try_fold(4096usize, |bytes, field| bytes.checked_add(field.text.len()))
+        ensure!(
+            capture.iter().all(|field| &field.document == id),
+            "capture belongs to another issue"
+        );
+        let bytes = capture
+            .iter()
+            .try_fold(4096usize, |bytes, field| {
+                bytes.checked_add(field.text.len())
+            })
             .context("issue capture byte count overflow")?;
         let owner = self.get(id)?;
         owner.admission.check()?;
@@ -321,12 +328,18 @@ impl IssueDocumentService {
             .context("issue save ended without collection")?
     }
 
-    async fn execute_save(&self, owner: Arc<IssueOwner>, capture: Vec<RegionEdit>) -> Result<IssueSave> {
+    async fn execute_save(
+        &self,
+        owner: Arc<IssueOwner>,
+        capture: Vec<RegionEdit>,
+    ) -> Result<IssueSave> {
         let (mutation, operation, sequence, node_id) = {
             let mut document = owner.document.lock().await;
             owner.admission.check()?;
-            ensure!(!document.fresh_required() && document.pending_operation().is_none(),
-                "issue requires recovery or a fresh observation before saving");
+            ensure!(
+                !document.fresh_required() && document.pending_operation().is_none(),
+                "issue requires recovery or a fresh observation before saving"
+            );
             document.capture_draft(capture)?;
             let Some(mutation) = document.begin_save()? else {
                 self.github
@@ -679,9 +692,9 @@ impl IssueDocumentService {
     }
     fn admit_job(&self, _bytes: usize) -> Result<OwnedSemaphorePermit> {
         self.jobs
-                .clone()
-                .try_acquire_owned()
-                .context("issue job admission is full")
+            .clone()
+            .try_acquire_owned()
+            .context("issue job admission is full")
     }
     fn spawn(&self, future: impl Future<Output = ()> + Send + 'static) -> Result<()> {
         let mut state = self.state.lock().expect("issue registry");

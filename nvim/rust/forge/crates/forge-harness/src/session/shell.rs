@@ -58,7 +58,9 @@ impl CheckShell {
         let mut command = tokio::process::Command::new(executable);
         match self {
             Self::Nushell => {
-                if piped_input { command.arg("--stdin"); }
+                if piped_input {
+                    command.arg("--stdin");
+                }
                 command.args(["--no-config-file", "--no-history", "-c", source]);
             }
             Self::System => {
@@ -73,7 +75,11 @@ impl CheckShell {
                 }
             }
         }
-        command.stdin(if piped_input { std::process::Stdio::piped() } else { std::process::Stdio::null() });
+        command.stdin(if piped_input {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
         Ok(command)
     }
 }
@@ -87,7 +93,8 @@ mod tests {
     async fn system_shell_preserves_native_exit_and_reports_powershell_errors() -> Result<()> {
         let shell = CheckShell::System;
         let executable = shell.executable()?;
-        let mut native = shell.command(&executable, "& pwsh -NoProfile -Command 'exit 13'", false)?;
+        let mut native =
+            shell.command(&executable, "& pwsh -NoProfile -Command 'exit 13'", false)?;
         let result =
             tokio::time::timeout(std::time::Duration::from_secs(10), native.output()).await??;
         assert_eq!(result.status.code(), Some(13));

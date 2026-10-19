@@ -1,16 +1,13 @@
 mod support;
 
-use std::{
-    fs,
-    path::Path,
-};
+use std::{fs, path::Path};
 
 use forge_diff::source::{Representation, SourceVersion};
 use forge_git::{
     RepositoryPath,
     content::{
-        ContentOrigin, ContentRequest, ContentResult, ContentSource,
-        ContentUnavailable, FileContent, IndexStage,
+        ContentOrigin, ContentRequest, ContentResult, ContentSource, ContentUnavailable,
+        FileContent, IndexStage,
     },
     store::RepositoryStore,
 };
@@ -207,7 +204,11 @@ async fn packed_blob_and_worktree_beyond_former_byte_limit_preserve_complete_con
             conversion: forge_git::content::WorktreeConversion::Raw,
         },
     ] {
-        let result = repository.content(&store, request(source)).await.unwrap().value;
+        let result = repository
+            .content(&store, request(source))
+            .await
+            .unwrap()
+            .value;
         assert_eq!(ready(result).source.bytes(), bytes);
     }
 }
@@ -233,8 +234,13 @@ async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
             .value,
     );
     assert_eq!(loaded.source.identity(), identity);
-    let source = SourceVersion::new(b"one\r\ntwo\nthree".repeat(10_001), Representation::Raw).unwrap();
-    let result = repository.content(&store, request(ContentSource::Supplied(source.clone()))).await.unwrap().value;
+    let source =
+        SourceVersion::new(b"one\r\ntwo\nthree".repeat(10_001), Representation::Raw).unwrap();
+    let result = repository
+        .content(&store, request(ContentSource::Supplied(source.clone())))
+        .await
+        .unwrap()
+        .value;
     assert_eq!(ready(result).source.bytes(), source.bytes());
     let constrained = RepositoryStore::new(1, 1).unwrap();
     let repository = constrained
@@ -246,9 +252,10 @@ async fn supplied_sources_preserve_identity_lines_and_spare_capacity() {
     spare.push(b'x');
     let source = SourceVersion::new(spare, Representation::Raw).unwrap();
     let result = repository
-            .content(&constrained, request(ContentSource::Supplied(source)))
-            .await
-            .unwrap().value;
+        .content(&constrained, request(ContentSource::Supplied(source)))
+        .await
+        .unwrap()
+        .value;
     assert_eq!(ready(result).source.bytes(), b"x");
 }
 

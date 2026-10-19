@@ -3,7 +3,6 @@ BackgroundConfiguration.__index = BackgroundConfiguration
 local store = require("forge.integrations.background_settings")
 local client = require("forge.client")
 local picker = require("forge.views.picker")
-local field = require("forge.views.picker.field")
 local notifications = require("forge.infra.notifications")
 
 ---@class ForgeBackgroundConfigurationOptions
@@ -22,7 +21,7 @@ local notifications = require("forge.infra.notifications")
 ---@field pending boolean
 ---@field failure? string
 ---@field revision integer
----@field rows fun(self: ForgeBackgroundConfiguration): table[]
+---@field fields fun(self: ForgeBackgroundConfiguration): table<string, ForgePickerField>
 ---@field change fun(self: ForgeBackgroundConfiguration, id: string, direction: integer): boolean
 ---@field open fun(self: ForgeBackgroundConfiguration, id: string): boolean
 ---@field load_models fun(self: ForgeBackgroundConfiguration)
@@ -78,20 +77,20 @@ function BackgroundConfiguration:descriptor()
   end
 end
 
-function BackgroundConfiguration:rows()
+function BackgroundConfiguration:fields()
   local selected = self:model()
   local disabled = self.pending and "Saving Background settings" or not self.snapshot and (self.failure or "Loading Background settings") or nil
   local catalog_disabled = disabled or not self.model_list and (self.failure or "Loading Background models") or nil
   local policy = self.snapshot and self.snapshot.settings.auto_compaction
   return {
-    { id = "background-model", label = "Background model", disabled_reason = catalog_disabled,
-      columns = { "Background model", field.render(selected and selected.model or "Loading…", true), self.options.backend .. " · independent of chat" } },
-    { id = "background-thinking", label = "Background thinking", disabled_reason = catalog_disabled,
-      columns = { "Background thinking", field.render(selected and selected.thinking or "Default", true), "Reasoning effort for Background requests" } },
-    { id = "background-compact", label = "Background auto compact", disabled_reason = disabled,
-      columns = { "Background auto compact", field.render(policy and policy.enabled and "On" or "Off", true), "Default for Background sessions" } },
-    { id = "background-threshold", label = "Background compact at tokens", disabled_reason = disabled,
-      columns = { "Background compact at tokens", field.render(tostring(policy and policy.threshold_tokens or 128000), true), "Provider-reported context tokens" } },
+    model = { id = "background-model", kind = "choice", value = selected and selected.model or "Loading…",
+      disabled_reason = catalog_disabled, description = "Model for Background requests, independent of the main conversation." },
+    thinking = { id = "background-thinking", kind = "choice", label = "Thinking", value = selected and selected.thinking or "Default",
+      disabled_reason = catalog_disabled, description = "Reasoning effort for Background requests." },
+    compact = { id = "background-compact", kind = "toggle", label = "Automatic", value = policy and policy.enabled == true,
+      disabled_reason = disabled, description = "Automatically compact Background sessions after completed turns." },
+    threshold = { id = "background-threshold", kind = "input", label = "Threshold", value = tostring(policy and policy.threshold_tokens or 128000),
+      disabled_reason = disabled, muted = not (policy and policy.enabled), description = "Background compaction threshold in provider-reported context tokens." },
   }
 end
 
@@ -138,7 +137,9 @@ function BackgroundConfiguration:change(id, direction)
     preferences.auto_compaction.enabled = not preferences.auto_compaction.enabled
     self:save(preferences)
   elseif id == "background-threshold" then
-    return self:open(id)
+    local preferences = self:preferences()
+    preferences.auto_compaction.threshold_tokens = math.max(1, preferences.auto_compaction.threshold_tokens + direction)
+    self:save(preferences)
   elseif id == "background-model" and self.model_list and #self.model_list > 0 then
     local position = 1
     for index, model in ipairs(self.model_list) do if model.id == self:model().model then position = index end end

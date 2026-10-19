@@ -46,10 +46,19 @@ impl Default for WidthProfile {
 impl WidthProfile {
     /// Returns the retained byte count and display rows for a word-wrapped single-line preview.
     /// The limit bounds only the preview, leaving the complete source available to its owner.
-    pub fn wrapped_prefix(&self, text: &str, rows: usize, continuation_indent: usize) -> Result<(usize, usize), ContractError> {
+    pub fn wrapped_prefix(
+        &self,
+        text: &str,
+        rows: usize,
+        continuation_indent: usize,
+    ) -> Result<(usize, usize), ContractError> {
         self.validate()?;
-        if text.contains(['\n', '\0']) { return Err(ContractError("wrapped preview requires one text row")); }
-        if rows == 0 { return Ok((0, 0)); }
+        if text.contains(['\n', '\0']) {
+            return Err(ContractError("wrapped preview requires one text row"));
+        }
+        if rows == 0 {
+            return Ok((0, 0));
+        }
         let indent = continuation_indent.min(self.columns.saturating_sub(1));
         let mut display_rows = 1;
         let mut column = 0;
@@ -57,7 +66,9 @@ impl WidthProfile {
         for part in text.split_inclusive(char::is_whitespace) {
             let base = if display_rows == 1 { 0 } else { indent };
             if column > base && column + self.cells(part, column)? > self.columns {
-                if display_rows == rows { return Ok((offset, display_rows)); }
+                if display_rows == rows {
+                    return Ok((offset, display_rows));
+                }
                 display_rows += 1;
                 column = indent;
             }
@@ -65,7 +76,9 @@ impl WidthProfile {
                 let cells = self.cells(cluster, column)?;
                 let base = if display_rows == 1 { 0 } else { indent };
                 if column > base && column + cells > self.columns {
-                    if display_rows == rows { return Ok((offset, display_rows)); }
+                    if display_rows == rows {
+                        return Ok((offset, display_rows));
+                    }
                     display_rows += 1;
                     column = indent;
                 }
@@ -227,7 +240,10 @@ mod tests {
         let line = "x".repeat(257);
         let source = format!("{line}\n").repeat(65_537);
         assert!(source.len() > 16 * 1024 * 1024);
-        let profile = super::WidthProfile { columns: 512, ..Default::default() };
+        let profile = super::WidthProfile {
+            columns: 512,
+            ..Default::default()
+        };
         let rows = profile.wrap_plain(&source, 2).unwrap();
         assert_eq!(rows.len(), 65_538);
         assert_eq!(rows[0], line);

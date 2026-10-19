@@ -12,7 +12,6 @@ use crate::{
     store::RepositoryStore,
 };
 
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum StatusBackend {
     Gix,

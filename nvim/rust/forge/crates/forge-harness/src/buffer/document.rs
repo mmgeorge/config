@@ -1,4 +1,4 @@
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
@@ -20,8 +20,15 @@ pub(super) struct TranscriptSource<'source> {
 }
 
 pub enum TranscriptChange {
-    Block { block: BufferBlock },
-    ToolBody { owner: String, anchor: BlockId, removed: usize, block: Vec<BufferBlock> },
+    Block {
+        block: BufferBlock,
+    },
+    ToolBody {
+        owner: String,
+        anchor: BlockId,
+        removed: usize,
+        block: Vec<BufferBlock>,
+    },
     Insert {
         index: usize,
         entry: TranscriptEntry,
@@ -81,7 +88,11 @@ impl TranscriptDocument {
             "invalid timeline revision"
         );
         let (position, block) = prepare_entries(entry)?;
-        let entry_index = position.iter().enumerate().map(|(index,entry)|(entry.id.clone(),index)).collect();
+        let entry_index = position
+            .iter()
+            .enumerate()
+            .map(|(index, entry)| (entry.id.clone(), index))
+            .collect();
         let mut block_owner = HashMap::new();
         let mut offset = 0;
         for entry in &position {
@@ -92,7 +103,7 @@ impl TranscriptDocument {
         }
         Ok(Self {
             block_owner,
-            dirty: position.iter().map(|entry|entry.id.clone()).collect(),
+            dirty: position.iter().map(|entry| entry.id.clone()).collect(),
             block_dirty: HashSet::new(),
             body_dirty: Vec::new(),
             structure_dirty: true,
@@ -107,33 +118,46 @@ impl TranscriptDocument {
     }
 
     pub(super) fn mark_block_dirty(&mut self, block: &BlockId) {
-        if self.block_owner.contains_key(block) { self.block_dirty.insert(block.clone()); }
+        if self.block_owner.contains_key(block) {
+            self.block_dirty.insert(block.clone());
+        }
     }
 
-    pub(super) fn entry_position(&self, id: &str) -> Option<usize> { self.entry_index.get(id).copied() }
+    pub(super) fn entry_position(&self, id: &str) -> Option<usize> {
+        self.entry_index.get(id).copied()
+    }
 
     pub(super) fn block_owner(&self, id: &BlockId) -> Option<&str> {
         self.block_owner.get(id).map(String::as_str)
     }
 
     pub(super) fn entry_ids(&self) -> Vec<String> {
-        self.entry.iter().map(|entry|entry.id.clone()).collect()
+        self.entry.iter().map(|entry| entry.id.clone()).collect()
     }
 
     pub(super) fn source_entry(&self, id: &str) -> Result<TranscriptSource<'_>> {
         let index = *self.entry_index.get(id).context("unknown source entry")?;
         Ok(TranscriptSource {
             id: &self.entry[index].id,
-            block: self.document.blocks(self.document.revision(), self.entry_range(index)?)?.collect(),
+            block: self
+                .document
+                .blocks(self.document.revision(), self.entry_range(index)?)?
+                .collect(),
         })
     }
 
     fn remove_entry_owners(&mut self, id: &str) {
-        let Some(index) = self.entry_index.get(id).copied() else { return; };
-        let Ok(range) = self.entry_range(index) else { return; };
+        let Some(index) = self.entry_index.get(id).copied() else {
+            return;
+        };
+        let Ok(range) = self.entry_range(index) else {
+            return;
+        };
         if let Ok(previous) = self.document.blocks(self.document.revision(), range) {
             let ids: Vec<_> = previous.map(|block| block.id.clone()).collect();
-            for id in ids { self.block_owner.remove(&id); }
+            for id in ids {
+                self.block_owner.remove(&id);
+            }
         }
     }
 
@@ -142,24 +166,44 @@ impl TranscriptDocument {
             TranscriptChange::Block { block } => {
                 self.mark_block_dirty(&block.id);
             }
-            TranscriptChange::ToolBody { owner, anchor, removed, block } => {
+            TranscriptChange::ToolBody {
+                owner,
+                anchor,
+                removed,
+                block,
+            } => {
                 let mut removed_ids = Vec::new();
                 if let Some(start) = self.document.block_index(anchor) {
-                    if let Ok(previous) = self.document.blocks(self.document.revision(), start..start + removed) {
+                    if let Ok(previous) = self
+                        .document
+                        .blocks(self.document.revision(), start..start + removed)
+                    {
                         let ids: Vec<_> = previous.map(|block| block.id.clone()).collect();
                         removed_ids.clone_from(&ids);
-                        for id in ids { self.block_owner.remove(&id); }
+                        for id in ids {
+                            self.block_owner.remove(&id);
+                        }
                     }
                 }
-                self.body_dirty.push(BodyChange { owner: owner.clone(), anchor: anchor.clone(),
-                    removed: removed_ids, inserted: block.iter().map(|block| block.id.clone()).collect() });
-                for block in block { self.block_owner.insert(block.id.clone(),owner.clone()); }
+                self.body_dirty.push(BodyChange {
+                    owner: owner.clone(),
+                    anchor: anchor.clone(),
+                    removed: removed_ids,
+                    inserted: block.iter().map(|block| block.id.clone()).collect(),
+                });
+                for block in block {
+                    self.block_owner.insert(block.id.clone(), owner.clone());
+                }
             }
             TranscriptChange::Insert { entry, .. } | TranscriptChange::Replace { entry, .. } => {
                 self.dirty.insert(entry.id.clone());
-                if matches!(change,TranscriptChange::Insert { .. }) { self.structure_dirty = true; }
+                if matches!(change, TranscriptChange::Insert { .. }) {
+                    self.structure_dirty = true;
+                }
                 self.remove_entry_owners(&entry.id);
-                for block in &entry.block { self.block_owner.insert(block.id.clone(),entry.id.clone()); }
+                for block in &entry.block {
+                    self.block_owner.insert(block.id.clone(), entry.id.clone());
+                }
             }
             TranscriptChange::Remove { id, .. } => {
                 self.structure_dirty = true;
@@ -223,16 +267,23 @@ impl TranscriptDocument {
         } else {
             let (position, block) = prepare_entries(entry)?;
             self.structure_dirty = true;
-            self.dirty = position.iter().map(|entry|entry.id.clone()).collect();
+            self.dirty = position.iter().map(|entry| entry.id.clone()).collect();
             self.block_owner.clear();
             let mut start = 0;
             for entry in &position {
-                for block in &block[start..start + entry.blocks] { self.block_owner.insert(block.id.clone(),entry.id.clone()); }
+                for block in &block[start..start + entry.blocks] {
+                    self.block_owner.insert(block.id.clone(), entry.id.clone());
+                }
                 start += entry.blocks;
             }
             let patch = self.document.edit(0..self.document.block_count(), block)?;
             self.entry = position;
-            self.entry_index = self.entry.iter().enumerate().map(|(index,entry)|(entry.id.clone(),index)).collect();
+            self.entry_index = self
+                .entry
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| (entry.id.clone(), index))
+                .collect();
             patch.into_iter().collect()
         };
         self.timeline_revision = timeline_revision;
@@ -288,14 +339,23 @@ impl TranscriptDocument {
     }
 
     /// Changes tool layout without advancing the canonical timeline or scanning other entries.
-    pub(super) fn tool_layout(&mut self, changes: Vec<TranscriptChange>) -> Result<Vec<BufferPatch>> {
-        ensure!(self.synchronized, "transcript requires a new canonical snapshot");
+    pub(super) fn tool_layout(
+        &mut self,
+        changes: Vec<TranscriptChange>,
+    ) -> Result<Vec<BufferPatch>> {
+        ensure!(
+            self.synchronized,
+            "transcript requires a new canonical snapshot"
+        );
         let mut patches = Vec::new();
         for change in changes {
             match self.apply_change(change) {
                 Ok(Some(patch)) => patches.push(patch),
-                Ok(None) => {},
-                Err(failure) => { self.synchronized = false; return Err(failure); }
+                Ok(None) => {}
+                Err(failure) => {
+                    self.synchronized = false;
+                    return Err(failure);
+                }
             }
         }
         Ok(patches)
@@ -304,19 +364,31 @@ impl TranscriptDocument {
     fn apply_change(&mut self, change: TranscriptChange) -> Result<Option<BufferPatch>> {
         self.track(&change);
         match change {
-            TranscriptChange::ToolBody { owner,anchor,removed,block } => {
-                let index = *self.entry_index.get(&owner).context("tool body entry is missing")?;
-                let start = self.document.block_index(&anchor).context("tool body anchor is missing")?;
+            TranscriptChange::ToolBody {
+                owner,
+                anchor,
+                removed,
+                block,
+            } => {
+                let index = *self
+                    .entry_index
+                    .get(&owner)
+                    .context("tool body entry is missing")?;
+                let start = self
+                    .document
+                    .block_index(&anchor)
+                    .context("tool body anchor is missing")?;
                 let entry = self.entry_range(index)?;
-                ensure!(start >= entry.start && start + removed <= entry.end, "tool body exceeds its owner");
+                ensure!(
+                    start >= entry.start && start + removed <= entry.end,
+                    "tool body exceeds its owner"
+                );
                 let inserted = block.len();
-                let patch = self.document.splice(start..start + removed,block)?;
+                let patch = self.document.splice(start..start + removed, block)?;
                 self.entry[index].blocks = self.entry[index].blocks - removed + inserted;
                 Ok(patch)
             }
-            TranscriptChange::Block { block } => {
-                Ok(self.document.replace_block(block)?)
-            }
+            TranscriptChange::Block { block } => Ok(self.document.replace_block(block)?),
             TranscriptChange::Insert { index, entry } => {
                 validate_entry(&entry)?;
                 ensure!(
@@ -336,7 +408,9 @@ impl TranscriptDocument {
                 };
                 let patch = self.document.edit(start..start, entry.block)?;
                 self.entry.insert(index, position);
-                for (index,entry) in self.entry.iter().enumerate().skip(index) { self.entry_index.insert(entry.id.clone(),index); }
+                for (index, entry) in self.entry.iter().enumerate().skip(index) {
+                    self.entry_index.insert(entry.id.clone(), index);
+                }
                 Ok(patch)
             }
             TranscriptChange::Replace { index, entry } => {
@@ -394,7 +468,9 @@ impl TranscriptDocument {
                 let patch = self.document.edit(range, Vec::new())?;
                 self.entry.remove(index);
                 self.entry_index.remove(&id);
-                for (index,entry) in self.entry.iter().enumerate().skip(index) { self.entry_index.insert(entry.id.clone(),index); }
+                for (index, entry) in self.entry.iter().enumerate().skip(index) {
+                    self.entry_index.insert(entry.id.clone(), index);
+                }
                 Ok(patch)
             }
         }
@@ -469,26 +545,39 @@ mod tests {
             DocumentId("large-transcript".into()),
             "session".into(),
             1,
-            vec![TranscriptEntry { id: "history".into(), block: blocks }],
+            vec![TranscriptEntry {
+                id: "history".into(),
+                block: blocks,
+            }],
         )?;
         assert!(document.document.text_bytes() > 32 * 1024 * 1024);
         assert!(document.document.block_count() > 65_536);
-        let patch = document.append(BufferBlock {
-            id: BlockId("block-65536".into()),
-            text: BufferText::from_rows(["updated"])?,
-            metadata: BlockMetadata::default(),
-        })?.expect("changed tail");
+        let patch = document
+            .append(BufferBlock {
+                id: BlockId("block-65536".into()),
+                text: BufferText::from_rows(["updated"])?,
+                metadata: BlockMetadata::default(),
+            })?
+            .expect("changed tail");
         assert_eq!(patch.text_edit.len(), 1);
         assert_eq!(patch.text_edit[0].start_row, 65_536);
-        document.apply_event("session", 1, 2, vec![TranscriptChange::Insert {
-            index: 1,
-            entry: TranscriptEntry {
-                id: "next".into(),
-                block: vec![block("next-prompt", "next prompt")],
-            },
-        }])?;
+        document.apply_event(
+            "session",
+            1,
+            2,
+            vec![TranscriptChange::Insert {
+                index: 1,
+                entry: TranscriptEntry {
+                    id: "next".into(),
+                    block: vec![block("next-prompt", "next prompt")],
+                },
+            }],
+        )?;
         assert_eq!(document.document.block_count(), 65_538);
-        assert_eq!(document.snapshot()?.block.last().unwrap().id.0, "next-prompt");
+        assert_eq!(
+            document.snapshot()?.block.last().unwrap().id.0,
+            "next-prompt"
+        );
         Ok(())
     }
 

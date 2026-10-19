@@ -229,10 +229,7 @@ async fn large_invalid_unterminated_request_fails_json_decoding_after_eof() {
         .unwrap();
     assert!(!output.status.success());
     assert!(output.stdout.is_empty());
-    assert!(
-        String::from_utf8_lossy(&output.stderr)
-            .contains("decode Forge initialize request")
-    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("decode Forge initialize request"));
 }
 
 struct BrokerProcess {

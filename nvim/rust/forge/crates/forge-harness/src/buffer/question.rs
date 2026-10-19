@@ -209,8 +209,13 @@ impl<'exchange> QuestionHistory<'exchange> {
                     return history;
                 }
                 for branch in &mut group.branch {
-                    branch.source = elicitation.answer.iter().find(|answer| answer.question_id == branch.question.id)
-                        .map_or(crate::session::ResolutionSource::User, |answer| answer.source);
+                    branch.source = elicitation
+                        .answer
+                        .iter()
+                        .find(|answer| answer.question_id == branch.question.id)
+                        .map_or(crate::session::ResolutionSource::User, |answer| {
+                            answer.source
+                        });
                     branch.answer = elicitation
                         .answer
                         .iter()

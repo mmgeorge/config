@@ -4,8 +4,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use super::{
-    GhClient, GhDirectory, GraphFailure, append_graph_failures, classify_failure,
-    diagnostic, remote_result,
+    GhClient, GhDirectory, GraphFailure, append_graph_failures, classify_failure, diagnostic,
+    remote_result,
 };
 use crate::comment::ConversationCommentCreation;
 use crate::comment::{

@@ -44,15 +44,23 @@ pub struct AlgorithmReference {
 
 /// Select a reference by one-based line and byte column, excluding prose strings and comments.
 /// Complete references remain available when another part of a draft is incomplete.
-pub fn algorithm_reference(source: &str, line: usize, column: usize) -> Result<Option<AlgorithmReference>, SyntaxError> {
-    Ok(algorithm_references(source)?.into_iter().find(|reference|
-        reference.line == line && reference.column <= column && column < reference.column + reference.segment.len()))
+pub fn algorithm_reference(
+    source: &str,
+    line: usize,
+    column: usize,
+) -> Result<Option<AlgorithmReference>, SyntaxError> {
+    Ok(algorithm_references(source)?.into_iter().find(|reference| {
+        reference.line == line
+            && reference.column <= column
+            && column < reference.column + reference.segment.len()
+    }))
 }
 
 /// Enumerate parsed identifier segments, excluding strings and comments even in incomplete drafts.
 pub fn algorithm_references(source: &str) -> Result<Vec<AlgorithmReference>, SyntaxError> {
     let mut parser = Parser::new();
-    parser.set_language(&SyntaxLanguage::Algorithm.grammar())
+    parser
+        .set_language(&SyntaxLanguage::Algorithm.grammar())
         .map_err(|error| SyntaxError::Language(error.to_string()))?;
     let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
     let mut cursor = tree.root_node().walk();
@@ -66,40 +74,67 @@ pub fn algorithm_references(source: &str) -> Result<Vec<AlgorithmReference>, Syn
             let identifiers = node.named_children(&mut children).collect::<Vec<_>>();
             for (index, identifier) in identifiers.iter().enumerate() {
                 result.push(AlgorithmReference {
-                line: start.row + 1,
-                column: identifier.start_position().column + 1,
-                prefix: source[node.start_byte()..identifier.end_byte()].split_whitespace().collect(),
-                name: source[node.byte_range()].split_whitespace().collect(),
-                segment: source[identifier.byte_range()].to_owned(),
-                first: index == 0,
-                last: index + 1 == identifiers.len(),
-                end_column: end.column + 1,
-                invocation: node.parent().is_some_and(|parent| parent.kind() == "invocation"
-                    && !parent.has_error() && parent.child_by_field_name("function") == Some(node)),
-                construction_field: false,
-            });
-            }
-        }
-        if node.kind() == "named_argument" && !node.has_error()
-            && let Some(identifier) = node.child_by_field_name("name")
-            && let Some(invocation) = node.parent().and_then(|parent| parent.parent())
-            && invocation.kind() == "invocation"
-            && let Some(target) = invocation.child_by_field_name("function") {
-            let target = source[target.byte_range()].split_whitespace().collect::<String>();
-            if target.rsplit([':', '.']).next().and_then(|name| name.chars().next()).is_some_and(char::is_uppercase) {
-                let segment = source[identifier.byte_range()].to_owned();
-                let name = format!("{target}.{segment}");
-                result.push(AlgorithmReference {
-                    line: identifier.start_position().row + 1, column: identifier.start_position().column + 1,
-                    prefix: name.clone(), name, segment, first: false, last: true,
-                    end_column: identifier.end_position().column + 1, invocation: false, construction_field: true,
+                    line: start.row + 1,
+                    column: identifier.start_position().column + 1,
+                    prefix: source[node.start_byte()..identifier.end_byte()]
+                        .split_whitespace()
+                        .collect(),
+                    name: source[node.byte_range()].split_whitespace().collect(),
+                    segment: source[identifier.byte_range()].to_owned(),
+                    first: index == 0,
+                    last: index + 1 == identifiers.len(),
+                    end_column: end.column + 1,
+                    invocation: node.parent().is_some_and(|parent| {
+                        parent.kind() == "invocation"
+                            && !parent.has_error()
+                            && parent.child_by_field_name("function") == Some(node)
+                    }),
+                    construction_field: false,
                 });
             }
         }
-        if cursor.goto_first_child() { continue; }
+        if node.kind() == "named_argument"
+            && !node.has_error()
+            && let Some(identifier) = node.child_by_field_name("name")
+            && let Some(invocation) = node.parent().and_then(|parent| parent.parent())
+            && invocation.kind() == "invocation"
+            && let Some(target) = invocation.child_by_field_name("function")
+        {
+            let target = source[target.byte_range()]
+                .split_whitespace()
+                .collect::<String>();
+            if target
+                .rsplit([':', '.'])
+                .next()
+                .and_then(|name| name.chars().next())
+                .is_some_and(char::is_uppercase)
+            {
+                let segment = source[identifier.byte_range()].to_owned();
+                let name = format!("{target}.{segment}");
+                result.push(AlgorithmReference {
+                    line: identifier.start_position().row + 1,
+                    column: identifier.start_position().column + 1,
+                    prefix: name.clone(),
+                    name,
+                    segment,
+                    first: false,
+                    last: true,
+                    end_column: identifier.end_position().column + 1,
+                    invocation: false,
+                    construction_field: true,
+                });
+            }
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
         loop {
-            if cursor.goto_next_sibling() { break; }
-            if !cursor.goto_parent() { return Ok(result); }
+            if cursor.goto_next_sibling() {
+                break;
+            }
+            if !cursor.goto_parent() {
+                return Ok(result);
+            }
         }
     }
 }
@@ -331,13 +366,26 @@ mod tests {
             (2, "start_dash", false, true, true),
         ] {
             let column = source.lines().nth(line - 1).unwrap().find(token).unwrap() + 1;
-            let reference = super::algorithm_reference(source, line, column).unwrap().unwrap();
-            assert_eq!((reference.segment.as_str(), reference.first, reference.last, reference.invocation),
-                (token, first, last, invocation));
+            let reference = super::algorithm_reference(source, line, column)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                (
+                    reference.segment.as_str(),
+                    reference.first,
+                    reference.last,
+                    reference.invocation
+                ),
+                (token, first, last, invocation)
+            );
         }
         for token in ["movement_direction", "abilities"] {
             let column = source.lines().nth(2).unwrap().find(token).unwrap() + 1;
-            assert!(super::algorithm_reference(source, 3, column).unwrap().is_none());
+            assert!(
+                super::algorithm_reference(source, 3, column)
+                    .unwrap()
+                    .is_none()
+            );
         }
         assert!(super::algorithm_reference(source, 2, 11).unwrap().is_none());
     }

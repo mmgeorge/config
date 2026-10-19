@@ -3,10 +3,7 @@ use std::{path::PathBuf, sync::Arc};
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use forge_buffer::identity::DocumentId;
-use forge_git::{
-    completion::RevisionCandidates,
-    repository::RepositoryState,
-};
+use forge_git::{completion::RevisionCandidates, repository::RepositoryState};
 use forge_github::{
     comment::{CommentOperation, CommentTarget},
     issue_store::IssueStore,
@@ -514,13 +511,23 @@ impl HostRouter {
         }
     }
 
-    pub(crate) async fn prepare(&self, envelope: &mut RoutedRequestEnvelope) -> Result<RoutedMethod> {
+    pub(crate) async fn prepare(
+        &self,
+        envelope: &mut RoutedRequestEnvelope,
+    ) -> Result<RoutedMethod> {
         let method = decode_method(&envelope.request.method)?;
         if let RoutedMethod::Harness(harness_method) = method {
-            if matches!(harness_method, HarnessMethod::TaskTransition | HarnessMethod::QueueUpdate) {
-                self.host.harness.prepare_task(envelope.session_id.as_deref(), &envelope.request).await?;
+            if matches!(
+                harness_method,
+                HarnessMethod::TaskTransition | HarnessMethod::QueueUpdate
+            ) {
+                self.host
+                    .harness
+                    .prepare_task(envelope.session_id.as_deref(), &envelope.request)
+                    .await?;
             }
-            envelope.harness_admission = self.host
+            envelope.harness_admission = self
+                .host
                 .harness
                 .prepare(envelope.session_id.as_deref(), harness_method)
                 .await?;
@@ -535,7 +542,9 @@ impl HostRouter {
         sink: &MessageSender,
     ) -> Result<()> {
         {
-            let mut subscription = self.status_events.lock()
+            let mut subscription = self
+                .status_events
+                .lock()
                 .map_err(|_| anyhow::anyhow!("Forge status subscription owner poisoned"))?;
             match &*subscription {
                 StatusSubscription::Idle => {
@@ -615,13 +624,11 @@ impl HostRouter {
                             text.into_bytes(),
                         )?)?
                     }
-                    StatusContextRequest::AboutMessage { document, text } => {
-                        serde_json::to_value(self.host.sources.open_text(
-                            document,
-                            "About".into(),
-                            text.into_bytes(),
-                        )?)?
-                    }
+                    StatusContextRequest::AboutMessage { document, text } => serde_json::to_value(
+                        self.host
+                            .sources
+                            .open_text(document, "About".into(), text.into_bytes())?,
+                    )?,
                 };
                 send_completed_result(sink, request.id, result).await?;
             }
@@ -665,15 +672,24 @@ impl HostRouter {
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::RepositoryGenerate => {
-                let result = self.host.generation.dispatch(
-                    request.params,
-                    &self.host.harness,
-                    Some((sink.clone(), request.id)),
-                ).await?;
+                let result = self
+                    .host
+                    .generation
+                    .dispatch(
+                        request.params,
+                        &self.host.harness,
+                        Some((sink.clone(), request.id)),
+                    )
+                    .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::BackgroundTimeline => {
-                let result = self.host.harness.background.timeline(request.params).await?;
+                let result = self
+                    .host
+                    .harness
+                    .background
+                    .timeline(request.params)
+                    .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
             RoutedMethod::GenerationSettings => {
@@ -813,7 +829,12 @@ impl HostRouter {
                 let result = self
                     .host
                     .review
-                    .comment(&params.document, params.capture, params.draft_comment, params.command)
+                    .comment(
+                        &params.document,
+                        params.capture,
+                        params.draft_comment,
+                        params.command,
+                    )
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
@@ -965,7 +986,12 @@ impl HostRouter {
                 let result = self
                     .host
                     .review
-                    .submit_batched(&params.document, params.capture, params.draft_comment, params.verdict)
+                    .submit_batched(
+                        &params.document,
+                        params.capture,
+                        params.draft_comment,
+                        params.verdict,
+                    )
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
@@ -1257,7 +1283,9 @@ impl HostRouter {
     pub(crate) fn finish_status_subscription(
         &self,
     ) -> Result<Option<tokio::task::JoinHandle<Result<()>>>> {
-        let mut subscription = self.status_events.lock()
+        let mut subscription = self
+            .status_events
+            .lock()
             .map_err(|_| anyhow::anyhow!("Forge status subscription owner poisoned"))?;
         match std::mem::replace(&mut *subscription, StatusSubscription::Closed) {
             StatusSubscription::Active { stop, task } => {
@@ -1340,7 +1368,9 @@ async fn forward_status_updates(
                     document: String::new(),
                     event: "status.resync".into(),
                     payload: json!({}),
-                })).await.context("report lagged status subscription")?;
+                }))
+                .await
+                .context("report lagged status subscription")?;
             }
         }
     }
@@ -1407,7 +1437,9 @@ fn revision_page(
     );
     let count = candidates.values.len();
     let total = candidates.values.iter().try_fold(0usize, |total, value| {
-        total.checked_add(value.len()).and_then(|bytes| bytes.checked_add(1))
+        total
+            .checked_add(value.len())
+            .and_then(|bytes| bytes.checked_add(1))
             .context("revision candidate byte count overflow")
     })?;
     ensure!(
@@ -1454,15 +1486,25 @@ mod tests {
             .tempdir_in(std::env::current_dir().unwrap())
             .unwrap();
         let initialized = std::process::Command::new("git")
-            .arg("-C").arg(directory.path()).args(["init", "--quiet"])
-            .status().unwrap();
+            .arg("-C")
+            .arg(directory.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap();
         assert!(initialized.success());
         let store = forge_git::store::RepositoryStore::default();
-        let repository = store.open(directory.path().to_path_buf()).await.unwrap().unwrap();
+        let repository = store
+            .open(directory.path().to_path_buf())
+            .await
+            .unwrap()
+            .unwrap();
         let values: Vec<Vec<u8>> = (0..20_001)
             .map(|index| format!("branch-{index}-{}", "x".repeat(100)).into_bytes())
             .collect();
-        let expected: Vec<u8> = values.iter().flat_map(|value| value.iter().copied().chain([0])).collect();
+        let expected: Vec<u8> = values
+            .iter()
+            .flat_map(|value| value.iter().copied().chain([0]))
+            .collect();
         assert!(expected.len() > 2 * 1024 * 1024);
         let candidates = RevisionCandidates {
             revision: RevisionId(1),
@@ -1483,7 +1525,9 @@ mod tests {
             assert!(data.len() <= PAGE_BYTES);
             actual.extend(data);
             offset = page["next_offset"].as_u64().unwrap() as usize;
-            if offset == expected.len() { break; }
+            if offset == expected.len() {
+                break;
+            }
         }
         assert_eq!(actual, expected);
         assert!(revision_page(&repository, &candidates, expected.len() + 1).is_err());
@@ -1491,16 +1535,24 @@ mod tests {
 
     #[test]
     fn initialization_preserves_absolute_paths_without_byte_admission() {
-        let path = std::env::current_dir().unwrap().join("x".repeat(16 * 1024 + 1));
-        assert!(validate_initialize(&json!({
-            "protocol_version": forge_protocol::WIRE_VERSION,
-            "git_config_cache_path": path,
-            "recovery_directory": path,
-            "status_ignored_directory": path,
-        })).is_ok());
-        assert!(validate_initialize(&json!({
-            "protocol_version": forge_protocol::WIRE_VERSION,
-            "git_config_cache_path": "relative/path",
-        })).is_err());
+        let path = std::env::current_dir()
+            .unwrap()
+            .join("x".repeat(16 * 1024 + 1));
+        assert!(
+            validate_initialize(&json!({
+                "protocol_version": forge_protocol::WIRE_VERSION,
+                "git_config_cache_path": path,
+                "recovery_directory": path,
+                "status_ignored_directory": path,
+            }))
+            .is_ok()
+        );
+        assert!(
+            validate_initialize(&json!({
+                "protocol_version": forge_protocol::WIRE_VERSION,
+                "git_config_cache_path": "relative/path",
+            }))
+            .is_err()
+        );
     }
 }

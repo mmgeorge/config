@@ -102,10 +102,7 @@ impl SourceDocumentService {
         kind: &str,
     ) -> Result<SourceOpen> {
         id.validate()?;
-        ensure!(
-            !title.contains(['\0', '\n', '\r']),
-            "invalid source title"
-        );
+        ensure!(!title.contains(['\0', '\n', '\r']), "invalid source title");
         ensure!(
             !self.closed.load(Ordering::Acquire),
             "source document service is closed"
@@ -438,7 +435,8 @@ impl SourceDocument {
                 )?;
             }
             if !rows.is_empty()
-                && metadata.visible_decoration.len() + row_metadata.visible_decoration.len() > 8192 {
+                && metadata.visible_decoration.len() + row_metadata.visible_decoration.len() > 8192
+            {
                 break;
             }
             metadata
@@ -492,11 +490,10 @@ mod tests {
     async fn saved_diff_retains_large_read_only_source_through_bounded_delivery() -> Result<()> {
         let store = Arc::new(RepositoryStore::default());
         let diff = DiffEngine::new(CacheLimits::default(), 2);
-        let service = SourceDocumentService::new(
-            store,
-            SyntaxEngine::new(diff.analysis_pool()),
-        );
-        let text = format!("+{}\n", "x".repeat(254)).repeat(70_000).into_bytes();
+        let service = SourceDocumentService::new(store, SyntaxEngine::new(diff.analysis_pool()));
+        let text = format!("+{}\n", "x".repeat(254))
+            .repeat(70_000)
+            .into_bytes();
         assert!(
             service
                 .open_text(

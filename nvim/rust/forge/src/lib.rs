@@ -28,7 +28,10 @@ pub fn run(command: Command, diagnostic_skip_line_stats: bool) -> Result<()> {
     shutdown::run(async {
         match command {
             Command::CheckpointWait { path } => {
-                println!("{}", forge_harness::checkpoint::wait_hook(&path, &mut std::io::stdin().lock()).await);
+                println!(
+                    "{}",
+                    forge_harness::checkpoint::wait_hook(&path, &mut std::io::stdin().lock()).await
+                );
                 Ok(())
             }
             Command::Mcp => forge_harness::control_tools::run_stdio().await,

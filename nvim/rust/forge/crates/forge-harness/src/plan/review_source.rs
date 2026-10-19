@@ -14,7 +14,14 @@ pub(crate) struct ReviewSyntax {
 pub(crate) struct PlanReviewSource {
     pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
-    pub resolver: std::sync::Arc<tokio::sync::OnceCell<std::sync::Mutex<(crate::declaration::DeclarationResolver, crate::declaration::DeclarationResolver)>>>,
+    pub resolver: std::sync::Arc<
+        tokio::sync::OnceCell<
+            std::sync::Mutex<(
+                crate::declaration::DeclarationResolver,
+                crate::declaration::DeclarationResolver,
+            )>,
+        >,
+    >,
     pub historical: bool,
     pub public_only: bool,
     /// Keeps selected reference context visible without changing the public filter.
@@ -27,8 +34,7 @@ pub(crate) struct PlanReviewSource {
     pub saved_navigation: Option<super::PlanNavigationIndex>,
     pub saved_digest: String,
     pub syntax: Option<forge_diff::syntax::SyntaxHandle>,
-    pub declaration_syntax:
-        std::collections::HashMap<(String, String), ReviewSyntax>,
+    pub declaration_syntax: std::collections::HashMap<(String, String), ReviewSyntax>,
 }
 
 pub(crate) struct ReviewTrace {
@@ -71,13 +77,12 @@ impl PlanFileStore {
         );
         let saved = RenderedPlan {
             markdown: String::from_utf8(read_source(&path.with_extension("md"))?)?,
-            navigation: super::codec::from_slice(&read_source(&path.with_extension("index.json"))?)?,
+            navigation: super::codec::from_slice(&read_source(
+                &path.with_extension("index.json"),
+            )?)?,
         };
         let (rendered, saved_navigation) = if document.design.is_some() {
-            (
-                self.render_review(&document)?,
-                Some(saved.navigation),
-            )
+            (self.render_review(&document)?, Some(saved.navigation))
         } else {
             (saved, None)
         };
@@ -125,24 +130,43 @@ impl PlanFileStore {
         let physical = read_source(&directory.join("working.md"))?;
         let saved_navigation = match revision {
             Some(revision) => {
-                let submitted_path = directory.join("revisions").join(format!("submitted-{revision:04}.json"));
-                let submitted: PlanDocument = super::codec::from_slice(&read_source(&submitted_path)?)?;
-                anyhow::ensure!(super::codec::to_vec(&submitted)? == canonical,
-                    "submitted plan bytes changed after review");
+                let submitted_path = directory
+                    .join("revisions")
+                    .join(format!("submitted-{revision:04}.json"));
+                let submitted: PlanDocument =
+                    super::codec::from_slice(&read_source(&submitted_path)?)?;
+                anyhow::ensure!(
+                    super::codec::to_vec(&submitted)? == canonical,
+                    "submitted plan bytes changed after review"
+                );
                 if document.design.is_some() {
-                    anyhow::ensure!(physical == read_source(&submitted_path.with_extension("md"))?,
-                        "physical plan review changed after the submitted revision");
-                    Some(super::codec::from_slice(&read_source(&submitted_path.with_extension("index.json"))?)?)
+                    anyhow::ensure!(
+                        physical == read_source(&submitted_path.with_extension("md"))?,
+                        "physical plan review changed after the submitted revision"
+                    );
+                    Some(super::codec::from_slice(&read_source(
+                        &submitted_path.with_extension("index.json"),
+                    )?)?)
                 } else {
-                    anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan review changed after review");
+                    anyhow::ensure!(
+                        physical == rendered.markdown.as_bytes(),
+                        "physical plan review changed after review"
+                    );
                     None
                 }
             }
             None => {
-                anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan draft changed after review");
-                let navigation: super::PlanNavigationIndex = super::codec::from_slice(&read_source(&directory.join("working.index.json"))?)?;
-                anyhow::ensure!(super::codec::to_vec(&navigation)? == super::codec::to_vec(&rendered.navigation)?,
-                    "plan draft navigation changed after review");
+                anyhow::ensure!(
+                    physical == rendered.markdown.as_bytes(),
+                    "physical plan draft changed after review"
+                );
+                let navigation: super::PlanNavigationIndex =
+                    super::codec::from_slice(&read_source(&directory.join("working.index.json"))?)?;
+                anyhow::ensure!(
+                    super::codec::to_vec(&navigation)?
+                        == super::codec::to_vec(&rendered.navigation)?,
+                    "plan draft navigation changed after review"
+                );
                 document.design.is_some().then_some(navigation)
             }
         };
@@ -173,8 +197,7 @@ pub(super) fn read_source(path: &Path) -> Result<Vec<u8>> {
         metadata.is_file() && !metadata.file_type().is_symlink(),
         "plan source is not a regular file"
     );
-    std::fs::read(path)
-        .with_context(|| format!("read physical plan source {}", path.display()))
+    std::fs::read(path).with_context(|| format!("read physical plan source {}", path.display()))
 }
 
 #[cfg(test)]
@@ -215,12 +238,18 @@ mod tests {
         crate::checks::configure_fixture(&store.workspace);
         let mut document = crate::plan::document::test_fixture("large-plan", "Large plan");
         document.overview = "x".repeat(9 * 1024 * 1024);
-        store.write_working_document("session", "large-plan", &document).unwrap();
+        store
+            .write_working_document("session", "large-plan", &document)
+            .unwrap();
         let (_, rendered, checksum) = store
             .submit_document_revision("session", "large-plan", 1, document.version)
             .unwrap();
-        let current = store.capture_review_source("session", "large-plan", Some(1), &checksum).unwrap();
-        let historical = store.capture_revision_source("session", "large-plan", 1).unwrap();
+        let current = store
+            .capture_review_source("session", "large-plan", Some(1), &checksum)
+            .unwrap();
+        let historical = store
+            .capture_revision_source("session", "large-plan", 1)
+            .unwrap();
         assert_eq!(current.document, document);
         assert_eq!(historical.document, document);
         assert_eq!(current.rendered, rendered);
@@ -243,8 +272,19 @@ mod tests {
         design.document.objective = "Revise the registry interface.".into();
         design.document.background = "The fixture contains the declarations under review.".into();
         design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
-        design.proposed.get_mut("registry.rs").unwrap().push_str("pub fn inspect(registry: &Registry);\n");
-        design.proposed_calls.insert("registry.rs".into(), crate::plan::calls::extract("registry.rs", "pub fn inspect(registry: &Registry) { registry.first; registry.second; }").unwrap());
+        design
+            .proposed
+            .get_mut("registry.rs")
+            .unwrap()
+            .push_str("pub fn inspect(registry: &Registry);\n");
+        design.proposed_calls.insert(
+            "registry.rs".into(),
+            crate::plan::calls::extract(
+                "registry.rs",
+                "pub fn inspect(registry: &Registry) { registry.first; registry.second; }",
+            )
+            .unwrap(),
+        );
         document.design = Some(design);
         store
             .write_working_document("session", "plan", &document)

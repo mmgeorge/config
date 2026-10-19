@@ -312,9 +312,7 @@ fn source(
             source: empty.clone(),
             origin: ContentOrigin::Supplied,
         })),
-        ContentResult::Binary | ContentResult::Unavailable(_) => {
-            Ok(None)
-        }
+        ContentResult::Binary | ContentResult::Unavailable(_) => Ok(None),
         ContentResult::Failed(error) => Err(error),
     }
 }

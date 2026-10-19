@@ -218,17 +218,67 @@ async fn reopening_large_harness_history_transfers_document_without_poisoning_ho
     params["session_id"] = session_id.clone();
     let reopened = host.request(2, "harness.initialize", params).await;
     assert_eq!(reopened["result"]["session"]["id"], session_id);
-    let document = host.request(3, "harness.document", json!({
-        "operation":"open", "document":"large-history", "view":"history-view",
-        "width":forge_buffer::width::WidthProfile::default(),
-    })).await;
-    let snapshot: forge_buffer::patch::BufferSnapshot = serde_json::from_value(
-        document["result"]["transcript"].clone(),
-    ).expect("history document response");
-    let displayed = snapshot.block.iter().find(|block| block.id.0 == "large-history:prompt")
-        .expect("reopened prompt block").text.wire_rows().join("\n");
-    assert!(displayed.split_whitespace().filter(|word| *word != "●").eq(prompt.split_whitespace()),
-        "reopened transcript must preserve every saved prompt word");
+    let document = host
+        .request(
+            3,
+            "harness.document",
+            json!({
+                "operation":"open", "document":"large-history", "view":"history-view",
+                "width":forge_buffer::width::WidthProfile::default(),
+            }),
+        )
+        .await;
+    let snapshot: forge_buffer::patch::BufferSnapshot =
+        serde_json::from_value(document["result"]["transcript"].clone())
+            .expect("history document response");
+    let preview = snapshot
+        .block
+        .iter()
+        .find(|block| block.id.0 == "large-history:prompt")
+        .expect("reopened prompt preview");
+    assert!(preview.text.row_count() <= 3);
+    let node = preview.metadata.node.as_ref().expect("prompt node");
+    assert_eq!(node.display, forge_buffer::node::NodeDisplay::Preview);
+    let expanded = host
+        .request(
+            30,
+            "harness.document",
+            json!({
+                "operation":"node", "document":"large-history", "view":"history-view",
+                "sequence":1, "node":node.id.0, "generation":node.generation,
+                "action":"set_expansion", "expanded":true, "rows":48,
+                "width":forge_buffer::width::WidthProfile::default(),
+            }),
+        )
+        .await;
+    assert!(expanded.get("error").is_none(), "{expanded}");
+    let document = host
+        .request(
+            31,
+            "harness.document",
+            json!({
+                "operation":"snapshot", "document":"large-history",
+            }),
+        )
+        .await;
+    let snapshot: forge_buffer::patch::BufferSnapshot =
+        serde_json::from_value(document["result"].clone())
+            .expect("expanded history document response");
+    let displayed = snapshot
+        .block
+        .iter()
+        .find(|block| block.id.0 == "large-history:prompt")
+        .expect("reopened prompt block")
+        .text
+        .wire_rows()
+        .join("\n");
+    assert!(
+        displayed
+            .split_whitespace()
+            .filter(|word| *word != "●")
+            .eq(prompt.split_whitespace()),
+        "reopened transcript must preserve every saved prompt word"
+    );
     assert!(serde_json::to_vec(&document).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
     let subsequent = host
         .request(
@@ -452,11 +502,18 @@ async fn review_document_edits_save_and_reconcile_through_the_shared_host() {
     )
     .unwrap();
     let saved = host
-        .request(7, "review.save", json!({"document":document,"capture":[{
-            "document":document,"region":"title","base":0,"sequence":2,"text":"Uncertain title"
-        }]}))
+        .request(
+            7,
+            "review.save",
+            json!({"document":document,"capture":[{
+                "document":document,"region":"title","base":0,"sequence":2,"text":"Uncertain title"
+            }]}),
+        )
         .await;
-    assert_eq!(saved["result"]["snapshot"]["field"][0]["revision"], 1, "{saved}");
+    assert_eq!(
+        saved["result"]["snapshot"]["field"][0]["revision"], 1,
+        "{saved}"
+    );
     assert_eq!(saved["result"]["snapshot"]["uncertain"], true, "{saved}");
     let reconciled = host
         .request(8, "review.reconcile", json!({"document":document}))
@@ -952,11 +1009,18 @@ async fn host_restart_retains_issue_notification_and_pr_recovery_without_replayi
     assert!(opened.get("error").is_none(), "{opened}");
     let document = opened["result"]["document"].clone();
     let uncertain = pr_host
-        .request(15, "review.save", json!({"document":document,"capture":[{
-            "document":document,"region":"title","base":0,"sequence":1,"text":saved_title
-        }]}))
+        .request(
+            15,
+            "review.save",
+            json!({"document":document,"capture":[{
+                "document":document,"region":"title","base":0,"sequence":1,"text":saved_title
+            }]}),
+        )
         .await;
-    assert_eq!(uncertain["result"]["snapshot"]["field"][0]["revision"], 1, "{uncertain}");
+    assert_eq!(
+        uncertain["result"]["snapshot"]["field"][0]["revision"], 1,
+        "{uncertain}"
+    );
     assert_eq!(
         uncertain["result"]["snapshot"]["uncertain"], true,
         "{uncertain}"
@@ -1289,7 +1353,10 @@ async fn large_cached_detail_transfers_with_credit_and_preserves_the_host() {
         )
         .unwrap();
     let large = host.request(4, "github.issues", json!({"database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}})).await;
-    assert_eq!(large["result"]["item"]["body"].as_str().unwrap().len(), 16 * 1024 * 1024 + 1);
+    assert_eq!(
+        large["result"]["item"]["body"].as_str().unwrap().len(),
+        16 * 1024 * 1024 + 1
+    );
     host.stop().await;
 }
 
@@ -1664,6 +1731,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
 #[tokio::test]
 async fn harness_submits_complete_text_with_document_lifetime_admission() {
     let fixture = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
     git(fixture.path(), &["init", "--quiet"]);
     let mut host = Host::start().await;
     let unavailable = host
@@ -1686,7 +1754,7 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             3,
             "harness.initialize",
             json!({
-                "workspace":fixture.path(), "data_root":fixture.path().join("harness-data"),
+                "workspace":fixture.path(), "data_root":data.path(),
                 "client_id":"document-host-test", "backend":{"kind":"mock","command":[]}
             }),
         )
@@ -1726,8 +1794,12 @@ async fn harness_submits_complete_text_with_document_lifetime_admission() {
             }),
         )
         .await;
-    assert!(synchronized["result"]["patch"].as_array()
-        .is_some_and(|patch| !patch.is_empty()), "{synchronized}");
+    assert!(
+        synchronized["result"]["patch"]
+            .as_array()
+            .is_some_and(|patch| !patch.is_empty()),
+        "{synchronized}"
+    );
     let submitted = host
         .request(
             21,
@@ -2172,11 +2244,17 @@ async fn review_conversation_draft_creates_through_native_host() {
     let mut state = hosted_comment(body);
     state["__typename"] = json!("IssueComment");
     std::fs::write(root.path().join("creation-result.json"),serde_json::to_vec(&json!({"data":{"mutation":{"clientMutationId":"__receipt__","subject":{"id":"PR_fixture"},"commentEdge":{"node":state}}}})).unwrap()).unwrap();
-    let saved = host.request(5,"review.comment",json!({
-        "document":document,
-        "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":body}],
-        "command":{"operation":"save","comment":comment,"action":"save"}
-    })).await;
+    let saved = host
+        .request(
+            5,
+            "review.comment",
+            json!({
+                "document":document,
+                "capture":[{"document":document,"region":region,"base":0,"sequence":1,"text":body}],
+                "command":{"operation":"save","comment":comment,"action":"save"}
+            }),
+        )
+        .await;
     assert_eq!(saved["result"]["snapshot"]["revision"], 1, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["baseline"], body, "{saved}");
     assert_eq!(saved["result"]["snapshot"]["dirty"], false);

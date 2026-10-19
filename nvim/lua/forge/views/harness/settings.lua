@@ -1,7 +1,6 @@
 local M = {}
 local client = require("forge.client")
 local picker = require("forge.views.picker")
-local picker_field = require("forge.views.picker.field")
 local duration = require("forge.views.harness.duration")
 local notifications = require("forge.infra.notifications")
 local log_buffer_by_path = {}
@@ -173,6 +172,7 @@ function M.open(state, host)
   request(session_id, "trace.status", {}, function(status)
     if not state.session or state.session.id ~= session_id then return end
     local pending = false
+    ---@type table<string, any>
     local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
       state.pending_config or {}, state.task_config or {})
     active.status_thoughts = state.status_thoughts == true
@@ -294,91 +294,226 @@ function M.open(state, host)
         end)
       end
     end
+    local function current()
+      return M._revision == owner_revision and state.session ~= nil and state.session.id == session_id
+    end
+    local function redraw()
+      if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
+    end
+    local function model_descriptor()
+      for _, model in ipairs(commit and commit.model_list or {}) do
+        if model.id == active.model then return model end
+      end
+    end
+    local function change_main(id, direction)
+      local function cycle(values, value)
+        if #values == 0 then return value end
+        local position = math.max(1, vim.fn.index(values, value) + 1)
+        return values[(position - 1 + direction) % #values + 1]
+      end
+      if id == "main-model" then
+        local models = commit and commit.model_list or {}
+        local values = vim.tbl_map(function(model) return model.id end, models)
+        local selected = cycle(values, active.model)
+        for _, model in ipairs(models) do
+          if model.id == selected then
+            configure({ model = selected, effort = model.default_reasoning or (model.reasoning or {})[1] or active.effort })
+            return
+          end
+        end
+      elseif id == "main-thinking" then
+        local model = model_descriptor()
+        configure({ effort = cycle(model and model.reasoning or {}, active.effort) })
+      elseif id == "main-speed" then
+        local values = { "default" }
+        if state.capability.fast_mode then values[#values + 1] = "fast" end
+        if state.capability.ultrafast_mode then values[#values + 1] = "ultrafast" end
+        configure({ service_tier = cycle(values, active.service_tier or "default") })
+      end
+    end
+    local function activate(id)
+      if commit and id:match("^background%-") and commit:open(id) then return end
+      if id == "main-model" then
+        local models = vim.deepcopy(commit and commit.model_list or {})
+        for _, model in ipairs(models) do
+          if model.id == active.model then model.selected_reasoning = active.effort end
+        end
+        picker.close(false)
+        require("forge.views.harness.model_picker").open({ host = host, model_list = models,
+          backend = active.backend, current_model = active.model, is_current = current,
+          on_close = function() if current() then M.open(state, host) end end,
+          on_confirm = function(value)
+            picker.close(false)
+            configure({ model = value.model, effort = value.effort, context_window = value.context_window },
+              function() if current() then M.open(state, host) end end)
+          end })
+      elseif id == "native-import" then
+        require("forge.views.harness.native_import").open(state, host)
+      elseif id == "provider-setup" then
+        require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
+      elseif id == "provider" then
+        require("forge.views.harness.controller").select_backend()
+      elseif id:match("^main%-") then
+        change_main(id, 1)
+      else
+        toggle({ option = { id = id } }, 1)
+      end
+    end
     build_spec = function()
       local policy = access.policy(active)
       local supported = state.capability and state.capability.os_sandbox == true
-      local commit_rows = commit and commit:rows() or {}
-      local provider_setup = (active.backend == "claude" or active.backend == "antigravity") and {
-        id = "provider-setup", label = "Provider setup",
-        columns = { "Provider setup", "Install / sign in", "Manage the ACP runtime and OAuth login" },
-      } or nil
+      local background = commit and commit:fields() or {}
+      local capability = state.capability or {}
+      ---@param id string
+      ---@param kind 'choice'|'toggle'|'input'|'action'
+      ---@param value string|boolean
+      ---@param label string?
+      ---@param description string
+      ---@param disabled string?
+      ---@param muted boolean?
+      ---@return ForgePickerField
+      local function field(id, kind, value, label, description, disabled, muted)
+        return { id = id, kind = kind, value = value, label = label, description = description,
+          disabled_reason = disabled, muted = muted }
+      end
+      local catalog_disabled = not (commit and commit.model_list) and (commit and commit.failure or "Loading models") or nil
+      local main = {
+        field("main-model", "choice", active.model or "Default", nil, "Model for the main conversation and task execution.",
+          not capability.model_selection and "Model selection is unavailable for this provider" or catalog_disabled),
+        field("main-thinking", "choice", active.effort or "Default", "Thinking", "Reasoning effort for the selected main model.",
+          not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
+      }
+      if capability.fast_mode or capability.ultrafast_mode then
+        main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed", "Provider service tier for the main conversation.")
+      end
+      local compaction = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
+      local sandbox = {
+        field("sandbox", "toggle", policy.sandbox, "Enabled", "OS isolation, independent of approval mode.",
+          not supported and "OS sandbox configuration is unavailable for this provider" or nil),
+      }
+      if vim.fn.has("win32") == 1 then
+        sandbox[#sandbox + 1] = field("windows-sandbox", "choice", policy.windows_sandbox, "Windows mode", "Windows sandbox implementation. MXC requires host support.",
+          not supported and "OS sandbox configuration is unavailable for this provider" or nil)
+      end
+      local approval, answer = duration.value(active.approval_timeout), duration.value(active.answer_timeout)
+      local approval_unit = field("approval_timeout:unit", "choice", approval.unit, nil, "Approval timeout unit: seconds, minutes, or hours.")
+      local answer_unit = field("answer_timeout:unit", "choice", answer.unit, nil, "Answer timeout unit: seconds, minutes, or hours.")
+      approval_unit.join_previous, answer_unit.join_previous = true, true
+      local provider_configuration = {
+        field("native-import", "action", "Import…", nil, "Preview and select native skills or MCP definitions to import into Forge settings."),
+      }
+      if active.backend == "claude" or active.backend == "antigravity" then
+        provider_configuration[#provider_configuration + 1] = field("provider-setup", "action", "Install / sign in…", nil, "Manage the ACP runtime and OAuth login.")
+      end
+      ---@param id string
+      ---@param section string
+      ---@param label string
+      ---@param fields ForgePickerField[]
+      ---@param inline_fields? boolean
+      ---@return table
+      local function row(id, section, label, fields, inline_fields)
+        return { id = id, section = section, label = label, fields = fields, inline_fields = inline_fields }
+      end
       return {
-        owner = "harness-config", host = host,
+        owner = "harness-config", host = host, height_ratio = 0.9, fit_content = true,
         page_list = { {
-          id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown")
-            .. (configuration_pending and " · Changes pending" or ""),
-          column_headers = { "Setting", "Value", "Description" },
+          id = "config", title = "Configuration",
+          subtitle = configuration_pending and "Changes pending" or nil,
+          field_navigation = true, highlight_selected_text = false, compact_sections = true,
           option_list = {
-            commit_rows[1], commit_rows[2], commit_rows[3], commit_rows[4],
-            { id = "auto-compact", label = "Auto compact", columns = { "Auto compact", picker_field.render(active.auto_compaction and active.auto_compaction.enabled and "On" or "Off", true), state.capability and state.capability.native_compact and (active.context_usage and active.context_usage ~= vim.NIL and "Current session · after completed turns" or "Waiting for provider context usage") or "Unavailable for this provider" } },
-            { id = "compact-threshold", label = "Compact at tokens", columns = { "Compact at tokens", picker_field.render(tostring(active.auto_compaction and active.auto_compaction.threshold_tokens or 128000), true), "Current session · provider-reported context tokens" } },
-            { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
-            { id = "answer_timeout", label = "Answer timeout", columns = { "Answer timeout", duration.render(duration.value(active.answer_timeout), timeout_focus.answer_timeout), "Automatically answer questions using recommended defaults · 0 disables" } },
-            { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
-            { id = "check-timing", label = "Automatic checks", columns = { "Automatic checks", picker_field.render(active.check_timing == "between_work" and "Between queued work" or "After queue", true), "Run after each work item or once the queue finishes" } },
-            { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
-            { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
-            { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
-            { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render((active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
-            { id = "lsp-tools", label = "LSP tools", columns = { "LSP tools", picker_field.render((active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true and "On" or "Off", true), "Read-only agent queries through editor language servers" } },
-            { id = "status-thoughts", label = "Status thoughts", columns = { "Status thoughts", picker_field.render(active.status_thoughts and "On" or "Off", true), "Show the latest thought under live status · timeline unchanged" } },
-            { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
-              or "Disabled (unsupported)", "OS isolation, independent of approval mode" } },
-            { id = "read-access", label = "Read access", columns = { "Read access", picker_field.render(policy.read_access, true), "Approval scope for reported file reads · not OS confinement" } },
-            { id = "readable-directories", label = "Additional readable directories", columns = { "Additional readable directories", tostring(#policy.readable_directory), "Enter to add, edit, or remove" } },
-            { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), "Approval scope for reported file writes · independent of sandbox" } },
-            { id = "writable-directories", label = "Additional writable directories", columns = { "Additional writable directories", tostring(#policy.writable_directory), "Enter to add, edit, or remove" } },
-            { id = "windows-sandbox", label = "Windows sandbox", columns = { "Windows sandbox", picker_field.render(policy.windows_sandbox, true), "Windows only · MXC requires host support" } },
-            { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
-            { id = "provider", label = "Provider", columns = { "Provider", cli or "Unknown",
-              require("forge.views.harness").backend_switch_available() and "Choose a new chat or resume a session" or "Finish pending work to switch" } },
-            { id = "native-import", label = "Import native configuration", columns = { "Import native configuration", "Preview / select", "Import skills or MCP definitions into Forge settings" } },
-            provider_setup,
+            row("main-model", "Models", "Main", main),
+            row("background-model", "Models", "Background", { background.model, background.thinking }),
+            row("main-compaction", "Compaction", "Main", {
+              field("auto-compact", "toggle", compaction.enabled, "Automatic", "Compact the main conversation after completed turns.",
+                not capability.native_compact and "Compaction is unavailable for this provider" or nil),
+              field("compact-threshold", "input", tostring(compaction.threshold_tokens), "Threshold", "Main compaction threshold in provider-reported context tokens.", nil, not compaction.enabled),
+            }),
+            row("background-compaction", "Compaction", "Background", { background.compact, background.threshold }),
+            row("check-execution", "Checks", "Execution", {
+              field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell", "Shell used for saved checks. Nushell is available when installed."),
+              field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing", "Run checks after each work item or once the queue finishes."),
+            }),
+            row("check-editing", "Checks", "Setup", {
+              field("check-editing", "toggle", state.check_editing == true, "Enabled", "Allow the agent to edit project checks. Changes permission without sending a prompt."),
+            }),
+            row("plan-permission", "Planning", "Permission", {
+              field("plan-permission", "choice", ({ read = "Read", write = "Write", yolo = "YOLO" })[active.plan_permission] or "Keep current", nil, "Approval mode applied when starting a planning task."),
+            }),
+            row("plan-revisions", "Planning", "Auto-approve", {
+              field("plan-revisions", "toggle", active.plan_auto_approve_revisions ~= false, "Auto-approve", "Automatically accept validated execution plan revisions."),
+            }, true),
+            row("execute-permission", "Execute", "Permission", {
+              field("default-write-permission", "choice", active.default_write_permission == "yolo" and "YOLO" or "Write", nil, "Approval mode applied to new goals and accepted plan execution. Choose Write or YOLO."),
+            }),
+            row("read-access", "Permissions", "Read", {
+              field("read-access", "choice", policy.read_access, nil, "Approval scope for reported file reads. This does not configure OS confinement."),
+              field("readable-directories", "action", tostring(#policy.readable_directory) .. "…", "Extra directories", "Add, edit, or remove additional readable directories."),
+            }),
+            row("write-access", "Permissions", "Write", {
+              field("write-access", "choice", policy.write_access, nil, "Approval scope for reported file writes, independent of the sandbox."),
+              field("writable-directories", "action", tostring(#policy.writable_directory) .. "…", "Extra directories", "Add, edit, or remove additional writable directories."),
+            }),
+            row("sandbox", "Permissions", "Sandbox", sandbox),
+            row("timeouts", "Tools", "Timeouts", {
+              field("approval_timeout:amount", "input", tostring(approval.amount), "Approval", "Automatically reject unanswered approvals after this duration. Set 0 to disable."),
+              approval_unit,
+              field("answer_timeout:amount", "input", tostring(answer.amount), "Answer", "Automatically answer questions with recommended defaults after this duration. Set 0 to disable."),
+              answer_unit,
+            }),
+            row("subagent-tools", "Tools", "Subagents", {
+              field("subagent-tools", "toggle", (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) == true, "Subagents", "Allow root model delegation. Manual spawning remains available."),
+            }, true),
+            row("lsp-tools", "Tools", "LSP", {
+              field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "LSP", "Read-only agent queries through editor language servers."),
+            }, true),
+            row("status-thoughts", "Display", "Thoughts", {
+              field("status-thoughts", "toggle", active.status_thoughts == true, "Thoughts", "Show the latest thought under live status without changing timeline messages."),
+            }, true),
+            row("provider", "Provider", "Connection", {
+              field("provider", "action", cli or "Unknown", nil, "Choose a new chat or resume a session with another provider."),
+            }),
+            row("provider-configuration", "Provider", "Configuration", provider_configuration),
+            row("logging", "Debug", "Logging", {
+              field("logging", "toggle", status.enabled == true, "Logging", "Save the session log."),
+            }, true),
           },
-          footer = "←→ change setting  Tab amount/unit  Enter edit/select  q close",
+          footer = "↑↓ row  Tab/S-Tab field  ←→ value  Space toggle  Enter edit/open  q close",
         } },
-        action_list = {
-          { id = "previous-value", command = "previous_value", callback = function(context) toggle(context, -1) end },
-          { id = "next-value", command = "next_value", callback = function(context) toggle(context, 1) end },
-          { key = "<Tab>", modes = { "n", "i" }, desc = "Select timeout amount or unit", callback = function(context)
-            local id = context.option and context.option.id
-            if not timeout_focus[id] or pending then return end
-            timeout_focus[id] = timeout_focus[id] == "amount" and "unit" or "amount"
-            picker.update(build_spec())
-          end },
-        },
-        on_confirm = function(result)
-          local id = result.option.id
-          if commit and commit:open(id) then return false end
-          if timeout_focus[id] and timeout_focus[id] == "amount" then
-            if pending then return false end
-            vim.ui.input({ prompt = result.option.label .. " amount (0 = Off): ", default = tostring(duration.value(active[id]).amount) }, function(text)
-              if text == nil then return end
-              local amount = tonumber(text)
-              if not text:match("^%d+$") or not amount or amount > 4294967295 then
-                notifications.error("Enter a whole number from 0 to 4294967295", "Harness timeout")
-                return
-              end
-              local value = duration.value(active[id])
-              value.amount = amount
-              configure({ [id] = value })
+        on_field_action = function(context, action, direction)
+          if not current() or pending then return end
+          local id = context.field.id
+          if id == "check-editing" then
+            pending = true
+            client.request_for(session_id, "checks.editing", { enabled = not state.check_editing }, function(result, failure)
+              if not current() then return end
+              pending = false
+              if failure then notifications.error(failure, "Harness checks") else state.check_editing = result.check_editing == true end
+              require("forge.views.harness.controller").refresh_winbar()
+              redraw()
             end)
-            return false
+            return
           end
-          if result.option.id == "native-import" then
-            require("forge.views.harness.native_import").open(state, host)
-            return false
-          end
-          if result.option.id == "provider-setup" then
-            require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
-            return false
-          end
-          if result.option.id == "provider" then
-            require("forge.views.harness.controller").select_backend()
-            return false
-          end
-          toggle({ option = result.option })
-          return false
+          local timeout, focus = id:match("^([^:]+):([^:]+)$")
+          if timeout then
+            timeout_focus[timeout] = focus
+            if action == "activate" and focus == "amount" then
+              vim.ui.input({ prompt = (timeout == "approval_timeout" and "Approval" or "Answer") .. " timeout amount (0 disables): ",
+                default = tostring(duration.value(active[timeout]).amount) }, function(text)
+                if not text or not current() then return end
+                local amount = tonumber(text)
+                if not text:match("^%d+$") or not amount or amount > 4294967295 then notifications.error("Enter a whole number from 0 to 4294967295", "Harness timeout") return end
+                local value = duration.value(active[timeout])
+                value.amount = amount
+                configure({ [timeout] = value })
+              end)
+            else toggle({ option = { id = timeout } }, direction) end
+          elseif action == "activate" then activate(id)
+          elseif id == "compact-threshold" then
+            local policy = vim.deepcopy(active.auto_compaction or { enabled = false, threshold_tokens = 128000 })
+            policy.threshold_tokens = math.max(1, policy.threshold_tokens + direction)
+            configure({ auto_compaction = policy })
+          elseif id:match("^main%-") then change_main(id, direction)
+          else toggle({ option = { id = id } }, direction) end
         end,
       }
     end

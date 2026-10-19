@@ -25,7 +25,8 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                 PlanReviewTarget::Declaration {
                     path, side, line, ..
                 } => (path, side == "baseline", *line),
-                PlanReviewTarget::Call { path, side, .. } | PlanReviewTarget::Behavior { path, side, .. } => (path, side == "baseline", 0),
+                PlanReviewTarget::Call { path, side, .. }
+                | PlanReviewTarget::Behavior { path, side, .. } => (path, side == "baseline", 0),
                 PlanReviewTarget::File { path } => (path, !design.proposed.contains_key(path), 0),
                 _ => {
                     general.insert(index);
@@ -47,18 +48,50 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
                 .get(&before)
                 .cloned()
                 .unwrap_or_else(|| path.clone());
-            let text = if baseline { design.baseline.get(path).map(|file| &file.text) } else { design.proposed.get(path) };
-            let calls = if baseline { &design.baseline_calls } else { &design.proposed_calls };
+            let text = if baseline {
+                design.baseline.get(path).map(|file| &file.text)
+            } else {
+                design.proposed.get(path)
+            };
+            let calls = if baseline {
+                &design.baseline_calls
+            } else {
+                &design.proposed_calls
+            };
             let line = if let Some(text) = text {
-                let presentation = super::calls::insert(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default(), false, false)?;
+                let presentation = super::calls::insert(
+                    path,
+                    text,
+                    calls.get(path).map(Vec::as_slice).unwrap_or_default(),
+                    false,
+                    false,
+                )?;
                 if let PlanReviewTarget::Call { owner, name, .. } = &subject.target {
-                    presentation.call_row.iter().find(|(_, target)| target.0 == *owner && target.1 == *name).map(|(row, _)| *row as u32 + 1).context("reviewed call is absent from its saved snapshot")?
+                    presentation
+                        .call_row
+                        .iter()
+                        .find(|(_, target)| target.0 == *owner && target.1 == *name)
+                        .map(|(row, _)| *row as u32 + 1)
+                        .context("reviewed call is absent from its saved snapshot")?
                 } else if let PlanReviewTarget::Behavior { owner, offset, .. } = &subject.target {
-                    presentation.behavior_row.iter().find(|(_, target)| target.0 == *owner && target.1 == *offset).map(|(row, _)| *row as u32 + 1).context("reviewed behavior is absent from its saved snapshot")?
+                    presentation
+                        .behavior_row
+                        .iter()
+                        .find(|(_, target)| target.0 == *owner && target.1 == *offset)
+                        .map(|(row, _)| *row as u32 + 1)
+                        .context("reviewed behavior is absent from its saved snapshot")?
                 } else if line > 0 {
-                    presentation.declaration_row.get(&(line as usize - 1)).map(|row| *row as u32 + 1).context("reviewed declaration is absent from its saved snapshot")?
-                } else { line }
-            } else { line };
+                    presentation
+                        .declaration_row
+                        .get(&(line as usize - 1))
+                        .map(|row| *row as u32 + 1)
+                        .context("reviewed declaration is absent from its saved snapshot")?
+                } else {
+                    line
+                }
+            } else {
+                line
+            };
             files
                 .entry(after.clone())
                 .or_insert_with(|| FeedbackFile {
@@ -77,11 +110,35 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
         let before = design
             .baseline
             .get(&file.baseline)
-            .map(|source| super::calls::combined(&file.baseline, &source.text, design.baseline_calls.get(&file.baseline).map(Vec::as_slice).unwrap_or_default())).transpose()?.unwrap_or_default();
+            .map(|source| {
+                super::calls::combined(
+                    &file.baseline,
+                    &source.text,
+                    design
+                        .baseline_calls
+                        .get(&file.baseline)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let after = design
             .proposed
             .get(&file.proposed)
-            .map(|text| super::calls::combined(&file.proposed, text, design.proposed_calls.get(&file.proposed).map(Vec::as_slice).unwrap_or_default())).transpose()?.unwrap_or_default();
+            .map(|text| {
+                super::calls::combined(
+                    &file.proposed,
+                    text,
+                    design
+                        .proposed_calls
+                        .get(&file.proposed)
+                        .map(Vec::as_slice)
+                        .unwrap_or_default(),
+                )
+            })
+            .transpose()?
+            .unwrap_or_default();
         let diff = TextDiff::from_lines(&before, &after);
         let changes = diff.iter_all_changes().collect::<Vec<_>>();
         if changes.is_empty() {
@@ -371,16 +428,41 @@ mod test {
     #[test]
     fn change_feedback_uses_saved_summary_rows_and_rejects_missing_offsets() {
         let mut document = document("pub fn run();\n", "pub fn run();\n");
-        document.design.as_mut().unwrap().proposed_calls.insert("src/controls.rs".into(), vec![crate::plan::FunctionBody { evidence: None,
-            owner: "run".into(), call: None, behavior: Some(crate::plan::FunctionBehavior::Change("Stop retrying authentication failures.\nRecord the final attempt.".into())),
-        }]);
-        let mut annotation = comment("src/controls.rs", "proposed", &[1], "Specify the retry limit.");
-        annotation.subject[0].target = PlanReviewTarget::Behavior { path: "src/controls.rs".into(), side: "proposed".into(), owner: "run".into(), offset: 2 };
+        document.design.as_mut().unwrap().proposed_calls.insert(
+            "src/controls.rs".into(),
+            vec![crate::plan::FunctionBody {
+                evidence: None,
+                owner: "run".into(),
+                call: None,
+                behavior: Some(crate::plan::FunctionBehavior::Change(
+                    "Stop retrying authentication failures.\nRecord the final attempt.".into(),
+                )),
+            }],
+        );
+        let mut annotation = comment(
+            "src/controls.rs",
+            "proposed",
+            &[1],
+            "Specify the retry limit.",
+        );
+        annotation.subject[0].target = PlanReviewTarget::Behavior {
+            path: "src/controls.rs".into(),
+            side: "proposed".into(),
+            owner: "run".into(),
+            offset: 2,
+        };
         let feedback = render(&document, &[annotation.clone()]).unwrap();
         assert!(feedback.contains("4: Specify the retry limit."));
         assert!(feedback.contains("Record the final attempt."));
-        if let PlanReviewTarget::Behavior { offset, .. } = &mut annotation.subject[0].target { *offset = 99; }
-        assert!(render(&document, &[annotation]).unwrap_err().to_string().contains("absent"));
+        if let PlanReviewTarget::Behavior { offset, .. } = &mut annotation.subject[0].target {
+            *offset = 99;
+        }
+        assert!(
+            render(&document, &[annotation])
+                .unwrap_err()
+                .to_string()
+                .contains("absent")
+        );
     }
 
     #[test]

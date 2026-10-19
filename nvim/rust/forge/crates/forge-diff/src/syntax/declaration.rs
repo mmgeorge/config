@@ -69,7 +69,8 @@ impl DeclarationOverview {
             } else {
                 let mut cursor = node.walk();
                 pending.extend(
-                    node.named_children(&mut cursor).map(|child| (child, depth + 1)),
+                    node.named_children(&mut cursor)
+                        .map(|child| (child, depth + 1)),
                 );
             }
         }
@@ -78,30 +79,69 @@ impl DeclarationOverview {
     }
 
     /// Locate a saved declaration token in the current inspection presentation.
-    pub fn display_position(path: &str, saved: &str, source: DeclarationPosition) -> Result<DeclarationPosition, SyntaxError> {
+    pub fn display_position(
+        path: &str,
+        saved: &str,
+        source: DeclarationPosition,
+    ) -> Result<DeclarationPosition, SyntaxError> {
         let presentation = Self::present(path, saved)?;
         let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
         let saved_tokens = layout_tokens(language, saved)?;
         let displayed_tokens = layout_tokens(language, &presentation.text)?;
-        let identity = saved_tokens.iter().find(|(_, (position, _))| *position == source).map(|(identity, _)| identity).ok_or_else(|| SyntaxError::Query("saved declaration token is unavailable".into()))?;
-        displayed_tokens.get(identity).map(|(position, _)| *position).ok_or_else(|| SyntaxError::Query("declaration token is hidden in the presentation".into()))
+        let identity = saved_tokens
+            .iter()
+            .find(|(_, (position, _))| *position == source)
+            .map(|(identity, _)| identity)
+            .ok_or_else(|| SyntaxError::Query("saved declaration token is unavailable".into()))?;
+        displayed_tokens
+            .get(identity)
+            .map(|(position, _)| *position)
+            .ok_or_else(|| {
+                SyntaxError::Query("declaration token is hidden in the presentation".into())
+            })
     }
     /// Map a selected rendered token to its saved declaration position.
-    pub fn token_position(path: &str, saved: &str, anchor: DeclarationPosition, row: &str, column: usize) -> Result<DeclarationPosition, SyntaxError> {
+    pub fn token_position(
+        path: &str,
+        saved: &str,
+        anchor: DeclarationPosition,
+        row: &str,
+        column: usize,
+    ) -> Result<DeclarationPosition, SyntaxError> {
         let presentation = Self::present(path, saved)?;
         let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
         let saved_tokens = layout_tokens(language, saved)?;
         let displayed_tokens = layout_tokens(language, &presentation.text)?;
-        let display_row = presentation.source.iter().enumerate().find(|(index, position)| **position == Some(anchor) && presentation.text.lines().nth(*index) == Some(row))
-            .or_else(|| presentation.source.iter().enumerate().find(|(_, position)| **position == Some(anchor))).map(|(index, _)| index as u32 + 1);
+        let display_row = presentation
+            .source
+            .iter()
+            .enumerate()
+            .find(|(index, position)| {
+                **position == Some(anchor) && presentation.text.lines().nth(*index) == Some(row)
+            })
+            .or_else(|| {
+                presentation
+                    .source
+                    .iter()
+                    .enumerate()
+                    .find(|(_, position)| **position == Some(anchor))
+            })
+            .map(|(index, _)| index as u32 + 1);
         if let Some(display_row) = display_row {
             for (identity, (position, token)) in displayed_tokens {
-                if position.line == display_row && position.column as usize <= column && column < position.column as usize + token.len() {
-                    if let Some((source, _)) = saved_tokens.get(&identity) { return Ok(*source); }
+                if position.line == display_row
+                    && position.column as usize <= column
+                    && column < position.column as usize + token.len()
+                {
+                    if let Some((source, _)) = saved_tokens.get(&identity) {
+                        return Ok(*source);
+                    }
                 }
             }
         }
-        Err(SyntaxError::Query("cursor is not on a mapped declaration token".into()))
+        Err(SyntaxError::Query(
+            "cursor is not on a mapped declaration token".into(),
+        ))
     }
     /// Admit source declarations and complete configuration documents independently of highlighting.
     pub fn supports(path: &str) -> bool {
@@ -136,14 +176,28 @@ impl DeclarationOverview {
     }
 
     /// Extract declarations and call evidence from one complete source parse.
-    pub fn extract_with_calls(path: &str, source: &str) -> Result<(String, Vec<super::DeclarationCallable>), SyntaxError> {
-        if ConfigurationFormat::for_path(path).is_some() { return Ok((Self::extract(path, source)?, Vec::new())); }
+    pub fn extract_with_calls(
+        path: &str,
+        source: &str,
+    ) -> Result<(String, Vec<super::DeclarationCallable>), SyntaxError> {
+        if ConfigurationFormat::for_path(path).is_some() {
+            return Ok((Self::extract(path, source)?, Vec::new()));
+        }
         let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
         let mut parser = Parser::new();
-        parser.set_language(&language.grammar()).map_err(|error| SyntaxError::Query(error.to_string()))?;
+        parser
+            .set_language(&language.grammar())
+            .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
-        if tree.root_node().has_error() { return Err(SyntaxError::Query(format!("invalid source syntax in {path}"))); }
-        Ok((Self::project_tree(source, false, language, &tree)?, super::DeclarationCalls::from_tree(source, language, &tree, false)?))
+        if tree.root_node().has_error() {
+            return Err(SyntaxError::Query(format!(
+                "invalid source syntax in {path}"
+            )));
+        }
+        Ok((
+            Self::project_tree(source, false, language, &tree)?,
+            super::DeclarationCalls::from_tree(source, language, &tree, false)?,
+        ))
     }
 
     fn project(path: &str, source: &str, formatted: bool) -> Result<String, SyntaxError> {
@@ -170,7 +224,12 @@ impl DeclarationOverview {
         Self::project_tree(source, formatted, language, &tree)
     }
 
-    fn project_tree(source: &str, formatted: bool, language: SyntaxLanguage, tree: &tree_sitter::Tree) -> Result<String, SyntaxError> {
+    fn project_tree(
+        source: &str,
+        formatted: bool,
+        language: SyntaxLanguage,
+        tree: &tree_sitter::Tree,
+    ) -> Result<String, SyntaxError> {
         let grammar = language.grammar();
         let query_text = match language {
             SyntaxLanguage::Rust => include_str!("../../query/forge/rust/design.scm"),
@@ -251,9 +310,16 @@ impl DeclarationOverview {
         if ConfigurationFormat::for_path(path).is_some() {
             return Ok(DeclarationPresentation {
                 text: overview.to_owned(),
-                source: overview.lines().enumerate().map(|(row, _)| {
-                    Some(DeclarationPosition { line: row as u32 + 1, column: 0 })
-                }).collect(),
+                source: overview
+                    .lines()
+                    .enumerate()
+                    .map(|(row, _)| {
+                        Some(DeclarationPosition {
+                            line: row as u32 + 1,
+                            column: 0,
+                        })
+                    })
+                    .collect(),
             });
         }
         let language = Self::language(path).ok_or_else(|| {
@@ -327,10 +393,14 @@ fn xml_comments(text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
             allow_dtd: true,
             ..Default::default()
         },
-    ).map_err(|error| SyntaxError::Query(error.to_string()))?;
+    )
+    .map_err(|error| SyntaxError::Query(error.to_string()))?;
     let line_start = std::iter::once(0)
-        .chain(text.bytes().enumerate()
-            .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)))
+        .chain(
+            text.bytes()
+                .enumerate()
+                .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
+        )
         .collect::<Vec<_>>();
     let mut comment = Vec::new();
     for node in document.descendants().filter(|node| node.is_comment()) {
@@ -686,7 +756,9 @@ pub(super) fn declaration_surrogate(
             } else if language == SyntaxLanguage::Lua
                 && text.starts_with("local ")
                 && !text.contains('=')
-                && text[6..].chars().all(|character| character.is_alphanumeric() || character == '_')
+                && text[6..]
+                    .chars()
+                    .all(|character| character.is_alphanumeric() || character == '_')
             {
                 format!("{line} = nil\n")
             } else if language == SyntaxLanguage::Lua
@@ -756,7 +828,10 @@ pub(super) fn declaration_surrogate(
                     insertions.push(signature.end_byte());
                 }
             }
-            pending.extend(node.named_children(&mut cursor).filter(|child| child.has_error()));
+            pending.extend(
+                node.named_children(&mut cursor)
+                    .filter(|child| child.has_error()),
+            );
         }
         insertions.sort_unstable();
         insertions.dedup();
@@ -988,7 +1063,11 @@ fn project_node(
         return format!(
             "{}{}",
             source[node.start_byte()..body.start_byte()].trim(),
-            if text.trim_end().ends_with(';') { ";" } else { "" },
+            if text.trim_end().ends_with(';') {
+                ";"
+            } else {
+                ""
+            },
         );
     }
     if node.kind() == "export_statement"
@@ -1073,7 +1152,11 @@ fn project_node(
         }
     }
     if language == SyntaxLanguage::Lua && node.kind() == "function_call" {
-        return if lua_literal_require(text).is_some() { text.into() } else { String::new() };
+        return if lua_literal_require(text).is_some() {
+            text.into()
+        } else {
+            String::new()
+        };
     }
     if roles.get(&node.id()) == Some(&"design.callable") {
         if language == SyntaxLanguage::Lua {
@@ -1127,7 +1210,10 @@ fn project_node(
             if child.kind() == "," || child.kind() == ")" {
                 let field = source[position..child.start_byte()].trim();
                 if !field.is_empty() {
-                    fields.push(format!("{field}{}", if child.kind() == "," { "," } else { "" }));
+                    fields.push(format!(
+                        "{field}{}",
+                        if child.kind() == "," { "," } else { "" }
+                    ));
                 }
                 position = child.end_byte();
             }
@@ -1216,10 +1302,17 @@ fn lua_literal_require(source: &str) -> Option<&str> {
         None => (argument, false),
     };
     let quote = argument.chars().next()?;
-    if !matches!(quote, '\'' | '"') { return None; }
+    if !matches!(quote, '\'' | '"') {
+        return None;
+    }
     let (module, rest) = argument[1..].split_once(quote)?;
     let rest = rest.trim();
-    (if parenthesized { rest == ")" } else { rest.is_empty() }).then_some(module)
+    (if parenthesized {
+        rest == ")"
+    } else {
+        rest.is_empty()
+    })
+    .then_some(module)
 }
 
 fn normalize(text: &str) -> String {
@@ -1237,16 +1330,39 @@ mod tests {
     #[test]
     fn comments_preserve_saved_coordinates_and_exclude_literal_markers() {
         for (path, source, line, column) in [
-            ("lib.rs", "const TEXT: &str = r#\"/// Returns text.\"#;\n  /// Get settings.\npub fn standard();\n", 2, 2),
-            ("lib.lua", "function first()\n\n--- Get settings.\nfunction standard()\n", 3, 0),
-            ("App.csproj", "<Project><![CDATA[<!-- Returns text. -->]]>é<!-- Get settings. --></Project>", 1, 45),
+            (
+                "lib.rs",
+                "const TEXT: &str = r#\"/// Returns text.\"#;\n  /// Get settings.\npub fn standard();\n",
+                2,
+                2,
+            ),
+            (
+                "lib.lua",
+                "function first()\n\n--- Get settings.\nfunction standard()\n",
+                3,
+                0,
+            ),
+            (
+                "App.csproj",
+                "<Project><![CDATA[<!-- Returns text. -->]]>é<!-- Get settings. --></Project>",
+                1,
+                45,
+            ),
         ] {
             let comment = DeclarationOverview::comments(path, source).unwrap();
             assert_eq!(comment.len(), 1, "{path}");
-            assert_eq!(comment[0].position, DeclarationPosition { line, column }, "{path}");
+            assert_eq!(
+                comment[0].position,
+                DeclarationPosition { line, column },
+                "{path}"
+            );
             assert!(comment[0].text.contains("Get settings."));
         }
-        let comment = DeclarationOverview::comments("lib.ts", "const text = `${/* Returns settings. */ value}`;\n").unwrap();
+        let comment = DeclarationOverview::comments(
+            "lib.ts",
+            "const text = `${/* Returns settings. */ value}`;\n",
+        )
+        .unwrap();
         assert_eq!(comment.len(), 1);
         assert_eq!(comment[0].text, "/* Returns settings. */");
     }
@@ -1254,13 +1370,28 @@ mod tests {
     #[test]
     fn toml_configuration_retains_values_comments_and_multiline_string_contents() {
         let manifest = "# Engine package\r\n[package]\r\nname = \"arena\"\r\nversion = \"0.1.0\"\r\n\r\n[dependencies]\r\nbevy = { version = \"0.17\", default-features = false, features = [\"std\", \"bevy_sprite\"] }\r\n\r\n[package.metadata]\r\nnotes = \"\"\"first\r\n  preserve indentation\r\nlast\"\"\"\r\n";
-        assert_eq!(DeclarationOverview::extract("Cargo.toml", manifest).unwrap(), manifest);
-        assert_eq!(DeclarationOverview::parse("Cargo.toml", manifest).unwrap(), manifest);
-        assert_eq!(DeclarationOverview::format_with_width("Cargo.toml", manifest, 40).unwrap(), manifest);
+        assert_eq!(
+            DeclarationOverview::extract("Cargo.toml", manifest).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            DeclarationOverview::parse("Cargo.toml", manifest).unwrap(),
+            manifest
+        );
+        assert_eq!(
+            DeclarationOverview::format_with_width("Cargo.toml", manifest, 40).unwrap(),
+            manifest
+        );
         let display = DeclarationOverview::present("Cargo.toml", manifest).unwrap();
         assert_eq!(display.text, manifest);
-        let dependency_row = manifest.lines().position(|line| line.starts_with("bevy =")).unwrap();
-        assert_eq!(display.source[dependency_row].unwrap().line, dependency_row as u32 + 1);
+        let dependency_row = manifest
+            .lines()
+            .position(|line| line.starts_with("bevy ="))
+            .unwrap();
+        assert_eq!(
+            display.source[dependency_row].unwrap().line,
+            dependency_row as u32 + 1
+        );
         assert!(DeclarationOverview::parse("Cargo.toml", "[dependencies\nbevy =").is_err());
     }
 
@@ -1616,6 +1747,13 @@ return M
         assert!(!overview.contains("runtime.only"));
         let formatted = DeclarationOverview::format_with_width("init.lua", &overview, 80).unwrap();
         let index = crate::syntax::DeclarationIndex::extract("init.lua", &formatted).unwrap();
-        assert_eq!(index.import.iter().filter_map(|import| import.source.as_deref()).collect::<Vec<_>>(), ["plugin.module", "plugin.setup"]);
+        assert_eq!(
+            index
+                .import
+                .iter()
+                .filter_map(|import| import.source.as_deref())
+                .collect::<Vec<_>>(),
+            ["plugin.module", "plugin.setup"]
+        );
     }
 }

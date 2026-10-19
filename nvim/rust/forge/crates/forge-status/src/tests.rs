@@ -6,11 +6,7 @@ use forge_buffer::{
     input::DocumentInput,
     patch::BufferSnapshot,
 };
-use forge_diff::{
-    cache::CacheLimits,
-    engine::DiffEngine,
-    syntax::{SyntaxEngine},
-};
+use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxEngine};
 use forge_git::{
     command::{CommandLimits, read_command},
     store::RepositoryStore,
@@ -1216,8 +1212,13 @@ async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity()
     std::os::unix::fs::symlink(directory.path(), &alias).unwrap();
     let selected = vec![forge_git::RepositoryPath::new(b"sample.txt".to_vec()).unwrap()];
     crate::ignored::update(
-        storage.path(), directory.path(), &Default::default(), &selected, true,
-    ).unwrap();
+        storage.path(),
+        directory.path(),
+        &Default::default(),
+        &selected,
+        true,
+    )
+    .unwrap();
     assert_eq!(
         crate::ignored::load(Some(storage.path()), &alias).unwrap(),
         selected.into_iter().collect(),
@@ -1226,9 +1227,13 @@ async fn symlinked_worktree_preserves_local_deleted_files_and_ignored_identity()
         if deleted {
             std::fs::remove_file(directory.path().join("sample.txt")).unwrap();
         }
-        let snapshot = service.open_local(
-            DocumentId(format!("linked-local-{deleted}")), alias.join("sample.txt"),
-        ).await.unwrap();
+        let snapshot = service
+            .open_local(
+                DocumentId(format!("linked-local-{deleted}")),
+                alias.join("sample.txt"),
+            )
+            .await
+            .unwrap();
         assert_eq!(snapshot.file.len(), 1);
         assert!(service.close(&snapshot.document));
     }
@@ -1493,7 +1498,10 @@ async fn whole_section_stages_current_contents_and_only_selected_paths() {
 #[tokio::test]
 async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
     let (directory, _, diff, _) = fixture().await;
-    let old = format!("fn before() {{}}\nfn retained() {{}}\n{}", "\n".repeat(9999));
+    let old = format!(
+        "fn before() {{}}\nfn retained() {{}}\n{}",
+        "\n".repeat(9999)
+    );
     let new = format!("fn after() {{}}\nfn retained() {{}}\n{}", "\n".repeat(9999));
     std::fs::write(directory.path().join("syntax.rs"), &old).unwrap();
     git(directory.path(), &["add", "syntax.rs"]);
@@ -1764,14 +1772,8 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
             .filter(|block| block.id.0.starts_with("hunk-header:"))
             .collect();
         assert_eq!(headers.len(), 2, "{path}");
-        assert_eq!(
-            headers[0].text.wire_rows()[0],
-            "@@ +3 -3"
-        );
-        assert_eq!(
-            headers[1].text.wire_rows()[0],
-            "@@ +1 -1"
-        );
+        assert_eq!(headers[0].text.wire_rows()[0], "@@ +3 -3");
+        assert_eq!(headers[1].text.wire_rows()[0], "@@ +1 -1");
         assert_eq!(
             loaded
                 .block
@@ -1860,24 +1862,62 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
 
 fn assert_impl_context(snapshot: &BufferSnapshot, expected_groups: usize) {
     let source = rows(snapshot);
-    assert_eq!(source.iter().filter(|text| **text == "impl Engine {").count(), 1);
-    assert_eq!(source.iter().filter(|text| **text == "    fn run() {").count(), 1);
+    assert_eq!(
+        source
+            .iter()
+            .filter(|text| **text == "impl Engine {")
+            .count(),
+        1
+    );
+    assert_eq!(
+        source
+            .iter()
+            .filter(|text| **text == "    fn run() {")
+            .count(),
+        1
+    );
     assert_eq!(source.iter().filter(|text| **text == "}").count(), 1);
-    assert_eq!(snapshot.block.iter().filter(|block| block.id.0.starts_with("hunk-header:")).count(), expected_groups);
-    assert!(snapshot.block.iter().filter(|block| block.id.0.starts_with("hunk-header:"))
-        .all(|block| !block.text.wire_rows()[0].contains("impl") && !block.text.wire_rows()[0].contains("fn run")));
+    assert_eq!(
+        snapshot
+            .block
+            .iter()
+            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .count(),
+        expected_groups
+    );
+    assert!(
+        snapshot
+            .block
+            .iter()
+            .filter(|block| block.id.0.starts_with("hunk-header:"))
+            .all(|block| !block.text.wire_rows()[0].contains("impl")
+                && !block.text.wire_rows()[0].contains("fn run"))
+    );
     let mut omissions = 0;
     for block in &snapshot.block {
         for (row, text) in block.text.wire_rows().iter().enumerate() {
             if text.trim() == "..." {
                 omissions += 1;
                 assert!(block.target_at(TextPosition { row, column: 0 }).is_none());
-                assert!(block.metadata.visible_decoration.iter().filter(|capture| capture.range.start.row == row)
-                    .all(|capture| !capture.capture.ends_with(".rust")));
+                assert!(
+                    block
+                        .metadata
+                        .visible_decoration
+                        .iter()
+                        .filter(|capture| capture.range.start.row == row)
+                        .all(|capture| !capture.capture.ends_with(".rust"))
+                );
             }
             if *text == "impl Engine {" || *text == "    fn run() {" {
-                assert!(block.metadata.visible_decoration.iter().any(|capture|
-                    capture.range.start.row == row && capture.capture.ends_with(".rust")), "missing declaration syntax: {text}");
+                assert!(
+                    block
+                        .metadata
+                        .visible_decoration
+                        .iter()
+                        .any(|capture| capture.range.start.row == row
+                            && capture.capture.ends_with(".rust")),
+                    "missing declaration syntax: {text}"
+                );
             }
         }
     }
@@ -1896,55 +1936,146 @@ async fn staging_one_raw_hunk_splits_shared_context_and_unstaging_merges_it_agai
     git(directory.path(), &["add", "engine.rs"]);
     git(directory.path(), &["commit", "-m", "shared context"]);
     let mut changed = original.clone();
-    for row in [8, 18, 28] { changed[row] = format!("        let value_{} = 999;", row - 2); }
+    for row in [8, 18, 28] {
+        changed[row] = format!("        let value_{} = 999;", row - 2);
+    }
     std::fs::write(&path, changed.join("\n") + "\n").unwrap();
-    let opened = service.open(DocumentId("split-context".into()), directory.path().to_owned()).await.unwrap();
-    service.demand(input(&opened, "engine.rs", 1, "demand")).await.unwrap();
-    let update = tokio::time::timeout(Duration::from_secs(5), updates.recv()).await.unwrap().unwrap();
+    let opened = service
+        .open(
+            DocumentId("split-context".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    service
+        .demand(input(&opened, "engine.rs", 1, "demand"))
+        .await
+        .unwrap();
+    let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(update.phase, "context");
     let snapshot = service.snapshot(&opened.document).await.unwrap();
     let selected = file(&snapshot, "engine.rs", Some(StatusSection::Unstaged));
     let loaded = body(&service, &snapshot, selected).await;
     assert_impl_context(&loaded, 1);
-    let (selected_block, selected_row) = loaded.block.iter().find_map(|block|
-        block.text.wire_rows().iter().position(|text| *text == changed[18]).map(|row| (block, row))).unwrap();
+    let (selected_block, selected_row) = loaded
+        .block
+        .iter()
+        .find_map(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .position(|text| *text == changed[18])
+                .map(|row| (block, row))
+        })
+        .unwrap();
     let mut stage = input(&snapshot, "engine.rs", 2, "stage");
     stage.location = body_location(selected, &loaded, selected_block, selected_row);
     let stale_location = stage.location.clone();
     let outcome = service.input(stage).await.unwrap().finish().await.unwrap();
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
     writer.acknowledge(outcome.operation);
     let index = String::from_utf8(git(directory.path(), &["show", ":engine.rs"])).unwrap();
-    assert!(index.contains(&changed[18]) && index.contains(&original[8]) && index.contains(&original[28]));
+    assert!(
+        index.contains(&changed[18])
+            && index.contains(&original[8])
+            && index.contains(&original[28])
+    );
     assert!(!index.contains(&changed[8]) && !index.contains(&changed[28]));
 
     let snapshot = service.snapshot(&opened.document).await.unwrap();
     for (section, groups) in [(StatusSection::Unstaged, 2), (StatusSection::Staged, 1)] {
-        let loaded = body(&service, &snapshot, file(&snapshot, "engine.rs", Some(section))).await;
+        let loaded = body(
+            &service,
+            &snapshot,
+            file(&snapshot, "engine.rs", Some(section)),
+        )
+        .await;
         assert_impl_context(&loaded, groups);
-        let (block, row) = loaded.block.iter().find_map(|block|
-            block.text.wire_rows().iter().position(|text| text.trim() == "...").map(|row| (block, row))).unwrap();
+        let (block, row) = loaded
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .position(|text| text.trim() == "...")
+                    .map(|row| (block, row))
+            })
+            .unwrap();
         let mut gap_action = input(&snapshot, "engine.rs", 3, "stage");
-        gap_action.location = body_location(file(&snapshot, "engine.rs", Some(section)), &loaded, block, row);
-        assert!(service.input(gap_action).await.is_err(), "omission marker admitted a mutation");
+        gap_action.location = body_location(
+            file(&snapshot, "engine.rs", Some(section)),
+            &loaded,
+            block,
+            row,
+        );
+        assert!(
+            service.input(gap_action).await.is_err(),
+            "omission marker admitted a mutation"
+        );
     }
     let mut stale = input(&snapshot, "engine.rs", 3, "stage");
     stale.location = stale_location;
-    assert!(service.input(stale).await.is_err(), "old hunk target survived regrouping");
+    assert!(
+        service.input(stale).await.is_err(),
+        "old hunk target survived regrouping"
+    );
     let selected = file(&snapshot, "engine.rs", Some(StatusSection::Staged));
     let loaded = body(&service, &snapshot, selected).await;
-    let (block, row) = loaded.block.iter().find_map(|block|
-        block.text.wire_rows().iter().position(|text| *text == changed[18]).map(|row| (block, row))).unwrap();
+    let (block, row) = loaded
+        .block
+        .iter()
+        .find_map(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .position(|text| *text == changed[18])
+                .map(|row| (block, row))
+        })
+        .unwrap();
     let mut unstage = input(&snapshot, "engine.rs", 4, "unstage");
     unstage.location = body_location(selected, &loaded, block, row);
-    let outcome = service.input(unstage).await.unwrap().finish().await.unwrap();
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
+    let outcome = service
+        .input(unstage)
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
     writer.acknowledge(outcome.operation);
     let snapshot = service.snapshot(&opened.document).await.unwrap();
-    let loaded = body(&service, &snapshot, file(&snapshot, "engine.rs", Some(StatusSection::Unstaged))).await;
+    let loaded = body(
+        &service,
+        &snapshot,
+        file(&snapshot, "engine.rs", Some(StatusSection::Unstaged)),
+    )
+    .await;
     assert_impl_context(&loaded, 1);
-    assert_eq!(git(directory.path(), &["show", ":engine.rs"]), (original.join("\n") + "\n").as_bytes());
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), changed.join("\n") + "\n");
+    assert_eq!(
+        git(directory.path(), &["show", ":engine.rs"]),
+        (original.join("\n") + "\n").as_bytes()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&path).unwrap(),
+        changed.join("\n") + "\n"
+    );
     assert!(service.close(&opened.document));
 }
 
@@ -1953,7 +2084,9 @@ async fn ignoring_staged_changes_unstages_and_persists_without_changing_worktree
     for kind in ["modified", "new", "deleted", "renamed", "partial"] {
         let (directory, service, _, writer) = fixture().await;
         let storage = tempfile::tempdir().unwrap();
-        service.configure_ignored_directory(storage.path().to_owned()).unwrap();
+        service
+            .configure_ignored_directory(storage.path().to_owned())
+            .unwrap();
         let selected = match kind {
             "new" => {
                 std::fs::write(directory.path().join("added.txt"), "added\n").unwrap();
@@ -1965,7 +2098,11 @@ async fn ignoring_staged_changes_unstages_and_persists_without_changing_worktree
             }
             "renamed" => {
                 std::fs::write(directory.path().join("sample.txt"), "old\n").unwrap();
-                std::fs::rename(directory.path().join("sample.txt"), directory.path().join("renamed.txt")).unwrap();
+                std::fs::rename(
+                    directory.path().join("sample.txt"),
+                    directory.path().join("renamed.txt"),
+                )
+                .unwrap();
                 "renamed.txt"
             }
             _ => "sample.txt",
@@ -1975,23 +2112,63 @@ async fn ignoring_staged_changes_unstages_and_persists_without_changing_worktree
             std::fs::write(directory.path().join("sample.txt"), "newer worktree\n").unwrap();
         }
         let before = std::fs::read(directory.path().join(selected)).ok();
-        let opened = service.open(DocumentId(format!("ignore-staged-{kind}")), directory.path().to_owned()).await.unwrap();
+        let opened = service
+            .open(
+                DocumentId(format!("ignore-staged-{kind}")),
+                directory.path().to_owned(),
+            )
+            .await
+            .unwrap();
         let request = section_input(&opened, "staged", selected, 1, "ignore");
         let crate::StatusAction::Write(ticket) = service.act(request, None).await.unwrap() else {
             panic!("staged ignore must own an unstage operation: {kind}")
         };
         let outcome = ticket.finish().await.unwrap();
-        assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed), "{kind}: {outcome:?}");
-        assert!(outcome.settlement_diagnostic.is_none(), "{kind}: {:?}", outcome.settlement_diagnostic);
+        assert!(
+            outcome
+                .target
+                .iter()
+                .all(|target| target.completion == TargetCompletion::Completed),
+            "{kind}: {outcome:?}"
+        );
+        assert!(
+            outcome.settlement_diagnostic.is_none(),
+            "{kind}: {:?}",
+            outcome.settlement_diagnostic
+        );
         writer.acknowledge(outcome.operation);
-        assert_eq!(std::fs::read(directory.path().join(selected)).ok(), before, "{kind}");
+        assert_eq!(
+            std::fs::read(directory.path().join(selected)).ok(),
+            before,
+            "{kind}"
+        );
         service.refresh(&opened.document).await.unwrap();
         let current = service.snapshot(&opened.document).await.unwrap();
-        assert_eq!(file(&current, selected, None).section, StatusSection::Ignored, "{kind}");
-        assert!(git(directory.path(), &["diff", "--cached", "--name-only", "--", selected]).is_empty(), "{kind}");
-        assert!(crate::ignored::load(Some(storage.path()), directory.path()).unwrap().iter().any(|path| path.raw() == selected.as_bytes()), "{kind}");
+        assert_eq!(
+            file(&current, selected, None).section,
+            StatusSection::Ignored,
+            "{kind}"
+        );
+        assert!(
+            git(
+                directory.path(),
+                &["diff", "--cached", "--name-only", "--", selected]
+            )
+            .is_empty(),
+            "{kind}"
+        );
+        assert!(
+            crate::ignored::load(Some(storage.path()), directory.path())
+                .unwrap()
+                .iter()
+                .any(|path| path.raw() == selected.as_bytes()),
+            "{kind}"
+        );
         if kind == "renamed" {
-            assert_eq!(file(&current, "sample.txt", None).section, StatusSection::Ignored);
+            assert_eq!(
+                file(&current, "sample.txt", None).section,
+                StatusSection::Ignored
+            );
             assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
         }
         assert!(!directory.path().join(".gitignore").exists());
@@ -2003,25 +2180,53 @@ async fn ignoring_staged_changes_unstages_and_persists_without_changing_worktree
 async fn ignoring_staged_changes_does_not_hide_a_failed_unstage() {
     let (directory, service, _, writer) = fixture().await;
     let storage = tempfile::tempdir().unwrap();
-    service.configure_ignored_directory(storage.path().to_owned()).unwrap();
+    service
+        .configure_ignored_directory(storage.path().to_owned())
+        .unwrap();
     git(directory.path(), &["add", "sample.txt"]);
-    let opened = service.open(DocumentId("ignore-staged-failure".into()), directory.path().to_owned()).await.unwrap();
+    let opened = service
+        .open(
+            DocumentId("ignore-staged-failure".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
     let lock = directory.path().join(".git/index.lock");
     std::fs::write(&lock, "fixture lock").unwrap();
-    match service.act(input(&opened, "sample.txt", 1, "ignore"), None).await {
+    match service
+        .act(input(&opened, "sample.txt", 1, "ignore"), None)
+        .await
+    {
         Err(_) => {}
         Ok(crate::StatusAction::Write(ticket)) => {
             let outcome = ticket.finish().await.unwrap();
-            assert!(outcome.target.iter().all(|target| target.completion != TargetCompletion::Completed));
+            assert!(
+                outcome
+                    .target
+                    .iter()
+                    .all(|target| target.completion != TargetCompletion::Completed)
+            );
             writer.acknowledge(outcome.operation);
         }
         _ => panic!("failed unstage must not report a projection"),
     }
     std::fs::remove_file(lock).unwrap();
-    assert!(crate::ignored::load(Some(storage.path()), directory.path()).unwrap().is_empty());
+    assert!(
+        crate::ignored::load(Some(storage.path()), directory.path())
+            .unwrap()
+            .is_empty()
+    );
     assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"new\n");
     service.refresh(&opened.document).await.unwrap();
-    assert_eq!(file(&service.snapshot(&opened.document).await.unwrap(), "sample.txt", None).section, StatusSection::Staged);
+    assert_eq!(
+        file(
+            &service.snapshot(&opened.document).await.unwrap(),
+            "sample.txt",
+            None
+        )
+        .section,
+        StatusSection::Staged
+    );
     service.close(&opened.document);
 }
 
@@ -2514,16 +2719,48 @@ async fn optimistic_pending_index_is_shared_with_reopened_view_and_survives_clos
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn changed_hunk_source_rejects_queued_stage_and_refreshes_body() {
     let (directory, service, _, _) = fixture().await;
-    let opened = service.open(DocumentId("changed-hunk".into()), directory.path().to_owned()).await.unwrap();
-    service.demand(input(&opened, "sample.txt", 1, "demand")).await.unwrap();
+    let opened = service
+        .open(
+            DocumentId("changed-hunk".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    service
+        .demand(input(&opened, "sample.txt", 1, "demand"))
+        .await
+        .unwrap();
     let current = service.snapshot(&opened.document).await.unwrap();
     let selected = file(&current, "sample.txt", Some(StatusSection::Unstaged));
     let loaded = body(&service, &current, selected).await;
-    let (block, row) = loaded.block.iter().find_map(|block| {
-        block.text.wire_rows().iter().position(|row| *row == "new").map(|row| (block, row))
-    }).unwrap();
-    let repository = service.store.open(directory.path().to_owned()).await.unwrap().unwrap();
-    let gate = service.store.writes.admit(vec![forge_git::mutation::MutationScope::Index(repository.identity.worktree.clone().unwrap())], 0).unwrap();
+    let (block, row) = loaded
+        .block
+        .iter()
+        .find_map(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .position(|row| *row == "new")
+                .map(|row| (block, row))
+        })
+        .unwrap();
+    let repository = service
+        .store
+        .open(directory.path().to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let gate = service
+        .store
+        .writes
+        .admit(
+            vec![forge_git::mutation::MutationScope::Index(
+                repository.identity.worktree.clone().unwrap(),
+            )],
+            0,
+        )
+        .unwrap();
     let guard = service.store.writes.start(gate).unwrap().unwrap();
     let mut capture = input(&current, "sample.txt", 2, "stage");
     capture.location = body_location(selected, &loaded, block, row);
@@ -2531,22 +2768,60 @@ async fn changed_hunk_source_rejects_queued_stage_and_refreshes_body() {
     let ticket = service.input(capture).await.unwrap();
     let optimistic = service.snapshot(&opened.document).await.unwrap();
     assert!(!optimistic.pending.is_empty());
-    assert!(optimistic.section.iter().any(|section| section.kind == StatusSection::Staged));
-    std::fs::write(directory.path().join("sample.txt"), b"external replacement\n").unwrap();
-    guard.finish(forge_git::mutation::OperationCompletion::Completed).unwrap();
+    assert!(
+        optimistic
+            .section
+            .iter()
+            .any(|section| section.kind == StatusSection::Staged)
+    );
+    std::fs::write(
+        directory.path().join("sample.txt"),
+        b"external replacement\n",
+    )
+    .unwrap();
+    guard
+        .finish(forge_git::mutation::OperationCompletion::Completed)
+        .unwrap();
     service.store.writes.take_receipt(gate).unwrap();
-    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), ticket.finish()).await.unwrap().unwrap();
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Rejected), "{outcome:?}");
+    let outcome = tokio::time::timeout(std::time::Duration::from_secs(20), ticket.finish())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Rejected),
+        "{outcome:?}"
+    );
     assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
-    assert_eq!(std::fs::read(directory.path().join("sample.txt")).unwrap(), b"external replacement\n");
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        b"external replacement\n"
+    );
     let refreshed = service.snapshot(&opened.document).await.unwrap();
     assert!(refreshed.pending.is_empty());
-    assert!(!refreshed.section.iter().any(|section| section.kind == StatusSection::Staged));
-    let settled = std::iter::from_fn(|| updates.try_recv().ok()).find(|update| update.phase == "settled").unwrap();
+    assert!(
+        !refreshed
+            .section
+            .iter()
+            .any(|section| section.kind == StatusSection::Staged)
+    );
+    let settled = std::iter::from_fn(|| updates.try_recv().ok())
+        .find(|update| update.phase == "settled")
+        .unwrap();
     assert!(!settled.delta.pending.contains(&outcome.operation.value()));
-    service.demand(input(&refreshed, "sample.txt", 3, "demand")).await.unwrap();
+    service
+        .demand(input(&refreshed, "sample.txt", 3, "demand"))
+        .await
+        .unwrap();
     let refreshed = service.snapshot(&opened.document).await.unwrap();
-    let loaded = body(&service, &refreshed, file(&refreshed, "sample.txt", Some(StatusSection::Unstaged))).await;
+    let loaded = body(
+        &service,
+        &refreshed,
+        file(&refreshed, "sample.txt", Some(StatusSection::Unstaged)),
+    )
+    .await;
     assert!(rows(&loaded).contains(&"external replacement"));
     assert!(!rows(&loaded).contains(&"new"));
 }

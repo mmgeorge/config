@@ -405,7 +405,8 @@ pub(crate) fn inventory(
                 }
             })
             .collect();
-        selected.sort_unstable_by(|left, right| left.change.path.raw().cmp(right.change.path.raw()));
+        selected
+            .sort_unstable_by(|left, right| left.change.path.raw().cmp(right.change.path.raw()));
         for observed in selected {
             let record = &observed.change;
             let section = if section == StatusSection::Unstaged

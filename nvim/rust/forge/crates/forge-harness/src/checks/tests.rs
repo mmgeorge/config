@@ -16,7 +16,9 @@ fn definition(id: &str, command: &str) -> CheckDefinition {
         trigger: CheckTrigger::AnyChange,
         scope: CheckScope::All,
         directory: ".".into(),
-        all: CheckOperation { args: None, package_manager: None,
+        all: CheckOperation {
+            args: None,
+            package_manager: None,
             command: command.into(),
         },
         files: None,
@@ -32,7 +34,10 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
 #[test]
 fn relative_check_paths_validate_structure_without_a_byte_ceiling() -> Result<()> {
     let path = format!("{}helper.nu", "directory/".repeat(512));
-    assert_eq!(super::config::relative_path(&path)?, std::path::PathBuf::from(&path));
+    assert_eq!(
+        super::config::relative_path(&path)?,
+        std::path::PathBuf::from(&path)
+    );
     for invalid in ["../outside", "/absolute", "invalid\0path"] {
         assert!(super::config::relative_path(invalid).is_err());
     }
@@ -42,25 +47,38 @@ fn relative_check_paths_validate_structure_without_a_byte_ceiling() -> Result<()
 #[test]
 fn large_check_configuration_and_helpers_preserve_complete_content() -> Result<()> {
     let workspace = tempfile::tempdir()?;
-    let definitions = (0..129).map(|index| definition(&format!("check-{index}"), "print ok"))
+    let definitions = (0..129)
+        .map(|index| definition(&format!("check-{index}"), "print ok"))
         .collect::<Vec<_>>();
     let document = serde_json::json!({
         "checks":{"version":2,"definitions":definitions},
         "unrelated":"λ".repeat(1024 * 1024)
     });
-    std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&document)?)?;
+    std::fs::write(
+        workspace.path().join(".forge.json"),
+        serde_json::to_vec(&document)?,
+    )?;
     let helpers = workspace.path().join(".forge/checks");
     std::fs::create_dir_all(&helpers)?;
     let source = "# retained helper\n".repeat(32_769);
     assert!(source.len() > 256 * 1024);
     for index in 0..129 {
-        std::fs::write(helpers.join(format!("helper-{index}.nu")),
-            if index == 0 { source.as_str() } else { "print ok" })?;
+        std::fs::write(
+            helpers.join(format!("helper-{index}.nu")),
+            if index == 0 {
+                source.as_str()
+            } else {
+                "print ok"
+            },
+        )?;
     }
     let snapshot = ConfigSnapshot::load(workspace.path())?;
     assert_eq!(snapshot.config.definitions.len(), 129);
     assert_eq!(snapshot.helper_digest.len(), 129);
-    assert_eq!(snapshot.helper_digest[".forge/checks/helper-0.nu"], crate::plan::digest(source.as_bytes()));
+    assert_eq!(
+        snapshot.helper_digest[".forge/checks/helper-0.nu"],
+        crate::plan::digest(source.as_bytes())
+    );
     assert_eq!(super::config::read_document(workspace.path())?, document);
     Ok(())
 }
@@ -82,37 +100,74 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
 fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    save(workspace.path(), (0..33).map(|index| definition(&format!("check-{index}"), "print done")).collect());
+    save(
+        workspace.path(),
+        (0..33)
+            .map(|index| definition(&format!("check-{index}"), "print done"))
+            .collect(),
+    );
     let runner = make_runner(workspace.path(), data.path());
-    let mut run = runner.prepare_request(RunRequest {
-        ids: (0..4).map(|index| format!("check-{index}")).collect(),
-        ..Default::default()
-    }, None, crate::session::CheckShell::Nushell, "User requested".into())?;
+    let mut run = runner.prepare_request(
+        RunRequest {
+            ids: (0..4).map(|index| format!("check-{index}")).collect(),
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "User requested".into(),
+    )?;
     assert_eq!(run.commands.len(), 33);
     let activity = CheckActivity::from_run(&run).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (0, 4));
-    let states = [CheckState::Passed, CheckState::Failed, CheckState::Running, CheckState::Pending];
-    for (command, state) in run.commands.iter_mut().filter(|command| command.selected).zip(states) {
+    let states = [
+        CheckState::Passed,
+        CheckState::Failed,
+        CheckState::Running,
+        CheckState::Pending,
+    ];
+    for (command, state) in run
+        .commands
+        .iter_mut()
+        .filter(|command| command.selected)
+        .zip(states)
+    {
         command.state = state;
     }
     let activity = CheckActivity::from_run(&run).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (2, 4));
-    let mut package_command = run.commands.iter().find(|command| command.state == CheckState::Passed).unwrap().clone();
+    let mut package_command = run
+        .commands
+        .iter()
+        .find(|command| command.state == CheckState::Passed)
+        .unwrap()
+        .clone();
     package_command.id = "expanded-package".into();
     package_command.state = CheckState::Pending;
     run.commands.push(package_command);
     let activity = CheckActivity::from_run(&run).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (1, 4));
     run.commands.last_mut().unwrap().state = CheckState::Passed;
-    run.commands.iter_mut().find(|command| command.selected && command.state == CheckState::Pending).unwrap().state = CheckState::Skipped;
+    run.commands
+        .iter_mut()
+        .find(|command| command.selected && command.state == CheckState::Pending)
+        .unwrap()
+        .state = CheckState::Skipped;
     let restored: CheckRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
     let activity = CheckActivity::from_run(&restored).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (3, 4));
     Ok(())
 }
 
-fn direct_operation(command: &str, args: &[&str], manager: Option<PackageManager>) -> CheckOperation {
-    CheckOperation { command: command.into(), args: Some(args.iter().map(|argument| (*argument).into()).collect()), package_manager: manager }
+fn direct_operation(
+    command: &str,
+    args: &[&str],
+    manager: Option<PackageManager>,
+) -> CheckOperation {
+    CheckOperation {
+        command: command.into(),
+        args: Some(args.iter().map(|argument| (*argument).into()).collect()),
+        package_manager: manager,
+    }
 }
 
 #[tokio::test]
@@ -121,15 +176,30 @@ async fn completion_wait_ignores_progress_and_observes_terminal_states() -> Resu
     let data = tempfile::tempdir()?;
     save(workspace.path(), vec![definition("wait", "print done")]);
     let runner = make_runner(workspace.path(), data.path());
-    for state in [CheckState::Passed, CheckState::Failed, CheckState::Interrupted, CheckState::ConfigurationError] {
-        let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
-            crate::session::CheckShell::Nushell, "wait test".into())?;
+    for state in [
+        CheckState::Passed,
+        CheckState::Failed,
+        CheckState::Interrupted,
+        CheckState::ConfigurationError,
+    ] {
+        let run = runner.prepare_request(
+            RunRequest {
+                all: true,
+                ..Default::default()
+            },
+            None,
+            crate::session::CheckShell::Nushell,
+            "wait test".into(),
+        )?;
         runner.publish(&run, None).await?;
         let waiting = runner.status(&run.id, 1000, true);
         tokio::pin!(waiting);
         assert!(futures_util::poll!(waiting.as_mut()).is_pending());
         runner.publish(&run, None).await?;
-        assert!(futures_util::poll!(waiting.as_mut()).is_pending(), "progress completed a terminal wait");
+        assert!(
+            futures_util::poll!(waiting.as_mut()).is_pending(),
+            "progress completed a terminal wait"
+        );
         let progress = runner.status(&run.id, 1000, false);
         tokio::pin!(progress);
         assert!(futures_util::poll!(progress.as_mut()).is_pending());
@@ -151,20 +221,47 @@ async fn completion_wait_returns_running_when_deadline_expires() -> Result<()> {
     let data = tempfile::tempdir()?;
     save(workspace.path(), vec![definition("wait", "print done")]);
     let runner = make_runner(workspace.path(), data.path());
-    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
-        crate::session::CheckShell::Nushell, "wait test".into())?;
+    let run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "wait test".into(),
+    )?;
     runner.publish(&run, None).await?;
-    assert_eq!(runner.status(&run.id, 0, true).await?.state, CheckState::Running);
-    assert_eq!(runner.status(&run.id, 1, true).await?.state, CheckState::Running);
+    assert_eq!(
+        runner.status(&run.id, 0, true).await?.state,
+        CheckState::Running
+    );
+    assert_eq!(
+        runner.status(&run.id, 1, true).await?.state,
+        CheckState::Running
+    );
     Ok(())
 }
 
-async fn begin_recorded_task(workspace: &std::path::Path, data: &std::path::Path, runner: &CheckSupervisor) -> Result<()> {
-    assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(workspace).status()?.success());
-    let checkpoint = crate::checkpoint::GitCheckpoint::new(workspace).capture(
-        &crate::storage::objects::ObjectStore::open(data)?,
-        &Arc::new(forge_git::store::RepositoryStore::default()), "recorded-task", 1,
-    ).await?;
+async fn begin_recorded_task(
+    workspace: &std::path::Path,
+    data: &std::path::Path,
+    runner: &CheckSupervisor,
+) -> Result<()> {
+    assert!(
+        std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace)
+            .status()?
+            .success()
+    );
+    let checkpoint = crate::checkpoint::GitCheckpoint::new(workspace)
+        .capture(
+            &crate::storage::objects::ObjectStore::open(data)?,
+            &Arc::new(forge_git::store::RepositoryStore::default()),
+            "recorded-task",
+            1,
+        )
+        .await?;
     runner.begin_changes("recorded-task".into(), &checkpoint)
 }
 
@@ -173,30 +270,78 @@ async fn automatic_package_coverage_reuses_only_the_package_already_checked() ->
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     node_workspace(workspace.path(), false)?;
-    for name in ["0", "1"] { std::fs::write(workspace.path().join(format!("packages/{name}/src/code.ts")), "before")?; }
+    for name in ["0", "1"] {
+        std::fs::write(
+            workspace
+                .path()
+                .join(format!("packages/{name}/src/code.ts")),
+            "before",
+        )?;
+    }
     let mut check = definition("package", "print all");
-    check.trigger = CheckTrigger::FilesChanged { include: vec!["**/*.ts".into()], exclude: Vec::new() };
+    check.trigger = CheckTrigger::FilesChanged {
+        include: vec!["**/*.ts".into()],
+        exclude: Vec::new(),
+    };
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(direct_operation("nu", &["--no-config-file", "-c", "print '{package.name}'"], Some(PackageManager::Npm)));
+    check.files = Some(direct_operation(
+        "nu",
+        &["--no-config-file", "-c", "print '{package.name}'"],
+        Some(PackageManager::Npm),
+    ));
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
-    for name in ["0", "1"] { std::fs::write(workspace.path().join(format!("packages/{name}/src/code.ts")), "after")?; }
+    for name in ["0", "1"] {
+        std::fs::write(
+            workspace
+                .path()
+                .join(format!("packages/{name}/src/code.ts")),
+            "after",
+        )?;
+    }
     runner.refresh_changes().await?;
-    let explicit = RunRequest { ids: vec!["package".into()], selections: BTreeMap::from([("package".into(), CheckSelection::Files { files: vec!["packages/0/src/code.ts".into()] })]), ..Default::default() };
-    let first = runner.prepare_request(explicit, Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Explicit".into())?;
+    let explicit = RunRequest {
+        ids: vec!["package".into()],
+        selections: BTreeMap::from([(
+            "package".into(),
+            CheckSelection::Files {
+                files: vec!["packages/0/src/code.ts".into()],
+            },
+        )]),
+        ..Default::default()
+    };
+    let first = runner.prepare_request(
+        explicit,
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
     let first = runner.run(first, None, None).await?;
     assert_eq!(first.state, CheckState::Passed);
     assert!(first.commands[0].evidence.is_some());
-    let mut next = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Automatic".into())?;
+    let mut next = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Automatic".into(),
+    )?;
     next.context.as_mut().unwrap().automatic = true;
     let next = runner.run(next, None, None).await?;
     assert_eq!(next.commands.len(), 2);
     assert!(next.commands[0].reused_from.is_some());
     assert!(next.commands[1].reused_from.is_none());
-    std::fs::write(workspace.path().join("packages/0/src/code.ts"), "changed again")?;
+    std::fs::write(
+        workspace.path().join("packages/0/src/code.ts"),
+        "changed again",
+    )?;
     runner.refresh_changes().await?;
-    let mut changed = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Automatic".into())?;
+    let mut changed = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Automatic".into(),
+    )?;
     changed.context.as_mut().unwrap().automatic = true;
     let changed = runner.run(changed, None, None).await?;
     assert!(changed.commands[0].reused_from.is_none());
@@ -214,15 +359,28 @@ async fn automatic_failure_reuses_evidence_and_stops_unchanged_repairs() -> Resu
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     std::fs::write(workspace.path().join("source.txt"), "after")?;
     runner.refresh_changes().await?;
-    let first = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Explicit".into())?;
+    let first = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
     let first = runner.run(first, None, None).await?;
     let mut automatic = super::automatic::AutomaticChecks::open(data.path(), "recorded-task")?;
     assert!(automatic.observe(&first)?.is_some());
     let mut pending = super::automatic::AutomaticChecks::open(data.path(), "recorded-task")?;
-    assert!(pending.observe(&first)?.is_some(), "an unadmitted repair must survive recovery");
+    assert!(
+        pending.observe(&first)?.is_some(),
+        "an unadmitted repair must survive recovery"
+    );
     automatic.repair_exchange = Some("repair".into());
     automatic.save()?;
-    let mut next = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Automatic".into())?;
+    let mut next = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Automatic".into(),
+    )?;
     next.context.as_mut().unwrap().automatic = true;
     let next = runner.run(next, None, None).await?;
     assert!(next.commands[0].reused_from.is_some());
@@ -240,10 +398,26 @@ fn explicit_plan_checks_include_nonautomatic_checks_and_prerequisites() -> Resul
     optional.depends_on = vec!["prerequisite".into()];
     let mut prerequisite = definition("prerequisite", "print prerequisite");
     prerequisite.auto = false;
-    let config = CheckConfig { version: 2, definitions: vec![prerequisite, optional] };
-    let automatic = super::applicability::resolve(&RunRequest::default(), &config, Some(&["source.rs".into()]), true)?;
+    let config = CheckConfig {
+        version: 2,
+        definitions: vec![prerequisite, optional],
+    };
+    let automatic = super::applicability::resolve(
+        &RunRequest::default(),
+        &config,
+        Some(&["source.rs".into()]),
+        true,
+    )?;
     assert!(automatic.iter().all(|selection| !selection.selected));
-    let explicit = super::applicability::resolve(&RunRequest { include: vec!["optional".into()], ..Default::default() }, &config, Some(&[]), true)?;
+    let explicit = super::applicability::resolve(
+        &RunRequest {
+            include: vec!["optional".into()],
+            ..Default::default()
+        },
+        &config,
+        Some(&[]),
+        true,
+    )?;
     assert!(explicit.iter().all(|selection| selection.selected));
     assert!(config.validate_selection(&["missing".into()]).is_err());
     Ok(())
@@ -261,20 +435,52 @@ async fn plan_check_choices_disable_automatic_dependents_and_restore_prerequisit
     save(workspace.path(), vec![prerequisite, optional, automatic]);
     let mut design = crate::plan::DeclarationDesign::open(workspace.path())?;
     design.check_configuration = Some(super::ConfigSnapshot::load(workspace.path())?);
-    design.proposed.insert("source.rs".into(), "fn source();".into());
+    design
+        .proposed
+        .insert("source.rs".into(), "fn source();".into());
     let config = design.check_configuration.as_ref().unwrap().config.clone();
-    design.document.set_checks(&config, &BTreeMap::from([("prerequisite".into(), false)]))?;
+    design
+        .document
+        .set_checks(&config, &BTreeMap::from([("prerequisite".into(), false)]))?;
     let preview = super::preview_plan(workspace.path(), &design).await?;
     assert!(preview.iter().all(|check| !check.selected));
     assert_eq!(design.document.disabled_checks.len(), 3);
-    design.document.set_checks(&config, &BTreeMap::from([("optional".into(), true)]))?;
+    design
+        .document
+        .set_checks(&config, &BTreeMap::from([("optional".into(), true)]))?;
     let preview = super::preview_plan(workspace.path(), &design).await?;
-    assert!(preview.iter().find(|check| check.id == "optional").unwrap().selected);
-    assert!(preview.iter().find(|check| check.id == "prerequisite").unwrap().selected);
-    assert!(!preview.iter().find(|check| check.id == "automatic").unwrap().selected);
-    assert_eq!(super::ConfigSnapshot::load(workspace.path())?.config, config);
+    assert!(
+        preview
+            .iter()
+            .find(|check| check.id == "optional")
+            .unwrap()
+            .selected
+    );
+    assert!(
+        preview
+            .iter()
+            .find(|check| check.id == "prerequisite")
+            .unwrap()
+            .selected
+    );
+    assert!(
+        !preview
+            .iter()
+            .find(|check| check.id == "automatic")
+            .unwrap()
+            .selected
+    );
+    assert_eq!(
+        super::ConfigSnapshot::load(workspace.path())?.config,
+        config
+    );
     let previous = design.document.clone();
-    assert!(design.document.set_checks(&config, &BTreeMap::from([("missing".into(), true)])).is_err());
+    assert!(
+        design
+            .document
+            .set_checks(&config, &BTreeMap::from([("missing".into(), true)]))
+            .is_err()
+    );
     assert_eq!(design.document, previous);
     Ok(())
 }
@@ -284,14 +490,31 @@ async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     std::fs::write(workspace.path().join("source.txt"), "before")?;
-    save(workspace.path(), vec![definition("mutating", "'after' | save --force source.txt")]);
+    save(
+        workspace.path(),
+        vec![definition("mutating", "'after' | save --force source.txt")],
+    );
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
-    let run = runner.prepare_request(RunRequest { ids: vec!["mutating".into()], ..Default::default() }, Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Explicit".into())?;
+    let run = runner.prepare_request(
+        RunRequest {
+            ids: vec!["mutating".into()],
+            ..Default::default()
+        },
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
     let run = runner.run(run, None, None).await?;
     assert_eq!(run.state, CheckState::Failed);
     assert!(run.commands[0].evidence.is_none());
-    assert!(run.commands[0].error.as_deref().unwrap().contains("inputs changed"));
+    assert!(
+        run.commands[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("inputs changed")
+    );
     Ok(())
 }
 
@@ -308,11 +531,24 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     std::fs::write(workspace.path().join("source.txt"), "after")?;
     runner.refresh_changes().await?;
-    let initial = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Explicit".into())?;
+    let initial = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
     let initial = runner.run(initial, None, None).await?;
     assert_eq!(initial.state, CheckState::Passed);
-    assert!(matches!(initial.commands[0].context.as_ref().unwrap().resolved, Some(CheckSelection::Cases { .. })));
-    let mut repeated = runner.prepare_request(RunRequest::default(), Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Automatic".into())?;
+    assert!(matches!(
+        initial.commands[0].context.as_ref().unwrap().resolved,
+        Some(CheckSelection::Cases { .. })
+    ));
+    let mut repeated = runner.prepare_request(
+        RunRequest::default(),
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Automatic".into(),
+    )?;
     repeated.context.as_mut().unwrap().automatic = true;
     let repeated = runner.run(repeated, None, None).await?;
     assert!(repeated.commands[0].reused_from.is_some());
@@ -320,12 +556,23 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
 }
 
 fn node_workspace(root: &std::path::Path, pnpm: bool) -> Result<()> {
-    std::fs::write(root.join("package.json"), r#"{"name":"root","private":true,"workspaces":["packages/*","!packages/excluded"]}"#)?;
-    if pnpm { std::fs::write(root.join("pnpm-workspace.yaml"), "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n")?; }
+    std::fs::write(
+        root.join("package.json"),
+        r#"{"name":"root","private":true,"workspaces":["packages/*","!packages/excluded"]}"#,
+    )?;
+    if pnpm {
+        std::fs::write(
+            root.join("pnpm-workspace.yaml"),
+            "packages:\n  - 'packages/*'\n  - '!packages/excluded'\n",
+        )?;
+    }
     for name in ["0", "1", "excluded"] {
         let directory = root.join("packages").join(name);
         std::fs::create_dir_all(directory.join("src"))?;
-        std::fs::write(directory.join("package.json"), serde_json::to_vec(&serde_json::json!({"name":name}))?)?;
+        std::fs::write(
+            directory.join("package.json"),
+            serde_json::to_vec(&serde_json::json!({"name":name}))?,
+        )?;
     }
     Ok(())
 }
@@ -335,22 +582,82 @@ async fn package_resolution_deduplicates_and_respects_membership() -> Result<()>
     for manager in [PackageManager::Npm, PackageManager::Pnpm] {
         let workspace = tempfile::tempdir()?;
         node_workspace(workspace.path(), manager == PackageManager::Pnpm)?;
-        let operation = direct_operation("npm", &["test", "--workspace={package.name}"], Some(manager));
+        let operation = direct_operation(
+            "npm",
+            &["test", "--workspace={package.name}"],
+            Some(manager),
+        );
         let mut resolver = super::invocation::InvocationResolver::default();
-        let invocations = resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["packages/0/src/one.ts".into(), "packages/0/src/deleted.ts".into(), "packages/1/src/two.ts".into()] }).await?;
+        let invocations = resolver
+            .resolve(
+                workspace.path(),
+                ".",
+                &operation,
+                &CheckSelection::Files {
+                    files: vec![
+                        "packages/0/src/one.ts".into(),
+                        "packages/0/src/deleted.ts".into(),
+                        "packages/1/src/two.ts".into(),
+                    ],
+                },
+            )
+            .await?;
         assert_eq!(invocations.len(), 2);
         assert_eq!(invocations[0].args, ["test", "--workspace=0"]);
         assert_eq!(invocations[0].files.len(), 2);
-        assert!(resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["packages/excluded/src/one.ts".into()] }).await.is_err());
-        assert!(resolver.resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["package-lock.json".into()] }).await.is_err());
+        assert!(
+            resolver
+                .resolve(
+                    workspace.path(),
+                    ".",
+                    &operation,
+                    &CheckSelection::Files {
+                        files: vec!["packages/excluded/src/one.ts".into()]
+                    }
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            resolver
+                .resolve(
+                    workspace.path(),
+                    ".",
+                    &operation,
+                    &CheckSelection::Files {
+                        files: vec!["package-lock.json".into()]
+                    }
+                )
+                .await
+                .is_err()
+        );
     }
     for manager in [PackageManager::Npm, PackageManager::Pnpm] {
         let workspace = tempfile::tempdir()?;
-        std::fs::write(workspace.path().join("package.json"), r#"{"name":"single"}"#)?;
-        let operation = direct_operation("npm", &["--prefix", "{package.directory}", "test"], Some(manager));
-        let invocations = super::invocation::InvocationResolver::default().resolve(workspace.path(), ".", &operation, &CheckSelection::Files { files: vec!["src/one.js".into(), "src/two.js".into()] }).await?;
+        std::fs::write(
+            workspace.path().join("package.json"),
+            r#"{"name":"single"}"#,
+        )?;
+        let operation = direct_operation(
+            "npm",
+            &["--prefix", "{package.directory}", "test"],
+            Some(manager),
+        );
+        let invocations = super::invocation::InvocationResolver::default()
+            .resolve(
+                workspace.path(),
+                ".",
+                &operation,
+                &CheckSelection::Files {
+                    files: vec!["src/one.js".into(), "src/two.js".into()],
+                },
+            )
+            .await?;
         assert_eq!(invocations.len(), 1);
-        assert_eq!(invocations[0].package.as_ref().unwrap().name.as_deref(), Some("single"));
+        assert_eq!(
+            invocations[0].package.as_ref().unwrap().name.as_deref(),
+            Some("single")
+        );
         assert!(std::path::Path::new(&invocations[0].args[1]).is_absolute());
     }
     Ok(())
@@ -365,7 +672,15 @@ async fn discovery_cancellation_stops_the_owned_process() -> Result<()> {
         requested.store(true, std::sync::atomic::Ordering::Release);
     });
     let start = std::time::Instant::now();
-    let result = super::invocation::capture("nu", &["--no-config-file".into(), "-c".into(), "sleep 10sec".into()], std::path::Path::new("."), Some(cancelled.as_ref()), None, 3).await;
+    let result = super::invocation::capture(
+        "nu",
+        &["--no-config-file".into(), "-c".into(), "sleep 10sec".into()],
+        std::path::Path::new("."),
+        Some(cancelled.as_ref()),
+        None,
+        3,
+    )
+    .await;
     signal.await?;
     assert!(result.unwrap_err().to_string().contains("interrupted"));
     assert!(start.elapsed() < std::time::Duration::from_secs(2));
@@ -378,7 +693,16 @@ async fn output_directory_failure_does_not_retain_execution_admission() -> Resul
     let data = tempfile::tempdir()?;
     save(workspace.path(), vec![definition("one", "print done")]);
     let runner = make_runner(workspace.path(), data.path());
-    let prepared = runner.prepare_request(RunRequest { include: Vec::new(), all: true, ..Default::default() }, None, crate::session::CheckShell::Nushell, "test".into())?;
+    let prepared = runner.prepare_request(
+        RunRequest {
+            include: Vec::new(),
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "test".into(),
+    )?;
     std::fs::write(data.path().join(&prepared.id), "blocks directory creation")?;
     assert!(runner.run(prepared, None, None).await.is_err());
     assert!(runner.active()?.is_none());
@@ -389,17 +713,42 @@ async fn output_directory_failure_does_not_retain_execution_admission() -> Resul
 async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    std::fs::write(workspace.path().join("echo.nu"), "def main [value: string] { print $value }")?;
+    std::fs::write(
+        workspace.path().join("echo.nu"),
+        "def main [value: string] { print $value }",
+    )?;
     let mut check = definition("file", "exit 91");
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(direct_operation("nu", &["--no-config-file", "echo.nu", "{file.path}"], None));
+    check.files = Some(direct_operation(
+        "nu",
+        &["--no-config-file", "echo.nu", "{file.path}"],
+        None,
+    ));
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/spaces $value; [quoted].rs";
-    let prepared = runner.prepare_request(RunRequest { include: Vec::new(), ids: vec!["file".into()], selections: BTreeMap::from([("file".into(), CheckSelection::Files { files: vec![path.into()] })]), ..Default::default() }, None, crate::session::CheckShell::Nushell, "test".into())?;
+    let prepared = runner.prepare_request(
+        RunRequest {
+            include: Vec::new(),
+            ids: vec!["file".into()],
+            selections: BTreeMap::from([(
+                "file".into(),
+                CheckSelection::Files {
+                    files: vec![path.into()],
+                },
+            )]),
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "test".into(),
+    )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::Passed);
-    assert_eq!(std::fs::read_to_string(&run.commands[0].stdout)?.trim(), path);
+    assert_eq!(
+        std::fs::read_to_string(&run.commands[0].stdout)?.trim(),
+        path
+    );
     Ok(())
 }
 
@@ -410,12 +759,33 @@ async fn every_package_prerequisite_must_pass() -> Result<()> {
     node_workspace(workspace.path(), false)?;
     let mut prerequisite = definition("packages", "exit 0");
     prerequisite.scope = CheckScope::ChangedFiles;
-    prerequisite.files = Some(direct_operation("nu", &["--no-config-file", "-c", "exit {package.name}"], Some(PackageManager::Npm)));
+    prerequisite.files = Some(direct_operation(
+        "nu",
+        &["--no-config-file", "-c", "exit {package.name}"],
+        Some(PackageManager::Npm),
+    ));
     let mut dependent = definition("dependent", "'ran' | save should-not-exist.txt");
     dependent.depends_on = vec!["packages".into()];
     save(workspace.path(), vec![prerequisite, dependent]);
     let runner = make_runner(workspace.path(), data.path());
-    let prepared = runner.prepare(ConfigSnapshot::load(workspace.path())?, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(vec!["packages/0/src/one.ts".into(), "packages/1/src/two.ts".into()]), cases: None, new_cases: None, has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "test".into(), task_id: None, revision: 0 })?;
+    let prepared = runner.prepare(
+        ConfigSnapshot::load(workspace.path())?,
+        CheckAdmission {
+            request: Default::default(),
+            overrides: BTreeMap::new(),
+            files: Some(vec![
+                "packages/0/src/one.ts".into(),
+                "packages/1/src/two.ts".into(),
+            ]),
+            cases: None,
+            new_cases: None,
+            has_scope: true,
+            shell: crate::session::CheckShell::Nushell,
+            trigger: "test".into(),
+            task_id: None,
+            revision: 0,
+        },
+    )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.commands.len(), 3);
     assert_eq!(run.commands[0].state, CheckState::Passed);
@@ -429,11 +799,31 @@ async fn every_package_prerequisite_must_pass() -> Result<()> {
 fn new_case_scope_keeps_modified_cases_separate() -> Result<()> {
     let mut check = definition("new", "exit 0");
     check.scope = CheckScope::NewCases;
-    check.cases = Some(CheckOperation { command: "handler".into(), args: None, package_manager: None });
-    let config = CheckConfig { version: 2, definitions: vec![check] };
-    let new = CheckCase { file: "src/lib.rs".into(), name: "new_case".into(), target: Some("lib".into()) };
-    let modified = CheckCase { name: "modified_case".into(), ..new.clone() };
-    let selected = RunRequest::default().selections(&config, &["src/lib.rs".into()], Some(&[new.clone(), modified]), Some(std::slice::from_ref(&new)), true)?;
+    check.cases = Some(CheckOperation {
+        command: "handler".into(),
+        args: None,
+        package_manager: None,
+    });
+    let config = CheckConfig {
+        version: 2,
+        definitions: vec![check],
+    };
+    let new = CheckCase {
+        file: "src/lib.rs".into(),
+        name: "new_case".into(),
+        target: Some("lib".into()),
+    };
+    let modified = CheckCase {
+        name: "modified_case".into(),
+        ..new.clone()
+    };
+    let selected = RunRequest::default().selections(
+        &config,
+        &["src/lib.rs".into()],
+        Some(&[new.clone(), modified]),
+        Some(std::slice::from_ref(&new)),
+        true,
+    )?;
     assert_eq!(selected["new"], CheckSelection::Cases { cases: vec![new] });
     Ok(())
 }
@@ -442,13 +832,29 @@ fn new_case_scope_keeps_modified_cases_separate() -> Result<()> {
 fn advertised_schema_accepts_file_trigger_and_direct_package_arguments() -> Result<()> {
     let mut check = definition("packages", "exit 0");
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(direct_operation("cargo", &["test", "--package", "{package.name}", "--tests"], Some(PackageManager::Cargo)));
-    let mut value = serde_json::to_value(CheckConfig { version: 2, definitions: vec![check] })?;
-    value["definitions"][0]["trigger"] = serde_json::json!({"kind":"files_changed", "include":["**/*.rs"]});
+    check.files = Some(direct_operation(
+        "cargo",
+        &["test", "--package", "{package.name}", "--tests"],
+        Some(PackageManager::Cargo),
+    ));
+    let mut value = serde_json::to_value(CheckConfig {
+        version: 2,
+        definitions: vec![check],
+    })?;
+    value["definitions"][0]["trigger"] =
+        serde_json::json!({"kind":"files_changed", "include":["**/*.rs"]});
     serde_json::from_value::<CheckConfig>(value.clone())?.validate()?;
     let schema = serde_json::to_value(schemars::schema_for!(CheckConfig))?;
     let validator = jsonschema::validator_for(&schema).unwrap();
-    assert!(validator.is_valid(&value), "advertised schema rejects files_changed: {}", validator.iter_errors(&value).map(|error| error.to_string()).collect::<Vec<_>>().join("; "));
+    assert!(
+        validator.is_valid(&value),
+        "advertised schema rejects files_changed: {}",
+        validator
+            .iter_errors(&value)
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
     Ok(())
 }
 
@@ -456,17 +862,48 @@ fn advertised_schema_accepts_file_trigger_and_direct_package_arguments() -> Resu
 async fn cargo_discovery_respects_the_operation_toolchain_and_cache_key() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     std::fs::create_dir(workspace.path().join("src"))?;
-    std::fs::write(workspace.path().join("Cargo.toml"), "[package]\nname='toolchain-fixture'\nversion='0.1.0'\nedition='2024'\n")?;
-    std::fs::write(workspace.path().join("Cargo.lock"), "version = 4\n[[package]]\nname = 'toolchain-fixture'\nversion = '0.1.0'\n")?;
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname='toolchain-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = 'toolchain-fixture'\nversion = '0.1.0'\n",
+    )?;
     std::fs::write(workspace.path().join("src/lib.rs"), "")?;
     let mut resolver = super::invocation::InvocationResolver::default();
-    let mut operation = direct_operation("cargo", &["test", "--package", "{package.name}"], Some(PackageManager::Cargo));
-    let selection = CheckSelection::Files { files: vec!["src/lib.rs".into()] };
-    let invocation = resolver.resolve(workspace.path(), ".", &operation, &selection).await?;
-    assert!(invocation[0].args.iter().any(|argument| argument == "toolchain-fixture"));
-    operation.args.as_mut().unwrap().insert(0, "+forge-checks-missing-toolchain".into());
-    let failure = resolver.resolve(workspace.path(), ".", &operation, &selection).await.unwrap_err();
-    assert!(failure.to_string().contains("forge-checks-missing-toolchain"), "{failure:#}");
+    let mut operation = direct_operation(
+        "cargo",
+        &["test", "--package", "{package.name}"],
+        Some(PackageManager::Cargo),
+    );
+    let selection = CheckSelection::Files {
+        files: vec!["src/lib.rs".into()],
+    };
+    let invocation = resolver
+        .resolve(workspace.path(), ".", &operation, &selection)
+        .await?;
+    assert!(
+        invocation[0]
+            .args
+            .iter()
+            .any(|argument| argument == "toolchain-fixture")
+    );
+    operation
+        .args
+        .as_mut()
+        .unwrap()
+        .insert(0, "+forge-checks-missing-toolchain".into());
+    let failure = resolver
+        .resolve(workspace.path(), ".", &operation, &selection)
+        .await
+        .unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("forge-checks-missing-toolchain"),
+        "{failure:#}"
+    );
     Ok(())
 }
 
@@ -476,20 +913,75 @@ async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()
     let data = tempfile::tempdir()?;
     std::fs::create_dir_all(workspace.path().join("src"))?;
     std::fs::create_dir_all(workspace.path().join("tests"))?;
-    std::fs::write(workspace.path().join("Cargo.toml"), "[package]\nname='native-fixture'\nversion='0.1.0'\nedition='2024'\n")?;
-    std::fs::write(workspace.path().join("Cargo.lock"), "version = 4\n[[package]]\nname = 'native-fixture'\nversion = '0.1.0'\n")?;
-    std::fs::write(workspace.path().join("src/lib.rs"), "#[test] fn added() {}\n#[test] fn existing() {}\n#[test] #[ignore] fn ignored() {}\n")?;
-    std::fs::write(workspace.path().join("tests/gameplay.rs"), "#[test] fn integration() {}\n")?;
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname='native-fixture'\nversion='0.1.0'\nedition='2024'\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("Cargo.lock"),
+        "version = 4\n[[package]]\nname = 'native-fixture'\nversion = '0.1.0'\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("src/lib.rs"),
+        "#[test] fn added() {}\n#[test] fn existing() {}\n#[test] #[ignore] fn ignored() {}\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("tests/gameplay.rs"),
+        "#[test] fn integration() {}\n",
+    )?;
     let mut packages = definition("packages", "exit 99");
     packages.scope = CheckScope::ChangedFiles;
-    packages.files = Some(direct_operation("cargo", &["test", "--release", "--locked", "--package", "{package.name}", "--tests"], Some(PackageManager::Cargo)));
+    packages.files = Some(direct_operation(
+        "cargo",
+        &[
+            "test",
+            "--release",
+            "--locked",
+            "--package",
+            "{package.name}",
+            "--tests",
+        ],
+        Some(PackageManager::Cargo),
+    ));
     let mut new = definition("new", "exit 99");
     new.scope = CheckScope::NewCases;
-    new.cases = Some(direct_operation("cargo", &["test", "--release", "--locked", "--package", "{package.name}", "{case.target_args}", "--", "{case.name}", "--exact"], Some(PackageManager::Cargo)));
+    new.cases = Some(direct_operation(
+        "cargo",
+        &[
+            "test",
+            "--release",
+            "--locked",
+            "--package",
+            "{package.name}",
+            "{case.target_args}",
+            "--",
+            "{case.name}",
+            "--exact",
+        ],
+        Some(PackageManager::Cargo),
+    ));
     save(workspace.path(), vec![packages, new]);
     let runner = make_runner(workspace.path(), data.path());
-    let case = CheckCase { file: "src/lib.rs".into(), name: "added".into(), target: Some("lib".into()) };
-    let prepared = runner.prepare(ConfigSnapshot::load(workspace.path())?, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(vec!["src/lib.rs".into()]), cases: Some(vec![case.clone()]), new_cases: Some(vec![case.clone()]), has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "plan".into(), task_id: None, revision: 1 })?;
+    let case = CheckCase {
+        file: "src/lib.rs".into(),
+        name: "added".into(),
+        target: Some("lib".into()),
+    };
+    let prepared = runner.prepare(
+        ConfigSnapshot::load(workspace.path())?,
+        CheckAdmission {
+            request: Default::default(),
+            overrides: BTreeMap::new(),
+            files: Some(vec!["src/lib.rs".into()]),
+            cases: Some(vec![case.clone()]),
+            new_cases: Some(vec![case.clone()]),
+            has_scope: true,
+            shell: crate::session::CheckShell::Nushell,
+            trigger: "plan".into(),
+            task_id: None,
+            revision: 1,
+        },
+    )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
     assert!(std::fs::read_to_string(&run.commands[0].stdout)?.contains("integration"));
@@ -497,19 +989,72 @@ async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()
     assert!(output.contains("test added ... ok"));
     assert!(!output.contains("test existing ... ok"));
     for name in ["missing", "ignored"] {
-        let request = RunRequest { include: Vec::new(), ids: vec!["new".into()], selections: BTreeMap::from([("new".into(), CheckSelection::Cases { cases: vec![CheckCase { name: name.into(), ..case.clone() }] })]), ..Default::default() };
-        let prepared = runner.prepare_request(request, None, crate::session::CheckShell::Nushell, "explicit".into())?;
+        let request = RunRequest {
+            include: Vec::new(),
+            ids: vec!["new".into()],
+            selections: BTreeMap::from([(
+                "new".into(),
+                CheckSelection::Cases {
+                    cases: vec![CheckCase {
+                        name: name.into(),
+                        ..case.clone()
+                    }],
+                },
+            )]),
+            ..Default::default()
+        };
+        let prepared = runner.prepare_request(
+            request,
+            None,
+            crate::session::CheckShell::Nushell,
+            "explicit".into(),
+        )?;
         let run = runner.run(prepared, None, None).await?;
-        assert_eq!(run.commands.iter().find(|command| command.context.as_ref().unwrap().definition_id == "new").unwrap().state, CheckState::ConfigurationError);
+        assert_eq!(
+            run.commands
+                .iter()
+                .find(|command| command.context.as_ref().unwrap().definition_id == "new")
+                .unwrap()
+                .state,
+            CheckState::ConfigurationError
+        );
     }
-    std::fs::write(workspace.path().join("tests/custom.rs"), "fn main() { std::fs::write(\"custom-ran\", \"yes\").unwrap(); }")?;
+    std::fs::write(
+        workspace.path().join("tests/custom.rs"),
+        "fn main() { std::fs::write(\"custom-ran\", \"yes\").unwrap(); }",
+    )?;
     let manifest = workspace.path().join("Cargo.toml");
-    std::fs::write(&manifest, std::fs::read_to_string(&manifest)? + "\n[[test]]\nname='custom'\nharness=false\n")?;
-    let request = RunRequest { include: Vec::new(), ids: vec!["new".into()], selections: BTreeMap::from([("new".into(), CheckSelection::Cases { cases: vec![CheckCase { file: "tests/custom.rs".into(), name: "declared".into(), target: Some("test:custom".into()) }] })]), ..Default::default() };
-    let prepared = runner.prepare_request(request, None, crate::session::CheckShell::Nushell, "custom".into())?;
+    std::fs::write(
+        &manifest,
+        std::fs::read_to_string(&manifest)? + "\n[[test]]\nname='custom'\nharness=false\n",
+    )?;
+    let request = RunRequest {
+        include: Vec::new(),
+        ids: vec!["new".into()],
+        selections: BTreeMap::from([(
+            "new".into(),
+            CheckSelection::Cases {
+                cases: vec![CheckCase {
+                    file: "tests/custom.rs".into(),
+                    name: "declared".into(),
+                    target: Some("test:custom".into()),
+                }],
+            },
+        )]),
+        ..Default::default()
+    };
+    let prepared = runner.prepare_request(
+        request,
+        None,
+        crate::session::CheckShell::Nushell,
+        "custom".into(),
+    )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::ConfigurationError);
-    assert!(!workspace.path().join("custom-ran").exists(), "custom harness must not run during native discovery");
+    assert!(
+        !workspace.path().join("custom-ran").exists(),
+        "custom harness must not run during native discovery"
+    );
     Ok(())
 }
 
@@ -520,23 +1065,71 @@ async fn preview_matches_execution_and_manifest_changes_invalidate_bindings() ->
     node_workspace(workspace.path(), false)?;
     let mut check = definition("packages", "exit 0");
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(direct_operation("nu", &["--no-config-file", "-c", "exit {package.name}"], Some(PackageManager::Npm)));
+    check.files = Some(direct_operation(
+        "nu",
+        &["--no-config-file", "-c", "exit {package.name}"],
+        Some(PackageManager::Npm),
+    ));
     save(workspace.path(), vec![check]);
     let snapshot = ConfigSnapshot::load(workspace.path())?;
     let files = vec!["packages/0/src/new.js".into()];
-    let preview = super::preview::resolve(workspace.path(), &snapshot.config, &files, None, None, false, &[]).await?;
+    let preview = super::preview::resolve(
+        workspace.path(),
+        &snapshot.config,
+        &files,
+        None,
+        None,
+        false,
+        &[],
+    )
+    .await?;
     assert!(preview[0].selected && !preview[0].pending);
-    let pending = super::preview::resolve(workspace.path(), &snapshot.config, &files, None, None, true, &[]).await?;
+    let pending = super::preview::resolve(
+        workspace.path(),
+        &snapshot.config,
+        &files,
+        None,
+        None,
+        true,
+        &[],
+    )
+    .await?;
     assert!(pending[0].pending);
     let runner = make_runner(workspace.path(), data.path());
-    let prepared = runner.prepare(snapshot, CheckAdmission { request: Default::default(), overrides: BTreeMap::new(), files: Some(files), cases: None, new_cases: None, has_scope: true, shell: crate::session::CheckShell::Nushell, trigger: "test".into(), task_id: None, revision: 0 })?;
+    let prepared = runner.prepare(
+        snapshot,
+        CheckAdmission {
+            request: Default::default(),
+            overrides: BTreeMap::new(),
+            files: Some(files),
+            cases: None,
+            new_cases: None,
+            has_scope: true,
+            shell: crate::session::CheckShell::Nushell,
+            trigger: "test".into(),
+            task_id: None,
+            revision: 0,
+        },
+    )?;
     let resolved = runner.resolve(prepared).await?;
     assert_eq!(preview[0].command, resolved.commands[0].command);
-    assert!(runner.history()?.is_empty(), "preview must not create run history");
-    std::fs::write(workspace.path().join("packages/0/package.json"), r#"{"name":"renamed"}"#)?;
+    assert!(
+        runner.history()?.is_empty(),
+        "preview must not create run history"
+    );
+    std::fs::write(
+        workspace.path().join("packages/0/package.json"),
+        r#"{"name":"renamed"}"#,
+    )?;
     let run = runner.run(resolved, None, None).await?;
     assert_eq!(run.state, CheckState::ConfigurationError);
-    assert!(run.commands[0].error.as_deref().unwrap().contains("configuration changed"));
+    assert!(
+        run.commands[0]
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("configuration changed")
+    );
     Ok(())
 }
 
@@ -621,7 +1214,9 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
         exclude: vec!["src/generated/**".into()],
     };
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(CheckOperation { args: None, package_manager: None,
+    check.files = Some(CheckOperation {
+        args: None,
+        package_manager: None,
         command: "files".into(),
     });
     let mut config = CheckConfig {
@@ -645,7 +1240,8 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
     config.definitions[0].scope = CheckScope::ChangedCases;
     let cases = files
         .iter()
-        .map(|file| CheckCase { target: None,
+        .map(|file| CheckCase {
+            target: None,
             file: file.clone(),
             name: "case".into(),
         })
@@ -681,7 +1277,8 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let case_selection = CheckSelection::Cases {
-        cases: vec![CheckCase { target: None,
+        cases: vec![CheckCase {
+            target: None,
             file: "tests/unit.rs".into(),
             name: "selected_case".into(),
         }],
@@ -696,7 +1293,8 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
         ),
         (None, Some(case_selection.clone()), CheckState::Passed),
     ] {
-        let request = RunRequest { include: Vec::new(),
+        let request = RunRequest {
+            include: Vec::new(),
             all: false,
             ids: vec!["unit".into()],
             selections: selection
@@ -870,7 +1468,8 @@ fn selection_deduplicates_without_broadening_and_rejects_escape_paths() -> Resul
         .is_err()
     );
     let requested = CheckSelection::Cases {
-        cases: vec![CheckCase { target: None,
+        cases: vec![CheckCase {
+            target: None,
             file: "src/test.rs".into(),
             name: "one".into(),
         }],
@@ -904,7 +1503,8 @@ async fn independent_failures_continue_and_dependents_skip() -> Result<()> {
     );
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: true,
             ..Default::default()
         },
@@ -935,12 +1535,15 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'wrong all' | save all-ran.txt");
-    check.files = Some(CheckOperation { args: None, package_manager: None,
+    check.files = Some(CheckOperation {
+        args: None,
+        package_manager: None,
         command: "print 'no receipt'".into(),
     });
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
-    let request = RunRequest { include: Vec::new(),
+    let request = RunRequest {
+        include: Vec::new(),
         all: false,
         ids: vec!["unit".into()],
         selections: BTreeMap::from([(
@@ -971,15 +1574,17 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/name $var; [case].rs".to_owned();
-    let mut files = (0..5000).map(|index|
-        format!("src/{}-{index:05}.rs", "retained".repeat(40))).collect::<Vec<_>>();
+    let mut files = (0..5000)
+        .map(|index| format!("src/{}-{index:05}.rs", "retained".repeat(40)))
+        .collect::<Vec<_>>();
     files.push(path);
     files.sort();
     let selection = CheckSelection::Files {
         files: files.clone(),
     };
     let prepared = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: false,
             ids: vec!["unit".into()],
             selections: BTreeMap::from([("unit".into(), selection.clone())]),
@@ -999,7 +1604,9 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
         run.commands[0].context.as_ref().unwrap().resolved,
         Some(selection)
     );
-    assert!(std::fs::metadata(&run.commands[0].context.as_ref().unwrap().receipt)?.len() > 1024 * 1024);
+    assert!(
+        std::fs::metadata(&run.commands[0].context.as_ref().unwrap().receipt)?.len() > 1024 * 1024
+    );
     assert_eq!(
         serde_json::from_slice::<Vec<String>>(&std::fs::read(
             workspace.path().join("received.json")
@@ -1022,8 +1629,10 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
         version: 2,
         definitions: Vec::new(),
     };
-    let helper_source = format!("{}let selected = $in | from json\nprint $selected\n",
-        "# retained helper\n".repeat(32_769));
+    let helper_source = format!(
+        "{}let selected = $in | from json\nprint $selected\n",
+        "# retained helper\n".repeat(32_769)
+    );
     let helper = super::tools::CheckHelper {
         path: ".forge/checks/select.nu".into(),
         source: helper_source.clone(),
@@ -1040,7 +1649,10 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
             None,
         )
         .await?;
-    assert_eq!(std::fs::read_to_string(workspace.path().join(".forge/checks/select.nu"))?, helper_source);
+    assert_eq!(
+        std::fs::read_to_string(workspace.path().join(".forge/checks/select.nu"))?,
+        helper_source
+    );
     let revision = runner.catalog(None)?["revision"]
         .as_str()
         .unwrap()
@@ -1076,7 +1688,10 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     let mut original = super::config::read_document(workspace.path())?;
     let unrelated = "λ".repeat(1024 * 1024);
     original["unrelated"] = serde_json::json!(unrelated);
-    std::fs::write(workspace.path().join(".forge.json"), serde_json::to_vec(&original)?)?;
+    std::fs::write(
+        workspace.path().join(".forge.json"),
+        serde_json::to_vec(&original)?,
+    )?;
     let runner = make_runner(workspace.path(), data.path());
     let catalog = runner.catalog(None)?;
     runner
@@ -1097,11 +1712,15 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
         super::config::read_document(workspace.path())?["branch_prefix"],
         "feature"
     );
-    assert_eq!(super::config::read_document(workspace.path())?["unrelated"], unrelated);
+    assert_eq!(
+        super::config::read_document(workspace.path())?["unrelated"],
+        unrelated
+    );
     save(workspace.path(), vec![definition("unit", "exit 0")]);
     runner.set_overrides(
         Some("task-one"),
-        super::tools::CheckOverrides { auto: Default::default(),
+        super::tools::CheckOverrides {
+            auto: Default::default(),
             enabled: BTreeMap::from([("unit".into(), false)]),
             scopes: BTreeMap::new(),
         },
@@ -1110,7 +1729,8 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     assert!(
         runner
             .prepare_request(
-                RunRequest { include: Vec::new(),
+                RunRequest {
+                    include: Vec::new(),
                     all: false,
                     ids: vec!["unit".into()],
                     selections: BTreeMap::new()
@@ -1191,7 +1811,8 @@ async fn disabled_prerequisite_is_a_configuration_error_and_independent_checks_c
     );
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: true,
             ..Default::default()
         },
@@ -1214,7 +1835,8 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     save(workspace.path(), vec![definition("slow", "sleep 5sec")]);
     let runner = make_runner(workspace.path(), data.path());
     let first = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: true,
             ..Default::default()
         },
@@ -1223,7 +1845,8 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         "Test".into(),
     )?;
     let second = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: true,
             ..Default::default()
         },
@@ -1242,13 +1865,25 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
+    assert_eq!(
+        runner.status(&id, 0, false).await?.state,
+        CheckState::Interrupted
+    );
     let mut automatic = runner.prepare_request(
-        RunRequest { all: true, ..Default::default() }, None,
-        crate::session::CheckShell::Nushell, "Automatic".into())?;
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Automatic".into(),
+    )?;
     automatic.context.as_mut().unwrap().automatic = true;
-    let stopped = tokio::time::timeout(std::time::Duration::from_secs(1),
-        runner.run(automatic, None, None)).await??;
+    let stopped = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        runner.run(automatic, None, None),
+    )
+    .await??;
     assert_eq!(stopped.state, CheckState::Blocked);
     assert!(stopped.commands[0].started_at_ms.is_none());
     Ok(())
@@ -1261,7 +1896,8 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     save(workspace.path(), vec![definition("slow", "sleep 5sec")]);
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
-        RunRequest { include: Vec::new(),
+        RunRequest {
+            include: Vec::new(),
             all: true,
             ..Default::default()
         },
@@ -1281,7 +1917,10 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
         Ok::<_, anyhow::Error>(())
     })
     .await??;
-    assert_eq!(runner.status(&id, 0, false).await?.state, CheckState::Interrupted);
+    assert_eq!(
+        runner.status(&id, 0, false).await?.state,
+        CheckState::Interrupted
+    );
     Ok(())
 }
 
@@ -1291,32 +1930,70 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let ready = data.path().join("ready");
-    save(workspace.path(), vec![definition("slow", &format!(
-        "'ready' | save --force '{}'; sleep 30sec; 'orphan' | save orphan.txt", ready.display()))]);
+    save(
+        workspace.path(),
+        vec![definition(
+            "slow",
+            &format!(
+                "'ready' | save --force '{}'; sleep 30sec; 'orphan' | save orphan.txt",
+                ready.display()
+            ),
+        )],
+    );
     let runner = make_runner(workspace.path(), data.path());
     let (sink, mut stream) = crate::backend::events::channel();
-    let filler = crate::backend::BackendEvent { received_at_ms: None, address: None, turn_boundary: None,
-        kind: "assistant_message".into(), text: Some("x".repeat(16_384)), data: serde_json::Value::Null,
-        activity: None, summary: None, task_update: None };
-    while let Ok(result) = tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await {
+    let filler = crate::backend::BackendEvent {
+        received_at_ms: None,
+        address: None,
+        turn_boundary: None,
+        kind: "assistant_message".into(),
+        text: Some("x".repeat(16_384)),
+        data: serde_json::Value::Null,
+        activity: None,
+        summary: None,
+        task_update: None,
+    };
+    while let Ok(result) =
+        tokio::time::timeout(Duration::from_millis(20), sink.send_wait(filler.clone())).await
+    {
         result?;
     }
-    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
-        crate::session::CheckShell::Nushell, "Backpressure test".into())?;
+    let run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Backpressure test".into(),
+    )?;
     let admission = Arc::new(tokio::sync::Semaphore::new(1));
     let permit = Arc::clone(&admission).acquire_owned().await?;
-    let id = tokio::time::timeout(Duration::from_secs(1), runner.start(run, Some(sink), None, Some(permit))).await??;
+    let id = tokio::time::timeout(
+        Duration::from_secs(1),
+        runner.start(run, Some(sink), None, Some(permit)),
+    )
+    .await??;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
-    }).await?;
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
     runner.cancel(&id)?;
     tokio::time::timeout(Duration::from_secs(1), async {
-        while runner.active()?.is_some() { runner.status(&id, 50, false).await?; }
+        while runner.active()?.is_some() {
+            runner.status(&id, 50, false).await?;
+        }
         Ok::<_, anyhow::Error>(())
-    }).await??;
+    })
+    .await??;
     let snapshot = runner.snapshot()?;
     assert!(snapshot.active_run.is_none());
-    assert!(Arc::clone(&admission).try_acquire_owned().is_ok(), "presentation retained execution admission");
+    assert!(
+        Arc::clone(&admission).try_acquire_owned().is_ok(),
+        "presentation retained execution admission"
+    );
     let finished = snapshot.history.iter().find(|run| run.id == id).unwrap();
     assert_eq!(finished.state, CheckState::Interrupted);
     assert!(finished.completed_at_ms.is_some());
@@ -1325,9 +2002,12 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let event = stream.recv().await.unwrap().unwrap();
-            if event.kind == "document_changed" && event.data["checks_running"] == false { break; }
+            if event.kind == "document_changed" && event.data["checks_running"] == false {
+                break;
+            }
         }
-    }).await?;
+    })
+    .await?;
     Ok(())
 }
 
@@ -1338,37 +2018,68 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     let data = tempfile::tempdir()?;
     let ready = data.path().join("ready");
     let allow = data.path().join("allow");
-    save(workspace.path(), vec![definition("controlled", &format!(
-        "if not ('{}' | path exists) {{ 'ready' | save --force '{}'; sleep 30sec }}; print done",
-        allow.display(), ready.display()))]);
+    save(
+        workspace.path(),
+        vec![definition(
+            "controlled",
+            &format!(
+                "if not ('{}' | path exists) {{ 'ready' | save --force '{}'; sleep 30sec }}; print done",
+                allow.display(),
+                ready.display()
+            ),
+        )],
+    );
     std::fs::write(workspace.path().join("source.txt"), "before")?;
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     std::fs::write(workspace.path().join("source.txt"), "after")?;
     runner.refresh_changes().await?;
-    let prepare = || runner.prepare_request(RunRequest { all: true, ..Default::default() },
-        Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Cancellation test".into());
+    let prepare = || {
+        runner.prepare_request(
+            RunRequest {
+                all: true,
+                ..Default::default()
+            },
+            Some("recorded-task".into()),
+            crate::session::CheckShell::Nushell,
+            "Cancellation test".into(),
+        )
+    };
     let first = runner.start(prepare()?, None, None, None).await?;
     tokio::time::timeout(Duration::from_secs(5), async {
-        while !ready.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
-    }).await?;
+        while !ready.exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await?;
     runner.cancel(&first)?;
     let cancelled = runner.status(&first, 5000, true).await?;
     assert_eq!(cancelled.state, CheckState::Interrupted);
     assert!(cancelled.cancelled_inputs.is_some());
     let mut automatic = prepare()?;
     automatic.context.as_mut().unwrap().automatic = true;
-    let blocked = tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
+    let blocked =
+        tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
     assert_eq!(blocked.commands[0].state, CheckState::Blocked);
     assert!(blocked.commands[0].started_at_ms.is_none());
     let mut policy = AutomaticChecks::open(data.path(), "recorded-task")?;
     assert!(policy.observe(&blocked)?.is_none());
     assert!(policy.pending && policy.blocked.is_some());
     let reopened = make_runner(workspace.path(), data.path());
-    let mut recovered = reopened.prepare_request(RunRequest { all: true, ..Default::default() },
-        Some("recorded-task".into()), crate::session::CheckShell::Nushell, "Recovered automatic run".into())?;
+    let mut recovered = reopened.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Recovered automatic run".into(),
+    )?;
     recovered.context.as_mut().unwrap().automatic = true;
-    assert_eq!(reopened.run(recovered, None, None).await?.state, CheckState::Blocked);
+    assert_eq!(
+        reopened.run(recovered, None, None).await?.state,
+        CheckState::Blocked
+    );
     std::fs::write(&allow, "allow")?;
     let retry = runner.run(prepare()?, None, None).await?;
     assert_eq!(retry.state, CheckState::Passed);
@@ -1390,11 +2101,24 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
 fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    save(workspace.path(), vec![definition("failure", "exit 1"), definition("cancelled", "exit 0"),
-        definition("pending", "exit 0")]);
+    save(
+        workspace.path(),
+        vec![
+            definition("failure", "exit 1"),
+            definition("cancelled", "exit 0"),
+            definition("pending", "exit 0"),
+        ],
+    );
     let runner = make_runner(workspace.path(), data.path());
-    let mut run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
-        crate::session::CheckShell::Nushell, "Summary".into())?;
+    let mut run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Summary".into(),
+    )?;
     run.commands[0].state = CheckState::Failed;
     run.commands[1].state = CheckState::Interrupted;
     assert!(run.summary().contains("1 failed"));
@@ -1407,12 +2131,29 @@ fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
 async fn output_failure_collects_the_process_before_releasing_admission() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    save(workspace.path(), vec![definition("output", "sleep 250ms; 'orphan' | save orphan.txt")]);
+    save(
+        workspace.path(),
+        vec![definition(
+            "output",
+            "sleep 250ms; 'orphan' | save orphan.txt",
+        )],
+    );
     let runner = make_runner(workspace.path(), data.path());
-    let run = runner.prepare_request(RunRequest { all: true, ..Default::default() }, None,
-        crate::session::CheckShell::Nushell, "Output failure".into())?;
+    let run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Output failure".into(),
+    )?;
     std::fs::create_dir_all(&run.commands[0].output)?;
-    let run = tokio::time::timeout(std::time::Duration::from_secs(2), runner.run(run, None, None)).await??;
+    let run = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        runner.run(run, None, None),
+    )
+    .await??;
     assert_eq!(run.state, CheckState::ConfigurationError);
     assert!(runner.active()?.is_none());
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;

@@ -35,7 +35,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
     let broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
         backend_launch_by_provider: Default::default(),
-            config_dir: None,
+        config_dir: None,
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),
         permission_file: Some(
             temporary
@@ -189,7 +189,11 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             }),
         })
         .await;
-    assert!(accepted.response.error().is_none(), "{:?}", accepted.response.error());
+    assert!(
+        accepted.response.error().is_none(),
+        "{:?}",
+        accepted.response.error()
+    );
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
         PermissionMode::Write

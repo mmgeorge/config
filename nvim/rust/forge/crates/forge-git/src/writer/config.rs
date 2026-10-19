@@ -20,7 +20,10 @@ impl Drop for ConfigTemporary {
         if !self.published {
             if let Err(error) = std::fs::remove_file(&self.path) {
                 if error.kind() != std::io::ErrorKind::NotFound {
-                    let _ = writeln!(std::io::stderr(), "Forge repository config temporary cleanup failed: {error}");
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "Forge repository config temporary cleanup failed: {error}"
+                    );
                 }
             }
         }

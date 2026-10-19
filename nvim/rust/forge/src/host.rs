@@ -475,7 +475,11 @@ impl ConnectionHost {
                     failure.push(error.to_string());
                 }
             }
-            if feature_done && pending.is_empty() && subscription_done && connection.writer.is_none() {
+            if feature_done
+                && pending.is_empty()
+                && subscription_done
+                && connection.writer.is_none()
+            {
                 break;
             }
             tokio::select! {
@@ -545,9 +549,13 @@ impl ConnectionHost {
             task.abort();
             match task.await {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => failure.push(format!("Forge status subscription failed: {error:#}")),
+                Ok(Err(error)) => {
+                    failure.push(format!("Forge status subscription failed: {error:#}"))
+                }
                 Err(error) if error.is_cancelled() => {}
-                Err(error) => failure.push(format!("Forge status subscription task failed: {error}")),
+                Err(error) => {
+                    failure.push(format!("Forge status subscription task failed: {error}"))
+                }
             }
         }
         connection.sink.take();
@@ -803,7 +811,9 @@ mod tests {
             client.read_to_end(&mut remaining).await.unwrap();
             assert!(remaining.is_empty(), "{remaining:?}");
             running.await.unwrap().unwrap();
-        }).await.expect("EOF did not collect the status subscription");
+        })
+        .await
+        .expect("EOF did not collect the status subscription");
         assert!(runtime.requests.pending().is_empty());
         assert!(matches!(
             updates.try_recv(),

@@ -173,13 +173,27 @@ impl AnalysisCache {
                     .accounting
                     .lock()
                     .expect("analysis accounting poisoned");
-                if (evict && self.entry.is_empty()) || (usage.admitted_entries < self.limits.entries
-                    && bytes.source <= self.limits.source_bytes.saturating_sub(usage.bytes.source)
-                    && bytes.result <= self.limits.result_bytes.saturating_sub(usage.bytes.result))
+                if (evict && self.entry.is_empty())
+                    || (usage.admitted_entries < self.limits.entries
+                        && bytes.source
+                            <= self.limits.source_bytes.saturating_sub(usage.bytes.source)
+                        && bytes.result
+                            <= self.limits.result_bytes.saturating_sub(usage.bytes.result))
                 {
-                    let entries = usage.admitted_entries.checked_add(1).ok_or(CacheError::AccountingOverflow)?;
-                    let source = usage.bytes.source.checked_add(bytes.source).ok_or(CacheError::AccountingOverflow)?;
-                    let result = usage.bytes.result.checked_add(bytes.result).ok_or(CacheError::AccountingOverflow)?;
+                    let entries = usage
+                        .admitted_entries
+                        .checked_add(1)
+                        .ok_or(CacheError::AccountingOverflow)?;
+                    let source = usage
+                        .bytes
+                        .source
+                        .checked_add(bytes.source)
+                        .ok_or(CacheError::AccountingOverflow)?;
+                    let result = usage
+                        .bytes
+                        .result
+                        .checked_add(bytes.result)
+                        .ok_or(CacheError::AccountingOverflow)?;
                     usage.admitted_entries = entries;
                     usage.bytes = AnalysisBytes { source, result };
                     return Ok(AnalysisReservation {
@@ -196,7 +210,9 @@ impl AnalysisCache {
                 .iter()
                 .min_by_key(|(_, entry)| entry.used)
                 .map(|(key, _)| *key)
-            else { unreachable!("nonempty cache has an eviction candidate"); };
+            else {
+                unreachable!("nonempty cache has an eviction candidate");
+            };
             self.entry.remove(&key);
         }
     }

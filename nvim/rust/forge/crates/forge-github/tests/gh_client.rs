@@ -29,20 +29,26 @@ fn executable() -> &'static Path {
                 "gh-fixture"
             });
             fs::write(&source, include_str!("fixtures/gh.rs")).unwrap();
-            let output = std::thread::scope(|scope| scope.spawn(|| {
-                read_command(
-                    Command::new("rustup")
-                        .args(["run", "1.94.0", "rustc", "--edition=2024"])
-                        .arg(&source)
-                        .arg("-o")
-                        .arg(&path),
-                    CommandLimits {
-                        stderr_bytes: 64 * 1024,
-                        timeout: Duration::from_secs(30),
-                    },
-                    || Ok(()),
-                )
-            }).join().expect("GitHub fixture compiler thread")).unwrap();
+            let output = std::thread::scope(|scope| {
+                scope
+                    .spawn(|| {
+                        read_command(
+                            Command::new("rustup")
+                                .args(["run", "1.94.0", "rustc", "--edition=2024"])
+                                .arg(&source)
+                                .arg("-o")
+                                .arg(&path),
+                            CommandLimits {
+                                stderr_bytes: 64 * 1024,
+                                timeout: Duration::from_secs(30),
+                            },
+                            || Ok(()),
+                        )
+                    })
+                    .join()
+                    .expect("GitHub fixture compiler thread")
+            })
+            .unwrap();
             assert!(
                 output.status.success(),
                 "{}",
@@ -339,10 +345,21 @@ async fn repository_users_distinguish_empty_pages_from_invalid_pages() -> Result
             RemoteFailureKind::InvalidResponse
         );
     }
-    let users = serde_json::to_string(&vec![(0..101).map(|index| json!({"login":format!("user-{index}")})).collect::<Vec<_>>()])?;
+    let users = serde_json::to_string(&vec![
+        (0..101)
+            .map(|index| json!({"login":format!("user-{index}")}))
+            .collect::<Vec<_>>(),
+    ])?;
     fs::write(root.path().join("contributors.json"), &users)?;
     fs::write(root.path().join("collaborators.json"), "[]")?;
-    assert_eq!(client.read_repository_users(request().repository).await?.contributors.len(), 101);
+    assert_eq!(
+        client
+            .read_repository_users(request().repository)
+            .await?
+            .contributors
+            .len(),
+        101
+    );
     client.shutdown(Duration::from_secs(1)).await?;
     Ok(())
 }
@@ -580,10 +597,14 @@ async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() 
 #[tokio::test]
 async fn oversized_output_and_command_failure_do_not_become_empty_success() -> Result<()> {
     let (root, client) = fixture("success")?;
-    let mut response: serde_json::Value = serde_json::from_slice(&fs::read(root.path().join("response.json"))?)?;
+    let mut response: serde_json::Value =
+        serde_json::from_slice(&fs::read(root.path().join("response.json"))?)?;
     let title = format!("{}complete title tail", "x".repeat(8 * 1024 * 1024 + 1));
     response["data"]["repository"]["issues"]["nodes"][0]["title"] = json!(title);
-    fs::write(root.path().join("response.json"), serde_json::to_vec(&response)?)?;
+    fs::write(
+        root.path().join("response.json"),
+        serde_json::to_vec(&response)?,
+    )?;
     assert_eq!(client.read_issues(request()).await?.issues[0].title, title);
     client.shutdown(Duration::from_secs(1)).await?;
     let (_root, client) = fixture("oversized")?;

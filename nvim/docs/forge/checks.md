@@ -9,7 +9,8 @@ repository settings and asks for your choices before saving.
 `/checks setup on` enables check-editing permission without sending a prompt.
 `/checks setup off` disables it without sending a prompt, including during active work.
 The permission starts off, applies to this Harness conversation, and survives reopening.
-The winbar shows `check editing on` or `check editing off`. Guided `/checks setup`
+The winbar shows `check editing on` or `check editing off`. The same permission is
+available in `/config` under **Checks → Setup**, toggled with Space. Guided `/checks setup`
 also enables permission, but still asks for your choices before saving. Enabling
 permission does not run checks or change which checks are enabled.
 

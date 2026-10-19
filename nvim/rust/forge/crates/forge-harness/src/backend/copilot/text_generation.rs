@@ -1,8 +1,7 @@
 use crate::backend::TextGeneration;
 use anyhow::{Context, Result};
 use github_copilot_sdk::{
-    CliProgram, Client, ClientOptions, MessageOptions, SessionConfig,
-    SystemMessageConfig,
+    CliProgram, Client, ClientOptions, MessageOptions, SessionConfig, SystemMessageConfig,
 };
 use std::{sync::Arc, time::Duration};
 
@@ -24,7 +23,15 @@ pub(super) async fn generate(
     let client = tokio::time::timeout(Duration::from_secs(20), Client::start(options))
         .await
         .context("Isolated provider startup timed out")??;
-    let result = summarize(&client, workspace, purpose, model, reasoning_effort, history).await;
+    let result = summarize(
+        &client,
+        workspace,
+        purpose,
+        model,
+        reasoning_effort,
+        history,
+    )
+    .await;
     tokio::time::timeout(Duration::from_secs(8), client.stop())
         .await
         .context("Isolated provider shutdown timed out")?

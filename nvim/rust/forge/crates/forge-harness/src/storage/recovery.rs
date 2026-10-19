@@ -12,16 +12,24 @@ impl SqliteStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let session_event = {
-            let mut statement = transaction.prepare("SELECT payload FROM session_event_record WHERE session_id=?1")?;
-            statement.query_map([session_id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut statement = transaction
+                .prepare("SELECT payload FROM session_event_record WHERE session_id=?1")?;
+            statement
+                .query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for payload in session_event {
             let mut event: crate::timeline::SessionEventRecord = serde_json::from_str(&payload)?;
             if let crate::timeline::SessionEventKind::Compaction { compaction } = &mut event.detail
-                && compaction.state == crate::backend::CompactionState::Running {
+                && compaction.state == crate::backend::CompactionState::Running
+            {
                 compaction.state = crate::backend::CompactionState::Unconfirmed;
-                compaction.result.error = Some("Runtime stopped before compaction completion was confirmed".into());
-                transaction.execute("UPDATE session_event_record SET payload=?2 WHERE id=?1", params![event.id, serde_json::to_string(&event)?])?;
+                compaction.result.error =
+                    Some("Runtime stopped before compaction completion was confirmed".into());
+                transaction.execute(
+                    "UPDATE session_event_record SET payload=?2 WHERE id=?1",
+                    params![event.id, serde_json::to_string(&event)?],
+                )?;
             }
         }
         let exchange = {
@@ -107,8 +115,12 @@ impl SqliteStore {
                 changed = true;
             }
             for message in &mut agent.inbox {
-                if message.delivery != crate::agent::MessageDelivery::Attached { continue; }
-                let Some(task_id) = message.task_id.as_ref() else { continue; };
+                if message.delivery != crate::agent::MessageDelivery::Attached {
+                    continue;
+                }
+                let Some(task_id) = message.task_id.as_ref() else {
+                    continue;
+                };
                 let unfinished: bool = transaction.query_row(
                     "SELECT json_extract(payload,'$.completed_at_ms') IS NULL FROM agent_task_record WHERE id=?1 AND session_id=?2",
                     params![task_id,session_id], |row| row.get(0)).optional()?.unwrap_or(false);
@@ -126,70 +138,117 @@ impl SqliteStore {
             }
         }
         let child_task = {
-            let mut statement = transaction.prepare("SELECT payload FROM agent_task_record WHERE session_id=?1")?;
-            statement.query_map([session_id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut statement =
+                transaction.prepare("SELECT payload FROM agent_task_record WHERE session_id=?1")?;
+            statement
+                .query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for payload in child_task {
-            let mut task:crate::agent::AgentTask = serde_json::from_str(&payload)?;
-            if task.completed_at_ms.is_some() {continue;}
-            let observed_at:Option<i64> = transaction.query_row("SELECT json_extract(payload,'$.completed_at_ms') FROM exchange_record WHERE id=?1",
-                [&task.id],|row|row.get(0))?;
+            let mut task: crate::agent::AgentTask = serde_json::from_str(&payload)?;
+            if task.completed_at_ms.is_some() {
+                continue;
+            }
+            let observed_at: Option<i64> = transaction.query_row(
+                "SELECT json_extract(payload,'$.completed_at_ms') FROM exchange_record WHERE id=?1",
+                [&task.id],
+                |row| row.get(0),
+            )?;
             task.state = ExchangeState::Interrupted;
             task.completed_at_ms = Some(observed_at.unwrap_or(task.created_at_ms));
             task.error = Some("Runtime restarted. Inspect completed effects before assigning an explicit follow-up".into());
             task.parent_reported = true;
-            transaction.execute("UPDATE agent_task_record SET payload=?2 WHERE id=?1",params![task.id,serde_json::to_string(&task)?])?;
+            transaction.execute(
+                "UPDATE agent_task_record SET payload=?2 WHERE id=?1",
+                params![task.id, serde_json::to_string(&task)?],
+            )?;
         }
         let executions = {
-            let mut statement=transaction.prepare("SELECT payload FROM plan_execution_record WHERE session_id=?1")?;
-            statement.query_map([session_id], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut statement = transaction
+                .prepare("SELECT payload FROM plan_execution_record WHERE session_id=?1")?;
+            statement
+                .query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for payload in executions {
-            let mut execution:crate::plan::PlanExecutionRecord=serde_json::from_str(&payload)?;
-            let mut changed=false;
+            let mut execution: crate::plan::PlanExecutionRecord = serde_json::from_str(&payload)?;
+            let mut changed = false;
             for run in &mut execution.check_runs {
                 if run.state == crate::checks::CheckState::Running {
-                    run.state=crate::checks::CheckState::Interrupted;
+                    run.state = crate::checks::CheckState::Interrupted;
                     for command in &mut run.commands {
                         if command.state == crate::checks::CheckState::Running {
-                            command.state=crate::checks::CheckState::Interrupted;
-                            command.output_bytes=std::fs::metadata(&command.output).map_or(0,|metadata|metadata.len());
+                            command.state = crate::checks::CheckState::Interrupted;
+                            command.output_bytes = std::fs::metadata(&command.output)
+                                .map_or(0, |metadata| metadata.len());
                         }
                     }
-                    changed=true;
+                    changed = true;
                 }
             }
-            if changed { transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?; }
+            if changed {
+                transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?;
+            }
         }
         transaction.execute("UPDATE goal_record SET payload=json_set(payload,'$.state','paused') WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
         transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.state','paused','$.generation',json_extract(payload,'$.generation')+1) WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
         let tasks = {
-            let mut statement = transaction.prepare("SELECT payload FROM task_record WHERE session_id=?1")?;
-            statement.query_map([session_id], |row| row.get::<_, String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut statement =
+                transaction.prepare("SELECT payload FROM task_record WHERE session_id=?1")?;
+            statement
+                .query_map([session_id], |row| row.get::<_, String>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         for payload in tasks {
             use crate::task::{TaskKind, TaskStatus};
             let mut task: crate::task::TaskRecord = serde_json::from_str(&payload)?;
-            if task.status.terminal() { continue; }
+            if task.status.terminal() {
+                continue;
+            }
             if let Some(goal_id) = &task.goal_id {
-                let goal: Option<String> = transaction.query_row("SELECT payload FROM goal_record WHERE id=?1", [goal_id], |row| row.get(0)).optional()?;
+                let goal: Option<String> = transaction
+                    .query_row(
+                        "SELECT payload FROM goal_record WHERE id=?1",
+                        [goal_id],
+                        |row| row.get(0),
+                    )
+                    .optional()?;
                 if let Some(goal) = goal {
                     let goal: crate::goal::GoalRecord = serde_json::from_str(&goal)?;
-                    if goal.state == crate::goal::GoalState::Complete { task.status = TaskStatus::Completed; }
-                    if goal.state == crate::goal::GoalState::Cleared { task.status = TaskStatus::Cancelled; }
+                    if goal.state == crate::goal::GoalState::Complete {
+                        task.status = TaskStatus::Completed;
+                    }
+                    if goal.state == crate::goal::GoalState::Cleared {
+                        task.status = TaskStatus::Cancelled;
+                    }
                 }
                 let phase: Option<String> = transaction.query_row("SELECT json_extract(payload,'$.phase') FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload,'$.goal_id')=?2 ORDER BY rowid DESC LIMIT 1", params![session_id,goal_id], |row| row.get(0)).optional()?;
-                if let Some(phase) = phase { task.phase = phase; }
+                if let Some(phase) = phase {
+                    task.phase = phase;
+                }
             }
-            if matches!(task.status, TaskStatus::Running | TaskStatus::Stopping | TaskStatus::Ready) {
+            if matches!(
+                task.status,
+                TaskStatus::Running | TaskStatus::Stopping | TaskStatus::Ready
+            ) {
                 let waiting = if task.kind == TaskKind::Plan {
                     transaction.query_row("SELECT json_extract(payload,'$.state') IN ('awaiting_review','awaiting_input') FROM plan_record WHERE id=?1", [&task.plan_id], |row| row.get::<_, bool>(0)).optional()?.unwrap_or(false)
-                } else { false };
-                task.status = if waiting { TaskStatus::Waiting } else { TaskStatus::Paused };
-                task.reason = Some("Runtime restarted. Inspect completed effects before resuming".into());
+                } else {
+                    false
+                };
+                task.status = if waiting {
+                    TaskStatus::Waiting
+                } else {
+                    TaskStatus::Paused
+                };
+                task.reason =
+                    Some("Runtime restarted. Inspect completed effects before resuming".into());
                 task.generation += 1;
             }
-            transaction.execute("UPDATE task_record SET payload=?2 WHERE id=?1", params![task.id,serde_json::to_string(&task)?])?;
+            transaction.execute(
+                "UPDATE task_record SET payload=?2 WHERE id=?1",
+                params![task.id, serde_json::to_string(&task)?],
+            )?;
         }
         let clearing: bool = transaction.query_row(
             "SELECT COALESCE((SELECT json_extract(payload,'$.action.action')='clear' AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1),0)",

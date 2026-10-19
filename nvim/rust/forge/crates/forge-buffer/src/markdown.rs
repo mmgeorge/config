@@ -83,9 +83,16 @@ struct RenderState<'profile> {
 impl MarkdownRenderer {
     /// Return inline code spans and their byte ranges in the original Markdown.
     pub fn inline_code(source: &str) -> Vec<(Range<usize>, String)> {
-        Parser::new_ext(source, Options::all()).into_offset_iter().filter_map(|(event, range)| {
-            if let Event::Code(text) = event { Some((range, text.into_string())) } else { None }
-        }).collect()
+        Parser::new_ext(source, Options::all())
+            .into_offset_iter()
+            .filter_map(|(event, range)| {
+                if let Event::Code(text) = event {
+                    Some((range, text.into_string()))
+                } else {
+                    None
+                }
+            })
+            .collect()
     }
 
     /// Preserves physical source rows and delimiters while decorating Markdown spans.
@@ -232,11 +239,7 @@ impl MarkdownRenderer {
                 output: row..row + 1,
             })
             .collect();
-        let block = BufferBlock {
-            id,
-            text,
-            metadata,
-        };
+        let block = BufferBlock { id, text, metadata };
         block.validate()?;
         Ok(RenderedMarkdown {
             block,
@@ -466,14 +469,22 @@ impl MarkdownRenderer {
 }
 
 fn file_destination(destination: &str) -> bool {
-    if destination.is_empty() || destination.starts_with(['#', '?']) || destination.starts_with("//") {
+    if destination.is_empty()
+        || destination.starts_with(['#', '?'])
+        || destination.starts_with("//")
+    {
         return false;
     }
-    if destination.get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")) {
+    if destination
+        .get(..5)
+        .is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:"))
+    {
         return true;
     }
     let bytes = destination.as_bytes();
-    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    if bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
         && matches!(bytes[2], b'/' | b'\\')
     {
         return true;
@@ -503,10 +514,12 @@ fn project_file_labels(
     }
     let translate = |offset: usize| {
         let index = removed.partition_point(|(range, _)| range.end <= offset);
-        let before = index.checked_sub(1)
+        let before = index
+            .checked_sub(1)
             .map_or(0, |index| removed[index].1 + removed[index].0.len());
-        let within = removed.get(index)
-            .map_or(0, |(range, _)| offset.saturating_sub(range.start).min(range.len()));
+        let within = removed.get(index).map_or(0, |(range, _)| {
+            offset.saturating_sub(range.start).min(range.len())
+        });
         offset - before - within
     };
     let position = |position: &mut TextPosition| {
@@ -521,7 +534,9 @@ fn project_file_labels(
         position(&mut decoration.range.start);
         position(&mut decoration.range.end);
     }
-    metadata.decoration.retain(|decoration| decoration.range.start != decoration.range.end);
+    metadata
+        .decoration
+        .retain(|decoration| decoration.range.start != decoration.range.end);
     let mut projected = String::with_capacity(source.len() - removed_bytes);
     let mut offset = 0;
     for (range, _) in &removed {
@@ -745,9 +760,14 @@ mod tests {
         let source = format!("```text\n{}```", format!("{line}\n").repeat(65_537));
         assert!(source.len() > 16 * 1024 * 1024);
         let profile = WidthProfile::default();
-        let preserved = MarkdownRenderer::source(BlockId("source".into()), &source, &profile).unwrap();
-        assert_eq!(preserved.block.text.wire_rows(), source.split('\n').collect::<Vec<_>>());
-        let rendered = MarkdownRenderer::render(BlockId("rendered".into()), &source, &profile).unwrap();
+        let preserved =
+            MarkdownRenderer::source(BlockId("source".into()), &source, &profile).unwrap();
+        assert_eq!(
+            preserved.block.text.wire_rows(),
+            source.split('\n').collect::<Vec<_>>()
+        );
+        let rendered =
+            MarkdownRenderer::render(BlockId("rendered".into()), &source, &profile).unwrap();
         assert_eq!(rendered.code.len(), 1);
         assert_eq!(rendered.code[0].row.len(), 65_537);
         assert!(rendered.code[0].row.iter().all(|row| row.text == line));
@@ -757,9 +777,9 @@ mod tests {
     fn many_markdown_spans_preserve_decorations_without_admission_failure() {
         use super::*;
         let source = "**bold** *italic* ~~strike~~ `code`\n".repeat(65_537);
-        let rendered = MarkdownRenderer::source(
-            BlockId("spans".into()), &source, &WidthProfile::default(),
-        ).unwrap();
+        let rendered =
+            MarkdownRenderer::source(BlockId("spans".into()), &source, &WidthProfile::default())
+                .unwrap();
         assert!(rendered.block.metadata.decoration.len() > 262_144);
         assert_eq!(rendered.block.text.row_count(), 65_538);
     }
@@ -806,22 +826,37 @@ mod tests {
         let source = "Added [**界.md**](/D:/code/test/界.md) and [`other.md`](file:///tmp/other.md). [web](https://example.test) [anchor](#here) `[literal](./raw.md)`";
         let expected = "Added **界.md** and `other.md`. [web](https://example.test) [anchor](#here) `[literal](./raw.md)`";
         let rendered = MarkdownRenderer::file_link_labels(
-            BlockId("files".into()), source, &WidthProfile::default(),
-        ).unwrap();
+            BlockId("files".into()),
+            source,
+            &WidthProfile::default(),
+        )
+        .unwrap();
         assert_eq!(rendered.block.text.wire_rows(), vec![expected]);
         assert_eq!(rendered.link.len(), 4);
         for (link, label) in rendered.link.iter().zip([
-            "**界.md**", "`other.md`", "[web](https://example.test)", "[anchor](#here)",
+            "**界.md**",
+            "`other.md`",
+            "[web](https://example.test)",
+            "[anchor](#here)",
         ]) {
-            let target = rendered.block.metadata.target.iter().find(|target| target.id == link.target).unwrap();
-            assert_eq!(&expected[target.range.start.column..target.range.end.column], label);
+            let target = rendered
+                .block
+                .metadata
+                .target
+                .iter()
+                .find(|target| target.id == link.target)
+                .unwrap();
+            assert_eq!(
+                &expected[target.range.start.column..target.range.end.column],
+                label
+            );
         }
         assert_eq!(rendered.link[0].destination, "/D:/code/test/界.md");
         assert_eq!(rendered.link[1].destination, "file:///tmp/other.md");
         rendered.block.validate().unwrap();
-        let editable = MarkdownRenderer::source(
-            BlockId("editable".into()), source, &WidthProfile::default(),
-        ).unwrap();
+        let editable =
+            MarkdownRenderer::source(BlockId("editable".into()), source, &WidthProfile::default())
+                .unwrap();
         assert_eq!(editable.block.text.wire_rows(), vec![source]);
     }
 
@@ -829,39 +864,87 @@ mod tests {
     fn file_labels_keep_physical_rows_references_and_code_examples() {
         let source = "[first\nsecond](./file.md) [reference][local]\n\n[local]: ../other.md\n\n```md\n[example](./example.md)\n```\n";
         let rendered = MarkdownRenderer::file_link_labels(
-            BlockId("rows".into()), source, &WidthProfile::default(),
-        ).unwrap();
-        assert_eq!(rendered.block.text.wire_rows(), vec![
-            "first", "second reference", "", "[local]: ../other.md", "", "```md",
-            "[example](./example.md)", "```", "",
-        ]);
+            BlockId("rows".into()),
+            source,
+            &WidthProfile::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            rendered.block.text.wire_rows(),
+            vec![
+                "first",
+                "second reference",
+                "",
+                "[local]: ../other.md",
+                "",
+                "```md",
+                "[example](./example.md)",
+                "```",
+                "",
+            ]
+        );
         assert_eq!(rendered.link.len(), 2);
         assert_eq!(rendered.link[1].destination, "../other.md");
         for (index, mapping) in rendered.source.iter().enumerate() {
             assert_eq!(mapping.source, index..index + 1);
             assert_eq!(mapping.output, index..index + 1);
         }
-        assert_eq!(rendered.block.metadata.target[0].range.end, TextPosition { row: 1, column: 6 });
-        assert_eq!(rendered.block.metadata.target[1].range.start, TextPosition { row: 1, column: 7 });
+        assert_eq!(
+            rendered.block.metadata.target[0].range.end,
+            TextPosition { row: 1, column: 6 }
+        );
+        assert_eq!(
+            rendered.block.metadata.target[1].range.start,
+            TextPosition { row: 1, column: 7 }
+        );
         rendered.block.validate().unwrap();
     }
 
     #[test]
     fn file_labels_distinguish_local_paths_from_remote_schemes() {
-        for destination in ["/tmp/a.md", "/D:/code/a.md", "D:/code/a.md", "file:///tmp/a.md", "FILE:///tmp/a.md", "./src/main.rs", "../README.md", "Cargo.toml", "src/main.rs#L20"] {
+        for destination in [
+            "/tmp/a.md",
+            "/D:/code/a.md",
+            "D:/code/a.md",
+            "file:///tmp/a.md",
+            "FILE:///tmp/a.md",
+            "./src/main.rs",
+            "../README.md",
+            "Cargo.toml",
+            "src/main.rs#L20",
+        ] {
             let source = format!("[label]({destination})");
             let rendered = MarkdownRenderer::file_link_labels(
-                BlockId("local".into()), &source, &WidthProfile::default(),
-            ).unwrap();
+                BlockId("local".into()),
+                &source,
+                &WidthProfile::default(),
+            )
+            .unwrap();
             assert_eq!(rendered.block.text.row(0), Some("label"), "{destination}");
             assert_eq!(rendered.link[0].destination, destination);
         }
-        for destination in ["https://example.test/a.md", "http://example.test", "//example.test/a.md", "mailto:a@example.test", "ftp://example.test/a.md", "app://tool", "#heading", "?query"] {
+        for destination in [
+            "https://example.test/a.md",
+            "http://example.test",
+            "//example.test/a.md",
+            "mailto:a@example.test",
+            "ftp://example.test/a.md",
+            "app://tool",
+            "#heading",
+            "?query",
+        ] {
             let source = format!("[label]({destination})");
             let rendered = MarkdownRenderer::file_link_labels(
-                BlockId("remote".into()), &source, &WidthProfile::default(),
-            ).unwrap();
-            assert_eq!(rendered.block.text.row(0), Some(source.as_str()), "{destination}");
+                BlockId("remote".into()),
+                &source,
+                &WidthProfile::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                rendered.block.text.row(0),
+                Some(source.as_str()),
+                "{destination}"
+            );
         }
     }
 

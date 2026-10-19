@@ -72,7 +72,12 @@ fn full_file_preview_delivers_every_line_beyond_former_cutoff_without_losing_raw
                             break;
                         }
                         if line_count > 0 {
-                            assert!(!patch_body(&raw, raw.hunks()[0].id).unwrap().bytes.is_empty());
+                            assert!(
+                                !patch_body(&raw, raw.hunks()[0].id)
+                                    .unwrap()
+                                    .bytes
+                                    .is_empty()
+                            );
                         }
                         assert_eq!(chunk.state, DisplayState::More);
                         assert!(iteration < 9);

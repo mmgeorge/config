@@ -268,7 +268,10 @@ async fn invalid_edit_requests_never_reach_the_remote() {
 fn complete_large_pr_fields_pass_text_validation() {
     let title = "x".repeat(4097);
     let body = format!("{}complete body tail", "λ".repeat(256 * 1024 + 1));
-    let edit = PullRequestEdit { title: Some(title.clone()), body: Some(body.clone()) };
+    let edit = PullRequestEdit {
+        title: Some(title.clone()),
+        body: Some(body.clone()),
+    };
     edit.validate().unwrap();
     assert_eq!(edit.title.as_deref(), Some(title.as_str()));
     assert_eq!(edit.body.as_deref(), Some(body.as_str()));

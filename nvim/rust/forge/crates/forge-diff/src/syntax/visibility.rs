@@ -26,7 +26,10 @@ impl DeclarationVisibility {
     pub fn analyze(path: &str, text: &str, public_only: bool) -> Result<Self, SyntaxError> {
         if ConfigurationFormat::for_path(path).is_some() {
             DeclarationOverview::parse(path, text)?;
-            return Ok(Self { rows: vec![true; text.lines().count()], replacement: HashMap::new() });
+            return Ok(Self {
+                rows: vec![true; text.lines().count()],
+                replacement: HashMap::new(),
+            });
         }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
@@ -110,27 +113,51 @@ impl Visibility<'_> {
         let mut cursor = owner.walk();
         let mut attached = Vec::new();
         for node in owner.named_children(&mut cursor) {
-            if matches!(node.kind(), "attribute_item" | "line_comment" | "block_comment") {
+            if matches!(
+                node.kind(),
+                "attribute_item" | "line_comment" | "block_comment"
+            ) {
                 attached.push(node);
                 continue;
             }
             let mut children = node.walk();
             let body_test = node.child_by_field_name("body").is_some_and(|body| {
                 let mut cursor = body.walk();
-                body.named_children(&mut cursor).any(|attribute| attribute.kind() == "inner_attribute_item" && test_attribute(attribute, self.text))
+                body.named_children(&mut cursor).any(|attribute| {
+                    attribute.kind() == "inner_attribute_item"
+                        && test_attribute(attribute, self.text)
+                })
             });
-            if attached.iter().any(|attribute| test_attribute(*attribute, self.text)) || body_test
-                || (node.kind() == "inner_attribute_item" && test_attribute(node, self.text)) {
-                let first = if node.kind() == "inner_attribute_item" { owner.start_position().row }
-                    else { attached.first().copied().unwrap_or(node).start_position().row };
-                let last = if node.kind() == "inner_attribute_item" { owner.end_position() } else { node.end_position() };
+            if attached
+                .iter()
+                .any(|attribute| test_attribute(*attribute, self.text))
+                || body_test
+                || (node.kind() == "inner_attribute_item" && test_attribute(node, self.text))
+            {
+                let first = if node.kind() == "inner_attribute_item" {
+                    owner.start_position().row
+                } else {
+                    attached
+                        .first()
+                        .copied()
+                        .unwrap_or(node)
+                        .start_position()
+                        .row
+                };
+                let last = if node.kind() == "inner_attribute_item" {
+                    owner.end_position()
+                } else {
+                    node.end_position()
+                };
                 let end = last.row + usize::from(last.column > 0);
                 for row in first..end.min(self.rows.len()) {
                     self.rows[row] = false;
                     self.replacement.remove(&row);
                 }
             } else {
-                for child in node.named_children(&mut children) { self.hide_tests(child); }
+                for child in node.named_children(&mut children) {
+                    self.hide_tests(child);
+                }
             }
             attached.clear();
         }
@@ -168,9 +195,8 @@ impl Visibility<'_> {
 
     fn public(&self, node: Node<'_>) -> bool {
         let mut cursor = node.walk();
-        node.named_children(&mut cursor).any(|child| {
-            child.kind() == "visibility_modifier"
-        })
+        node.named_children(&mut cursor)
+            .any(|child| child.kind() == "visibility_modifier")
     }
 
     fn collect_types(&mut self, node: Node<'_>) {
@@ -317,7 +343,8 @@ impl Visibility<'_> {
             }
             let entry_point = matches!(scope, Scope::Top)
                 && matches!(node.kind(), "function_item" | "function_signature_item")
-                && node.child_by_field_name("name")
+                && node
+                    .child_by_field_name("name")
                     .is_some_and(|name| &self.text[name.byte_range()] == "main");
             if !matches!(scope, Scope::Inherited) && !self.public(node) && !entry_point {
                 return false;
@@ -381,11 +408,18 @@ impl Visibility<'_> {
             let mut declaration_cursor = node.walk();
             for assignment in node.named_children(&mut declaration_cursor) {
                 let mut assignment_cursor = assignment.walk();
-                for variables in assignment.named_children(&mut assignment_cursor).filter(|child| child.kind() == "variable_list") {
+                for variables in assignment
+                    .named_children(&mut assignment_cursor)
+                    .filter(|child| child.kind() == "variable_list")
+                {
                     let mut binding_cursor = variables.walk();
-                    local_owner |= variables.named_children(&mut binding_cursor).any(|binding| {
-                        binding.kind() == "identifier" && self.returned.as_deref() == Some(&self.text[binding.byte_range()])
-                    });
+                    local_owner |= variables
+                        .named_children(&mut binding_cursor)
+                        .any(|binding| {
+                            binding.kind() == "identifier"
+                                && self.returned.as_deref()
+                                    == Some(&self.text[binding.byte_range()])
+                        });
                 }
             }
         }
@@ -398,16 +432,34 @@ impl Visibility<'_> {
 }
 
 fn test_attribute(node: Node<'_>, source: &str) -> bool {
-    if !matches!(node.kind(), "attribute_item" | "inner_attribute_item") { return false; }
+    if !matches!(node.kind(), "attribute_item" | "inner_attribute_item") {
+        return false;
+    }
     let mut cursor = node.walk();
-    let Some(attribute) = node.named_children(&mut cursor).find(|child| child.kind() == "attribute") else { return false; };
+    let Some(attribute) = node
+        .named_children(&mut cursor)
+        .find(|child| child.kind() == "attribute")
+    else {
+        return false;
+    };
     let mut cursor = attribute.walk();
     let parts = attribute.named_children(&mut cursor).collect::<Vec<_>>();
-    let Some(name) = parts.first().map(|name| source[name.byte_range()].split_whitespace().collect::<String>()) else { return false; };
-    if matches!(name.as_str(), "test" | "bench") || name.ends_with("::test") { return true; }
-    name == "cfg" && parts.get(1).is_some_and(|arguments| {
-        cfg_arguments(*arguments, source).first().is_some_and(|expression| requires_test(expression, source))
-    })
+    let Some(name) = parts.first().map(|name| {
+        source[name.byte_range()]
+            .split_whitespace()
+            .collect::<String>()
+    }) else {
+        return false;
+    };
+    if matches!(name.as_str(), "test" | "bench") || name.ends_with("::test") {
+        return true;
+    }
+    name == "cfg"
+        && parts.get(1).is_some_and(|arguments| {
+            cfg_arguments(*arguments, source)
+                .first()
+                .is_some_and(|expression| requires_test(expression, source))
+        })
 }
 
 fn cfg_arguments<'tree>(node: Node<'tree>, source: &str) -> Vec<Vec<Node<'tree>>> {
@@ -431,8 +483,15 @@ fn requires_test(expression: &[Node<'_>], source: &str) -> bool {
         [name, arguments] if arguments.kind() == "token_tree" => {
             let arguments = cfg_arguments(*arguments, source);
             match &source[name.byte_range()] {
-                "all" => arguments.iter().any(|argument| requires_test(argument, source)),
-                "any" => !arguments.is_empty() && arguments.iter().all(|argument| requires_test(argument, source)),
+                "all" => arguments
+                    .iter()
+                    .any(|argument| requires_test(argument, source)),
+                "any" => {
+                    !arguments.is_empty()
+                        && arguments
+                            .iter()
+                            .all(|argument| requires_test(argument, source))
+                }
                 _ => false,
             }
         }
@@ -449,28 +508,63 @@ mod tests {
         let source = "pub fn production();\n/// Test helpers.\n#[cfg(test)]\nmod tests {\n fn helper();\n #[test]\n fn works();\n}\n/// Direct test.\n#[tokio::test]\nasync fn direct_test();\n#[cfg(all(test, feature = \"fixtures\"))]\nmod fixtures { fn factory(); }\n#[cfg(not(test))]\npub fn production_only();\n#[cfg(any(test, feature = \"runtime\"))]\npub fn also_production();\n#[cfg(all(feature = \"x,test,y\", unix))]\npub fn string_is_not_test();\n";
         let presentation = DeclarationOverview::present("lib.rs", source).unwrap();
         for public_only in [false, true] {
-            let visibility = DeclarationVisibility::analyze("lib.rs", &presentation.text, public_only).unwrap();
-            let shown = presentation.text.lines().zip(visibility.rows).filter_map(|(line, visible)| visible.then_some(line)).collect::<Vec<_>>().join("\n");
-            for hidden in ["mod tests", "Test helpers", "helper", "works", "Direct test", "direct_test", "fixtures", "factory"] {
+            let visibility =
+                DeclarationVisibility::analyze("lib.rs", &presentation.text, public_only).unwrap();
+            let shown = presentation
+                .text
+                .lines()
+                .zip(visibility.rows)
+                .filter_map(|(line, visible)| visible.then_some(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            for hidden in [
+                "mod tests",
+                "Test helpers",
+                "helper",
+                "works",
+                "Direct test",
+                "direct_test",
+                "fixtures",
+                "factory",
+            ] {
                 assert!(!shown.contains(hidden), "{hidden}: {shown}");
             }
-            for retained in ["production", "production_only", "also_production", "string_is_not_test"] {
+            for retained in [
+                "production",
+                "production_only",
+                "also_production",
+                "string_is_not_test",
+            ] {
                 assert!(shown.contains(retained), "{retained}: {shown}");
             }
         }
-        assert!(presentation.text.contains("mod tests") && presentation.text.contains("direct_test"));
+        assert!(
+            presentation.text.contains("mod tests") && presentation.text.contains("direct_test")
+        );
     }
 
     #[test]
     fn test_names_and_other_languages_remain_visible() {
         for (path, source) in [
-            ("main.rs", "pub fn test();\npub mod tests { pub fn helper(); }"),
-            ("main.ts", "export function test(): void;\nexport namespace tests { export function helper(): void; }"),
-            ("main.lua", "function test()\nend\nfunction tests.helper()\nend\n"),
+            (
+                "main.rs",
+                "pub fn test();\npub mod tests { pub fn helper(); }",
+            ),
+            (
+                "main.ts",
+                "export function test(): void;\nexport namespace tests { export function helper(): void; }",
+            ),
+            (
+                "main.lua",
+                "function test()\nend\nfunction tests.helper()\nend\n",
+            ),
         ] {
             let text = DeclarationOverview::present(path, source).unwrap().text;
             let visibility = DeclarationVisibility::analyze(path, &text, false).unwrap();
-            assert!(visibility.rows.iter().all(|visible| *visible), "{path}: {text}");
+            assert!(
+                visibility.rows.iter().all(|visible| *visible),
+                "{path}: {text}"
+            );
         }
     }
 
@@ -581,10 +675,21 @@ impl Default for ArenaPlugin { fn default() -> Self; }";
     fn scoped_public_owners_members_and_attachments_remain_visible() {
         let source = "#[derive(Clone)]\n/// Crate state.\npub(crate) struct State { pub(super) value: u64, private: u64 }\nimpl State { pub(crate) fn new() -> Self; pub(super) fn update(&mut self); fn hidden(); }\npub(super) enum Phase { Ready, Done }\npub(crate) trait Contract { fn apply(&self); }\npub(super) fn configure();\nstruct Hidden;\nimpl Hidden { pub(crate) fn concealed(); }\n";
         let text = visible("state.rs", source);
-        for retained in ["#[derive(Clone)]", "/// Crate state.", "pub(crate) struct State",
-            "pub(super) value", "impl State", "pub(crate) fn new", "pub(super) fn update",
-            "pub(super) enum Phase", "Ready", "Done", "pub(crate) trait Contract", "fn apply",
-            "pub(super) fn configure"] {
+        for retained in [
+            "#[derive(Clone)]",
+            "/// Crate state.",
+            "pub(crate) struct State",
+            "pub(super) value",
+            "impl State",
+            "pub(crate) fn new",
+            "pub(super) fn update",
+            "pub(super) enum Phase",
+            "Ready",
+            "Done",
+            "pub(crate) trait Contract",
+            "fn apply",
+            "pub(super) fn configure",
+        ] {
             assert!(text.contains(retained), "missing {retained}: {text}");
         }
         for hidden in ["private:", "fn hidden", "struct Hidden", "fn concealed"] {

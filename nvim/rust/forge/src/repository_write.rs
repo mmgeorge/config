@@ -228,13 +228,13 @@ impl WriteAction {
     fn into_action(self) -> Result<GitWriteAction> {
         Ok(match self {
             Self::Stage { paths } => GitWriteAction::Stage {
-                path: decode_paths(paths)?,
+                path: decode_repository_paths(paths)?,
             },
             Self::Unstage { paths } => GitWriteAction::Unstage {
-                path: decode_paths(paths)?,
+                path: decode_repository_paths(paths)?,
             },
             Self::Discard { paths, source } => GitWriteAction::Discard {
-                path: decode_paths(paths)?,
+                path: decode_repository_paths(paths)?,
                 source: match source {
                     DiscardBase::Index => DiscardSource::Index,
                     DiscardBase::Head => DiscardSource::Head,
@@ -261,7 +261,7 @@ impl WriteAction {
     }
 }
 
-fn decode_paths(paths: Vec<String>) -> Result<Vec<RepositoryPath>> {
+fn decode_repository_paths(paths: Vec<String>) -> Result<Vec<RepositoryPath>> {
     paths
         .into_iter()
         .map(|path| {
@@ -280,10 +280,13 @@ mod tests {
         let accepted = (0..10_001)
             .map(|index| STANDARD.encode(format!("source-{index}.rs")))
             .collect();
-        assert_eq!(decode_paths(accepted).unwrap().len(), 10_001);
+        assert_eq!(decode_repository_paths(accepted).unwrap().len(), 10_001);
         let path = vec![b'x'; 1024 * 1024 + 1];
-        assert_eq!(decode_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(), path);
-        assert!(decode_paths(vec![STANDARD.encode("../outside")]).is_err());
+        assert_eq!(
+            decode_repository_paths(vec![STANDARD.encode(&path)]).unwrap()[0].raw(),
+            path
+        );
+        assert!(decode_repository_paths(vec![STANDARD.encode("../outside")]).is_err());
     }
 }
 

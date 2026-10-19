@@ -853,23 +853,20 @@ impl StatusService {
                 .worktree_root
                 .clone()
                 .context("ignored paths require worktree")?;
-            intent.set_settlement_handler(
-                Arc::new(move |outcome| {
-                    let completed: Vec<_> = private_path
-                        .iter()
-                        .filter(|path| {
-                            outcome.target.iter().any(|target| {
-                                target.path.as_ref() == Some(path)
-                                    && target.completion == TargetCompletion::Completed
-                            })
+            intent.set_settlement_handler(Arc::new(move |outcome| {
+                let completed: Vec<_> = private_path
+                    .iter()
+                    .filter(|path| {
+                        outcome.target.iter().any(|target| {
+                            target.path.as_ref() == Some(path)
+                                && target.completion == TargetCompletion::Completed
                         })
-                        .cloned()
-                        .collect();
-                    let expected = completed.iter().cloned().collect();
-                    crate::ignored::update(&directory, &root, &expected, &completed, false)
-                        .map(|_| ())
-                }),
-            )?;
+                    })
+                    .cloned()
+                    .collect();
+                let expected = completed.iter().cloned().collect();
+                crate::ignored::update(&directory, &root, &expected, &completed, false).map(|_| ())
+            }))?;
         }
         let operation = intent.operation();
         let (completion, receiver) = watch::channel(None);
@@ -1170,13 +1167,11 @@ impl StatusService {
                     } else {
                         file.record.unstaged_stats = stats;
                     }
-                    file.cursor = Some(
-                        DisplayCursor::new(analysis.clone(), 3)
-                            .with_syntax_context(
-                                file.old_syntax.as_ref(),
-                                file.new_syntax.as_ref(),
-                            ),
-                    );
+                    file.cursor =
+                        Some(DisplayCursor::new(analysis.clone(), 3).with_syntax_context(
+                            file.old_syntax.as_ref(),
+                            file.new_syntax.as_ref(),
+                        ));
                     file.analysis = Some(analysis);
                     if let Some(previous) = before.file.get(&file.id) {
                         preserve_identity(&mut document, &mut file, previous, &journal.transition);
@@ -2026,7 +2021,10 @@ fn apply_prediction(state: &mut WorktreeJournal, target: &MutationTarget) -> Res
         },
         mode: if target.stage {
             target.observed.change.worktree_mode.unwrap_or_else(|| {
-                if matches!(target.observed.change.state, PathState::Untracked | PathState::Ignored) {
+                if matches!(
+                    target.observed.change.state,
+                    PathState::Untracked | PathState::Ignored
+                ) {
                     0o100644
                 } else {
                     0

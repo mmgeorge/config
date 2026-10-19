@@ -144,11 +144,7 @@ async fn durable_issue_save_retains_newer_typing_and_collected_close() {
         .configure_recovery(directory.path().join("forge/recovery/github/v1"))
         .unwrap();
     let pool = analysis();
-    let service = IssueDocumentService::new(
-        github.clone(),
-        EditBudget::default(),
-        pool.clone(),
-    );
+    let service = IssueDocumentService::new(github.clone(), EditBudget::default(), pool.clone());
     let remote = Arc::new(Remote {
         started: Default::default(),
         release: Default::default(),
@@ -246,9 +242,18 @@ async fn durable_issue_save_retains_newer_typing_and_collected_close() {
         tokio::spawn(async move { service.save(&id, vec![]).await })
     };
     remote.started.notified().await;
-    let before_rejected_capture = serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap();
-    assert!(service.save(&id, vec![edit(&id, 1, 2, "rejected concurrent capture")]).await.is_err());
-    assert_eq!(serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap(), before_rejected_capture);
+    let before_rejected_capture =
+        serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap();
+    assert!(
+        service
+            .save(&id, vec![edit(&id, 1, 2, "rejected concurrent capture")])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap(),
+        before_rejected_capture
+    );
     service.edit(edit(&id, 1, 2, "newer\r\n")).await.unwrap();
     let closing = {
         let service = service.clone();
@@ -298,11 +303,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
     github
         .configure_recovery(recovery_directory.clone())
         .unwrap();
-    let service = IssueDocumentService::new(
-        github,
-        EditBudget::default(),
-        analysis(),
-    );
+    let service = IssueDocumentService::new(github, EditBudget::default(), analysis());
     let id = DocumentId("issue-restart-recovery".into());
     service
         .open(
@@ -344,11 +345,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
     restarted_github
         .configure_recovery(recovery_directory)
         .unwrap();
-    let restarted = IssueDocumentService::new(
-        restarted_github,
-        EditBudget::default(),
-        analysis(),
-    );
+    let restarted = IssueDocumentService::new(restarted_github, EditBudget::default(), analysis());
     let reopened = restarted
         .open(
             id.clone(),
@@ -387,11 +384,8 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
 
 #[tokio::test]
 async fn issue_shutdown_deadline_retains_owned_job_until_collection() {
-    let service = IssueDocumentService::new(
-        GithubService::default(),
-        EditBudget::default(),
-        analysis(),
-    );
+    let service =
+        IssueDocumentService::new(GithubService::default(), EditBudget::default(), analysis());
     let release = Arc::new(tokio::sync::Notify::new());
     let waiting = release.clone();
     service

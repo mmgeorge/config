@@ -153,7 +153,8 @@ pub(super) fn parse(
     };
     let line = std::iter::once(0)
         .chain(
-            parsed.source
+            parsed
+                .source
                 .bytes()
                 .iter()
                 .enumerate()
@@ -238,9 +239,13 @@ impl ParseSession<'_> {
         included: &[Range],
     ) -> Result<(), SyntaxError> {
         self.budget.check().map_err(stop_error)?;
-        if self.active_injection.iter().any(|(active_language, active_range)| {
-            *active_language == language && active_range.as_slice() == included
-        }) {
+        if self
+            .active_injection
+            .iter()
+            .any(|(active_language, active_range)| {
+                *active_language == language && active_range.as_slice() == included
+            })
+        {
             return Ok(());
         }
         self.active_injection.push((language, included.to_vec()));

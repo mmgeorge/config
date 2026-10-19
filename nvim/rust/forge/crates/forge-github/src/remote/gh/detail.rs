@@ -215,11 +215,7 @@ fn invalid_response(message: &str) -> RemoteFailure {
     }
 }
 
-fn nullable_collection<
-    'input,
-    Value: Deserialize<'input>,
-    Decoder: Deserializer<'input>,
->(
+fn nullable_collection<'input, Value: Deserialize<'input>, Decoder: Deserializer<'input>>(
     deserializer: Decoder,
 ) -> std::result::Result<Vec<Value>, Decoder::Error> {
     Option::<Vec<Value>>::deserialize(deserializer).map(Option::unwrap_or_default)

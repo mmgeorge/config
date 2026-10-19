@@ -279,9 +279,9 @@ mod tests {
         let source = "[package]\nname = 'example'\nversion = '0.1.0'\n";
         std::fs::write(workspace.path().join("Cargo.toml"), source).unwrap();
         let mut design = DeclarationDesign::default();
-        design.proposed = (0..16385).map(|index| {
-            (format!("src/file_{index}.rs"), String::new())
-        }).collect();
+        design.proposed = (0..16385)
+            .map(|index| (format!("src/file_{index}.rs"), String::new()))
+            .collect();
         let mut inspected = (0..257).map(|index| format!("metadata_{index}")).collect();
         assert!(read(workspace.path(), "Cargo.toml", &mut design, &mut inspected).unwrap());
         assert_eq!(design.proposed.len(), 16386);

@@ -204,26 +204,51 @@ impl LspService {
         };
         let scope = {
             let pending = self.pending.lock().unwrap();
-            let request = pending.get(id).context("cancelled: LSP request is no longer active.")?;
-            ensure!(request.session == session, "invalid_request: LSP session mismatch.");
+            let request = pending
+                .get(id)
+                .context("cancelled: LSP request is no longer active.")?;
+            ensure!(
+                request.session == session,
+                "invalid_request: LSP session mismatch."
+            );
             request.scope.clone()
         };
         scope.authorize(path).await?;
         let assembled = {
             let mut pending = self.pending.lock().unwrap();
-            let request = pending.get_mut(id).context("cancelled: LSP request is no longer active.")?;
+            let request = pending
+                .get_mut(id)
+                .context("cancelled: LSP request is no longer active.")?;
             scope.check()?;
             if offset == 0 {
-                ensure!(request.upload.is_none(), "invalid_request: Source transfer already active.");
-                request.upload = Some(AnalysisUpload { path: path.into(), total, source: String::new() });
+                ensure!(
+                    request.upload.is_none(),
+                    "invalid_request: Source transfer already active."
+                );
+                request.upload = Some(AnalysisUpload {
+                    path: path.into(),
+                    total,
+                    source: String::new(),
+                });
             }
-            let upload = request.upload.as_mut().context("invalid_request: Source transfer is missing.")?;
-            ensure!(upload.path == path && upload.total == total && upload.source.len() == offset,
-                "invalid_request: Source transfer identity or offset mismatch.");
-            ensure!(source.len() <= total.saturating_sub(offset) && (!source.is_empty() || total == 0),
-                "invalid_request: Source chunk exceeds declared size or is empty.");
+            let upload = request
+                .upload
+                .as_mut()
+                .context("invalid_request: Source transfer is missing.")?;
+            ensure!(
+                upload.path == path && upload.total == total && upload.source.len() == offset,
+                "invalid_request: Source transfer identity or offset mismatch."
+            );
+            ensure!(
+                source.len() <= total.saturating_sub(offset) && (!source.is_empty() || total == 0),
+                "invalid_request: Source chunk exceeds declared size or is empty."
+            );
             upload.source.push_str(&source);
-            if upload.source.len() == total { request.upload.take().map(|upload| upload.source) } else { None }
+            if upload.source.len() == total {
+                request.upload.take().map(|upload| upload.source)
+            } else {
+                None
+            }
         };
         match assembled {
             Some(source) => self.analyze(session, id, path, source, syntax).await,
@@ -363,9 +388,14 @@ impl LspScope {
         };
         let absolute = match tokio::fs::canonicalize(&absolute).await {
             Ok(path) => path,
-            Err(_) => tokio::fs::canonicalize(absolute.parent().context("invalid_path: Path has no parent.")?)
-                .await.map_err(|_| anyhow::anyhow!("path_not_found: {}", path.display()))?
-                .join(absolute.file_name().context("path has no file name")?),
+            Err(_) => tokio::fs::canonicalize(
+                absolute
+                    .parent()
+                    .context("invalid_path: Path has no parent.")?,
+            )
+            .await
+            .map_err(|_| anyhow::anyhow!("path_not_found: {}", path.display()))?
+            .join(absolute.file_name().context("path has no file name")?),
         };
         let path = absolute
             .to_str()
@@ -383,7 +413,8 @@ impl LspScope {
         )?;
         ensure!(
             decision.decision == PermissionDecision::Allow,
-            "access_denied: {}", absolute.display()
+            "access_denied: {}",
+            absolute.display()
         );
         self.check()?;
         Ok(absolute)
@@ -392,7 +423,8 @@ impl LspScope {
     /// Execute an allowlisted query and emit only bounded, authorized text.
     pub(crate) async fn invoke(self: &Arc<Self>, name: &str, value: Value) -> Result<String> {
         self.check()?;
-        let mut arguments = Arguments::parse(name, value).map_err(|failure| anyhow::anyhow!("invalid_argument: {failure}"))?;
+        let mut arguments = Arguments::parse(name, value)
+            .map_err(|failure| anyhow::anyhow!("invalid_argument: {failure}"))?;
         if let Some(path) = &arguments.path {
             arguments.path = Some(
                 self.authorize(path)
@@ -402,9 +434,18 @@ impl LspScope {
                     .replace('\\', "/"),
             );
         }
-        for target in [&mut arguments.from, &mut arguments.to].into_iter().flatten() {
+        for target in [&mut arguments.from, &mut arguments.to]
+            .into_iter()
+            .flatten()
+        {
             if let Some(path) = &target.path {
-                target.path = Some(self.authorize(path).await?.to_string_lossy().trim_start_matches("\\\\?\\").replace('\\', "/"));
+                target.path = Some(
+                    self.authorize(path)
+                        .await?
+                        .to_string_lossy()
+                        .trim_start_matches("\\\\?\\")
+                        .replace('\\', "/"),
+                );
             }
         }
         let _slot = self
@@ -441,7 +482,11 @@ impl LspScope {
             event: "lsp.request".into(),
             payload: json!({"id":id,"workspace":self.workspace,"arguments":arguments}),
         };
-        let timeout = if arguments.operation == contract::Operation::Paths { 105 } else { 75 };
+        let timeout = if arguments.operation == contract::Operation::Paths {
+            105
+        } else {
+            75
+        };
         let received = tokio::time::timeout(Duration::from_secs(timeout), async {
             sender.send_event(event).await?;
             tokio::pin!(result);
@@ -630,34 +675,82 @@ mod tests {
         let frame = receiver.recv().await.unwrap().unwrap();
         let event: Value = serde_json::from_slice(frame.bytes()).unwrap();
         let id = event["payload"]["id"].as_str().unwrap();
-        let path = directory.path().join("source.rs").to_string_lossy().into_owned();
-        let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(forge_diff::workers::AnalysisPool::new(
-            forge_diff::workers::PoolLimits { workers: 1, jobs: 2 },
-        )));
-        let source = format!("{}pub fn beyond_previous_limits() {{}}\n", "// Unicode α and source padding for a large file\n".repeat(11000));
+        let path = directory
+            .path()
+            .join("source.rs")
+            .to_string_lossy()
+            .into_owned();
+        let syntax = forge_diff::syntax::SyntaxEngine::new(Arc::new(
+            forge_diff::workers::AnalysisPool::new(forge_diff::workers::PoolLimits {
+                workers: 1,
+                jobs: 2,
+            }),
+        ));
+        let source = format!(
+            "{}pub fn beyond_previous_limits() {{}}\n",
+            "// Unicode α and source padding for a large file\n".repeat(11000)
+        );
         assert!(source.len() > 512 * 1024);
-        let rendering = syntax.analyze(forge_diff::syntax::SyntaxRequest {
-            source: forge_diff::source::SourceVersion::new(source.as_bytes().to_vec(), forge_diff::source::Representation::Raw).unwrap(),
-            language: forge_diff::syntax::SyntaxLanguage::Rust,
-            priority: forge_diff::workers::WorkPriority::Foreground,
-            deadline: None,
-        }).await.unwrap();
-        assert_eq!(rendering.tree_count(), 1, "large source was not parsed completely");
+        let rendering = syntax
+            .analyze(forge_diff::syntax::SyntaxRequest {
+                source: forge_diff::source::SourceVersion::new(
+                    source.as_bytes().to_vec(),
+                    forge_diff::source::Representation::Raw,
+                )
+                .unwrap(),
+                language: forge_diff::syntax::SyntaxLanguage::Rust,
+                priority: forge_diff::workers::WorkPriority::Foreground,
+                deadline: None,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            rendering.tree_count(),
+            1,
+            "large source was not parsed completely"
+        );
         let mut offset = 0;
         let mut result = json!(null);
         while offset < source.len() {
             let mut end = (offset + 32768).min(source.len());
-            while !source.is_char_boundary(end) { end -= 1; }
-            result = service.analyze_part("session", id, &path, source[offset..end].into(), Some((offset, source.len())), &syntax).await.unwrap();
-            if end < source.len() { assert_eq!(result, json!({"pending":true})); }
+            while !source.is_char_boundary(end) {
+                end -= 1;
+            }
+            result = service
+                .analyze_part(
+                    "session",
+                    id,
+                    &path,
+                    source[offset..end].into(),
+                    Some((offset, source.len())),
+                    &syntax,
+                )
+                .await
+                .unwrap();
+            if end < source.len() {
+                assert_eq!(result, json!({"pending":true}));
+            }
             offset = end;
         }
         assert_eq!(result["complete"], true);
         assert_eq!(result["declarations"][0]["name"], "beyond_previous_limits");
         assert_eq!(result["declarations"][0]["line"], 11001);
-        assert!(service.analyze_part("other", id, &path, "x".into(), Some((0, 2)), &syntax).await.is_err());
-        assert!(service.analyze_part("session", id, &path, "x".into(), Some((1, 2)), &syntax).await.is_err());
-        service.analyze_part("session", id, &path, "x".into(), Some((0, 2)), &syntax).await.unwrap();
+        assert!(
+            service
+                .analyze_part("other", id, &path, "x".into(), Some((0, 2)), &syntax)
+                .await
+                .is_err()
+        );
+        assert!(
+            service
+                .analyze_part("session", id, &path, "x".into(), Some((1, 2)), &syntax)
+                .await
+                .is_err()
+        );
+        service
+            .analyze_part("session", id, &path, "x".into(), Some((0, 2)), &syntax)
+            .await
+            .unwrap();
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
         assert!(service.pending.lock().unwrap().is_empty());

@@ -67,19 +67,25 @@ pub enum Message {
 }
 
 impl Serialize for Message {
-    fn serialize<Serialization: Serializer>(&self, serializer: Serialization) -> Result<Serialization::Ok, Serialization::Error> {
+    fn serialize<Serialization: Serializer>(
+        &self,
+        serializer: Serialization,
+    ) -> Result<Serialization::Ok, Serialization::Error> {
         match self {
             Self::Response(response) => response.serialize(serializer),
             Self::Event(event) => {
-                crate::contract::validate("session", &event.event, &event.payload).map_err(serde::ser::Error::custom)?;
+                crate::contract::validate("session", &event.event, &event.payload)
+                    .map_err(serde::ser::Error::custom)?;
                 event.serialize(serializer)
             }
             Self::RequestEvent(event) => {
-                crate::contract::validate("request", &event.event, &event.payload).map_err(serde::ser::Error::custom)?;
+                crate::contract::validate("request", &event.event, &event.payload)
+                    .map_err(serde::ser::Error::custom)?;
                 event.serialize(serializer)
             }
             Self::DocumentEvent(event) => {
-                crate::contract::validate("document", &event.event, &event.payload).map_err(serde::ser::Error::custom)?;
+                crate::contract::validate("document", &event.event, &event.payload)
+                    .map_err(serde::ser::Error::custom)?;
                 event.serialize(serializer)
             }
         }

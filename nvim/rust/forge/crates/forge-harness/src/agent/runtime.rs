@@ -21,14 +21,17 @@ pub struct AgentRuntime {
 impl AgentRuntime {
     pub async fn run(mut self) -> Result<()> {
         let owner = self.request.owner()?;
-        anyhow::ensure!(!owner.is_root(), "child runtime cannot own the root conversation");
+        anyhow::ensure!(
+            !owner.is_root(),
+            "child runtime cannot own the root conversation"
+        );
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         let event_sink = event_sink.owned(owner.clone());
         let mut request = self.request.clone();
         let mut stream_open = true;
         let mut cancelled = *self.cancellation.borrow();
         let mut output = loop {
-          let result = async {
+            let result = async {
             let prompt = self.backend.prompt_stream(request.clone(), Some(event_sink.clone()));
             tokio::pin!(prompt);
             loop {
@@ -53,19 +56,32 @@ impl AgentRuntime {
                 }
             }
           }.await;
-          if cancelled || result.is_err() { break result; }
-          let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else { break result; };
-          if let Ok(output) = &result {
-              if output.backend_session_id.is_some() { request.backend_session_id = output.backend_session_id.clone(); }
-          }
-          request.input = crate::backend::BackendInput::from_text(feedback);
+            if cancelled || result.is_err() {
+                break result;
+            }
+            let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else {
+                break result;
+            };
+            if let Ok(output) = &result {
+                if output.backend_session_id.is_some() {
+                    request.backend_session_id = output.backend_session_id.clone();
+                }
+            }
+            request.input = crate::backend::BackendInput::from_text(feedback);
         };
         drop(self.lsp_lease.take());
         let runtime_key = self.request.runtime_key()?;
-        let retained = match tokio::time::timeout(std::time::Duration::from_secs(2),self.backend.active_session_id_for(&runtime_key)).await {
+        let retained = match tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            self.backend.active_session_id_for(&runtime_key),
+        )
+        .await
+        {
             Ok(retained) => retained,
             Err(_) => {
-                output = Err(anyhow::anyhow!("child provider identity lookup exceeded 2 seconds"));
+                output = Err(anyhow::anyhow!(
+                    "child provider identity lookup exceeded 2 seconds"
+                ));
                 None
             }
         };
@@ -76,9 +92,21 @@ impl AgentRuntime {
             }
         }
         if let Some(provider_thread_id) = &retained {
-            self.publish(&owner, BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
-                kind:"agent_conversation_resolved".into(),text:None,
-                data:serde_json::json!({"thread_id":provider_thread_id}),activity:None,summary:None,task_update:None}).await?;
+            self.publish(
+                &owner,
+                BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "agent_conversation_resolved".into(),
+                    text: None,
+                    data: serde_json::json!({"thread_id":provider_thread_id}),
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                },
+            )
+            .await?;
         }
         let cleanup = tokio::time::timeout(std::time::Duration::from_secs(30), async {
             let mut failure = Vec::new();
@@ -94,9 +122,12 @@ impl AgentRuntime {
                 failure.push(format!("shutdown: {error:#}"));
             }
             failure
-        }).await;
+        })
+        .await;
         let output = output.map(|mut output: BackendOutput| {
-            if output.backend_session_id.is_none() { output.backend_session_id = retained; }
+            if output.backend_session_id.is_none() {
+                output.backend_session_id = retained;
+            }
             output
         });
         let cleanup_error = match cleanup {
@@ -104,15 +135,33 @@ impl AgentRuntime {
             Ok(failure) => Some(failure.join("\n")),
             Err(_) => Some("child cleanup exceeded 30 seconds".to_owned()),
         };
-        self.sender.send(AgentCommand::Completed { owner, task_id: self.task_id.clone(), output, cleanup_error }).await
+        self.sender
+            .send(AgentCommand::Completed {
+                owner,
+                task_id: self.task_id.clone(),
+                output,
+                cleanup_error,
+            })
+            .await
     }
 
     async fn publish(&self, owner: &ExecutionOwner, mut event: BackendEvent) -> Result<()> {
         if let Some(address) = &mut event.address {
-            anyhow::ensure!(address.owner.as_ref().is_none_or(|observed| observed == owner),
-                "provider event crosses child execution ownership");
+            anyhow::ensure!(
+                address
+                    .owner
+                    .as_ref()
+                    .is_none_or(|observed| observed == owner),
+                "provider event crosses child execution ownership"
+            );
             address.owner = Some(owner.clone());
         }
-        self.sender.send(AgentCommand::Event { owner: owner.clone(), task_id: self.task_id.clone(), event }).await
+        self.sender
+            .send(AgentCommand::Event {
+                owner: owner.clone(),
+                task_id: self.task_id.clone(),
+                event,
+            })
+            .await
     }
 }

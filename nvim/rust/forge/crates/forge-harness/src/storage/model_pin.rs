@@ -29,27 +29,46 @@ impl ModelPinStore {
 
     /// Loads pin membership for one backend without requiring a model catalog.
     pub(crate) fn load(&self, backend: &str) -> Result<Vec<String>> {
-        ensure!(!backend.trim().is_empty(), "model pin backend cannot be empty");
-        let mut statement = self.connection.prepare(
-            "SELECT model FROM model_pin WHERE backend = ?1 ORDER BY model",
-        )?;
-        Ok(statement.query_map([backend], |row| row.get(0))?
+        ensure!(
+            !backend.trim().is_empty(),
+            "model pin backend cannot be empty"
+        );
+        let mut statement = self
+            .connection
+            .prepare("SELECT model FROM model_pin WHERE backend = ?1 ORDER BY model")?;
+        Ok(statement
+            .query_map([backend], |row| row.get(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Sets one pin idempotently without replacing other concurrent pin writes.
     pub(crate) fn set(&mut self, backend: &str, model: &str, pinned: bool) -> Result<Vec<String>> {
-        ensure!(!backend.trim().is_empty(), "model pin backend cannot be empty");
-        ensure!(!model.trim().is_empty(), "model pin identifier cannot be empty");
+        ensure!(
+            !backend.trim().is_empty(),
+            "model pin backend cannot be empty"
+        );
+        ensure!(
+            !model.trim().is_empty(),
+            "model pin identifier cannot be empty"
+        );
         let transaction = self.connection.transaction()?;
         if pinned {
-            transaction.execute("INSERT OR IGNORE INTO model_pin (backend, model) VALUES (?1, ?2)", params![backend, model])?;
+            transaction.execute(
+                "INSERT OR IGNORE INTO model_pin (backend, model) VALUES (?1, ?2)",
+                params![backend, model],
+            )?;
         } else {
-            transaction.execute("DELETE FROM model_pin WHERE backend = ?1 AND model = ?2", params![backend, model])?;
+            transaction.execute(
+                "DELETE FROM model_pin WHERE backend = ?1 AND model = ?2",
+                params![backend, model],
+            )?;
         }
         let identifier_list = {
-            let mut statement = transaction.prepare("SELECT model FROM model_pin WHERE backend = ?1 ORDER BY model")?;
-            statement.query_map([backend], |row| row.get(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+            let mut statement = transaction
+                .prepare("SELECT model FROM model_pin WHERE backend = ?1 ORDER BY model")?;
+            statement
+                .query_map([backend], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
         };
         transaction.commit()?;
         Ok(identifier_list)
@@ -65,7 +84,10 @@ mod test {
         let directory = tempfile::tempdir()?;
         let mut store = ModelPinStore::open(directory.path())?;
         assert!(store.load("copilot")?.is_empty());
-        assert_eq!(store.set("copilot", "temporarily-unavailable", true)?, ["temporarily-unavailable"]);
+        assert_eq!(
+            store.set("copilot", "temporarily-unavailable", true)?,
+            ["temporarily-unavailable"]
+        );
         store.set("copilot", "temporarily-unavailable", true)?;
         store.set("codex", "another-model", true)?;
         assert!(store.set("copilot", " ", true).is_err());
@@ -75,8 +97,16 @@ mod test {
         let mut reopened = ModelPinStore::open(directory.path())?;
         assert_eq!(reopened.load("copilot")?, ["temporarily-unavailable"]);
         assert_eq!(reopened.load("codex")?, ["another-model"]);
-        assert!(reopened.set("copilot", "temporarily-unavailable", false)?.is_empty());
-        assert!(reopened.set("copilot", "temporarily-unavailable", false)?.is_empty());
+        assert!(
+            reopened
+                .set("copilot", "temporarily-unavailable", false)?
+                .is_empty()
+        );
+        assert!(
+            reopened
+                .set("copilot", "temporarily-unavailable", false)?
+                .is_empty()
+        );
         assert_eq!(reopened.load("codex")?, ["another-model"]);
         Ok(())
     }
@@ -96,8 +126,13 @@ mod test {
                 Ok(())
             })
         });
-        for handle in handle_list { handle.join().unwrap()?; }
-        assert_eq!(ModelPinStore::open(directory.path())?.load("copilot")?, ["first", "second"]);
+        for handle in handle_list {
+            handle.join().unwrap()?;
+        }
+        assert_eq!(
+            ModelPinStore::open(directory.path())?.load("copilot")?,
+            ["first", "second"]
+        );
         Ok(())
     }
 }

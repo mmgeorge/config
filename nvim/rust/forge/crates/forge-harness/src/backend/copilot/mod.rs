@@ -1,9 +1,9 @@
-mod event_decoder;
-mod file_change;
-mod event_stream;
 mod compaction;
-mod text_generation;
+mod event_decoder;
+mod event_stream;
+mod file_change;
 mod mcp;
+mod text_generation;
 mod turn;
 #[cfg(test)]
 mod turn_test;
@@ -26,16 +26,16 @@ use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
-use turn::{CopilotRetraction, CopilotTurnEvent};
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::{
-    CommandsInvokeRequest, EventLogReadRequest, EventsAgentScope, EventsCursorStatus, HistoryTruncateRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
-    McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, McpStartServerRequest, SessionsForkRequest,
-    SkillsConfigSetDisabledSkillsRequest, SkillsDisableRequest, SkillsEnableRequest,
-    SlashCommandInvocationResult,
+    CommandsInvokeRequest, EventLogReadRequest, EventsAgentScope, EventsCursorStatus,
+    HistoryTruncateRequest, McpConfigDisableRequest, McpConfigEnableRequest, McpDisableRequest,
+    McpDiscoverRequest, McpEnableRequest, McpListToolsRequest, McpStartServerRequest,
+    SessionsForkRequest, SkillsConfigSetDisabledSkillsRequest, SkillsDisableRequest,
+    SkillsEnableRequest, SlashCommandInvocationResult,
 };
-use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::session_events::ReasoningSummary;
+use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::types::{ContextTier, ToolSearchConfig};
 use github_copilot_sdk::{
     CliProgram, Client, ClientOptions, DeliveryMode, Model, PermissionRequestData,
@@ -50,12 +50,21 @@ use std::sync::{
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use tokio::sync::{Mutex, mpsc};
+use turn::{CopilotRetraction, CopilotTurnEvent};
 
 const SYSTEM_MESSAGE: &str = super::HARNESS_SYSTEM_MESSAGE;
 
 fn native_agent_exclusions() -> Vec<String> {
-    ["task", "list_agents", "read_agent", "write_agent", "send_inbox"]
-        .into_iter().map(|name| format!("builtin:{name}")).collect()
+    [
+        "task",
+        "list_agents",
+        "read_agent",
+        "write_agent",
+        "send_inbox",
+    ]
+    .into_iter()
+    .map(|name| format!("builtin:{name}"))
+    .collect()
 }
 
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
@@ -72,36 +81,72 @@ struct CopilotSessionBinding {
 /// Retains terminal observations after the prompt event subscription ends.
 struct CopilotTerminalMonitor {
     session: std::sync::Weak<github_copilot_sdk::session::Session>,
-    snapshot: tokio::sync::watch::Receiver<Option<std::result::Result<super::terminal::TerminalSnapshot, String>>>,
+    snapshot: tokio::sync::watch::Receiver<
+        Option<std::result::Result<super::terminal::TerminalSnapshot, String>>,
+    >,
     task: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for CopilotTerminalMonitor {
-    fn drop(&mut self) { self.task.abort(); }
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl CopilotTerminalMonitor {
     /// Subscribe before the first query so terminal transitions cannot be lost at attachment.
-    fn new(session: &SharedCopilotSession, trace: Arc<crate::trace::TraceStore>, harness_session_id: String) -> Self {
-        let mut event = event_stream::SessionEventStream::new(session,
-            |event| event.event_type == "session.background_tasks_changed", trace, harness_session_id);
+    fn new(
+        session: &SharedCopilotSession,
+        trace: Arc<crate::trace::TraceStore>,
+        harness_session_id: String,
+    ) -> Self {
+        let mut event = event_stream::SessionEventStream::new(
+            session,
+            |event| event.event_type == "session.background_tasks_changed",
+            trace,
+            harness_session_id,
+        );
         let session = Arc::downgrade(session);
         let monitored_session = session.clone();
         let (send, snapshot) = tokio::sync::watch::channel(None);
         let task = tokio::spawn(async move {
             loop {
-                let Some(session) = session.upgrade() else { return; };
+                let Some(session) = session.upgrade() else {
+                    return;
+                };
                 let result = tokio::time::timeout(std::time::Duration::from_secs(6), async {
-                    session.rpc().tasks().refresh().await.context("refresh Copilot background terminals")?;
-                    let result = session.rpc().tasks().list().await.context("list Copilot background terminals")?;
+                    session
+                        .rpc()
+                        .tasks()
+                        .refresh()
+                        .await
+                        .context("refresh Copilot background terminals")?;
+                    let result = session
+                        .rpc()
+                        .tasks()
+                        .list()
+                        .await
+                        .context("list Copilot background terminals")?;
                     super::terminal::TerminalSnapshot::parse(&serde_json::to_value(result)?, true)
-                }).await.context("Copilot terminal query timed out").and_then(|result| result).map_err(|error: anyhow::Error| error.to_string());
-                let has_terminals = result.as_ref().is_ok_and(|snapshot| !snapshot.terminal.is_empty());
-                if send.send(Some(result)).is_err() { return; }
+                })
+                .await
+                .context("Copilot terminal query timed out")
+                .and_then(|result| result)
+                .map_err(|error: anyhow::Error| error.to_string());
+                let has_terminals = result
+                    .as_ref()
+                    .is_ok_and(|snapshot| !snapshot.terminal.is_empty());
+                if send.send(Some(result)).is_err() {
+                    return;
+                }
                 drop(session);
                 // Bound refresh-triggered notifications to one query per two seconds.
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                let delay = tokio::time::sleep(std::time::Duration::from_secs(if has_terminals { 2 } else { 10 }));
+                let delay = tokio::time::sleep(std::time::Duration::from_secs(if has_terminals {
+                    2
+                } else {
+                    10
+                }));
                 tokio::pin!(delay);
                 loop {
                     tokio::select! {
@@ -118,7 +163,11 @@ impl CopilotTerminalMonitor {
                 }
             }
         });
-        Self { session: monitored_session, snapshot, task }
+        Self {
+            session: monitored_session,
+            snapshot,
+            task,
+        }
     }
 }
 
@@ -150,8 +199,12 @@ impl CopilotBackend {
     /// Build a Copilot backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
         let permission_coordinator = PermissionCoordinator::transient(".")?;
-        Self::new_with_permission_coordinator(command, permission_coordinator,
-            Arc::new(crate::trace::TraceStore::open(std::path::Path::new("."))?), None)
+        Self::new_with_permission_coordinator(
+            command,
+            permission_coordinator,
+            Arc::new(crate::trace::TraceStore::open(std::path::Path::new("."))?),
+            None,
+        )
     }
 
     /// Build a Copilot backend with the shared Harness permission coordinator.
@@ -219,14 +272,33 @@ impl CopilotBackend {
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let mut active_session = session_slot.lock().await;
-        let tool_schema = ControlToolRegistry.definition_list_for_context(request.control_context.as_ref(), request.owner()?.is_root())
-            .iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>();
-        if let Some(binding) = active_session.as_mut().filter(|binding|
+        let tool_schema = ControlToolRegistry
+            .definition_list_for_context(
+                request.control_context.as_ref(),
+                request.owner()?.is_root(),
+            )
+            .iter()
+            .map(|definition| definition.mcp_value())
+            .collect::<Vec<_>>();
+        if let Some(binding) = active_session.as_mut().filter(|binding| {
             request.control_context.is_none() || binding.tool_schema == tool_schema
-        ) {
+        }) {
             if binding.compaction.is_none() {
-                binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
-                    .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event), Arc::clone(&self.trace), request.harness_session_id.clone()));
+                binding.compaction = self
+                    .compaction_subscription_by_harness
+                    .lock()
+                    .await
+                    .get(&request.runtime_key()?)
+                    .cloned()
+                    .map(|subscription| {
+                        compaction::CompactionMonitor::new(
+                            &binding.session,
+                            subscription,
+                            Arc::clone(&turn_event),
+                            Arc::clone(&self.trace),
+                            request.harness_session_id.clone(),
+                        )
+                    });
             }
             let session = &binding.session;
             if request.model != "default" {
@@ -235,7 +307,10 @@ impl CopilotBackend {
                 session
                     .set_model(
                         &request.model,
-                        Some(model_options(reasoning_effort, request.context_window.as_deref())),
+                        Some(model_options(
+                            reasoning_effort,
+                            request.context_window.as_deref(),
+                        )),
                     )
                     .await
                     .context("set Copilot session model")?;
@@ -247,33 +322,73 @@ impl CopilotBackend {
         let tool_list =
             self.control_tool_list(self.control_router(&request.runtime_key()?).await, request);
         let system_message = SystemMessageConfig::new()
-            .with_mode(if request.mode == PromptMode::Background { "replace" } else { "append" })
-            .with_content(if request.mode == PromptMode::Background { request.system_message() } else { SYSTEM_MESSAGE.to_owned() });
-        let permission_handler: Arc<dyn PermissionHandler> = if request.mode == PromptMode::Background {
-            Arc::new(github_copilot_sdk::handler::DenyAllHandler)
-        } else { Arc::new(CopilotPermissionHandler {
-            context: self.permission_context(&request.runtime_key()?).await,
-        }) };
+            .with_mode(if request.mode == PromptMode::Background {
+                "replace"
+            } else {
+                "append"
+            })
+            .with_content(if request.mode == PromptMode::Background {
+                request.system_message()
+            } else {
+                SYSTEM_MESSAGE.to_owned()
+            });
+        let permission_handler: Arc<dyn PermissionHandler> =
+            if request.mode == PromptMode::Background {
+                Arc::new(github_copilot_sdk::handler::DenyAllHandler)
+            } else {
+                Arc::new(CopilotPermissionHandler {
+                    context: self.permission_context(&request.runtime_key()?).await,
+                })
+            };
         let checkpoint_hooks = Arc::new(CopilotCheckpointHooks {
             context: self.permission_context(&request.runtime_key()?).await,
         });
         let resource_request = BackendCatalogRequest {
             execution_owner: request.execution_owner.clone(),
-            harness_session_id: request.harness_session_id.clone(), workspace: request.workspace.clone(),
-            access: request.access.clone(), execution_mode: request.execution_mode,
+            harness_session_id: request.harness_session_id.clone(),
+            workspace: request.workspace.clone(),
+            access: request.access.clone(),
+            execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
         };
-        let resources = self.settings_root.as_ref().filter(|_| request.mode != PromptMode::Background).map(|root| {
-            crate::settings::SessionResources::load(root, &resource_request, "copilot", "copilotcli")
-        }).transpose()?;
-        let profile = resources.as_ref().map(|resources| {
-            crate::settings::ResourceProfile::copilot(self.settings_root.as_ref().expect("configured resource root"), &resources.selected_skill)
-        }).transpose()?;
-        let skill_directories = profile.as_ref().map(|profile| vec![profile.path().join("skills")]);
-        let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
+        let resources = self
+            .settings_root
+            .as_ref()
+            .filter(|_| request.mode != PromptMode::Background)
+            .map(|root| {
+                crate::settings::SessionResources::load(
+                    root,
+                    &resource_request,
+                    "copilot",
+                    "copilotcli",
+                )
+            })
+            .transpose()?;
+        let profile = resources
+            .as_ref()
+            .map(|resources| {
+                crate::settings::ResourceProfile::copilot(
+                    self.settings_root
+                        .as_ref()
+                        .expect("configured resource root"),
+                    &resources.selected_skill,
+                )
+            })
+            .transpose()?;
+        let skill_directories = profile
+            .as_ref()
+            .map(|profile| vec![profile.path().join("skills")]);
+        let retained_session_id = active_session
+            .as_ref()
+            .map(|binding| binding.session.id().to_string());
         // Dropping the old SDK session after resume unregisters the replacement's event router.
         if let Some(mut binding) = active_session.take() {
-            if let Some(mut monitor) = self.terminal_monitor.lock().await.remove(&request.runtime_key()?) {
+            if let Some(mut monitor) = self
+                .terminal_monitor
+                .lock()
+                .await
+                .remove(&request.runtime_key()?)
+            {
                 monitor.task.abort();
                 let _ = (&mut monitor.task).await;
             }
@@ -284,7 +399,10 @@ impl CopilotBackend {
             }
             drop(binding);
         }
-        let session = if let Some(session_id) = retained_session_id.as_deref().or(request.backend_session_id.as_deref()) {
+        let session = if let Some(session_id) = retained_session_id
+            .as_deref()
+            .or(request.backend_session_id.as_deref())
+        {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
@@ -319,7 +437,11 @@ impl CopilotBackend {
                 config.enable_session_store = Some(true);
             }
             client
-                .resume_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
+                .resume_session(
+                    config
+                        .with_permission_handler(permission_handler)
+                        .with_hooks(checkpoint_hooks),
+                )
                 .await
                 .context("resume Copilot session")?
         } else {
@@ -357,7 +479,11 @@ impl CopilotBackend {
                 config.enable_session_store = Some(true);
             }
             client
-                .create_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
+                .create_session(
+                    config
+                        .with_permission_handler(permission_handler)
+                        .with_hooks(checkpoint_hooks),
+                )
                 .await
                 .context("create Copilot session")?
         };
@@ -365,39 +491,105 @@ impl CopilotBackend {
         if let Some(resources) = &resources {
             let mut stage = "inspect Copilot skill selection".to_owned();
             let verified = tokio::time::timeout(std::time::Duration::from_secs(30), async {
-                let loaded = session.rpc().skills().list().await.context("inspect Copilot skill selection")?;
-                for skill in loaded.skills.iter().filter(|skill| skill.enabled && !resources.selected_skill.iter().any(|selected| selected.name == skill.name)) {
-                    session.rpc().skills().disable(SkillsDisableRequest { name: skill.name.clone() }).await
-                        .with_context(||format!("exclude unselected Copilot skill {}", skill.name))?;
+                let loaded = session
+                    .rpc()
+                    .skills()
+                    .list()
+                    .await
+                    .context("inspect Copilot skill selection")?;
+                for skill in loaded.skills.iter().filter(|skill| {
+                    skill.enabled
+                        && !resources
+                            .selected_skill
+                            .iter()
+                            .any(|selected| selected.name == skill.name)
+                }) {
+                    session
+                        .rpc()
+                        .skills()
+                        .disable(SkillsDisableRequest {
+                            name: skill.name.clone(),
+                        })
+                        .await
+                        .with_context(|| {
+                            format!("exclude unselected Copilot skill {}", skill.name)
+                        })?;
                 }
                 stage = "verify Copilot skill selection".into();
-                let loaded = session.rpc().skills().list().await.context("verify Copilot skill selection")?;
+                let loaded = session
+                    .rpc()
+                    .skills()
+                    .list()
+                    .await
+                    .context("verify Copilot skill selection")?;
                 for skill in &resources.skill {
-                    let enabled = loaded.skills.iter().any(|candidate| candidate.name == skill.name && candidate.enabled);
-                    let selected = resources.selected_skill.iter().any(|candidate| candidate.name == skill.name);
-                    anyhow::ensure!(enabled == selected, "Copilot did not apply skill selection for {}", skill.name);
+                    let enabled = loaded
+                        .skills
+                        .iter()
+                        .any(|candidate| candidate.name == skill.name && candidate.enabled);
+                    let selected = resources
+                        .selected_skill
+                        .iter()
+                        .any(|candidate| candidate.name == skill.name);
+                    anyhow::ensure!(
+                        enabled == selected,
+                        "Copilot did not apply skill selection for {}",
+                        skill.name
+                    );
                 }
                 Ok::<_, anyhow::Error>(())
-            }).await.with_context(|| format!("Copilot resource verification timed out while attempting to {stage}"))
-                .and_then(|result| result);
+            })
+            .await
+            .with_context(|| {
+                format!("Copilot resource verification timed out while attempting to {stage}")
+            })
+            .and_then(|result| result);
             if let Err(error) = verified {
                 let _ = session.disconnect().await;
                 return Err(error);
             }
         }
         let mcp_failure = if let Some(resources) = &resources {
-            match mcp::start(&session, &resources.launch, &self.trace, &request.harness_session_id,
-                std::time::Duration::from_secs(30)).await {
+            match mcp::start(
+                &session,
+                &resources.launch,
+                &self.trace,
+                &request.harness_session_id,
+                std::time::Duration::from_secs(30),
+            )
+            .await
+            {
                 Ok(failure) => failure,
                 Err(error) => {
                     let _ = session.disconnect().await;
                     return Err(error);
                 }
             }
-        } else { HashMap::new() };
-        let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
-            .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event, Arc::clone(&self.trace), request.harness_session_id.clone()));
-        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), tool_schema, compaction, mcp_failure, _profile: profile });
+        } else {
+            HashMap::new()
+        };
+        let compaction = self
+            .compaction_subscription_by_harness
+            .lock()
+            .await
+            .get(&request.runtime_key()?)
+            .cloned()
+            .map(|subscription| {
+                compaction::CompactionMonitor::new(
+                    &session,
+                    subscription,
+                    turn_event,
+                    Arc::clone(&self.trace),
+                    request.harness_session_id.clone(),
+                )
+            });
+        *active_session = Some(CopilotSessionBinding {
+            session: Arc::clone(&session),
+            tool_schema,
+            compaction,
+            mcp_failure,
+            _profile: profile,
+        });
         Ok(session)
     }
 
@@ -417,7 +609,11 @@ impl CopilotBackend {
             .await
             .get(harness_session_id)
             .cloned()?;
-        session_slot.lock().await.as_ref().map(|binding| Arc::clone(&binding.session))
+        session_slot
+            .lock()
+            .await
+            .as_ref()
+            .map(|binding| Arc::clone(&binding.session))
     }
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
@@ -476,10 +672,17 @@ impl CopilotBackend {
         )
     }
 
-    fn control_tool_list(&self, router: Arc<ControlToolRouter>, request: &BackendRequest) -> Vec<Tool> {
+    fn control_tool_list(
+        &self,
+        router: Arc<ControlToolRouter>,
+        request: &BackendRequest,
+    ) -> Vec<Tool> {
         let handler: Arc<dyn ToolHandler> = Arc::new(CopilotControlToolHandler { router });
         ControlToolRegistry
-            .definition_list_for_context(request.control_context.as_ref(),request.owner().is_ok_and(|owner|owner.is_root()))
+            .definition_list_for_context(
+                request.control_context.as_ref(),
+                request.owner().is_ok_and(|owner| owner.is_root()),
+            )
             .into_iter()
             .map(|definition| {
                 Tool::new(definition.name)
@@ -497,7 +700,12 @@ fn capability() -> BackendCapability {
         os_sandbox: BackendKind::Copilot.supports_sandbox(),
         native_fork: true,
         native_compact: true,
-        compaction: super::CompactionCapability { lifecycle: true, background: true, summary: true, metrics: true },
+        compaction: super::CompactionCapability {
+            lifecycle: true,
+            background: true,
+            summary: true,
+            metrics: true,
+        },
         native_steer: true,
         native_turn_rollback: true,
         native_goal: false,
@@ -523,11 +731,20 @@ fn capability() -> BackendCapability {
 
 #[async_trait]
 impl Backend for CopilotBackend {
-    fn checkpoint_tool_gate(&self) -> bool { true }
+    fn checkpoint_tool_gate(&self) -> bool {
+        true
+    }
 
-    async fn reconcile_settings(&self, mut request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
+    async fn reconcile_settings(
+        &self,
+        mut request: BackendCatalogRequest,
+        setting: &crate::settings::PortableSettings,
+    ) -> Result<()> {
         if self.settings_root.is_none() {
-            anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "shared resource selection requires the Forge settings store");
+            anyhow::ensure!(
+                setting.skill.is_empty() && setting.mcp.is_empty(),
+                "shared resource selection requires the Forge settings store"
+            );
             return Ok(());
         }
         self.cleanup_execution(&request.runtime_key()?).await?;
@@ -535,63 +752,132 @@ impl Backend for CopilotBackend {
         let mut binding = slot.lock().await;
         if let Some(active) = binding.as_ref() {
             request.backend_session_id = Some(active.session.id().to_string());
-            active.session.disconnect().await.context("disconnect Copilot before applying shared resources")?;
+            active
+                .session
+                .disconnect()
+                .await
+                .context("disconnect Copilot before applying shared resources")?;
         }
         binding.take();
         drop(binding);
-        self.terminal_monitor.lock().await.remove(&request.runtime_key()?);
-        self.session(&Self::catalog_backend_request(&request)).await?;
+        self.terminal_monitor
+            .lock()
+            .await
+            .remove(&request.runtime_key()?);
+        self.session(&Self::catalog_backend_request(&request))
+            .await?;
         Ok(())
     }
 
-    async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, reasoning_effort: Option<&str>, history: &str) -> Result<String> {
+    async fn generate_text(
+        &self,
+        request: BackendCatalogRequest,
+        purpose: super::TextGeneration,
+        model: &str,
+        reasoning_effort: Option<&str>,
+        history: &str,
+    ) -> Result<String> {
         self.trace.record(&request.harness_session_id, "copilot.generation.request", json!({
             "purpose": purpose.name(),
             "model":model,"reasoning_effort":reasoning_effort,"instructions":purpose.instructions(),"history":history}));
-        let result = text_generation::generate(&self.command, &request.workspace, purpose, model, reasoning_effort, history).await;
-        self.trace.record(&request.harness_session_id, "copilot.generation.result", match &result {
-            Ok(text) => json!({"text":text}), Err(error) => json!({"error":error.to_string()}),
-        });
+        let result = text_generation::generate(
+            &self.command,
+            &request.workspace,
+            purpose,
+            model,
+            reasoning_effort,
+            history,
+        )
+        .await;
+        self.trace.record(
+            &request.harness_session_id,
+            "copilot.generation.result",
+            match &result {
+                Ok(text) => json!({"text":text}),
+                Err(error) => json!({"error":error.to_string()}),
+            },
+        );
         result
     }
     async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
-        let session = self.active_session(&request.runtime_key()?).await
+        let session = self
+            .active_session(&request.runtime_key()?)
+            .await
             .context("Copilot session is not attached")?;
         session.rpc().tasks().refresh().await?;
         let inventory = session.rpc().tasks().list().await?;
-        let inventory = super::terminal::TerminalSnapshot::parse(&serde_json::to_value(inventory)?, true)?;
-        anyhow::ensure!(inventory.terminal.iter().any(|terminal| terminal.id == id),
-            "Background terminal is no longer running");
-        let result = session.rpc().tasks().cancel(github_copilot_sdk::rpc::TasksCancelRequest { id: id.into() }).await?;
-        anyhow::ensure!(result.cancelled, "Background terminal could not be cancelled");
-        self.terminal_monitor.lock().await.remove(&request.runtime_key()?);
+        let inventory =
+            super::terminal::TerminalSnapshot::parse(&serde_json::to_value(inventory)?, true)?;
+        anyhow::ensure!(
+            inventory.terminal.iter().any(|terminal| terminal.id == id),
+            "Background terminal is no longer running"
+        );
+        let result = session
+            .rpc()
+            .tasks()
+            .cancel(github_copilot_sdk::rpc::TasksCancelRequest { id: id.into() })
+            .await?;
+        anyhow::ensure!(
+            result.cancelled,
+            "Background terminal could not be cancelled"
+        );
+        self.terminal_monitor
+            .lock()
+            .await
+            .remove(&request.runtime_key()?);
         Ok(())
     }
 
-    async fn background_terminals(&self, request: BackendCatalogRequest) -> Result<super::terminal::TerminalSnapshot> {
+    async fn background_terminals(
+        &self,
+        request: BackendCatalogRequest,
+    ) -> Result<super::terminal::TerminalSnapshot> {
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let active_session = match session_slot.try_lock() {
             Ok(binding) => binding,
-            Err(_) => return Ok(super::terminal::TerminalSnapshot {
-                supported: true, starting: true, terminal: Vec::new(),
-            }),
+            Err(_) => {
+                return Ok(super::terminal::TerminalSnapshot {
+                    supported: true,
+                    starting: true,
+                    terminal: Vec::new(),
+                });
+            }
         };
         let session = match active_session.as_ref() {
             Some(binding) => &binding.session,
-            None => return Ok(super::terminal::TerminalSnapshot {
-                supported: true, starting: false, terminal: Vec::new(),
-            }),
+            None => {
+                return Ok(super::terminal::TerminalSnapshot {
+                    supported: true,
+                    starting: false,
+                    terminal: Vec::new(),
+                });
+            }
         };
         let mut monitor_store = self.terminal_monitor.lock().await;
-        let monitor = monitor_store.entry(request.runtime_key()?)
-            .or_insert_with(|| CopilotTerminalMonitor::new(session, Arc::clone(&self.trace), request.harness_session_id.clone()));
+        let monitor = monitor_store
+            .entry(request.runtime_key()?)
+            .or_insert_with(|| {
+                CopilotTerminalMonitor::new(
+                    session,
+                    Arc::clone(&self.trace),
+                    request.harness_session_id.clone(),
+                )
+            });
         if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(session)) {
-            *monitor = CopilotTerminalMonitor::new(session, Arc::clone(&self.trace), request.harness_session_id.clone());
+            *monitor = CopilotTerminalMonitor::new(
+                session,
+                Arc::clone(&self.trace),
+                request.harness_session_id.clone(),
+            );
         }
         let snapshot = monitor.snapshot.clone();
         drop(monitor_store);
         let Some(result) = snapshot.borrow().clone() else {
-            return Ok(super::terminal::TerminalSnapshot { supported: true, starting: true, terminal: Vec::new() });
+            return Ok(super::terminal::TerminalSnapshot {
+                supported: true,
+                starting: true,
+                terminal: Vec::new(),
+            });
         };
         result.map_err(anyhow::Error::msg)
     }
@@ -600,7 +886,9 @@ impl Backend for CopilotBackend {
         self.closed.store(true, Ordering::Release);
         self.terminal_monitor.lock().await.clear();
         for slot in self.session_slot_by_harness.lock().await.values() {
-            if let Some(binding) = slot.lock().await.as_mut() { binding.compaction.take(); }
+            if let Some(binding) = slot.lock().await.as_mut() {
+                binding.compaction.take();
+            }
         }
         self.compaction_subscription_by_harness.lock().await.clear();
         let mut shutdown = self.shutdown.lock().await;
@@ -642,11 +930,22 @@ impl Backend for CopilotBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         let turn_event = self.turn_event(&request.runtime_key()?).await;
-        let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Copilot)?;
-        let _directories = self.permission_coordinator.directories(self.settings_root.as_deref(), &request)?;
+        let skills = self.permission_coordinator.skills(
+            self.settings_root.as_deref(),
+            &request,
+            super::BackendKind::Copilot,
+        )?;
+        let _directories = self
+            .permission_coordinator
+            .directories(self.settings_root.as_deref(), &request)?;
         let event_sink = skills.sink(event_sink);
-        let _turn_event_guard = turn_event.activate(event_sink.clone(),
-            request.control_context.as_ref().and_then(|context| context.submission_cancelled.clone()))?;
+        let _turn_event_guard = turn_event.activate(
+            event_sink.clone(),
+            request
+                .control_context
+                .as_ref()
+                .and_then(|context| context.submission_cancelled.clone()),
+        )?;
         self.permission_context(&request.runtime_key()?)
             .await
             .configure(
@@ -655,13 +954,27 @@ impl Backend for CopilotBackend {
                 request.workspace.clone(),
                 event_sink.clone(),
             )?;
-        self.permission_context(&request.runtime_key()?).await.state.lock()
-            .map_err(|_|anyhow::anyhow!("Copilot permission context lock poisoned"))?.checkpoint =
-            request.control_context.as_ref().and_then(|context|context.checkpoint.clone());
+        self.permission_context(&request.runtime_key()?)
+            .await
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .checkpoint = request
+            .control_context
+            .as_ref()
+            .and_then(|context| context.checkpoint.clone());
         let session = self.session(&request).await?;
-        let mut subscription = event_stream::SessionEventStream::new(&session, |event| {
-            !matches!(event.event_type.as_str(), "assistant.streaming_delta" | "assistant.tool_call_delta")
-        }, Arc::clone(&self.trace), request.harness_session_id.clone());
+        let mut subscription = event_stream::SessionEventStream::new(
+            &session,
+            |event| {
+                !matches!(
+                    event.event_type.as_str(),
+                    "assistant.streaming_delta" | "assistant.tool_call_delta"
+                )
+            },
+            Arc::clone(&self.trace),
+            request.harness_session_id.clone(),
+        );
         let control_router = self.control_router(&request.runtime_key()?).await;
         let control_context = request
             .control_context
@@ -677,7 +990,9 @@ impl Backend for CopilotBackend {
             },
             ..BackendOutput::default()
         };
-        let decoder = CopilotEventDecoder { workspace: request.workspace.clone() };
+        let decoder = CopilotEventDecoder {
+            workspace: request.workspace.clone(),
+        };
         let initial_task_snapshot = session
             .rpc()
             .plan()
@@ -701,7 +1016,9 @@ impl Backend for CopilotBackend {
         }
         let provider_text = match &request.input {
             BackendInput::Text { text, .. } => text.clone(),
-            BackendInput::Skill { name, arguments, .. } => {
+            BackendInput::Skill {
+                name, arguments, ..
+            } => {
                 let skill_available = session
                     .rpc()
                     .skills()
@@ -730,17 +1047,25 @@ impl Backend for CopilotBackend {
                 }
             }
         };
-        let prompt = format!(
-            "{}\n\n{}",
-            request.interaction_contract(), provider_text
-        );
-        let history = session.rpc().event_log().tail().await.context("capture Copilot pre-submit history boundary")?;
+        let prompt = format!("{}\n\n{}", request.interaction_contract(), provider_text);
+        let history = session
+            .rpc()
+            .event_log()
+            .tail()
+            .await
+            .context("capture Copilot pre-submit history boundary")?;
         turn_event.set_history_cursor(history.cursor)?;
         let message = crate::attachment::copilot_input(&prompt, request.input.attachments())?;
-        turn_event.send(async {
-            self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
-            session.send(message).await.context("send Copilot prompt")
-        }).await?;
+        turn_event
+            .send(async {
+                self.trace.record(
+                    &request.harness_session_id,
+                    "copilot.session.send",
+                    json!({"session_id":session.id().to_string(),"prompt":prompt}),
+                );
+                session.send(message).await.context("send Copilot prompt")
+            })
+            .await?;
         let mut execution_control_call = std::collections::HashSet::new();
         let mut execution_turn_stopped = false;
         loop {
@@ -832,41 +1157,82 @@ impl Backend for CopilotBackend {
         let request = request.request;
         let session = self.session(&request).await?;
         let slot = self.session_slot(&request.runtime_key()?).await;
-        let manual = slot.lock().await.as_ref().and_then(|binding| binding.compaction.as_ref())
+        let manual = slot
+            .lock()
+            .await
+            .as_ref()
+            .and_then(|binding| binding.compaction.as_ref())
             .map(|monitor| Arc::clone(&monitor.manual));
-        if let Some(manual) = &manual { manual.lock().await.register(id.clone()); }
-        let result = match session.rpc().history().compact().await.context("compact Copilot history") {
+        if let Some(manual) = &manual {
+            manual.lock().await.register(id.clone());
+        }
+        let result = match session
+            .rpc()
+            .history()
+            .compact()
+            .await
+            .context("compact Copilot history")
+        {
             Ok(result) => result,
             Err(error) => {
-                if let Some(manual) = &manual { manual.lock().await.finish(&id); }
+                if let Some(manual) = &manual {
+                    manual.lock().await.finish(&id);
+                }
                 return Err(error);
             }
         };
-        if let Some(manual) = &manual { manual.lock().await.finish(&id); }
+        if let Some(manual) = &manual {
+            manual.lock().await.finish(&id);
+        }
         let data = serde_json::to_value(&result)?;
         let compaction = crate::backend::Compaction {
-            id, thread_id: session.id().to_string(),
-            state: if result.success { crate::backend::CompactionState::Completed }
-                else { crate::backend::CompactionState::Failed },
-            manual: true, started_at_ms: None, completed_at_ms: None,
+            id,
+            thread_id: session.id().to_string(),
+            state: if result.success {
+                crate::backend::CompactionState::Completed
+            } else {
+                crate::backend::CompactionState::Failed
+            },
+            manual: true,
+            started_at_ms: None,
+            completed_at_ms: None,
             result: serde_json::from_value(data)?,
         };
-        let context_usage = compaction.result.context_window.as_ref().and_then(|context| {
-            context.current_tokens.zip(context.token_limit)
-                .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
-        });
+        let context_usage = compaction
+            .result
+            .context_window
+            .as_ref()
+            .and_then(|context| {
+                context
+                    .current_tokens
+                    .zip(context.token_limit)
+                    .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
+            });
         Ok(BackendOutput {
-            backend_session_id: Some(session.id().to_string()), capability: capability(),
-            runtime: crate::backend::BackendRuntime { provider: "Copilot CLI".into(), model: None },
+            backend_session_id: Some(session.id().to_string()),
+            capability: capability(),
+            runtime: crate::backend::BackendRuntime {
+                provider: "Copilot CLI".into(),
+                model: None,
+            },
             event: vec![BackendEvent::from_compaction(compaction, None)],
-            metrics: crate::backend::TurnMetrics { context_usage, ..Default::default() },
+            metrics: crate::backend::TurnMetrics {
+                context_usage,
+                ..Default::default()
+            },
             ..BackendOutput::default()
         })
     }
 
-    async fn compaction_stream(&self, session_id: &str) -> Result<Option<super::events::BackendEventStream>> {
+    async fn compaction_stream(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<super::events::BackendEventStream>> {
         let (sink, stream) = super::events::channel();
-        self.compaction_subscription_by_harness.lock().await.insert(session_id.to_owned(), compaction::CompactionSubscription::new(sink));
+        self.compaction_subscription_by_harness.lock().await.insert(
+            session_id.to_owned(),
+            compaction::CompactionSubscription::new(sink),
+        );
         Ok(Some(stream))
     }
 
@@ -891,9 +1257,11 @@ impl Backend for CopilotBackend {
                 .session_id
                 .to_string(),
             _ => {
-                target_request.harness_session_id.clone_from(&request.target_harness_session_id);
+                target_request
+                    .harness_session_id
+                    .clone_from(&request.target_harness_session_id);
                 self.session(&target_request).await?.id().to_string()
-            },
+            }
         };
         target_request.harness_session_id = request.target_harness_session_id;
         target_request.backend_session_id = Some(backend_session_id.clone());
@@ -918,7 +1286,13 @@ impl Backend for CopilotBackend {
 
     async fn skill_list(&self, request: BackendCatalogRequest) -> Result<Vec<SkillDefinition>> {
         if let Some(root) = &self.settings_root {
-            return Ok(crate::settings::SessionResources::load(root, &request, "copilot", "copilotcli")?.skill);
+            return Ok(crate::settings::SessionResources::load(
+                root,
+                &request,
+                "copilot",
+                "copilotcli",
+            )?
+            .skill);
         }
         let backend_request = Self::catalog_backend_request(&request);
         let session = self.session(&backend_request).await?;
@@ -933,8 +1307,8 @@ impl Backend for CopilotBackend {
             .into_iter()
             .filter(|skill| skill.user_invocable)
             .map(|skill| SkillDefinition {
-                scope:None,
-                resource_id:None,
+                scope: None,
+                resource_id: None,
                 name: skill.name,
                 description: skill.description,
                 enabled: skill.enabled,
@@ -1009,29 +1383,54 @@ impl Backend for CopilotBackend {
         })
     }
 
-    async fn mcp_configuration(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+    async fn mcp_configuration(
+        &self,
+        request: BackendCatalogRequest,
+    ) -> Result<Vec<McpDefinition>> {
         if let Some(root) = &self.settings_root {
-            return Ok(crate::settings::SessionResources::load(root, &request, "copilot", "copilotcli")?.mcp);
+            return Ok(crate::settings::SessionResources::load(
+                root,
+                &request,
+                "copilot",
+                "copilotcli",
+            )?
+            .mcp);
         }
         let client = self.client(&request.workspace).await?;
-        let discovery = client.rpc().mcp().discover(McpDiscoverRequest {
-            working_directory: Some(request.workspace),
-        }).await.context("discover configured Copilot MCP servers")?;
-        let mut servers = discovery.servers.into_iter().map(|server| McpDefinition {
-            scope:None, source_path:None,
-            resource_id:None,
-            name: server.name,
-            enabled: server.enabled,
-            transport: server.r#type.and_then(|transport| serde_json::to_value(transport).ok())
-                .and_then(|transport| transport.as_str().map(str::to_owned))
-                .unwrap_or_else(|| "unknown".into()),
-            status: if server.enabled { McpStatus::Loading } else { McpStatus::Disabled },
-            status_detail: None,
-            token_count: None,
-            token_estimated: false,
-            tools: Vec::new(),
-            tool_error: None,
-        }).collect::<Vec<_>>();
+        let discovery = client
+            .rpc()
+            .mcp()
+            .discover(McpDiscoverRequest {
+                working_directory: Some(request.workspace),
+            })
+            .await
+            .context("discover configured Copilot MCP servers")?;
+        let mut servers = discovery
+            .servers
+            .into_iter()
+            .map(|server| McpDefinition {
+                scope: None,
+                source_path: None,
+                resource_id: None,
+                name: server.name,
+                enabled: server.enabled,
+                transport: server
+                    .r#type
+                    .and_then(|transport| serde_json::to_value(transport).ok())
+                    .and_then(|transport| transport.as_str().map(str::to_owned))
+                    .unwrap_or_else(|| "unknown".into()),
+                status: if server.enabled {
+                    McpStatus::Loading
+                } else {
+                    McpStatus::Disabled
+                },
+                status_detail: None,
+                token_count: None,
+                token_estimated: false,
+                tools: Vec::new(),
+                tool_error: None,
+            })
+            .collect::<Vec<_>>();
         servers.sort_by(|left, right| left.name.cmp(&right.name));
         Ok(servers)
     }
@@ -1039,8 +1438,14 @@ impl Backend for CopilotBackend {
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let backend_request = Self::catalog_backend_request(&request);
         let session = self.session(&backend_request).await?;
-        let mcp_failure = self.session_slot(&request.runtime_key()?).await.lock().await
-            .as_ref().map(|binding| binding.mcp_failure.clone()).unwrap_or_default();
+        let mcp_failure = self
+            .session_slot(&request.runtime_key()?)
+            .await
+            .lock()
+            .await
+            .as_ref()
+            .map(|binding| binding.mcp_failure.clone())
+            .unwrap_or_default();
         let definition = self.mcp_configuration(request).await?;
         let server_list = session
             .rpc()
@@ -1105,7 +1510,12 @@ impl Backend for CopilotBackend {
                 _ => McpStatus::Unavailable,
             };
             let startup_error = mcp_failure.get(&discovered.name);
-            if startup_error.is_some() && matches!(status, McpStatus::Disabled | McpStatus::Loading | McpStatus::Unavailable) {
+            if startup_error.is_some()
+                && matches!(
+                    status,
+                    McpStatus::Disabled | McpStatus::Loading | McpStatus::Unavailable
+                )
+            {
                 status = McpStatus::Failed;
             }
             let (tools, tool_error) = if status == McpStatus::Connected {
@@ -1134,16 +1544,22 @@ impl Backend for CopilotBackend {
                 (Vec::new(), None)
             };
             definition_list.push(McpDefinition {
-                scope:discovered.scope, source_path:discovered.source_path,
-                resource_id:discovered.resource_id,
+                scope: discovered.scope,
+                source_path: discovered.source_path,
+                resource_id: discovered.resource_id,
                 token_count: token_by_name.get(&discovered.name).copied(),
                 token_estimated: false,
                 enabled: discovered.enabled,
                 status,
-                status_detail: status_entry.and_then(|server| server.error.clone())
-                    .or_else(|| (status == McpStatus::Failed).then(|| startup_error.cloned()).flatten()),
+                status_detail: status_entry
+                    .and_then(|server| server.error.clone())
+                    .or_else(|| {
+                        (status == McpStatus::Failed)
+                            .then(|| startup_error.cloned())
+                            .flatten()
+                    }),
                 name: discovered.name,
-                transport:discovered.transport,
+                transport: discovered.transport,
                 tools,
                 tool_error,
             });
@@ -1220,17 +1636,26 @@ impl Backend for CopilotBackend {
         let text = input.text().to_owned();
         let message = crate::attachment::copilot_input(&text, input.attachments())?
             .with_mode(DeliveryMode::Immediate);
-        self.trace.record(session_id, "copilot.session.steer", json!({"text":text}));
+        self.trace
+            .record(session_id, "copilot.session.steer", json!({"text":text}));
         let session = self
             .active_session(session_id)
             .await
             .context("Copilot session has not started")?;
-        self.turn_event(session_id).await.send(async {
-            session.send(message)
-                .await.context("steer active Copilot turn")
-        }).await?;
+        self.turn_event(session_id)
+            .await
+            .send(async {
+                session
+                    .send(message)
+                    .await
+                    .context("steer active Copilot turn")
+            })
+            .await?;
         if matches!(input, super::SteeringInput::User { .. }) {
-            self.turn_event(session_id).await.publish_steering(text).await?;
+            self.turn_event(session_id)
+                .await
+                .publish_steering(text)
+                .await?;
         }
         Ok(())
     }
@@ -1241,51 +1666,93 @@ impl Backend for CopilotBackend {
         let stop = turn_event.request_stop()?;
         let result = tokio::time::timeout(std::time::Duration::from_secs(8), async {
             if stop.submitted {
-                let session = self.active_session(session_id).await.context("Submitted Copilot session is missing")?;
+                let session = self
+                    .active_session(session_id)
+                    .await
+                    .context("Submitted Copilot session is missing")?;
                 session.abort().await.context("abort active Copilot turn")?;
             }
             if turn_event.stop().await? {
                 if stop.sending || !stop.submitted {
-                    let session = self.active_session(session_id).await.context("Submitted Copilot session is missing")?;
-                    session.abort().await.context("abort committed Copilot send after collection")?;
+                    let session = self
+                        .active_session(session_id)
+                        .await
+                        .context("Submitted Copilot session is missing")?;
+                    session
+                        .abort()
+                        .await
+                        .context("abort committed Copilot send after collection")?;
                 }
                 turn_event.wait_finished().await;
             }
             Ok::<_, anyhow::Error>(())
-        }).await.context("Copilot execution did not stop within 8 seconds").and_then(|result| result);
-        if let Some(controls) = controls { controls.close().await; }
+        })
+        .await
+        .context("Copilot execution did not stop within 8 seconds")
+        .and_then(|result| result);
+        if let Some(controls) = controls {
+            controls.close().await;
+        }
         result
     }
 
     async fn rollback_cancelled_turn_for(&self, session_id: &str) -> Result<bool> {
         let turn_event = self.turn_event(session_id).await;
         let target = turn_event.retraction_target()?;
-        if matches!(target, CopilotRetraction::Unsent) { return Ok(true); }
-        let session = self.active_session(session_id).await.context("Copilot session is missing for rewind")?;
-        let event_id = match target {
-            CopilotRetraction::Event(event_id) => event_id,
-            CopilotRetraction::History(mut cursor) => loop {
-                let history = session.rpc().event_log().read(EventLogReadRequest {
-                    cursor: Some(cursor.clone()), agent_scope: Some(EventsAgentScope::Primary),
-                    types: Some(json!(["user.message"])), max: Some(1), wait_ms: Some(0),
-                }).await.context("verify cancelled Copilot submission in native history")?;
-                anyhow::ensure!(history.cursor_status == EventsCursorStatus::Ok,
-                    "Copilot rewind history boundary expired");
-                if let Some(event) = history.events.into_iter().find(|event|
-                    event.agent_id.is_none() && event.event_type == "user.message")
-                { break event.id; }
-                if !history.has_more {
-                    turn_event.finish_retraction()?;
-                    return Ok(true);
-                }
-                anyhow::ensure!(history.cursor != cursor, "Copilot rewind history cursor did not advance");
-                cursor = history.cursor;
-            },
-            CopilotRetraction::Unsent => unreachable!(),
-        };
-        let result = session.rpc().history().truncate(HistoryTruncateRequest { event_id }).await
+        if matches!(target, CopilotRetraction::Unsent) {
+            return Ok(true);
+        }
+        let session = self
+            .active_session(session_id)
+            .await
+            .context("Copilot session is missing for rewind")?;
+        let event_id =
+            match target {
+                CopilotRetraction::Event(event_id) => event_id,
+                CopilotRetraction::History(mut cursor) => loop {
+                    let history = session
+                        .rpc()
+                        .event_log()
+                        .read(EventLogReadRequest {
+                            cursor: Some(cursor.clone()),
+                            agent_scope: Some(EventsAgentScope::Primary),
+                            types: Some(json!(["user.message"])),
+                            max: Some(1),
+                            wait_ms: Some(0),
+                        })
+                        .await
+                        .context("verify cancelled Copilot submission in native history")?;
+                    anyhow::ensure!(
+                        history.cursor_status == EventsCursorStatus::Ok,
+                        "Copilot rewind history boundary expired"
+                    );
+                    if let Some(event) = history.events.into_iter().find(|event| {
+                        event.agent_id.is_none() && event.event_type == "user.message"
+                    }) {
+                        break event.id;
+                    }
+                    if !history.has_more {
+                        turn_event.finish_retraction()?;
+                        return Ok(true);
+                    }
+                    anyhow::ensure!(
+                        history.cursor != cursor,
+                        "Copilot rewind history cursor did not advance"
+                    );
+                    cursor = history.cursor;
+                },
+                CopilotRetraction::Unsent => unreachable!(),
+            };
+        let result = session
+            .rpc()
+            .history()
+            .truncate(HistoryTruncateRequest { event_id })
+            .await
             .context("rewind output-free Copilot turn")?;
-        anyhow::ensure!(result.events_removed > 0, "Copilot rewind removed no history events");
+        anyhow::ensure!(
+            result.events_removed > 0,
+            "Copilot rewind removed no history events"
+        );
         turn_event.finish_retraction()?;
         Ok(true)
     }
@@ -1377,8 +1844,13 @@ fn default_model_descriptor() -> BackendModel {
 
 fn mcp_launch_request(name: &str, payload: &Value) -> McpStartServerRequest {
     let mut config = payload.clone();
-    if config.get("tools").is_none() { config["tools"] = json!(["*"]); }
-    McpStartServerRequest { server_name: name.to_owned(), config }
+    if config.get("tools").is_none() {
+        config["tools"] = json!(["*"]);
+    }
+    McpStartServerRequest {
+        server_name: name.to_owned(),
+        config,
+    }
 }
 
 fn selected_reasoning_effort(
@@ -1471,18 +1943,23 @@ impl ControlToolRouter {
             (active_sender, admission, runtime)
         };
         {
-            let sender = self.sender.lock()
+            let sender = self
+                .sender
+                .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot control-tool router lock poisoned"))?;
-            anyhow::ensure!(sender.as_ref().is_some_and(|current| current.same_channel(&active_sender)),
-                "Copilot control-tool invocation belongs to a collected turn");
+            anyhow::ensure!(
+                sender
+                    .as_ref()
+                    .is_some_and(|current| current.same_channel(&active_sender)),
+                "Copilot control-tool invocation belongs to a collected turn"
+            );
         }
         let outcome = runtime.execute(invocation.clone()).await?;
         let execution_finished = outcome.execution_finished;
         let result = outcome.result;
-        let failure_json = result
-            .as_ref()
-            .err()
-            .map(|error| control_tool_failure_json(&invocation, error, outcome.plan_document.as_ref()));
+        let failure_json = result.as_ref().err().map(|error| {
+            control_tool_failure_json(&invocation, error, outcome.plan_document.as_ref())
+        });
         let sender_guard = self
             .sender
             .lock()
@@ -1503,7 +1980,9 @@ impl ControlToolRouter {
             }
         };
         let Some(accepted) = result.invocation else {
-            if execution_finished { admission.send(invocation); }
+            if execution_finished {
+                admission.send(invocation);
+            }
             return Ok(result.message);
         };
         let invocation = accepted;
@@ -1513,14 +1992,21 @@ impl ControlToolRouter {
 
     async fn close(&self) -> Result<()> {
         let runtime = self.cancel()?;
-        if let Some(runtime) = runtime { runtime.close().await; }
+        if let Some(runtime) = runtime {
+            runtime.close().await;
+        }
         Ok(())
     }
 
     fn cancel(&self) -> Result<Option<Arc<ControlToolExecutor>>> {
-        let runtime = self.runtime.lock()
-            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?.clone();
-        if let Some(runtime) = &runtime { runtime.cancel(); }
+        let runtime = self
+            .runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot control-tool runtime lock poisoned"))?
+            .clone();
+        if let Some(runtime) = &runtime {
+            runtime.cancel();
+        }
         Ok(runtime)
     }
 }
@@ -1545,7 +2031,9 @@ impl Drop for ControlToolStream {
         if let Ok(mut sender) = self.router.sender.lock() {
             *sender = None;
             if let Ok(mut runtime) = self.router.runtime.lock() {
-                if let Some(runtime) = runtime.take() { runtime.cancel(); }
+                if let Some(runtime) = runtime.take() {
+                    runtime.cancel();
+                }
             }
         }
     }
@@ -1595,7 +2083,7 @@ impl CopilotPermissionContext {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
                 checkpoint: None,
-                owner:None,
+                owner: None,
                 execution_mode: PermissionMode::Read,
                 workspace: ".".into(),
                 event_sink: None,
@@ -1605,7 +2093,7 @@ impl CopilotPermissionContext {
 
     fn configure(
         &self,
-        owner:crate::backend::ExecutionOwner,
+        owner: crate::backend::ExecutionOwner,
         execution_mode: PermissionMode,
         workspace: String,
         event_sink: Option<BackendEventSink>,
@@ -1616,7 +2104,7 @@ impl CopilotPermissionContext {
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))? =
             CopilotPermissionState {
                 checkpoint: None,
-                owner:Some(owner),
+                owner: Some(owner),
                 execution_mode,
                 workspace,
                 event_sink,
@@ -1640,18 +2128,24 @@ impl github_copilot_sdk::hooks::SessionHooks for CopilotCheckpointHooks {
         _input: github_copilot_sdk::hooks::PreToolUseInput,
         _context: github_copilot_sdk::hooks::HookContext,
     ) -> Option<github_copilot_sdk::hooks::PreToolUseOutput> {
-        let checkpoint = self.context.state.lock().map(|state|state.checkpoint.clone())
-            .map_err(|_|anyhow::anyhow!("Copilot checkpoint context lock poisoned"));
+        let checkpoint = self
+            .context
+            .state
+            .lock()
+            .map(|state| state.checkpoint.clone())
+            .map_err(|_| anyhow::anyhow!("Copilot checkpoint context lock poisoned"));
         let result = match checkpoint {
             Ok(Some(gate)) => gate.wait().await,
             Ok(None) => Ok(()),
             Err(error) => Err(error),
         };
-        result.err().map(|error|github_copilot_sdk::hooks::PreToolUseOutput {
-            permission_decision: Some("deny".into()),
-            permission_decision_reason: Some(format!("{error:#}")),
-            ..Default::default()
-        })
+        result
+            .err()
+            .map(|error| github_copilot_sdk::hooks::PreToolUseOutput {
+                permission_decision: Some("deny".into()),
+                permission_decision_reason: Some(format!("{error:#}")),
+                ..Default::default()
+            })
     }
 }
 
@@ -1727,9 +2221,11 @@ fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
 mod test {
     #[test]
     fn main_agent_idle_finishes_without_waiting_for_background_session_idle() {
-        let mut event: github_copilot_sdk::SessionEvent = serde_json::from_value(serde_json::json!({
-            "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
-        })).unwrap();
+        let mut event: github_copilot_sdk::SessionEvent =
+            serde_json::from_value(serde_json::json!({
+                "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
+            }))
+            .unwrap();
         assert!(super::completes_exchange(&event));
         event.agent_id = Some("child".into());
         assert!(!super::completes_exchange(&event));
@@ -1820,10 +2316,7 @@ mod test {
             })
             .await
             .unwrap();
-        assert_eq!(
-            stream.receive().await.unwrap().name,
-            "goal_complete"
-        );
+        assert_eq!(stream.receive().await.unwrap().name, "goal_complete");
     }
 
     #[tokio::test]
@@ -1834,12 +2327,14 @@ mod test {
         context.checkpoint = Some(crate::checkpoint::ToolGate::new()?);
         let mut stream = router.activate(context)?;
         let mut pending = Box::pin(router.route(ControlToolInvocation {
-            name: "goal_complete".into(), arguments: json!({"summary":"complete"}),
+            name: "goal_complete".into(),
+            arguments: json!({"summary":"complete"}),
         }));
         assert!(futures_util::poll!(pending.as_mut()).is_pending());
         let (outcome, closed) = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             tokio::join!(pending, router.close())
-        }).await?;
+        })
+        .await?;
         closed?;
         assert!(outcome.unwrap_err().is::<crate::broker::TurnCancelled>());
         assert!(stream.try_receive().is_err());
@@ -1847,8 +2342,12 @@ mod test {
         let mut replacement = ControlTurnContext::inactive(PromptMode::Chat);
         replacement.has_active_goal = true;
         let mut stream = router.activate(replacement)?;
-        router.route(ControlToolInvocation { name: "goal_complete".into(),
-            arguments: json!({"summary":"replacement"}) }).await?;
+        router
+            .route(ControlToolInvocation {
+                name: "goal_complete".into(),
+                arguments: json!({"summary":"replacement"}),
+            })
+            .await?;
         assert_eq!(stream.receive().await.unwrap().name, "goal_complete");
         Ok(())
     }
@@ -1912,10 +2411,7 @@ mod test {
         for _ in 0..31 {
             assert_eq!(stream.receive().await.unwrap().name, "goal_status");
         }
-        assert_eq!(
-            stream.receive().await.unwrap().name,
-            "goal_complete"
-        );
+        assert_eq!(stream.receive().await.unwrap().name, "goal_complete");
         assert!(stream.try_receive().is_err());
     }
 
@@ -2031,7 +2527,10 @@ mod test {
             Some(ContextTier::LongContext)
         ));
         for context in [None, Some("unknown")] {
-            assert_eq!(model_options(None, context).reasoning_summary, Some(ReasoningSummary::Concise));
+            assert_eq!(
+                model_options(None, context).reasoning_summary,
+                Some(ReasoningSummary::Concise)
+            );
         }
     }
 

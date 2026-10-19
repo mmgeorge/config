@@ -324,15 +324,9 @@ fn refresh_invalidates_old_region_revision_and_refuses_dirty_text() {
 
 #[test]
 fn save_admission_and_retired_identity_preserve_fields() {
-    let limits = EditLimits {
-        pending_saves: 1,
-    };
-    let mut store = EditStore::new(
-        DocumentId("review".into()),
-        limits,
-        EditBudget::default(),
-    )
-    .unwrap();
+    let limits = EditLimits { pending_saves: 1 };
+    let mut store =
+        EditStore::new(DocumentId("review".into()), limits, EditBudget::default()).unwrap();
     store
         .insert(region(), RegionRevision(0), "old".into())
         .unwrap();
@@ -355,7 +349,9 @@ fn save_admission_and_retired_identity_preserve_fields() {
         .insert(other.clone(), RegionRevision(0), "".into())
         .unwrap();
     store.remove(&other).unwrap();
-    store.insert(RegionId("third".into()), RegionRevision(0), "".into()).unwrap();
+    store
+        .insert(RegionId("third".into()), RegionRevision(0), "".into())
+        .unwrap();
 }
 
 #[test]
@@ -500,8 +496,14 @@ fn explicit_capture_preserves_complete_large_fields() {
         RegionRevision(1)
     );
     assert_eq!(store.snapshot(&title).unwrap().revision, RegionRevision(1));
-    assert_eq!(store.snapshot(&title).unwrap().text, "replacement".repeat(2 * 1024 * 1024));
-    assert_eq!(budget.retained_bytes(), 8 + 4 + "replacement".len() * 2 * 1024 * 1024);
+    assert_eq!(
+        store.snapshot(&title).unwrap().text,
+        "replacement".repeat(2 * 1024 * 1024)
+    );
+    assert_eq!(
+        budget.retained_bytes(),
+        8 + 4 + "replacement".len() * 2 * 1024 * 1024
+    );
 }
 
 #[test]
@@ -509,13 +511,18 @@ fn prepared_capture_abort_preserves_fields_and_releases_reserved_text() {
     let budget = EditBudget::default();
     let mut store = store(&budget);
     let retained = budget.retained_bytes();
-    let captured = store.prepare_capture(vec![RegionEdit {
-        document: DocumentId("review".into()),
-        region: region(),
-        base: RegionRevision(0),
-        sequence: EditSequence(1),
-        text: "candidate body".into(),
-    }], &[]).unwrap();
+    let captured = store
+        .prepare_capture(
+            vec![RegionEdit {
+                document: DocumentId("review".into()),
+                region: region(),
+                base: RegionRevision(0),
+                sequence: EditSequence(1),
+                text: "candidate body".into(),
+            }],
+            &[],
+        )
+        .unwrap();
     let proposed = captured.snapshot(&region()).unwrap();
     assert_eq!(proposed.text, "candidate body");
     assert_eq!(proposed.baseline, "old");
@@ -523,7 +530,10 @@ fn prepared_capture_abort_preserves_fields_and_releases_reserved_text() {
     assert_eq!(budget.retained_bytes(), retained + "candidate body".len());
     drop(captured);
     assert_eq!(store.snapshot(&region()).unwrap().text, "old");
-    assert_eq!(store.snapshot(&region()).unwrap().revision, RegionRevision(0));
+    assert_eq!(
+        store.snapshot(&region()).unwrap().revision,
+        RegionRevision(0)
+    );
     assert_eq!(budget.retained_bytes(), retained);
 }
 
@@ -538,7 +548,10 @@ fn merge_conflict_retains_replacement_versions() {
         MergeOutcome::Conflict
     );
     assert_eq!(budget.retained_bytes(), 14);
-    assert_eq!(store.merge(&region(), "replacement".into()).unwrap(), MergeOutcome::Conflict);
+    assert_eq!(
+        store.merge(&region(), "replacement".into()).unwrap(),
+        MergeOutcome::Conflict
+    );
     let snapshot = store.snapshot(&region()).unwrap();
     assert_eq!(
         (snapshot.text, snapshot.baseline, snapshot.remote),

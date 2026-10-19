@@ -97,7 +97,11 @@ struct ObjectRows {
 }
 
 /// Construct one bounded prompt for every comparison and provider route.
-pub(super) async fn prompt(files: &mut [ChangedFile], syntax: &Arc<SyntaxEngine>, limit: usize) -> String {
+pub(super) async fn prompt(
+    files: &mut [ChangedFile],
+    syntax: &Arc<SyntaxEngine>,
+    limit: usize,
+) -> String {
     files.sort_by(|left, right| {
         test_path(&left.path)
             .cmp(&test_path(&right.path))

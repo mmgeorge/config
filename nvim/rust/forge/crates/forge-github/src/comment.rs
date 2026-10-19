@@ -146,10 +146,7 @@ impl CommentState {
                     .starts_with(&prefix.to_ascii_lowercase()),
             "comment observation belongs to another PR"
         );
-        ensure!(
-            !self.body.contains('\0'),
-            "comment body contains NUL"
-        );
+        ensure!(!self.body.contains('\0'), "comment body contains NUL");
         Ok(())
     }
 }

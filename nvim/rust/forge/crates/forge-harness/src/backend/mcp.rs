@@ -70,8 +70,13 @@ impl McpDiscovery {
                 return Ok(Vec::new());
             }
             for server in &mut self.servers {
-                if server.enabled && !matches!(server.status, McpStatus::Failed | McpStatus::NeedsAuthentication)
-                    && !(server.status == McpStatus::Unavailable && server.status_detail.is_some()) {
+                if server.enabled
+                    && !matches!(
+                        server.status,
+                        McpStatus::Failed | McpStatus::NeedsAuthentication
+                    )
+                    && !(server.status == McpStatus::Unavailable && server.status_detail.is_some())
+                {
                     server.status = McpStatus::Loading;
                 }
             }
@@ -103,18 +108,25 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for DiscoveryBackend {
-        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
 
         async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
             anyhow::bail!("backend cannot confirm execution cleanup")
         }
 
-        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
 
-        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
 
-        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
-
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
 
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor {
@@ -149,8 +161,9 @@ mod test {
 
     fn server(name: &str, status: McpStatus) -> McpDefinition {
         McpDefinition {
-            scope:None, source_path:None,
-            resource_id:None,
+            scope: None,
+            source_path: None,
+            resource_id: None,
             name: name.into(),
             transport: "stdio".into(),
             enabled: true,
@@ -193,13 +206,17 @@ mod test {
     #[tokio::test]
     async fn known_credential_failure_stays_unavailable_while_other_servers_load() {
         let backend = Arc::new(DiscoveryBackend {
-            release: Notify::new(), calls: AtomicUsize::new(0),
+            release: Notify::new(),
+            calls: AtomicUsize::new(0),
             unavailable_reason: Some("credential reference is unset"),
         });
         let mut discovery = McpDiscovery::default();
         let rows = discovery.snapshot(backend, request()).await.unwrap();
         assert_eq!(rows[0].status, McpStatus::Unavailable);
-        assert_eq!(rows[0].status_detail.as_deref(), Some("credential reference is unset"));
+        assert_eq!(
+            rows[0].status_detail.as_deref(),
+            Some("credential reference is unset")
+        );
         assert_eq!(rows[1].status, McpStatus::Loading);
     }
 

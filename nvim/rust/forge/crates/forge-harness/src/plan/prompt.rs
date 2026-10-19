@@ -16,9 +16,17 @@ pub enum PlanExecutionPromptKind {
 impl PlanPrompt {
     /// Include persisted user edits when a provider accepts, revises, or resumes a reviewed plan.
     pub(crate) fn with_manual_changes(prompt: String, changes: &[String]) -> String {
-        if changes.is_empty() { return prompt; }
-        format!("{prompt}\n\nManual plan edits recorded during review:\n{}\nThe current canonical plan determines which edits remain after the review decision. When acknowledging the review decision, state these manual changes.",
-            changes.iter().map(|change| format!("- {change}")).collect::<Vec<_>>().join("\n"))
+        if changes.is_empty() {
+            return prompt;
+        }
+        format!(
+            "{prompt}\n\nManual plan edits recorded during review:\n{}\nThe current canonical plan determines which edits remain after the review decision. When acknowledging the review decision, state these manual changes.",
+            changes
+                .iter()
+                .map(|change| format!("- {change}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        )
     }
 
     /// Build a decision-complete planning request for one user objective.
@@ -96,14 +104,24 @@ Review comments:
         document_json: &str,
     ) -> String {
         let continuation = match kind {
-            PlanExecutionPromptKind::Start => "Start the Execute task for this accepted plan. Inspect the current workspace before implementation.",
-            PlanExecutionPromptKind::Continue => "Continue the same Execute task at the persisted phase below. Reuse confirmed work and check whether existing evidence still applies.",
-            PlanExecutionPromptKind::ResumeAfterInterruption => "Resume the same Execute task after interruption. Preserve its plan, accepted revision, and phase. Inspect current files, completed tool results, and any background commands before retrying unfinished work. Do not assume interruption rolled back changes or stopped a command.",
+            PlanExecutionPromptKind::Start => {
+                "Start the Execute task for this accepted plan. Inspect the current workspace before implementation."
+            }
+            PlanExecutionPromptKind::Continue => {
+                "Continue the same Execute task at the persisted phase below. Reuse confirmed work and check whether existing evidence still applies."
+            }
+            PlanExecutionPromptKind::ResumeAfterInterruption => {
+                "Resume the same Execute task after interruption. Preserve its plan, accepted revision, and phase. Inspect current files, completed tool results, and any background commands before retrying unfinished work. Do not assume interruption rolled back changes or stopped a command."
+            }
         };
         format!(
             "{continuation}\nExecution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nReviewer approval comments (context only, not plan edits):\n{}\nAccepted semantic design:\n{}",
-            execution.id, execution.plan_id, execution.instructions(),
-            execution.findings.join("\n"), execution.approval_comments.join("\n"), document_json
+            execution.id,
+            execution.plan_id,
+            execution.instructions(),
+            execution.findings.join("\n"),
+            execution.approval_comments.join("\n"),
+            document_json
         )
     }
 
@@ -197,19 +215,35 @@ mod test {
     fn planning_patch_example_applies_to_virtual_declarations() {
         let workspace = tempfile::tempdir().unwrap();
         let contract = PLANNING_CONTRACT.replace("\r\n", "\n");
-        let examples = contract.split("```text\n").skip(1)
+        let examples = contract
+            .split("```text\n")
+            .skip(1)
             .map(|part| part.split_once("\n```").unwrap().0)
-            .filter(|example| example.starts_with("*** Begin Patch\n")).collect::<Vec<_>>();
+            .filter(|example| example.starts_with("*** Begin Patch\n"))
+            .collect::<Vec<_>>();
         let example = examples.last().unwrap();
         let mut design = crate::plan::DeclarationDesign::default();
         design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
-        let described = design.patch(workspace.path(), &Default::default(), examples[0]).unwrap();
-        assert!(described.document.usage.as_deref().is_some_and(|usage| !usage.is_empty()));
+        let described = design
+            .patch(workspace.path(), &Default::default(), examples[0])
+            .unwrap();
+        assert!(
+            described
+                .document
+                .usage
+                .as_deref()
+                .is_some_and(|usage| !usage.is_empty())
+        );
         assert!(!described.document.objective.is_empty());
-        let changed = described.patch(workspace.path(), &Default::default(), example).unwrap();
+        let changed = described
+            .patch(workspace.path(), &Default::default(), example)
+            .unwrap();
         assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));
-        assert!(changed.proposed["src/textures.rs"].contains("pub fn cancel(request: RequestId) -> bool;"));
-        assert_eq!(design.baseline,changed.baseline);
+        assert!(
+            changed.proposed["src/textures.rs"]
+                .contains("pub fn cancel(request: RequestId) -> bool;")
+        );
+        assert_eq!(design.baseline, changed.baseline);
     }
 
     #[test]
@@ -255,5 +289,4 @@ mod test {
         assert!(!prompt.contains("Harness Plan task"));
         assert!(prompt.contains("question_answer"));
     }
-
 }

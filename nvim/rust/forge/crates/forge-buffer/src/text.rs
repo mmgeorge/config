@@ -3,8 +3,8 @@
 use std::ops::Range;
 use std::sync::Arc;
 
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde::ser::SerializeSeq;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 use crate::ContractError;
 
@@ -33,7 +33,9 @@ impl BufferText {
             result.text.push_str(row);
             result.text.push('\n');
         }
-        Ok(Self { storage: Arc::new(result) })
+        Ok(Self {
+            storage: Arc::new(result),
+        })
     }
 
     pub fn row_count(&self) -> usize {
@@ -46,13 +48,15 @@ impl BufferText {
 
     /// Charge the full retained storage even when immutable snapshots share it.
     pub fn allocated_bytes(&self) -> usize {
-        self.storage.text.capacity() + self.storage.row_offset.capacity() * std::mem::size_of::<usize>()
+        self.storage.text.capacity()
+            + self.storage.row_offset.capacity() * std::mem::size_of::<usize>()
     }
 
     pub fn row(&self, row: usize) -> Option<&str> {
         let start = *self.storage.row_offset.get(row)?;
         let end = self
-            .storage.row_offset
+            .storage
+            .row_offset
             .get(row + 1)
             .copied()
             .unwrap_or(self.storage.text.len());
@@ -97,7 +101,10 @@ mod tests {
         let source = BufferText::from_rows(["x".repeat(2 * 1024 * 1024), String::new()]).unwrap();
         let snapshot = source.clone();
         assert!(Arc::ptr_eq(&source.storage, &snapshot.storage));
-        assert_eq!(source.row(0).unwrap().as_ptr(), snapshot.row(0).unwrap().as_ptr());
+        assert_eq!(
+            source.row(0).unwrap().as_ptr(),
+            snapshot.row(0).unwrap().as_ptr()
+        );
         let replacement = BufferText::from_rows(["replacement"]).unwrap();
         drop(source);
         assert_eq!(snapshot.row_count(), 2);

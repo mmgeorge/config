@@ -32,7 +32,9 @@ pub enum ReviewAnnotationKind {
 }
 
 impl ReviewAnnotationKind {
-    fn is_comment(&self) -> bool { *self == Self::Comment }
+    fn is_comment(&self) -> bool {
+        *self == Self::Comment
+    }
 }
 
 /// Binds a persisted answer to the exact question text it answered.
@@ -104,12 +106,12 @@ impl ReviewAnnotationStore {
     }
 
     /// Rebuild display ranges from saved semantic targets.
-    pub(crate) fn reanchor(
-        &mut self,
-        current: &super::PlanNavigationIndex,
-    ) -> Result<()> {
+    pub(crate) fn reanchor(&mut self, current: &super::PlanNavigationIndex) -> Result<()> {
         for annotation in &mut self.annotation {
-            let anchor = annotation.anchor.as_ref().context("plan comment has no saved semantic anchor")?;
+            let anchor = annotation
+                .anchor
+                .as_ref()
+                .context("plan comment has no saved semantic anchor")?;
             let start = find_target(current, &anchor.start)
                 .context("comment start is absent from the formatted design")?;
             let end = find_target(current, &anchor.end)
@@ -207,39 +209,65 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
             "plan annotation contains NUL"
         );
         if let Some(parent_id) = &annotation.parent_id {
-            ensure!(identities.contains(parent_id) && parent_id != &annotation.id,
-                "annotation parent must precede its follow-up");
+            ensure!(
+                identities.contains(parent_id) && parent_id != &annotation.id,
+                "annotation parent must precede its follow-up"
+            );
         }
         if let Some(reply) = &annotation.reply {
-            ensure!(annotation.kind == ReviewAnnotationKind::Question
-                && reply.question_body == annotation.source.body
-                && !reply.body.trim().is_empty()
-                && !reply.body.contains('\0'), "invalid plan question reply");
+            ensure!(
+                annotation.kind == ReviewAnnotationKind::Question
+                    && reply.question_body == annotation.source.body
+                    && !reply.body.trim().is_empty()
+                    && !reply.body.contains('\0'),
+                "invalid plan question reply"
+            );
         }
     }
     for item in annotation {
         if let Some(parent_id) = &item.parent_id {
-            let parent = annotation.iter().find(|parent| &parent.id == parent_id).expect("validated parent");
-            ensure!(parent.source.start_line == item.source.start_line
-                && parent.source.end_line == item.source.end_line,
-                "follow-up must retain its parent's source range");
+            let parent = annotation
+                .iter()
+                .find(|parent| &parent.id == parent_id)
+                .expect("validated parent");
+            ensure!(
+                parent.source.start_line == item.source.start_line
+                    && parent.source.end_line == item.source.end_line,
+                "follow-up must retain its parent's source range"
+            );
         }
     }
     Ok(())
 }
 
 /// Render only this conversation in saved order, including authoritative model replies.
-pub(crate) fn thread_context(annotation: &[ReviewAnnotation], selected: &ReviewAnnotation) -> String {
-    fn root<'annotation>(annotation: &'annotation [ReviewAnnotation], mut item: &'annotation ReviewAnnotation) -> &'annotation str {
+pub(crate) fn thread_context(
+    annotation: &[ReviewAnnotation],
+    selected: &ReviewAnnotation,
+) -> String {
+    fn root<'annotation>(
+        annotation: &'annotation [ReviewAnnotation],
+        mut item: &'annotation ReviewAnnotation,
+    ) -> &'annotation str {
         while let Some(parent_id) = &item.parent_id {
-            item = annotation.iter().find(|parent| &parent.id == parent_id).expect("validated parent");
+            item = annotation
+                .iter()
+                .find(|parent| &parent.id == parent_id)
+                .expect("validated parent");
         }
         &item.id
     }
     let selected_root = root(annotation, selected);
     let mut context = String::new();
-    for item in annotation.iter().filter(|item| root(annotation, item) == selected_root) {
-        let heading = if item.kind == ReviewAnnotationKind::Question { "Plan question" } else { "Plan comment" };
+    for item in annotation
+        .iter()
+        .filter(|item| root(annotation, item) == selected_root)
+    {
+        let heading = if item.kind == ReviewAnnotationKind::Question {
+            "Plan question"
+        } else {
+            "Plan comment"
+        };
         context.push_str(&format!("{heading}:\n{}\n\n", item.source.body));
         if let Some(reply) = &item.reply {
             context.push_str(&format!("Plan answer:\n{}\n\n", reply.body));
@@ -311,9 +339,9 @@ mod tests {
         let mut first = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let mut stale = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let annotation = vec![ReviewAnnotation {
-                parent_id: None,
-                kind: Default::default(),
-                reply: None,
+            parent_id: None,
+            kind: Default::default(),
+            reply: None,
             anchor: None,
             id: "comment".into(),
             source: PlanAnnotationInput {
@@ -340,18 +368,26 @@ mod tests {
         let checksum = digest(b"canonical");
         let body = "question".repeat(150_000);
         let reply = "answer".repeat(4096);
-        let mut annotations = (0..65).map(|index| ReviewAnnotation {
-            id: format!("comment-{index}"),
-            parent_id: None,
-            source: PlanAnnotationInput { start_line: 1, end_line: 1, body: "comment".into() },
-            anchor: None,
-            kind: ReviewAnnotationKind::Comment,
-            reply: None,
-        }).collect::<Vec<_>>();
+        let mut annotations = (0..65)
+            .map(|index| ReviewAnnotation {
+                id: format!("comment-{index}"),
+                parent_id: None,
+                source: PlanAnnotationInput {
+                    start_line: 1,
+                    end_line: 1,
+                    body: "comment".into(),
+                },
+                anchor: None,
+                kind: ReviewAnnotationKind::Comment,
+                reply: None,
+            })
+            .collect::<Vec<_>>();
         annotations[0].source.body = body.clone();
         annotations[0].kind = ReviewAnnotationKind::Question;
         annotations[0].reply = Some(ReviewQuestionReply {
-            question_body: body.clone(), body: reply.clone(), duration_ms: None,
+            question_body: body.clone(),
+            body: reply.clone(),
+            duration_ms: None,
         });
         let mut store = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         store.replace(annotations).unwrap();
@@ -393,13 +429,11 @@ pub(crate) fn resolve_annotations(
                 .range(input.start_line..=input.end_line)
                 .map(|(_, anchor)| *anchor)
                 .filter(|anchor| seen_path.insert(anchor.json_path.clone()))
-                .map(|anchor| {
-                    crate::plan::PlanAnnotationSubject {
-                        target: anchor.target.clone(),
-                        json_path: anchor.json_path.clone(),
-                        label: anchor.label.clone(),
-                        path: anchor.path.clone(),
-                    }
+                .map(|anchor| crate::plan::PlanAnnotationSubject {
+                    target: anchor.target.clone(),
+                    json_path: anchor.json_path.clone(),
+                    label: anchor.label.clone(),
+                    path: anchor.path.clone(),
                 })
                 .collect::<Vec<_>>();
             anyhow::ensure!(
@@ -462,7 +496,12 @@ mod subject_tests {
         assert_eq!(resolved[0].subject.len(), 4097);
         rendered.navigation.anchor.truncate(1);
         rendered.navigation.anchor[0].label = "x".repeat(1024 * 1024);
-        assert_eq!(resolve_annotations(&rendered, input(1)).unwrap()[0].subject[0].label.len(), 1024 * 1024);
+        assert_eq!(
+            resolve_annotations(&rendered, input(1)).unwrap()[0].subject[0]
+                .label
+                .len(),
+            1024 * 1024
+        );
         rendered.navigation.anchor.clear();
         assert!(
             resolve_annotations(&rendered, input(1))

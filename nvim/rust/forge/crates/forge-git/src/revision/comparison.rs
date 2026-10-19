@@ -53,17 +53,18 @@ pub async fn observe(
     request: ComparisonRequest,
 ) -> Result<RepositoryRead<ComparisonObservation>> {
     ensure!(
-        !request.reference.is_empty()
-            && !request.reference.chars().any(char::is_control),
+        !request.reference.is_empty() && !request.reference.chars().any(char::is_control),
         "invalid comparison reference"
     );
     ensure!(
         request.head.as_ref().is_none_or(|head| !request.worktree
-            && !head.is_empty() && !head.chars().any(char::is_control)),
+            && !head.is_empty()
+            && !head.chars().any(char::is_control)),
         "invalid comparison head"
     );
     let path = request.path.as_ref().map(resolve_argument).transpose()?;
-    let retained = request.reference.capacity() + request.head.as_ref().map_or(0, String::capacity)
+    let retained = request.reference.capacity()
+        + request.head.as_ref().map_or(0, String::capacity)
         + request
             .path
             .as_ref()
@@ -96,13 +97,21 @@ pub async fn observe(
                 .rev_parse_single(spec.as_str())
                 .context("comparison reference unavailable")?
                 .detach();
-            let head = request.head.as_ref().map(|head| {
-                local.rev_parse_single(format!("{head}^{{commit}}").as_str())
-                    .map(|resolved| resolved.detach())
-                    .context("comparison head unavailable")
-            }).transpose()?;
+            let head = request
+                .head
+                .as_ref()
+                .map(|head| {
+                    local
+                        .rev_parse_single(format!("{head}^{{commit}}").as_str())
+                        .map(|resolved| resolved.detach())
+                        .context("comparison head unavailable")
+                })
+                .transpose()?;
             let baseline = if let Some(head) = head {
-                local.merge_base(commit, head).context("comparison branches have no merge base")?.detach()
+                local
+                    .merge_base(commit, head)
+                    .context("comparison branches have no merge base")?
+                    .detach()
             } else {
                 commit
             };
@@ -181,13 +190,13 @@ pub async fn observe(
             }
             if head.is_none() {
                 crate::snapshot::collect_line_stats(
-                &local,
-                &worker.identity,
-                &mut path,
-                Some(&analysis),
-                Some(&worker.line_stats),
-                skip_line_stats,
-                &mut check,
+                    &local,
+                    &worker.identity,
+                    &mut path,
+                    Some(&analysis),
+                    Some(&worker.line_stats),
+                    skip_line_stats,
+                    &mut check,
                 )?;
             }
             for observed in &mut path {
@@ -340,7 +349,11 @@ mod tests {
             git(&["config", "user.email", "forge@example.invalid"]);
             git(&["config", "core.autocrlf", "false"]);
             let binary = scenario == "binary";
-            let original: &[u8] = if binary { b"original\0bytes" } else { b"original\n" };
+            let original: &[u8] = if binary {
+                b"original\0bytes"
+            } else {
+                b"original\n"
+            };
             std::fs::write(root.join("shared.txt"), original).unwrap();
             git(&["add", "."]);
             git(&["commit", "--quiet", "-m", "initial"]);
@@ -368,15 +381,34 @@ mod tests {
             let index_before = std::fs::read(root.join(".git/index")).unwrap();
             let store = RepositoryStore::default();
             let repository = store.open(root.to_owned()).await.unwrap().unwrap();
-            let failure = observe(&store, repository, ComparisonRequest {
-                reference: "main".into(), head: Some("feature".into()), worktree: false, path: None,
-            }).await.err().expect("conflicting range was accepted");
+            let failure = observe(
+                &store,
+                repository,
+                ComparisonRequest {
+                    reference: "main".into(),
+                    head: Some("feature".into()),
+                    worktree: false,
+                    path: None,
+                },
+            )
+            .await
+            .err()
+            .expect("conflicting range was accepted");
             assert!(failure.is::<MergeConflict>(), "{scenario}: {failure:#}");
             assert_eq!(git(&["rev-parse", "HEAD"]), head_before);
             assert_eq!(git(&["status", "--porcelain=v2"]), status_before);
-            assert_eq!(std::fs::read(root.join(".git/index")).unwrap(), index_before);
-            assert_eq!(std::fs::read(root.join("staged.txt")).unwrap(), b"staged contents\n");
-            assert_eq!(std::fs::read(root.join("untracked.txt")).unwrap(), b"untracked contents\n");
+            assert_eq!(
+                std::fs::read(root.join(".git/index")).unwrap(),
+                index_before
+            );
+            assert_eq!(
+                std::fs::read(root.join("staged.txt")).unwrap(),
+                b"staged contents\n"
+            );
+            assert_eq!(
+                std::fs::read(root.join("untracked.txt")).unwrap(),
+                b"untracked contents\n"
+            );
         }
     }
 

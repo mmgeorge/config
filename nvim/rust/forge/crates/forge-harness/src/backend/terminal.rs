@@ -80,9 +80,13 @@ mod tests {
 
     #[test]
     fn terminal_inventory_preserves_every_provider_record() {
-        let rows = (0..1025).map(|index| json!({
-            "processId": format!("process-{index}"), "command": "printf complete",
-        })).collect::<Vec<_>>();
+        let rows = (0..1025)
+            .map(|index| {
+                json!({
+                    "processId": format!("process-{index}"), "command": "printf complete",
+                })
+            })
+            .collect::<Vec<_>>();
         let snapshot = TerminalSnapshot::parse(&json!({"data":rows}), false).unwrap();
         assert_eq!(snapshot.terminal.len(), 1025);
         assert_eq!(snapshot.terminal[1024].id, "process-1024");
@@ -92,8 +96,10 @@ mod tests {
     fn terminal_inventory_preserves_large_commands() {
         let command = "retained-command ".repeat(2049).trim_end().to_owned();
         let snapshot = TerminalSnapshot::parse(
-            &json!({"data":[{"processId":"1","command":command}]}), false,
-        ).unwrap();
+            &json!({"data":[{"processId":"1","command":command}]}),
+            false,
+        )
+        .unwrap();
         assert_eq!(snapshot.terminal[0].command, command);
     }
 

@@ -40,8 +40,7 @@ impl HarnessBroker {
                 self.store
                     .save_execution_transition(&execution, &goal, None, None, None)?;
                 if let Some(run) = execution.check_runs.last().cloned() {
-                    self.publish_check_run(&mut execution, &run)
-                        .await?;
+                    self.publish_check_run(&mut execution, &run).await?;
                 }
             }
         }
@@ -93,7 +92,9 @@ impl HarnessBroker {
         let overrides = self.check_runner.overrides(task_id.as_deref())?;
         let mut snapshot = crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace))?;
         for definition in &mut snapshot.config.definitions {
-            if let Some(auto) = overrides.auto.get(&definition.id) { definition.auto = *auto; }
+            if let Some(auto) = overrides.auto.get(&definition.id) {
+                definition.auto = *auto;
+            }
             if let Some(scope) = overrides.scopes.get(&definition.id) {
                 definition.scope = *scope;
             }
@@ -120,16 +121,32 @@ impl HarnessBroker {
                     })
             })
             .collect();
-        let new_cases = design.document.tests.iter().flat_map(|file| {
-            file.cases.iter().filter(|case| case.change == crate::plan::DesignTestChange::New)
-                .map(|case| crate::checks::CheckCase { file: file.file.clone(), name: case.name.clone(), target: case.target.clone() })
-        }).collect();
+        let new_cases = design
+            .document
+            .tests
+            .iter()
+            .flat_map(|file| {
+                file.cases
+                    .iter()
+                    .filter(|case| case.change == crate::plan::DesignTestChange::New)
+                    .map(|case| crate::checks::CheckCase {
+                        file: file.file.clone(),
+                        name: case.name.clone(),
+                        target: case.target.clone(),
+                    })
+            })
+            .collect();
         let mut enabled = overrides.enabled;
-        for id in &design.document.disabled_checks { enabled.insert(id.clone(), false); }
+        for id in &design.document.disabled_checks {
+            enabled.insert(id.clone(), false);
+        }
         let mut run = self.check_runner.prepare(
             snapshot,
             crate::checks::CheckAdmission {
-                request: crate::checks::RunRequest { include: design.document.checks.clone(), ..Default::default() },
+                request: crate::checks::RunRequest {
+                    include: design.document.checks.clone(),
+                    ..Default::default()
+                },
                 overrides: enabled,
                 files,
                 cases: Some(cases),
@@ -142,7 +159,11 @@ impl HarnessBroker {
             },
         )?;
         run.context.as_mut().unwrap().automatic = true;
-        run.exchange_id = self.store.list_exchange(&self.session.id)?.last().map(|exchange| exchange.id.clone());
+        run.exchange_id = self
+            .store
+            .list_exchange(&self.session.id)?
+            .last()
+            .map(|exchange| exchange.id.clone());
         run.progress = progress;
         run.workspace_identity = workspace_identity.clone();
         run.workspace_digest = run.progress.source_digest.clone();
@@ -284,8 +305,7 @@ impl HarnessBroker {
         self.store
             .save_execution_transition(&execution, &goal, None, None, None)?;
         self.settle_task(None)?;
-        self.publish_check_run(&mut execution, &run)
-            .await?;
+        self.publish_check_run(&mut execution, &run).await?;
         events.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
         Ok(events)
     }
@@ -334,6 +354,8 @@ impl HarnessBroker {
     ) -> Result<()> {
         Self::save_run(execution, run);
         self.store.save_plan_execution(execution)?;
-        self.check_runner.publish(run, self.event_sink.as_ref()).await
+        self.check_runner
+            .publish(run, self.event_sink.as_ref())
+            .await
     }
 }

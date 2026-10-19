@@ -46,9 +46,10 @@ pub struct CheckOperation {
 impl CheckOperation {
     /// Renders the complete configured invocation for review and permission matching.
     pub fn display(&self) -> String {
-        self.args.as_ref().map_or_else(|| self.command.clone(), |args| {
-            super::invocation::display(&self.command, args)
-        })
+        self.args.as_ref().map_or_else(
+            || self.command.clone(),
+            |args| super::invocation::display(&self.command, args),
+        )
     }
 }
 
@@ -100,7 +101,11 @@ impl CheckConfig {
     /// Rejects explicit plan selections that cannot execute from this configuration.
     pub(crate) fn validate_selection(&self, ids: &[String]) -> Result<()> {
         for id in ids {
-            let definition = self.definitions.iter().find(|definition| &definition.id == id).with_context(|| format!("unknown planned check: {id}"))?;
+            let definition = self
+                .definitions
+                .iter()
+                .find(|definition| &definition.id == id)
+                .with_context(|| format!("unknown planned check: {id}"))?;
             ensure!(definition.enabled, "planned check is disabled: {id}");
         }
         Ok(())
@@ -115,8 +120,7 @@ impl CheckConfig {
         let mut identities = BTreeSet::new();
         for definition in &self.definitions {
             ensure!(
-                !definition.area.trim().is_empty()
-                    && !definition.area.contains(['\0', '\n', '\r']),
+                !definition.area.trim().is_empty() && !definition.area.contains(['\0', '\n', '\r']),
                 "invalid check area"
             );
             definition.trigger.validate()?;
@@ -136,10 +140,7 @@ impl CheckConfig {
                 "duplicate check id: {}",
                 definition.id
             );
-            ensure!(
-                !definition.name.trim().is_empty(),
-                "invalid check name"
-            );
+            ensure!(!definition.name.trim().is_empty(), "invalid check name");
             relative_path(&definition.directory)?;
             for operation in std::iter::once(&definition.all)
                 .chain(definition.files.iter())

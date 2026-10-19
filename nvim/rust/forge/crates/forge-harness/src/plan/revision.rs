@@ -30,12 +30,16 @@ impl DeclarationDelta {
                     .collect()
             });
         let mut baseline_paths = std::collections::BTreeSet::new();
-        let mut baseline_calls = previous.map(|design| design.proposed_calls.clone()).unwrap_or_else(|| design.baseline_calls.clone());
+        let mut baseline_calls = previous
+            .map(|design| design.proposed_calls.clone())
+            .unwrap_or_else(|| design.baseline_calls.clone());
         if let Some(previous) = previous {
             for (path, file) in &design.baseline {
                 if !previous.baseline.contains_key(path) && !previous.proposed.contains_key(path) {
                     baseline.insert(path.clone(), file.text.clone());
-                    if let Some(calls) = design.baseline_calls.get(path) { baseline_calls.insert(path.clone(), calls.clone()); }
+                    if let Some(calls) = design.baseline_calls.get(path) {
+                        baseline_calls.insert(path.clone(), calls.clone());
+                    }
                     baseline_paths.insert(path.clone());
                 }
             }
@@ -75,8 +79,36 @@ impl DeclarationDelta {
         };
         let mut patch = Vec::new();
         for file in super::review_file_layout::order(&delta, &Default::default()) {
-            let before = delta.baseline.get(&file.baseline).map(|source| super::calls::combined(&file.baseline, &source.text, delta.baseline_calls.get(&file.baseline).map(Vec::as_slice).unwrap_or_default())).transpose()?;
-            let after = delta.proposed.get(&file.proposed).map(|text| super::calls::combined(&file.proposed, text, delta.proposed_calls.get(&file.proposed).map(Vec::as_slice).unwrap_or_default())).transpose()?;
+            let before = delta
+                .baseline
+                .get(&file.baseline)
+                .map(|source| {
+                    super::calls::combined(
+                        &file.baseline,
+                        &source.text,
+                        delta
+                            .baseline_calls
+                            .get(&file.baseline)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    )
+                })
+                .transpose()?;
+            let after = delta
+                .proposed
+                .get(&file.proposed)
+                .map(|text| {
+                    super::calls::combined(
+                        &file.proposed,
+                        text,
+                        delta
+                            .proposed_calls
+                            .get(&file.proposed)
+                            .map(Vec::as_slice)
+                            .unwrap_or_default(),
+                    )
+                })
+                .transpose()?;
             write_file(
                 &file.baseline,
                 &file.proposed,
@@ -86,10 +118,15 @@ impl DeclarationDelta {
             )?;
         }
         let mut document = Vec::new();
-        let previous_sections = previous.map(|design| design.document.sections()).unwrap_or_default();
+        let previous_sections = previous
+            .map(|design| design.document.sections())
+            .unwrap_or_default();
         for section in design.document.sections() {
-            let before = previous_sections.iter().find(|previous| previous.path == section.path)
-                .map(|previous| previous.text.as_str()).filter(|text| !text.trim().is_empty());
+            let before = previous_sections
+                .iter()
+                .find(|previous| previous.path == section.path)
+                .map(|previous| previous.text.as_str())
+                .filter(|text| !text.trim().is_empty());
             let after = (!section.text.trim().is_empty()).then_some(section.text.as_str());
             write_file(section.title, section.title, before, after, &mut document)?;
         }
@@ -159,14 +196,43 @@ mod tests {
     fn change_only_revisions_compare_summaries_without_signature_edits() {
         let mut previous = super::super::document::test_fixture("change", "Behavior change");
         let mut design = DeclarationDesign::default();
-        design.proposed.insert("main.rs".into(), "pub fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, owner: "run".into(), call: None, behavior: Some(crate::plan::FunctionBehavior::Change("Stop retrying authentication failures.".into())) }]);
+        design
+            .proposed
+            .insert("main.rs".into(), "pub fn run();\n".into());
+        design.proposed_calls.insert(
+            "main.rs".into(),
+            vec![super::super::FunctionBody {
+                evidence: None,
+                owner: "run".into(),
+                call: None,
+                behavior: Some(crate::plan::FunctionBehavior::Change(
+                    "Stop retrying authentication failures.".into(),
+                )),
+            }],
+        );
         previous.design = Some(design);
         let mut current = previous.clone();
-        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].behavior = Some(crate::plan::FunctionBehavior::Change("Limit transient retries to three attempts.".into()));
+        current
+            .design
+            .as_mut()
+            .unwrap()
+            .proposed_calls
+            .get_mut("main.rs")
+            .unwrap()[0]
+            .behavior = Some(crate::plan::FunctionBehavior::Change(
+            "Limit transient retries to three attempts.".into(),
+        ));
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
-        assert!(delta.files.contains("-  Stop retrying authentication failures."));
-        assert!(delta.files.contains("+  Limit transient retries to three attempts."));
+        assert!(
+            delta
+                .files
+                .contains("-  Stop retrying authentication failures.")
+        );
+        assert!(
+            delta
+                .files
+                .contains("+  Limit transient retries to three attempts.")
+        );
         assert!(!delta.files.contains("+pub fn") && !delta.files.contains("-pub fn"));
     }
 
@@ -174,11 +240,36 @@ mod tests {
     fn call_only_revisions_compare_saved_occurrences() {
         let mut previous = super::super::document::test_fixture("calls", "Calls");
         let mut design = DeclarationDesign::default();
-        design.proposed.insert("main.rs".into(), "fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, behavior: None, owner: "run".into(), call: Some(vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }]) }]);
+        design
+            .proposed
+            .insert("main.rs".into(), "fn run();\n".into());
+        design.proposed_calls.insert(
+            "main.rs".into(),
+            vec![super::super::FunctionBody {
+                evidence: None,
+                behavior: None,
+                owner: "run".into(),
+                call: Some(vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
+                    name: "before".into(),
+                    source: None,
+                    unresolved: false,
+                }]),
+            }],
+        );
         previous.design = Some(design);
         let mut current = previous.clone();
-        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call.as_mut().unwrap()[0].name = "after".into();
+        current
+            .design
+            .as_mut()
+            .unwrap()
+            .proposed_calls
+            .get_mut("main.rs")
+            .unwrap()[0]
+            .call
+            .as_mut()
+            .unwrap()[0]
+            .name = "after".into();
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
         assert!(delta.files.contains("-  before") && delta.files.contains("+  after"));
     }
@@ -187,22 +278,43 @@ mod tests {
     fn newly_captured_revision_files_compare_against_source_without_restoring_deletions() {
         let mut previous = super::super::document::test_fixture("lazy", "Lazy revision");
         let mut design = DeclarationDesign::default();
-        design.baseline.insert("deleted.rs".into(), DeclarationFile { text: "pub struct Deleted;\n".into(), source_digest: String::new() });
+        design.baseline.insert(
+            "deleted.rs".into(),
+            DeclarationFile {
+                text: "pub struct Deleted;\n".into(),
+                source_digest: String::new(),
+            },
+        );
         previous.design = Some(design);
         let mut current = previous.clone();
         let design = current.design.as_mut().unwrap();
-        design.baseline.insert("Foo.rs".into(), DeclarationFile { text: "pub struct Before;\n".into(), source_digest: String::new() });
-        design.proposed.insert("Foo.rs".into(), "pub struct After;\n".into());
+        design.baseline.insert(
+            "Foo.rs".into(),
+            DeclarationFile {
+                text: "pub struct Before;\n".into(),
+                source_digest: String::new(),
+            },
+        );
+        design
+            .proposed
+            .insert("Foo.rs".into(), "pub struct After;\n".into());
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
-        assert!(delta.files.contains("-pub struct Before;") && delta.files.contains("+pub struct After;"));
+        assert!(
+            delta.files.contains("-pub struct Before;")
+                && delta.files.contains("+pub struct After;")
+        );
         assert!(!delta.files.contains("deleted.rs") && !delta.files.contains("new file mode"));
         assert_eq!(delta.baseline_paths, ["Foo.rs".into()].into());
     }
 
     #[test]
     fn declaration_changes_bound_context_and_separate_distant_edits() {
-        let before = (1..=60).map(|line| format!("pub struct Item{line};\n")).collect::<String>();
-        let after = before.replace("Item11;", "Changed11;").replace("Item41;", "Changed41;");
+        let before = (1..=60)
+            .map(|line| format!("pub struct Item{line};\n"))
+            .collect::<String>();
+        let after = before
+            .replace("Item11;", "Changed11;")
+            .replace("Item41;", "Changed41;");
         let mut output = Vec::new();
         write_file("lib.rs", "lib.rs", Some(&before), Some(&after), &mut output).unwrap();
         let text = String::from_utf8(output).unwrap();
@@ -278,7 +390,9 @@ mod tests {
         let overview = UnifiedPatch::parse(&delta.document).unwrap();
         assert_eq!(overview.file.len(), 1);
         assert_eq!(overview.file[0].new_path.as_deref(), Some("Design"));
-        assert!(!delta.document.contains("plan.json") && !delta.document.contains("\"description\""));
+        assert!(
+            !delta.document.contains("plan.json") && !delta.document.contains("\"description\"")
+        );
         let unchanged = DeclarationDelta::between(Some(&current), &current).unwrap();
         assert!(unchanged.files.is_empty() && unchanged.document.is_empty());
     }
@@ -303,7 +417,10 @@ mod tests {
         assert_eq!(patch.file.len(), 2);
         assert_eq!(patch.file[0].new_path.as_deref(), Some("Objective"));
         assert_eq!(patch.file[1].new_path.as_deref(), Some("Design"));
-        assert!(delta.document.contains("-Original second paragraph.") && delta.document.contains("+Revised `State` paragraph."));
+        assert!(
+            delta.document.contains("-Original second paragraph.")
+                && delta.document.contains("+Revised `State` paragraph.")
+        );
         assert!(!delta.document.contains("\\n") && !delta.document.contains("\"task\""));
     }
 

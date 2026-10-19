@@ -134,7 +134,10 @@ impl DeclarationCalls {
         collect(tree.root_node(), source, language, &[], &mut callable, 0)?;
         let mut return_type = HashMap::new();
         collect_returns(tree.root_node(), source, language, &[], &mut return_type, 0)?;
-        let callable_name = callable.iter().map(|function| function.owner.clone()).collect::<std::collections::HashSet<_>>();
+        let callable_name = callable
+            .iter()
+            .map(|function| function.owner.clone())
+            .collect::<std::collections::HashSet<_>>();
         if !declarations {
             let position = callable
                 .iter()
@@ -291,14 +294,21 @@ fn collect(
         }
         lua_annotations(node, source, &mut binding);
         let mut binding_position = std::collections::BTreeMap::new();
-        let mut parameter = node.child_by_field_name("parameters").into_iter().collect::<Vec<_>>();
+        let mut parameter = node
+            .child_by_field_name("parameters")
+            .into_iter()
+            .collect::<Vec<_>>();
         while let Some(parameter_node) = parameter.pop() {
             let name = contents(parameter_node, source);
-            if matches!(parameter_node.kind(), "identifier" | "self") && binding.contains_key(name) {
+            if matches!(parameter_node.kind(), "identifier" | "self") && binding.contains_key(name)
+            {
                 let position = parameter_node.start_position();
-                binding_position.entry(name.to_owned()).or_insert(super::DeclarationPosition {
-                    line: position.row as u32 + 1, column: position.column as u32,
-                });
+                binding_position
+                    .entry(name.to_owned())
+                    .or_insert(super::DeclarationPosition {
+                        line: position.row as u32 + 1,
+                        column: position.column as u32,
+                    });
             } else if parameter_node.kind() != "type_identifier" {
                 let mut children = parameter_node.walk();
                 parameter.extend(parameter_node.named_children(&mut children));
@@ -312,8 +322,13 @@ fn collect(
         let mut heading = node.start_position().row;
         let mut preceding = node.prev_named_sibling();
         while let Some(previous) = preceding {
-            if !matches!(previous.kind(), "attribute_item" | "line_comment" | "block_comment" | "comment")
-                || previous.end_position().row + 1 < heading { break; }
+            if !matches!(
+                previous.kind(),
+                "attribute_item" | "line_comment" | "block_comment" | "comment"
+            ) || previous.end_position().row + 1 < heading
+            {
+                break;
+            }
             heading = previous.start_position().row;
             preceding = previous.prev_named_sibling();
         }
@@ -622,9 +637,8 @@ fn base_type(value: &str) -> Option<String> {
             let mut characters = part.chars();
             characters.next().is_some_and(|character| {
                 character.is_alphabetic() || matches!(character, '_' | '$')
-            }) && characters.all(|character| {
-                character.is_alphanumeric() || matches!(character, '_' | '$')
-            })
+            }) && characters
+                .all(|character| character.is_alphanumeric() || matches!(character, '_' | '$'))
         });
     qualified.then(|| name.to_owned())
 }
@@ -636,7 +650,10 @@ fn expression_type(
     binding: &HashMap<String, Option<String>>,
 ) -> Option<String> {
     match node.kind() {
-        "identifier" | "self" | "this" => binding.get(contents(node, source)).and_then(|value| value.as_deref()).and_then(base_type),
+        "identifier" | "self" | "this" => binding
+            .get(contents(node, source))
+            .and_then(|value| value.as_deref())
+            .and_then(base_type),
         "struct_expression" | "new_expression" | "table_constructor" => node
             .child_by_field_name("name")
             .or_else(|| node.child_by_field_name("constructor"))
@@ -807,7 +824,9 @@ fn calls(
     }
     if matches!(node.kind(), "type_arguments" | "type_annotation")
         || node.parent().is_some_and(|parent| {
-            parent.child_by_field_name("type").is_some_and(|type_node| type_node.id() == node.id())
+            parent
+                .child_by_field_name("type")
+                .is_some_and(|type_node| type_node.id() == node.id())
         })
     {
         return Ok(());
@@ -864,7 +883,11 @@ fn calls(
             if !(language == SyntaxLanguage::Rust && matches!(name.as_str(), "Ok" | "Err" | "Some"))
             {
                 output.push(DeclarationCall {
-                    kind: if node.kind() == "new_expression" { DeclarationCallKind::Construct } else { DeclarationCallKind::Call },
+                    kind: if node.kind() == "new_expression" {
+                        DeclarationCallKind::Construct
+                    } else {
+                        DeclarationCallKind::Call
+                    },
                     name,
                     expression: contents(function, source).into(),
                     unresolved: shadowed_target(function, source, returns, binding),
@@ -875,10 +898,14 @@ fn calls(
         }
     }
     if language == SyntaxLanguage::Rust && node.kind() == "struct_expression" {
-        if let Some(target) = node.child_by_field_name("name").or_else(|| node.child_by_field_name("type")) {
+        if let Some(target) = node
+            .child_by_field_name("name")
+            .or_else(|| node.child_by_field_name("type"))
+        {
             output.push(DeclarationCall {
                 kind: DeclarationCallKind::Construct,
-                name: base_type(contents(target, source)).unwrap_or_else(|| contents(target, source).into()),
+                name: base_type(contents(target, source))
+                    .unwrap_or_else(|| contents(target, source).into()),
                 expression: contents(target, source).into(),
                 unresolved: false,
                 line: reference_token(target).start_position().row as u32 + 1,
@@ -912,11 +939,7 @@ fn calls(
                 ) {
                     output.push(DeclarationCall {
                         kind: DeclarationCallKind::Property,
-                        name: format!(
-                            "{}::{}",
-                            owner,
-                            contents(field, source)
-                        ),
+                        name: format!("{}::{}", owner, contents(field, source)),
                         expression: contents(field, source).into(),
                         unresolved: false,
                         line: field.start_position().row as u32 + 1,
@@ -939,7 +962,11 @@ fn calls(
     {
         let name = call_name(node, source, returns, binding);
         output.push(DeclarationCall {
-            kind: if callable.contains(&name) { DeclarationCallKind::Callback } else { DeclarationCallKind::Property },
+            kind: if callable.contains(&name) {
+                DeclarationCallKind::Callback
+            } else {
+                DeclarationCallKind::Property
+            },
             name,
             expression: contents(node, source).into(),
             unresolved: member_access(node, source).is_none()
@@ -948,19 +975,47 @@ fn calls(
             column: reference_token(node).start_position().column as u32,
         });
     }
-    if matches!(node.kind(), "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier")
-        && !invocation_target(node)
+    if matches!(
+        node.kind(),
+        "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier"
+    ) && !invocation_target(node)
         && !binding.contains_key(contents(node, source))
         && !node.parent().is_some_and(|parent| {
-            matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier" | "field_expression" | "member_expression" | "dot_index_expression" | "method_index_expression" | "subscript_expression" | "bracket_index_expression" | "parameters" | "parameter" | "closure_parameters" | "variable_list" | "type_annotation" | "type_arguments" | "struct_expression" | "struct_pattern")
-                || matches!(parent.kind(), "let_declaration" | "variable_declarator") && parent.child_by_field_name("pattern").or_else(|| parent.child_by_field_name("name")).is_some_and(|name| name.id() == node.id())
+            matches!(
+                parent.kind(),
+                "scoped_identifier"
+                    | "scoped_type_identifier"
+                    | "field_expression"
+                    | "member_expression"
+                    | "dot_index_expression"
+                    | "method_index_expression"
+                    | "subscript_expression"
+                    | "bracket_index_expression"
+                    | "parameters"
+                    | "parameter"
+                    | "closure_parameters"
+                    | "variable_list"
+                    | "type_annotation"
+                    | "type_arguments"
+                    | "struct_expression"
+                    | "struct_pattern"
+            ) || matches!(parent.kind(), "let_declaration" | "variable_declarator")
+                && parent
+                    .child_by_field_name("pattern")
+                    .or_else(|| parent.child_by_field_name("name"))
+                    .is_some_and(|name| name.id() == node.id())
         })
     {
         let name = contents(node, source).to_owned();
         let callback = callable.contains(&name);
         output.push(DeclarationCall {
-            kind: if callback { DeclarationCallKind::Callback } else { DeclarationCallKind::Value },
-            unresolved: false, name,
+            kind: if callback {
+                DeclarationCallKind::Callback
+            } else {
+                DeclarationCallKind::Value
+            },
+            unresolved: false,
+            name,
             expression: contents(node, source).into(),
             line: node.start_position().row as u32 + 1,
             column: node.start_position().column as u32,
@@ -968,7 +1023,16 @@ fn calls(
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        calls(child, source, language, returns, callable, binding, output, depth + 1)?;
+        calls(
+            child,
+            source,
+            language,
+            returns,
+            callable,
+            binding,
+            output,
+            depth + 1,
+        )?;
     }
     if let Some((name, value)) = pending_binding {
         binding.insert(name, value);
@@ -981,13 +1045,19 @@ fn calls(
 
 fn reference_token(node: Node<'_>) -> Node<'_> {
     if node.kind() == "generic_function" {
-        return node.child_by_field_name("function").map(reference_token).unwrap_or(node);
+        return node
+            .child_by_field_name("function")
+            .map(reference_token)
+            .unwrap_or(node);
     }
     node.child_by_field_name("field")
         .or_else(|| node.child_by_field_name("property"))
         .or_else(|| node.child_by_field_name("method"))
         .or_else(|| node.child_by_field_name("index"))
-        .or_else(|| node.child_by_field_name("name").filter(|_| matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier")))
+        .or_else(|| {
+            node.child_by_field_name("name")
+                .filter(|_| matches!(node.kind(), "scoped_identifier" | "scoped_type_identifier"))
+        })
         .unwrap_or(node)
 }
 
@@ -1046,16 +1116,38 @@ mod tests {
     #[test]
     fn signature_bindings_retain_types_and_exact_parameter_positions() {
         for (path, source, expected_type) in [
-            ("main.rs", "pub fn run(\n  input: ResMut<crate::Client>\n);", Some("ResMut<crate::Client>")),
-            ("main.ts", "export function run(\n  input: Client\n): void;", Some(": Client")),
-            ("main.lua", "---@param input Client\nfunction run(input)\nend", Some("Client")),
+            (
+                "main.rs",
+                "pub fn run(\n  input: ResMut<crate::Client>\n);",
+                Some("ResMut<crate::Client>"),
+            ),
+            (
+                "main.ts",
+                "export function run(\n  input: Client\n): void;",
+                Some(": Client"),
+            ),
+            (
+                "main.lua",
+                "---@param input Client\nfunction run(input)\nend",
+                Some("Client"),
+            ),
         ] {
             let functions = DeclarationCalls::extract(path, source, true).unwrap();
-            let function = functions.iter().find(|function| function.owner == "run").unwrap();
-            assert_eq!(function.binding["input"].as_deref(), expected_type, "{path}");
+            let function = functions
+                .iter()
+                .find(|function| function.owner == "run")
+                .unwrap();
+            assert_eq!(
+                function.binding["input"].as_deref(),
+                expected_type,
+                "{path}"
+            );
             let position = function.binding_position["input"];
             let row = source.lines().nth(position.line as usize - 1).unwrap();
-            assert!(row[position.column as usize..].starts_with("input"), "{path}");
+            assert!(
+                row[position.column as usize..].starts_with("input"),
+                "{path}"
+            );
         }
     }
 
@@ -1068,7 +1160,10 @@ mod tests {
             ("Writer | null", "Writer"),
             ("Writer | null | undefined", "Writer"),
             ("Container<Writer | Reader> | undefined", "Container"),
-            ("Container<(input: Writer) => Reader> | undefined", "Container"),
+            (
+                "Container<(input: Writer) => Reader> | undefined",
+                "Container",
+            ),
             ("Container<fn() -> Reader>", "Container"),
         ] {
             assert_eq!(base_type(annotation).as_deref(), Some(expected));
@@ -1112,9 +1207,13 @@ mod tests {
             "boundary.ts",
             "class Store { writers: Writer[]; run() { this.writers.push(); } }",
             false,
-        ).unwrap();
-        let call = functions[0].call.iter()
-            .find(|reference| reference.kind == DeclarationCallKind::Call).unwrap();
+        )
+        .unwrap();
+        let call = functions[0]
+            .call
+            .iter()
+            .find(|reference| reference.kind == DeclarationCallKind::Call)
+            .unwrap();
         assert_eq!(call.name, "this.writers.push");
         assert!(call.unresolved);
     }
@@ -1129,7 +1228,11 @@ mod tests {
         assert!(calls[0].unresolved);
         assert_eq!(calls[0].expression, "input\n .writer\n .send");
         assert_eq!((calls[0].line, calls[0].column), (3, 2));
-        assert!(calls.iter().all(|reference| !reference.name.contains(['\r', '\n'])));
+        assert!(
+            calls
+                .iter()
+                .all(|reference| !reference.name.contains(['\r', '\n']))
+        );
     }
 
     #[test]
@@ -1209,29 +1312,77 @@ mod tests {
     fn construction_targets_exclude_type_mentions_and_destructuring() {
         let source = "struct Weapon { cooldown: f32 } fn setup(input: Option<&Weapon>) { let typed: Option<&Weapon> = None; inspect::<Option<&Weapon>>(); let weapon = Weapon { cooldown: 0.0 }; let Weapon { cooldown } = weapon; }";
         let functions = DeclarationCalls::extract("lib.rs", source, false).unwrap();
-        let setup = functions.iter().find(|function| function.owner == "setup").unwrap();
-        let weapons = setup.call.iter().filter(|reference| reference.name == "Weapon").collect::<Vec<_>>();
+        let setup = functions
+            .iter()
+            .find(|function| function.owner == "setup")
+            .unwrap();
+        let weapons = setup
+            .call
+            .iter()
+            .filter(|reference| reference.name == "Weapon")
+            .collect::<Vec<_>>();
         assert_eq!(weapons.len(), 1, "{:#?}", setup.call);
         assert_eq!(weapons[0].kind, DeclarationCallKind::Construct);
         assert_eq!(&source[weapons[0].column as usize..][..6], "Weapon");
-        assert_eq!(setup.call.iter().filter(|reference| reference.name == "Weapon::cooldown" && reference.kind == DeclarationCallKind::Property).count(), 2);
+        assert_eq!(
+            setup
+                .call
+                .iter()
+                .filter(|reference| reference.name == "Weapon::cooldown"
+                    && reference.kind == DeclarationCallKind::Property)
+                .count(),
+            2
+        );
         let functions = DeclarationCalls::extract("main.ts", "function setup(input: Weapon) { const typed: Weapon = input; const weapon = new Weapon(); Weapon.create(); }", false).unwrap();
         let references = &functions[0].call;
-        assert_eq!(references.iter().filter(|reference| reference.kind == DeclarationCallKind::Construct).map(|reference| reference.name.as_str()).collect::<Vec<_>>(), ["Weapon"]);
-        assert!(references.iter().any(|reference| reference.name == "Weapon.create" && reference.kind == DeclarationCallKind::Call));
+        assert_eq!(
+            references
+                .iter()
+                .filter(|reference| reference.kind == DeclarationCallKind::Construct)
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Weapon"]
+        );
+        assert!(
+            references
+                .iter()
+                .any(|reference| reference.name == "Weapon.create"
+                    && reference.kind == DeclarationCallKind::Call)
+        );
     }
 
     #[test]
     fn callbacks_and_named_values_preserve_extraction_order_and_shadowing() {
         let source = "const LIMIT: u32 = 3; fn worker() {} fn install() { register(worker); consume(LIMIT); worker(); } fn shadowed(worker: fn()) { register(worker); }";
         let functions = DeclarationCalls::extract("lib.rs", source, false).unwrap();
-        let install = functions.iter().find(|function| function.owner == "install").unwrap();
-        assert_eq!(install.call.iter().map(|call| (call.name.as_str(), call.kind)).collect::<Vec<_>>(), [
-            ("register", DeclarationCallKind::Call), ("worker", DeclarationCallKind::Callback),
-            ("consume", DeclarationCallKind::Call), ("LIMIT", DeclarationCallKind::Value), ("worker", DeclarationCallKind::Call),
-        ]);
-        let shadowed = functions.iter().find(|function| function.owner == "shadowed").unwrap();
-        assert!(!shadowed.call.iter().any(|call| call.name == "worker" && !call.unresolved));
+        let install = functions
+            .iter()
+            .find(|function| function.owner == "install")
+            .unwrap();
+        assert_eq!(
+            install
+                .call
+                .iter()
+                .map(|call| (call.name.as_str(), call.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("register", DeclarationCallKind::Call),
+                ("worker", DeclarationCallKind::Callback),
+                ("consume", DeclarationCallKind::Call),
+                ("LIMIT", DeclarationCallKind::Value),
+                ("worker", DeclarationCallKind::Call),
+            ]
+        );
+        let shadowed = functions
+            .iter()
+            .find(|function| function.owner == "shadowed")
+            .unwrap();
+        assert!(
+            !shadowed
+                .call
+                .iter()
+                .any(|call| call.name == "worker" && !call.unresolved)
+        );
     }
 
     #[test]

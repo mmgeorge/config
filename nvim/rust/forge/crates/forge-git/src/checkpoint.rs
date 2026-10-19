@@ -65,7 +65,10 @@ pub struct CheckpointSignature {
 ///
 /// Runs a bounded, read-only Git status under the caller's repository admission. HEAD,
 /// index identity, untracked paths, and metadata of already-dirty files all participate.
-pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<CheckpointSignature> {
+pub fn signature(
+    root: &Path,
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<CheckpointSignature> {
     let started = std::time::Instant::now();
     let repository = gix::open(root)?;
     let index = match std::fs::metadata(repository.index_path()) {
@@ -81,15 +84,33 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
     let mut status = std::process::Command::new("git");
     #[cfg(windows)]
     status.args(["-c", "core.ignoreCase=false"]);
-    status.current_dir(root).env("GIT_INDEX_FILE", &temporary_index).args([
-            "-c", "core.splitIndex=false", "status", "--porcelain=v2", "-z", "--branch",
-            "--untracked-files=all", "--ignore-submodules=none", "--no-renames",
-            "--", ".", ":(exclude,attr:filter=lfs)",
+    status
+        .current_dir(root)
+        .env("GIT_INDEX_FILE", &temporary_index)
+        .args([
+            "-c",
+            "core.splitIndex=false",
+            "status",
+            "--porcelain=v2",
+            "-z",
+            "--branch",
+            "--untracked-files=all",
+            "--ignore-submodules=none",
+            "--no-renames",
+            "--",
+            ".",
+            ":(exclude,attr:filter=lfs)",
         ]);
     let mut names = std::process::Command::new("git");
     #[cfg(windows)]
     names.args(["-c", "core.ignoreCase=false"]);
-    names.current_dir(root).args(["ls-files", "--cached", "--others", "--exclude-standard", "-z"]);
+    names.current_dir(root).args([
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ]);
     let (output, names) = crate::command::read_command_pair(
         status,
         names,
@@ -99,8 +120,16 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
         },
         &mut *check,
     )?;
-    ensure!(output.status.success(), "checkpoint status failed: {}", String::from_utf8_lossy(&output.stderr));
-    ensure!(names.status.success(), "checkpoint path inventory failed: {}", String::from_utf8_lossy(&names.stderr));
+    ensure!(
+        output.status.success(),
+        "checkpoint status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    ensure!(
+        names.status.success(),
+        "checkpoint path inventory failed: {}",
+        String::from_utf8_lossy(&names.stderr)
+    );
     let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash())?;
     let mut observation = Vec::with_capacity(paths.len());
     for path in &paths {
@@ -108,23 +137,62 @@ pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<C
         observation.push(crate::snapshot::read_worktree_stamp(root, &path.path)?);
     }
     let mut attributes = Vec::new();
-    for name in names.stdout.split(|byte| *byte == 0).filter(|name| {
-        *name == b".gitattributes" || name.ends_with(b"/.gitattributes")
-    }) {
-        attributes.push(crate::snapshot::read_worktree_stamp(root, &crate::RepositoryPath::new(name.to_vec())?)?);
+    for name in names
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|name| *name == b".gitattributes" || name.ends_with(b"/.gitattributes"))
+    {
+        attributes.push(crate::snapshot::read_worktree_stamp(
+            root,
+            &crate::RepositoryPath::new(name.to_vec())?,
+        )?);
     }
     let mut config = Vec::new();
     repository.config_snapshot().write_to(&mut config)?;
-    let identity = crate::discover_identity(root)?.ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
+    let identity = crate::discover_identity(root)?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
     config.extend(crate::content::conversion::read_info(&identity, check)?.unwrap_or_default());
     let command_elapsed = started.elapsed();
-    let checkout = checkout_attributes(root, &names.stdout.split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty()).map(path_key).collect(), check)?;
-    let refreshed = gix::index::File::at_or_default(&temporary_index, repository.object_hash(), false, Default::default())?;
-    let checkout_size = refreshed.entries().iter()
-        .map(|entry| (path_key(entry.path(&refreshed)), entry.stat.size)).collect();
-    let _ = writeln!(std::io::stderr(), "checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}", command_elapsed.as_millis(), (started.elapsed()-command_elapsed).as_millis(), names.stdout.len(), checkout.len());
-    Ok(CheckpointSignature { status: output.stdout, index, observation, paths, names: names.stdout, attributes, config, checkout, checkout_size })
+    let checkout = checkout_attributes(
+        root,
+        &names
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(path_key)
+            .collect(),
+        check,
+    )?;
+    let refreshed = gix::index::File::at_or_default(
+        &temporary_index,
+        repository.object_hash(),
+        false,
+        Default::default(),
+    )?;
+    let checkout_size = refreshed
+        .entries()
+        .iter()
+        .map(|entry| (path_key(entry.path(&refreshed)), entry.stat.size))
+        .collect();
+    let _ = writeln!(
+        std::io::stderr(),
+        "checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}",
+        command_elapsed.as_millis(),
+        (started.elapsed() - command_elapsed).as_millis(),
+        names.stdout.len(),
+        checkout.len()
+    );
+    Ok(CheckpointSignature {
+        status: output.stdout,
+        index,
+        observation,
+        paths,
+        names: names.stdout,
+        attributes,
+        config,
+        checkout,
+        checkout_size,
+    })
 }
 
 /// Reads existing trees and eligible paths without writing any Git object, ref, or index.
@@ -138,24 +206,52 @@ pub fn inventory(
     let tree = repository.head_tree_id_or_empty()?;
     let tree_id = head.as_ref().map(|_| tree.to_string());
     let mut base = tree_files(root, tree_id.as_deref())?;
-    let mut candidate = signature.paths.iter()
-        .map(|entry| path_key(entry.path.raw())).collect::<BTreeSet<_>>();
-    let paths = base.keys().chain(candidate.iter()).cloned()
-        .chain(signature.names.split(|byte| *byte == 0).filter(|path| !path.is_empty()).map(path_key))
+    let mut candidate = signature
+        .paths
+        .iter()
+        .map(|entry| path_key(entry.path.raw()))
         .collect::<BTreeSet<_>>();
-    let listed = signature.names.split(|byte| *byte == 0).filter(|path| !path.is_empty())
-        .map(path_key).collect::<BTreeSet<_>>();
+    let paths = base
+        .keys()
+        .chain(candidate.iter())
+        .cloned()
+        .chain(
+            signature
+                .names
+                .split(|byte| *byte == 0)
+                .filter(|path| !path.is_empty())
+                .map(path_key),
+        )
+        .collect::<BTreeSet<_>>();
+    let listed = signature
+        .names
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(path_key)
+        .collect::<BTreeSet<_>>();
     let missing = paths.difference(&listed).cloned().collect::<BTreeSet<_>>();
-    let additional = if missing.is_empty() { BTreeMap::new() } else { checkout_attributes(root, &missing, check)? };
+    let additional = if missing.is_empty() {
+        BTreeMap::new()
+    } else {
+        checkout_attributes(root, &missing, check)?
+    };
     let empty = std::array::from_fn(|_| gix::attrs::State::Unspecified);
     let mut excluded = BTreeSet::new();
     #[allow(unused_mut)]
     let mut missing = BTreeSet::new();
-    let auto_crlf = repository.config_snapshot().string("core.autocrlf")
-        .is_some_and(|value| value.eq_ignore_ascii_case(b"true") || value.eq_ignore_ascii_case(b"input"));
+    let auto_crlf = repository
+        .config_snapshot()
+        .string("core.autocrlf")
+        .is_some_and(|value| {
+            value.eq_ignore_ascii_case(b"true") || value.eq_ignore_ascii_case(b"input")
+        });
     for path in &paths {
         check()?;
-        let state = signature.checkout.get(path).or_else(|| additional.get(path)).unwrap_or(&empty);
+        let state = signature
+            .checkout
+            .get(path)
+            .or_else(|| additional.get(path))
+            .unwrap_or(&empty);
         let Some(mut rule) = checkout_rule(&repository, state) else {
             excluded.insert(path.clone());
             candidate.remove(path);
@@ -165,13 +261,22 @@ pub fn inventory(
         if let Some(file) = base.get_mut(path) {
             if rule.unsupported.is_some() || (cfg!(windows) && file.mode == 0o120000) {
                 candidate.insert(path.clone());
-            } else if !candidate.contains(path) && file.mode != 0o120000 && file.mode != 0o160000
-                && (auto_crlf || [0, 3, 4].into_iter().any(|index|
-                    !matches!(state[index], gix::attrs::State::Unspecified | gix::attrs::State::Unset)))
+            } else if !candidate.contains(path)
+                && file.mode != 0o120000
+                && file.mode != 0o160000
+                && (auto_crlf
+                    || [0, 3, 4].into_iter().any(|index| {
+                        !matches!(
+                            state[index],
+                            gix::attrs::State::Unspecified | gix::attrs::State::Unset
+                        )
+                    }))
             {
                 if let Some(size) = signature.checkout_size.get(path) {
                     let physical_size = u64::from(*size);
-                    let blob_size = repository.find_header(gix::ObjectId::from_hex(file.object_id.as_bytes())?)?.size();
+                    let blob_size = repository
+                        .find_header(gix::ObjectId::from_hex(file.object_id.as_bytes())?)?
+                        .size();
                     if physical_size >= blob_size && physical_size <= blob_size.saturating_mul(2) {
                         rule.crlf = physical_size > blob_size;
                         rule.automatic = false;
@@ -185,7 +290,10 @@ pub fn inventory(
     }
     #[cfg(windows)]
     {
-        let spelling = base.keys().map(|path| (path.to_lowercase(), path)).collect::<BTreeMap<_, _>>();
+        let spelling = base
+            .keys()
+            .map(|path| (path.to_lowercase(), path))
+            .collect::<BTreeMap<_, _>>();
         for path in &candidate {
             if let Some(original) = spelling.get(&path.to_lowercase())
                 && *original != path
@@ -209,10 +317,17 @@ pub fn inventory(
 
 /// Resolve LFS exclusions from attributes without opening asset contents or invoking filters.
 pub fn lfs_paths(root: &Path, paths: &BTreeSet<String>) -> Result<BTreeSet<String>> {
-    if crate::discover_identity(root)?.is_none() { return Ok(BTreeSet::new()); }
-    Ok(checkout_attributes(root, paths, &mut || Ok(()))?.into_iter()
-        .filter_map(|(path, state)| matches!(&state[2], gix::attrs::State::Value(value)
-            if value.as_ref().as_bstr() == b"lfs".as_bstr()).then_some(path)).collect())
+    if crate::discover_identity(root)?.is_none() {
+        return Ok(BTreeSet::new());
+    }
+    Ok(checkout_attributes(root, paths, &mut || Ok(()))?
+        .into_iter()
+        .filter_map(|(path, state)| {
+            matches!(&state[2], gix::attrs::State::Value(value)
+            if value.as_ref().as_bstr() == b"lfs".as_bstr())
+            .then_some(path)
+        })
+        .collect())
 }
 
 fn checkout_attributes(
@@ -220,7 +335,8 @@ fn checkout_attributes(
     paths: &BTreeSet<String>,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<BTreeMap<String, [gix::attrs::State; 6]>> {
-    let identity = crate::discover_identity(root)?.ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
+    let identity = crate::discover_identity(root)?
+        .ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
     let repository = gix::open(root)?;
     let info = crate::content::conversion::read_info(&identity, check)?;
     let (pipeline, _) = repository.filter_pipeline(None)?;
@@ -228,12 +344,23 @@ fn checkout_attributes(
     let mut result = BTreeMap::new();
     for path in paths {
         let state = crate::content::conversion::resolve_attribute_states(
-            &repository, &identity, &crate::RepositoryPath::new(path_bytes(path)?)?,
-            &mut attributes, info.as_deref(), check,
+            &repository,
+            &identity,
+            &crate::RepositoryPath::new(path_bytes(path)?)?,
+            &mut attributes,
+            info.as_deref(),
+            check,
         )?;
-        if state.iter().any(|state| *state != gix::attrs::State::Unspecified) {
-            result.insert(path.clone(), state.try_into()
-                .map_err(|_| anyhow::anyhow!("checkpoint attribute selection changed shape"))?);
+        if state
+            .iter()
+            .any(|state| *state != gix::attrs::State::Unspecified)
+        {
+            result.insert(
+                path.clone(),
+                state
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("checkpoint attribute selection changed shape"))?,
+            );
         }
     }
     Ok(result)

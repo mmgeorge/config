@@ -36,7 +36,11 @@ impl StatusView<'_> {
             checks,
         } = *self;
         let checking = checks.is_some() && matches!(status, SessionPhase::Idle);
-        let text = if checking { "Checking".into() } else { primary_text(status, now_ms) };
+        let text = if checking {
+            "Checking".into()
+        } else {
+            primary_text(status, now_ms)
+        };
         let text = if agent_count > 0 && !matches!(status, SessionPhase::WaitingForAgent { .. }) {
             format!(
                 "{text} · {agent_count} agent{} running",
@@ -55,15 +59,19 @@ impl StatusView<'_> {
         block.metadata.status = Some(StatusPresentation {
             row: 1,
             animated: checking || status.animated(),
-            hint: if checking { Some(StatusHint::Working) } else { match status {
-                SessionPhase::Working { .. }
-                | SessionPhase::RetryingPlanGeneration { .. }
-                | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
-                SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
-                SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
-                SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
-                _ => None,
-            } },
+            hint: if checking {
+                Some(StatusHint::Working)
+            } else {
+                match status {
+                    SessionPhase::Working { .. }
+                    | SessionPhase::RetryingPlanGeneration { .. }
+                    | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
+                    SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
+                    SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
+                    SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
+                    _ => None,
+                }
+            },
         });
         let action = bind_primary_action(&mut block, id, status);
         if let Some(checks) = checks {

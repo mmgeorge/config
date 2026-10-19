@@ -186,8 +186,13 @@ impl AnalysisPool {
             return Err(PoolError::Busy);
         }
         let sequence = state.next_sequence;
-        let next_sequence = sequence.checked_add(1).ok_or(PoolError::WorkerUnavailable)?;
-        let input_bytes = state.usage.input_bytes.checked_add(budget.input_bytes)
+        let next_sequence = sequence
+            .checked_add(1)
+            .ok_or(PoolError::WorkerUnavailable)?;
+        let input_bytes = state
+            .usage
+            .input_bytes
+            .checked_add(budget.input_bytes)
             .ok_or(PoolError::WorkerUnavailable)?;
 
         // Start capacity before retaining a queued closure, with workers blocked on the state lock.

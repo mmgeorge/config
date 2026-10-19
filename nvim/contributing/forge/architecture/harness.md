@@ -518,6 +518,32 @@ terminal's previous state. Models, effort, service tier, artifacts, agents, inte
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
 
+Structured settings rows use `field_navigation` with `option.fields`. Every row and
+field has a stable ID. `picker/state.lua` retains field focus per row across selection,
+search, and asynchronous spec replacement. `picker/field.lua` renders choice, toggle,
+input, and action fields. Tab and Shift-Tab move focus, arrows change choices or numeric
+values, Space toggles booleans, and Enter edits inputs or opens actions. The view receives
+`on_field_action(context, action, direction)` and owns persistence. Disabled fields retain
+focus and show their reason, but the picker rejects their actions.
+
+A field can set `join_previous` to share the preceding field's column while retaining
+its own focus, as timeout units do beside their amounts. Single-toggle rows can set
+`inline_fields` to render their icon and label together in the first column. The layout wraps every
+structured field without dropping value text, carries its
+highlight spans through wrapping, and pins the focused field's explanation below the
+scrolling rows. Section headings remain outside option selection. A `fit_content` view
+may grow past the default picker height within its host bounds and optional height ratio.
+Other pickers retain their configured maximum height.
+
+`/config` groups all controls into Models, Compaction, Checks, Planning, Execute, Permissions,
+Tools, Display, Provider, and Debug. Main and Background model controls retain separate
+mutation owners. Planning owns the plan permission and revision Auto-approve controls.
+Execute labels the existing execution permission as Write or YOLO without a Defaults row.
+The check-editing toggle uses the independent `checks.editing` control.
+Related values share rows, and the selected field replaces the permanent description
+column. Tools contains Timeouts and separate single-toggle rows for Subagents and LSP, Display owns Thoughts, and the final
+Debug category owns Logging. Background preference publication preserves focus and never changes chat settings.
+
 Boolean row enablement uses a leading `●` for enabled and `○` for disabled, toggled
 with Space. Keep that state out of editable text columns. Tab selects the next
 editable field, such as Scope or Auto, and the left/right arrows change its value.

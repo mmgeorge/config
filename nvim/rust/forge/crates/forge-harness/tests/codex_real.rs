@@ -65,7 +65,7 @@ async fn initialize_real_codex_broker(
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
         backend_launch_by_provider: Default::default(),
-            config_dir: None,
+        config_dir: None,
         data_root: data_root.to_string_lossy().into_owned(),
         permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),

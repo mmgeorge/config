@@ -123,7 +123,11 @@
           ],
           "package_manager": "cargo"
         },
-        "depends_on": []
+        "depends_on": [
+          "forge-build",
+          "forge-rust-format-fix",
+          "forge-rust-workspace-format-fix"
+        ]
       },
       {
         "id": "forge-rust-workspace-tests",
@@ -161,7 +165,11 @@
         },
         "files": null,
         "cases": null,
-        "depends_on": []
+        "depends_on": [
+          "forge-build",
+          "forge-rust-format-fix",
+          "forge-rust-workspace-format-fix"
+        ]
       },
       {
         "id": "forge-rust-clippy",
@@ -216,8 +224,8 @@
         "depends_on": []
       },
       {
-        "id": "forge-rust-format",
-        "name": "Affected Rust package formatting",
+        "id": "forge-rust-format-fix",
+        "name": "Affected Rust package formatting fix",
         "category": "format",
         "enabled": true,
         "auto": true,
@@ -227,7 +235,9 @@
           "include": [
             "nvim/rust/forge/src/**/*.rs",
             "nvim/rust/forge/crates/**/*.rs",
-            "nvim/rust/forge/crates/**/Cargo.toml"
+            "nvim/rust/forge/crates/**/Cargo.toml",
+            "nvim/rust/forge/tests/**/*.rs",
+            "nvim/rust/forge/crates/**/tests/**/*.rs"
           ],
           "exclude": [
             "**/target/**",
@@ -240,8 +250,7 @@
           "command": "cargo",
           "args": [
             "fmt",
-            "--all",
-            "--check"
+            "--all"
           ]
         },
         "files": {
@@ -249,17 +258,18 @@
           "args": [
             "fmt",
             "--package",
-            "{package.name}",
-            "--check"
+            "{package.name}"
           ],
           "package_manager": "cargo"
         },
         "cases": null,
-        "depends_on": []
+        "depends_on": [
+          "forge-build"
+        ]
       },
       {
-        "id": "forge-rust-workspace-format",
-        "name": "Shared-configuration Rust formatting",
+        "id": "forge-rust-workspace-format-fix",
+        "name": "Shared-configuration Rust formatting fix",
         "category": "format",
         "enabled": true,
         "auto": true,
@@ -281,13 +291,14 @@
           "command": "cargo",
           "args": [
             "fmt",
-            "--all",
-            "--check"
+            "--all"
           ]
         },
         "files": null,
         "cases": null,
-        "depends_on": []
+        "depends_on": [
+          "forge-build"
+        ]
       },
       {
         "id": "lua-affected",

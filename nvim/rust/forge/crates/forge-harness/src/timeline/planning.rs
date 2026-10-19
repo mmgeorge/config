@@ -3,8 +3,7 @@ use std::collections::HashMap;
 use crate::exchange::{Exchange, ExchangeNode, InputIntent};
 use crate::plan::{
     ExchangeAnchor, ExchangePlanEvent, PlanAudit, PlanDeviation, PlanEventContent,
-    PlanExecutionRecord, PlanLifecycleKind, PlanLifecycleRecord,
-    PlanRecord, PlanResolutionRecord,
+    PlanExecutionRecord, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord, PlanResolutionRecord,
 };
 
 /// Attach plan audit content to exchange positions before constructing the timeline.
@@ -375,7 +374,8 @@ mod tests {
                     header: "Goal".into(),
                     question: "Which migration goal?".into(),
                     options: vec![crate::plan::PlanQuestionOption {
-                        recommended: false, label: "Rust learning".into(),
+                        recommended: false,
+                        label: "Rust learning".into(),
                         description: "Learn Rust ownership".into(),
                     }],
                     allow_freeform: true,
@@ -386,7 +386,13 @@ mod tests {
                 Some(ExchangeAnchor::capture(&source)),
             );
             asked.question = Some(question.clone());
-            source.append_input(InputIntent::Steering, "Clarify the options first".into(), 10).unwrap();
+            source
+                .append_input(
+                    InputIntent::Steering,
+                    "Clarify the options first".into(),
+                    10,
+                )
+                .unwrap();
             let answer = "Planning feedback:\n- Goal: Rust learning";
             source
                 .append_input(InputIntent::Clarification, answer.into(), 11)
@@ -416,10 +422,17 @@ mod tests {
                 id: "exchange".into(),
                 created_at_ms: 1,
                 exchange: projected.remove(0),
-                check_runs: Vec::new(), agent_by_id: HashMap::new(),
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
             };
-            let rendered =
-                crate::buffer::projection::project(&entry, &Default::default(), false, &Default::default(), &Default::default()).unwrap();
+            let rendered = crate::buffer::projection::project(
+                &entry,
+                &Default::default(),
+                false,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
             let text = rendered
                 .entry
                 .block
@@ -447,12 +460,20 @@ mod tests {
                 assert!(rendered.prompt.iter().any(|id| id.0.ends_with(":answer")));
                 assert_eq!(text.matches("You answered:").count(), 1);
                 assert!(text.contains("You answered: Rust learning"));
-                assert!(text.find("You answered: Rust learning").unwrap() < text.find("Later commentary boundary").unwrap());
+                assert!(
+                    text.find("You answered: Rust learning").unwrap()
+                        < text.find("Later commentary boundary").unwrap()
+                );
             } else {
                 assert!(text.contains("Clarification withdrawn"));
-                assert!(!text.contains("You answered:"), "withdrawal reason must not become a user answer");
+                assert!(
+                    !text.contains("You answered:"),
+                    "withdrawal reason must not become a user answer"
+                );
             }
-            assert!(text.find("Questions ·").unwrap() < text.find("Clarify the options first").unwrap());
+            assert!(
+                text.find("Questions ·").unwrap() < text.find("Clarify the options first").unwrap()
+            );
         }
     }
 

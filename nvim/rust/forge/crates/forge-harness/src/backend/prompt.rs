@@ -3,7 +3,9 @@ use super::{BackendRequest, HARNESS_SYSTEM_MESSAGE, PromptMode};
 impl BackendRequest {
     /// Bind shared provider instructions to the permission and purpose of this turn.
     pub(crate) fn system_message(&self) -> String {
-        if self.mode == PromptMode::Background { return super::BACKGROUND_SYSTEM_MESSAGE.to_owned(); }
+        if self.mode == PromptMode::Background {
+            return super::BACKGROUND_SYSTEM_MESSAGE.to_owned();
+        }
         format!(
             "{HARNESS_SYSTEM_MESSAGE}\n\n{}",
             self.interaction_contract()
@@ -45,7 +47,10 @@ impl BackendRequest {
         } else {
             "Use question_answer only for an explicit answer to a currently pending question, and question_withdraw only when that decision is no longer needed."
         };
-        let shell = self.control_context.as_ref().map_or(Default::default(), |context|context.check_shell);
+        let shell = self
+            .control_context
+            .as_ref()
+            .map_or(Default::default(), |context| context.check_shell);
         let interpreter = match shell {
             crate::session::CheckShell::Nushell => "Nushell",
             crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
@@ -61,15 +66,20 @@ impl BackendRequest {
         } else {
             ""
         };
-        let check_editing = if self.control_context.as_ref().and_then(|context| context.checks.as_ref())
-            .is_some_and(|scope| scope.editing_enabled()) {
+        let check_editing = if self
+            .control_context
+            .as_ref()
+            .and_then(|context| context.checks.as_ref())
+            .is_some_and(|scope| scope.editing_enabled())
+        {
             "enabled. Use checks_configure for authorized edits. Guided setup still requires answers before saving."
         } else {
             "disabled. The user can enable it with /checks setup on or start guided /checks setup."
         };
         format!(
             "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call checks_run for earlier feedback. Read recorded results through checks_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
-            self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
+            self.execution_mode.label(),
+            serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }
 }
@@ -84,8 +94,16 @@ mod test {
     #[test]
     fn background_profile_excludes_workflow_instructions_and_tools() {
         let context = ControlTurnContext::inactive(PromptMode::Background);
-        assert!(crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(&context),true).is_empty());
-        assert!(crate::control_tools::ControlToolRegistry.definition_list_for_context(Some(&context),false).is_empty());
+        assert!(
+            crate::control_tools::ControlToolRegistry
+                .definition_list_for_context(Some(&context), true)
+                .is_empty()
+        );
+        assert!(
+            crate::control_tools::ControlToolRegistry
+                .definition_list_for_context(Some(&context), false)
+                .is_empty()
+        );
     }
 
     #[test]
@@ -146,8 +164,14 @@ mod test {
             assert!(request.system_message().contains(expected));
         }
         request.mode = PromptMode::Background;
-        assert_eq!(request.system_message(), super::super::BACKGROUND_SYSTEM_MESSAGE);
-        assert_eq!(request.interaction_contract(), super::super::BACKGROUND_SYSTEM_MESSAGE);
+        assert_eq!(
+            request.system_message(),
+            super::super::BACKGROUND_SYSTEM_MESSAGE
+        );
+        assert_eq!(
+            request.interaction_contract(),
+            super::super::BACKGROUND_SYSTEM_MESSAGE
+        );
         assert!(!request.system_message().contains("Conventional Commit"));
     }
 }

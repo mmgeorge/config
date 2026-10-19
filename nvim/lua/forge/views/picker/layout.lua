@@ -108,10 +108,21 @@ end
 ---@param page { option_list: table[], wrap_column?: integer, show_item_counter?: boolean, highlight_selected_line?: boolean, highlight_selected_text?: boolean, [string]: any }
 ---@param selected_index integer
 ---@param width integer
----@param options? { input_visible?: boolean, search_visible?: boolean, footer?: string }
+---@param options? { input_visible?: boolean, search_visible?: boolean, footer?: string, field_by_option?: table<string, string> }
 ---@return table
 function PickerLayout.build(page, selected_index, width, options)
   options = options or {}
+  local field_renderer = require("forge.views.picker.field")
+  local source_page = page
+  if page.field_navigation then
+    page = vim.tbl_extend("force", page, { option_list = {} })
+    for index, source in ipairs(source_page.option_list) do
+      local option = vim.tbl_extend("force", source, {})
+      option.columns, option.column_segments = field_renderer.columns(source,
+        (options.field_by_option or {})[source.id], index == selected_index)
+      page.option_list[index] = option
+    end
+  end
   local lines = {}
   local option_range = {}
   local primary_range = {}
@@ -227,7 +238,13 @@ function PickerLayout.build(page, selected_index, width, options)
       cells[column] = value .. string.rep(" ", math.max(0, size - vim.fn.strdisplaywidth(value)))
       offset = offset + #cells[column] + 2
     end
-    return { text = prefix .. table.concat(cells, "  "):gsub("%s+$", ""), spans = spans }
+    local text = prefix .. table.concat(cells, "  "):gsub("%s+$", "")
+    local visible_spans = {}
+    for _, span in ipairs(spans) do
+      span.last = math.min(span.last, #text)
+      if span.first < span.last then visible_spans[#visible_spans + 1] = span end
+    end
+    return { text = text, spans = visible_spans }
   end
   if page.column_headers then
     lines[#lines + 1] = column_row(page.column_headers, string.rep(" ", prefix_width)).text
@@ -237,7 +254,7 @@ function PickerLayout.build(page, selected_index, width, options)
   local previous_section = nil
   for index, option in ipairs(page.option_list) do
     if option.section and option.section ~= previous_section then
-      if #lines > 0 and lines[#lines] ~= "" then lines[#lines + 1] = "" end
+      if not page.compact_sections and #lines > 0 and lines[#lines] ~= "" then lines[#lines + 1] = "" end
       section_line[#section_line + 1] = #lines + 1
       lines[#lines + 1] = "  " .. option.section
       previous_section = option.section
@@ -250,6 +267,27 @@ function PickerLayout.build(page, selected_index, width, options)
     local row = column_row(values, prefix, option.column_segments, option.column_spans)
     if option.wrap_label then
       append(lines, wrap(option.label, usable_width, prefix, string.rep(" ", prefix_width)))
+    elseif option.fields then
+      local cells, height = {}, 1
+      for column, value in ipairs(values) do
+        cells[column] = wrap_cell(value:gsub("%s+$", ""), column_width[column])
+        height = math.max(height, #cells[column])
+      end
+      for fragment_index = 1, height do
+        local fragments, offsets = {}, {}
+        for column in ipairs(values) do
+          local fragment = cells[column][fragment_index]
+          fragments[column], offsets[column] = fragment and fragment.text or "", fragment and fragment.first or 0
+        end
+        local fragment_row = column_row(fragments, fragment_index == 1 and prefix or string.rep(" ", prefix_width),
+          option.column_segments, nil, offsets)
+        lines[#lines + 1] = fragment_row.text
+        if fragment_index == 1 then row = fragment_row else
+          for _, span in ipairs(fragment_row.spans) do
+            content_span_list[#content_span_list + 1] = vim.tbl_extend("force", span, { line = #lines })
+          end
+        end
+      end
     elseif page.wrap_column and values[page.wrap_column] then
       local column = page.wrap_column
       for fragment_index, fragment in ipairs(wrap_cell(values[column], column_width[column])) do
@@ -288,6 +326,21 @@ function PickerLayout.build(page, selected_index, width, options)
     input_start = #lines + 1
     local reserve = math.max(3, page.input_height or 3)
     for _ = 1, reserve do lines[#lines + 1] = "" end
+  end
+  if page.field_navigation then
+    local option = page.option_list[selected_index]
+    local selected_id = option and (options.field_by_option or {})[option.id]
+    local field = option and option.fields and option.fields[1]
+    for _, candidate in ipairs(option and option.fields or {}) do
+      if candidate.id == selected_id then field = candidate break end
+    end
+    local description = field and (field.disabled_reason or field.description)
+    if description then
+      lines[#lines + 1] = ""
+      local first = #lines + 1
+      append(lines, wrap(description, usable_width, "  "))
+      content_range[#content_range + 1] = { first = first, last = #lines, group = "ForgePickerHint" }
+    end
   end
   local footer_line = #lines + 1
   local footer = "  " .. (options.footer or page.footer or "↑↓ select  Enter confirm  q close")

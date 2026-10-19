@@ -181,11 +181,7 @@ async fn saturated_cache_preserves_exact_counts_and_unavailable_classification()
     ] {
         std::fs::write(root.join(name), bytes).unwrap();
     }
-    std::fs::write(
-        root.join("oversized"),
-        vec![b'x'; 8 * 1024 * 1024 + 1],
-    )
-    .unwrap();
+    std::fs::write(root.join("oversized"), vec![b'x'; 8 * 1024 * 1024 + 1]).unwrap();
     let mut store = RepositoryStore::default();
     store.analysis = Arc::new(AnalysisStore::new(CacheLimits {
         entries: 0,

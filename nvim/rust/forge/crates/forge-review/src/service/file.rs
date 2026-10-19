@@ -509,9 +509,7 @@ pub(crate) fn continuation_block(path: &str) -> Result<BufferBlock> {
 }
 
 fn project_next(file: &mut RetainedFile) -> Result<()> {
-    use forge_diff::{
-        display::{ChunkLimits, DisplayCursor, DisplayState},
-    };
+    use forge_diff::display::{ChunkLimits, DisplayCursor, DisplayState};
     use std::hash::{Hash, Hasher};
     if file.cursor.is_none() {
         file.cursor = Some(DisplayCursor::new(file.diff.clone(), 3));
@@ -528,17 +526,29 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
     let prefix = format!("file:{:016x}", hash.finish());
     let mut candidate = Vec::new();
     for display in &chunk.rows {
-        let group = cursor.group(display.group_index).context("diff display group is missing")?;
-        if let Some(heading) = file.presenter.begin_hunk(display.group_index,
-            BlockId(format!("{prefix}:group:{}", display.group_index)), group,
-            forge_diff::presentation::HunkHeading::Ranges)? {
+        let group = cursor
+            .group(display.group_index)
+            .context("diff display group is missing")?;
+        if let Some(heading) = file.presenter.begin_hunk(
+            display.group_index,
+            BlockId(format!("{prefix}:group:{}", display.group_index)),
+            group,
+            forge_diff::presentation::HunkHeading::Ranges,
+        )? {
             candidate.push(heading);
         }
         let mut block = file.presenter.rows(
-            BlockId(format!("{prefix}:row:{}", file.next_block + candidate.len())),
+            BlockId(format!(
+                "{prefix}:row:{}",
+                file.next_block + candidate.len()
+            )),
             std::slice::from_ref(display),
-            cursor.group(display.group_index).context("diff display group is missing")?,
-            file.old_syntax.as_ref(), file.new_syntax.as_ref())?;
+            cursor
+                .group(display.group_index)
+                .context("diff display group is missing")?,
+            file.old_syntax.as_ref(),
+            file.new_syntax.as_ref(),
+        )?;
         if let Some(anchor) = inline_anchor(&revision, &path, display) {
             let target = TargetId(format!(
                 "{prefix}:inline:{}",

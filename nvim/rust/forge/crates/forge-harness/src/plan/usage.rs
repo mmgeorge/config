@@ -121,8 +121,12 @@ pub(super) fn validate(design: &DeclarationDesign, workspace: &Path) -> Result<(
                 DeclarationRole::Property => {
                     "Add its read, write, construction, or destructuring use to the user's Accesses section."
                 }
-                DeclarationRole::Type => "Add its signature reference or construction to the caller's Constructs section.",
-                _ => "Add a resolved type reference or a named use in Calls, Constructs, or Accesses.",
+                DeclarationRole::Type => {
+                    "Add its signature reference or construction to the caller's Constructs section."
+                }
+                _ => {
+                    "Add a resolved type reference or a named use in Calls, Constructs, or Accesses."
+                }
             };
             let role = match symbol.role {
                 DeclarationRole::Callable => "function",
@@ -314,7 +318,12 @@ mod tests {
         let design = DeclarationDesign::default().patch(workspace.path(), &BTreeMap::new(), "*** Begin Patch\n*** Add File: src/lib.rs\n+struct Weapon;\n+pub fn setup();\n+Constructs\n+  Weapon\n*** End Patch").unwrap();
         validate(&design, workspace.path()).unwrap();
         let index = PlanReferenceIndex::design(&design, workspace.path()).unwrap();
-        assert!(index.occurrence.iter().any(|reference| reference.name == "Weapon" && reference.kind == "construct"));
+        assert!(
+            index
+                .occurrence
+                .iter()
+                .any(|reference| reference.name == "Weapon" && reference.kind == "construct")
+        );
         let mut omitted = design.clone();
         omitted.proposed_calls.clear();
         assert!(validate(&omitted, workspace.path()).is_err());

@@ -19,7 +19,9 @@ struct Payload {
 }
 
 fn identity(root: &Path) -> Result<String> {
-    let root = root.canonicalize().context("resolve ignored-path worktree root")?;
+    let root = root
+        .canonicalize()
+        .context("resolve ignored-path worktree root")?;
     let mut key = root
         .to_str()
         .context("Forge ignored paths require a UTF-8 worktree root")?
@@ -90,10 +92,7 @@ pub(crate) fn update(
     selected: &[RepositoryPath],
     ignored: bool,
 ) -> Result<IgnoredPathSet> {
-    ensure!(
-        !selected.is_empty(),
-        "ignored change requires paths"
-    );
+    ensure!(!selected.is_empty(), "ignored change requires paths");
     let (destination, key) = path(directory, root)?;
     std::fs::create_dir_all(directory)?;
     let lock_path = destination.with_extension("lock");

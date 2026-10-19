@@ -129,11 +129,7 @@ impl ReviewDocument {
         let title = text.title.context("PR observation omitted title")?;
         let body = text.body.context("PR observation omitted body")?;
         let mut edits = EditStore::new(id.clone(), EditLimits::default(), budget)?;
-        let comments = CommentStore::new(
-            id.clone(),
-            target.clone(),
-            ReviewMode::Overview,
-        )?;
+        let comments = CommentStore::new(id.clone(), target.clone(), ReviewMode::Overview)?;
         edits.insert(RegionId("title".into()), RegionRevision(0), title)?;
         edits.insert(RegionId("body".into()), RegionRevision(0), body)?;
         Ok(Self {

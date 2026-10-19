@@ -1,17 +1,17 @@
 //! Resolves declaration references once for validation and source navigation.
 
+pub(crate) mod exposure;
 mod sources;
-pub(crate) mod trace;
 #[cfg(test)]
 mod tests;
+pub(crate) mod trace;
 mod typescript;
-pub(crate) mod exposure;
 
 use crate::plan::DeclarationDesign;
 use anyhow::Result;
 use forge_diff::syntax::{
-    DeclarationIndex, DeclarationIndexTiming, DeclarationPosition, DeclarationReference, DeclarationSymbol,
-    SymbolVisibility,
+    DeclarationIndex, DeclarationIndexTiming, DeclarationPosition, DeclarationReference,
+    DeclarationSymbol, SymbolVisibility,
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -207,16 +207,36 @@ static PARSE_CACHE: OnceLock<ParseCache> = OnceLock::new();
 impl DeclarationResolver {
     /// Reuse a snapshot's parsed declaration evidence without another source read.
     pub(crate) fn index(&self, path: &str) -> Option<Arc<DeclarationIndex>> {
-        self.file.get(&normalize(&self.workspace.join(path))).map(|file| file.index.clone())
+        self.file
+            .get(&normalize(&self.workspace.join(path)))
+            .map(|file| file.index.clone())
     }
 
     /// Inspect the role of one resolved target using its existing parsed evidence.
-    pub(crate) fn role(&self, resolution: &DeclarationResolution) -> Option<forge_diff::syntax::DeclarationRole> {
-        let DeclarationResolution::Resolved { destination } = resolution else { return None; };
-        self.file.get(Path::new(&destination.path))?.index.symbol.iter().find(|symbol| symbol.position.line == destination.line && symbol.position.column == destination.column).map(|symbol| symbol.role)
+    pub(crate) fn role(
+        &self,
+        resolution: &DeclarationResolution,
+    ) -> Option<forge_diff::syntax::DeclarationRole> {
+        let DeclarationResolution::Resolved { destination } = resolution else {
+            return None;
+        };
+        self.file
+            .get(Path::new(&destination.path))?
+            .index
+            .symbol
+            .iter()
+            .find(|symbol| {
+                symbol.position.line == destination.line
+                    && symbol.position.column == destination.column
+            })
+            .map(|symbol| symbol.role)
     }
     /// Resolve declarations exclusively from saved plan files without consulting workspace sources.
-    pub(crate) fn planned(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
+    pub(crate) fn planned(
+        workspace: &Path,
+        design: &DeclarationDesign,
+        baseline: bool,
+    ) -> Result<Self> {
         let mut resolver = Self::snapshot(workspace, design, baseline)?;
         sources::project(&mut resolver)?;
         resolver.discard_snapshot_originals();
@@ -312,7 +332,10 @@ impl DeclarationResolver {
         if self.file.contains_key(&path) {
             return Ok(true);
         }
-        let stage = self.trace.as_ref().map(|trace| trace.stage("index_file", Some(self.baseline)));
+        let stage = self
+            .trace
+            .as_ref()
+            .map(|trace| trace.stage("index_file", Some(self.baseline)));
         let started = Instant::now();
         let read_started = Instant::now();
         let Some(text) = self.read(&path) else {
@@ -337,16 +360,20 @@ impl DeclarationResolver {
             .get(&key)
             .cloned();
         if self.trace.is_some() {
-            if cached.is_some() { self.work.parse_cache_hits += 1; }
-            else { self.work.parse_cache_misses += 1; }
+            if cached.is_some() {
+                self.work.parse_cache_hits += 1;
+            } else {
+                self.work.parse_cache_misses += 1;
+            }
         }
         let cache_hit = cached.is_some();
         let mut timing = DeclarationIndexTiming::default();
         let index = match cached {
             Some(index) => index,
             None => {
-                let (index, measured) = DeclarationIndex::extract_timed(&path.to_string_lossy(), &text)
-                    .map_err(|error| anyhow::anyhow!("{}: {error:?}", path.display()))?;
+                let (index, measured) =
+                    DeclarationIndex::extract_timed(&path.to_string_lossy(), &text)
+                        .map_err(|error| anyhow::anyhow!("{}: {error:?}", path.display()))?;
                 timing = measured;
                 let index = Arc::new(index);
                 let mut cache = cache
@@ -376,7 +403,8 @@ impl DeclarationResolver {
             },
         );
         if !package.is_empty() {
-            self.module.insert((package.into(), module.to_vec()), path.clone());
+            self.module
+                .insert((package.into(), module.to_vec()), path.clone());
         }
         if let Some(stage) = stage {
             let load_ms = started.elapsed().as_secs_f64() * 1000.0;
@@ -386,9 +414,11 @@ impl DeclarationResolver {
             self.work.file_read_ms += read_ms;
             self.work.file_parse_ms += parse_ms;
             self.work.file_extract_ms += extract_ms;
-            stage.complete(serde_json::json!({"path":path,"package":package,"module":module,
+            stage.complete(
+                serde_json::json!({"path":path,"package":package,"module":module,
                 "available":true,"bytes":text.len(),"cached":cache_hit,"read_ms":read_ms,
-                "parse_ms":parse_ms,"extract_ms":extract_ms,"load_ms":load_ms}));
+                "parse_ms":parse_ms,"extract_ms":extract_ms,"load_ms":load_ms}),
+            );
         }
         Ok(true)
     }
@@ -488,11 +518,14 @@ impl DeclarationResolver {
         manifest_path: PathBuf,
         dependency: HashMap<String, String>,
     ) {
-        self.package.insert(identity, RustPackage {
-            source_manifest: Some(normalize(&manifest_path)),
-            dependency,
-            ..Default::default()
-        });
+        self.package.insert(
+            identity,
+            RustPackage {
+                source_manifest: Some(normalize(&manifest_path)),
+                dependency,
+                ..Default::default()
+            },
+        );
     }
 
     fn register_root(&mut self, package: &str, root: PathBuf) -> Result<()> {
@@ -500,7 +533,8 @@ impl DeclarationResolver {
         if root.starts_with(&self.workspace) {
             self.load_rust(&root, package, &[], 0)?;
         } else {
-            self.pending_module.insert((package.into(), Vec::new()), (root, false));
+            self.pending_module
+                .insert((package.into(), Vec::new()), (root, false));
         }
         Ok(())
     }
@@ -537,7 +571,9 @@ impl DeclarationResolver {
         }
         for file in files {
             for reference in &file.index.reference {
-                if reference.macro_namespace { continue; }
+                if reference.macro_namespace {
+                    continue;
+                }
                 let result = self.resolve_reference(&file, reference, false);
                 record(
                     &mut report,
@@ -611,18 +647,57 @@ impl DeclarationResolver {
                     result,
                 );
             }
-            let path = file.path.strip_prefix(&self.workspace).unwrap_or(&file.path).to_string_lossy().replace('\\', "/");
+            let path = file
+                .path
+                .strip_prefix(&self.workspace)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .replace('\\', "/");
             if let Some(functions) = design.proposed_calls.get(&path) {
                 for function in functions {
-                    for reference in function.call.iter().flatten().filter(|reference| reference.kind == crate::plan::CallKind::Construct) {
-                        let position = reference.source.as_ref().map(|source| DeclarationPosition { line: source.line, column: source.column })
-                            .or_else(|| file.index.symbol.iter().find(|symbol| {
-                                symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("::") == function.owner
-                            }).map(|symbol| symbol.position))
+                    for reference in function
+                        .call
+                        .iter()
+                        .flatten()
+                        .filter(|reference| reference.kind == crate::plan::CallKind::Construct)
+                    {
+                        let position = reference
+                            .source
+                            .as_ref()
+                            .map(|source| DeclarationPosition {
+                                line: source.line,
+                                column: source.column,
+                            })
+                            .or_else(|| {
+                                file.index
+                                    .symbol
+                                    .iter()
+                                    .find(|symbol| {
+                                        symbol
+                                            .scope
+                                            .iter()
+                                            .chain(std::iter::once(&symbol.name))
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join("::")
+                                            == function.owner
+                                    })
+                                    .map(|symbol| symbol.position)
+                            })
                             .unwrap_or(DeclarationPosition { line: 1, column: 0 });
-                        let result = if reference.unresolved { unverified("Construction target includes an opaque local binding") }
-                            else { self.construct(&path, &function.owner, &reference.name) };
-                        record(&mut report, &self.workspace, &file.path, position, &reference.name, result);
+                        let result = if reference.unresolved {
+                            unverified("Construction target includes an opaque local binding")
+                        } else {
+                            self.construct(&path, &function.owner, &reference.name)
+                        };
+                        record(
+                            &mut report,
+                            &self.workspace,
+                            &file.path,
+                            position,
+                            &reference.name,
+                            result,
+                        );
                     }
                 }
             }
@@ -734,7 +809,17 @@ impl DeclarationResolver {
     /// Release redundant original text from indexed declaration snapshots.
     pub(crate) fn discard_snapshot_originals(&mut self) {
         for file in self.file.values_mut() {
-            if file.path.strip_prefix(&self.workspace).ok().is_some_and(|path| self.snapshot.contains_key(&path.to_string_lossy().replace('\\', "/"))) { file.original = None; }
+            if file
+                .path
+                .strip_prefix(&self.workspace)
+                .ok()
+                .is_some_and(|path| {
+                    self.snapshot
+                        .contains_key(&path.to_string_lossy().replace('\\', "/"))
+                })
+            {
+                file.original = None;
+            }
         }
     }
 
@@ -759,9 +844,16 @@ impl DeclarationResolver {
             conditional: false,
         };
         let result = self.resolve_reference(&file, &reference, true);
-        if self.role(&result) == Some(forge_diff::syntax::DeclarationRole::Module) && let DeclarationResolution::Resolved { destination } = &result {
-            let target = Path::new(&destination.path).strip_prefix(&self.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
-            if let Some(target) = target { return self.at(&target, destination.line, destination.column); }
+        if self.role(&result) == Some(forge_diff::syntax::DeclarationRole::Module)
+            && let DeclarationResolution::Resolved { destination } = &result
+        {
+            let target = Path::new(&destination.path)
+                .strip_prefix(&self.workspace)
+                .ok()
+                .map(|path| path.to_string_lossy().replace('\\', "/"));
+            if let Some(target) = target {
+                return self.at(&target, destination.line, destination.column);
+            }
         }
         result
     }
@@ -914,13 +1006,30 @@ impl DeclarationResolver {
     /// Resolve a named body value in its value namespace, then its type namespace.
     pub(crate) fn value(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
         let result = self.callable(path, owner, name);
-        if matches!(result, DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }) { return result; }
+        if matches!(
+            result,
+            DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }
+        ) {
+            return result;
+        }
         let separator = if path.ends_with(".rs") { "::" } else { "." };
-        self.type_target(path, &owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &name.split(separator).map(str::to_owned).collect::<Vec<_>>())
+        self.type_target(
+            path,
+            &owner
+                .split(separator)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            &name.split(separator).map(str::to_owned).collect::<Vec<_>>(),
+        )
     }
 
     /// Resolve a type or a callable whose declared return is an owned named type.
-    pub(crate) fn construct(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
+    pub(crate) fn construct(
+        &mut self,
+        path: &str,
+        owner: &str,
+        name: &str,
+    ) -> DeclarationResolution {
         let target = self.value(path, owner, name);
         match self.role(&target) {
             Some(forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Variant) | None => target,
@@ -933,27 +1042,79 @@ impl DeclarationResolver {
 
     /// Classify factories by their captured return type, excluding borrowed and scalar results.
     pub(crate) fn factory(&mut self, target: &DeclarationResolution) -> bool {
-        let DeclarationResolution::Resolved { destination } = target else { return false; };
+        let DeclarationResolution::Resolved { destination } = target else {
+            return false;
+        };
         let path = PathBuf::from(&destination.path);
         if !self.returns.contains_key(&path) {
-            let Some(source) = self.read(&path) else { return false; };
-            let Ok(functions) = forge_diff::syntax::DeclarationCalls::extract(&destination.path, &source, true) else { return false; };
+            let Some(source) = self.read(&path) else {
+                return false;
+            };
+            let Ok(functions) =
+                forge_diff::syntax::DeclarationCalls::extract(&destination.path, &source, true)
+            else {
+                return false;
+            };
             self.returns.insert(path.clone(), functions);
         }
-        let Some(function) = self.returns[&path].iter().find(|function| function.line == destination.line && function.column == destination.column) else { return false; };
-        let Some(return_type) = &function.return_type else { return false; };
-        let name = return_type.split('<').next().unwrap_or(return_type).trim().trim_end_matches("::");
-        if name.is_empty() || !name.chars().all(|character| character.is_alphanumeric() || "_:.$".contains(character)) {
+        let Some(function) = self.returns[&path].iter().find(|function| {
+            function.line == destination.line && function.column == destination.column
+        }) else {
+            return false;
+        };
+        let Some(return_type) = &function.return_type else {
+            return false;
+        };
+        let name = return_type
+            .split('<')
+            .next()
+            .unwrap_or(return_type)
+            .trim()
+            .trim_end_matches("::");
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|character| character.is_alphanumeric() || "_:.$".contains(character))
+        {
             return false;
         }
-        if rust_primitive(name) || matches!(name, "void" | "never" | "unknown" | "any" | "string" | "number" | "boolean" | "object" | "undefined" | "null" | "symbol" | "bigint") {
+        if rust_primitive(name)
+            || matches!(
+                name,
+                "void"
+                    | "never"
+                    | "unknown"
+                    | "any"
+                    | "string"
+                    | "number"
+                    | "boolean"
+                    | "object"
+                    | "undefined"
+                    | "null"
+                    | "symbol"
+                    | "bigint"
+            )
+        {
             return false;
         }
         let owner = function.owner.clone();
         let name = name.to_owned();
-        let Some(relative) = path.strip_prefix(&self.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/")) else { return false; };
+        let Some(relative) = path
+            .strip_prefix(&self.workspace)
+            .ok()
+            .map(|path| path.to_string_lossy().replace('\\', "/"))
+        else {
+            return false;
+        };
         let separator = if relative.ends_with(".rs") { "::" } else { "." };
-        let returned = self.type_target(&relative, &owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &name.split(separator).map(str::to_owned).collect::<Vec<_>>());
+        let returned = self.type_target(
+            &relative,
+            &owner
+                .split(separator)
+                .map(str::to_owned)
+                .collect::<Vec<_>>(),
+            &name.split(separator).map(str::to_owned).collect::<Vec<_>>(),
+        );
         self.role(&returned) == Some(forge_diff::syntax::DeclarationRole::Type)
             || matches!(returned, DeclarationResolution::Unverified { .. })
     }
@@ -1074,7 +1235,13 @@ impl DeclarationResolver {
                 &mut HashSet::new(),
             );
             let bound = reference.path.first().is_some_and(|name| {
-                self.rust_bound(&file.package, &scope[..depth], name, reference.value_namespace, reference.macro_namespace)
+                self.rust_bound(
+                    &file.package,
+                    &scope[..depth],
+                    name,
+                    reference.value_namespace,
+                    reference.macro_namespace,
+                )
             });
             if bound
                 || matches!(
@@ -1171,9 +1338,9 @@ impl DeclarationResolver {
                     )
                 }
             }
-            "std" | "core" | "alloc" => unverified(
-                "External standard-library references are unchecked during planning",
-            ),
+            "std" | "core" | "alloc" => {
+                unverified("External standard-library references are unchecked during planning")
+            }
             _ => {
                 if self.rust_bound(package, scope, first, value, origin.macro_namespace) {
                     return self.rust_member(package, scope, path, value, origin, visited);
@@ -1191,12 +1358,26 @@ impl DeclarationResolver {
         }
     }
 
-    fn rust_bound(&self, package: &str, scope: &[String], name: &str, value: bool, macro_namespace: bool) -> bool {
+    fn rust_bound(
+        &self,
+        package: &str,
+        scope: &[String],
+        name: &str,
+        value: bool,
+        macro_namespace: bool,
+    ) -> bool {
         self.rust_scope_file(package, scope).is_some_and(|file| {
             let relative = scope.strip_prefix(file.module.as_slice()).unwrap();
             file.index.symbol.iter().any(|symbol| {
-                symbol.scope == relative && symbol.name == name
-                    && if macro_namespace { symbol.macro_namespace } else if value { symbol.value_namespace } else { symbol.type_namespace }
+                symbol.scope == relative
+                    && symbol.name == name
+                    && if macro_namespace {
+                        symbol.macro_namespace
+                    } else if value {
+                        symbol.value_namespace
+                    } else {
+                        symbol.type_namespace
+                    }
             }) || file.index.import.iter().any(|import| {
                 import.scope == relative && !import.glob && import.alias.as_deref() == Some(name)
             })
@@ -1205,7 +1386,8 @@ impl DeclarationResolver {
 
     fn rust_scope_file(&self, package: &str, scope: &[String]) -> Option<&IndexedFile> {
         (0..=scope.len()).rev().find_map(|depth| {
-            self.module.get(&(package.into(), scope[..depth].to_vec()))
+            self.module
+                .get(&(package.into(), scope[..depth].to_vec()))
                 .and_then(|path| self.file.get(path))
         })
     }
@@ -1225,7 +1407,9 @@ impl DeclarationResolver {
         }
         let key = format!("{package}:{}:{}:{value}", scope.join("::"), path.join("::"));
         if visited.len() > 256 || !visited.insert(key.clone()) {
-            if self.trace.is_some() { self.work.cycle_or_depth_stops += 1; }
+            if self.trace.is_some() {
+                self.work.cycle_or_depth_stops += 1;
+            }
             return unverified("cyclic or excessively deep re-export chain");
         }
         let result = self.rust_member_inner(package, scope, path, value, origin, visited);
@@ -1266,8 +1450,14 @@ impl DeclarationResolver {
         }
         let first = &path[0];
         let mut results = Vec::new();
-        let files = self.rust_scope_file(package, scope).cloned().into_iter().collect::<Vec<_>>();
-        if self.trace.is_some() { self.work.file_scans += files.len(); }
+        let files = self
+            .rust_scope_file(package, scope)
+            .cloned()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if self.trace.is_some() {
+            self.work.file_scans += files.len();
+        }
         for file in &files {
             let relative = scope.strip_prefix(file.module.as_slice());
             let Some(relative) = relative else {
@@ -1290,10 +1480,12 @@ impl DeclarationResolver {
                 let local_conditional_use = origin.navigation
                     && origin.package == package
                     && match symbol.role {
-                        forge_diff::syntax::DeclarationRole::Callable => origin.scope.starts_with(scope),
-                        forge_diff::syntax::DeclarationRole::Module => {
-                            origin.scope.starts_with(&joined(scope, std::slice::from_ref(&symbol.name)))
+                        forge_diff::syntax::DeclarationRole::Callable => {
+                            origin.scope.starts_with(scope)
                         }
+                        forge_diff::syntax::DeclarationRole::Module => origin
+                            .scope
+                            .starts_with(&joined(scope, std::slice::from_ref(&symbol.name))),
                         _ => false,
                     };
                 if symbol.conditional && !local_conditional_use {
@@ -1319,7 +1511,11 @@ impl DeclarationResolver {
             }
             // A qualified path enters its lexical container before considering same-named aliases.
             if path.len() > 1 && !results.is_empty() {
-                return combine(results, || self.missing_rust(package, &joined(scope, path).join("::")), origin.navigation);
+                return combine(
+                    results,
+                    || self.missing_rust(package, &joined(scope, path).join("::")),
+                    origin.navigation,
+                );
             }
             for import in file.index.import.iter().filter(|import| {
                 import.scope == relative && !import.glob && import.alias.as_ref() == Some(first)
@@ -1373,7 +1569,9 @@ impl DeclarationResolver {
                     results.push(unverified("re-export is conditionally compiled"));
                     continue;
                 }
-                if self.trace.is_some() { self.work.glob_branches += 1; }
+                if self.trace.is_some() {
+                    self.work.glob_branches += 1;
+                }
                 let target = joined(&import.path, path);
                 let result = self.resolve_rust_path(
                     package,
@@ -1483,9 +1681,7 @@ fn combine(
             }
             DeclarationResolution::Intrinsic => return DeclarationResolution::Intrinsic,
             DeclarationResolution::Ambiguous { .. } => return result,
-            DeclarationResolution::Unverified { .. } => {
-                uncertain = Some(result)
-            }
+            DeclarationResolution::Unverified { .. } => uncertain = Some(result),
             DeclarationResolution::Invalid { .. } => {}
         }
     }

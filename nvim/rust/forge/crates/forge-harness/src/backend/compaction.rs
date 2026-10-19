@@ -177,7 +177,8 @@ impl Compaction {
     pub(crate) fn observe_context_usage(&mut self, used: u64) -> bool {
         if self.result.context_tokens_before.is_none()
             || self.state != CompactionState::Completed
-            || self.result.context_tokens_after.is_some() {
+            || self.result.context_tokens_after.is_some()
+        {
             return false;
         }
         self.result.context_tokens_after = Some(used);
@@ -200,9 +201,13 @@ impl Compaction {
             return;
         }
         update.started_at_ms = self.started_at_ms.or(update.started_at_ms);
-        update.result.context_tokens_before = self.result.context_tokens_before
+        update.result.context_tokens_before = self
+            .result
+            .context_tokens_before
             .or(update.result.context_tokens_before);
-        update.result.context_tokens_after = update.result.context_tokens_after
+        update.result.context_tokens_after = update
+            .result
+            .context_tokens_after
             .or(self.result.context_tokens_after);
         update.result.before_context = self
             .result
@@ -299,7 +304,12 @@ mod tests {
         assert_eq!(start.completed_at_ms, Some(400));
         assert_eq!(start.result.model.as_deref(), Some("summary-model"));
         assert_eq!(
-            start.result.before_context.as_ref().unwrap().conversation_tokens,
+            start
+                .result
+                .before_context
+                .as_ref()
+                .unwrap()
+                .conversation_tokens,
             Some(800)
         );
         let mut detail = start.clone();
@@ -308,7 +318,10 @@ mod tests {
         start.observe(detail, 600);
         assert_eq!(start.completed_at_ms, Some(400));
         assert_eq!(start.result.tokens_removed, Some(0));
-        assert_eq!(start.result.summary_content.as_deref(), Some("Retained context"));
+        assert_eq!(
+            start.result.summary_content.as_deref(),
+            Some("Retained context")
+        );
         let mut replay = start.clone();
         replay.state = CompactionState::Running;
         replay.result.context_tokens_before = Some(800);

@@ -1,30 +1,40 @@
 //! Exact-source syntax trees share native parsing between highlights and structural context.
 
-mod assets;
 mod algorithm;
-pub use algorithm::{AlgorithmInvocation, AlgorithmReference, algorithm_reference, algorithm_references, validate_algorithm};
-mod context;
-mod query;
+mod assets;
+pub use algorithm::{
+    AlgorithmInvocation, AlgorithmReference, algorithm_reference, algorithm_references,
+    validate_algorithm,
+};
 mod configuration;
+mod context;
 mod declaration;
 mod declaration_contract;
+mod query;
 pub use declaration_contract::{ContractDeclaration, ContractDifference, DeclarationContract};
+mod declaration_calls;
 mod declaration_fold;
 mod declaration_index;
-mod declaration_calls;
-pub use declaration_calls::{DeclarationCall, DeclarationCallKind, DeclarationCallable, DeclarationCalls};
-pub use declaration_index::{DeclarationIndex, DeclarationIndexTiming, DeclarationImport, DeclarationModule, DeclarationMemberOwner, DeclarationReference, DeclarationRole, DeclarationSymbol, SymbolVisibility};
+pub use declaration_calls::{
+    DeclarationCall, DeclarationCallKind, DeclarationCallable, DeclarationCalls,
+};
 pub use declaration_fold::{DeclarationFold, DeclarationFolding};
+pub use declaration_index::{
+    DeclarationImport, DeclarationIndex, DeclarationIndexTiming, DeclarationMemberOwner,
+    DeclarationModule, DeclarationReference, DeclarationRole, DeclarationSymbol, SymbolVisibility,
+};
 mod visibility;
 pub use configuration::ConfigurationFormat;
+pub use declaration::{
+    DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation,
+};
 pub use visibility::DeclarationVisibility;
-pub use declaration::{DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation};
+mod outline;
 mod service;
 mod structure;
-mod outline;
 mod tree;
-pub use structure::SourceDeclaration;
 pub use outline::{SourceOutline, SourceScope};
+pub use structure::SourceDeclaration;
 
 pub use assets::SyntaxLanguage;
 pub use context::HunkContext;
@@ -54,12 +64,10 @@ mod tests {
     use std::sync::Arc;
 
     fn engine() -> Arc<SyntaxEngine> {
-        SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 2,
-            })),
-        )
+        SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 2,
+        })))
     }
 
     fn request(language: SyntaxLanguage, text: &str) -> SyntaxRequest {
@@ -81,7 +89,12 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(syntax.tree_count(), 1101);
-        assert!(syntax.captures().iter().any(|capture| capture.range.start.row == 2198));
+        assert!(
+            syntax
+                .captures()
+                .iter()
+                .any(|capture| capture.range.start.row == 2198)
+        );
     }
 
     #[tokio::test]
@@ -236,9 +249,15 @@ mod tests {
             ("typescript", "const value: number = 1;"),
             ("tsx", "const view = <div>Hi</div>;"),
             ("lua", "local value = 1"),
-            ("python", "def example(value: int) -> int:\n    return value + 1\n"),
+            (
+                "python",
+                "def example(value: int) -> int:\n    return value + 1\n",
+            ),
             ("c", "int calculate(int value) { return value + 1; }"),
-            ("cpp", "template<typename Value> Value calculate(Value value) { return value + 1; }"),
+            (
+                "cpp",
+                "template<typename Value> Value calculate(Value value) { return value + 1; }",
+            ),
             ("vim", "let value = 1"),
             ("vimdoc", "*example* example help"),
             ("json", "{\"value\": 1}"),
@@ -287,9 +306,15 @@ mod tests {
             ("typescript", "const value: number = 1;"),
             ("tsx", "const view = <div>Hi</div>;"),
             ("lua", "local value = 1"),
-            ("python", "def example(value: int) -> int:\n    return value + 1\n"),
+            (
+                "python",
+                "def example(value: int) -> int:\n    return value + 1\n",
+            ),
             ("c", "int calculate(int value) { return value + 1; }"),
-            ("cpp", "template<typename Value> Value calculate(Value value) { return value + 1; }"),
+            (
+                "cpp",
+                "template<typename Value> Value calculate(Value value) { return value + 1; }",
+            ),
             ("vim", "let value = 1"),
             ("vimdoc", "*example* example help"),
             ("json", "{\"value\": 1}"),
@@ -469,32 +494,49 @@ mod tests {
             workers: 1,
             jobs: 1,
         }));
-        let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(0, None)).unwrap();
+        let occupied = pool
+            .reserve(WorkPriority::Foreground, WorkBudget::new(0, None))
+            .unwrap();
         let engine = SyntaxEngine::new(Arc::clone(&pool));
         let mut pending = Box::pin(engine.analyze(SyntaxRequest {
             priority: WorkPriority::Visible,
             ..request(SyntaxLanguage::Rust, "fn visible() {}")
         }));
-        let before_release = std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context))).await;
+        let before_release =
+            std::future::poll_fn(|context| Poll::Ready(pending.as_mut().poll(context))).await;
         drop(occupied);
         let result = match before_release {
             Poll::Ready(result) => result,
-            Poll::Pending => tokio::time::timeout(std::time::Duration::from_secs(5), pending).await.unwrap(),
+            Poll::Pending => tokio::time::timeout(std::time::Duration::from_secs(5), pending)
+                .await
+                .unwrap(),
         };
-        assert!(result.is_ok(), "temporary pool saturation permanently failed visible syntax: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "temporary pool saturation permanently failed visible syntax: {:?}",
+            result.err()
+        );
         assert_eq!(pool.usage().admitted_jobs, 0);
     }
 
     #[tokio::test]
     async fn syntax_uses_workers_when_shared_byte_capacity_is_occupied() {
         use crate::workers::WorkBudget;
-        let pool = Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 4 }));
-        let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(1, None)).unwrap();
+        let pool = Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 4,
+        }));
+        let occupied = pool
+            .reserve(WorkPriority::Foreground, WorkBudget::new(1, None))
+            .unwrap();
         let engine = SyntaxEngine::new(Arc::clone(&pool));
         let syntax = tokio::time::timeout(
             std::time::Duration::from_secs(2),
             engine.analyze(request(SyntaxLanguage::Rust, "fn highlighted() {}")),
-        ).await.unwrap().unwrap();
+        )
+        .await
+        .unwrap()
+        .unwrap();
         assert!(!syntax.captures().is_empty());
         assert_eq!(pool.usage().input_bytes, 1);
         drop(occupied);
@@ -507,26 +549,43 @@ mod tests {
         use std::future::Future;
         use std::task::Poll;
         for boundary in ["deadline", "syntax close", "pool close"] {
-            let pool = Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 1 }));
-            let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(0, None)).unwrap();
+            let pool = Arc::new(AnalysisPool::new(PoolLimits {
+                workers: 1,
+                jobs: 1,
+            }));
+            let occupied = pool
+                .reserve(WorkPriority::Foreground, WorkBudget::new(0, None))
+                .unwrap();
             let engine = SyntaxEngine::new(Arc::clone(&pool));
             let mut source = request(SyntaxLanguage::Rust, "fn waiting() {}");
             if boundary == "deadline" {
-                source.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(30));
+                source.deadline =
+                    Some(std::time::Instant::now() + std::time::Duration::from_millis(30));
             }
             let mut waiting = Box::pin(engine.analyze(source));
-            assert!(std::future::poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context))).await.is_pending());
+            assert!(
+                std::future::poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context)))
+                    .await
+                    .is_pending()
+            );
             match boundary {
                 "syntax close" => engine.close(),
                 "pool close" => pool.close(),
-                _ => {},
+                _ => {}
             }
-            let error = tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().err().unwrap();
-            assert_eq!(error, match boundary {
-                "syntax close" => SyntaxError::Closed,
-                "pool close" => SyntaxError::Pool(PoolError::Closed),
-                _ => SyntaxError::Deadline,
-            });
+            let error = tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+                .await
+                .unwrap()
+                .err()
+                .unwrap();
+            assert_eq!(
+                error,
+                match boundary {
+                    "syntax close" => SyntaxError::Closed,
+                    "pool close" => SyntaxError::Pool(PoolError::Closed),
+                    _ => SyntaxError::Deadline,
+                }
+            );
             assert_eq!(pool.usage().admitted_jobs, 1);
             drop(occupied);
         }
@@ -541,7 +600,12 @@ mod tests {
         ] {
             let pool = Arc::new(AnalysisPool::new(PoolLimits { workers, jobs }));
             let engine = SyntaxEngine::new(pool);
-            let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), engine.analyze(request(SyntaxLanguage::Rust, "fn main() {}"))).await.unwrap();
+            let outcome = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                engine.analyze(request(SyntaxLanguage::Rust, "fn main() {}")),
+            )
+            .await
+            .unwrap();
             assert_eq!(outcome.err(), Some(SyntaxError::Pool(expected)));
         }
     }
@@ -549,15 +613,22 @@ mod tests {
     #[tokio::test]
     async fn pinned_syntax_survives_cache_eviction_without_blocking_new_files() {
         let engine = engine();
-        let pinned = engine.analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
-            .await.unwrap();
+        let pinned = engine
+            .analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
+            .await
+            .unwrap();
         for revision in 0..257 {
             let source = format!("fn revision_{revision}() {{ let value = {revision}; }}");
-            let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+            let syntax = engine
+                .analyze(request(SyntaxLanguage::Rust, &source))
+                .await
+                .unwrap();
             assert!(!syntax.captures().is_empty());
         }
-        let reloaded = engine.analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
-            .await.unwrap();
+        let reloaded = engine
+            .analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
+            .await
+            .unwrap();
         assert!(!Arc::ptr_eq(&pinned.0, &reloaded.0));
         assert_eq!(pinned.source_identity(), reloaded.source_identity());
         assert!(!pinned.captures().is_empty());
@@ -572,8 +643,13 @@ mod tests {
                     let mut source = vec!["// padding"; lines];
                     source[0] = "fn boundary() {}";
                     let mut source = source.join(newline);
-                    if trailing_newline { source.push_str(newline); }
-                    let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+                    if trailing_newline {
+                        source.push_str(newline);
+                    }
+                    let syntax = engine
+                        .analyze(request(SyntaxLanguage::Rust, &source))
+                        .await
+                        .unwrap();
                     assert_eq!(syntax.source().text(), source);
                     assert_eq!(syntax.tree_count(), 1);
                     assert!(!syntax.captures().is_empty());
@@ -586,11 +662,17 @@ mod tests {
     async fn long_lines_and_many_captures_remain_eligible() {
         let engine = engine();
         let source = format!("fn long_line() {{}} // {}", "x".repeat(1024 * 1024));
-        let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+        let syntax = engine
+            .analyze(request(SyntaxLanguage::Rust, &source))
+            .await
+            .unwrap();
         assert_eq!(syntax.tree_count(), 1);
         assert!(!syntax.captures().is_empty());
         let source = "fn dense() { let first = 1; let second = first + 2; }\n".repeat(10_001);
-        let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+        let syntax = engine
+            .analyze(request(SyntaxLanguage::Rust, &source))
+            .await
+            .unwrap();
         assert!(syntax.captures().len() > 65_536);
     }
 
@@ -677,13 +759,19 @@ mod tests {
     #[tokio::test]
     async fn python_outline_includes_decorators_and_does_not_treat_dicts_as_closing_delimiters() {
         let source = "from typing import (\n    Any,\n)\n@decorate\nclass Client:\n    @classmethod\n    async def fetch(\n        cls, value: int,\n    ) -> dict[str, int]:\n        return {\n            \"value\": value,\n        }\n";
-        let handle = engine().analyze(request(SyntaxLanguage::Python, source)).await.unwrap();
+        let handle = engine()
+            .analyze(request(SyntaxLanguage::Python, source))
+            .await
+            .unwrap();
         let outline = handle.outline();
         assert_eq!(outline.import, [0..3]);
         assert_eq!(outline.scope.len(), 2);
         assert_eq!(outline.scope[0].identity, "class_definition:Client");
         assert_eq!(outline.scope[0].signature, 3..5);
-        assert_eq!(outline.scope[1].identity, "class_definition:Client/function_definition:fetch");
+        assert_eq!(
+            outline.scope[1].identity,
+            "class_definition:Client/function_definition:fetch"
+        );
         assert_eq!(outline.scope[1].signature, 5..9);
         assert_eq!(outline.scope[1].extent, 5..12);
         assert_eq!(outline.scope[1].closing, None);
@@ -694,11 +782,20 @@ mod tests {
     #[tokio::test]
     async fn cue_highlights_definitions_fields_and_imports() {
         let source = "package schema\nimport \"strings\"\n#Server: {\n    port: int & >0\n}\nserver: #Server & {port: 8080}\n";
-        let handle = engine().analyze(request(SyntaxLanguage::Cue, source)).await.unwrap();
+        let handle = engine()
+            .analyze(request(SyntaxLanguage::Cue, source))
+            .await
+            .unwrap();
         assert!(!handle.0.tree[0].root_node().has_error());
         assert_eq!(handle.outline().import, [1..2]);
         for row in [2, 3, 5] {
-            assert!(handle.captures_intersecting_rows(row, row + 1).next().is_some(), "missing CUE captures for row {row}");
+            assert!(
+                handle
+                    .captures_intersecting_rows(row, row + 1)
+                    .next()
+                    .is_some(),
+                "missing CUE captures for row {row}"
+            );
         }
     }
 }

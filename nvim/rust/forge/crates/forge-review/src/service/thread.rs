@@ -322,9 +322,7 @@ pub(super) fn decode(record: &Value) -> Result<ReviewThread> {
         .and_then(Value::as_u64)
         .context("thread comment count is missing")?;
     ensure!(
-        total_comments > 0
-            && nodes.len() <= 100
-            && nodes.len() as u64 <= total_comments,
+        total_comments > 0 && nodes.len() <= 100 && nodes.len() as u64 <= total_comments,
         "thread comment count exceeds limits"
     );
     let more = connection
@@ -391,10 +389,7 @@ fn decode_comment(record: &Value) -> Result<ReviewThreadComment> {
         .get("body")
         .and_then(Value::as_str)
         .context("thread comment body is missing")?;
-    ensure!(
-        !body.contains('\0'),
-        "thread comment body exceeds limits"
-    );
+    ensure!(!body.contains('\0'), "thread comment body exceeds limits");
     let diff_hunk = record.get("diffHunk").and_then(Value::as_str).unwrap_or("");
     ensure!(
         !diff_hunk.contains('\0'),

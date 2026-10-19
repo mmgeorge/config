@@ -2,8 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use forge_buffer::block::{
-    BlockAnchor, BufferBlock, Decoration, TargetRange, TextChunk,
-    TextPosition, TextRange,
+    BlockAnchor, BufferBlock, Decoration, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_diff::display::RowKind;
@@ -19,34 +18,65 @@ pub(super) struct ChangeTree {
     pub action: HashMap<TargetId, TranscriptAction>,
 }
 
-fn file_action(path: &str, line: usize, previous: bool, declaration: Option<(&crate::exchange::DeclarationRevision, bool)>) -> TranscriptAction {
+fn file_action(
+    path: &str,
+    line: usize,
+    previous: bool,
+    declaration: Option<(&crate::exchange::DeclarationRevision, bool)>,
+) -> TranscriptAction {
     match declaration {
         Some((declaration, document)) => TranscriptAction::Declaration {
             plan_id: declaration.plan_id.clone(),
-            revision: if previous && declaration.revision > 1 && !declaration.baseline_paths.contains(path) { declaration.revision - 1 } else { declaration.revision },
-            baseline: previous && (declaration.revision == 1 || declaration.baseline_paths.contains(path)),
-            path: path.into(), line, document,
+            revision: if previous
+                && declaration.revision > 1
+                && !declaration.baseline_paths.contains(path)
+            {
+                declaration.revision - 1
+            } else {
+                declaration.revision
+            },
+            baseline: previous
+                && (declaration.revision == 1 || declaration.baseline_paths.contains(path)),
+            path: path.into(),
+            line,
+            document,
         },
-        None => TranscriptAction::File { path: path.into(), line },
+        None => TranscriptAction::File {
+            path: path.into(),
+            line,
+        },
     }
 }
 
 impl ChangeTree {
     /// Render one captured declaration change using the shared file and hunk projection.
-    pub fn declaration(renderer: &TranscriptRenderer<'_>, id: &str, name: &str, patch: &str) -> Result<Self> {
+    pub fn declaration(
+        renderer: &TranscriptRenderer<'_>,
+        id: &str,
+        name: &str,
+        patch: &str,
+    ) -> Result<Self> {
         let mut tree = Self::render(renderer, id, name, "", patch, None, None)?;
-        if tree.block.len() < 2 { return Ok(tree); }
+        if tree.block.len() < 2 {
+            return Ok(tree);
+        }
         tree.block.remove(0);
         tree.action.clear();
-        for block in &mut tree.block { block.metadata.target.clear(); }
+        for block in &mut tree.block {
+            block.metadata.target.clear();
+        }
         let heading = &mut tree.block[0];
         let mut replacement = renderer.literal(heading.id.clone(), &format!("▸ {name}"), 2)?;
         replacement.metadata.fold = std::mem::take(&mut heading.metadata.fold);
         replacement.metadata.node = heading.metadata.node.take();
         TranscriptRenderer::fold_marker(&mut replacement);
         let target = TargetId(replacement.id.0.clone());
-        replacement.metadata.target.push(TargetRange { id: target.clone(), range: whole_block(&replacement) });
-        tree.action.insert(target, TranscriptAction::Diff { text: patch.into() });
+        replacement.metadata.target.push(TargetRange {
+            id: target.clone(),
+            range: whole_block(&replacement),
+        });
+        tree.action
+            .insert(target, TranscriptAction::Diff { text: patch.into() });
         tree.block[0] = replacement;
         Ok(tree)
     }
@@ -96,10 +126,18 @@ impl ChangeTree {
             .filter(|row| row.kind == RowKind::Removed)
             .count();
         let count = patch.file.len();
-        let unit = if declaration.is_some_and(|(_, document)| document) { "section" } else { "file" };
+        let unit = if declaration.is_some_and(|(_, document)| document) {
+            "section"
+        } else {
+            "file"
+        };
         let summary = format!(
             "▸ {label} {count} {} +{added} -{removed}{suffix}",
-            if count == 1 { unit.into() } else { format!("{unit}s") }
+            if count == 1 {
+                unit.into()
+            } else {
+                format!("{unit}s")
+            }
         );
         let mut heading = renderer.literal(BlockId(id.into()), &summary, 2)?;
         TranscriptRenderer::heading_marker(&mut heading, "Normal");
@@ -144,12 +182,14 @@ impl ChangeTree {
             } else {
                 path.clone()
             };
-            let heading = presenter.file(BlockId(file_id.clone()), status, &display_path, Some((added as u64, removed as u64)))?;
+            let heading = presenter.file(
+                BlockId(file_id.clone()),
+                status,
+                &display_path,
+                Some((added as u64, removed as u64)),
+            )?;
             if let Some(path) = &file.new_path {
-                tree.push_action(
-                    heading,
-                    file_action(path, 1, false, declaration),
-                )?;
+                tree.push_action(heading, file_action(path, 1, false, declaration))?;
             } else if declaration.is_some() {
                 tree.push_action(heading, file_action(path, 1, true, declaration))?;
             } else {
@@ -174,16 +214,32 @@ impl ChangeTree {
                 let hunk_start = tree.block.len();
                 let hunk_id = format!("{file_id}:hunk:{hunk_index}");
                 let (group, rows) = forge_diff::presentation::patch_rows(hunk);
-                tree.block.push(presenter.hunk(BlockId(hunk_id.clone()), &group,
-                    forge_diff::presentation::HunkHeading::Saved(hunk.header))?);
+                tree.block.push(presenter.hunk(
+                    BlockId(hunk_id.clone()),
+                    &group,
+                    forge_diff::presentation::HunkHeading::Saved(hunk.header),
+                )?);
                 for (batch_index, rows) in rows.chunks(128).enumerate() {
-                    let mut block = presenter.rows(BlockId(format!("{hunk_id}:rows:{batch_index}")), rows, &group, None, None)?;
+                    let mut block = presenter.rows(
+                        BlockId(format!("{hunk_id}:rows:{batch_index}")),
+                        rows,
+                        &group,
+                        None,
+                        None,
+                    )?;
                     for (row_index, row) in rows.iter().enumerate() {
-                        let location = if let (Some(path), Some(line)) = (&file.new_path, row.new.map(|coordinate| coordinate.line)) {
+                        let location = if let (Some(path), Some(line)) =
+                            (&file.new_path, row.new.map(|coordinate| coordinate.line))
+                        {
                             Some((path, line, false))
                         } else if declaration.is_some() {
-                            file.old_path.as_ref().zip(row.old.map(|coordinate| coordinate.line)).map(|(path, line)| (path, line, true))
-                        } else { None };
+                            file.old_path
+                                .as_ref()
+                                .zip(row.old.map(|coordinate| coordinate.line))
+                                .map(|(path, line)| (path, line, true))
+                        } else {
+                            None
+                        };
                         if let Some((path, line, baseline)) = location {
                             let target = TargetId(format!("{}:row:{row_index}", block.id.0));
                             block.metadata.target.push(TargetRange {
@@ -199,10 +255,8 @@ impl ChangeTree {
                                     },
                                 },
                             });
-                            tree.action.insert(
-                                target,
-                                file_action(path, line + 1, baseline, declaration),
-                            );
+                            tree.action
+                                .insert(target, file_action(path, line + 1, baseline, declaration));
                         }
                     }
                     tree.block.push(block);
@@ -235,15 +289,32 @@ impl ChangeTree {
                 column: 0,
             },
         };
-        forge_diff::presentation::DiffPresenter::fold(&mut self.block[start], FoldId(id.into()), end,
-            forge_diff::presentation::FoldPolicy { closed: true, collapse_children: start == 0, expand_children });
+        forge_diff::presentation::DiffPresenter::fold(
+            &mut self.block[start],
+            FoldId(id.into()),
+            end,
+            forge_diff::presentation::FoldPolicy {
+                closed: true,
+                collapse_children: start == 0,
+                expand_children,
+            },
+        );
         self.block[start].metadata.node = Some(forge_buffer::node::NodeState::new(
-            FoldId(id.into()), if start == 0 { forge_buffer::node::NodeKind::Changes }
-            else if expand_children { forge_buffer::node::NodeKind::File }
-            else { forge_buffer::node::NodeKind::Hunk }, forge_buffer::node::NodeDisplay::Heading));
+            FoldId(id.into()),
+            if start == 0 {
+                forge_buffer::node::NodeKind::Changes
+            } else if expand_children {
+                forge_buffer::node::NodeKind::File
+            } else {
+                forge_buffer::node::NodeKind::Hunk
+            },
+            forge_buffer::node::NodeDisplay::Heading,
+        ));
         if start == 0 || expand_children {
             TranscriptRenderer::fold_marker(&mut self.block[start]);
-            if expand_children { self.block[start].metadata.layout.as_mut().unwrap().indent = 4; }
+            if expand_children {
+                self.block[start].metadata.layout.as_mut().unwrap().indent = 4;
+            }
         }
         Ok(())
     }
@@ -294,19 +365,69 @@ mod tests {
         let patch = "--- a/old.rs\n+++ b/new.rs\n@@ -10,2 +20,2 @@ fn run\n-before\n+after\n context\n@@ -50 +60 @@\n-old\n+new\n--- /dev/null\n+++ b/added.rs\n@@ -0,0 +1 @@\n+added\n";
         let mut baseline = None;
         for columns in [40, 80, 120] {
-            let width = WidthProfile { columns, ..Default::default() };
+            let width = WidthProfile {
+                columns,
+                ..Default::default()
+            };
             let renderer = TranscriptRenderer::new(&width).unwrap();
-            let tree = ChangeTree::render(&renderer, "nested:changes", "Changed", "", patch, None, None).unwrap();
-            let snapshot = BufferSnapshot { document: DocumentId("timeline".into()), revision: DocumentRevision(0), block: tree.block.clone() };
+            let tree = ChangeTree::render(
+                &renderer,
+                "nested:changes",
+                "Changed",
+                "",
+                patch,
+                None,
+                None,
+            )
+            .unwrap();
+            let snapshot = BufferSnapshot {
+                document: DocumentId("timeline".into()),
+                revision: DocumentRevision(0),
+                block: tree.block.clone(),
+            };
             snapshot.validate().unwrap();
-            let rows = tree.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
-            assert_eq!(rows, ["▸ Changed 2 files +3 -2", "Renamed  old.rs → new.rs +2 -2", "@@ -10,2 +20,2 @@ fn run", "before", "after", "context", "@@ -50 +60 @@", "old", "new", "New      added.rs +1 -0", "@@ -0,0 +1 @@", "added"]);
+            let rows = tree
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>();
+            assert_eq!(
+                rows,
+                [
+                    "▸ Changed 2 files +3 -2",
+                    "Renamed  old.rs → new.rs +2 -2",
+                    "@@ -10,2 +20,2 @@ fn run",
+                    "before",
+                    "after",
+                    "context",
+                    "@@ -50 +60 @@",
+                    "old",
+                    "new",
+                    "New      added.rs +1 -0",
+                    "@@ -0,0 +1 @@",
+                    "added"
+                ]
+            );
             let encoded = serde_json::to_value(&snapshot).unwrap();
-            if let Some(baseline) = &baseline { assert_eq!(&encoded, baseline); }
-            else { baseline = Some(encoded); }
+            if let Some(baseline) = &baseline {
+                assert_eq!(&encoded, baseline);
+            } else {
+                baseline = Some(encoded);
+            }
             assert_eq!(tree.block[0].metadata.layout.as_ref().unwrap().indent, 2);
-            assert_eq!(tree.block.iter().flat_map(|block| &block.metadata.fold).count(), 6);
-            assert!(tree.block.iter().flat_map(|block| &block.metadata.fold).all(|fold| fold.closed));
+            assert_eq!(
+                tree.block
+                    .iter()
+                    .flat_map(|block| &block.metadata.fold)
+                    .count(),
+                6
+            );
+            assert!(
+                tree.block
+                    .iter()
+                    .flat_map(|block| &block.metadata.fold)
+                    .all(|fold| fold.closed)
+            );
             assert!(tree.action.values().any(|action| matches!(action, TranscriptAction::File { path, line: 60 } if path == "new.rs")));
         }
     }
@@ -388,10 +509,39 @@ mod tests {
         let file = &tree.block[1];
         let hunk = &tree.block[2];
         assert!(file.metadata.fold[0].expand_children);
-        assert_eq!(tree.block[0].metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "▸");
-        assert_eq!(file.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "▸");
-        assert!(hunk.metadata.layout.as_ref().is_none_or(|layout| layout.marker.is_none()));
-        assert!(!hunk.metadata.fold[0].expand_children && !tree.block[0].metadata.fold[0].expand_children);
+        assert_eq!(
+            tree.block[0]
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .text,
+            "▸"
+        );
+        assert_eq!(
+            file.metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .text,
+            "▸"
+        );
+        assert!(
+            hunk.metadata
+                .layout
+                .as_ref()
+                .is_none_or(|layout| layout.marker.is_none())
+        );
+        assert!(
+            !hunk.metadata.fold[0].expand_children
+                && !tree.block[0].metadata.fold[0].expand_children
+        );
         assert_eq!(file.text.row(0), Some("Modified test.rs +1 -1"));
         assert_eq!(hunk.text.row(0), Some("@@ -10,2 +20,2 @@ fn test"));
         assert_eq!(file.metadata.gutter, hunk.metadata.gutter);
@@ -441,8 +591,8 @@ mod tests {
         let width = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&width).unwrap();
         let source = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n";
-        let tree =
-            ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None, None).unwrap();
+        let tree = ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None, None)
+            .unwrap();
         assert!(
             tree.block[0]
                 .text
@@ -465,8 +615,16 @@ mod tests {
             "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,300 @@\n{}",
             "+line\n".repeat(300)
         );
-        let tree =
-            ChangeTree::render(&renderer, "large:changes", "Changed", "", &source, None, None).unwrap();
+        let tree = ChangeTree::render(
+            &renderer,
+            "large:changes",
+            "Changed",
+            "",
+            &source,
+            None,
+            None,
+        )
+        .unwrap();
         let rows = tree
             .block
             .iter()
@@ -535,8 +693,16 @@ fn large_diff_retains_source_and_navigation_without_byte_admission() -> Result<(
     let line = "x".repeat(8 * 1024 * 1024 + 1);
     let source = format!("--- /dev/null\n+++ b/large.txt\n@@ -0,0 +1 @@\n+{line}\n");
     let tree = ChangeTree::render(&renderer, "large", "Changes", "", &source, None, None)?;
-    assert!(tree.block.iter().any(|block| block.text.row(0) == Some(line.as_str())));
-    assert!(tree.action.values().any(|action| matches!(action, TranscriptAction::Diff { text } if text == &source)));
+    assert!(
+        tree.block
+            .iter()
+            .any(|block| block.text.row(0) == Some(line.as_str()))
+    );
+    assert!(
+        tree.action
+            .values()
+            .any(|action| matches!(action, TranscriptAction::Diff { text } if text == &source))
+    );
     Ok(())
 }
 
@@ -546,10 +712,32 @@ fn declaration_changes_navigate_immutable_sides_including_removed_rows() {
     let renderer = TranscriptRenderer::new(&width).unwrap();
     let diff = "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub struct Before;\n+pub struct After;\ndiff --git a/gone.rs b/gone.rs\ndeleted file mode 100644\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-pub struct Gone;\n";
     for revision in [1, 3] {
-        let declaration = crate::exchange::DeclarationRevision { plan_id: "plan".into(), revision, document_diff: String::new(), baseline_paths: Default::default() };
-        let tree = ChangeTree::render(&renderer, "declaration", "Proposed changes", "", diff, None, Some((&declaration, false))).unwrap();
-        assert_eq!(tree.block[0].text.row(0), Some("▸ Proposed changes 2 files +1 -2"));
-        assert!(!tree.action.values().any(|action| matches!(action, TranscriptAction::File { .. })));
+        let declaration = crate::exchange::DeclarationRevision {
+            plan_id: "plan".into(),
+            revision,
+            document_diff: String::new(),
+            baseline_paths: Default::default(),
+        };
+        let tree = ChangeTree::render(
+            &renderer,
+            "declaration",
+            "Proposed changes",
+            "",
+            diff,
+            None,
+            Some((&declaration, false)),
+        )
+        .unwrap();
+        assert_eq!(
+            tree.block[0].text.row(0),
+            Some("▸ Proposed changes 2 files +1 -2")
+        );
+        assert!(
+            !tree
+                .action
+                .values()
+                .any(|action| matches!(action, TranscriptAction::File { .. }))
+        );
         assert!(tree.action.values().any(|action| matches!(action,
             TranscriptAction::Declaration { path, revision: target, baseline, line: 1, .. }
                 if path == "gone.rs" && *target == if revision == 1 { 1 } else { 2 } && *baseline == (revision == 1))));
@@ -558,10 +746,21 @@ fn declaration_changes_navigate_immutable_sides_including_removed_rows() {
                 if path == "lib.rs" && *target == revision)));
     }
     let declaration = crate::exchange::DeclarationRevision {
-        plan_id: "plan".into(), revision: 3, document_diff: String::new(),
+        plan_id: "plan".into(),
+        revision: 3,
+        document_diff: String::new(),
         baseline_paths: ["gone.rs".into()].into(),
     };
-    let tree = ChangeTree::render(&renderer, "lazy", "Proposed changes", "", diff, None, Some((&declaration, false))).unwrap();
+    let tree = ChangeTree::render(
+        &renderer,
+        "lazy",
+        "Proposed changes",
+        "",
+        diff,
+        None,
+        Some((&declaration, false)),
+    )
+    .unwrap();
     assert!(tree.action.values().any(|action| matches!(action,
         TranscriptAction::Declaration { path, revision: 3, baseline: true, line: 1, .. } if path == "gone.rs")));
 }

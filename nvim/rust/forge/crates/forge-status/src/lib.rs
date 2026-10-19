@@ -1,7 +1,7 @@
 mod hunks;
 mod ignored;
-mod navigation;
 mod mutation;
+mod navigation;
 pub use mutation::{StatusActionAccepted, StatusOperationTicket, StatusUpdate};
 pub mod protocol;
 pub use protocol::{StatusDelta, StatusInput, StatusLocation, StatusSelection, StatusSnapshot};

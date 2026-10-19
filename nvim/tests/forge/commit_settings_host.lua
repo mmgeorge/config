@@ -40,21 +40,23 @@ end
 local function option(id)
   local instance = picker._state_for_test()
   if not instance then return end
-  for _, value in ipairs(instance.spec.page_list[1].option_list) do if value.id == id then return value end end
+  for _, row in ipairs(instance.spec.page_list[1].option_list) do
+    for _, field in ipairs(row.fields or {}) do if field.id == id then return field end end
+  end
 end
 require("forge").open_harness()
 wait(function() return state.ready and state.session end, "Harness did not start")
 local before = { model = state.session.model, effort = state.session.effort }
-settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
+settings.open(state, { window_list = { state.transcript_win, state.composer_win }, control_win = state.composer_win })
 wait(function() local model = option("background-model") return model and not model.disabled_reason end, "Background controls did not load")
 local expected = stage == "save" and "low" or "medium"
-assert(option("background-model").columns[2]:find("mock-model", 1, true))
-assert(option("background-thinking").columns[2]:find(expected, 1, true), vim.inspect(option("background-thinking")))
+assert(option("background-model").value:find("mock-model", 1, true))
+assert(option("background-thinking").value:find(expected, 1, true), vim.inspect(option("background-thinking")))
 local lines = vim.api.nvim_buf_get_lines(picker._state_for_test().buf, 0, -1, false)
-assert(table.concat(lines, "\n"):find("Background model", 1, true), "Background controls did not render")
+assert(table.concat(lines, "\n"):find("Background", 1, true), "Background controls did not render")
 if stage == "save" then
-  picker._state_for_test().spec.action_list[2].callback({ option = option("background-thinking") })
-  wait(function() return option("background-thinking").columns[2]:find("medium", 1, true) ~= nil end, "Thinking did not save")
+  picker._state_for_test().spec.on_field_action({ field = option("background-thinking") }, "change", 1)
+  wait(function() return option("background-thinking").value:find("medium", 1, true) ~= nil end, "Thinking did not save")
 end
 assert(state.session.model == before.model and state.session.effort == before.effort, "Commit settings changed the chat")
 local generator = require("forge.integrations.ai_commit")

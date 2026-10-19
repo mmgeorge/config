@@ -4,13 +4,13 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::session::{PermissionMode, continuation::ContinuationBudget};
 use self::edit_trace::{PlanEditTrace, measure};
+use crate::session::{PermissionMode, continuation::ContinuationBudget};
 
 mod audit;
+mod comment_lint;
 pub(crate) mod conformance;
 pub(crate) mod implementation_report;
-mod comment_lint;
 mod usage;
 pub(crate) use design::workspace_source;
 mod design;
@@ -25,17 +25,17 @@ mod references;
 mod workspace_definition;
 pub use workspace_definition::{DefinitionLocation, WorkspaceDefinition};
 mod reference_context;
-pub use calls::{CallKind, CallSite, CallPosition, FunctionBody, FunctionBehavior};
+pub use calls::{CallKind, CallPosition, CallSite, FunctionBehavior, FunctionBody};
 mod design_review;
 mod deviation;
 mod document;
-mod review_file_layout;
-mod review_diff;
 mod review_alignment;
 mod review_delivery;
+mod review_diff;
+mod review_file_layout;
+pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 #[cfg(test)]
 pub(crate) use review_delivery::reconstruct;
-pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 mod edit;
 pub(crate) mod edit_trace;
 pub(crate) mod event;
@@ -43,22 +43,27 @@ pub use event::{ExchangeAnchor, ExchangePlanEvent, PlanEventContent};
 mod graph;
 mod prompt;
 mod render;
-pub(crate) mod revision;
-pub(crate) mod revision_review;
 mod resolution;
 mod review_annotation;
 mod review_cache;
 mod review_feedback;
-pub(crate) use review_feedback::render as render_review_feedback;
+pub(crate) mod revision;
+pub(crate) mod revision_review;
 pub(crate) use review_annotation::resolve_annotations;
-pub use review_annotation::{ReviewAnnotation, ReviewAnnotationAnchor, ReviewAnnotationKind, ReviewQuestionReply};
+pub use review_annotation::{
+    ReviewAnnotation, ReviewAnnotationAnchor, ReviewAnnotationKind, ReviewQuestionReply,
+};
+pub(crate) use review_feedback::render as render_review_feedback;
+pub(crate) mod execution;
 pub(crate) mod review_document;
 mod review_projection;
-mod review_symbols;
 pub(crate) mod review_source;
+mod review_symbols;
 mod scheduler;
-pub(crate) mod execution;
-pub use execution::{PlanExecutionState, PlanExecutionRecord, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanPhase};
+pub use execution::{
+    PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanExecutionRecord,
+    PlanExecutionState, PlanPhase,
+};
 pub mod state_machine;
 mod validation;
 
@@ -388,7 +393,8 @@ impl PlanAcceptance {
                     .iter()
                     .copied()
                     .map(|mode| PlanQuestionOption {
-                        recommended: false, label: execution_mode_option_label(mode).into(),
+                        recommended: false,
+                        label: execution_mode_option_label(mode).into(),
                         description: execution_mode_option_description(mode).into(),
                     })
                     .collect(),
@@ -458,7 +464,11 @@ const fn execution_mode_option_description(mode: PermissionMode) -> &'static str
 
 impl PlanElicitation {
     /// Capture the question-set deadline once, excluding explicit plan acceptance.
-    pub fn start_timeout(&mut self, timeout: crate::session::InputTimeout, now_ms: i64) -> Result<()> {
+    pub fn start_timeout(
+        &mut self,
+        timeout: crate::session::InputTimeout,
+        now_ms: i64,
+    ) -> Result<()> {
         if self.question_set.id != "plan-acceptance" {
             self.deadline = timeout.deadline(now_ms)?;
         }
@@ -467,15 +477,34 @@ impl PlanElicitation {
 
     /// Preserve confirmed responses and fill only unanswered questions before automatic submission.
     pub fn expire(&mut self) -> Result<()> {
-        anyhow::ensure!(self.question_set.id != "plan-acceptance", "plan acceptance requires user confirmation");
+        anyhow::ensure!(
+            self.question_set.id != "plan-acceptance",
+            "plan acceptance requires user confirmation"
+        );
         for question in self.question_set.questions.clone() {
-            if self.answer.iter().any(|answer| answer.question_id == question.id) { continue; }
-            let selected = question.options.iter().find(|option| option.recommended).or_else(|| question.options.first());
-            let response = selected.map_or(PlanQuestionResponse::Skipped, |option| PlanQuestionResponse::Selected {
-                option: option.label.clone(), feedback: None,
+            if self
+                .answer
+                .iter()
+                .any(|answer| answer.question_id == question.id)
+            {
+                continue;
+            }
+            let selected = question
+                .options
+                .iter()
+                .find(|option| option.recommended)
+                .or_else(|| question.options.first());
+            let response = selected.map_or(PlanQuestionResponse::Skipped, |option| {
+                PlanQuestionResponse::Selected {
+                    option: option.label.clone(),
+                    feedback: None,
+                }
             });
             self.answer(&question.id, response)?;
-            self.answer.last_mut().expect("committed timeout answer").source = crate::session::ResolutionSource::Timeout;
+            self.answer
+                .last_mut()
+                .expect("committed timeout answer")
+                .source = crate::session::ResolutionSource::Timeout;
         }
         self.resolution_source = crate::session::ResolutionSource::Timeout;
         self.deadline = None;
@@ -569,7 +598,8 @@ impl PlanElicitation {
         self.answer
             .retain(|answer| answer.question_id != question_id);
         self.answer.push(PlanQuestionAnswer {
-            source: crate::session::ResolutionSource::User, question_id: question_id.to_owned(),
+            source: crate::session::ResolutionSource::User,
+            question_id: question_id.to_owned(),
             response,
         });
         self.current_index = self
@@ -617,7 +647,13 @@ impl PlanElicitation {
                     "[intentionally unanswered; continue with best judgment]".into()
                 }
             };
-            let provenance = if answer.is_some_and(|answer| answer.source == crate::session::ResolutionSource::Timeout) { " [automatic timeout]" } else { "" };
+            let provenance = if answer
+                .is_some_and(|answer| answer.source == crate::session::ResolutionSource::Timeout)
+            {
+                " [automatic timeout]"
+            } else {
+                ""
+            };
             line_list.push(format!("- {}{provenance}: {value}", question.header));
         }
         if self.resolution_source == crate::session::ResolutionSource::Timeout {
@@ -789,7 +825,12 @@ pub struct PlanAnnotation {
 /// Owns physical plan files and immutable revision history.
 pub struct PlanFileStore {
     review_cache: review_cache::ReviewCache,
-    implementation_report_cache: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<implementation_report::ImplementationReport>>>,
+    implementation_report_cache: std::sync::Mutex<
+        std::collections::HashMap<
+            String,
+            std::sync::Arc<implementation_report::ImplementationReport>,
+        >,
+    >,
     root: PathBuf,
     workspace: PathBuf,
 }
@@ -805,23 +846,42 @@ impl PlanFileStore {
     }
 
     /// Share immutable report contents without copying them into durable exchanges.
-    pub(crate) fn implementation_report(&self, reference: &implementation_report::ImplementationReportRef)
-        -> Result<std::sync::Arc<implementation_report::ImplementationReport>> {
-        let mut cache = self.implementation_report_cache.lock().map_err(|_| anyhow::anyhow!("report cache lock poisoned"))?;
-        if let Some(report) = cache.get(&reference.object_id) { return Ok(report.clone()); }
+    pub(crate) fn implementation_report(
+        &self,
+        reference: &implementation_report::ImplementationReportRef,
+    ) -> Result<std::sync::Arc<implementation_report::ImplementationReport>> {
+        let mut cache = self
+            .implementation_report_cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("report cache lock poisoned"))?;
+        if let Some(report) = cache.get(&reference.object_id) {
+            return Ok(report.clone());
+        }
         let objects = crate::storage::objects::ObjectStore::open(&self.root)?;
-        let report = std::sync::Arc::new(implementation_report::ImplementationReport::load(&objects, reference)?);
+        let report = std::sync::Arc::new(implementation_report::ImplementationReport::load(
+            &objects, reference,
+        )?);
         cache.insert(reference.object_id.clone(), report.clone());
         Ok(report)
     }
 
     /// Restore the accepted working view without overwriting any submitted revision.
-    pub(crate) fn restore_revision(&self, session_id: &str, plan_id: &str, revision: u32) -> Result<PlanDocument> {
+    pub(crate) fn restore_revision(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+    ) -> Result<PlanDocument> {
         let document = self.read_submitted_document(session_id, plan_id, revision)?;
         let directory = self.plan_dir(session_id, plan_id);
         for extension in ["md", "index.json"] {
-            let source = directory.join("revisions").join(format!("submitted-{revision:04}.{extension}"));
-            write_bytes_atomically(&directory.join(format!("working.{extension}")), &fs::read(source)?)?;
+            let source = directory
+                .join("revisions")
+                .join(format!("submitted-{revision:04}.{extension}"));
+            write_bytes_atomically(
+                &directory.join(format!("working.{extension}")),
+                &fs::read(source)?,
+            )?;
         }
         self.write_working_document(session_id, plan_id, &document)?;
         Ok(document)
@@ -879,15 +939,23 @@ impl PlanFileStore {
         name: &str,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(String, PlanDocument, RenderedPlan, String)> {
-        let document = measure(trace, "rename.read_validate", || self.read_working_document(session_id, plan_id))?;
+        let document = measure(trace, "rename.read_validate", || {
+            self.read_working_document(session_id, plan_id)
+        })?;
         anyhow::ensure!(
             document.version == expected_version,
             "plan version changed before rename"
         );
-        let index = measure(trace, "rename.reference_index", || references::PlanReferenceIndex::planned(&document, &self.workspace))?;
+        let index = measure(trace, "rename.reference_index", || {
+            references::PlanReferenceIndex::planned(&document, &self.workspace)
+        })?;
         let (_, definition) = index.rename_definition(&document, identity)?;
-        let renamed = measure(trace, "rename.semantic_edit", || index.renamed(&document, identity, name))?;
-        let rendered = measure(trace, "rename.render_changed_plan", || design_review::render(&renamed))?;
+        let renamed = measure(trace, "rename.semantic_edit", || {
+            index.renamed(&document, identity, name)
+        })?;
+        let rendered = measure(trace, "rename.render_changed_plan", || {
+            design_review::render(&renamed)
+        })?;
         let (document, rendered, digest) =
             self.persist_review_draft(session_id, plan_id, renamed, rendered, trace)?;
         Ok((definition.name, document, rendered, digest))
@@ -952,15 +1020,20 @@ impl PlanFileStore {
         }
         document.validate_for_submission()?;
         if let Some(design) = &mut document.design {
-            design.check_configuration = Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
+            design.check_configuration =
+                Some(crate::checks::ConfigSnapshot::load(&self.workspace)?);
             if design
                 .validation
                 .as_ref()
                 .is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design))
             {
                 design.validation = Some(
-                    crate::declaration::DeclarationResolver::planned(&self.workspace, design, false)?
-                        .validate(design),
+                    crate::declaration::DeclarationResolver::planned(
+                        &self.workspace,
+                        design,
+                        false,
+                    )?
+                    .validate(design),
                 );
             }
             design.validation.as_ref().unwrap().ensure_valid()?;
@@ -969,13 +1042,30 @@ impl PlanFileStore {
     }
 
     /// Freeze a validated execution revision without requiring unchanged original sources.
-    pub(crate) fn submit_execution_revision(&self, session_id: &str, plan_id: &str, revision: u32, mut document: PlanDocument) -> Result<(PlanDocument, RenderedPlan, String)> {
+    pub(crate) fn submit_execution_revision(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        mut document: PlanDocument,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let current = self.read_working_document(session_id, plan_id)?;
-        anyhow::ensure!(current.version == document.version && document.plan_id == plan_id, "execution revision changed before submission");
-        let design = document.design.as_ref().context("execution revision requires semantic design")?.formatted()?;
+        anyhow::ensure!(
+            current.version == document.version && document.plan_id == plan_id,
+            "execution revision changed before submission"
+        );
+        let design = document
+            .design
+            .as_ref()
+            .context("execution revision requires semantic design")?
+            .formatted()?;
         comment_lint::validate(&design)?;
         usage::validate(&design, &self.workspace)?;
-        design.validation.as_ref().context("execution revision has no validation evidence")?.ensure_valid()?;
+        design
+            .validation
+            .as_ref()
+            .context("execution revision has no validation evidence")?
+            .ensure_valid()?;
         document.design = Some(design);
         document.validate_for_submission()?;
         self.persist_revision(session_id, plan_id, revision, document, None)
@@ -989,135 +1079,281 @@ impl PlanFileStore {
         document: PlanDocument,
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let rendered = measure(trace, "persist.render_plan", || self.render_review(&document))?;
+        let rendered = measure(trace, "persist.render_plan", || {
+            self.render_review(&document)
+        })?;
         self.persist_rendered_revision(session_id, plan_id, revision, document, rendered, trace)
     }
 
     /// Render a validated review document while reusing unchanged analysis.
     pub(crate) fn render_review(&self, document: &PlanDocument) -> Result<RenderedPlan> {
         self.review_cache.validate(document, true)?;
-        if let Some(rendered) = self.review_cache.rendered(document)? { return Ok(rendered); }
-        let rendered = if document.design.is_some() { design_review::render(document)? }
-            else { render_plan_at(document, &self.workspace)? };
+        if let Some(rendered) = self.review_cache.rendered(document)? {
+            return Ok(rendered);
+        }
+        let rendered = if document.design.is_some() {
+            design_review::render(document)?
+        } else {
+            render_plan_at(document, &self.workspace)?
+        };
         self.review_cache.remember(document, &rendered)?;
         Ok(rendered)
     }
 
     fn persist_rendered_revision(
-        &self, session_id: &str, plan_id: &str, revision: u32, document: PlanDocument,
-        rendered: RenderedPlan, trace: Option<&PlanEditTrace>,
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        document: PlanDocument,
+        rendered: RenderedPlan,
+        trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let (document, rendered, checksum) = self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
+        let (document, rendered, checksum) =
+            self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
         let revision_directory = self.plan_dir(session_id, plan_id).join("revisions");
-        measure(trace, "persist.revision_directory", || Ok(fs::create_dir_all(&revision_directory)?))?;
+        measure(trace, "persist.revision_directory", || {
+            Ok(fs::create_dir_all(&revision_directory)?)
+        })?;
         let stem = format!("submitted-{revision:04}");
-        measure(trace, "persist.submitted_json", || write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document))?;
-        measure(trace, "persist.submitted_markdown", || write_text_atomically(
-            &revision_directory.join(format!("{stem}.md")), &rendered.markdown,
-        ))?;
-        measure(trace, "persist.submitted_navigation", || write_json_atomically(
-            &revision_directory.join(format!("{stem}.index.json")), &rendered.navigation,
-        ))?;
+        measure(trace, "persist.submitted_json", || {
+            write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document)
+        })?;
+        measure(trace, "persist.submitted_markdown", || {
+            write_text_atomically(
+                &revision_directory.join(format!("{stem}.md")),
+                &rendered.markdown,
+            )
+        })?;
+        measure(trace, "persist.submitted_navigation", || {
+            write_json_atomically(
+                &revision_directory.join(format!("{stem}.index.json")),
+                &rendered.navigation,
+            )
+        })?;
         Ok((document, rendered, checksum))
     }
 
     /// Save the current review draft without creating an immutable submitted revision.
     pub(crate) fn persist_review_draft(
-        &self, session_id: &str, plan_id: &str, document: PlanDocument,
-        rendered: RenderedPlan, trace: Option<&PlanEditTrace>,
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        document: PlanDocument,
+        rendered: RenderedPlan,
+        trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        anyhow::ensure!(document.plan_id == plan_id && rendered.navigation.plan_id == plan_id
-            && rendered.navigation.plan_version == document.version, "rendered plan identity changed");
+        anyhow::ensure!(
+            document.plan_id == plan_id
+                && rendered.navigation.plan_id == plan_id
+                && rendered.navigation.plan_version == document.version,
+            "rendered plan identity changed"
+        );
         let plan_directory = self.plan_dir(session_id, plan_id);
-        measure(trace, "persist.working_directory", || Ok(fs::create_dir_all(&plan_directory)?))?;
-        measure(trace, "persist.working_json", || write_json_atomically(&plan_directory.join("working.json"), &document))?;
-        measure(trace, "persist.working_markdown", || write_text_atomically(&plan_directory.join("working.md"), &rendered.markdown))?;
-        measure(trace, "persist.working_navigation", || write_json_atomically(
-            &plan_directory.join("working.index.json"),
-            &rendered.navigation,
-        ))?;
-        let checksum = measure(trace, "persist.digest", || Ok(digest(crate::plan::codec::to_vec(&document)?.as_slice())))?;
+        measure(trace, "persist.working_directory", || {
+            Ok(fs::create_dir_all(&plan_directory)?)
+        })?;
+        measure(trace, "persist.working_json", || {
+            write_json_atomically(&plan_directory.join("working.json"), &document)
+        })?;
+        measure(trace, "persist.working_markdown", || {
+            write_text_atomically(&plan_directory.join("working.md"), &rendered.markdown)
+        })?;
+        measure(trace, "persist.working_navigation", || {
+            write_json_atomically(
+                &plan_directory.join("working.index.json"),
+                &rendered.navigation,
+            )
+        })?;
+        let checksum = measure(trace, "persist.digest", || {
+            Ok(digest(crate::plan::codec::to_vec(&document)?.as_slice()))
+        })?;
         self.review_cache.remember(&document, &rendered)?;
         Ok((document, rendered, checksum))
     }
 
     /// Freeze an unchanged reviewed draft at the final review decision.
     pub(crate) fn submit_reviewed_revision(
-        &self, session_id: &str, plan_id: &str, revision: u32,
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
         reviewed: &review_source::PlanReviewSource,
     ) -> Result<()> {
         let checksum = digest(&crate::plan::codec::to_vec(&reviewed.document)?);
         let current = self.capture_review_source(session_id, plan_id, None, &checksum)?;
-        anyhow::ensure!(current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
-            "working plan changed before the review decision");
-        self.persist_rendered_revision(session_id, plan_id, revision,
-            reviewed.document.clone(), reviewed.rendered.clone(), None)?;
+        anyhow::ensure!(
+            current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
+            "working plan changed before the review decision"
+        );
+        self.persist_rendered_revision(
+            session_id,
+            plan_id,
+            revision,
+            reviewed.document.clone(),
+            reviewed.rendered.clone(),
+            None,
+        )?;
         Ok(())
     }
 
     /// Publish a reviewed test-inventory edit without changing declarations or project files.
     pub(crate) fn remove_tests(
-        &self, session_id: &str, plan_id: &str, expected_version: u64,
-        expected_digest: &str, selected: &[DesignTestSelection],
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+        expected_digest: &str,
+        selected: &[DesignTestSelection],
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
-        let mut document = measure(trace, "delete.read_validate", || self.read_working_document(session_id, plan_id))?;
-        anyhow::ensure!(document.version == expected_version, "plan version changed before test deletion");
-        anyhow::ensure!(digest(&crate::plan::codec::to_vec(&document)?) == expected_digest, "plan changed before test deletion");
-        let before = measure(trace, "delete.render_previous", || self.render_review(&document))?;
+        let mut document = measure(trace, "delete.read_validate", || {
+            self.read_working_document(session_id, plan_id)
+        })?;
+        anyhow::ensure!(
+            document.version == expected_version,
+            "plan version changed before test deletion"
+        );
+        anyhow::ensure!(
+            digest(&crate::plan::codec::to_vec(&document)?) == expected_digest,
+            "plan changed before test deletion"
+        );
+        let before = measure(trace, "delete.render_previous", || {
+            self.render_review(&document)
+        })?;
         let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let annotation = measure(trace, "delete.read_annotations", || Ok(review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(&path)?))?
-            .annotation().to_vec()))?;
-        measure(trace, "delete.semantic_edit", || design_tests::remove(&mut document.design.as_mut().context("test deletion requires a declaration design")?.document.tests, selected))?;
-        document.version = document.version.checked_add(1).context("plan version exhausted")?;
-        let rendered = measure(trace, "delete.update_test_rows", || design_review::replace_test_inventory(&before, &document))?;
-        self.persist_annotated_edit(session_id, plan_id, document, rendered, &before, annotation, trace)
+        let annotation = measure(trace, "delete.read_annotations", || {
+            Ok(review_annotation::ReviewAnnotationStore::open(
+                path.clone(),
+                digest(&fs::read(&path)?),
+            )?
+            .annotation()
+            .to_vec())
+        })?;
+        measure(trace, "delete.semantic_edit", || {
+            design_tests::remove(
+                &mut document
+                    .design
+                    .as_mut()
+                    .context("test deletion requires a declaration design")?
+                    .document
+                    .tests,
+                selected,
+            )
+        })?;
+        document.version = document
+            .version
+            .checked_add(1)
+            .context("plan version exhausted")?;
+        let rendered = measure(trace, "delete.update_test_rows", || {
+            design_review::replace_test_inventory(&before, &document)
+        })?;
+        self.persist_annotated_edit(
+            session_id, plan_id, document, rendered, &before, annotation, trace,
+        )
     }
 
     /// Updates check selection without changing repository defaults or discarding review annotations.
     pub(crate) async fn update_checks(
-        &self, session_id: &str, plan_id: &str, expected_version: u64, expected_digest: &str,
-        changes: &std::collections::BTreeMap<String, bool>, tests: &[DesignTestSelection], trace: Option<&PlanEditTrace>,
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        expected_version: u64,
+        expected_digest: &str,
+        changes: &std::collections::BTreeMap<String, bool>,
+        tests: &[DesignTestSelection],
+        trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let mut document = self.read_working_document(session_id, plan_id)?;
-        anyhow::ensure!(document.version == expected_version, "plan version changed before check selection");
-        anyhow::ensure!(digest(&crate::plan::codec::to_vec(&document)?) == expected_digest, "plan changed before check selection");
+        anyhow::ensure!(
+            document.version == expected_version,
+            "plan version changed before check selection"
+        );
+        anyhow::ensure!(
+            digest(&crate::plan::codec::to_vec(&document)?) == expected_digest,
+            "plan changed before check selection"
+        );
         let before = self.render_review(&document)?;
         let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let annotation = review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?.annotation().to_vec();
-        let design = document.design.as_mut().context("check selection requires a declaration design")?;
-        let config = &design.check_configuration.as_ref().context("plan has no configured checks")?.config;
+        let annotation =
+            review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?
+                .annotation()
+                .to_vec();
+        let design = document
+            .design
+            .as_mut()
+            .context("check selection requires a declaration design")?;
+        let config = &design
+            .check_configuration
+            .as_ref()
+            .context("plan has no configured checks")?
+            .config;
         design.document.set_checks(config, changes)?;
-        if !tests.is_empty() { design_tests::remove(&mut design.document.tests, tests)?; }
+        if !tests.is_empty() {
+            design_tests::remove(&mut design.document.tests, tests)?;
+        }
         design.check_preview = crate::checks::preview_plan(&self.workspace, design).await?;
         design.check_preview_source = design.check_preview_fingerprint()?;
-        document.version = document.version.checked_add(1).context("plan version exhausted")?;
+        document.version = document
+            .version
+            .checked_add(1)
+            .context("plan version exhausted")?;
         let rendered = design_review::render(&document)?;
-        self.persist_annotated_edit(session_id, plan_id, document, rendered, &before, annotation, trace)
+        self.persist_annotated_edit(
+            session_id, plan_id, document, rendered, &before, annotation, trace,
+        )
     }
 
     fn persist_annotated_edit(
-        &self, session_id: &str, plan_id: &str, document: PlanDocument, rendered: RenderedPlan,
-        before: &RenderedPlan, annotation: Vec<ReviewAnnotation>, trace: Option<&PlanEditTrace>,
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        document: PlanDocument,
+        rendered: RenderedPlan,
+        before: &RenderedPlan,
+        annotation: Vec<ReviewAnnotation>,
+        trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let path = self.plan_dir(session_id, plan_id).join("working.json");
-        let (document, rendered, checksum) = self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
+        let (document, rendered, checksum) =
+            self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();
         for mut item in annotation {
-            let find = |line| before.navigation.resolve_line(line).and_then(|previous| rendered.navigation.anchor.iter()
-                .find(|current| current.target == previous.target && current.label == previous.label));
-            let (Some(start), Some(end)) = (find(item.source.start_line), find(item.source.end_line)) else { continue; };
-            if item.parent_id.as_ref().is_some_and(|parent| !retained.iter().any(|saved: &ReviewAnnotation| &saved.id == parent)) { continue; }
+            let find = |line| {
+                before.navigation.resolve_line(line).and_then(|previous| {
+                    rendered.navigation.anchor.iter().find(|current| {
+                        current.target == previous.target && current.label == previous.label
+                    })
+                })
+            };
+            let (Some(start), Some(end)) =
+                (find(item.source.start_line), find(item.source.end_line))
+            else {
+                continue;
+            };
+            if item.parent_id.as_ref().is_some_and(|parent| {
+                !retained
+                    .iter()
+                    .any(|saved: &ReviewAnnotation| &saved.id == parent)
+            }) {
+                continue;
+            }
             item.source.start_line = start.line.min(end.line);
             item.source.end_line = start.line.max(end.line);
-            item.anchor = Some(review_annotation::ReviewAnnotationAnchor { start: start.target.clone(), end: end.target.clone() });
+            item.anchor = Some(review_annotation::ReviewAnnotationAnchor {
+                start: start.target.clone(),
+                end: end.target.clone(),
+            });
             retained.push(item);
         }
         if !retained.is_empty() {
-            review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?.replace(retained)?;
+            review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?
+                .replace(retained)?;
         }
-        if let Some(stage) = reanchor { stage.complete(serde_json::json!({})); }
+        if let Some(stage) = reanchor {
+            stage.complete(serde_json::json!({}));
+        }
         Ok((document, rendered, checksum))
     }
 
@@ -1275,23 +1511,47 @@ mod test {
             {"id":"freeform","header":"Freeform","question":"What name?","options":[]}
         ]})).unwrap();
         let mut elicitation = PlanElicitation::new(questions.normalize().unwrap());
-        elicitation.answer("confirmed", PlanQuestionResponse::Selected { option:"B".into(), feedback:Some("keep note".into()) }).unwrap();
+        elicitation
+            .answer(
+                "confirmed",
+                PlanQuestionResponse::Selected {
+                    option: "B".into(),
+                    feedback: Some("keep note".into()),
+                },
+            )
+            .unwrap();
         elicitation.expire().unwrap();
         assert_eq!(elicitation.answer[0].source, ResolutionSource::User);
-        assert!(matches!(&elicitation.answer[0].response, PlanQuestionResponse::Selected {feedback:Some(note),..} if note == "keep note"));
-        assert!(matches!(&elicitation.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "Second (Recommended)"));
+        assert!(
+            matches!(&elicitation.answer[0].response, PlanQuestionResponse::Selected {feedback:Some(note),..} if note == "keep note")
+        );
+        assert!(
+            matches!(&elicitation.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "Second (Recommended)")
+        );
         assert_eq!(elicitation.answer[1].source, ResolutionSource::Timeout);
-        assert_eq!(elicitation.answer[2].response, PlanQuestionResponse::Skipped);
+        assert_eq!(
+            elicitation.answer[2].response,
+            PlanQuestionResponse::Skipped
+        );
         assert!(elicitation.current_question().is_none());
         assert!(elicitation.feedback().contains("not user answers"));
         assert!(elicitation.feedback().contains("[automatic timeout]"));
         let mut fallback = PlanElicitation::new(elicitation.question_set.clone());
         fallback.question_set.questions[1].options[1].recommended = false;
         fallback.expire().unwrap();
-        assert!(matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First"));
-        let mut acceptance = PlanAcceptance::new("digest".into(), &[PermissionMode::Read, PermissionMode::Write]).unwrap();
+        assert!(
+            matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First")
+        );
+        let mut acceptance = PlanAcceptance::new(
+            "digest".into(),
+            &[PermissionMode::Read, PermissionMode::Write],
+        )
+        .unwrap();
         assert_eq!(acceptance.overall_comment, None);
-        acceptance.elicitation.start_timeout(Default::default(), 0).unwrap();
+        acceptance
+            .elicitation
+            .start_timeout(Default::default(), 0)
+            .unwrap();
         assert!(acceptance.elicitation.deadline.is_none());
         assert!(acceptance.elicitation.expire().is_err());
     }
@@ -1318,41 +1578,86 @@ mod test {
                 {"name":"first","change":"new","description":"Updates the first state."},
                 {"name":"keep","change":"new","description":"Retains another state."}
             ]}
-        ])).unwrap();
+        ]))
+        .unwrap();
         document.design = Some(design);
-        store.persist_revision("session", "fast-review", 1, document.clone(), None).unwrap();
+        store
+            .persist_revision("session", "fast-review", 1, document.clone(), None)
+            .unwrap();
         let index = references::PlanReferenceIndex::planned(&document, temporary.path()).unwrap();
         let identity = &index.definition[&("src/part_0.rs".into(), 1, 11)].0;
         let started = std::time::Instant::now();
-        let (_, renamed, _, checksum) = store.rename_symbol("session", "fast-review", 1,
-            identity, "RenamedState", None).unwrap();
+        let (_, renamed, _, checksum) = store
+            .rename_symbol("session", "fast-review", 1, identity, "RenamedState", None)
+            .unwrap();
         let rename_elapsed = started.elapsed();
         renamed.validate_for_submission().unwrap();
-        assert_eq!(renamed.design.as_ref().unwrap().proposed["src/part_0.rs"],
-            document.design.as_ref().unwrap().proposed["src/part_0.rs"].replace("State0", "RenamedState"));
-        assert_eq!(renamed.design.as_ref().unwrap().proposed["src/part_12.rs"],
-            document.design.as_ref().unwrap().proposed["src/part_12.rs"]);
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed["src/part_0.rs"],
+            document.design.as_ref().unwrap().proposed["src/part_0.rs"]
+                .replace("State0", "RenamedState")
+        );
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed["src/part_12.rs"],
+            document.design.as_ref().unwrap().proposed["src/part_12.rs"]
+        );
         let started = std::time::Instant::now();
-        let (deleted, rendered, _) = store.remove_tests("session", "fast-review", 2, &checksum,
-            &[DesignTestSelection { file:"tests/state.rs".into(),name:"first".into() }], None).unwrap();
+        let (deleted, rendered, _) = store
+            .remove_tests(
+                "session",
+                "fast-review",
+                2,
+                &checksum,
+                &[DesignTestSelection {
+                    file: "tests/state.rs".into(),
+                    name: "first".into(),
+                }],
+                None,
+            )
+            .unwrap();
         let delete_elapsed = started.elapsed();
         deleted.validate_for_submission().unwrap();
-        assert_eq!(rendered, render_plan_at(&deleted, temporary.path()).unwrap());
+        assert_eq!(
+            rendered,
+            render_plan_at(&deleted, temporary.path()).unwrap()
+        );
         assert!(rendered.markdown.contains("Tests · 1 new"));
         let directory = store.plan_dir("session", "fast-review");
-        assert_eq!(fs::read_dir(directory.join("revisions")).unwrap().count(), 3);
-        assert_eq!(store.read_submitted_document("session", "fast-review", 1).unwrap(), document);
+        assert_eq!(
+            fs::read_dir(directory.join("revisions")).unwrap().count(),
+            3
+        );
+        assert_eq!(
+            store
+                .read_submitted_document("session", "fast-review", 1)
+                .unwrap(),
+            document
+        );
         let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         crate::checks::configure_fixture(&reopened.workspace);
         let checksum = digest(&crate::plan::codec::to_vec(&deleted).unwrap());
-        let reviewed = reopened.capture_review_source("session", "fast-review", None, &checksum).unwrap();
+        let reviewed = reopened
+            .capture_review_source("session", "fast-review", None, &checksum)
+            .unwrap();
         assert_eq!(reviewed.document, deleted);
-        assert!(reopened.capture_review_source("session", "fast-review", Some(1), &checksum).is_err());
+        assert!(
+            reopened
+                .capture_review_source("session", "fast-review", Some(1), &checksum)
+                .is_err()
+        );
         fs::write(directory.join("working.md"), "tampered draft").unwrap();
-        assert!(reopened.capture_review_source("session", "fast-review", None, &checksum).is_err());
+        assert!(
+            reopened
+                .capture_review_source("session", "fast-review", None, &checksum)
+                .is_err()
+        );
         fs::write(directory.join("working.md"), &rendered.markdown).unwrap();
         fs::write(directory.join("working.index.json"), "{}").unwrap();
-        assert!(reopened.capture_review_source("session", "fast-review", None, &checksum).is_err());
+        assert!(
+            reopened
+                .capture_review_source("session", "fast-review", None, &checksum)
+                .is_err()
+        );
         eprintln!("warm 13-file review: rename={rename_elapsed:?}, delete={delete_elapsed:?}");
     }
 
@@ -1381,21 +1686,26 @@ mod test {
         );
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![FunctionBody { evidence: None, behavior: None,
+            vec![FunctionBody {
+                evidence: None,
+                behavior: None,
                 owner: "introduced".into(),
                 call: Some(vec![
                     CallSite {
-                        kind: crate::plan::CallKind::Call, name: "introduced".into(),
+                        kind: crate::plan::CallKind::Call,
+                        name: "introduced".into(),
                         source: None,
                         unresolved: false,
                     },
                     CallSite {
-                        kind: crate::plan::CallKind::Call, name: "existing".into(),
+                        kind: crate::plan::CallKind::Call,
+                        name: "existing".into(),
                         source: None,
                         unresolved: false,
                     },
                     CallSite {
-                        kind: crate::plan::CallKind::Call, name: "introduced".into(),
+                        kind: crate::plan::CallKind::Call,
+                        name: "introduced".into(),
                         source: None,
                         unresolved: false,
                     },
@@ -1428,15 +1738,20 @@ mod test {
             .unwrap();
         assert_eq!(renamed.version, document.version + 1);
         renamed.validate_for_submission().unwrap();
-        assert_eq!(renamed.design.as_ref().unwrap().proposed["src/lib.rs"],
-            document.design.as_ref().unwrap().proposed["src/lib.rs"].replace("introduced", "dispatch"));
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed["src/lib.rs"],
+            document.design.as_ref().unwrap().proposed["src/lib.rs"]
+                .replace("introduced", "dispatch")
+        );
         assert_eq!(
             renamed.design.as_ref().unwrap().baseline,
             document.design.as_ref().unwrap().baseline
         );
         assert_eq!(
             renamed.design.as_ref().unwrap().proposed_calls["src/lib.rs"][0]
-                .call.iter().flatten()
+                .call
+                .iter()
+                .flatten()
                 .map(|call| call.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["dispatch", "existing", "dispatch"]
@@ -1453,7 +1768,14 @@ mod test {
         let current = fs::read(store.plan_dir("session", "rename").join("working.json")).unwrap();
         assert!(
             store
-                .rename_symbol("session", "rename", document.version, identity, "stale", None)
+                .rename_symbol(
+                    "session",
+                    "rename",
+                    document.version,
+                    identity,
+                    "stale",
+                    None
+                )
                 .is_err()
         );
         let index = references::PlanReferenceIndex::planned(&renamed, temporary.path()).unwrap();
@@ -1465,7 +1787,8 @@ mod test {
                     "rename",
                     renamed.version,
                     existing,
-                    "forbidden", None
+                    "forbidden",
+                    None
                 )
                 .is_err()
         );
@@ -1495,14 +1818,24 @@ mod test {
         let design = DeclarationDesign::open(temporary.path()).unwrap();
         assert!(design.baseline.is_empty());
         let invalid = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n name = \"arena\"\n+name = \"duplicate\"\n*** End Patch";
-        assert!(design.patch(temporary.path(), &Default::default(), invalid).is_err());
+        assert!(
+            design
+                .patch(temporary.path(), &Default::default(), invalid)
+                .is_err()
+        );
         let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Enable engine input and configure arena speed.\",\n*** End Patch";
         let mut document = document::test_fixture("plan", "Arena dependencies");
-        document.design = Some(design.patch(temporary.path(), &Default::default(), patch).unwrap());
+        document.design = Some(
+            design
+                .patch(temporary.path(), &Default::default(), patch)
+                .unwrap(),
+        );
         document.design.as_mut().unwrap().document.objective =
             "Enable keyboard input with configurable arena movement.".into();
-        document.design.as_mut().unwrap().document.background = "Cargo.toml already enables engine rendering.".into();
-        document.design.as_mut().unwrap().document.requirements = vec!["Enable input without disabling rendering.".into()];
+        document.design.as_mut().unwrap().document.background =
+            "Cargo.toml already enables engine rendering.".into();
+        document.design.as_mut().unwrap().document.requirements =
+            vec!["Enable input without disabling rendering.".into()];
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         crate::checks::configure_fixture(&store.workspace);
         store
@@ -1597,13 +1930,21 @@ mod test {
         let mut design = DeclarationDesign::open(temporary.path()).unwrap();
         assert!(!design.baseline.contains_key("plan.json"));
         for (path, baseline, proposed, invalid) in configurations {
-            assert_eq!(design.inspect(temporary.path(), Some(path), false).unwrap()["text"], baseline);
+            assert_eq!(
+                design.inspect(temporary.path(), Some(path), false).unwrap()["text"],
+                baseline
+            );
             let before = design.clone();
             let invalid_patch = format!(
                 "*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+{invalid}\n*** End Patch",
                 baseline.trim_end()
             );
-            assert!(design.patch(temporary.path(), &Default::default(), &invalid_patch).is_err(), "{path}");
+            assert!(
+                design
+                    .patch(temporary.path(), &Default::default(), &invalid_patch)
+                    .is_err(),
+                "{path}"
+            );
             assert_eq!(design, before);
             let removed = baseline
                 .lines()
@@ -1619,7 +1960,11 @@ mod test {
         }
         design = design.patch(temporary.path(), &Default::default(), "*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
         design = design
-            .patch(temporary.path(), &Default::default(), "*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch")
+            .patch(
+                temporary.path(),
+                &Default::default(),
+                "*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch",
+            )
             .unwrap();
         assert!(!design.proposed.contains_key("settings.jsonc"));
         design.document.objective = "Update project configuration across supported formats.".into();
@@ -1942,11 +2287,13 @@ mod test {
                 question: "Which migration?".into(),
                 options: vec![
                     PlanQuestionOption {
-                        recommended: false, label: "Staged".into(),
+                        recommended: false,
+                        label: "Staged".into(),
                         description: "Support both formats.".into(),
                     },
                     PlanQuestionOption {
-                        recommended: false, label: "Immediate".into(),
+                        recommended: false,
+                        label: "Immediate".into(),
                         description: "Replace immediately.".into(),
                     },
                 ],
@@ -2044,11 +2391,13 @@ mod test {
                     question: "Which migration?".into(),
                     options: vec![
                         PlanQuestionOption {
-                            recommended: false, label: "Staged".into(),
+                            recommended: false,
+                            label: "Staged".into(),
                             description: "Support both formats.".into(),
                         },
                         PlanQuestionOption {
-                            recommended: false, label: "Immediate".into(),
+                            recommended: false,
+                            label: "Immediate".into(),
                             description: "Replace immediately.".into(),
                         },
                     ],
@@ -2094,7 +2443,8 @@ mod test {
     #[test]
     fn replaces_questions_and_preserves_only_valid_answers() {
         let option = |label: &str| PlanQuestionOption {
-            recommended: false, label: label.into(),
+            recommended: false,
+            label: label.into(),
             description: format!("Use {label}"),
         };
         let question = |id: &str, options: Vec<PlanQuestionOption>, allow_freeform| PlanQuestion {
@@ -2193,7 +2543,8 @@ mod test {
                 header: "Migration".into(),
                 question: "Which migration?".into(),
                 options: vec![PlanQuestionOption {
-                    recommended: false, label: "Staged".into(),
+                    recommended: false,
+                    label: "Staged".into(),
                     description: "Preserve compatibility.".into(),
                 }],
                 allow_freeform: true,

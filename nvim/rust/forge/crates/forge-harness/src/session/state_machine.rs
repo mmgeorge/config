@@ -70,7 +70,9 @@ impl WorkflowActivity {
         match exchange.kind {
             ExchangeKind::PlanDraft => Self::Planning,
             ExchangeKind::PlanRevision => Self::Revising,
-            ExchangeKind::PlanExecution => exchange.execution_phase.as_ref()
+            ExchangeKind::PlanExecution => exchange
+                .execution_phase
+                .as_ref()
                 .map_or(Self::Implementing, |phase| phase.phase.into()),
             ExchangeKind::Chat if exchange.goal_id.is_some() => Self::Goal,
             ExchangeKind::Chat => Self::Working,
@@ -91,7 +93,11 @@ impl From<PlanPhase> for WorkflowActivity {
 
 #[derive(Clone, Copy)]
 /// Distinguishes entry, automatic continuation, and explicit resumption.
-pub enum LifecycleAction { Started, Continued, Resumed }
+pub enum LifecycleAction {
+    Started,
+    Continued,
+    Resumed,
+}
 
 impl LifecycleAction {
     fn label(self) -> &'static str {
@@ -174,8 +180,10 @@ pub struct ExecutionStatus {
 impl ExecutionStatus {
     /// Reports recorded comparison evidence without treating an empty result as running work.
     pub(crate) fn has_comparison(&self) -> bool {
-        !self.progress.matched.is_empty() || !self.progress.missing.is_empty()
-            || !self.progress.different.is_empty() || !self.progress.unverified.is_empty()
+        !self.progress.matched.is_empty()
+            || !self.progress.missing.is_empty()
+            || !self.progress.different.is_empty()
+            || !self.progress.unverified.is_empty()
             || !self.progress.declaration_changes.is_empty()
     }
 }
@@ -190,18 +198,30 @@ impl SessionPhase {
         if let Some(started_at_ms) = exchange.and_then(Exchange::compaction_started_at_ms) {
             return Self::Compacting { started_at_ms };
         }
-        let active_wait = active_wait.filter(|wait| exchange.is_some_and(|exchange|
-            exchange.id == wait.exchange_id && matches!(exchange.activity(),
-                ExchangeActivity::Active | ExchangeActivity::WaitingForAgent)));
+        let active_wait = active_wait.filter(|wait| {
+            exchange.is_some_and(|exchange| {
+                exchange.id == wait.exchange_id
+                    && matches!(
+                        exchange.activity(),
+                        ExchangeActivity::Active | ExchangeActivity::WaitingForAgent
+                    )
+            })
+        });
         match exchange.map(Exchange::activity) {
             Some(ExchangeActivity::Paused) => return Self::Paused,
-            Some(ExchangeActivity::AwaitingApproval) => return Self::AwaitingApproval {
-                exchange_id: exchange.unwrap().id.clone(),
-            },
-            Some(ExchangeActivity::Compacting { started_at_ms }) => return Self::Compacting { started_at_ms },
-            Some(ExchangeActivity::WaitingForAgent) => return Self::WaitingForAgent {
-                agent_count: active_wait.map_or(0, |wait| wait.agent_count),
-            },
+            Some(ExchangeActivity::AwaitingApproval) => {
+                return Self::AwaitingApproval {
+                    exchange_id: exchange.unwrap().id.clone(),
+                };
+            }
+            Some(ExchangeActivity::Compacting { started_at_ms }) => {
+                return Self::Compacting { started_at_ms };
+            }
+            Some(ExchangeActivity::WaitingForAgent) => {
+                return Self::WaitingForAgent {
+                    agent_count: active_wait.map_or(0, |wait| wait.agent_count),
+                };
+            }
             _ => {}
         }
         let executing = exchange.is_some_and(|exchange| {
@@ -220,13 +240,18 @@ impl SessionPhase {
             return Self::PlanningFailed {
                 plan_id: plan.id.clone(),
                 turn_count: plan.generation.budget.turn_count,
-                reason: if plan.generation.budget.turn_count >= plan.generation.budget.max_turn_count {
+                reason: if plan.generation.budget.turn_count
+                    >= plan.generation.budget.max_turn_count
+                {
                     "continuation limit reached"
-                } else if plan.generation.budget.consecutive_no_progress >= plan.generation.budget.max_consecutive_no_progress {
+                } else if plan.generation.budget.consecutive_no_progress
+                    >= plan.generation.budget.max_consecutive_no_progress
+                {
                     "no progress limit reached"
                 } else {
                     "planning could not finish"
-                }.into(),
+                }
+                .into(),
             };
         }
         if let Some(plan) = active_plan
@@ -277,7 +302,15 @@ impl SessionPhase {
                 agent_count: wait.agent_count,
             };
         }
-        if let (Some(plan), Some((started_at_ms, duration_ms, activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising), _))) = (
+        if let (
+            Some(plan),
+            Some((
+                started_at_ms,
+                duration_ms,
+                activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising),
+                _,
+            )),
+        ) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
                     && plan.generation.budget.turn_count > 0
@@ -308,25 +341,49 @@ impl SessionPhase {
     /// Computes elapsed time from recorded intervals without inventing a running clock.
     pub(crate) fn elapsed_ms(&self, now_ms: i64) -> u64 {
         match self {
-            Self::Working { duration_ms, started_at_ms, .. }
-            | Self::RetryingPlanGeneration { duration_ms, started_at_ms, .. } =>
-                duration_ms.saturating_add(started_at_ms.map_or(0,
-                    |started| now_ms.saturating_sub(started).max(0) as u64)),
-            Self::Compacting { started_at_ms } => now_ms.saturating_sub(*started_at_ms).max(0) as u64,
+            Self::Working {
+                duration_ms,
+                started_at_ms,
+                ..
+            }
+            | Self::RetryingPlanGeneration {
+                duration_ms,
+                started_at_ms,
+                ..
+            } => duration_ms.saturating_add(
+                started_at_ms.map_or(0, |started| now_ms.saturating_sub(started).max(0) as u64),
+            ),
+            Self::Compacting { started_at_ms } => {
+                now_ms.saturating_sub(*started_at_ms).max(0) as u64
+            }
             _ => 0,
         }
     }
 
     /// Selects animation from lifecycle ownership rather than text or clock presence.
     pub(crate) fn animated(&self) -> bool {
-        matches!(self, Self::Working { .. } | Self::RetryingPlanGeneration { .. }
-            | Self::Compacting { .. } | Self::WaitingForAgent { .. } | Self::Finalizing { error: None, .. })
+        matches!(
+            self,
+            Self::Working { .. }
+                | Self::RetryingPlanGeneration { .. }
+                | Self::Compacting { .. }
+                | Self::WaitingForAgent { .. }
+                | Self::Finalizing { error: None, .. }
+        )
     }
 
     /// Selects periodic text refresh only when elapsed time can advance.
     pub(crate) fn ticking(&self) -> bool {
-        matches!(self, Self::Working { started_at_ms: Some(_), .. }
-            | Self::RetryingPlanGeneration { started_at_ms: Some(_), .. } | Self::Compacting { .. })
+        matches!(
+            self,
+            Self::Working {
+                started_at_ms: Some(_),
+                ..
+            } | Self::RetryingPlanGeneration {
+                started_at_ms: Some(_),
+                ..
+            } | Self::Compacting { .. }
+        )
     }
 }
 
@@ -388,23 +445,38 @@ mod test {
     #[test]
     fn planning_retries_preserve_creation_and_revision_activity() {
         for (kind, state, activity) in [
-            (ExchangeKind::PlanDraft, PlanState::Generating, WorkflowActivity::Planning),
-            (ExchangeKind::PlanRevision, PlanState::Revising, WorkflowActivity::Revising),
+            (
+                ExchangeKind::PlanDraft,
+                PlanState::Generating,
+                WorkflowActivity::Planning,
+            ),
+            (
+                ExchangeKind::PlanRevision,
+                PlanState::Revising,
+                WorkflowActivity::Revising,
+            ),
         ] {
             let mut exchange = exchange();
             exchange.kind = kind;
             let mut plan = plan(state);
             plan.generation.budget.observe(true);
-            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::RetryingPlanGeneration { activity: actual, .. } if actual == activity));
+            assert!(
+                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::RetryingPlanGeneration { activity: actual, .. } if actual == activity)
+            );
             plan.state = PlanState::Failed;
             plan.generation.budget.turn_count = plan.generation.budget.max_turn_count;
-            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::PlanningFailed { reason, .. } if reason == "continuation limit reached"));
+            assert!(
+                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::PlanningFailed { reason, .. } if reason == "continuation limit reached")
+            );
             plan.generation.budget.turn_count = 2;
-            plan.generation.budget.consecutive_no_progress = plan.generation.budget.max_consecutive_no_progress;
-            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
-                SessionPhase::PlanningFailed { reason, .. } if reason == "no progress limit reached"));
+            plan.generation.budget.consecutive_no_progress =
+                plan.generation.budget.max_consecutive_no_progress;
+            assert!(
+                matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::PlanningFailed { reason, .. } if reason == "no progress limit reached")
+            );
         }
     }
 
@@ -413,7 +485,8 @@ mod test {
         assert_eq!(
             SessionPhase::resolve(None, None, Some(&exchange()),),
             SessionPhase::Working {
-                duration_ms: 0, started_at_ms: Some(42),
+                duration_ms: 0,
+                started_at_ms: Some(42),
                 activity: WorkflowActivity::Planning,
                 execution: None,
                 reasoning_summary: None,
@@ -423,18 +496,27 @@ mod test {
 
     #[test]
     fn compaction_restores_workflow_status_after_every_terminal_outcome() {
-        for state in [crate::backend::CompactionState::Completed,
-            crate::backend::CompactionState::Failed, crate::backend::CompactionState::Unconfirmed] {
+        for state in [
+            crate::backend::CompactionState::Completed,
+            crate::backend::CompactionState::Failed,
+            crate::backend::CompactionState::Unconfirmed,
+        ] {
             let mut exchange = exchange();
             let original = SessionPhase::resolve(None, None, Some(&exchange));
             let mut compaction = crate::backend::Compaction {
-                id: "compaction".into(), thread_id: "provider".into(),
-                state: crate::backend::CompactionState::Running, manual: false,
-                started_at_ms: None, completed_at_ms: None, result: Default::default(),
+                id: "compaction".into(),
+                thread_id: "provider".into(),
+                state: crate::backend::CompactionState::Running,
+                manual: false,
+                started_at_ms: None,
+                completed_at_ms: None,
+                result: Default::default(),
             };
             exchange.observe_compaction(compaction.clone(), 50);
-            assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)),
-                SessionPhase::Compacting { started_at_ms: 50 });
+            assert_eq!(
+                SessionPhase::resolve(None, None, Some(&exchange)),
+                SessionPhase::Compacting { started_at_ms: 50 }
+            );
             compaction.state = state;
             exchange.observe_compaction(compaction, 60);
             assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)), original);
@@ -521,7 +603,8 @@ mod test {
                 turn: 2,
                 max_turn: 20,
                 activity: WorkflowActivity::Planning,
-                duration_ms: 0, started_at_ms: Some(42),
+                duration_ms: 0,
+                started_at_ms: Some(42),
             }
         );
     }
@@ -540,7 +623,8 @@ mod test {
         assert_eq!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working {
-                duration_ms: 0, started_at_ms: Some(100),
+                duration_ms: 0,
+                started_at_ms: Some(100),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -605,29 +689,57 @@ mod test {
 
     #[test]
     fn terminal_exchanges_release_approval_status_without_hiding_background_compaction() {
-        for state in [ExchangeState::Finalizing, ExchangeState::Complete, ExchangeState::Failed,
-            ExchangeState::Cancelled, ExchangeState::Interrupted] {
+        for state in [
+            ExchangeState::Finalizing,
+            ExchangeState::Complete,
+            ExchangeState::Failed,
+            ExchangeState::Cancelled,
+            ExchangeState::Interrupted,
+        ] {
             let mut exchange = exchange();
-            exchange.observe_compaction(crate::backend::Compaction {
-                id:"compaction".into(), thread_id:"thread".into(),
-                state:crate::backend::CompactionState::Running, manual:false,
-                started_at_ms:Some(42), completed_at_ms:None, result:Default::default(),
-            }, 42);
-            exchange.observe_blocker("approval:command".into(),true,50);
+            exchange.observe_compaction(
+                crate::backend::Compaction {
+                    id: "compaction".into(),
+                    thread_id: "thread".into(),
+                    state: crate::backend::CompactionState::Running,
+                    manual: false,
+                    started_at_ms: Some(42),
+                    completed_at_ms: None,
+                    result: Default::default(),
+                },
+                42,
+            );
+            exchange.observe_blocker("approval:command".into(), true, 50);
             exchange.state = state;
-            assert_eq!(exchange.activity(),crate::exchange::ExchangeActivity::Settled);
-            let status = SessionPhase::resolve(None,None,Some(&exchange));
-            assert_eq!(status,SessionPhase::Compacting {started_at_ms:42});
+            assert_eq!(
+                exchange.activity(),
+                crate::exchange::ExchangeActivity::Settled
+            );
+            let status = SessionPhase::resolve(None, None, Some(&exchange));
+            assert_eq!(status, SessionPhase::Compacting { started_at_ms: 42 });
             exchange.node_list.clear();
-            let status = SessionPhase::resolve(None,None,Some(&exchange));
-            assert!(matches!(status,SessionPhase::Finalizing { .. } | SessionPhase::Idle),"{state:?}: {status:?}");
+            let status = SessionPhase::resolve(None, None, Some(&exchange));
+            assert!(
+                matches!(status, SessionPhase::Finalizing { .. } | SessionPhase::Idle),
+                "{state:?}: {status:?}"
+            );
         }
         let mut exchange = exchange();
-        exchange.start_turn(crate::backend::ProviderAddress {
-            owner:None, thread_id:"thread".into(), turn_id:"turn".into(),
-        },42).unwrap();
-        exchange.observe_blocker("approval:command".into(),true,50);
+        exchange
+            .start_turn(
+                crate::backend::ProviderAddress {
+                    owner: None,
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                },
+                42,
+            )
+            .unwrap();
+        exchange.observe_blocker("approval:command".into(), true, 50);
         exchange.pause_for_restart(60).unwrap();
-        assert_eq!(SessionPhase::resolve(None,None,Some(&exchange)),SessionPhase::Paused);
+        assert_eq!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Paused
+        );
     }
 }

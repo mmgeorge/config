@@ -60,10 +60,20 @@ impl RowChange {
     /// Returns the marker, row background, gutter foreground, and emphasis captures.
     pub(crate) fn style(self) -> (&'static str, &'static str, &'static str, &'static str) {
         match self {
-            Self::Context => (" ", "ForgeContextBg", "ForgeContextLineNr", "ForgeContextBg"),
+            Self::Context => (
+                " ",
+                "ForgeContextBg",
+                "ForgeContextLineNr",
+                "ForgeContextBg",
+            ),
             Self::Added => ("+", "ForgeAddBg", "ForgeAddLineNr", "ForgeInlineAddBg"),
             Self::Modified => ("~", "ForgeModifyBg", "ForgeModifyLineNr", "ForgeModifyBg"),
-            Self::Removed => ("-", "ForgeDeleteBg", "ForgeDeleteLineNr", "ForgeInlineDeleteBg"),
+            Self::Removed => (
+                "-",
+                "ForgeDeleteBg",
+                "ForgeDeleteLineNr",
+                "ForgeInlineDeleteBg",
+            ),
         }
     }
 }
@@ -113,19 +123,50 @@ impl DiffPresenter {
     }
 
     /// Projects a semantic diff row with optional one-based old/new declaration lines.
-    pub fn summary(&self, id: BlockId, text: &str, change: RowChange, lines: [Option<u32>; 2], line_width: usize) -> Result<BufferBlock, ContractError> {
+    pub fn summary(
+        &self,
+        id: BlockId,
+        text: &str,
+        change: RowChange,
+        lines: [Option<u32>; 2],
+        line_width: usize,
+    ) -> Result<BufferBlock, ContractError> {
         let mut block = BufferBlock {
-            id, text: BufferText::from_rows([text])?, metadata: Default::default(),
+            id,
+            text: BufferText::from_rows([text])?,
+            metadata: Default::default(),
         };
         block.metadata.layout = self.options.layout.clone();
         let (_, background, number, _) = change.style();
-        let width = line_width.max(3).max(lines.iter().flatten().map(|line| line.to_string().len()).max().unwrap_or(0));
+        let width = line_width.max(3).max(
+            lines
+                .iter()
+                .flatten()
+                .map(|line| line.to_string().len())
+                .max()
+                .unwrap_or(0),
+        );
         let mut columns = Vec::new();
         for line in lines {
-            columns.push(TextChunk { text: format!("{:>width$}", line.map(|line| line.to_string()).unwrap_or_default()), capture: number.into() });
-            columns.push(TextChunk { text: "  ".into(), capture: background.into() });
+            columns.push(TextChunk {
+                text: format!(
+                    "{:>width$}",
+                    line.map(|line| line.to_string()).unwrap_or_default()
+                ),
+                capture: number.into(),
+            });
+            columns.push(TextChunk {
+                text: "  ".into(),
+                capture: background.into(),
+            });
         }
-        crate::projection::append_change_row(&mut block.metadata, 0, change, columns, self.options.indent)?;
+        crate::projection::append_change_row(
+            &mut block.metadata,
+            0,
+            change,
+            columns,
+            self.options.indent,
+        )?;
         Ok(block)
     }
 
@@ -199,10 +240,29 @@ impl DiffPresenter {
     }
 
     /// Presents one source row with a semantic change category and its original coordinates.
-    pub fn row(&self, id: BlockId, row: &DisplayRow, group: &DisplayHunk, change: RowChange) -> Result<BufferBlock, ContractError> {
-        let mut block = BufferBlock { id, text: BufferText::from_rows([&row.text])?, metadata: Default::default() };
+    pub fn row(
+        &self,
+        id: BlockId,
+        row: &DisplayRow,
+        group: &DisplayHunk,
+        change: RowChange,
+    ) -> Result<BufferBlock, ContractError> {
+        let mut block = BufferBlock {
+            id,
+            text: BufferText::from_rows([&row.text])?,
+            metadata: Default::default(),
+        };
         block.metadata.layout = self.options.layout.clone();
-        crate::projection::append_display_row(&mut block.metadata, 0, row, group, None, None, Some(change), self.options.indent)?;
+        crate::projection::append_display_row(
+            &mut block.metadata,
+            0,
+            row,
+            group,
+            None,
+            None,
+            Some(change),
+            self.options.indent,
+        )?;
         Ok(block)
     }
 

@@ -1,6 +1,5 @@
 use forge_diff::source::{
-    NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion,
-    validate_source_pair,
+    NewlineMetadata, Representation, SourceError, SourcePair, SourceVersion, validate_source_pair,
 };
 
 #[test]

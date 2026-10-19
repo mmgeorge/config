@@ -1,7 +1,5 @@
 use crate::backend::{BackendOutput, PlanSubmitRequest};
-use crate::plan::{
-    PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal,
-};
+use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -9,26 +7,37 @@ use std::collections::HashMap;
 use std::sync::OnceLock;
 use tokio::io::{AsyncWriteExt, BufReader};
 
-mod failure;
 mod executor;
+mod failure;
 pub(crate) mod lsp;
 pub mod repository;
 mod runtime;
+pub(crate) use executor::ControlToolExecutor;
 pub(crate) use failure::{
     ControlToolArgumentError, control_tool_failure_json, schema_violation_list,
 };
-pub use runtime::{ControlToolResult, ControlTurnContext};
-pub(crate) use executor::ControlToolExecutor;
 #[cfg(test)]
 pub(crate) use runtime::ControlToolRuntime;
+pub use runtime::{ControlToolResult, ControlTurnContext};
 
 pub(crate) fn is_agent_tool(name: &str) -> bool {
-    matches!(name,"agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt"
-        | "agent_list" | "agent_activity" | "agent_tool_output")
+    matches!(
+        name,
+        "agent_spawn"
+            | "agent_send"
+            | "agent_followup"
+            | "agent_interrupt"
+            | "agent_list"
+            | "agent_activity"
+            | "agent_tool_output"
+    )
 }
 
 fn is_check_tool(name: &str) -> bool {
-    matches!(name, "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel")
+    matches!(
+        name,
+        "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel"
+    )
 }
 
 /// Defines one Harness control tool independently from any provider transport.
@@ -59,42 +68,70 @@ impl ControlToolRegistry {
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         let mut definitions = vec![
             ControlToolDefinition {
-                name:"agent_spawn",
-                description:"Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
-                input_schema:strict_object_input_schema(vec![("profile",string_schema()),("text",string_schema())],&["text"]),
+                name: "agent_spawn",
+                description: "Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
+                input_schema: strict_object_input_schema(
+                    vec![("profile", string_schema()), ("text", string_schema())],
+                    &["text"],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_send",
-                description:"Supply information to a child by stable ID, canonical path, or task name. Does not start an idle child. Native steering is used only when supported, otherwise information remains in its durable inbox.",
-                input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
+                name: "agent_send",
+                description: "Supply information to a child by stable ID, canonical path, or task name. Does not start an idle child. Native steering is used only when supported, otherwise information remains in its durable inbox.",
+                input_schema: strict_object_input_schema(
+                    vec![("target", string_schema()), ("message", string_schema())],
+                    &["target", "message"],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_followup",
-                description:"Admit another task into an existing child's retained conversation while its profile is enabled. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history. Current session delegation and profile settings govern every new task.",
-                input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
+                name: "agent_followup",
+                description: "Admit another task into an existing child's retained conversation while its profile is enabled. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history. Current session delegation and profile settings govern every new task.",
+                input_schema: strict_object_input_schema(
+                    vec![("target", string_schema()), ("message", string_schema())],
+                    &["target", "message"],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_interrupt",
-                description:"Interrupt one child and cancel its queued follow-ups. Retains its identity, history, and informational inbox. Execution capacity remains reserved until cleanup settles.",
-                input_schema:strict_object_input_schema(vec![("target",string_schema())],&["target"]),
+                name: "agent_interrupt",
+                description: "Interrupt one child and cancel its queued follow-ups. Retains its identity, history, and informational inbox. Execution capacity remains reserved until cleanup settles.",
+                input_schema: strict_object_input_schema(
+                    vec![("target", string_schema())],
+                    &["target"],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_list",
-                description:"List Main and Harness-owned children with execution selections, lifecycle, and latest task outcome. Optional path_prefix filters canonical task paths within this root.",
-                input_schema:strict_object_input_schema(vec![("path_prefix",string_schema())],&[]),
+                name: "agent_list",
+                description: "List Main and Harness-owned children with execution selections, lifecycle, and latest task outcome. Optional path_prefix filters canonical task paths within this root.",
+                input_schema: strict_object_input_schema(
+                    vec![("path_prefix", string_schema())],
+                    &[],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_activity",
-                description:"Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Defaults to 5 entries. Pass limit (1–20) to request a different count. Does not message or restart the child.",
-                input_schema:strict_object_input_schema(vec![("target",string_schema()),
-                    ("limit",json!({"type":"integer","minimum":1,"maximum":20}))],&["target"]),
+                name: "agent_activity",
+                description: "Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Defaults to 5 entries. Pass limit (1–20) to request a different count. Does not message or restart the child.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("target", string_schema()),
+                        ("limit", json!({"type":"integer","minimum":1,"maximum":20})),
+                    ],
+                    &["target"],
+                ),
             },
             ControlToolDefinition {
-                name:"agent_tool_output",
-                description:"Read existing output for a call_ref from agent_activity. Works during execution and after child follow-ups. Offsets and limits count Unicode characters. Default limit 8000, maximum 32000. Follow next_offset for more currently available output. A running call may produce more later. Never executes the tool again.",
-                input_schema:strict_object_input_schema(vec![("call_ref",string_schema()),
-                    ("offset",json!({"type":"integer","minimum":0})),
-                    ("limit",json!({"type":"integer","minimum":1,"maximum":32000}))],&["call_ref"]),
+                name: "agent_tool_output",
+                description: "Read existing output for a call_ref from agent_activity. Works during execution and after child follow-ups. Offsets and limits count Unicode characters. Default limit 8000, maximum 32000. Follow next_offset for more currently available output. A running call may produce more later. Never executes the tool again.",
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("call_ref", string_schema()),
+                        ("offset", json!({"type":"integer","minimum":0})),
+                        (
+                            "limit",
+                            json!({"type":"integer","minimum":1,"maximum":32000}),
+                        ),
+                    ],
+                    &["call_ref"],
+                ),
             },
             ControlToolDefinition {
                 name: "repository_status",
@@ -119,13 +156,31 @@ impl ControlToolRegistry {
             ControlToolDefinition {
                 name: "design_patch",
                 description: "Atomically edit virtual declaration overviews, complete JSON/JSONC, TOML, YAML, XML, and .gitignore proposals, and plan.json metadata. Never writes workspace files. Use *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax with project-relative paths. Source proposals contain signatures, explanatory comments, Algorithm blocks for new callables, one-to-two-sentence Change summaries only for modified callables, Calls, Constructs, and Accesses, never executable bodies. New callables require a nonempty Algorithm at submission. Write academic pseudocode as high-level and compact as possible while preserving required behavior. Configuration retains complete values. Read affected text through plan_read when exact text or version is unavailable and omit its displayed line numbers from patches. Read an existing workspace file before its first edit. The first successful Update, Delete, or Move captures its immutable baseline. Add requires an absent destination. Later edits use the saved proposal. Optional source_digests maps paths to inspected hashes for stale-read checks across turns. Success returns the new version and the complete applied diff. Use that confirmation instead of rereading unchanged files. plan.json already exists and accepts Update File only. Its fields are objective, optional usage, requirements, background, decisions, design, flows, verification, and tests. Submission requires nonempty objective, background, and design. Requirements identify the 2-4 key delivered outcomes and acceptance constraints and may be empty for bug fixes. Keep routine validation and implementation safeguards in Design or declarations unless explicitly requested or essential to task-specific acceptance. Background records relevant starting conditions. Decisions is an array of {decision, rationale} objects for consequential choices with task-specific reasons, or [] when none apply. Design explains the solution and ownership. Flows is an array of {title, description, trigger, steps}, or [] when none apply. Each flow has one explicit initiating event. Steps run in order and contain action, optional effects, and optional branches. Each effect has exactly target and change and is terminal: never put actions, steps, children, branches, or triggers inside effects. Each branch has condition and nonempty steps evaluated during this execution. Later independent events require separate flows, even when they consume state produced by another flow. Branches do not imply parallel execution. Use plain single-line labels and exact declaration names. Harness generates the diagram after Design. Do not put a Flows heading or hand-formatted diagrams in design. Do not duplicate repository instructions, milestones, or execution progress in plan prose. Propose concrete supported file changes, including needed .gitignore rules, and describe generated artifacts or unsupported file changes in Design. Do not create placeholder lockfiles. Automated checks belong to saved .forge.json configuration, not plan.json. If submission reports checks_not_configured, use the check setup tool and retry the same plan. verification is an array of manual actions and expected observations, performed only after Checking passes. Manual verification may be empty. The required tests array groups {file, cases} by project-relative forward-slash path. Each case has name, change (new, modified, removed, or reused), and description (scenario and expected result or removal rationale). Include inline and separate-file tests and reused coverage, omit unrelated tests, and use [] when none apply. The inventory records intended coverage, not results. Keep all metadata and proposals consistent. Optional title names the design.",
-                input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema()),("source_digests",json!({"type":"object","additionalProperties":{"type":"string"}}))], &["plan_id","expected_version","patch"]),
+                input_schema: strict_object_input_schema(
+                    vec![
+                        ("plan_id", string_schema()),
+                        ("expected_version", json!({"type":"integer","minimum":1})),
+                        ("patch", string_schema()),
+                        ("title", string_schema()),
+                        (
+                            "source_digests",
+                            json!({"type":"object","additionalProperties":{"type":"string"}}),
+                        ),
+                    ],
+                    &["plan_id", "expected_version", "patch"],
+                ),
             },
             ControlToolDefinition {
                 name: "plan_read",
                 description: "List captured/proposed declaration and configuration paths and plan.json, or read one file as plain text with 1-based line numbers and the active version. Optional start_line and end_line select an inclusive range and require path. Omitted bounds select the beginning or end of the file. Line-number prefixes are presentation only, omit them from patches. plan.json contains objective, optional usage, requirements, background, decisions, design, flows, verification (manual actions), and tests (planned coverage) and has no baseline. Omit path for the inventory and, during execution, current phase, findings, and verification_evidence with completed tool-call IDs. Set baseline true to inspect immutable current-code declarations or complete configuration. For an uncaptured path, extracts only that workspace file and returns its source digest without saving a baseline or changing the version. Read existing files before editing them. Does not return implementation bodies.",
                 input_schema: strict_object_input_schema(
-                    vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"})),("start_line",json!({"type":"integer","minimum":1})),("end_line",json!({"type":"integer","minimum":1}))],
+                    vec![
+                        ("plan_id", string_schema()),
+                        ("path", string_schema()),
+                        ("baseline", json!({"type":"boolean"})),
+                        ("start_line", json!({"type":"integer","minimum":1})),
+                        ("end_line", json!({"type":"integer","minimum":1})),
+                    ],
                     &["plan_id"],
                 ),
             },
@@ -136,7 +191,10 @@ impl ControlToolRegistry {
                     vec![
                         ("plan_id", string_schema()),
                         ("expected_version", json!({"type":"integer","minimum":1})),
-                        ("check_ids", json!({"type":"array","minItems":1,"items":string_schema()})),
+                        (
+                            "check_ids",
+                            json!({"type":"array","minItems":1,"items":string_schema()}),
+                        ),
                     ],
                     &["plan_id", "expected_version", "check_ids"],
                 ),
@@ -159,24 +217,49 @@ impl ControlToolRegistry {
             ControlToolDefinition {
                 name: "plan_phase_done",
                 description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Constructs/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
-                input_schema: strict_object_input_schema(vec![
-                    ("phase", json!({"type":"string","enum":["implement","verify","resolve"]})),
-                    ("revision", json!({"type":"integer","minimum":1})),
-                    ("summary", string_schema()),
-                    ("verification", strict_object_input_schema(vec![
-                        ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
-                        ("checks", json!({"type":"array","description":"One result per accepted manual action, in plan order. Use the exact command or manual check label. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
+                input_schema: strict_object_input_schema(
+                    vec![
+                        (
+                            "phase",
+                            json!({"type":"string","enum":["implement","verify","resolve"]}),
+                        ),
+                        ("revision", json!({"type":"integer","minimum":1})),
+                        ("summary", string_schema()),
+                        (
+                            "verification",
+                            strict_object_input_schema(
+                                vec![
+                                    (
+                                        "outcome",
+                                        json!({"type":"string","enum":["passed","failed","blocked"]}),
+                                    ),
+                                    (
+                                        "checks",
+                                        json!({"type":"array","description":"One result per accepted manual action, in plan order. Use the exact command or manual check label. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
                             ("category", json!({"type":"string","enum":["manual"]})),
                             ("label", string_schema()),
                             ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
                             ("summary", string_schema()),
                             ("evidence", json!({"type":"array","items":{"type":"string"}}))
-                        ], &["category","label","outcome","summary","evidence"])})),
-                        ("evidence", json!({"type":"array","description":"Exact completed tool-call IDs from plan_read execution.verification_evidence", "items":{"type":"string"}})),
-                        ("findings", json!({"type":"array","items":{"type":"string"}})),
-                        ("reason", string_schema()), ("reuse_reason", string_schema())
-                    ], &["outcome","checks"]))
-                ], &["phase","revision","summary"]),
+                        ], &["category","label","outcome","summary","evidence"])}),
+                                    ),
+                                    (
+                                        "evidence",
+                                        json!({"type":"array","description":"Exact completed tool-call IDs from plan_read execution.verification_evidence", "items":{"type":"string"}}),
+                                    ),
+                                    (
+                                        "findings",
+                                        json!({"type":"array","items":{"type":"string"}}),
+                                    ),
+                                    ("reason", string_schema()),
+                                    ("reuse_reason", string_schema()),
+                                ],
+                                &["outcome", "checks"],
+                            ),
+                        ),
+                    ],
+                    &["phase", "revision", "summary"],
+                ),
             },
             ControlToolDefinition {
                 name: "question_ask",
@@ -255,12 +338,20 @@ impl ControlToolRegistry {
     }
 
     /// Expose plan mutation only while authoring a plan or resolving an execution.
-    pub fn definition_list_for(&self, phase: Option<crate::plan::PlanPhase>) -> Vec<ControlToolDefinition> {
-        self.definition_list().into_iter().filter(|definition| {
-            !is_agent_tool(definition.name) && (!matches!(definition.name, "plan_checks_add" | "design_patch" | "plan_submit")
-                || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
-            )
-        }).collect()
+    pub fn definition_list_for(
+        &self,
+        phase: Option<crate::plan::PlanPhase>,
+    ) -> Vec<ControlToolDefinition> {
+        self.definition_list()
+            .into_iter()
+            .filter(|definition| {
+                !is_agent_tool(definition.name)
+                    && (!matches!(
+                        definition.name,
+                        "plan_checks_add" | "design_patch" | "plan_submit"
+                    ) || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve))
+            })
+            .collect()
     }
 
     /// Select tools from authenticated root ownership and current optional-tool authority.
@@ -269,7 +360,9 @@ impl ControlToolRegistry {
         context: Option<&ControlTurnContext>,
         root: bool,
     ) -> Vec<ControlToolDefinition> {
-        if context.is_some_and(|context| context.mode == crate::backend::PromptMode::Background) { return Vec::new(); }
+        if context.is_some_and(|context| context.mode == crate::backend::PromptMode::Background) {
+            return Vec::new();
+        }
         let phase =
             context.and_then(|context| context.execution.as_ref().map(|execution| execution.phase));
         self.definition_list()
@@ -360,7 +453,11 @@ pub fn apply_invocation(
     validate_arguments(invocation)?;
     match invocation.name.as_str() {
         "design_patch" => {
-            output.design_patch.push(decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?);
+            output
+                .design_patch
+                .push(decode_arguments::<crate::plan::DesignPatchRequest>(
+                    invocation,
+                )?);
             output.plan_submit = None;
             output.structured_plan = true;
         }
@@ -472,10 +569,7 @@ where
 }
 
 fn repository_input_schema(diff: bool, file: bool) -> Value {
-    let mut properties = vec![(
-        "offset",
-        json!({ "type": "integer", "minimum": 0 }),
-    )];
+    let mut properties = vec![("offset", json!({ "type": "integer", "minimum": 0 }))];
     if diff {
         properties.push((
             "side",
@@ -495,17 +589,10 @@ fn string_schema() -> Value {
     json!({ "type": "string" })
 }
 
-
-
-
-
-
 #[cfg(test)]
 fn plan_edit_input_schema() -> Value {
     crate::plan::plan_edit_request_schema()
 }
-
-
 
 fn strict_object_input_schema(
     property_list: Vec<(&'static str, Value)>,
@@ -646,10 +733,13 @@ pub async fn run_stdio() -> Result<()> {
 mod test {
     #[test]
     fn repository_schema_preserves_complete_offsets_and_path_identities() {
-        assert!(validate_arguments(&ControlToolInvocation {
-            name: "repository_file_diff".into(),
-            arguments: json!({"offset":65537,"path_hex":"61".repeat(4097)}),
-        }).is_ok());
+        assert!(
+            validate_arguments(&ControlToolInvocation {
+                name: "repository_file_diff".into(),
+                arguments: json!({"offset":65537,"path_hex":"61".repeat(4097)}),
+            })
+            .is_ok()
+        );
     }
 
     #[test]
@@ -717,39 +807,90 @@ mod test {
     fn checks_catalog_matches_runtime_requests_and_root_ownership() {
         let requests = [
             ("checks_list", json!({})),
-            ("checks_configure", json!({"expected_revision":"revision","config":{"version":2,"definitions":[]}})),
-            ("checks_run", json!({"ids":["unit"],"selections":{"unit":{"kind":"cases","cases":[{"file":"src/lib.rs","name":"tests::example","target":"lib"}]}}})),
-            ("checks_status", json!({"run_id":"run","wait_ms":100,"wait_for_completion":true})),
+            (
+                "checks_configure",
+                json!({"expected_revision":"revision","config":{"version":2,"definitions":[]}}),
+            ),
+            (
+                "checks_run",
+                json!({"ids":["unit"],"selections":{"unit":{"kind":"cases","cases":[{"file":"src/lib.rs","name":"tests::example","target":"lib"}]}}}),
+            ),
+            (
+                "checks_status",
+                json!({"run_id":"run","wait_ms":100,"wait_for_completion":true}),
+            ),
             ("checks_cancel", json!({"run_id":"run"})),
         ];
         let catalog = ControlToolRegistry.mcp_tool_list();
         for (name, arguments) in requests {
-            assert_eq!(catalog.iter().filter(|tool| tool["name"] == name).count(), 1);
-            apply_invocation(&ControlToolInvocation { name: name.into(), arguments: arguments.clone() }, &mut BackendOutput::default()).unwrap();
+            assert_eq!(
+                catalog.iter().filter(|tool| tool["name"] == name).count(),
+                1
+            );
+            apply_invocation(
+                &ControlToolInvocation {
+                    name: name.into(),
+                    arguments: arguments.clone(),
+                },
+                &mut BackendOutput::default(),
+            )
+            .unwrap();
             let mut invalid = arguments;
             invalid["workspace"] = json!("untrusted");
-            assert!(validate_arguments(&ControlToolInvocation { name: name.into(), arguments: invalid }).is_err());
+            assert!(
+                validate_arguments(&ControlToolInvocation {
+                    name: name.into(),
+                    arguments: invalid
+                })
+                .is_err()
+            );
         }
         let root = crate::backend::ExecutionOwner::root("session");
-        let child = crate::backend::ExecutionOwner { session_id: "session".into(), agent_id: "child".into() };
-        assert_eq!(ControlToolRegistry.definition_list_for_owner(&root, false, false).iter().filter(|tool| is_check_tool(tool.name)).count(), 5);
-        assert!(!ControlToolRegistry.definition_list_for_owner(&child, true, true).iter().any(|tool| is_check_tool(tool.name)));
+        let child = crate::backend::ExecutionOwner {
+            session_id: "session".into(),
+            agent_id: "child".into(),
+        };
+        assert_eq!(
+            ControlToolRegistry
+                .definition_list_for_owner(&root, false, false)
+                .iter()
+                .filter(|tool| is_check_tool(tool.name))
+                .count(),
+            5
+        );
+        assert!(
+            !ControlToolRegistry
+                .definition_list_for_owner(&child, true, true)
+                .iter()
+                .any(|tool| is_check_tool(tool.name))
+        );
         let context = ControlTurnContext::inactive(crate::backend::PromptMode::Chat);
-        assert!(!ControlToolRegistry.definition_list_for_context(Some(&context), true).iter().any(|tool| is_check_tool(tool.name)));
+        assert!(
+            !ControlToolRegistry
+                .definition_list_for_context(Some(&context), true)
+                .iter()
+                .any(|tool| is_check_tool(tool.name))
+        );
     }
 
     #[test]
     fn design_patch_contract_replaces_legacy_authoring_tools() {
         let definition = ControlToolRegistry.definition_list();
         assert!(definition.iter().any(|tool| tool.name == "design_patch"));
-        assert!(!definition.iter().any(|tool| matches!(tool.name,"harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report")));
-        let invocation = ControlToolInvocation { name:"design_patch".into(),arguments:json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}) };
+        assert!(!definition.iter().any(|tool| matches!(
+            tool.name,
+            "harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report"
+        )));
+        let invocation = ControlToolInvocation {
+            name: "design_patch".into(),
+            arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}),
+        };
         let mut output = BackendOutput::default();
-        apply_invocation(&invocation,&mut output).unwrap();
-        assert_eq!(output.design_patch.len(),1);
+        apply_invocation(&invocation, &mut output).unwrap();
+        assert_eq!(output.design_patch.len(), 1);
         let mut invalid = invocation;
         invalid.arguments["baseline"] = json!({});
-        assert!(apply_invocation(&invalid,&mut BackendOutput::default()).is_err());
+        assert!(apply_invocation(&invalid, &mut BackendOutput::default()).is_err());
     }
 
     #[test]
@@ -1371,13 +1512,4 @@ mod test {
         assert!(!relation_violation_list(json!({ "kind": "call" })).is_empty());
         assert!(!relation_violation_list(json!("dispatch")).is_empty());
     }
-
-
-
-
-
-
-
-
-
 }

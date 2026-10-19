@@ -237,10 +237,7 @@ fn text<'value>(value: &'value Value, path: &str) -> Result<&'value str> {
         .pointer(path)
         .and_then(Value::as_str)
         .with_context(|| format!("notification field {path} is missing"))?;
-    ensure!(
-        !text.contains('\0'),
-        "notification field {path} is invalid"
-    );
+    ensure!(!text.contains('\0'), "notification field {path} is invalid");
     Ok(text)
 }
 
@@ -414,18 +411,13 @@ pub fn decode_detail(
         Some(Value::String(body)) => body.clone(),
         _ => anyhow::bail!("notification body is not text"),
     };
-    ensure!(
-        !body.contains('\0'),
-        "notification body contains NUL"
-    );
+    ensure!(!body.contains('\0'), "notification body contains NUL");
     let author = raw
         .pointer("/user/login")
         .and_then(Value::as_str)
         .map(str::to_owned);
     ensure!(
-        author
-            .as_ref()
-            .is_none_or(|author| !author.contains('\0')),
+        author.as_ref().is_none_or(|author| !author.contains('\0')),
         "notification author contains NUL"
     );
     let comments = match raw.get("comments") {

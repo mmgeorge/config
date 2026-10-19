@@ -1,10 +1,12 @@
-mod settings;
 mod catalog;
+mod import;
 mod profile;
 mod resources;
-mod import;
-pub use settings::{PortableSettings, SettingScope, SettingsSnapshot, SettingsStore, SettingsApplication};
+mod settings;
 pub(crate) use catalog::{ResourceCatalog, SkillResource};
+pub(crate) use import::{ImportKind, ImportedResource, NativeImport};
 pub(crate) use profile::ResourceProfile;
 pub(crate) use resources::SessionResources;
-pub(crate) use import::{ImportKind, ImportedResource, NativeImport};
+pub use settings::{
+    PortableSettings, SettingScope, SettingsApplication, SettingsSnapshot, SettingsStore,
+};

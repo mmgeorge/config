@@ -38,12 +38,22 @@ pub struct DesignDocument {
 
 impl DesignDocument {
     /// Applies plan-only choices, enabling prerequisites and disabling dependent checks together.
-    pub(crate) fn set_checks(&mut self, config: &crate::checks::CheckConfig, changes: &std::collections::BTreeMap<String, bool>) -> Result<()> {
+    pub(crate) fn set_checks(
+        &mut self,
+        config: &crate::checks::CheckConfig,
+        changes: &std::collections::BTreeMap<String, bool>,
+    ) -> Result<()> {
         ensure!(!changes.is_empty(), "select at least one check");
         for (id, enabled) in changes {
-            let check = config.definitions.iter().find(|check| &check.id == id)
+            let check = config
+                .definitions
+                .iter()
+                .find(|check| &check.id == id)
                 .ok_or_else(|| anyhow::anyhow!("unknown planned check: {id}"))?;
-            ensure!(!enabled || check.enabled, "configured check is disabled: {id}");
+            ensure!(
+                !enabled || check.enabled,
+                "configured check is disabled: {id}"
+            );
         }
         let mut resolved = changes.clone();
         loop {
@@ -51,22 +61,45 @@ impl DesignDocument {
             for check in &config.definitions {
                 if resolved.get(&check.id) == Some(&true) {
                     for dependency in &check.depends_on {
-                        ensure!(resolved.get(dependency) != Some(&false), "conflicting choices for prerequisite {dependency}");
-                        ensure!(config.definitions.iter().any(|candidate| &candidate.id == dependency && candidate.enabled), "configured prerequisite is disabled: {dependency}");
+                        ensure!(
+                            resolved.get(dependency) != Some(&false),
+                            "conflicting choices for prerequisite {dependency}"
+                        );
+                        ensure!(
+                            config
+                                .definitions
+                                .iter()
+                                .any(|candidate| &candidate.id == dependency && candidate.enabled),
+                            "configured prerequisite is disabled: {dependency}"
+                        );
                         added |= resolved.insert(dependency.clone(), true).is_none();
                     }
                 }
-                if check.depends_on.iter().any(|dependency| resolved.get(dependency) == Some(&false)) {
-                    ensure!(resolved.get(&check.id) != Some(&true), "conflicting choices for dependent {}", check.id);
+                if check
+                    .depends_on
+                    .iter()
+                    .any(|dependency| resolved.get(dependency) == Some(&false))
+                {
+                    ensure!(
+                        resolved.get(&check.id) != Some(&true),
+                        "conflicting choices for dependent {}",
+                        check.id
+                    );
                     added |= resolved.insert(check.id.clone(), false).is_none();
                 }
             }
-            if !added { break; }
+            if !added {
+                break;
+            }
         }
         for (id, enabled) in resolved {
             self.checks.retain(|selected| selected != &id);
             self.disabled_checks.retain(|selected| selected != &id);
-            if enabled { self.checks.push(id); } else { self.disabled_checks.push(id); }
+            if enabled {
+                self.checks.push(id);
+            } else {
+                self.disabled_checks.push(id);
+            }
         }
         self.validate()
     }
@@ -113,8 +146,16 @@ impl DesignDocument {
                     .map(|decision| {
                         format!(
                             "- **{}** {}",
-                            decision.decision.split_whitespace().collect::<Vec<_>>().join(" "),
-                            decision.rationale.split_whitespace().collect::<Vec<_>>().join(" ")
+                            decision
+                                .decision
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" "),
+                            decision
+                                .rationale
+                                .split_whitespace()
+                                .collect::<Vec<_>>()
+                                .join(" ")
                         )
                     })
                     .collect::<Vec<_>>()
@@ -142,20 +183,43 @@ impl DesignDocument {
                 path: "verification",
                 title: "Verification",
                 section: PlanSection::ManualVerification,
-                text: self.verification.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n"),
+                text: self
+                    .verification
+                    .iter()
+                    .map(|item| format!("- {item}"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
             },
         ]
     }
 
     /// Validate metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
-        ensure!(self.checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid planned check id");
-        ensure!(self.disabled_checks.iter().all(|id| !id.is_empty() && id.len() <= 128), "invalid disabled plan checks");
-        ensure!(self.checks.iter().all(|id| !self.disabled_checks.contains(id)), "plan check cannot be enabled and disabled");
+        ensure!(
+            self.checks
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 128),
+            "invalid planned check id"
+        );
+        ensure!(
+            self.disabled_checks
+                .iter()
+                .all(|id| !id.is_empty() && id.len() <= 128),
+            "invalid disabled plan checks"
+        );
+        ensure!(
+            self.checks
+                .iter()
+                .all(|id| !self.disabled_checks.contains(id)),
+            "plan check cannot be enabled and disabled"
+        );
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
         for action in &self.verification {
-            ensure!(!action.trim().is_empty(), "manual verification actions cannot be empty");
+            ensure!(
+                !action.trim().is_empty(),
+                "manual verification actions cannot be empty"
+            );
         }
         for requirement in &self.requirements {
             ensure!(
@@ -220,16 +284,23 @@ mod tests {
 
     #[test]
     fn complete_check_selection_preserves_every_configured_choice() {
-        let definitions = (0..129).map(|index| serde_json::json!({
-            "id": format!("check_{index}"), "name": format!("Check {index}"),
-            "category": "test", "enabled": true, "area": "Project",
-            "trigger": {"kind": "manual"}, "all": {"command": "test"},
-        })).collect::<Vec<_>>();
-        let config: crate::checks::CheckConfig = serde_json::from_value(
-            serde_json::json!({"version": 2, "definitions": definitions}),
-        ).unwrap();
-        let changes = config.definitions.iter()
-            .map(|check| (check.id.clone(), true)).collect();
+        let definitions = (0..129)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("check_{index}"), "name": format!("Check {index}"),
+                    "category": "test", "enabled": true, "area": "Project",
+                    "trigger": {"kind": "manual"}, "all": {"command": "test"},
+                })
+            })
+            .collect::<Vec<_>>();
+        let config: crate::checks::CheckConfig =
+            serde_json::from_value(serde_json::json!({"version": 2, "definitions": definitions}))
+                .unwrap();
+        let changes = config
+            .definitions
+            .iter()
+            .map(|check| (check.id.clone(), true))
+            .collect();
         let mut document = DesignDocument::default();
         document.set_checks(&config, &changes).unwrap();
         assert_eq!(document.checks, changes.keys().cloned().collect::<Vec<_>>());

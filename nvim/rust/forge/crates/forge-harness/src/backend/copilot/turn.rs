@@ -107,12 +107,17 @@ impl CopilotTurnEvent {
     /// Fence new sends immediately and identify a submitted send that still needs collection.
     pub(super) fn request_stop(&self) -> Result<StopRequest> {
         let submitted = {
-            let mut state = self.state.lock()
+            let mut state = self
+                .state
+                .lock()
                 .map_err(|_| anyhow::anyhow!("Copilot turn lock poisoned"))?;
             state.cancelled = true;
             state.submitted
         };
-        Ok(StopRequest { submitted, sending: self.dispatch.try_lock().is_err() })
+        Ok(StopRequest {
+            submitted,
+            sending: self.dispatch.try_lock().is_err(),
+        })
     }
 
     pub(super) async fn wait_finished(&self) {

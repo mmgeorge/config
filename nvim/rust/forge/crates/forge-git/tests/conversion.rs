@@ -4,8 +4,7 @@ use forge_diff::source::Representation;
 use forge_git::{
     RepositoryPath,
     content::{
-        ContentRequest, ContentResult, ContentSource, ContentUnavailable,
-        WorktreeConversion,
+        ContentRequest, ContentResult, ContentSource, ContentUnavailable, WorktreeConversion,
     },
     store::RepositoryStore,
 };
@@ -152,8 +151,14 @@ async fn encoding_preserves_complete_content_and_rejects_invalid_byte_order_mark
     fs::write(root.join("file"), input).unwrap();
     let store = RepositoryStore::default();
     let repository = store.open(root.to_path_buf()).await.unwrap().unwrap();
-    let result = repository.content(&store, canonical_request()).await.unwrap().value;
-    let ContentResult::Ready(content) = result else { panic!("{result:?}") };
+    let result = repository
+        .content(&store, canonical_request())
+        .await
+        .unwrap()
+        .value;
+    let ContentResult::Ready(content) = result else {
+        panic!("{result:?}")
+    };
     assert_eq!(content.source.bytes(), b"one\n".repeat(900_000));
     fs::write(root.join("file"), b"\xff\xfeo\0").unwrap();
     let result = repository

@@ -189,17 +189,27 @@ pub enum PresentationRequest {
 }
 
 impl SessionPresentation {
-    pub(crate) fn append_tool_output(&mut self, exchange: &Exchange,
-        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
-        let patch = self.timeline.append_tool_output(exchange,event)?;
-        if let Some(patch) = &patch { self.project_patch(patch); }
+    pub(crate) fn append_tool_output(
+        &mut self,
+        exchange: &Exchange,
+        event: &crate::backend::BackendEvent,
+    ) -> Result<Option<TimelinePatch>> {
+        let patch = self.timeline.append_tool_output(exchange, event)?;
+        if let Some(patch) = &patch {
+            self.project_patch(patch);
+        }
         Ok(patch)
     }
 
-    pub(crate) fn update_message(&mut self, exchange: &Exchange,
-        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
-        let patch = self.timeline.update_message(exchange,event)?;
-        if let Some(patch) = &patch { self.project_patch(patch); }
+    pub(crate) fn update_message(
+        &mut self,
+        exchange: &Exchange,
+        event: &crate::backend::BackendEvent,
+    ) -> Result<Option<TimelinePatch>> {
+        let patch = self.timeline.update_message(exchange, event)?;
+        if let Some(patch) = &patch {
+            self.project_patch(patch);
+        }
         Ok(patch)
     }
 
@@ -214,7 +224,12 @@ impl SessionPresentation {
                 use super::nodes::NodeAction;
                 self.document(&request.document)?;
                 let open = self.open.as_mut().expect("validated presentation");
-                if !open.sections.admit(&request.view, request.sequence, &request.node, request.generation)? {
+                if !open.sections.admit(
+                    &request.view,
+                    request.sequence,
+                    &request.node,
+                    request.generation,
+                )? {
                     return Ok(json!({}));
                 }
                 let (expanded, more) = match request.action {
@@ -222,20 +237,37 @@ impl SessionPresentation {
                     NodeAction::LoadMore => (true, true),
                     NodeAction::RetryLoading => (true, false),
                 };
-                ensure!((1..=8192).contains(&request.rows), "node row budget exceeds layout limits");
+                ensure!(
+                    (1..=8192).contains(&request.rows),
+                    "node row budget exceeds layout limits"
+                );
                 request.width.validate()?;
                 if let Some(call) = request.node.strip_suffix(":tool")
                     && open.sections.nodes.tool.contains_key(call)
-                    && (more || open.sections.expansion(&request.node) != Some(expanded)) {
+                    && (more || open.sections.expansion(&request.node) != Some(expanded))
+                {
                     let limit = if more {
-                        open.sections.nodes.tool_limit.get(&request.node).copied()
+                        open.sections
+                            .nodes
+                            .tool_limit
+                            .get(&request.node)
+                            .copied()
                             .unwrap_or(super::tool::INITIAL_INLINE_BYTES)
                             .saturating_add(super::tool::INITIAL_INLINE_BYTES)
-                    } else { super::tool::INITIAL_INLINE_BYTES };
+                    } else {
+                        super::tool::INITIAL_INLINE_BYTES
+                    };
                     toggle_inline_output(open, call, expanded, limit)?;
                 }
-                open.sections.set(&mut open.transcript, request.view, request.sequence,
-                    &request.node, expanded, more, Some((request.rows, request.width)))?;
+                open.sections.set(
+                    &mut open.transcript,
+                    request.view,
+                    request.sequence,
+                    &request.node,
+                    expanded,
+                    more,
+                    Some((request.rows, request.width)),
+                )?;
                 retain_patches(open, Vec::new())?;
                 Ok(json!({}))
             }
@@ -305,11 +337,15 @@ impl SessionPresentation {
                     .as_mut()
                     .context("session presentation is not open")?;
                 ensure!(
-                    !open.output.contains_key(&document)
-                        && document != open.transcript_id,
+                    !open.output.contains_key(&document) && document != open.transcript_id,
                     "tool document identity is already used"
                 );
-                let tool = open.sections.nodes.tool.get(&call_id).context("saved tool output is unavailable")?;
+                let tool = open
+                    .sections
+                    .nodes
+                    .tool
+                    .get(&call_id)
+                    .context("saved tool output is unavailable")?;
                 let source = tool.snapshot()?;
                 let output = OutputDocument::new(document.clone(), source)?;
                 let snapshot = output.snapshot();
@@ -346,7 +382,11 @@ impl SessionPresentation {
             PresentationRequest::Sync { document, revision } => {
                 Ok(to_value(self.sync(&document, revision)?)?)
             }
-            PresentationRequest::Staging { document, queue, steering } => {
+            PresentationRequest::Staging {
+                document,
+                queue,
+                steering,
+            } => {
                 self.set_staging(&document, queue, steering)?;
                 Ok(json!({"updated":true}))
             }
@@ -402,7 +442,7 @@ impl SessionPresentation {
     }
 
     pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
-        let patch=self.timeline.update_checks(run)?;
+        let patch = self.timeline.update_checks(run)?;
         self.project_patch(&patch);
         Ok(patch)
     }
@@ -420,7 +460,10 @@ impl SessionPresentation {
         enabled: bool,
     ) -> Result<TimelinePatch> {
         for entry in &mut entry {
-            if let TimelineEntry::Status { status_thoughts, .. } = entry {
+            if let TimelineEntry::Status {
+                status_thoughts, ..
+            } = entry
+            {
                 *status_thoughts = enabled;
             }
         }
@@ -440,7 +483,9 @@ impl SessionPresentation {
         status: SessionPhase,
         status_thoughts: bool,
     ) -> Result<TimelinePatch> {
-        let patch = self.timeline.update_live(interaction, removed, status, status_thoughts)?;
+        let patch = self
+            .timeline
+            .update_live(interaction, removed, status, status_thoughts)?;
         self.project_patch(&patch);
         Ok(patch)
     }
@@ -461,7 +506,7 @@ impl SessionPresentation {
                 reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
             }
             open.sections.register(view.clone());
-                open.input.entry(view).or_insert(InputSequence(0));
+            open.input.entry(view).or_insert(InputSequence(0));
             return Ok(PresentationOpen {
                 syntax_pending: syntax_pending(open),
                 transcript: open.sections.document.snapshot()?,
@@ -470,8 +515,16 @@ impl SessionPresentation {
         let mut projected = Vec::new();
         let latest = latest_exchange(self.timeline.entry_list());
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
-            let mut entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashMap::new(), &HashMap::new())?;
-            if Some(entry.entry.id.as_str()) != latest { settle_responses(&mut entry); }
+            let mut entry = project(
+                ProjectionSource::Entry(entry),
+                &width,
+                index > 0,
+                &HashMap::new(),
+                &HashMap::new(),
+            )?;
+            if Some(entry.entry.id.as_str()) != latest {
+                settle_responses(&mut entry);
+            }
             projected.push(entry);
         }
         let mut entry = HashMap::new();
@@ -480,7 +533,9 @@ impl SessionPresentation {
         let mut tool = HashMap::new();
         let mut block = Vec::new();
         for mut projected in projected {
-            for tool in projected.tool.values_mut() { tool.own(&projected.entry.id); }
+            for tool in projected.tool.values_mut() {
+                tool.own(&projected.entry.id);
+            }
             entry.insert(projected.entry.id.clone(), entry_presentation(&projected));
             block.push(projected.entry);
             action.extend(projected.action);
@@ -494,7 +549,8 @@ impl SessionPresentation {
             block,
         )?;
         transcript.views.open(view.clone(), width.clone())?;
-        let mut sections = super::sections::SectionProjection::new(&mut transcript, document.clone())?;
+        let mut sections =
+            super::sections::SectionProjection::new(&mut transcript, document.clone())?;
         sections.register(view.clone());
         sections.nodes.tool = tool;
         let opened = PresentationOpen {
@@ -534,7 +590,8 @@ impl SessionPresentation {
         revision: DocumentRevision,
     ) -> Result<PresentationSync> {
         if self.activity_updated.elapsed() >= std::time::Duration::from_secs(1)
-            && self.timeline.ticking_entries().next().is_some() {
+            && self.timeline.ticking_entries().next().is_some()
+        {
             let open = self
                 .open
                 .as_mut()
@@ -584,8 +641,14 @@ impl SessionPresentation {
         queue: Vec<String>,
         steering: Vec<String>,
     ) -> Result<()> {
-        let open = self.open.as_mut().context("session presentation is not open")?;
-        ensure!(open.transcript_id == *document, "transcript document identity changed");
+        let open = self
+            .open
+            .as_mut()
+            .context("session presentation is not open")?;
+        ensure!(
+            open.transcript_id == *document,
+            "transcript document identity changed"
+        );
         let staging = StagingContent { queue, steering };
         if open.staging.as_ref() == Some(&staging) {
             return Ok(());
@@ -737,14 +800,19 @@ impl SessionPresentation {
             "stale transcript input sequence"
         );
         let block = open
-            .sections.document
+            .sections
+            .document
             .document
             .block(&input.block)
             .context("transcript input block disappeared")?;
         let stable_tool = input.action == "activate"
             && input.target.as_ref().is_some_and(|target| {
                 matches!(open.action.get(target), Some(TranscriptAction::Tool { .. }))
-                    && block.metadata.target.iter().any(|candidate| &candidate.id == target)
+                    && block
+                        .metadata
+                        .target
+                        .iter()
+                        .any(|candidate| &candidate.id == target)
             });
         if input.revision == open.sections.document.document.revision() {
             let row = block
@@ -816,10 +884,7 @@ impl SessionPresentation {
         text: &str,
     ) -> Result<()> {
         self.document(document)?;
-        ensure!(
-            !text.trim().is_empty(),
-            "prompt requires nonempty text"
-        );
+        ensure!(!text.trim().is_empty(), "prompt requires nonempty text");
         let open = self.open.as_mut().expect("validated presentation");
         ensure!(
             open.pending_submission.is_none(),
@@ -940,28 +1005,67 @@ impl SessionPresentation {
         if open.failure.is_some() {
             return;
         }
-        let latest = if open.agent_scope.is_some() { open.latest_exchange.clone() } else { latest.map(str::to_owned) };
+        let latest = if open.agent_scope.is_some() {
+            open.latest_exchange.clone()
+        } else {
+            latest.map(str::to_owned)
+        };
         let applied = if open.agent_scope.is_some() {
-            if patch.operation.iter().all(|operation|matches!(operation,
-                TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. })
-                || matches!(operation,TimelineOperation::Replace { entry:TimelineEntry::Status { .. },.. })) {
-                let filtered: Vec<_> = patch.operation.iter().filter(|operation|match operation {
-                    TimelineOperation::ToolOutput { call_id,.. } => open.sections.nodes.tool.contains_key(call_id),
-                    TimelineOperation::Message { block_id,message,.. } => message.kind() != crate::turn::MessageKind::Assistant
-                        || open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_some(),
-                    _ => false,
-                }).collect();
-                apply_projection(open,patch,filtered.iter().copied(),latest.as_deref())
-            } else { reflow(open, self.timeline.entry_list(), self.timeline.revision()) }
-        } else if patch.operation.iter().any(|operation|match operation {
-            TimelineOperation::ToolOutput { call_id,.. } => !open.sections.nodes.tool.contains_key(call_id),
-            TimelineOperation::Message { block_id,message,.. } => message.kind() == crate::turn::MessageKind::Assistant
-                && open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_none(),
+            if patch.operation.iter().all(|operation| {
+                matches!(
+                    operation,
+                    TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. }
+                ) || matches!(
+                    operation,
+                    TimelineOperation::Replace {
+                        entry: TimelineEntry::Status { .. },
+                        ..
+                    }
+                )
+            }) {
+                let filtered: Vec<_> = patch
+                    .operation
+                    .iter()
+                    .filter(|operation| match operation {
+                        TimelineOperation::ToolOutput { call_id, .. } => {
+                            open.sections.nodes.tool.contains_key(call_id)
+                        }
+                        TimelineOperation::Message {
+                            block_id, message, ..
+                        } => {
+                            message.kind() != crate::turn::MessageKind::Assistant
+                                || open
+                                    .transcript
+                                    .document
+                                    .block(&forge_buffer::identity::BlockId(block_id.clone()))
+                                    .is_some()
+                        }
+                        _ => false,
+                    })
+                    .collect();
+                apply_projection(open, patch, filtered.iter().copied(), latest.as_deref())
+            } else {
+                reflow(open, self.timeline.entry_list(), self.timeline.revision())
+            }
+        } else if patch.operation.iter().any(|operation| match operation {
+            TimelineOperation::ToolOutput { call_id, .. } => {
+                !open.sections.nodes.tool.contains_key(call_id)
+            }
+            TimelineOperation::Message {
+                block_id, message, ..
+            } => {
+                message.kind() == crate::turn::MessageKind::Assistant
+                    && open
+                        .transcript
+                        .document
+                        .block(&forge_buffer::identity::BlockId(block_id.clone()))
+                        .is_none()
+            }
             _ => false,
         }) {
-            reflow(open,self.timeline.entry_list(),self.timeline.revision())
+            reflow(open, self.timeline.entry_list(), self.timeline.revision())
         } else {
-            apply_projection(open, patch, patch.operation.iter(),latest.as_deref())
+            apply_projection(open, patch, patch.operation.iter(), latest.as_deref())
         };
         if let Err(error) = applied {
             open.failure = Some(format!("{error:#}"));
@@ -984,9 +1088,18 @@ fn syntax_pending(open: &OpenPresentation) -> bool {
 fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
     EntryPresentation {
         prompt: projected.prompt.clone(),
-        response: projected.entry.block.iter().filter(|block| block.metadata.node.as_ref().is_some_and(|node|
-            node.kind == forge_buffer::node::NodeKind::Message && node.lifecycle == forge_buffer::node::NodeLifecycle::Live))
-            .map(|block| block.id.clone()).collect(),
+        response: projected
+            .entry
+            .block
+            .iter()
+            .filter(|block| {
+                block.metadata.node.as_ref().is_some_and(|node| {
+                    node.kind == forge_buffer::node::NodeKind::Message
+                        && node.lifecycle == forge_buffer::node::NodeLifecycle::Live
+                })
+            })
+            .map(|block| block.id.clone())
+            .collect(),
         target: projected.action.keys().cloned().collect(),
         syntax: projected.syntax.keys().cloned().collect(),
         tool: projected.tool.keys().cloned().collect(),
@@ -1001,7 +1114,9 @@ fn latest_exchange(source: &[TimelineEntry]) -> Option<&str> {
 }
 
 fn settle_responses(projected: &mut ProjectedEntry) {
-    for block in &mut projected.entry.block { super::message::settle(block); }
+    for block in &mut projected.entry.block {
+        super::message::settle(block);
+    }
 }
 
 fn find_agent<'source>(
@@ -1037,94 +1152,227 @@ fn find_agent<'source>(
     None
 }
 
-fn refresh_activity<'source>(open: &mut OpenPresentation,
-    source: impl IntoIterator<Item=&'source TimelineEntry>) -> Result<()> {
-    let width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
+fn refresh_activity<'source>(
+    open: &mut OpenPresentation,
+    source: impl IntoIterator<Item = &'source TimelineEntry>,
+) -> Result<()> {
+    let width = open
+        .transcript
+        .views
+        .profile()
+        .unwrap_or(&open.last_width)
+        .clone();
     let mut blocks = Vec::new();
     for entry in source {
-        for block in super::projection::timing_blocks(entry,&width,
-            &open.transcript.document,&open.sections.nodes.choice,&open.sections.nodes.tool)? {
+        for block in super::projection::timing_blocks(
+            entry,
+            &width,
+            &open.transcript.document,
+            &open.sections.nodes.choice,
+            &open.sections.nodes.tool,
+        )? {
             blocks.push(block);
         }
     }
     let mut patches = Vec::new();
     for block in blocks {
-        if let Some(patch) = open.transcript.append(block)? { patches.push(patch); }
+        if let Some(patch) = open.transcript.append(block)? {
+            patches.push(patch);
+        }
     }
-    retain_patches(open,patches)
+    retain_patches(open, patches)
 }
 
-fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool, limit: usize) -> Result<()> {
+fn toggle_inline_output(
+    open: &mut OpenPresentation,
+    call_id: &str,
+    expanded: bool,
+    limit: usize,
+) -> Result<()> {
     use forge_buffer::identity::BlockId;
-    let source = open.sections.nodes.tool.get_mut(call_id).context("inline tool source is missing")?;
-    if expanded { source.load_prefix(limit)?; }
+    let source = open
+        .sections
+        .nodes
+        .tool
+        .get_mut(call_id)
+        .context("inline tool source is missing")?;
+    if expanded {
+        source.load_prefix(limit)?;
+    }
     let owner = source.owner().to_owned();
-    let call = source.header().context("inline tool heading source is missing")?;
+    let call = source
+        .header()
+        .context("inline tool heading source is missing")?;
     let heading_id = BlockId(format!("{call_id}:tool"));
-    let previous_heading = open.transcript.document.block(&heading_id).context("inline heading is missing")?;
-    let was_expanded = previous_heading.metadata.node.as_ref()
+    let previous_heading = open
+        .transcript
+        .document
+        .block(&heading_id)
+        .context("inline heading is missing")?;
+    let was_expanded = previous_heading
+        .metadata
+        .node
+        .as_ref()
         .is_some_and(|node| node.expansion == Some(true));
     let layout = previous_heading.metadata.layout.clone();
-    let mut width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
-    width.columns = width.columns.saturating_sub(layout.as_ref().map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+    let mut width = open
+        .transcript
+        .views
+        .profile()
+        .unwrap_or(&open.last_width)
+        .clone();
+    width.columns = width
+        .columns
+        .saturating_sub(
+            layout
+                .as_ref()
+                .map_or(0, |layout| layout.indent.saturating_sub(2)),
+        )
+        .max(1);
     let renderer = super::transcript::TranscriptRenderer::new(&width)?;
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
-    let mut heading = renderer.tool_header(heading_id,previous_heading.metadata.target[0].id.clone(),
-        &call.kind,call.elapsed_ms(now),call.failed,&call.title,expanded)?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let mut heading = renderer.tool_header(
+        heading_id,
+        previous_heading.metadata.target[0].id.clone(),
+        &call.kind,
+        call.elapsed_ms(now),
+        call.failed,
+        &call.title,
+        expanded,
+    )?;
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
     heading.metadata.node = previous_heading.metadata.node.clone();
-    let chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+    let chunks = if expanded {
+        source.inline_prefix_chunks(limit)?
+    } else {
+        1
+    };
     if let Some(node) = &mut heading.metadata.node {
         node.more = expanded && (chunks < source.inline_chunks()? || source.has_unloaded_output());
         node.resolve(Some(expanded));
     }
-    let identity = |chunk| BlockId(if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") });
+    let identity = |chunk| {
+        BlockId(if chunk == 0 {
+            format!("{call_id}:preview")
+        } else {
+            format!("{call_id}:output:{chunk}")
+        })
+    };
     let hidden_id = BlockId(format!("{call_id}:hidden"));
-    let removed_chunks = open.transcript.document.block_index(&hidden_id).context("inline hidden anchor is missing")?
-        - open.transcript.document.block_index(&identity(0)).context("inline body anchor is missing")?;
+    let removed_chunks = open
+        .transcript
+        .document
+        .block_index(&hidden_id)
+        .context("inline hidden anchor is missing")?
+        - open
+            .transcript
+            .document
+            .block_index(&identity(0))
+            .context("inline body anchor is missing")?;
     let first_chunk = if expanded && was_expanded {
         removed_chunks.min(chunks)
-    } else { 0 };
+    } else {
+        0
+    };
     let mut retired_target = HashSet::new();
     for chunk in first_chunk..removed_chunks {
-        let block = open.transcript.document.block(&identity(chunk)).context("inline body is missing")?;
-        retired_target.extend(block.metadata.target.iter().map(|target|target.id.clone()));
+        let block = open
+            .transcript
+            .document
+            .block(&identity(chunk))
+            .context("inline body is missing")?;
+        retired_target.extend(block.metadata.target.iter().map(|target| target.id.clone()));
     }
-    let previous_hidden = open.transcript.document.block(&hidden_id).context("inline hidden counter is missing")?;
-    retired_target.extend(previous_hidden.metadata.target.iter().map(|target|target.id.clone()));
+    let previous_hidden = open
+        .transcript
+        .document
+        .block(&hidden_id)
+        .context("inline hidden counter is missing")?;
+    retired_target.extend(
+        previous_hidden
+            .metadata
+            .target
+            .iter()
+            .map(|target| target.id.clone()),
+    );
     let mut body = Vec::new();
     for chunk in first_chunk..chunks {
         let mut block = if !expanded && call.kind == "check" {
-            forge_buffer::block::BufferBlock { id:identity(chunk),text:Default::default(),metadata:Default::default() }
-        } else { renderer.tool_body(call_id,source,expanded,chunk)? };
+            forge_buffer::block::BufferBlock {
+                id: identity(chunk),
+                text: Default::default(),
+                metadata: Default::default(),
+            }
+        } else {
+            renderer.tool_body(call_id, source, expanded, chunk)?
+        };
         block.metadata.layout = layout.clone();
         body.push(block);
     }
     let mut hidden = if !expanded && call.kind == "check" {
-        forge_buffer::block::BufferBlock { id:BlockId(format!("{call_id}:hidden")),text:Default::default(),metadata:Default::default() }
-    } else { renderer.tool_hidden(call_id,source,expanded)? };
+        forge_buffer::block::BufferBlock {
+            id: BlockId(format!("{call_id}:hidden")),
+            text: Default::default(),
+            metadata: Default::default(),
+        }
+    } else {
+        renderer.tool_hidden(call_id, source, expanded)?
+    };
     hidden.metadata.layout = layout;
-    let target = body.iter().chain(std::iter::once(&hidden)).flat_map(|block|block.metadata.target.iter().map(|target|target.id.clone())).collect::<Vec<_>>();
-    let mut changes = vec![TranscriptChange::Block { block:heading }];
+    let target = body
+        .iter()
+        .chain(std::iter::once(&hidden))
+        .flat_map(|block| block.metadata.target.iter().map(|target| target.id.clone()))
+        .collect::<Vec<_>>();
+    let mut changes = vec![TranscriptChange::Block { block: heading }];
     if !body.is_empty() || first_chunk < removed_chunks {
-        changes.push(TranscriptChange::ToolBody { owner:owner.clone(),
-            anchor:if first_chunk < removed_chunks { identity(first_chunk) } else { hidden_id },
-            removed:removed_chunks - first_chunk,block:body });
+        changes.push(TranscriptChange::ToolBody {
+            owner: owner.clone(),
+            anchor: if first_chunk < removed_chunks {
+                identity(first_chunk)
+            } else {
+                hidden_id
+            },
+            removed: removed_chunks - first_chunk,
+            block: body,
+        });
     }
-    changes.push(TranscriptChange::Block { block:hidden });
+    changes.push(TranscriptChange::Block { block: hidden });
     let patches = match open.transcript.tool_layout(changes) {
         Ok(patches) => patches,
-        Err(failure) => { open.failure = Some(format!("{failure:#}")); return Err(failure); }
+        Err(failure) => {
+            open.failure = Some(format!("{failure:#}"));
+            return Err(failure);
+        }
     };
-    for target in &retired_target { open.action.remove(target); }
-    for target in &target { open.action.insert(target.clone(),TranscriptAction::Tool { call_id:call_id.to_owned() }); }
-    let entry = open.entry.get_mut(&owner).context("inline entry owner is missing")?;
-    entry.target.retain(|target|!retired_target.contains(target));
+    for target in &retired_target {
+        open.action.remove(target);
+    }
+    for target in &target {
+        open.action.insert(
+            target.clone(),
+            TranscriptAction::Tool {
+                call_id: call_id.to_owned(),
+            },
+        );
+    }
+    let entry = open
+        .entry
+        .get_mut(&owner)
+        .context("inline entry owner is missing")?;
+    entry
+        .target
+        .retain(|target| !retired_target.contains(target));
     entry.target.extend(target);
     let node = format!("{call_id}:tool");
-    if expanded { open.sections.nodes.tool_limit.insert(node, limit); }
-    else { open.sections.nodes.tool_limit.remove(&node); }
+    if expanded {
+        open.sections.nodes.tool_limit.insert(node, limit);
+    } else {
+        open.sections.nodes.tool_limit.remove(&node);
+    }
     let _ = patches;
     Ok(())
 }
@@ -1135,17 +1383,18 @@ fn reflow(
     timeline_revision: u64,
 ) -> Result<()> {
     let source = match open.agent_scope.as_deref() {
-        None => source.iter().map(ProjectionSource::Entry).collect::<Vec<_>>(),
-        Some(run_id) => {
-            find_agent(source, run_id, 0)
-                .into_iter()
-                .flat_map(|entry| match entry {
-                    TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
-                    _ => unreachable!("agent lookup returns an agent lifecycle"),
-                })
-                .map(ProjectionSource::Exchange)
-                .collect::<Vec<_>>()
-        }
+        None => source
+            .iter()
+            .map(ProjectionSource::Entry)
+            .collect::<Vec<_>>(),
+        Some(run_id) => find_agent(source, run_id, 0)
+            .into_iter()
+            .flat_map(|entry| match entry {
+                TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
+                _ => unreachable!("agent lookup returns an agent lifecycle"),
+            })
+            .map(ProjectionSource::Exchange)
+            .collect::<Vec<_>>(),
     };
     let width = open
         .transcript
@@ -1160,8 +1409,16 @@ fn reflow(
         _ => None,
     });
     for (index, entry) in source.into_iter().enumerate() {
-        let mut entry = project(entry, &width, index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
-        if Some(entry.entry.id.as_str()) != latest.as_deref() { settle_responses(&mut entry); }
+        let mut entry = project(
+            entry,
+            &width,
+            index > 0,
+            &open.sections.nodes.choice,
+            &open.sections.nodes.tool_limit,
+        )?;
+        if Some(entry.entry.id.as_str()) != latest.as_deref() {
+            settle_responses(&mut entry);
+        }
         projected.push(entry);
     }
     let mut entry = HashMap::new();
@@ -1170,7 +1427,9 @@ fn reflow(
     let mut tool = HashMap::new();
     let mut blocks = Vec::new();
     for mut projection in projected {
-        for tool in projection.tool.values_mut() { tool.own(&projection.entry.id); }
+        for tool in projection.tool.values_mut() {
+            tool.own(&projection.entry.id);
+        }
         entry.insert(projection.entry.id.clone(), entry_presentation(&projection));
         action.extend(projection.action);
         syntax.extend(projection.syntax);
@@ -1195,13 +1454,21 @@ fn reflow(
     retain_patches(open, patch)
 }
 
-fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePatch,
-    operations: impl Iterator<Item = &'operation TimelineOperation> + Clone, latest: Option<&str>) -> Result<()> {
+fn apply_projection<'operation>(
+    open: &mut OpenPresentation,
+    patch: &TimelinePatch,
+    operations: impl Iterator<Item = &'operation TimelineOperation> + Clone,
+    latest: Option<&str>,
+) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
     let mut changed = Vec::new();
     if open.latest_exchange.as_deref() != latest {
-        if let Some(entry) = open.latest_exchange.as_ref().and_then(|id| open.entry.get_mut(id)) {
+        if let Some(entry) = open
+            .latest_exchange
+            .as_ref()
+            .and_then(|id| open.entry.get_mut(id))
+        {
             for response in entry.response.drain(..) {
                 if let Some(previous) = open.transcript.document.block(&response) {
                     let mut block = previous.clone();
@@ -1214,106 +1481,229 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
     }
     for operation in operations.clone() {
         match operation {
-            TimelineOperation::Message { entry_id, exchange_id, block_id, message, .. } => {
-                if message.kind() != crate::turn::MessageKind::Assistant { continue; }
+            TimelineOperation::Message {
+                entry_id,
+                exchange_id,
+                block_id,
+                message,
+                ..
+            } => {
+                if message.kind() != crate::turn::MessageKind::Assistant {
+                    continue;
+                }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
-                let previous = open.transcript.document.block(&block_id).context("streamed message block is missing")?;
-                let mut replacement = super::projection::message_block(previous,message,width)?;
-                if Some(entry_id.as_str()) != latest { settle_responses(&mut replacement); }
-                let previous_targets = previous.metadata.target.iter().map(|target|target.id.clone()).collect::<Vec<_>>();
+                let previous = open
+                    .transcript
+                    .document
+                    .block(&block_id)
+                    .context("streamed message block is missing")?;
+                let mut replacement = super::projection::message_block(previous, message, width)?;
+                if Some(entry_id.as_str()) != latest {
+                    settle_responses(&mut replacement);
+                }
+                let previous_targets = previous
+                    .metadata
+                    .target
+                    .iter()
+                    .map(|target| target.id.clone())
+                    .collect::<Vec<_>>();
                 for target in &previous_targets {
                     open.action.remove(target);
                     open.syntax_done.remove(target);
                 }
-                let syntax_target = TargetId(format!("{}:markdown-syntax",block_id.0));
+                let syntax_target = TargetId(format!("{}:markdown-syntax", block_id.0));
                 open.syntax.remove(&syntax_target);
                 open.syntax_done.remove(&syntax_target);
-                let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
+                let owner = if open.agent_scope.is_some() {
+                    exchange_id
+                } else {
+                    entry_id
+                };
                 if let Some(entry) = open.entry.get_mut(owner) {
-                    entry.target.retain(|target|!previous_targets.contains(target));
+                    entry
+                        .target
+                        .retain(|target| !previous_targets.contains(target));
                     entry.target.extend(replacement.action.keys().cloned());
-                    entry.syntax.retain(|target|target != &syntax_target);
+                    entry.syntax.retain(|target| target != &syntax_target);
                     entry.syntax.extend(replacement.syntax.keys().cloned());
                     entry.response.retain(|response| response != &block_id);
-                    entry.response.extend(entry_presentation(&replacement).response);
+                    entry
+                        .response
+                        .extend(entry_presentation(&replacement).response);
                 }
                 open.action.extend(replacement.action);
                 open.syntax.extend(replacement.syntax);
-                changed.push(TranscriptChange::Block { block:replacement.entry.block.into_iter().next().expect("message block") });
+                changed.push(TranscriptChange::Block {
+                    block: replacement
+                        .entry
+                        .block
+                        .into_iter()
+                        .next()
+                        .expect("message block"),
+                });
             }
-            TimelineOperation::ToolOutput { entry_id, exchange_id, call_id, delta, .. } => {
+            TimelineOperation::ToolOutput {
+                entry_id,
+                exchange_id,
+                call_id,
+                delta,
+                ..
+            } => {
                 let node_id = format!("{call_id}:tool");
                 let expanded = open.sections.expansion(&node_id) == Some(true);
-                let limit = open.sections.nodes.tool_limit.get(&node_id).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
-                let source = open.sections.nodes.tool.get_mut(call_id).context("streamed tool cache is missing")?;
-                let old_chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+                let limit = open
+                    .sections
+                    .nodes
+                    .tool_limit
+                    .get(&node_id)
+                    .copied()
+                    .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+                let source = open
+                    .sections
+                    .nodes
+                    .tool
+                    .get_mut(call_id)
+                    .context("streamed tool cache is missing")?;
+                let old_chunks = if expanded {
+                    source.inline_prefix_chunks(limit)?
+                } else {
+                    1
+                };
                 let first_chunk = if expanded { source.inline_tail()? } else { 0 };
                 source.append(delta)?;
-                if source.group.is_empty() { continue; }
+                if source.group.is_empty() {
+                    continue;
+                }
                 let block_id = forge_buffer::identity::BlockId(format!("{call_id}:tool"));
-                let previous = open.transcript.document.block(&block_id).context("streamed tool block is missing")?;
+                let previous = open
+                    .transcript
+                    .document
+                    .block(&block_id)
+                    .context("streamed tool block is missing")?;
                 let layout = previous.metadata.layout.clone();
                 let mut content_width = width.clone();
-                content_width.columns = content_width.columns.saturating_sub(
-                    previous.metadata.layout.as_ref().map_or(0, |layout| layout.indent.saturating_sub(2))
-                ).max(1);
+                content_width.columns = content_width
+                    .columns
+                    .saturating_sub(
+                        previous
+                            .metadata
+                            .layout
+                            .as_ref()
+                            .map_or(0, |layout| layout.indent.saturating_sub(2)),
+                    )
+                    .max(1);
                 let renderer = super::transcript::TranscriptRenderer::new(&content_width)?;
-                let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
-                let chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+                let owner = if open.agent_scope.is_some() {
+                    exchange_id
+                } else {
+                    entry_id
+                };
+                let chunks = if expanded {
+                    source.inline_prefix_chunks(limit)?
+                } else {
+                    1
+                };
                 if expanded && let Some(node) = &previous.metadata.node {
                     let more = chunks < source.inline_chunks()?;
                     if node.more != more {
                         let mut heading = previous.clone();
                         heading.metadata.node.as_mut().expect("tool node").more = more;
-                        changed.push(TranscriptChange::Block { block:heading });
+                        changed.push(TranscriptChange::Block { block: heading });
                     }
                 }
-                let identity = |chunk| forge_buffer::identity::BlockId(if chunk == 0 { format!("{call_id}:preview") }
-                    else { format!("{call_id}:output:{chunk}") });
+                let identity = |chunk| {
+                    forge_buffer::identity::BlockId(if chunk == 0 {
+                        format!("{call_id}:preview")
+                    } else {
+                        format!("{call_id}:output:{chunk}")
+                    })
+                };
                 let mut block = Vec::new();
                 for chunk in first_chunk..chunks {
-                    let mut replacement = renderer.tool_body(call_id,source,expanded,chunk)?;
+                    let mut replacement = renderer.tool_body(call_id, source, expanded, chunk)?;
                     replacement.metadata.layout = layout.clone();
-                    if let Some(layout) = &mut replacement.metadata.layout { layout.source_indent = 0; }
+                    if let Some(layout) = &mut replacement.metadata.layout {
+                        layout.source_indent = 0;
+                    }
                     super::layout::materialize(&mut replacement)?;
                     let previous = open.transcript.document.block(&replacement.id);
-                    let new_target = previous.is_none_or(|previous|previous.metadata.target.is_empty());
+                    let new_target =
+                        previous.is_none_or(|previous| previous.metadata.target.is_empty());
                     if let Some(previous) = previous {
-                        for target in &previous.metadata.target { open.action.remove(&target.id); }
+                        for target in &previous.metadata.target {
+                            open.action.remove(&target.id);
+                        }
                     }
                     for target in &replacement.metadata.target {
-                        open.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() });
+                        open.action.insert(
+                            target.id.clone(),
+                            TranscriptAction::Tool {
+                                call_id: call_id.clone(),
+                            },
+                        );
                         if let Some(entry) = open.entry.get_mut(owner) {
-                            if new_target { entry.target.push(target.id.clone()); }
+                            if new_target {
+                                entry.target.push(target.id.clone());
+                            }
                         }
                     }
                     block.push(replacement);
                 }
                 let hidden_id = forge_buffer::identity::BlockId(format!("{call_id}:hidden"));
-                let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
+                let mut hidden = renderer.tool_hidden(call_id, source, expanded)?;
                 hidden.metadata.layout = layout;
-                if let Some(layout) = &mut hidden.metadata.layout { layout.source_indent = 0; }
+                if let Some(layout) = &mut hidden.metadata.layout {
+                    layout.source_indent = 0;
+                }
                 super::layout::materialize(&mut hidden)?;
-                let previous_hidden = open.transcript.document.block(&hidden_id).context("tool hidden counter is missing")?;
+                let previous_hidden = open
+                    .transcript
+                    .document
+                    .block(&hidden_id)
+                    .context("tool hidden counter is missing")?;
                 let new_hidden_target = previous_hidden.metadata.target.is_empty();
-                for target in &previous_hidden.metadata.target { open.action.remove(&target.id); }
+                for target in &previous_hidden.metadata.target {
+                    open.action.remove(&target.id);
+                }
                 for target in &hidden.metadata.target {
-                    open.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() });
+                    open.action.insert(
+                        target.id.clone(),
+                        TranscriptAction::Tool {
+                            call_id: call_id.clone(),
+                        },
+                    );
                     if let Some(entry) = open.entry.get_mut(owner) {
-                        if new_hidden_target { entry.target.push(target.id.clone()); }
+                        if new_hidden_target {
+                            entry.target.push(target.id.clone());
+                        }
                     }
                 }
                 if first_chunk < chunks {
-                    changed.push(TranscriptChange::ToolBody { owner:owner.clone(),
-                        anchor:if first_chunk < old_chunks { identity(first_chunk) } else { hidden_id },
-                        removed:old_chunks.saturating_sub(first_chunk),block });
+                    changed.push(TranscriptChange::ToolBody {
+                        owner: owner.clone(),
+                        anchor: if first_chunk < old_chunks {
+                            identity(first_chunk)
+                        } else {
+                            hidden_id
+                        },
+                        removed: old_chunks.saturating_sub(first_chunk),
+                        block,
+                    });
                 }
-                changed.push(TranscriptChange::Block { block:hidden });
+                changed.push(TranscriptChange::Block { block: hidden });
             }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
-                let mut entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
-                if Some(entry.entry.id.as_str()) != latest { settle_responses(&mut entry); }
+                let mut entry = project(
+                    ProjectionSource::Entry(entry),
+                    width,
+                    *index > 0,
+                    &open.sections.nodes.choice,
+                    &open.sections.nodes.tool_limit,
+                )?;
+                if Some(entry.entry.id.as_str()) != latest {
+                    settle_responses(&mut entry);
+                }
                 let info = entry_presentation(&entry);
                 projected.push((
                     entry.entry.id.clone(),
@@ -1355,7 +1745,10 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
             TimelineOperation::Insert { entry, .. } | TimelineOperation::Replace { entry, .. } => {
                 entry.id()
             }
-            TimelineOperation::Remove { id, .. } => { open.sections.retire_entry(id); id.clone() },
+            TimelineOperation::Remove { id, .. } => {
+                open.sections.retire_entry(id);
+                id.clone()
+            }
         };
         if let Some(previous) = open.entry.remove(&id) {
             for target in previous.target {
@@ -1363,7 +1756,9 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 open.action.remove(&target);
             }
             for call in previous.tool {
-                if let Some(tool) = open.sections.nodes.tool.remove(&call) { retained_tool.insert(call, tool); }
+                if let Some(tool) = open.sections.nodes.tool.remove(&call) {
+                    retained_tool.insert(call, tool);
+                }
             }
             for target in previous.syntax {
                 open.syntax_done.remove(&target);
@@ -1405,32 +1800,50 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
             text: forge_buffer::text::BufferText::from_rows(rows)?,
             metadata: Default::default(),
         };
-        block.metadata.decoration.push(forge_buffer::block::Decoration {
-            range: forge_buffer::block::TextRange {
-                start: forge_buffer::block::TextPosition { row: 0, column: 0 },
-                end: forge_buffer::block::TextPosition { row: block.text.row_count(), column: 0 },
-            },
-            capture: "ForgeStatusHint".into(),
-            priority: 100,
-        });
+        block
+            .metadata
+            .decoration
+            .push(forge_buffer::block::Decoration {
+                range: forge_buffer::block::TextRange {
+                    start: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                    end: forge_buffer::block::TextPosition {
+                        row: block.text.row_count(),
+                        column: 0,
+                    },
+                },
+                capture: "ForgeStatusHint".into(),
+                priority: 100,
+            });
         let entry = TranscriptEntry {
             id: "harness:staging".into(),
             block: vec![block],
         };
         patch = if let Some(index) = existing {
-            open.sections.document.tool_layout(vec![TranscriptChange::Replace { index, entry }])?
-                .into_iter().last()
+            open.sections
+                .document
+                .tool_layout(vec![TranscriptChange::Replace { index, entry }])?
+                .into_iter()
+                .last()
         } else {
-            open.sections.document.tool_layout(vec![TranscriptChange::Insert {
-                index: entry_ids.len(),
-                entry,
-            }])?.into_iter().last()
+            open.sections
+                .document
+                .tool_layout(vec![TranscriptChange::Insert {
+                    index: entry_ids.len(),
+                    entry,
+                }])?
+                .into_iter()
+                .last()
         };
     } else if let Some(index) = existing {
-        patch = open.sections.document.tool_layout(vec![TranscriptChange::Remove {
-            index,
-            id: "harness:staging".into(),
-        }])?.into_iter().last();
+        patch = open
+            .sections
+            .document
+            .tool_layout(vec![TranscriptChange::Remove {
+                index,
+                id: "harness:staging".into(),
+            }])?
+            .into_iter()
+            .last();
     }
     if let Some(patch) = patch {
         retain_patch(open, patch)?;
@@ -1438,7 +1851,12 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     Ok(())
 }
 
-fn append_staging_section(rows: &mut Vec<String>, label: &str, values: &[String], width: &WidthProfile) -> Result<()> {
+fn append_staging_section(
+    rows: &mut Vec<String>,
+    label: &str,
+    values: &[String],
+    width: &WidthProfile,
+) -> Result<()> {
     if values.is_empty() {
         return Ok(());
     }
@@ -1447,7 +1865,10 @@ fn append_staging_section(rows: &mut Vec<String>, label: &str, values: &[String]
     }
     rows.extend(width.wrap_plain(label, 0)?);
     for value in values {
-        rows.extend(width.wrap_plain(&format!("• {value}"), 2.min(width.columns.saturating_sub(1)))?);
+        rows.extend(width.wrap_plain(
+            &format!("• {value}"),
+            2.min(width.columns.saturating_sub(1)),
+        )?);
     }
     Ok(())
 }
@@ -1491,56 +1912,157 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
     #[test]
-    fn long_messages_fold_on_submission_and_the_next_exchange_and_reopen_after_resize() -> anyhow::Result<()> {
+    fn long_messages_fold_on_submission_and_the_next_exchange_and_reopen_after_resize()
+    -> anyhow::Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
         use forge_buffer::node::{NodeDisplay, NodeLifecycle};
         let mut entry = interaction_entry("first");
-        let TimelineEntry::Exchange { exchange, .. } = &mut entry else { unreachable!() };
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
         exchange.prompt = "first\nsecond\nthird\nfourth\nfifth".into();
         exchange.state = crate::exchange::ExchangeState::Running;
         exchange.completed_at_ms = None;
-        let mut event = BackendEvent { received_at_ms: None,
-            address: Some(ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "reply".into() }),
-            turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(), text: None,
-            data: serde_json::Value::Null, activity: None, summary: None, task_update: None };
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "reply".into(),
+            }),
+            turn_boundary: Some(TurnBoundary::Started),
+            kind: "turn_started".into(),
+            text: None,
+            data: serde_json::Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
         exchange.observe_turn(&event, 2)?;
         event.turn_boundary = None;
         event.kind = "assistant_message".into();
-        event.text = Some("response one\nresponse two\nresponse three\nresponse four\nresponse five".into());
+        event.text =
+            Some("response one\nresponse two\nresponse three\nresponse four\nresponse five".into());
         event.data = serde_json::json!({"phase":"final_answer", "provider_message_id":"reply"});
         exchange.observe_turn(&event, 3)?;
         let mut owner = super::SessionPresentation::new("session".into());
         owner.initialize(vec![entry.clone()])?;
         let document = forge_buffer::identity::DocumentId("message-folds".into());
         let view = forge_buffer::identity::ViewId("view".into());
-        owner.open(document.clone(), view.clone(), forge_buffer::width::WidthProfile::default())?;
+        owner.open(
+            document.clone(),
+            view.clone(),
+            forge_buffer::width::WidthProfile::default(),
+        )?;
         let response = owner.open.as_ref().unwrap().entry["first"].response[0].clone();
         let snapshot = owner.snapshot(&document)?;
-        assert_eq!(snapshot.block.iter().find(|block| block.id.0 == "first:prompt").unwrap().text.row_count(), 3);
-        assert_eq!(snapshot.block.iter().find(|block| block.id == response).unwrap().text.row_count(), 5);
-        let expand = |owner: &mut super::SessionPresentation, id: &str, sequence| -> anyhow::Result<()> {
-            let generation = owner.open.as_ref().unwrap().sections.nodes.generation(id).unwrap();
-            owner.dispatch(super::PresentationRequest::Node { request: NodeRequest {
-                document: document.clone(), view: view.clone(), sequence, node: id.into(), generation,
-                action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: Default::default(),
-            } })?;
-            Ok(())
-        };
+        assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "first:prompt")
+                .unwrap()
+                .text
+                .row_count(),
+            3
+        );
+        assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let expand =
+            |owner: &mut super::SessionPresentation, id: &str, sequence| -> anyhow::Result<()> {
+                let generation = owner
+                    .open
+                    .as_ref()
+                    .unwrap()
+                    .sections
+                    .nodes
+                    .generation(id)
+                    .unwrap();
+                owner.dispatch(super::PresentationRequest::Node {
+                    request: NodeRequest {
+                        document: document.clone(),
+                        view: view.clone(),
+                        sequence,
+                        node: id.into(),
+                        generation,
+                        action: NodeAction::SetExpansion { expanded: true },
+                        rows: 48,
+                        width: Default::default(),
+                    },
+                })?;
+                Ok(())
+            };
         expand(&mut owner, "first:prompt", 10)?;
         expand(&mut owner, &response.0, 11)?;
         owner.reconcile(vec![entry.clone(), interaction_entry("second")])?;
         let snapshot = owner.snapshot(&document)?;
-        let collapsed = snapshot.block.iter().find(|block| block.id == response).unwrap();
+        let collapsed = snapshot
+            .block
+            .iter()
+            .find(|block| block.id == response)
+            .unwrap();
         assert_eq!(collapsed.text.row_count(), 3);
-        assert_eq!(collapsed.metadata.node.as_ref().unwrap().display, NodeDisplay::Preview);
-        assert_eq!(collapsed.metadata.node.as_ref().unwrap().lifecycle, NodeLifecycle::Settled);
-        assert_eq!(owner.open.as_ref().unwrap().transcript.document.block(&response).unwrap().text.row_count(), 5);
+        assert_eq!(
+            collapsed.metadata.node.as_ref().unwrap().display,
+            NodeDisplay::Preview
+        );
+        assert_eq!(
+            collapsed.metadata.node.as_ref().unwrap().lifecycle,
+            NodeLifecycle::Settled
+        );
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
         expand(&mut owner, &response.0, 12)?;
-        owner.dispatch(super::PresentationRequest::Resize { document: document.clone(), view: view.clone(),
-            width: forge_buffer::width::WidthProfile { columns: 30, ..Default::default() } })?;
-        assert_eq!(owner.snapshot(&document)?.block.iter().find(|block| block.id == response).unwrap().text.row_count(), 5);
-        assert!(owner.snapshot(&document)?.block.iter().find(|block| block.id.0 == "first:prompt").unwrap().text.row_count() > 3);
+        owner.dispatch(super::PresentationRequest::Resize {
+            document: document.clone(),
+            view: view.clone(),
+            width: forge_buffer::width::WidthProfile {
+                columns: 30,
+                ..Default::default()
+            },
+        })?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        assert!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id.0 == "first:prompt")
+                .unwrap()
+                .text
+                .row_count()
+                > 3
+        );
         Ok(())
     }
 
@@ -1549,7 +2071,8 @@ mod tests {
     #[test]
     fn staging_uses_a_stable_physical_block_and_clears_without_entering_timeline() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { checks: None,
+        owner.initialize(vec![TimelineEntry::Status {
+            checks: None,
             status_thoughts: true,
             agent_count: 0,
             id: "status".into(),
@@ -1557,31 +2080,55 @@ mod tests {
             status: SessionPhase::Idle,
         }])?;
         let document = DocumentId("staging".into());
-        let opened = owner.open(document.clone(), ViewId("staging-view".into()), WidthProfile::default())?;
+        let opened = owner.open(
+            document.clone(),
+            ViewId("staging-view".into()),
+            WidthProfile::default(),
+        )?;
         let request: PresentationRequest = serde_json::from_value(serde_json::json!({
             "operation": "staging",
             "document": document,
             "queue": ["queued first", "queued second"],
             "steering": ["active direction"]
         }))?;
-        assert_eq!(owner.dispatch(request)?, serde_json::json!({"updated":true}));
+        assert_eq!(
+            owner.dispatch(request)?,
+            serde_json::json!({"updated":true})
+        );
         let snapshot = owner.snapshot(&document)?;
-        let staging_index = snapshot.block.iter().position(|block| block.id.0 == "harness:staging").unwrap();
+        let staging_index = snapshot
+            .block
+            .iter()
+            .position(|block| block.id.0 == "harness:staging")
+            .unwrap();
         assert_eq!(snapshot.block[staging_index - 1].id.0, "status");
         let rows = snapshot.block[staging_index].text.wire_rows().join("\n");
         assert!(rows.contains("Steering active turn"));
         assert!(rows.contains("active direction"));
         assert!(rows.contains("Queued follow-up inputs"));
         assert!(rows.find("queued first").unwrap() < rows.find("queued second").unwrap());
-        assert!(!owner.timeline.entry_list().iter().any(|entry| matches!(entry, TimelineEntry::Status { id, .. } if id == "harness:staging")));
+        assert!(!owner.timeline.entry_list().iter().any(
+            |entry| matches!(entry, TimelineEntry::Status { id, .. } if id == "harness:staging")
+        ));
 
         owner.dispatch(PresentationRequest::Staging {
             document: document.clone(),
             queue: Vec::new(),
             steering: Vec::new(),
         })?;
-        assert!(!owner.snapshot(&document)?.block.iter().any(|block| block.id.0 == "harness:staging"));
-        assert!(!owner.sync(&document, opened.transcript.revision)?.patch.is_empty());
+        assert!(
+            !owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .any(|block| block.id.0 == "harness:staging")
+        );
+        assert!(
+            !owner
+                .sync(&document, opened.transcript.revision)?
+                .patch
+                .is_empty()
+        );
         Ok(())
     }
 
@@ -1594,27 +2141,50 @@ mod tests {
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let prompt = "a Harness execution request is already running: no permits available\nwhen I entered this prompt it failed\n    never lose this indentation 界";
         owner.dispatch(PresentationRequest::Staging {
-            document: document.clone(), queue: vec![prompt.into()],
-            steering: vec!["Keep steering text aligned when it wraps across several display rows 界".into()],
+            document: document.clone(),
+            queue: vec![prompt.into()],
+            steering: vec![
+                "Keep steering text aligned when it wraps across several display rows 界".into(),
+            ],
         })?;
         for columns in [32, 54] {
-            let width = WidthProfile { columns, ..WidthProfile::default() };
+            let width = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
             owner.dispatch(PresentationRequest::Resize {
-                document: document.clone(), view: view.clone(), width: width.clone(),
+                document: document.clone(),
+                view: view.clone(),
+                width: width.clone(),
             })?;
             let snapshot = owner.snapshot(&document)?;
             let rows = snapshot.block.last().unwrap().text.wire_rows();
             let mut in_prompt = false;
             for row in rows {
                 assert!(width.cells(row, 0)? <= columns);
-                if row.starts_with("• ") { in_prompt = true; }
-                else if row.is_empty() || row == "Queued follow-up inputs" { in_prompt = false; }
-                else if in_prompt { assert!(row.starts_with("  "), "unaligned continuation: {row:?}"); }
+                if row.starts_with("• ") {
+                    in_prompt = true;
+                } else if row.is_empty() || row == "Queued follow-up inputs" {
+                    in_prompt = false;
+                } else if in_prompt {
+                    assert!(row.starts_with("  "), "unaligned continuation: {row:?}");
+                }
             }
-            assert!(snapshot.block.last().unwrap().text.wire_rows().iter()
-                .any(|row| row.starts_with("      never")));
+            assert!(
+                snapshot
+                    .block
+                    .last()
+                    .unwrap()
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.starts_with("      never"))
+            );
         }
-        assert_eq!(owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue, vec![prompt.to_owned()]);
+        assert_eq!(
+            owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue,
+            vec![prompt.to_owned()]
+        );
         Ok(())
     }
 
@@ -1625,7 +2195,9 @@ mod tests {
         let document = DocumentId("large-staging".into());
         let view = ViewId("large-staging-view".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
-        let queue: Vec<_> = (0..1200).map(|index| format!("queue-{index}-{}", "x".repeat(96))).collect();
+        let queue: Vec<_> = (0..1200)
+            .map(|index| format!("queue-{index}-{}", "x".repeat(96)))
+            .collect();
         let last = queue.last().unwrap().clone();
         let steering = "steering-λ".repeat(256);
         owner.dispatch(PresentationRequest::Staging {
@@ -1633,8 +2205,15 @@ mod tests {
             queue,
             steering: vec![steering.clone()],
         })?;
-        let rows = owner.snapshot(&document)?.block.iter()
-            .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
+        let rows = owner
+            .snapshot(&document)?
+            .block
+            .iter()
+            .find(|block| block.id.0 == "harness:staging")
+            .unwrap()
+            .text
+            .wire_rows()
+            .join("\n");
         assert!(rows.contains("queue-0-"));
         let unwrapped = rows.lines().map(str::trim_start).collect::<String>();
         assert!(unwrapped.contains(&last));
@@ -1643,7 +2222,8 @@ mod tests {
         owner.reconcile(vec![
             interaction_entry("main"),
             interaction_entry("followup"),
-            TimelineEntry::Status { checks: None,
+            TimelineEntry::Status {
+                checks: None,
                 status_thoughts: true,
                 agent_count: 0,
                 id: "status".into(),
@@ -1657,32 +2237,64 @@ mod tests {
                 },
             },
         ])?;
-        assert_eq!(owner.snapshot(&document)?.block.last().unwrap().id.0, "harness:staging");
+        assert_eq!(
+            owner.snapshot(&document)?.block.last().unwrap().id.0,
+            "harness:staging"
+        );
         owner.dispatch(PresentationRequest::Staging {
             document: document.clone(),
             queue: vec![last.clone()],
             steering: vec![steering.clone()],
         })?;
-        assert_eq!(owner.snapshot(&document)?.block.last().unwrap().id.0, "harness:staging");
+        assert_eq!(
+            owner.snapshot(&document)?.block.last().unwrap().id.0,
+            "harness:staging"
+        );
         owner.dispatch(PresentationRequest::Resize {
             document: document.clone(),
             view,
-            width: WidthProfile { columns: 32, ..WidthProfile::default() },
+            width: WidthProfile {
+                columns: 32,
+                ..WidthProfile::default()
+            },
         })?;
-        let rows = owner.snapshot(&document)?.block.iter()
-            .find(|block| block.id.0 == "harness:staging").unwrap().text.wire_rows().join("\n");
-        assert!(rows.lines().map(str::trim_start).collect::<String>().contains(&last));
-        assert_eq!(owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue.len(), 1);
+        let rows = owner
+            .snapshot(&document)?
+            .block
+            .iter()
+            .find(|block| block.id.0 == "harness:staging")
+            .unwrap()
+            .text
+            .wire_rows()
+            .join("\n");
+        assert!(
+            rows.lines()
+                .map(str::trim_start)
+                .collect::<String>()
+                .contains(&last)
+        );
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .staging
+                .as_ref()
+                .unwrap()
+                .queue
+                .len(),
+            1
+        );
         Ok(())
     }
 
     #[test]
     fn attached_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
-        let directory=tempfile::tempdir()?;
-        let output=directory.path().join("command.output");
-        let text="saved command output\n".repeat(15000);
-        std::fs::write(&output,&text)?;
-        let run:crate::checks::CheckRun=serde_json::from_value(serde_json::json!({
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("command.output");
+        let text = "saved command output\n".repeat(15000);
+        std::fs::write(&output, &text)?;
+        let run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
             "id":"gate","exchange_id":"implementation","revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
             "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
@@ -1692,66 +2304,171 @@ mod tests {
                 "output":output,"output_bytes":text.len(),"preview":"must not render"
             }]
         }))?;
-        let mut owner=SessionPresentation::new("session".into());
+        let mut owner = SessionPresentation::new("session".into());
         owner.initialize(crate::timeline::TimelineProjector::with_checks(
-            vec![interaction_entry("implementation")], vec![run],
+            vec![interaction_entry("implementation")],
+            vec![run],
         ))?;
-        let document=DocumentId("check-output".into());
-        owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes(),0);
-        expand_sections(&mut owner,"view")?;
-        let collapsed=owner.snapshot(&document)?;
-        let checks_position=collapsed.block.iter().position(|block|block.id.0=="gate:checks").unwrap();
-        assert!(!collapsed.block.iter().any(|block| block.id.0 == "gate:separator"));
-        let checks=&collapsed.block[checks_position];
+        let document = DocumentId("check-output".into());
+        owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"]
+                .snapshot()?
+                .retained_bytes(),
+            0
+        );
+        expand_sections(&mut owner, "view")?;
+        let collapsed = owner.snapshot(&document)?;
+        let checks_position = collapsed
+            .block
+            .iter()
+            .position(|block| block.id.0 == "gate:checks")
+            .unwrap();
+        assert!(
+            !collapsed
+                .block
+                .iter()
+                .any(|block| block.id.0 == "gate:separator")
+        );
+        let checks = &collapsed.block[checks_position];
         assert!(checks.metadata.node.as_ref().unwrap().parent.is_none());
-        for identity in ["gate:declarations","gate:0:tool"] {
-            let child=collapsed.block.iter().find(|block|block.id.0==identity).unwrap();
-            assert_eq!(child.metadata.node.as_ref().unwrap().parent.as_ref().unwrap().0,"gate:checks");
-            assert_eq!(child.metadata.layout.as_ref().unwrap().indent,
-                checks.metadata.layout.as_ref().unwrap().indent+2);
+        for identity in ["gate:declarations", "gate:0:tool"] {
+            let child = collapsed
+                .block
+                .iter()
+                .find(|block| block.id.0 == identity)
+                .unwrap();
+            assert_eq!(
+                child
+                    .metadata
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .parent
+                    .as_ref()
+                    .unwrap()
+                    .0,
+                "gate:checks"
+            );
+            assert_eq!(
+                child.metadata.layout.as_ref().unwrap().indent,
+                checks.metadata.layout.as_ref().unwrap().indent + 2
+            );
         }
         {
-            let open=owner.open.as_mut().unwrap();
-            open.sections.set(&mut open.transcript,ViewId("view".into()),99,"implementation:exchange",false,false,None)?;
-            retain_patches(open,Vec::new())?;
+            let open = owner.open.as_mut().unwrap();
+            open.sections.set(
+                &mut open.transcript,
+                ViewId("view".into()),
+                99,
+                "implementation:exchange",
+                false,
+                false,
+                None,
+            )?;
+            retain_patches(open, Vec::new())?;
         }
-        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.id.0=="gate:0:tool"),
-            "collapsing implementation activity must not hide its check results");
-        assert!(!collapsed.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output") || row.contains("must not render"))));
-        for (sequence,action) in [(100,super::super::nodes::NodeAction::SetExpansion { expanded:true }),
-            (101,super::super::nodes::NodeAction::LoadMore),(102,super::super::nodes::NodeAction::SetExpansion { expanded:false })] {
-            let generation=owner.snapshot(&document)?.block.iter().find_map(|block|block.metadata.node.as_ref()
-                .filter(|node|node.id.0=="gate:0:tool").map(|node|node.generation)).unwrap();
-            owner.dispatch(PresentationRequest::Node { request:super::super::nodes::NodeRequest {
-                document:document.clone(),view:ViewId("view".into()),sequence,node:"gate:0:tool".into(),generation,
-                action,rows:100,width:WidthProfile::default()
-            } })?;
-            let retained=owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes();
-            assert!(retained>0 && owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].has_unloaded_output(),"explicit opening must read a page, not the entire saved output");
+        assert!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .any(|block| block.id.0 == "gate:0:tool"),
+            "collapsing implementation activity must not hide its check results"
+        );
+        assert!(!collapsed.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("saved command output") || row.contains("must not render"))
+        }));
+        for (sequence, action) in [
+            (
+                100,
+                super::super::nodes::NodeAction::SetExpansion { expanded: true },
+            ),
+            (101, super::super::nodes::NodeAction::LoadMore),
+            (
+                102,
+                super::super::nodes::NodeAction::SetExpansion { expanded: false },
+            ),
+        ] {
+            let generation = owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find_map(|block| {
+                    block
+                        .metadata
+                        .node
+                        .as_ref()
+                        .filter(|node| node.id.0 == "gate:0:tool")
+                        .map(|node| node.generation)
+                })
+                .unwrap();
+            owner.dispatch(PresentationRequest::Node {
+                request: super::super::nodes::NodeRequest {
+                    document: document.clone(),
+                    view: ViewId("view".into()),
+                    sequence,
+                    node: "gate:0:tool".into(),
+                    generation,
+                    action,
+                    rows: 100,
+                    width: WidthProfile::default(),
+                },
+            })?;
+            let retained = owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"]
+                .snapshot()?
+                .retained_bytes();
+            assert!(
+                retained > 0
+                    && owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"]
+                        .has_unloaded_output(),
+                "explicit opening must read a page, not the entire saved output"
+            );
         }
-        assert!(!owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output"))));
+        assert!(!owner.snapshot(&document)?.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("saved command output"))
+        }));
         Ok(())
     }
 
     #[tokio::test]
-    async fn large_history_retains_parsers_and_syntax_across_refreshes_without_an_aggregate_limit() -> Result<()> {
+    async fn large_history_retains_parsers_and_syntax_across_refreshes_without_an_aggregate_limit()
+    -> Result<()> {
         use forge_diff::syntax::SyntaxEngine;
         use forge_diff::workers::{AnalysisPool, PoolLimits};
         use std::sync::Arc;
 
         let output = format!("{}\n", "x".repeat(511)).repeat(16_384);
-        let mut entries = (0..9).map(|index| {
-            let mut entry = interaction_entry(&format!("large-{index}"));
-            let TimelineEntry::Exchange { exchange, .. } = &mut entry else { unreachable!() };
-            let mut value = serde_json::to_value(&*exchange)?;
-            value["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
-            *exchange = serde_json::from_value(value)?;
-            Ok(entry)
-        }).collect::<Result<Vec<TimelineEntry>>>()?;
-        let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else { unreachable!() };
+        let mut entries = (0..9)
+            .map(|index| {
+                let mut entry = interaction_entry(&format!("large-{index}"));
+                let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+                    unreachable!()
+                };
+                let mut value = serde_json::to_value(&*exchange)?;
+                value["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
+                *exchange = serde_json::from_value(value)?;
+                Ok(entry)
+            })
+            .collect::<Result<Vec<TimelineEntry>>>()?;
+        let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else {
+            unreachable!()
+        };
         exchange.attributed_diff_text = Some(
-            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n".into(),
+            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n"
+                .into(),
         );
         assert!(output.len() * entries.len() > 64 * 1024 * 1024);
         let mut owner = SessionPresentation::new("session".into());
@@ -1759,27 +2476,55 @@ mod tests {
         let document = DocumentId("large-history".into());
         let view = ViewId("large-history-view".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
-        let snapshots = owner.open.as_ref().unwrap().sections.nodes.tool.values()
-            .map(|tool| tool.snapshot()).collect::<Result<Vec<_>>>()?;
-        assert!(snapshots.iter().map(|output| output.retained_bytes()).sum::<usize>() > 128 * 1024 * 1024);
+        let snapshots = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .tool
+            .values()
+            .map(|tool| tool.snapshot())
+            .collect::<Result<Vec<_>>>()?;
+        assert!(
+            snapshots
+                .iter()
+                .map(|output| output.retained_bytes())
+                .sum::<usize>()
+                > 128 * 1024 * 1024
+        );
 
         let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1, jobs: 2,
+            workers: 1,
+            jobs: 2,
         })));
         let job = owner.capture_syntax(&document)?.expect("saved diff syntax");
         owner.apply_syntax(&document, &job, job.analyze(&engine).await?)?;
         for iteration in 0..3 {
-            let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else { unreachable!() };
+            let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else {
+                unreachable!()
+            };
             exchange.prompt = format!("Updated prompt {iteration}");
             owner.reconcile(entries.clone())?;
             refresh_activity(owner.open.as_mut().unwrap(), &entries)?;
             owner.dispatch(PresentationRequest::Resize {
-                document: document.clone(), view: view.clone(),
-                width: WidthProfile { columns: 70 + iteration, ..WidthProfile::default() },
+                document: document.clone(),
+                view: view.clone(),
+                width: WidthProfile {
+                    columns: 70 + iteration,
+                    ..WidthProfile::default()
+                },
             })?;
             let snapshot = owner.snapshot(&document)?;
-            assert!(snapshot.block.iter().map(|block| block.text.byte_count()).sum::<usize>() < 1024 * 1024,
-                "collapsed history materialized tool output");
+            assert!(
+                snapshot
+                    .block
+                    .iter()
+                    .map(|block| block.text.byte_count())
+                    .sum::<usize>()
+                    < 1024 * 1024,
+                "collapsed history materialized tool output"
+            );
             owner.sync(&document, snapshot.revision)?;
         }
         Ok(())
@@ -1787,11 +2532,30 @@ mod tests {
 
     fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
         let open = owner.open.as_mut().unwrap();
-        let ids: Vec<_> = open.transcript.snapshot()?.block.iter()
-            .filter(|block| block.metadata.node.as_ref().is_none_or(|node| node.kind != forge_buffer::node::NodeKind::Tool))
-            .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone())).collect();
+        let ids: Vec<_> = open
+            .transcript
+            .snapshot()?
+            .block
+            .iter()
+            .filter(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_none_or(|node| node.kind != forge_buffer::node::NodeKind::Tool)
+            })
+            .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone()))
+            .collect();
         for (index, id) in ids.iter().enumerate() {
-            open.sections.set(&mut open.transcript, ViewId(view.into()), index as u64 + 1, id, true, false, None)?;
+            open.sections.set(
+                &mut open.transcript,
+                ViewId(view.into()),
+                index as u64 + 1,
+                id,
+                true,
+                false,
+                None,
+            )?;
             open.sections.quota_for_test(id, 16 * 1024 * 1024);
         }
         retain_patches(open, Vec::new())
@@ -1799,80 +2563,199 @@ mod tests {
 
     #[test]
     fn expanded_streaming_retains_settled_chunks_and_patches_only_the_mutable_tail() -> Result<()> {
-        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         use forge_buffer::identity::BlockId;
-        let output = (0..30000).map(|row|format!("row {row} λ\n")).collect::<String>();
+        let output = (0..30000)
+            .map(|row| format!("row {row} λ\n"))
+            .collect::<String>();
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
         active["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
-        let mut exchange:Exchange = serde_json::from_value(active["exchange"].take())?;
-        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() };
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+            serde_json::json!("inProgress");
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+            serde_json::Value::Null;
+        let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
+        let entry = TimelineEntry::Exchange {
+            id: "active".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        };
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![entry])?;
         let document = DocumentId("expanded-stream".into());
-        owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        owner.open.as_mut().unwrap().sections.nodes.choice.insert("active:turn:1:tool:tool".into(), true);
-        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",true, 16 * 1024 * 1024)?;
+        owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        owner
+            .open
+            .as_mut()
+            .unwrap()
+            .sections
+            .nodes
+            .choice
+            .insert("active:turn:1:tool:tool".into(), true);
+        toggle_inline_output(
+            owner.open.as_mut().unwrap(),
+            "active:turn:1:tool",
+            true,
+            16 * 1024 * 1024,
+        )?;
         expand_sections(&mut owner, "view")?;
         {
             let open = owner.open.as_mut().unwrap();
-            open.sections.quota_for_test("active:turn:1:tool:tool", 16 * 1024 * 1024);
+            open.sections
+                .quota_for_test("active:turn:1:tool:tool", 16 * 1024 * 1024);
             open.transcript.dirty.insert("active".into());
             retain_patches(open, Vec::new())?;
         }
         let opened = owner.snapshot(&document)?;
-        assert!(opened.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
+        assert!(
+            opened
+                .block
+                .iter()
+                .map(|block| block.text.row_count())
+                .sum::<usize>()
+                >= 30000
+        );
         let heading = BlockId("active:turn:1:tool:tool".into());
         let settled = BlockId("active:turn:1:tool:preview".into());
-        let pointer = |owner:&SessionPresentation,id:&BlockId|owner.open.as_ref().unwrap()
-            .transcript.document.block(id).unwrap().text.row(0).unwrap().as_ptr() as usize;
-        let heading_pointer = pointer(&owner,&heading);
-        let settled_pointer = pointer(&owner,&settled);
+        let pointer = |owner: &SessionPresentation, id: &BlockId| {
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(id)
+                .unwrap()
+                .text
+                .row(0)
+                .unwrap()
+                .as_ptr() as usize
+        };
+        let heading_pointer = pointer(&owner, &heading);
+        let settled_pointer = pointer(&owner, &settled);
         let mut revision = opened.revision;
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         for iteration in 0..100 {
             let event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
-                turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10+iteration}),
-                summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),kind:ToolActivityKind::Command,
-                    title:"Read output".into(),output:Some(format!("new {iteration} 🦀\n")),status:Some("inProgress".into()),
-                    output_delta:true,change:Default::default() }) };
-            exchange.observe_turn(&event,10+iteration)?;
-            owner.append_tool_output(&exchange,&event)?;
-            let sync = owner.sync(&document,revision)?;
+                received_at_ms: None,
+                address: Some(ProviderAddress {
+                    owner: None,
+                    thread_id: "thread".into(),
+                    turn_id: "active".into(),
+                }),
+                turn_boundary: None,
+                kind: "tool".into(),
+                text: None,
+                data: serde_json::json!({"emittedAtMs":10+iteration}),
+                summary: None,
+                task_update: None,
+                activity: Some(ToolActivity {
+                    id: "tool".into(),
+                    kind: ToolActivityKind::Command,
+                    title: "Read output".into(),
+                    output: Some(format!("new {iteration} 🦀\n")),
+                    status: Some("inProgress".into()),
+                    output_delta: true,
+                    change: Default::default(),
+                }),
+            };
+            exchange.observe_turn(&event, 10 + iteration)?;
+            owner.append_tool_output(&exchange, &event)?;
+            let sync = owner.sync(&document, revision)?;
             assert!(sync.snapshot.is_none());
             for patch in sync.patch {
-                assert!(patch.metadata_edit.iter().all(|edit|edit.block != settled));
-                assert!(patch.text_edit.iter().map(|edit|edit.text.byte_count()).sum::<usize>() < 20000);
+                assert!(patch.metadata_edit.iter().all(|edit| edit.block != settled));
+                assert!(
+                    patch
+                        .text_edit
+                        .iter()
+                        .map(|edit| edit.text.byte_count())
+                        .sum::<usize>()
+                        < 20000
+                );
                 revision = patch.next;
             }
-            assert_eq!(pointer(&owner,&heading),heading_pointer);
-            assert_eq!(pointer(&owner,&settled),settled_pointer);
-            assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries,
-                "a streamed tail rebuilt the containing exchange");
+            assert_eq!(pointer(&owner, &heading), heading_pointer);
+            assert_eq!(pointer(&owner, &settled), settled_pointer);
+            assert_eq!(
+                owner.open.as_ref().unwrap().sections.projected_entries,
+                projected_entries,
+                "a streamed tail rebuilt the containing exchange"
+            );
         }
-        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("new 99 🦀"))));
-        refresh_activity(owner.open.as_mut().unwrap(), &[TimelineEntry::Exchange {
-            id:"active".into(), created_at_ms:0, exchange, check_runs: Vec::new(), agent_by_id:HashMap::new(),
-        }])?;
-        let timed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap().to_owned();
-        assert_eq!(pointer(&owner,&settled),settled_pointer);
-        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",false, super::super::tool::INITIAL_INLINE_BYTES)?;
-        let collapsed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap();
-        let column = |text: &str| WidthProfile::default().cells(&text[..text.find("Read output").unwrap()], 0).unwrap();
-        assert_eq!(column(&timed_heading), column(collapsed_heading),
-            "timer updates and activation must keep the command column fixed");
+        assert!(owner.snapshot(&document)?.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("new 99 🦀"))
+        }));
+        refresh_activity(
+            owner.open.as_mut().unwrap(),
+            &[TimelineEntry::Exchange {
+                id: "active".into(),
+                created_at_ms: 0,
+                exchange,
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
+            }],
+        )?;
+        let timed_heading = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .transcript
+            .document
+            .block(&heading)
+            .unwrap()
+            .text
+            .row(0)
+            .unwrap()
+            .to_owned();
+        assert_eq!(pointer(&owner, &settled), settled_pointer);
+        toggle_inline_output(
+            owner.open.as_mut().unwrap(),
+            "active:turn:1:tool",
+            false,
+            super::super::tool::INITIAL_INLINE_BYTES,
+        )?;
+        let collapsed_heading = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .transcript
+            .document
+            .block(&heading)
+            .unwrap()
+            .text
+            .row(0)
+            .unwrap();
+        let column = |text: &str| {
+            WidthProfile::default()
+                .cells(&text[..text.find("Read output").unwrap()], 0)
+                .unwrap()
+        };
+        assert_eq!(
+            column(&timed_heading),
+            column(collapsed_heading),
+            "timer updates and activation must keep the command column fixed"
+        );
         Ok(())
     }
 
     #[test]
     fn streamed_message_reparses_only_its_owned_block_and_retains_tools() -> Result<()> {
-        use crate::backend::{BackendEvent,ProviderAddress};
+        use crate::backend::{BackendEvent, ProviderAddress};
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
@@ -1880,28 +2763,77 @@ mod tests {
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let mut event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
-            turn_boundary:None,kind:"assistant_message".into(),text:Some("First [link](https://example.com)".into()),
-            data:serde_json::json!({"provider_message_id":"message"}),summary:None,task_update:None,activity:None };
-        exchange.observe_turn(&event,2)?;
-        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() };
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "active".into(),
+            }),
+            turn_boundary: None,
+            kind: "assistant_message".into(),
+            text: Some("First [link](https://example.com)".into()),
+            data: serde_json::json!({"provider_message_id":"message"}),
+            summary: None,
+            task_update: None,
+            activity: None,
+        };
+        exchange.observe_turn(&event, 2)?;
+        let entry = TimelineEntry::Exchange {
+            id: "active".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        };
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![interaction_entry("settled"),entry])?;
+        owner.initialize(vec![interaction_entry("settled"), entry])?;
         let document = DocumentId("streamed-message".into());
-        let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
+        let opened = owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
-        let tool = owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let tool = owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"]
+            .preview(true)?
+            .row
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         event.text = Some("\n\nMore **text** with λ.".into());
-        exchange.observe_turn(&event,3)?;
-        let patch = owner.update_message(&exchange,&event)?.expect("owned message");
-        assert!(matches!(&patch.operation[..],[TimelineOperation::Message { index:1,.. }]));
-        let sync = owner.sync(&document,opened.transcript.revision)?;
+        exchange.observe_turn(&event, 3)?;
+        let patch = owner
+            .update_message(&exchange, &event)?
+            .expect("owned message");
+        assert!(matches!(
+            &patch.operation[..],
+            [TimelineOperation::Message { index: 1, .. }]
+        ));
+        let sync = owner.sync(&document, opened.transcript.revision)?;
         assert!(sync.snapshot.is_none() && !sync.patch.is_empty());
-        assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries);
-        assert!(sync.patch.iter().all(|patch|patch.block_edit.is_empty()
-            && patch.metadata_edit.iter().all(|edit|!edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool"))));
-        assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row,tool);
-        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("More **text**"))));
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.projected_entries,
+            projected_entries
+        );
+        assert!(sync.patch.iter().all(|patch| {
+            patch.block_edit.is_empty()
+                && patch.metadata_edit.iter().all(|edit| {
+                    !edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool")
+                })
+        }));
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"]
+                .preview(true)?
+                .row,
+            tool
+        );
+        assert!(owner.snapshot(&document)?.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("More **text**"))
+        }));
         Ok(())
     }
 
@@ -1917,7 +2849,11 @@ mod tests {
             let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
             let mut event = BackendEvent {
                 received_at_ms: None,
-                address: Some(ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "active".into() }),
+                address: Some(ProviderAddress {
+                    owner: None,
+                    thread_id: "thread".into(),
+                    turn_id: "active".into(),
+                }),
                 turn_boundary: None,
                 kind: "reasoning_summary".into(),
                 text: Some("Inspect settings.".into()),
@@ -1929,8 +2865,15 @@ mod tests {
             exchange.observe_turn(&event, 2)?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![
-                TimelineEntry::Exchange { id: "active".into(), created_at_ms: 0, exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() },
-                TimelineEntry::Status { checks: None,
+                TimelineEntry::Exchange {
+                    id: "active".into(),
+                    created_at_ms: 0,
+                    exchange: exchange.clone(),
+                    check_runs: Vec::new(),
+                    agent_by_id: HashMap::new(),
+                },
+                TimelineEntry::Status {
+                    checks: None,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     agent_count: 0,
@@ -1945,90 +2888,233 @@ mod tests {
                 },
             ])?;
             let document = DocumentId("streamed-thought".into());
-            owner.open(document.clone(), ViewId("view".into()), WidthProfile::default())?;
+            owner.open(
+                document.clone(),
+                ViewId("view".into()),
+                WidthProfile::default(),
+            )?;
             event.text = Some(" Next step.".into());
             exchange.observe_turn(&event, 3)?;
-            let patch = owner.update_message(&exchange, &event)?.expect("owned thought");
-            assert!(matches!(patch.operation.first(), Some(TimelineOperation::Message { .. })));
+            let patch = owner
+                .update_message(&exchange, &event)?
+                .expect("owned thought");
+            assert!(matches!(
+                patch.operation.first(),
+                Some(TimelineOperation::Message { .. })
+            ));
             assert_eq!(patch.operation.len(), if status_thoughts { 2 } else { 1 });
             let snapshot = owner.snapshot(&document)?;
-            assert!(snapshot.block.iter().filter(|block| block.id.0 != "session:status")
-                .any(|block| block.text.wire_rows().iter().any(|row| row.contains("Next step."))));
-            let status = snapshot.block.iter().find(|block| block.id.0 == "session:status").unwrap();
-            assert_eq!(status.text.wire_rows().iter().any(|row| row.contains("Next step.")), status_thoughts);
+            assert!(
+                snapshot
+                    .block
+                    .iter()
+                    .filter(|block| block.id.0 != "session:status")
+                    .any(|block| block
+                        .text
+                        .wire_rows()
+                        .iter()
+                        .any(|row| row.contains("Next step.")))
+            );
+            let status = snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "session:status")
+                .unwrap();
+            assert_eq!(
+                status
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.contains("Next step.")),
+                status_thoughts
+            );
             let toggle = owner.set_status_thoughts(!status_thoughts)?;
-            assert!(matches!(toggle.operation.as_slice(), [TimelineOperation::Replace {
-                entry: TimelineEntry::Status { .. }, ..
-            }]));
+            assert!(matches!(
+                toggle.operation.as_slice(),
+                [TimelineOperation::Replace {
+                    entry: TimelineEntry::Status { .. },
+                    ..
+                }]
+            ));
             let toggled = owner.snapshot(&document)?;
-            let status = toggled.block.iter().find(|block| block.id.0 == "session:status").unwrap();
-            assert_eq!(status.text.wire_rows().iter().any(|row| row.contains("Next step.")), !status_thoughts);
-            assert!(toggled.block.iter().filter(|block| block.id.0 != "session:status")
-                .any(|block| block.text.wire_rows().iter().any(|row| row.contains("Next step."))));
+            let status = toggled
+                .block
+                .iter()
+                .find(|block| block.id.0 == "session:status")
+                .unwrap();
+            assert_eq!(
+                status
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.contains("Next step.")),
+                !status_thoughts
+            );
+            assert!(
+                toggled
+                    .block
+                    .iter()
+                    .filter(|block| block.id.0 != "session:status")
+                    .any(|block| block
+                        .text
+                        .wire_rows()
+                        .iter()
+                        .any(|row| row.contains("Next step.")))
+            );
             let mut stale = owner.timeline.entry_list().to_vec();
             for entry in &mut stale {
-                if let TimelineEntry::Status { status_thoughts: preference, .. } = entry {
+                if let TimelineEntry::Status {
+                    status_thoughts: preference,
+                    ..
+                } = entry
+                {
                     *preference = status_thoughts;
                 }
             }
-            assert!(owner.reconcile_with_status_thoughts(stale, !status_thoughts)?.is_empty());
+            assert!(
+                owner
+                    .reconcile_with_status_thoughts(stale, !status_thoughts)?
+                    .is_empty()
+            );
         }
         Ok(())
     }
 
     #[test]
     fn streamed_output_changes_only_the_tool_and_its_fold_endpoints() -> Result<()> {
-        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         let mut active = serde_json::to_value(interaction_entry("active"))?;
         active["exchange"]["state"] = serde_json::json!("running");
         active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
         active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
-        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
-        let active = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
-            exchange:serde_json::from_value(active["exchange"].take())?,check_runs: Vec::new(), agent_by_id:HashMap::new() };
-        let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else { unreachable!() };
-        let mut entries: Vec<_> = (0..3000).map(|index| interaction_entry(&format!("history-{index}"))).collect();
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+            serde_json::json!("inProgress");
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+            serde_json::Value::Null;
+        let active = TimelineEntry::Exchange {
+            id: "active".into(),
+            created_at_ms: 0,
+            exchange: serde_json::from_value(active["exchange"].take())?,
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        };
+        let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else {
+            unreachable!()
+        };
+        let mut entries: Vec<_> = (0..3000)
+            .map(|index| interaction_entry(&format!("history-{index}")))
+            .collect();
         entries.push(active);
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(entries)?;
         let document = DocumentId("streamed-output".into());
-        let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        assert!(opened.transcript.block.iter().map(|block|block.text.row_count()).sum::<usize>() < 30000);
-        assert!(!opened.transcript.block.iter().any(|block| block.id.0 == "history-0:turn:1:tool:preview"));
+        let opened = owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        assert!(
+            opened
+                .transcript
+                .block
+                .iter()
+                .map(|block| block.text.row_count())
+                .sum::<usize>()
+                < 30000
+        );
+        assert!(
+            !opened
+                .transcript
+                .block
+                .iter()
+                .any(|block| block.id.0 == "history-0:turn:1:tool:preview")
+        );
         let event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
-            turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
-            summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
-                kind:ToolActivityKind::Command,title:"Read output".into(),output:Some("\nseventh\n".into()),
-                status:Some("inProgress".into()),output_delta:true,change:Default::default() }) };
-        exchange.observe_turn(&event,10)?;
-        let patch = owner.append_tool_output(&exchange,&event)?.expect("incremental output");
-        assert!(matches!(&patch.operation[..],[TimelineOperation::ToolOutput { index:3000,.. }]));
-        let sync = owner.sync(&document,opened.transcript.revision)?;
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "active".into(),
+            }),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::json!({"emittedAtMs":10}),
+            summary: None,
+            task_update: None,
+            activity: Some(ToolActivity {
+                id: "tool".into(),
+                kind: ToolActivityKind::Command,
+                title: "Read output".into(),
+                output: Some("\nseventh\n".into()),
+                status: Some("inProgress".into()),
+                output_delta: true,
+                change: Default::default(),
+            }),
+        };
+        exchange.observe_turn(&event, 10)?;
+        let patch = owner
+            .append_tool_output(&exchange, &event)?
+            .expect("incremental output");
+        assert!(matches!(
+            &patch.operation[..],
+            [TimelineOperation::ToolOutput { index: 3000, .. }]
+        ));
+        let sync = owner.sync(&document, opened.transcript.revision)?;
         assert!(sync.snapshot.is_none());
         assert!(!sync.patch.is_empty());
         for patch in &sync.patch {
             assert!(patch.block_edit.is_empty());
-            assert!(patch.metadata_edit.iter().all(|metadata| !metadata.block.0.contains("history-")));
-            assert!(patch.text_edit.iter().all(|edit| edit.removed_rows <= 4),
-                "stream updates replace only the four-row preview or its count");
+            assert!(
+                patch
+                    .metadata_edit
+                    .iter()
+                    .all(|metadata| !metadata.block.0.contains("history-"))
+            );
+            assert!(
+                patch.text_edit.iter().all(|edit| edit.removed_rows <= 4),
+                "stream updates replace only the four-row preview or its count"
+            );
         }
-        assert!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row.contains(&"seventh"));
+        assert!(
+            owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"]
+                .preview(true)?
+                .row
+                .contains(&"seventh")
+        );
         let snapshot = owner.snapshot(&document)?;
-        let preview = snapshot.block.iter().find(|block| block.id.0 == "active:turn:1:tool:preview").unwrap();
-        assert!(preview.text.wire_rows().iter().any(|row| row.contains("seventh")));
+        let preview = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == "active:turn:1:tool:preview")
+            .unwrap();
+        assert!(
+            preview
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("seventh"))
+        );
         assert_eq!(preview.text.row_count(), 4);
-        assert_eq!(snapshot.block.iter().find(|block| block.id.0 == "active:turn:1:tool:hidden").unwrap().text.row_count(), 0);
+        assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "active:turn:1:tool:hidden")
+                .unwrap()
+                .text
+                .row_count(),
+            0
+        );
         Ok(())
     }
 
     #[test]
     fn hidden_parallel_tool_output_stays_cached_until_exchange_completion() -> Result<()> {
-        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         use super::super::nodes::{NodeAction, NodeRequest};
-        use serde_json::{json, Value};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use serde_json::{Value, json};
         let mut value = serde_json::to_value(interaction_entry("parallel"))?;
         value["exchange"]["state"] = json!("running");
         value["exchange"]["completed_at_ms"] = Value::Null;
@@ -2038,73 +3124,204 @@ mod tests {
         value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = Value::Null;
         let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
         let mut event = BackendEvent {
-            received_at_ms: None, address: Some(ProviderAddress { owner: None,
-                thread_id: "thread".into(), turn_id: "parallel".into() }),
-            turn_boundary: None, kind: "tool".into(), text: None, data: Value::Null,
-            summary: None, task_update: None,
-            activity: Some(ToolActivity { id: "latest".into(), kind: ToolActivityKind::Command,
-                title: "Latest parallel tool".into(), output: Some("Latest output".into()),
-                status: Some("inProgress".into()), output_delta: false, change: Default::default() }),
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "parallel".into(),
+            }),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: Value::Null,
+            summary: None,
+            task_update: None,
+            activity: Some(ToolActivity {
+                id: "latest".into(),
+                kind: ToolActivityKind::Command,
+                title: "Latest parallel tool".into(),
+                output: Some("Latest output".into()),
+                status: Some("inProgress".into()),
+                output_delta: false,
+                change: Default::default(),
+            }),
         };
         exchange.observe_turn(&event, 2)?;
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
+        owner.initialize(vec![TimelineEntry::Exchange {
+            id: "parallel".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        }])?;
         let document = DocumentId("hidden-parallel".into());
         let view = ViewId("hidden-parallel-view".into());
         let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let before = owner.snapshot(&document)?;
-        assert!(!before.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"));
-        assert!(before.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
-        assert_eq!(before.block.iter().find(|block| block.id.0 == "parallel:turn:1:latest:preview").unwrap().text.row_count(), 4);
+        assert!(
+            !before
+                .block
+                .iter()
+                .any(|block| block.id.0 == "parallel:turn:1:tool:tool")
+        );
+        assert!(
+            before
+                .block
+                .iter()
+                .any(|block| block.id.0 == "parallel:turn:1:latest:tool")
+        );
+        assert_eq!(
+            before
+                .block
+                .iter()
+                .find(|block| block.id.0 == "parallel:turn:1:latest:preview")
+                .unwrap()
+                .text
+                .row_count(),
+            4
+        );
         let activity = event.activity.as_mut().unwrap();
         activity.id = "tool".into();
         activity.title = "Read output".into();
         activity.output = Some("\nLate older output".into());
         activity.output_delta = true;
         exchange.observe_turn(&event, 3)?;
-        owner.append_tool_output(&exchange, &event)?.expect("hidden tool output delta");
+        owner
+            .append_tool_output(&exchange, &event)?
+            .expect("hidden tool output delta");
         owner.sync(&document, opened.transcript.revision)?;
         let after = owner.snapshot(&document)?;
-        assert_eq!(serde_json::to_value(&before.block)?, serde_json::to_value(&after.block)?,
-            "an older tool's output must not move or replace the live preview");
-        let group = after.block.iter().find_map(|block| block.metadata.node.as_ref()
-            .filter(|node| node.kind == forge_buffer::node::NodeKind::ToolGroup)).unwrap();
-        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view: view.clone(), sequence: 100, node: group.id.0.clone(),
-            generation: group.generation, action: NodeAction::SetExpansion { expanded: true },
-            rows: 40, width: WidthProfile::default(),
-        } })?;
+        assert_eq!(
+            serde_json::to_value(&before.block)?,
+            serde_json::to_value(&after.block)?,
+            "an older tool's output must not move or replace the live preview"
+        );
+        let group = after
+            .block
+            .iter()
+            .find_map(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .filter(|node| node.kind == forge_buffer::node::NodeKind::ToolGroup)
+            })
+            .unwrap();
+        owner.dispatch(PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence: 100,
+                node: group.id.0.clone(),
+                generation: group.generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 40,
+                width: WidthProfile::default(),
+            },
+        })?;
         let expanded = owner.snapshot(&document)?;
-        assert!(!expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:tool:tool"),
-            "expanding a live group must keep older tools hidden");
-        assert!(expanded.block.iter().any(|block| block.id.0 == "parallel:turn:1:latest:tool"));
+        assert!(
+            !expanded
+                .block
+                .iter()
+                .any(|block| block.id.0 == "parallel:turn:1:tool:tool"),
+            "expanding a live group must keep older tools hidden"
+        );
+        assert!(
+            expanded
+                .block
+                .iter()
+                .any(|block| block.id.0 == "parallel:turn:1:latest:tool")
+        );
         let source = &owner.open.as_ref().unwrap().sections.nodes.tool["parallel:turn:1:tool"];
         assert!(source.preview(true)?.row.contains(&"Late older output"));
-        event.activity = Some(ToolActivity { id: "third".into(), kind: ToolActivityKind::Command,
-            title: "Third parallel tool".into(), output: Some("Third output".into()),
-            status: Some("inProgress".into()), output_delta: false, change: Default::default() });
+        event.activity = Some(ToolActivity {
+            id: "third".into(),
+            kind: ToolActivityKind::Command,
+            title: "Third parallel tool".into(),
+            output: Some("Third output".into()),
+            status: Some("inProgress".into()),
+            output_delta: false,
+            change: Default::default(),
+        });
         exchange.observe_turn(&event, 4)?;
-        owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
-        assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
-            block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 1,
-            "new calls must replace the preview even after explicit group expansion");
-        assert_eq!(owner.snapshot(&document)?.block.iter().find(|block|
-            block.id.0 == "parallel:turn:1:third:preview").unwrap().text.row_count(), 4);
+        owner.reconcile(vec![TimelineEntry::Exchange {
+            id: "parallel".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        }])?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .filter(|block| block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool))
+                .count(),
+            1,
+            "new calls must replace the preview even after explicit group expansion"
+        );
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id.0 == "parallel:turn:1:third:preview")
+                .unwrap()
+                .text
+                .row_count(),
+            4
+        );
         exchange.state = crate::exchange::ExchangeState::Complete;
         exchange.completed_at_ms = Some(5);
-        owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange, check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
+        owner.reconcile(vec![TimelineEntry::Exchange {
+            id: "parallel".into(),
+            created_at_ms: 0,
+            exchange,
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        }])?;
         let activity = "parallel:exchange";
-        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(activity).unwrap();
-        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view, sequence: 101, node: activity.into(), generation,
-            action: NodeAction::SetExpansion { expanded: true }, rows: 40, width: WidthProfile::default(),
-        } })?;
-        assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
-            block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 3,
-            "completed exchanges must allow the full tool history to expand");
+        let generation = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .generation(activity)
+            .unwrap();
+        owner.dispatch(PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view,
+                sequence: 101,
+                node: activity.into(),
+                generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 40,
+                width: WidthProfile::default(),
+            },
+        })?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .filter(|block| block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool))
+                .count(),
+            3,
+            "completed exchanges must allow the full tool history to expand"
+        );
         Ok(())
     }
 
@@ -2122,7 +3339,7 @@ mod tests {
             exchange.completed_at_ms = None;
             exchange.execution_started_at_ms = Some(1);
             let mut event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
                     thread_id: "thread".into(),
@@ -2187,15 +3404,13 @@ mod tests {
     #[tokio::test]
     async fn saved_syntax_rejects_stale_and_closed_documents_and_survives_timer_refresh()
     -> Result<()> {
-        use forge_diff::syntax::{SyntaxEngine};
+        use forge_diff::syntax::SyntaxEngine;
         use forge_diff::workers::{AnalysisPool, PoolLimits};
         use std::sync::Arc;
-        let engine = SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 2,
-            })),
-        );
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 2,
+        })));
         let mut entry = interaction_entry("syntax");
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
             unreachable!()
@@ -2275,7 +3490,8 @@ mod tests {
         };
         let mut interaction = Exchange {
             lifecycle: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: "primary".into(),
             id: identity.into(),
@@ -2346,7 +3562,8 @@ mod tests {
         TimelineEntry::Exchange {
             id: identity.into(),
             created_at_ms: 0,
-            check_runs: Vec::new(), agent_by_id: HashMap::new(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
             exchange: interaction,
         }
     }
@@ -2355,7 +3572,10 @@ mod tests {
     fn tool_actions_survive_unrelated_revisions_without_retargeting_or_replay() -> Result<()> {
         use forge_buffer::{block::TextPosition, identity::BlockId};
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![interaction_entry("first"), interaction_entry("second")])?;
+        owner.initialize(vec![
+            interaction_entry("first"),
+            interaction_entry("second"),
+        ])?;
         let document = DocumentId("transcript:stable-tool".into());
         let view = ViewId("view:stable-tool".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
@@ -2374,14 +3594,22 @@ mod tests {
         owner.dispatch(PresentationRequest::Resize {
             document: document.clone(),
             view,
-            width: WidthProfile { columns: 65, ..WidthProfile::default() },
+            width: WidthProfile {
+                columns: 65,
+                ..WidthProfile::default()
+            },
         })?;
         assert!(owner.snapshot(&document)?.revision > captured.revision);
         let mut changed = input.clone();
         changed.action = "navigate_prompt".into();
-        assert!(owner.dispatch(PresentationRequest::NavigatePrompt {
-            input: changed, previous: true,
-        }).is_err());
+        assert!(
+            owner
+                .dispatch(PresentationRequest::NavigatePrompt {
+                    input: changed,
+                    previous: true,
+                })
+                .is_err()
+        );
         let mut changed = input.clone();
         changed.target = Some(TargetId("second:turn:1:tool:tool".into()));
         assert!(owner.action(changed).is_err());
@@ -2389,16 +3617,19 @@ mod tests {
         changed.document = DocumentId("transcript:other".into());
         assert!(owner.action(changed).is_err());
         let mut changed = input.clone();
-        changed.revision = forge_buffer::identity::DocumentRevision(
-            owner.snapshot(&document)?.revision.0 + 1,
-        );
+        changed.revision =
+            forge_buffer::identity::DocumentRevision(owner.snapshot(&document)?.revision.0 + 1);
         assert!(owner.action(changed).is_err());
-        assert!(matches!(owner.action(input.clone())?, TranscriptAction::Tool { .. }));
+        assert!(matches!(
+            owner.action(input.clone())?,
+            TranscriptAction::Tool { .. }
+        ));
         assert!(owner.action(input.clone()).is_err());
         let mut next = input.clone();
         next.sequence = InputSequence(2);
         owner.dispatch(PresentationRequest::ToolOpen {
-            input: next.clone(), document: DocumentId("output:stable-tool".into()),
+            input: next.clone(),
+            document: DocumentId("output:stable-tool".into()),
         })?;
         owner.reconcile(vec![interaction_entry("second")])?;
         next.sequence = InputSequence(3);
@@ -2407,11 +3638,16 @@ mod tests {
     }
 
     #[test]
-    fn streaming_pages_publish_continuations_without_exceeding_the_loaded_row_budget() -> Result<()> {
-        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
-        use super::super::nodes::{NodeAction,NodeRequest};
+    fn streaming_pages_publish_continuations_without_exceeding_the_loaded_row_budget() -> Result<()>
+    {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         for (rows, initial, delta) in [
-            (4096, format!("{}\n", "x".repeat(1500)).repeat(40), format!("{}\n", "y".repeat(1500)).repeat(10)),
+            (
+                4096,
+                format!("{}\n", "x".repeat(1500)).repeat(40),
+                format!("{}\n", "y".repeat(1500)).repeat(10),
+            ),
             (8, "initial\n".repeat(6), "appended\n".repeat(40)),
         ] {
             let mut value = serde_json::to_value(interaction_entry("active"))?;
@@ -2419,38 +3655,89 @@ mod tests {
             value["exchange"]["completed_at_ms"] = serde_json::Value::Null;
             value["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
             value["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(initial);
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
-            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
-            let mut exchange:Exchange = serde_json::from_value(value["exchange"].take())?;
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] =
+                serde_json::json!(initial);
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] =
+                serde_json::json!("inProgress");
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] =
+                serde_json::Value::Null;
+            let mut exchange: Exchange = serde_json::from_value(value["exchange"].take())?;
             let mut owner = SessionPresentation::new("session".into());
-            owner.initialize(vec![TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
-                exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() }])?;
+            owner.initialize(vec![TimelineEntry::Exchange {
+                id: "active".into(),
+                created_at_ms: 0,
+                exchange: exchange.clone(),
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
+            }])?;
             let document = DocumentId("stream-page".into());
             let view = ViewId("view".into());
-            owner.open(document.clone(),view.clone(),WidthProfile::default())?;
+            owner.open(document.clone(), view.clone(), WidthProfile::default())?;
             expand_sections(&mut owner, "view")?;
             let node = "active:turn:1:tool:tool";
-            let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
-            owner.dispatch(PresentationRequest::Node { request:NodeRequest { document:document.clone(),view,
-                sequence:100,node:node.into(),generation,action:NodeAction::SetExpansion { expanded:true },
-                rows,width:WidthProfile::default() } })?;
+            let generation = owner
+                .open
+                .as_ref()
+                .unwrap()
+                .sections
+                .nodes
+                .generation(node)
+                .unwrap();
+            owner.dispatch(PresentationRequest::Node {
+                request: NodeRequest {
+                    document: document.clone(),
+                    view,
+                    sequence: 100,
+                    node: node.into(),
+                    generation,
+                    action: NodeAction::SetExpansion { expanded: true },
+                    rows,
+                    width: WidthProfile::default(),
+                },
+            })?;
             let projected = owner.open.as_ref().unwrap().sections.projected_entries;
-            let event = BackendEvent { received_at_ms:None,
-                address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
-                turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
-                summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
-                    kind:ToolActivityKind::Command,title:"Read output".into(),output:Some(delta),
-                    status:Some("inProgress".into()),output_delta:true,change:Default::default() }) };
-            exchange.observe_turn(&event,10)?;
-            owner.append_tool_output(&exchange,&event)?;
+            let event = BackendEvent {
+                received_at_ms: None,
+                address: Some(ProviderAddress {
+                    owner: None,
+                    thread_id: "thread".into(),
+                    turn_id: "active".into(),
+                }),
+                turn_boundary: None,
+                kind: "tool".into(),
+                text: None,
+                data: serde_json::json!({"emittedAtMs":10}),
+                summary: None,
+                task_update: None,
+                activity: Some(ToolActivity {
+                    id: "tool".into(),
+                    kind: ToolActivityKind::Command,
+                    title: "Read output".into(),
+                    output: Some(delta),
+                    status: Some("inProgress".into()),
+                    output_delta: true,
+                    change: Default::default(),
+                }),
+            };
+            exchange.observe_turn(&event, 10)?;
+            owner.append_tool_output(&exchange, &event)?;
             let snapshot = owner.snapshot(&document)?;
-            let state = snapshot.block.iter().filter_map(|block|block.metadata.node.as_ref())
-                .find(|state|state.id.0 == node).unwrap();
+            let state = snapshot
+                .block
+                .iter()
+                .filter_map(|block| block.metadata.node.as_ref())
+                .find(|state| state.id.0 == node)
+                .unwrap();
             assert!(state.more, "stream growth lost its continuation");
-            assert!(state.loaded_rows <= rows + 1, "stream growth exceeded the page row budget");
-            assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries,projected,
-                "stream growth rebuilt the exchange instead of the tool subtree");
+            assert!(
+                state.loaded_rows <= rows + 1,
+                "stream growth exceeded the page row budget"
+            );
+            assert_eq!(
+                owner.open.as_ref().unwrap().sections.projected_entries,
+                projected,
+                "stream growth rebuilt the exchange instead of the tool subtree"
+            );
         }
         Ok(())
     }
@@ -2459,44 +3746,120 @@ mod tests {
     fn tool_pages_format_only_the_requested_prefix_and_retain_previous_chunks() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use forge_buffer::identity::BlockId;
-        let output = (0..512).map(|row|format!("row {row:03} {}\n", "x".repeat(2000))).collect::<String>();
+        let output = (0..512)
+            .map(|row| format!("row {row:03} {}\n", "x".repeat(2000)))
+            .collect::<String>();
         let mut entry = serde_json::to_value(interaction_entry("paged"))?;
         entry["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Exchange { id:"paged".into(), created_at_ms:0,
-            exchange:serde_json::from_value(entry["exchange"].take())?, check_runs: Vec::new(), agent_by_id:HashMap::new() }])?;
+        owner.initialize(vec![TimelineEntry::Exchange {
+            id: "paged".into(),
+            created_at_ms: 0,
+            exchange: serde_json::from_value(entry["exchange"].take())?,
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        }])?;
         let document = DocumentId("paged-tools".into());
         let view = ViewId("view:paged".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         expand_sections(&mut owner, "view:paged")?;
         let node = "paged:turn:1:tool:tool";
-        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
-        let request = |action, sequence| PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view: view.clone(), sequence, node: node.into(), generation,
-            action, rows: 4096, width: WidthProfile { columns:256, ..WidthProfile::default() },
-        } };
-        owner.dispatch(request(NodeAction::SetExpansion { expanded:true }, 100))?;
+        let generation = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .generation(node)
+            .unwrap();
+        let request = |action, sequence| PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence,
+                node: node.into(),
+                generation,
+                action,
+                rows: 4096,
+                width: WidthProfile {
+                    columns: 256,
+                    ..WidthProfile::default()
+                },
+            },
+        };
+        owner.dispatch(request(NodeAction::SetExpansion { expanded: true }, 100))?;
         let first = BlockId("paged:turn:1:tool:preview".into());
         let later = BlockId("paged:turn:1:tool:output:4".into());
-        let pointer = |owner:&SessionPresentation| owner.open.as_ref().unwrap().transcript.document
-            .block(&first).unwrap().text.row(0).unwrap().as_ptr();
+        let pointer = |owner: &SessionPresentation| {
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&first)
+                .unwrap()
+                .text
+                .row(0)
+                .unwrap()
+                .as_ptr()
+        };
         let retained = pointer(&owner);
-        assert!(owner.open.as_ref().unwrap().transcript.document.block(&later).is_none(),
-            "initial expansion formatted beyond its 64 KiB source prefix");
+        assert!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&later)
+                .is_none(),
+            "initial expansion formatted beyond its 64 KiB source prefix"
+        );
         let mut sequence = 101;
-        while owner.snapshot(&document)?.block.iter().any(|block|block.metadata.node.as_ref()
-            .is_some_and(|state|state.id.0 == node && state.more)) {
+        while owner.snapshot(&document)?.block.iter().any(|block| {
+            block
+                .metadata
+                .node
+                .as_ref()
+                .is_some_and(|state| state.id.0 == node && state.more)
+        }) {
             assert!(sequence < 140, "tool paging made no progress");
             owner.dispatch(request(NodeAction::LoadMore, sequence))?;
-            assert_eq!(pointer(&owner), retained, "paging reformatted the retained prefix");
+            assert_eq!(
+                pointer(&owner),
+                retained,
+                "paging reformatted the retained prefix"
+            );
             sequence += 1;
         }
-        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter()
-            .any(|row|row.contains("row 511"))), "last tool row was lost during paging");
-        owner.dispatch(request(NodeAction::SetExpansion { expanded:false }, sequence))?;
-        owner.dispatch(request(NodeAction::SetExpansion { expanded:true }, sequence + 1))?;
-        assert!(owner.open.as_ref().unwrap().transcript.document.block(&later).is_none(),
-            "reopening retained obsolete source pages");
+        assert!(
+            owner.snapshot(&document)?.block.iter().any(|block| block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("row 511"))),
+            "last tool row was lost during paging"
+        );
+        owner.dispatch(request(
+            NodeAction::SetExpansion { expanded: false },
+            sequence,
+        ))?;
+        owner.dispatch(request(
+            NodeAction::SetExpansion { expanded: true },
+            sequence + 1,
+        ))?;
+        assert!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&later)
+                .is_none(),
+            "reopening retained obsolete source pages"
+        );
         Ok(())
     }
 
@@ -2512,41 +3875,114 @@ mod tests {
         expand_sections(&mut owner, "view:nodes")?;
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         let node = "first:turn:1:tool:tool";
-        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
-        let request = |expanded, sequence, generation| PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view: view.clone(), sequence, node: node.into(), generation,
-            action: NodeAction::SetExpansion { expanded }, rows: 48, width: WidthProfile::default(),
-        } };
+        let generation = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .generation(node)
+            .unwrap();
+        let request = |expanded, sequence, generation| PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence,
+                node: node.into(),
+                generation,
+                action: NodeAction::SetExpansion { expanded },
+                rows: 48,
+                width: WidthProfile::default(),
+            },
+        };
         owner.dispatch(request(true, 100, generation))?;
         let text = |owner: &SessionPresentation| -> Result<Vec<String>> {
-            Ok(owner.snapshot(&document)?.block.into_iter().flat_map(|block| block.text.wire_rows()
-                .into_iter().map(str::to_owned).collect::<Vec<_>>()).collect())
+            Ok(owner
+                .snapshot(&document)?
+                .block
+                .into_iter()
+                .flat_map(|block| {
+                    block
+                        .text
+                        .wire_rows()
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect::<Vec<_>>()
+                })
+                .collect())
         };
         assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
         let invalid = NodeRequest {
-            document: document.clone(), view: view.clone(), sequence: 101, node: node.into(), generation,
-            action: NodeAction::SetExpansion { expanded: false }, rows: 0, width: WidthProfile::default(),
+            document: document.clone(),
+            view: view.clone(),
+            sequence: 101,
+            node: node.into(),
+            generation,
+            action: NodeAction::SetExpansion { expanded: false },
+            rows: 0,
+            width: WidthProfile::default(),
         };
-        assert!(owner.dispatch(PresentationRequest::Node { request: invalid }).is_err());
-        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")), "invalid request changed the committed frame");
+        assert!(
+            owner
+                .dispatch(PresentationRequest::Node { request: invalid })
+                .is_err()
+        );
+        assert!(
+            text(&owner)?.iter().any(|row| row.contains("sixth")),
+            "invalid request changed the committed frame"
+        );
         owner.dispatch(request(false, 99, generation))?;
-        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")), "stale action changed expansion");
+        assert!(
+            text(&owner)?.iter().any(|row| row.contains("sixth")),
+            "stale action changed expansion"
+        );
         assert!(owner.dispatch(request(false, 101, generation + 1)).is_err());
-        owner.dispatch(PresentationRequest::Resize { document: document.clone(), view: view.clone(),
-            width: WidthProfile { columns: 65, ..WidthProfile::default() } })?;
+        owner.dispatch(PresentationRequest::Resize {
+            document: document.clone(),
+            view: view.clone(),
+            width: WidthProfile {
+                columns: 65,
+                ..WidthProfile::default()
+            },
+        })?;
         assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
         owner.dispatch(request(false, 102, generation))?;
         let snapshot = owner.snapshot(&document)?;
-        assert!(snapshot.block.iter().all(|block| block.id != BlockId("first:turn:1:tool:preview".into())));
-        assert!(!text(&owner)?.iter().any(|row| row.contains("hidden") || row.contains("sixth")));
+        assert!(
+            snapshot
+                .block
+                .iter()
+                .all(|block| block.id != BlockId("first:turn:1:tool:preview".into()))
+        );
+        assert!(
+            !text(&owner)?
+                .iter()
+                .any(|row| row.contains("hidden") || row.contains("sixth"))
+        );
         owner.dispatch(request(true, 103, generation))?;
         assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
         // Resizing reflows once. Node toggles use only their indexed subtree.
-        assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries + 1);
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.projected_entries,
+            projected_entries + 1
+        );
         owner.reconcile(Vec::new())?;
         owner.reconcile(vec![interaction_entry("first")])?;
-        assert!(owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap() > generation);
-        assert!(owner.dispatch(request(true, 104, generation)).is_err(), "retired node accepted an old action");
+        assert!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .sections
+                .nodes
+                .generation(node)
+                .unwrap()
+                > generation
+        );
+        assert!(
+            owner.dispatch(request(true, 104, generation)).is_err(),
+            "retired node accepted an old action"
+        );
         Ok(())
     }
 
@@ -2644,7 +4080,8 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: exchange.created_at_ms,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(), agent_by_id: HashMap::new(),
+                    check_runs: Vec::new(),
+                    agent_by_id: HashMap::new(),
                 }
             } else {
                 let child = agent_entry("child", vec![exchange.clone()], Vec::new());
@@ -2669,7 +4106,7 @@ mod tests {
                 WidthProfile::default(),
             )?;
             let mut event = BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: Some(ProviderAddress {
                     owner: None,
                     thread_id: "thread".into(),
@@ -2746,7 +4183,9 @@ mod tests {
         use crate::backend::{BackendEvent, ToolActivity, ToolActivityKind, TurnBoundary};
         use crate::exchange::{ExchangeNode, ExchangeState};
         let live = |identity: &str| -> Result<Exchange> {
-            let TimelineEntry::Exchange { exchange, .. } = interaction_entry(identity) else { unreachable!() };
+            let TimelineEntry::Exchange { exchange, .. } = interaction_entry(identity) else {
+                unreachable!()
+            };
             let mut raw = serde_json::to_value(exchange)?;
             raw["state"] = serde_json::json!("running");
             raw["completed_at_ms"] = serde_json::Value::Null;
@@ -2762,16 +4201,32 @@ mod tests {
         parent.node_list.clear();
         let mut run = crate::agent::Agent::pending("session", "explorer", "Inspect", 0);
         run.id = "child-run".into();
-        parent.node_list.push(ExchangeNode::AgentReference { agent: crate::agent::Delegation {
-            id: "delegation".into(), parent_exchange_id: parent.id.clone(), parent_turn_id: None,
-            child_agent_id: run.id.clone(), child_exchange_id: child.id.clone(),
-            task: child.prompt.clone(), created_at_ms: 0,
-        } });
+        parent.node_list.push(ExchangeNode::AgentReference {
+            agent: crate::agent::Delegation {
+                id: "delegation".into(),
+                parent_exchange_id: parent.id.clone(),
+                parent_turn_id: None,
+                child_agent_id: run.id.clone(),
+                child_exchange_id: child.id.clone(),
+                task: child.prompt.clone(),
+                created_at_ms: 0,
+            },
+        });
         let entry = |child: Exchange| TimelineEntry::Exchange {
-            id: parent.id.clone(), created_at_ms: 0, exchange: parent.clone(),
-            check_runs: Vec::new(), agent_by_id: HashMap::from([(run.id.clone(), TimelineEntry::AgentLifecycle {
-                id: run.id.clone(), created_at_ms: 0, run: run.clone(), exchange: vec![child], agent: Vec::new(),
-            })]),
+            id: parent.id.clone(),
+            created_at_ms: 0,
+            exchange: parent.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::from([(
+                run.id.clone(),
+                TimelineEntry::AgentLifecycle {
+                    id: run.id.clone(),
+                    created_at_ms: 0,
+                    run: run.clone(),
+                    exchange: vec![child],
+                    agent: Vec::new(),
+                },
+            )]),
         };
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![entry(child.clone())])?;
@@ -2779,30 +4234,72 @@ mod tests {
         let view = ViewId("view:child-fold".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let contents = |owner: &SessionPresentation| -> Result<String> {
-            Ok(owner.snapshot(&document)?.block.iter().flat_map(|block| block.text.wire_rows())
-                .collect::<Vec<_>>().join("\n"))
+            Ok(owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n"))
         };
         assert!(contents(&owner)?.contains("Read output"));
         assert!(!contents(&owner)?.contains("sixth"));
-        let generation = owner.open.as_ref().unwrap().sections.nodes.generation("delegation").unwrap();
-        let expand = |sequence| PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view: view.clone(), sequence, node: "delegation".into(), generation,
-            action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: WidthProfile::default(),
-        } };
+        let generation = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .generation("delegation")
+            .unwrap();
+        let expand = |sequence| PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence,
+                node: "delegation".into(),
+                generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 48,
+                width: WidthProfile::default(),
+            },
+        };
         owner.dispatch(expand(1))?;
-        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: Some(run.id.clone()) })?;
-        assert!(contents(&owner)?.contains("Prompt child") && !contents(&owner)?.contains("Prompt parent"));
-        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: None })?;
+        owner.dispatch(PresentationRequest::SelectAgent {
+            document: document.clone(),
+            run_id: Some(run.id.clone()),
+        })?;
+        assert!(
+            contents(&owner)?.contains("Prompt child")
+                && !contents(&owner)?.contains("Prompt parent")
+        );
+        owner.dispatch(PresentationRequest::SelectAgent {
+            document: document.clone(),
+            run_id: None,
+        })?;
         let mut event = BackendEvent {
-            received_at_ms: None, address: Some(child.turn[0].provider().clone()), turn_boundary: None,
-            kind: "tool".into(), text: None, data: serde_json::Value::Null,
-            activity: Some(ToolActivity { id: "tool".into(), kind: ToolActivityKind::Command,
-                title: "Read output".into(), output: Some("\nSTREAMED_CHILD_OUTPUT".into()),
-                output_delta: true, status: Some("inProgress".into()), change: Default::default() }),
-            summary: None, task_update: None,
+            received_at_ms: None,
+            address: Some(child.turn[0].provider().clone()),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::Value::Null,
+            activity: Some(ToolActivity {
+                id: "tool".into(),
+                kind: ToolActivityKind::Command,
+                title: "Read output".into(),
+                output: Some("\nSTREAMED_CHILD_OUTPUT".into()),
+                output_delta: true,
+                status: Some("inProgress".into()),
+                change: Default::default(),
+            }),
+            summary: None,
+            task_update: None,
         };
         child.observe_turn(&event, 2)?;
-        owner.append_tool_output(&child, &event)?.expect("child output patch");
+        owner
+            .append_tool_output(&child, &event)?
+            .expect("child output patch");
         assert!(!contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
         event.activity = None;
         event.kind = "assistant_message".into();
@@ -2812,26 +4309,59 @@ mod tests {
         owner.reconcile(vec![entry(child.clone())])?;
         assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
         event.text = None;
-        event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+        event.turn_boundary = Some(TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
         child.observe_turn(&event, 4)?;
         child.finish(ExchangeState::Complete, 4)?;
         owner.reconcile(vec![entry(child)])?;
         let completed = owner.snapshot(&document)?;
-        let heading = completed.block.iter().find(|block| block.id.0 == "delegation").unwrap();
-        assert_eq!(heading.metadata.node.as_ref().unwrap().display, forge_buffer::node::NodeDisplay::Heading);
+        let heading = completed
+            .block
+            .iter()
+            .find(|block| block.id.0 == "delegation")
+            .unwrap();
+        assert_eq!(
+            heading.metadata.node.as_ref().unwrap().display,
+            forge_buffer::node::NodeDisplay::Heading
+        );
         assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
         owner.dispatch(expand(2))?;
-        assert!(contents(&owner)?.contains("Prompt child") && contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
+        assert!(
+            contents(&owner)?.contains("Prompt child")
+                && contents(&owner)?.contains("CHILD_FINAL_RESPONSE")
+        );
         expand_sections(&mut owner, "view:child-fold")?;
         let tool_node = "child:turn:1:tool:tool";
-        let tool_generation = owner.open.as_ref().unwrap().sections.nodes.generation(tool_node).unwrap();
-        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
-            document: document.clone(), view: view.clone(), sequence: 100, node: tool_node.into(), generation: tool_generation,
-            action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: WidthProfile::default(),
-        } })?;
+        let tool_generation = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .sections
+            .nodes
+            .generation(tool_node)
+            .unwrap();
+        owner.dispatch(PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence: 100,
+                node: tool_node.into(),
+                generation: tool_generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 48,
+                width: WidthProfile::default(),
+            },
+        })?;
         assert!(contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
-        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: Some(run.id) })?;
-        assert!(contents(&owner)?.contains("Prompt child") && !contents(&owner)?.contains("Prompt parent"));
+        owner.dispatch(PresentationRequest::SelectAgent {
+            document: document.clone(),
+            run_id: Some(run.id),
+        })?;
+        assert!(
+            contents(&owner)?.contains("Prompt child")
+                && !contents(&owner)?.contains("Prompt parent")
+        );
         Ok(())
     }
 
@@ -2907,19 +4437,50 @@ mod tests {
                 .any(|block| block.id.0 == "main:prompt")
         );
         assert_eq!(selected.block.last().unwrap().id.0, "harness:staging");
-        assert!(selected.block.last().unwrap().text.wire_rows().iter()
-            .any(|row| row.contains("queued while selecting agent")));
+        assert!(
+            selected
+                .block
+                .last()
+                .unwrap()
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("queued while selecting agent"))
+        );
         let event = crate::backend::BackendEvent {
-            received_at_ms: None, address:Some(interaction.turn[0].provider().clone()),
-            turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":2}),
-            activity:Some(crate::backend::ToolActivity { id:"tool".into(),kind:crate::backend::ToolActivityKind::Command,
-                title:"Read output".into(),output:Some("\nscoped output".into()),status:Some("inProgress".into()),
-                output_delta:true,change:Default::default() }),summary:None,task_update:None };
-        interaction.observe_turn(&event,2)?;
-        owner.append_tool_output(&interaction,&event)?.expect("scoped output");
-        let update = owner.sync(&document,selected.revision)?;
-        assert!(update.snapshot.is_none() && update.patch.iter().all(|patch|patch.block_edit.is_empty()));
-        assert!(owner.open.as_ref().unwrap().sections.nodes.tool["child:turn:1:tool"].preview(true)?.row.contains(&"scoped output"));
+            received_at_ms: None,
+            address: Some(interaction.turn[0].provider().clone()),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::json!({"emittedAtMs":2}),
+            activity: Some(crate::backend::ToolActivity {
+                id: "tool".into(),
+                kind: crate::backend::ToolActivityKind::Command,
+                title: "Read output".into(),
+                output: Some("\nscoped output".into()),
+                status: Some("inProgress".into()),
+                output_delta: true,
+                change: Default::default(),
+            }),
+            summary: None,
+            task_update: None,
+        };
+        interaction.observe_turn(&event, 2)?;
+        owner
+            .append_tool_output(&interaction, &event)?
+            .expect("scoped output");
+        let update = owner.sync(&document, selected.revision)?;
+        assert!(
+            update.snapshot.is_none()
+                && update.patch.iter().all(|patch| patch.block_edit.is_empty())
+        );
+        assert!(
+            owner.open.as_ref().unwrap().sections.nodes.tool["child:turn:1:tool"]
+                .preview(true)?
+                .row
+                .contains(&"scoped output")
+        );
         owner.reconcile(vec![interaction_entry("other-main"), agent])?;
         assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         owner.dispatch(PresentationRequest::SelectAgent {
@@ -2941,29 +4502,69 @@ mod tests {
     #[test]
     fn compaction_counter_refreshes_without_provider_events() -> Result<()> {
         let started_at_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as i64;
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
-            id: "session:status".into(), created_at_ms: 0,
+        owner.initialize(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
+            id: "session:status".into(),
+            created_at_ms: 0,
             status: SessionPhase::Compacting { started_at_ms },
         }])?;
         let document = DocumentId("transcript:compaction-timer".into());
-        let opened = owner.open(document.clone(), ViewId("view:compaction-timer".into()),
-            WidthProfile::default())?;
-        let before = opened.transcript.block[0].text.row(1).unwrap()
-            .strip_prefix("Compacting · ").unwrap().trim_end_matches('s').parse::<u64>()?;
+        let opened = owner.open(
+            document.clone(),
+            ViewId("view:compaction-timer".into()),
+            WidthProfile::default(),
+        )?;
+        let before = opened.transcript.block[0]
+            .text
+            .row(1)
+            .unwrap()
+            .strip_prefix("Compacting · ")
+            .unwrap()
+            .trim_end_matches('s')
+            .parse::<u64>()?;
         let timeline_revision = owner.revision();
         std::thread::sleep(std::time::Duration::from_millis(1_100));
         let update = owner.sync(&document, opened.transcript.revision)?;
-        assert!(!update.patch.is_empty(), "elapsed time did not produce a document patch");
+        assert!(
+            !update.patch.is_empty(),
+            "elapsed time did not produce a document patch"
+        );
         let refreshed = owner.snapshot(&document)?;
-        let after = refreshed.block[0].text.row(1).unwrap()
-            .strip_prefix("Compacting · ").unwrap().trim_end_matches('s').parse::<u64>()?;
+        let after = refreshed.block[0]
+            .text
+            .row(1)
+            .unwrap()
+            .strip_prefix("Compacting · ")
+            .unwrap()
+            .trim_end_matches('s')
+            .parse::<u64>()?;
         assert!(after > before, "compaction counter did not advance");
-        assert_eq!(owner.revision(), timeline_revision, "timer changed durable timeline state");
-        assert!(refreshed.block[0].metadata.status.as_ref().unwrap().animated);
+        assert_eq!(
+            owner.revision(),
+            timeline_revision,
+            "timer changed durable timeline state"
+        );
+        assert!(
+            refreshed.block[0]
+                .metadata
+                .status
+                .as_ref()
+                .unwrap()
+                .animated
+        );
         owner.update_live(None, None, SessionPhase::Idle, true)?;
-        assert!(!owner.snapshot(&document)?.block.iter().any(|block| block.id.0 == "session:status"));
+        assert!(
+            !owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .any(|block| block.id.0 == "session:status")
+        );
         Ok(())
     }
 
@@ -2972,11 +4573,15 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![
             interaction_entry("completed"),
-            TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+            TimelineEntry::Status {
+                checks: None,
+                status_thoughts: true,
+                agent_count: 0,
                 id: "status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
-                    duration_ms: 0, started_at_ms: Some(0),
+                    duration_ms: 0,
+                    started_at_ms: Some(0),
                     activity: crate::session::state_machine::WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: None,
@@ -3064,7 +4669,10 @@ mod tests {
     #[test]
     fn active_projection_preserves_pending_submission() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::Idle,
@@ -3076,7 +4684,10 @@ mod tests {
             WidthProfile::default(),
         )?;
         owner.begin_submission(&document, 1, "draft")?;
-        owner.reconcile(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -3096,7 +4707,10 @@ mod tests {
     #[test]
     fn hidden_transcript_keeps_streaming_until_a_new_width_owner_attaches() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -3111,7 +4725,10 @@ mod tests {
             document: document.clone(),
             view: ViewId("view:old".into()),
         })?;
-        owner.reconcile(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+        owner.reconcile(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 3 },
@@ -3160,7 +4777,10 @@ mod tests {
     #[test]
     fn layout_follows_the_oldest_live_view_without_changing_timeline_revision() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status { checks: None, status_thoughts: true, agent_count: 0,
+        owner.initialize(vec![TimelineEntry::Status {
+            checks: None,
+            status_thoughts: true,
+            agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },

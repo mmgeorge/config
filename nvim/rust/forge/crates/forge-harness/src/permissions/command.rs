@@ -32,22 +32,38 @@ pub struct CommandDisplay {
 impl CommandDisplay {
     /// Summarizes literal file operations without changing execution or approval input.
     pub(crate) fn summary(&self) -> Option<String> {
-        if self.source.chars().any(|character| matches!(character,
-            '\n' | '\r' | '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')' | '{' | '}')) {
+        if self.source.chars().any(|character| {
+            matches!(
+                character,
+                '\n' | '\r' | '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')' | '{' | '}'
+            )
+        }) {
             return None;
         }
         let tokens = shell_tokens(&self.source, self.shell).ok()?;
         let command = tokens.first()?.text.as_str();
-        let command = if self.shell == CommandShell::PowerShell { command.to_ascii_lowercase() }
-            else { command.to_owned() };
-        let arguments: Vec<&str> = tokens.iter().skip(1).map(|token| token.text.as_str()).collect();
+        let command = if self.shell == CommandShell::PowerShell {
+            command.to_ascii_lowercase()
+        } else {
+            command.to_owned()
+        };
+        let arguments: Vec<&str> = tokens
+            .iter()
+            .skip(1)
+            .map(|token| token.text.as_str())
+            .collect();
         match command.as_str() {
             "get-content" | "cat" | "head" | "tail" => read_summary(&command, &arguments),
             "get-childitem" | "ls" => list_summary(&command, &arguments, self.shell),
             "select-string" | "grep" => search_summary(&command, &arguments),
             "open" if self.shell == CommandShell::Nushell => read_summary(&command, &arguments),
-            "glob" if self.shell == CommandShell::Nushell && arguments.len() == 1
-                && !arguments[0].starts_with('-') => Some(format!("Find files · {}", arguments[0])),
+            "glob"
+                if self.shell == CommandShell::Nushell
+                    && arguments.len() == 1
+                    && !arguments[0].starts_with('-') =>
+            {
+                Some(format!("Find files · {}", arguments[0]))
+            }
             _ => None,
         }
     }
@@ -70,16 +86,28 @@ fn read_summary(command: &str, arguments: &[&str]) -> Option<String> {
     let mut raw = false;
     let mut arguments = arguments.iter().copied();
     while let Some(argument) = arguments.next() {
-        let option = if command == "get-content" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        let option = if command == "get-content" {
+            argument.to_ascii_lowercase()
+        } else {
+            argument.to_owned()
+        };
         match (command, option.as_str()) {
             ("get-content", "-path" | "-literalpath") => {
-                if path.is_some() { return None; }
+                if path.is_some() {
+                    return None;
+                }
                 path = Some(arguments.next()?);
             }
             ("get-content", "-totalcount" | "-tail") | ("head" | "tail", "-n" | "--lines") => {
-                if range.is_some() { return None; }
+                if range.is_some() {
+                    return None;
+                }
                 let count = arguments.next()?.parse::<u64>().ok()?;
-                let position = if command == "tail" || argument.eq_ignore_ascii_case("-tail") { "last" } else { "first" };
+                let position = if command == "tail" || argument.eq_ignore_ascii_case("-tail") {
+                    "last"
+                } else {
+                    "first"
+                };
                 range = Some(format!("{position} {count} lines"));
             }
             ("get-content", "-raw") | ("open", "--raw" | "-r") => raw = true,
@@ -88,10 +116,21 @@ fn read_summary(command: &str, arguments: &[&str]) -> Option<String> {
         }
     }
     let path = path.filter(|path| !path.is_empty())?;
-    if raw && range.is_some() { return None; }
-    let range = range.or_else(|| matches!(command, "head" | "tail")
-        .then(|| format!("{} 10 lines", if command == "head" { "first" } else { "last" })));
-    let suffix = range.map_or_else(|| if raw { " · raw".into() } else { String::new() }, |range| format!(" · {range}"));
+    if raw && range.is_some() {
+        return None;
+    }
+    let range = range.or_else(|| {
+        matches!(command, "head" | "tail").then(|| {
+            format!(
+                "{} 10 lines",
+                if command == "head" { "first" } else { "last" }
+            )
+        })
+    });
+    let suffix = range.map_or_else(
+        || if raw { " · raw".into() } else { String::new() },
+        |range| format!(" · {range}"),
+    );
     Some(format!("Read · {path}{suffix}"))
 }
 
@@ -103,18 +142,29 @@ fn list_summary(command: &str, arguments: &[&str], shell: CommandShell) -> Optio
     let mut filter = None;
     let mut arguments = arguments.iter().copied();
     while let Some(argument) = arguments.next() {
-        let option = if command == "get-childitem" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        let option = if command == "get-childitem" {
+            argument.to_ascii_lowercase()
+        } else {
+            argument.to_owned()
+        };
         match (command, option.as_str()) {
             ("get-childitem", "-path" | "-literalpath") => {
-                if path.is_some() { return None; }
+                if path.is_some() {
+                    return None;
+                }
                 path = Some(arguments.next()?);
             }
             ("get-childitem", "-recurse") => recursive = true,
             ("get-childitem", "-force") | ("ls", "-a" | "--all") => all = true,
             ("ls", "-l") if shell != CommandShell::Nushell => long = true,
-            ("ls", "-la" | "-al") if shell != CommandShell::Nushell => { all = true; long = true; }
+            ("ls", "-la" | "-al") if shell != CommandShell::Nushell => {
+                all = true;
+                long = true;
+            }
             ("get-childitem", "-filter") => {
-                if filter.is_some() { return None; }
+                if filter.is_some() {
+                    return None;
+                }
                 filter = Some(arguments.next()?);
             }
             _ if !argument.starts_with('-') && path.is_none() => path = Some(argument),
@@ -122,10 +172,18 @@ fn list_summary(command: &str, arguments: &[&str], shell: CommandShell) -> Optio
         }
     }
     let mut title = format!("List · {}", path.unwrap_or("."));
-    if recursive { title.push_str(" · recursive"); }
-    if all { title.push_str(" · all"); }
-    if long { title.push_str(" · long"); }
-    if let Some(filter) = filter { title.push_str(&format!(" · {filter}")); }
+    if recursive {
+        title.push_str(" · recursive");
+    }
+    if all {
+        title.push_str(" · all");
+    }
+    if long {
+        title.push_str(" · long");
+    }
+    if let Some(filter) = filter {
+        title.push_str(&format!(" · {filter}"));
+    }
     Some(title)
 }
 
@@ -135,25 +193,43 @@ fn search_summary(command: &str, arguments: &[&str]) -> Option<String> {
     let mut line_numbers = false;
     let mut arguments = arguments.iter().copied();
     while let Some(argument) = arguments.next() {
-        let option = if command == "select-string" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        let option = if command == "select-string" {
+            argument.to_ascii_lowercase()
+        } else {
+            argument.to_owned()
+        };
         match (command, option.as_str()) {
             ("select-string", "-path" | "-literalpath") => {
-                if path.is_some() { return None; }
+                if path.is_some() {
+                    return None;
+                }
                 path = Some(arguments.next()?);
             }
             ("select-string", "-pattern") => {
-                if pattern.is_some() { return None; }
+                if pattern.is_some() {
+                    return None;
+                }
                 pattern = Some(arguments.next()?);
             }
             ("grep", "-n" | "--line-number") if pattern.is_none() => line_numbers = true,
-            ("grep", _) if !argument.starts_with('-') && pattern.is_none() => pattern = Some(argument),
+            ("grep", _) if !argument.starts_with('-') && pattern.is_none() => {
+                pattern = Some(argument)
+            }
             ("grep", _) if !argument.starts_with('-') && path.is_none() => path = Some(argument),
             _ => return None,
         }
     }
-    let label = if command == "grep" { "Search" } else { "Search files" };
+    let label = if command == "grep" {
+        "Search"
+    } else {
+        "Search files"
+    };
     let pattern = serde_json::to_string(pattern?).ok()?;
-    Some(format!("{label} · {pattern} · {}{}", path?, if line_numbers { " · line numbers" } else { "" }))
+    Some(format!(
+        "{label} · {pattern} · {}{}",
+        path?,
+        if line_numbers { " · line numbers" } else { "" }
+    ))
 }
 
 /// Removes shell launchers from display text without changing permission or execution input.
@@ -315,11 +391,15 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
             let next = characters.peek().map(|(_, character)| *character);
             anyhow::ensure!(
                 !(matches!(shell, CommandShell::Bash | CommandShell::Zsh)
-                    && character == '$' && matches!(next, Some('\'' | '"')))
-                && !(shell == CommandShell::PowerShell
-                    && ((character == '@' && matches!(next, Some('\'' | '"')))
-                        || matches!(character, '‘' | '’' | '“' | '”')))
-                && !(shell == CommandShell::Nushell && !started && character == 'r' && next == Some('#')),
+                    && character == '$'
+                    && matches!(next, Some('\'' | '"')))
+                    && !(shell == CommandShell::PowerShell
+                        && ((character == '@' && matches!(next, Some('\'' | '"')))
+                            || matches!(character, '‘' | '’' | '“' | '”')))
+                    && !(shell == CommandShell::Nushell
+                        && !started
+                        && character == 'r'
+                        && next == Some('#')),
                 "unsupported shell string encoding"
             );
         }
@@ -392,14 +472,22 @@ fn decode_shell_escape(
     shell: CommandShell,
     at_word_boundary: bool,
 ) -> Result<(Option<char>, usize)> {
-    let (offset, character) = characters.next().ok_or_else(|| anyhow::anyhow!("unfinished shell escape"))?;
+    let (offset, character) = characters
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("unfinished shell escape"))?;
     let mut end = offset + character.len_utf8();
-    if character == '\n' && (matches!(shell, CommandShell::Bash | CommandShell::Zsh)
-        || (shell == CommandShell::PowerShell && at_word_boundary)) {
+    if character == '\n'
+        && (matches!(shell, CommandShell::Bash | CommandShell::Zsh)
+            || (shell == CommandShell::PowerShell && at_word_boundary))
+    {
         return Ok((None, end));
     }
-    if shell == CommandShell::PowerShell && at_word_boundary && character == '\r'
-        && characters.peek().is_some_and(|(_, character)| *character == '\n')
+    if shell == CommandShell::PowerShell
+        && at_word_boundary
+        && character == '\r'
+        && characters
+            .peek()
+            .is_some_and(|(_, character)| *character == '\n')
     {
         let (offset, _) = characters.next().unwrap();
         return Ok((None, offset + 1));
@@ -418,20 +506,41 @@ fn decode_shell_escape(
         't' => '\t',
         'v' if shell == CommandShell::PowerShell => '\u{b}',
         'u' => {
-            anyhow::ensure!(characters.next().is_some_and(|(_, character)| character == '{'), "invalid Unicode shell escape");
+            anyhow::ensure!(
+                characters
+                    .next()
+                    .is_some_and(|(_, character)| character == '{'),
+                "invalid Unicode shell escape"
+            );
             let mut digits = String::new();
             loop {
-                let (offset, character) = characters.next().ok_or_else(|| anyhow::anyhow!("unfinished Unicode shell escape"))?;
+                let (offset, character) = characters
+                    .next()
+                    .ok_or_else(|| anyhow::anyhow!("unfinished Unicode shell escape"))?;
                 end = offset + character.len_utf8();
-                if character == '}' { break; }
-                anyhow::ensure!(character.is_ascii_hexdigit() && digits.len() < 6, "invalid Unicode shell escape");
+                if character == '}' {
+                    break;
+                }
+                anyhow::ensure!(
+                    character.is_ascii_hexdigit() && digits.len() < 6,
+                    "invalid Unicode shell escape"
+                );
                 digits.push(character);
             }
-            u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32)
+            u32::from_str_radix(&digits, 16)
+                .ok()
+                .and_then(char::from_u32)
                 .ok_or_else(|| anyhow::anyhow!("invalid Unicode shell escape"))?
         }
-        character if shell == CommandShell::PowerShell || matches!(character,
-            '\\' | '"' | '\'' | '/' | '(' | ')' | '{' | '}' | '$' | '^' | '#' | '|' | '~') => character,
+        character
+            if shell == CommandShell::PowerShell
+                || matches!(
+                    character,
+                    '\\' | '"' | '\'' | '/' | '(' | ')' | '{' | '}' | '$' | '^' | '#' | '|' | '~'
+                ) =>
+        {
+            character
+        }
         _ => anyhow::bail!("invalid Nushell escape"),
     };
     Ok((Some(decoded), end))
@@ -448,7 +557,9 @@ pub fn normalize_command_in(command: &str, shell: CommandShell) -> CommandNormal
 fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> CommandNormalization {
     if depth >= 16 {
         return CommandNormalization {
-            failure: Some(CommandAnalysisFailure::Incomplete("nested shell analysis budget exhausted".into())),
+            failure: Some(CommandAnalysisFailure::Incomplete(
+                "nested shell analysis budget exhausted".into(),
+            )),
             ..Default::default()
         };
     }
@@ -599,25 +710,81 @@ mod test {
     #[test]
     fn summarizes_simple_file_operations_in_each_shell() {
         for (shell, source, expected) in [
-            (CommandShell::PowerShell, "Get-Content src/main.rs", "Read · src/main.rs"),
-            (CommandShell::PowerShell, "Get-Content -LiteralPath 'src/main file.rs' -TotalCount 40", "Read · src/main file.rs · first 40 lines"),
-            (CommandShell::PowerShell, "Get-Content src/main.rs -Tail 20", "Read · src/main.rs · last 20 lines"),
+            (
+                CommandShell::PowerShell,
+                "Get-Content src/main.rs",
+                "Read · src/main.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "Get-Content -LiteralPath 'src/main file.rs' -TotalCount 40",
+                "Read · src/main file.rs · first 40 lines",
+            ),
+            (
+                CommandShell::PowerShell,
+                "Get-Content src/main.rs -Tail 20",
+                "Read · src/main.rs · last 20 lines",
+            ),
             (CommandShell::PowerShell, "Get-ChildItem src", "List · src"),
-            (CommandShell::PowerShell, "Get-ChildItem src -Recurse -Filter *.rs", "List · src · recursive · *.rs"),
-            (CommandShell::PowerShell, "Select-String -Path src/*.rs -Pattern TODO", "Search files · \"TODO\" · src/*.rs"),
-            (CommandShell::PowerShell, "GET-CONTENT -PATH src/main.rs -TOTALCOUNT 40", "Read · src/main.rs · first 40 lines"),
+            (
+                CommandShell::PowerShell,
+                "Get-ChildItem src -Recurse -Filter *.rs",
+                "List · src · recursive · *.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "Select-String -Path src/*.rs -Pattern TODO",
+                "Search files · \"TODO\" · src/*.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "GET-CONTENT -PATH src/main.rs -TOTALCOUNT 40",
+                "Read · src/main.rs · first 40 lines",
+            ),
             (CommandShell::Bash, "cat src/main.rs", "Read · src/main.rs"),
-            (CommandShell::Bash, "head -n 40 src/main.rs", "Read · src/main.rs · first 40 lines"),
-            (CommandShell::Bash, "tail -n 20 src/main.rs", "Read · src/main.rs · last 20 lines"),
+            (
+                CommandShell::Bash,
+                "head -n 40 src/main.rs",
+                "Read · src/main.rs · first 40 lines",
+            ),
+            (
+                CommandShell::Bash,
+                "tail -n 20 src/main.rs",
+                "Read · src/main.rs · last 20 lines",
+            ),
             (CommandShell::Bash, "ls -la src", "List · src · all · long"),
-            (CommandShell::Bash, "grep -n TODO src/main.rs", "Search · \"TODO\" · src/main.rs · line numbers"),
-            (CommandShell::Nushell, "open --raw src/main.rs", "Read · src/main.rs · raw"),
+            (
+                CommandShell::Bash,
+                "grep -n TODO src/main.rs",
+                "Search · \"TODO\" · src/main.rs · line numbers",
+            ),
+            (
+                CommandShell::Nushell,
+                "open --raw src/main.rs",
+                "Read · src/main.rs · raw",
+            ),
             (CommandShell::Nushell, "ls -a src", "List · src · all"),
-            (CommandShell::Nushell, "glob 'src/**/*.rs'", "Find files · src/**/*.rs"),
-            (CommandShell::PowerShell, "bash -lc 'cat src/main.rs'", "Read · src/main.rs"),
-            (CommandShell::PowerShell, "nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
+            (
+                CommandShell::Nushell,
+                "glob 'src/**/*.rs'",
+                "Find files · src/**/*.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "bash -lc 'cat src/main.rs'",
+                "Read · src/main.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "nu -c 'open --raw src/main.rs'",
+                "Read · src/main.rs · raw",
+            ),
         ] {
-            assert_eq!(display_command(source, shell).summary().as_deref(), Some(expected), "{source}");
+            assert_eq!(
+                display_command(source, shell).summary().as_deref(),
+                Some(expected),
+                "{source}"
+            );
         }
     }
 
@@ -627,8 +794,14 @@ mod test {
             (CommandShell::PowerShell, "rg -n TODO src"),
             (CommandShell::Bash, "rg -n TODO src"),
             (CommandShell::Nushell, "rg -n TODO src"),
-            (CommandShell::PowerShell, "Get-Content src/main.rs; Remove-Item other.rs"),
-            (CommandShell::PowerShell, "Get-Content src/main.rs | Select-Object -First 5"),
+            (
+                CommandShell::PowerShell,
+                "Get-Content src/main.rs; Remove-Item other.rs",
+            ),
+            (
+                CommandShell::PowerShell,
+                "Get-Content src/main.rs | Select-Object -First 5",
+            ),
             (CommandShell::PowerShell, "Get-Content src/main.rs -Unknown"),
             (CommandShell::Bash, "cat src/main.rs && touch other.rs"),
             (CommandShell::Bash, "cat $(find src)"),
@@ -757,10 +930,18 @@ mod test {
         );
         assert!(nested.failure.is_none());
         assert!(nested.invocation_list.len() >= 3);
-        assert!(normalize_command_in(
-            "ForEach-Object { Get-ChildItem; Write-Output 'done'",
-            CommandShell::PowerShell,
-        ).failure.is_some());
-        assert!(normalize_command_in("tool (one]", CommandShell::PowerShell).failure.is_some());
+        assert!(
+            normalize_command_in(
+                "ForEach-Object { Get-ChildItem; Write-Output 'done'",
+                CommandShell::PowerShell,
+            )
+            .failure
+            .is_some()
+        );
+        assert!(
+            normalize_command_in("tool (one]", CommandShell::PowerShell)
+                .failure
+                .is_some()
+        );
     }
 }

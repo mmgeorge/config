@@ -370,7 +370,9 @@ fn append_notes(output: &mut String, reply: &Reply, workspace: &Path, maximum: u
     }
     if rendered < warnings.len() {
         let summary = "partial: Additional coverage warnings omitted.\n";
-        if output.len() + summary.len() <= maximum { output.push_str(summary); }
+        if output.len() + summary.len() <= maximum {
+            output.push_str(summary);
+        }
     }
 }
 

@@ -41,21 +41,43 @@ impl ControlServer {
 }
 
 impl Drop for ControlServer {
-    fn drop(&mut self) { self.driver.abort(); }
+    fn drop(&mut self) {
+        self.driver.abort();
+    }
 }
 
-async fn serve(socket: tokio::net::TcpStream, path: &str, handler: Arc<dyn AcpHandler>) -> Result<()> {
-    let (mut reader, request) = tokio::time::timeout(std::time::Duration::from_secs(10), read_request(socket, path))
-        .await.context("control request input exceeded 10 seconds")??;
-    let Some(request) = request else { return Ok(()) };
+async fn serve(
+    socket: tokio::net::TcpStream,
+    path: &str,
+    handler: Arc<dyn AcpHandler>,
+) -> Result<()> {
+    let (mut reader, request) = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        read_request(socket, path),
+    )
+    .await
+    .context("control request input exceeded 10 seconds")??;
+    let Some(request) = request else {
+        return Ok(());
+    };
     respond(&mut reader, request, handler).await
 }
 
-async fn read_request(socket: tokio::net::TcpStream, path: &str) -> Result<(BufReader<tokio::net::TcpStream>, Option<Value>)> {
+async fn read_request(
+    socket: tokio::net::TcpStream,
+    path: &str,
+) -> Result<(BufReader<tokio::net::TcpStream>, Option<Value>)> {
     let mut reader = BufReader::new(socket);
     let mut line = read_header_line(&mut reader, 8192).await?;
-    ensure!(line.split_whitespace().nth(1) == Some(path), "control endpoint mismatch");
-    let method = line.split_whitespace().next().unwrap_or_default().to_owned();
+    ensure!(
+        line.split_whitespace().nth(1) == Some(path),
+        "control endpoint mismatch"
+    );
+    let method = line
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_owned();
     let mut length = None;
     let mut header_bytes = line.len();
     loop {
@@ -64,9 +86,14 @@ async fn read_request(socket: tokio::net::TcpStream, path: &str) -> Result<(BufR
         ensure!(bytes > 0, "control request ended before headers");
         header_bytes += bytes;
         ensure!(header_bytes <= 8192, "control headers exceed 8192 bytes");
-        if line == "\r\n" || line == "\n" { break; }
+        if line == "\r\n" || line == "\n" {
+            break;
+        }
         if let Some((name, value)) = line.split_once(':')
-            && name.eq_ignore_ascii_case("content-length") { length = Some(value.trim().parse::<usize>()?); }
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            length = Some(value.trim().parse::<usize>()?);
+        }
     }
     if method != "POST" {
         reader.get_mut().write_all(b"HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
@@ -79,37 +106,67 @@ async fn read_request(socket: tokio::net::TcpStream, path: &str) -> Result<(BufR
     Ok((reader, Some(request)))
 }
 
-async fn read_header_line(reader: &mut BufReader<tokio::net::TcpStream>, remaining: usize) -> Result<String> {
+async fn read_header_line(
+    reader: &mut BufReader<tokio::net::TcpStream>,
+    remaining: usize,
+) -> Result<String> {
     let mut bytes = Vec::new();
-    (&mut *reader).take((remaining + 1) as u64).read_until(b'\n', &mut bytes).await?;
-    ensure!(bytes.len() <= remaining, "control headers exceed 8192 bytes");
+    (&mut *reader)
+        .take((remaining + 1) as u64)
+        .read_until(b'\n', &mut bytes)
+        .await?;
+    ensure!(
+        bytes.len() <= remaining,
+        "control headers exceed 8192 bytes"
+    );
     Ok(String::from_utf8(bytes)?)
 }
 
-async fn respond(reader: &mut BufReader<tokio::net::TcpStream>, request: Value, handler: Arc<dyn AcpHandler>) -> Result<()> {
+async fn respond(
+    reader: &mut BufReader<tokio::net::TcpStream>,
+    request: Value,
+    handler: Arc<dyn AcpHandler>,
+) -> Result<()> {
     let Some(id) = request.get("id") else {
-        reader.get_mut().write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await?;
+        reader
+            .get_mut()
+            .write_all(b"HTTP/1.1 202 Accepted\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await?;
         return Ok(());
     };
     let result = match request["method"].as_str().unwrap_or_default() {
-        "initialize" => Ok(json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
-            "serverInfo":{"name":"forge-harness-control","version":"1"}})),
+        "initialize" => Ok(
+            json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
+            "serverInfo":{"name":"forge-harness-control","version":"1"}}),
+        ),
         "ping" => Ok(json!({})),
-        "tools/list" => handler.request("forge/tools",json!({})).await,
+        "tools/list" => handler.request("forge/tools", json!({})).await,
         "tools/call" => {
-            match handler.request("forge/control", request["params"].clone()).await {
-                Ok(value) => Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}]})),
-                Err(error) => Ok(json!({"isError":true,"content":[{"type":"text","text":format!("{error:#}")}]})),
+            match handler
+                .request("forge/control", request["params"].clone())
+                .await
+            {
+                Ok(value) => {
+                    Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}]}))
+                }
+                Err(error) => Ok(
+                    json!({"isError":true,"content":[{"type":"text","text":format!("{error:#}")}]}),
+                ),
             }
         }
         _ => Err(anyhow::anyhow!("unsupported MCP control method")),
     };
     let response = match result {
         Ok(result) => json!({"jsonrpc":"2.0","id":id,"result":result}),
-        Err(error) => json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":error.to_string()}}),
+        Err(error) => {
+            json!({"jsonrpc":"2.0","id":id,"error":{"code":-32601,"message":error.to_string()}})
+        }
     };
     let body = serde_json::to_vec(&response)?;
-    let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    let header = format!(
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
     reader.get_mut().write_all(header.as_bytes()).await?;
     reader.get_mut().write_all(&body).await?;
     Ok(())
@@ -124,10 +181,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let content = "λ".repeat(1024 * 1024);
-        let body = serde_json::to_vec(&json!({"method":"tools/call","params":{"content":content}}))?;
+        let body =
+            serde_json::to_vec(&json!({"method":"tools/call","params":{"content":content}}))?;
         let sender = tokio::spawn(async move {
             let mut socket = tokio::net::TcpStream::connect(address).await?;
-            let header = format!("POST /control HTTP/1.1\r\nContent-Length: {}\r\n\r\n", body.len());
+            let header = format!(
+                "POST /control HTTP/1.1\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
             socket.write_all(header.as_bytes()).await?;
             socket.write_all(&body).await?;
             Ok::<_, anyhow::Error>(())

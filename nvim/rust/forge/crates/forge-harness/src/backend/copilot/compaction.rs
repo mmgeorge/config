@@ -76,9 +76,17 @@ impl CompactionMonitor {
         trace: Arc<crate::trace::TraceStore>,
         harness_session_id: String,
     ) -> Self {
-        let mut subscription = super::event_stream::SessionEventStream::new(session, |event| {
-            matches!(event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
-        }, trace, harness_session_id);
+        let mut subscription = super::event_stream::SessionEventStream::new(
+            session,
+            |event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.compaction_start" | "session.compaction_complete"
+                )
+            },
+            trace,
+            harness_session_id,
+        );
         let manual = Arc::clone(&subscription_state.manual);
         let correlation = Arc::clone(&manual);
         let thread_id = session.id().to_string();

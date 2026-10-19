@@ -70,8 +70,7 @@ impl<'source> UnifiedPatch<'source> {
                     .file
                     .last_mut()
                     .ok_or(PatchParseError("saved patch hunk has no file"))?;
-                file.hunk
-                    .push(PatchHunk::parse(line, &mut lines)?);
+                file.hunk.push(PatchHunk::parse(line, &mut lines)?);
             } else if line.starts_with("diff --cc ")
                 || line.starts_with("diff --combined ")
                 || line.starts_with("@@@")
@@ -119,7 +118,6 @@ impl<'source> UnifiedPatch<'source> {
         }
         Ok(result)
     }
-
 }
 
 #[derive(Debug)]
@@ -289,9 +287,7 @@ fn decode_path(text: &str) -> Result<String, PatchParseError> {
         return Err(PatchParseError("empty saved patch path"));
     }
     if text.contains('\0') {
-        return Err(PatchParseError(
-            "saved patch path contains NUL",
-        ));
+        return Err(PatchParseError("saved patch path contains NUL"));
     }
     if !text.starts_with('"') {
         return Ok(text.to_owned());
@@ -466,6 +462,11 @@ mod tests {
             262_145,
             "+x\n".repeat(262_145)
         );
-        assert_eq!(UnifiedPatch::parse(&rows).unwrap().file[0].hunk[0].row.len(), 262_145);
+        assert_eq!(
+            UnifiedPatch::parse(&rows).unwrap().file[0].hunk[0]
+                .row
+                .len(),
+            262_145
+        );
     }
 }

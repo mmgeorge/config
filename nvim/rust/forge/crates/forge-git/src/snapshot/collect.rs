@@ -16,7 +16,6 @@ use crate::{
 
 use super::{ObservationTiming, PathRecord};
 
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeadState {
     Unborn {
@@ -724,7 +723,13 @@ mod tests {
             )
             .unwrap();
         }
-        assert_eq!(read_index_stamp(&index, &mut || Ok(())).unwrap().shared.len(), 257);
+        assert_eq!(
+            read_index_stamp(&index, &mut || Ok(()))
+                .unwrap()
+                .shared
+                .len(),
+            257
+        );
     }
 
     #[test]

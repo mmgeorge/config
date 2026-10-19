@@ -707,10 +707,15 @@ fn parser_structural_guards_fail_closed() {
                 &format!("{}probe{}", "(".repeat(100), ")".repeat(100)),
                 shell
             )
-            .failure.is_some()
+            .failure
+            .is_some()
         );
     }
-    assert!(normalize_command_in("probe", CommandShell::Unknown).failure.is_some());
+    assert!(
+        normalize_command_in("probe", CommandShell::Unknown)
+            .failure
+            .is_some()
+    );
 }
 
 #[test]

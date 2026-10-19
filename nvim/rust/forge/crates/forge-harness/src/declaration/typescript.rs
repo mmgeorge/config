@@ -93,20 +93,64 @@ impl DeclarationResolver {
                 );
             }
         }
-        let globals = self.file.values().filter_map(|global| {
-            global.index.symbol.iter().find(|symbol| symbol.global && symbol.scope.is_empty()
-                && symbol.name == reference.path[0]
-                && if reference.value_namespace { symbol.value_namespace } else { symbol.type_namespace })
-                .map(|symbol| (global.path.clone(), symbol.clone()))
-        }).collect::<Vec<_>>();
-        let results = globals.into_iter().map(|(path, symbol)| {
-            if reference.path.len() == 1 { resolved(&self.file[&path], &symbol) }
-            else { self.ts_member(&path, &[symbol.name], &reference.path[1..], reference.value_namespace, false, visited) }
-        }).collect();
-        let internal = self.file.values().any(|candidate| candidate.index.symbol.iter()
-            .any(|symbol| symbol.name == reference.path[0]));
-        combine(results, || if internal { invalid("planned declaration is not visible in this scope") }
-            else { unverified("Unbound global or external references are unchecked during planning") }, false)
+        let globals = self
+            .file
+            .values()
+            .filter_map(|global| {
+                global
+                    .index
+                    .symbol
+                    .iter()
+                    .find(|symbol| {
+                        symbol.global
+                            && symbol.scope.is_empty()
+                            && symbol.name == reference.path[0]
+                            && if reference.value_namespace {
+                                symbol.value_namespace
+                            } else {
+                                symbol.type_namespace
+                            }
+                    })
+                    .map(|symbol| (global.path.clone(), symbol.clone()))
+            })
+            .collect::<Vec<_>>();
+        let results = globals
+            .into_iter()
+            .map(|(path, symbol)| {
+                if reference.path.len() == 1 {
+                    resolved(&self.file[&path], &symbol)
+                } else {
+                    self.ts_member(
+                        &path,
+                        &[symbol.name],
+                        &reference.path[1..],
+                        reference.value_namespace,
+                        false,
+                        visited,
+                    )
+                }
+            })
+            .collect();
+        let internal = self.file.values().any(|candidate| {
+            candidate
+                .index
+                .symbol
+                .iter()
+                .any(|symbol| symbol.name == reference.path[0])
+        });
+        combine(
+            results,
+            || {
+                if internal {
+                    invalid("planned declaration is not visible in this scope")
+                } else {
+                    unverified(
+                        "Unbound global or external references are unchecked during planning",
+                    )
+                }
+            },
+            false,
+        )
     }
 
     pub(super) fn resolve_ts_import(
@@ -125,12 +169,18 @@ impl DeclarationResolver {
                         let base = normalize(&file.path.parent().unwrap().join(source));
                         let removed = self.workspace_files.iter().any(|path| {
                             let candidate = normalize(&self.workspace.join(path));
-                            (candidate == base || candidate.with_extension("") == base || candidate == base.join("index.ts"))
+                            (candidate == base
+                                || candidate.with_extension("") == base
+                                || candidate == base.join("index.ts"))
                                 && !self.snapshot.contains_key(path)
                         });
-                        if removed { return invalid("import refers to a file removed by the plan"); }
+                        if removed {
+                            return invalid("import refers to a file removed by the plan");
+                        }
                     }
-                    return unverified("Imports outside the captured plan are unchecked during planning");
+                    return unverified(
+                        "Imports outside the captured plan are unchecked during planning",
+                    );
                 }
             },
             None => file.path.clone(),
@@ -234,16 +284,20 @@ impl DeclarationResolver {
                 results.push(self.resolve_ts_import(&file, import, &target, value, visited));
             }
         }
-        combine(results, || {
-            if file.index.incomplete {
-                unverified("module declaration syntax is incomplete or unsupported")
-            } else {
-                invalid(&format!(
-                    "module does not export `{}` in the requested namespace",
-                    names.join(".")
-                ))
-            }
-        }, false)
+        combine(
+            results,
+            || {
+                if file.index.incomplete {
+                    unverified("module declaration syntax is incomplete or unsupported")
+                } else {
+                    invalid(&format!(
+                        "module does not export `{}` in the requested namespace",
+                        names.join(".")
+                    ))
+                }
+            },
+            false,
+        )
     }
 
     fn ts_module(&self, origin: &Path, source: &str) -> Option<PathBuf> {
@@ -288,5 +342,4 @@ impl DeclarationResolver {
             ) && self.read(candidate).is_some()
         })
     }
-
 }

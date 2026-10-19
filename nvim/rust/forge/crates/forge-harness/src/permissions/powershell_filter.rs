@@ -54,15 +54,31 @@ const PARAMETER_LIST: &[(&str, FilterParameter)] = &[
 ];
 
 const PARAMETER_ALIAS: &[(&str, &str)] = &[
-    ("ieq", "eq"), ("ine", "ne"), ("igt", "gt"), ("ige", "ge"),
-    ("ilt", "lt"), ("ile", "le"), ("ilike", "like"), ("inotlike", "notlike"),
-    ("imatch", "match"), ("inotmatch", "notmatch"),
-    ("icontains", "contains"), ("inotcontains", "notcontains"),
-    ("iin", "in"), ("inotin", "notin"),
-    ("vb", "verbose"), ("db", "debug"), ("ea", "erroraction"),
-    ("ev", "errorvariable"), ("wa", "warningaction"), ("wv", "warningvariable"),
-    ("infa", "informationaction"), ("iv", "informationvariable"),
-    ("proga", "progressaction"), ("ov", "outvariable"), ("ob", "outbuffer"),
+    ("ieq", "eq"),
+    ("ine", "ne"),
+    ("igt", "gt"),
+    ("ige", "ge"),
+    ("ilt", "lt"),
+    ("ile", "le"),
+    ("ilike", "like"),
+    ("inotlike", "notlike"),
+    ("imatch", "match"),
+    ("inotmatch", "notmatch"),
+    ("icontains", "contains"),
+    ("inotcontains", "notcontains"),
+    ("iin", "in"),
+    ("inotin", "notin"),
+    ("vb", "verbose"),
+    ("db", "debug"),
+    ("ea", "erroraction"),
+    ("ev", "errorvariable"),
+    ("wa", "warningaction"),
+    ("wv", "warningvariable"),
+    ("infa", "informationaction"),
+    ("iv", "informationvariable"),
+    ("proga", "progressaction"),
+    ("ov", "outvariable"),
+    ("ob", "outbuffer"),
     ("pv", "pipelinevariable"),
 ];
 
@@ -103,7 +119,9 @@ impl<'tree> FilterBinding<'tree> {
             FilterParameter::Property => self.property = argument,
             FilterParameter::Value => self.value = argument,
             FilterParameter::Script => self.script = argument,
-            FilterParameter::Input | FilterParameter::CommonValue | FilterParameter::CommonSwitch => {}
+            FilterParameter::Input
+            | FilterParameter::CommonValue
+            | FilterParameter::CommonSwitch => {}
             comparison => {
                 if self.comparison.replace(comparison).is_some() {
                     return Err(unsupported("conflicting comparison parameters"));
@@ -115,7 +133,9 @@ impl<'tree> FilterBinding<'tree> {
 
     fn finish(mut self) -> Result<Option<Range<usize>>, CommandAnalysisFailure> {
         for argument in self.positional {
-            if self.script.is_none() && self.property.is_none() && self.comparison.is_none()
+            if self.script.is_none()
+                && self.property.is_none()
+                && self.comparison.is_none()
                 && expression_leaf(argument).kind() == "script_block_expression"
             {
                 self.script = Some(argument);
@@ -131,7 +151,9 @@ impl<'tree> FilterBinding<'tree> {
         }
         if let Some(script) = self.script {
             if self.property.is_some() || self.value.is_some() || self.comparison.is_some() {
-                return Err(unsupported("mixed script-block and property parameter sets"));
+                return Err(unsupported(
+                    "mixed script-block and property parameter sets",
+                ));
             }
             if expression_leaf(script).kind() != "script_block_expression" {
                 return Err(unsupported("dynamic FilterScript"));
@@ -144,7 +166,9 @@ impl<'tree> FilterBinding<'tree> {
         if self.comparison == Some(FilterParameter::Not) && self.value.is_some() {
             return Err(unsupported("value supplied with -Not"));
         }
-        Ok(self.value.filter(|_| self.comparison == Some(FilterParameter::TypeComparison))
+        Ok(self
+            .value
+            .filter(|_| self.comparison == Some(FilterParameter::TypeComparison))
             .map(expression_leaf)
             .filter(|value| value.kind() == "type_literal")
             .map(|value| value.byte_range()))
@@ -153,8 +177,10 @@ impl<'tree> FilterBinding<'tree> {
 
 /// Recognizes the cmdlet and its built-in aliases without evaluating command names.
 pub(super) fn is_command(name: &str) -> bool {
-    matches!(name.to_ascii_lowercase().as_str(),
-        "where-object" | "where" | "?" | "microsoft.powershell.core\\where-object")
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "where-object" | "where" | "?" | "microsoft.powershell.core\\where-object"
+    )
 }
 
 /// Binds supported filter parameter sets while leaving every argument visible to traversal.
@@ -163,11 +189,13 @@ pub(super) fn analyze(
     source: &str,
 ) -> Result<Option<Range<usize>>, CommandAnalysisFailure> {
     let mut cursor = command.walk();
-    let elements = command.named_children(&mut cursor)
+    let elements = command
+        .named_children(&mut cursor)
         .find(|child| child.kind() == "command_elements")
         .ok_or_else(|| unsupported("missing arguments"))?;
     let mut cursor = elements.walk();
-    let argument_list = elements.named_children(&mut cursor)
+    let argument_list = elements
+        .named_children(&mut cursor)
         .filter(|child| !matches!(child.kind(), "command_argument_sep" | "comment"))
         .collect::<Vec<_>>();
     let mut binding = FilterBinding::default();
@@ -189,14 +217,24 @@ pub(super) fn analyze(
         };
         let (name, parameter) = resolve_parameter(name.trim_start_matches('-'))
             .ok_or_else(|| unsupported("unknown or ambiguous parameter"))?;
-        let takes_value = matches!(parameter, FilterParameter::Property | FilterParameter::Value
-            | FilterParameter::Script | FilterParameter::Input | FilterParameter::CommonValue);
-        let inline = arguments.peek().is_some_and(|next| {
-            source[argument.end_byte()..next.start_byte()].trim() == ":"
-        });
+        let takes_value = matches!(
+            parameter,
+            FilterParameter::Property
+                | FilterParameter::Value
+                | FilterParameter::Script
+                | FilterParameter::Input
+                | FilterParameter::CommonValue
+        );
+        let inline = arguments
+            .peek()
+            .is_some_and(|next| source[argument.end_byte()..next.start_byte()].trim() == ":");
         let value = if takes_value || inline {
-            Some(arguments.next().filter(|value| value.kind() != "command_parameter")
-                .ok_or_else(|| unsupported("missing parameter value"))?)
+            Some(
+                arguments
+                    .next()
+                    .filter(|value| value.kind() != "command_parameter")
+                    .ok_or_else(|| unsupported("missing parameter value"))?,
+            )
         } else {
             None
         };
@@ -210,25 +248,32 @@ pub(super) fn is_type_operand(node: Node<'_>, source: &str) -> bool {
     let mut ancestor = node.parent();
     let mut type_comparison = false;
     while let Some(parent) = ancestor {
-        if matches!(parent.kind(), "comparison_expression" | "comparison_argument_expression") {
+        if matches!(
+            parent.kind(),
+            "comparison_expression" | "comparison_argument_expression"
+        ) {
             let mut cursor = parent.walk();
-            let child_list = parent.named_children(&mut cursor)
-                .filter(|child| child.kind() != "comment").collect::<Vec<_>>();
+            let child_list = parent
+                .named_children(&mut cursor)
+                .filter(|child| child.kind() != "comment")
+                .collect::<Vec<_>>();
             if let [_, operator, operand] = child_list.as_slice() {
-                type_comparison |= matches!(text(*operator, source).to_ascii_lowercase().as_str(),
-                    "-is" | "-isnot") && expression_leaf(*operand) == node;
+                type_comparison |= matches!(
+                    text(*operator, source).to_ascii_lowercase().as_str(),
+                    "-is" | "-isnot"
+                ) && expression_leaf(*operand) == node;
             }
         }
         if parent.kind() == "command" {
             let mut cursor = parent.walk();
-            let name = parent.children_by_field_name("command_name", &mut cursor)
+            let name = parent
+                .children_by_field_name("command_name", &mut cursor)
                 .find(|child| child.is_named());
             return name.is_some_and(|name| {
                 shell_token_list(text(name, source), CommandShell::PowerShell)
                     .is_ok_and(|tokens| tokens.len() == 1 && is_command(&tokens[0]))
-            }) && analyze(parent, source).is_ok_and(|range| {
-                type_comparison || range == Some(node.byte_range())
-            });
+            }) && analyze(parent, source)
+                .is_ok_and(|range| type_comparison || range == Some(node.byte_range()));
         }
         ancestor = parent.parent();
     }
@@ -236,11 +281,23 @@ pub(super) fn is_type_operand(node: Node<'_>, source: &str) -> bool {
 }
 
 fn expression_leaf(mut node: Node<'_>) -> Node<'_> {
-    while matches!(node.kind(), "command_argument_array" | "unary_expression"
-        | "parenthesized_expression" | "pipeline" | "pipeline_chain" | "statement_list"
-        | "logical_expression" | "bitwise_expression" | "comparison_expression"
-        | "additive_expression" | "multiplicative_expression" | "format_expression"
-        | "range_expression" | "array_literal_expression") && node.named_child_count() == 1
+    while matches!(
+        node.kind(),
+        "command_argument_array"
+            | "unary_expression"
+            | "parenthesized_expression"
+            | "pipeline"
+            | "pipeline_chain"
+            | "statement_list"
+            | "logical_expression"
+            | "bitwise_expression"
+            | "comparison_expression"
+            | "additive_expression"
+            | "multiplicative_expression"
+            | "format_expression"
+            | "range_expression"
+            | "array_literal_expression"
+    ) && node.named_child_count() == 1
     {
         let Some(child) = node.named_child(0) else {
             break;
@@ -252,15 +309,19 @@ fn expression_leaf(mut node: Node<'_>) -> Node<'_> {
 
 fn resolve_parameter(name: &str) -> Option<(&'static str, FilterParameter)> {
     let name = name.to_ascii_lowercase();
-    let canonical = PARAMETER_ALIAS.iter().find(|(alias, _)| *alias == name)
+    let canonical = PARAMETER_ALIAS
+        .iter()
+        .find(|(alias, _)| *alias == name)
         .map_or(name.as_str(), |(_, canonical)| *canonical);
     if let Some(parameter) = PARAMETER_LIST.iter().find(|(name, _)| *name == canonical) {
         return Some(*parameter);
     }
     let mut selected = None;
     for &(candidate, parameter) in PARAMETER_LIST {
-        let matched = candidate.starts_with(&name) || PARAMETER_ALIAS.iter()
-            .any(|(alias, canonical)| *canonical == candidate && alias.starts_with(&name));
+        let matched = candidate.starts_with(&name)
+            || PARAMETER_ALIAS
+                .iter()
+                .any(|(alias, canonical)| *canonical == candidate && alias.starts_with(&name));
         if matched {
             if selected.is_some_and(|(previous, _)| previous != candidate) {
                 return None;

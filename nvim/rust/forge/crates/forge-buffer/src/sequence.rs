@@ -240,7 +240,10 @@ impl BlockSequence {
             }
             if let Some(node) = &block.metadata.node {
                 if !incoming_node.insert(&node.id)
-                    || self.node_owner.get(&node.id).is_some_and(|owner| !removed.contains(owner))
+                    || self
+                        .node_owner
+                        .get(&node.id)
+                        .is_some_and(|owner| !removed.contains(owner))
                 {
                     return Err(ContractError("duplicate document node identity"));
                 }
@@ -323,8 +326,10 @@ impl BlockSequence {
                 }
             }
         }
-        let incoming_node: HashMap<_, _> = incoming.values().filter_map(|block|
-            block.metadata.node.as_ref().map(|node| (&node.id, *block))).collect();
+        let incoming_node: HashMap<_, _> = incoming
+            .values()
+            .filter_map(|block| block.metadata.node.as_ref().map(|node| (&node.id, *block)))
+            .collect();
         for owner in affected {
             let block = resolve(owner).ok_or(ContractError("fold owner is absent"))?;
             let start_index = position(owner).ok_or(ContractError("fold owner has no position"))?;
@@ -367,26 +372,60 @@ impl BlockSequence {
                     if !visited.insert(parent_id) {
                         return Err(ContractError("document node parent cycle"));
                     }
-                    let parent = incoming_node.get(parent_id).copied().or_else(||
-                        self.node_owner.get(parent_id).and_then(&resolve))
-                        .filter(|parent| parent.metadata.node.as_ref().is_some_and(|node| &node.id == parent_id))
+                    let parent = incoming_node
+                        .get(parent_id)
+                        .copied()
+                        .or_else(|| self.node_owner.get(parent_id).and_then(&resolve))
+                        .filter(|parent| {
+                            parent
+                                .metadata
+                                .node
+                                .as_ref()
+                                .is_some_and(|node| &node.id == parent_id)
+                        })
                         .ok_or(ContractError("document node parent is absent"))?;
-                    let parent_position = position(&parent.id).ok_or(ContractError("node parent has no position"))?;
+                    let parent_position =
+                        position(&parent.id).ok_or(ContractError("node parent has no position"))?;
                     if parent_position >= start_index {
                         return Err(ContractError("document node parent must precede child"));
                     }
-                    if let Some(parent_fold) = parent.metadata.fold.iter().find(|fold| &fold.id == parent_id) {
-                        let parent_end = (position(&parent_fold.end.block).ok_or(ContractError("node parent endpoint is absent"))?, parent_fold.end.position);
-                        let child_end = if let Some(fold) = block.metadata.fold.iter().find(|fold| fold.id == node.id) {
-                            (position(&fold.end.block).ok_or(ContractError("node endpoint is absent"))?, fold.end.position)
+                    if let Some(parent_fold) = parent
+                        .metadata
+                        .fold
+                        .iter()
+                        .find(|fold| &fold.id == parent_id)
+                    {
+                        let parent_end = (
+                            position(&parent_fold.end.block)
+                                .ok_or(ContractError("node parent endpoint is absent"))?,
+                            parent_fold.end.position,
+                        );
+                        let child_end = if let Some(fold) =
+                            block.metadata.fold.iter().find(|fold| fold.id == node.id)
+                        {
+                            (
+                                position(&fold.end.block)
+                                    .ok_or(ContractError("node endpoint is absent"))?,
+                                fold.end.position,
+                            )
                         } else {
-                            (start_index, crate::block::TextPosition { row: block.text.row_count(), column: 0 })
+                            (
+                                start_index,
+                                crate::block::TextPosition {
+                                    row: block.text.row_count(),
+                                    column: 0,
+                                },
+                            )
                         };
                         if child_end > parent_end {
                             return Err(ContractError("document node extends beyond parent fold"));
                         }
                     }
-                    ancestor = parent.metadata.node.as_ref().and_then(|node| node.parent.as_ref());
+                    ancestor = parent
+                        .metadata
+                        .node
+                        .as_ref()
+                        .and_then(|node| node.parent.as_ref());
                 }
             }
         }
@@ -555,7 +594,10 @@ impl BlockSequence {
         if let Some(node) = &block.metadata.node {
             self.node_owner.insert(node.id.clone(), block.id.clone());
             if let Some(parent) = &node.parent {
-                self.node_child.entry(parent.clone()).or_default().insert(block.id.clone());
+                self.node_child
+                    .entry(parent.clone())
+                    .or_default()
+                    .insert(block.id.clone());
             }
         }
         for region in &block.metadata.editable_region {
@@ -601,7 +643,9 @@ impl BlockSequence {
                 if let Some(parent) = &state.parent {
                     if let Some(children) = self.node_child.get_mut(parent) {
                         children.remove(&node.block.id);
-                        if children.is_empty() { self.node_child.remove(parent); }
+                        if children.is_empty() {
+                            self.node_child.remove(parent);
+                        }
                     }
                 }
             }
@@ -859,11 +903,18 @@ mod tests {
         let mut owner = block(2, 1);
         owner.metadata.fold.push(FoldRange {
             collapsed_suffix: None,
-            heading_start: Some(BlockAnchor { block: BlockId("block-1".into()), position: TextPosition { row: 0, column: 0 } }),
-            collapse_children: false, expand_children: false,
+            heading_start: Some(BlockAnchor {
+                block: BlockId("block-1".into()),
+                position: TextPosition { row: 0, column: 0 },
+            }),
+            collapse_children: false,
+            expand_children: false,
             id: FoldId("task".into()),
             start: TextPosition { row: 0, column: 0 },
-            end: BlockAnchor { block: BlockId("block-3".into()), position: TextPosition { row: 1, column: 0 } },
+            end: BlockAnchor {
+                block: BlockId("block-3".into()),
+                position: TextPosition { row: 1, column: 0 },
+            },
             closed: true,
         });
         let mut sequence = BlockSequence::new(vec![block(1, 1), owner, block(3, 1)]).unwrap();
@@ -880,7 +931,8 @@ mod tests {
         first.metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            collapse_children: false, expand_children: false,
+            collapse_children: false,
+            expand_children: false,
             id: FoldId("section".into()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor {

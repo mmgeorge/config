@@ -31,8 +31,7 @@ pub async fn resolve_file(
     path: RepositoryPath,
 ) -> Result<RepositoryRead<ResolvedFile>> {
     ensure!(
-        !reference.is_empty()
-            && !reference.chars().any(char::is_control),
+        !reference.is_empty() && !reference.chars().any(char::is_control),
         "invalid revision reference"
     );
     let path_argument = resolve_argument(&path)?;

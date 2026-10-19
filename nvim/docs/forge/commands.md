@@ -34,8 +34,8 @@ when available. Failures preserve the existing draft, including edits made while
 
 Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
 default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
-provides **Background model**, **Background thinking**, **Background auto compact**, and
-**Background compact at tokens**. Choices persist across restarts. Gemini is not part
+provides the **Background** row in **Models** for model and thinking choices, and
+its **Background** row in **Compaction** for automatic compaction and the token threshold. Choices persist across restarts. Gemini is not part
 of this workflow. Other AI features retain their existing adapters.
 
 The first actual generation creates the session. Normal commits reuse it. Switching
@@ -43,8 +43,8 @@ branches or rewriting history starts another conversation, with the old timeline
 Each request includes the last ten complete Git commit messages for terminology and style.
 
 Background auto-compaction defaults to **128,000 tokens** using the model's default context
-window. Ordinary Harness sessions default to off and have separate **Auto compact** and
-**Compact at tokens** controls in `/config`. Compaction runs after completed turns, with no
+window. Ordinary Harness sessions default to off. Their **Main** row in
+**Compaction** combines the automatic toggle and token threshold in `/config`. Compaction runs after completed turns, with no
 idle timer. Missing provider usage cannot trigger compaction. Failed compaction is visible
 and does not discard generated text.
 
@@ -113,7 +113,7 @@ aligns with the bottom of the pane. Check activity, queued messages, and other c
 add rows below the phase label only while present. Scrolling through history remains available.
 Live tool output occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
-Enable **Status thoughts** in `/config` to show the latest thought below it in
+Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
 italics, aligned with the phase label and wrapped into at most two preview rows. The option
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thought messages remain available in the timeline either way.
@@ -166,9 +166,23 @@ file references for the agent to inspect with tools, rather than native document
 inputs. Import errors keep the original path and report the failure. Finish pending
 imports before submitting. Attempts during import retain the draft and show a notice.
 
-`/config` includes an **LSP tools** toggle. It enables the read-only
+`/config` includes an **LSP** toggle under **Tools**. It enables the read-only
 [`lsp` tool](lsp-tools.md) for model-driven code exploration without
 changing interactive plan navigation or starting language servers.
+
+`/config` presents grouped rows for Models, Compaction, Checks, Planning, Execute, Permissions,
+Tools, Display, Provider, and Debug. Use Up/Down to select a row,
+Tab/Shift-Tab to select its fields, Left/Right to change values, Space to toggle
+`●` enabled or `○` disabled, and Enter to edit a number or open a selector.
+Planning has its own permission and Auto-approve controls. Execute has a Permission
+choice of Write or YOLO, applied to new goals and accepted plan execution.
+Tools contains Timeouts and separate Space toggles for Subagents and LSP. Display contains Thoughts, and Debug at the
+end contains Logging. The explanation below the rows follows the focused field. Related settings share
+rows, including model and thinking, automatic compaction and its threshold,
+check shell and timing, access scope and extra directories, and both timeouts.
+Check-editing permission is also available under **Checks → Setup** without
+sending a prompt. Unsupported controls explain their restriction, and provider
+setup and Windows sandbox options appear only where applicable.
 
 `/checks` opens project checks, and `/checks setup` configures their commands and
 selection policies through a guided conversation. `/checks setup on` and

@@ -20,7 +20,7 @@ local function valid_window(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
----@param spec { height_ratio?: number }
+---@param spec { height_ratio?: number, fit_content?: boolean }
 ---@param content_height integer
 ---@param host_height integer
 ---@return integer
@@ -31,7 +31,7 @@ local function window_height(spec, content_height, host_height)
       "picker height ratio must be greater than zero and at most one")
     available = math.min(available, math.max(4, math.floor(host_height * spec.height_ratio)))
   end
-  return math.min(content_height, config.options.picker.max_height, available)
+  return math.min(content_height, spec.fit_content and available or config.options.picker.max_height, available)
 end
 
 local function title_chunks(instance, width)
@@ -169,6 +169,7 @@ end
 ---@class ForgePickerSelectionContext
 ---@field page table
 ---@field option? table
+---@field field? ForgePickerField
 ---@field query string
 ---@field preview_height integer Visible host rows above the picker.
 
@@ -179,6 +180,7 @@ local function selection_context(instance)
   return {
     page = picker_state.page(instance.state, instance.spec),
     option = picker_state.selected_option(instance.state, instance.spec),
+    field = picker_state.selected_field(instance.state, instance.spec),
     query = picker_state.query(instance.state, instance.spec),
     preview_height = math.max(1, bounds.height - vim.api.nvim_win_get_height(instance.win) - 2),
   }
@@ -189,7 +191,8 @@ end
 local function notify_selection(instance, force)
   if not instance.spec.on_change then return end
   local context = selection_context(instance)
-  local identity = context.option and tostring(context.option.id or context.option.value or context.option.label) or ""
+  local identity = (context.option and tostring(context.option.id or context.option.value or context.option.label) or "")
+    .. (context.field and (":" .. context.field.id) or "")
   if not force and instance.notified_identity == identity
     and instance.notified_preview_height == context.preview_height then return end
   instance.notified_identity = identity
@@ -215,6 +218,7 @@ local function render_view(instance)
     search_visible = (not page.search or not page.search.start_in_normal
       or instance.search_visible or valid_window(instance.search_win)) == true,
     footer = input_visible and input_footer(instance) or footer,
+    field_by_option = instance.state.field_by_page[page.id] or {},
   })
   frame.chosen_index_set = {}
   frame.option_highlight_by_index = {}
@@ -408,7 +412,21 @@ local function open_input(instance, kind)
   focus_input(instance, true)
 end
 
+local function field_action(instance, action, direction)
+  local context = selection_context(instance)
+  local field, option = context.field, context.option
+  if not field or not option then return false end
+  if action == "toggle" and field.kind ~= "toggle" then return true end
+  if action == "change" and field.kind ~= "choice" and field.kind ~= "input" then return true end
+  if action == "activate" and field.kind == "toggle" then return true end
+  local failure = field.disabled_reason or option.disabled_reason
+  if failure then notifications.warn(failure, "Picker") return true end
+  if instance.spec.on_field_action then instance.spec.on_field_action(context, action, direction or 1) end
+  return true
+end
+
 local function confirm(instance, with_feedback)
+  if field_action(instance, "activate") then return end
   local page = picker_state.page(instance.state, instance.spec)
   local option = picker_state.selected_option(instance.state, instance.spec)
   if not option then return end
@@ -536,6 +554,17 @@ install_keymaps = function(instance)
   command_set.register(set, "scroll_next", function() Picker.scroll_content(1) end)
   command_set.register(set, "focus_input", function() focus_input(instance) end)
   command_set.register(set, "close", function() Picker.close(true) end)
+  if picker_state.page(instance.state, instance.spec).field_navigation then
+    for _, entry in ipairs({ { "next_field", 1 }, { "previous_field", -1 } }) do
+      command_set.register(set, entry[1], function()
+        picker_state.move_field(instance.state, instance.spec, entry[2])
+        render_view(instance)
+      end)
+    end
+    command_set.register(set, "previous_value", function() field_action(instance, "change", -1) end)
+    command_set.register(set, "next_value", function() field_action(instance, "change", 1) end)
+    command_set.register(set, "toggle_field", function() field_action(instance, "toggle") end)
+  end
   for _, command_id in ipairs(set.order) do
     for _, key in ipairs(keymaps.view_keys_for("picker", command_id)) do
       preserve_mapping(instance, instance.buf, key)
@@ -700,6 +729,7 @@ function Picker.update(spec)
   end
   next_state.selected_index_by_page = previous_state.selected_index_by_page
   next_state.selected_set_by_page = previous_state.selected_set_by_page
+  next_state.field_by_page = previous_state.field_by_page
   for page_id, draft in pairs(previous_state.draft_by_page) do next_state.draft_by_page[page_id] = draft end
   for page_id, query in pairs(previous_state.query_by_page) do next_state.query_by_page[page_id] = query end
   if previous_option_id and previous_page then

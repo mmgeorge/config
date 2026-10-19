@@ -25,8 +25,17 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
         "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-# Instalattion\n+# Installation\n",
     )).await.expect("Isolated commit generation timed out").unwrap();
     assert!(!message.is_empty());
-    assert_eq!(backend.client_start_count(), 0, "generation started the shared conversation client");
-    assert!(backend.active_session_id_for(&request.harness_session_id).await.is_none());
+    assert_eq!(
+        backend.client_start_count(),
+        0,
+        "generation started the shared conversation client"
+    );
+    assert!(
+        backend
+            .active_session_id_for(&request.harness_session_id)
+            .await
+            .is_none()
+    );
     backend.shutdown().await.unwrap();
 }
 
@@ -39,43 +48,96 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
     let workspace = temporary.path().join("workspace");
     std::fs::create_dir_all(&resource).unwrap();
     std::fs::create_dir_all(&workspace).unwrap();
-    std::fs::write(resource.join("mcp.json"), json!({
-        "mcpServers": {
-            "docs": {"command":"docs-mcp"},
-            "broken": {"command":"forge-missing-mcp-startup-test"}
-        }
-    }).to_string()).unwrap();
+    std::fs::write(
+        resource.join("mcp.json"),
+        json!({
+            "mcpServers": {
+                "docs": {"command":"docs-mcp"},
+                "broken": {"command":"forge-missing-mcp-startup-test"}
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
     let data = temporary.path().join("data");
-    forge_harness::settings::SettingsStore::open(&data).unwrap().configure_catalog(&config).unwrap();
+    forge_harness::settings::SettingsStore::open(&data)
+        .unwrap()
+        .configure_catalog(&config)
+        .unwrap();
     let trace = std::sync::Arc::new(forge_harness::trace::TraceStore::open(&data).unwrap());
     trace.configure(true).unwrap();
     let backend = CopilotBackend::new_with_permission_coordinator(
-        Vec::new(), forge_harness::backend::approval::PermissionCoordinator::transient(&workspace).unwrap(),
-        std::sync::Arc::clone(&trace), Some(data),
-    ).unwrap();
+        Vec::new(),
+        forge_harness::backend::approval::PermissionCoordinator::transient(&workspace).unwrap(),
+        std::sync::Arc::clone(&trace),
+        Some(data),
+    )
+    .unwrap();
     let request = BackendCatalogRequest {
-        execution_owner: None, harness_session_id: "copilot-mcp-no-args-test".into(),
-        workspace: workspace.to_string_lossy().into_owned(), access: Default::default(),
-        execution_mode: PermissionMode::Read, backend_session_id: None,
+        execution_owner: None,
+        harness_session_id: "copilot-mcp-no-args-test".into(),
+        workspace: workspace.to_string_lossy().into_owned(),
+        access: Default::default(),
+        execution_mode: PermissionMode::Read,
+        backend_session_id: None,
     };
     let server = tokio::time::timeout(Duration::from_secs(40), backend.mcp_list(request.clone()))
-        .await.expect("Copilot MCP startup timed out").unwrap();
+        .await
+        .expect("Copilot MCP startup timed out")
+        .unwrap();
     assert_eq!(server.len(), 2);
-    assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,
-        forge_harness::backend::McpStatus::Connected);
-    let failed = server.iter().find(|server| server.name == "broken").unwrap();
-    assert_eq!(failed.status, forge_harness::backend::McpStatus::Unavailable);
-    assert!(failed.status_detail.as_ref().is_some_and(|detail| !detail.is_empty()));
-    let log = std::fs::read_to_string(trace.session_status(&request.harness_session_id).path).unwrap();
+    assert_eq!(
+        server
+            .iter()
+            .find(|server| server.name == "docs")
+            .unwrap()
+            .status,
+        forge_harness::backend::McpStatus::Connected
+    );
+    let failed = server
+        .iter()
+        .find(|server| server.name == "broken")
+        .unwrap();
+    assert_eq!(
+        failed.status,
+        forge_harness::backend::McpStatus::Unavailable
+    );
+    assert!(
+        failed
+            .status_detail
+            .as_ref()
+            .is_some_and(|detail| !detail.is_empty())
+    );
+    let log =
+        std::fs::read_to_string(trace.session_status(&request.harness_session_id).path).unwrap();
     assert!(!log.contains("copilot.mcp.start_failed"));
-    let session_id = backend.active_session_id_for(&request.harness_session_id).await.unwrap();
+    let session_id = backend
+        .active_session_id_for(&request.harness_session_id)
+        .await
+        .unwrap();
     let server = backend.mcp_list(request.clone()).await.unwrap();
-    assert_eq!(server.iter().find(|server| server.name == "docs").unwrap().status,
-        forge_harness::backend::McpStatus::Connected);
-    assert_eq!(backend.active_session_id_for(&request.harness_session_id).await.as_deref(),
-        Some(session_id.as_str()));
-    let terminals = tokio::time::timeout(Duration::from_secs(10), backend.background_terminals(request))
-        .await.expect("Copilot terminal status timed out").unwrap();
+    assert_eq!(
+        server
+            .iter()
+            .find(|server| server.name == "docs")
+            .unwrap()
+            .status,
+        forge_harness::backend::McpStatus::Connected
+    );
+    assert_eq!(
+        backend
+            .active_session_id_for(&request.harness_session_id)
+            .await
+            .as_deref(),
+        Some(session_id.as_str())
+    );
+    let terminals = tokio::time::timeout(
+        Duration::from_secs(10),
+        backend.background_terminals(request),
+    )
+    .await
+    .expect("Copilot terminal status timed out")
+    .unwrap();
     assert!(terminals.supported);
     assert!(terminals.terminal.is_empty());
     backend.shutdown().await.unwrap();
@@ -130,7 +192,7 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
     let mut broker = HarnessBroker::initialize(InitializeRequest {
         background: None,
         backend_launch_by_provider: Default::default(),
-            config_dir: None,
+        config_dir: None,
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),
         permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),

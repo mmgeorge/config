@@ -1,5 +1,5 @@
-pub mod objects;
 pub(crate) mod model_pin;
+pub mod objects;
 mod ownership;
 mod recovery;
 mod tool_output;
@@ -39,7 +39,10 @@ pub struct SqliteStore {
 
 impl SqliteStore {
     /// Keeps related observations on one committed SQLite snapshot while writers continue.
-    pub(crate) fn read_snapshot<Value>(&self, read: impl FnOnce() -> Result<Value>) -> Result<Value> {
+    pub(crate) fn read_snapshot<Value>(
+        &self,
+        read: impl FnOnce() -> Result<Value>,
+    ) -> Result<Value> {
         let transaction = self.connection.unchecked_transaction()?;
         let value = read()?;
         transaction.commit()?;
@@ -48,17 +51,37 @@ impl SqliteStore {
 
     /// Holds an operating-system lock so lease expiry cannot admit a second live runtime.
     pub(crate) fn lock_session(&mut self, session_id: &str) -> Result<()> {
-        if self.session_lock.contains_key(session_id) { return Ok(()); }
+        if self.session_lock.contains_key(session_id) {
+            return Ok(());
+        }
         let directory = self.data_root.join("session-owner");
         fs::create_dir_all(&directory)?;
-        let path = directory.join(format!("{}.lock", crate::plan::digest(session_id.as_bytes())));
-        let owner = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        let path = directory.join(format!(
+            "{}.lock",
+            crate::plan::digest(session_id.as_bytes())
+        ));
+        let owner = fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&path)?;
         match owner.try_lock() {
-            Ok(()) => {},
-            Err(fs::TryLockError::WouldBlock) => return Err(crate::session::SessionLeaseConflict {
-                session_id: session_id.to_owned(), native_fork: self.load_session(session_id)?.is_some_and(|session| session.native_fork),
-            }.into()),
-            Err(error) => return Err(anyhow::anyhow!("acquire session runtime ownership: {error}")),
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => {
+                return Err(crate::session::SessionLeaseConflict {
+                    session_id: session_id.to_owned(),
+                    native_fork: self
+                        .load_session(session_id)?
+                        .is_some_and(|session| session.native_fork),
+                }
+                .into());
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "acquire session runtime ownership: {error}"
+                ));
+            }
         }
         self.session_lock.insert(session_id.to_owned(), owner);
         Ok(())
@@ -74,49 +97,123 @@ impl SqliteStore {
     }
 
     /// Commits task selection and its lifecycle checkpoint under the session lease.
-    pub fn select_task(&mut self, session: &HarnessSession, task: Option<&crate::task::TaskRecord>, goal: Option<&GoalRecord>, plan: Option<&PlanRecord>, client_id: &str) -> Result<()> {
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1", [&session.id], |row| row.get(0))?;
+    pub fn select_task(
+        &mut self,
+        session: &HarnessSession,
+        task: Option<&crate::task::TaskRecord>,
+        goal: Option<&GoalRecord>,
+        plan: Option<&PlanRecord>,
+        client_id: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [&session.id],
+            |row| row.get(0),
+        )?;
         let owner = decode_current_session(&payload)?.context("session format changed")?;
-        anyhow::ensure!(owner.lease_owner.as_deref() == Some(client_id), "task selection lost session ownership");
+        anyhow::ensure!(
+            owner.lease_owner.as_deref() == Some(client_id),
+            "task selection lost session ownership"
+        );
         if let Some(task) = task {
-            anyhow::ensure!(task.session_id == session.id, "task belongs to another conversation");
+            anyhow::ensure!(
+                task.session_id == session.id,
+                "task belongs to another conversation"
+            );
             transaction.execute("INSERT INTO task_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![task.id, session.id, encode(task)?])?;
         }
         if let Some(goal) = goal {
-            anyhow::ensure!(goal.session_id == session.id, "goal belongs to another conversation");
+            anyhow::ensure!(
+                goal.session_id == session.id,
+                "goal belongs to another conversation"
+            );
             transaction.execute("INSERT INTO goal_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![goal.id, session.id, encode(goal)?])?;
         }
         if let Some(plan) = plan {
-            anyhow::ensure!(plan.session_id == session.id, "plan belongs to another conversation");
+            anyhow::ensure!(
+                plan.session_id == session.id,
+                "plan belongs to another conversation"
+            );
             let mut payload = serde_json::to_value(plan)?;
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
             transaction.execute("INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![plan.id, session.id, encode(&payload)?])?;
         }
-        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1", params![session.id,encode_session(session)?,session.updated_at_ms])?;
+        transaction.execute(
+            "UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            params![session.id, encode_session(session)?, session.updated_at_ms],
+        )?;
         transaction.commit()?;
         Ok(())
     }
 
     /// Publishes acceptance and every execution owner in one commit before provider dispatch.
-    pub fn accept_task(&mut self, session: &HarnessSession, task: &crate::task::TaskRecord,
-        goal: &GoalRecord, plan: &PlanRecord, execution: &PlanExecutionRecord,
-        lifecycle: &PlanLifecycleRecord, client_id: &str) -> Result<()> {
-        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1", [&session.id], |row| row.get(0))?;
+    pub fn accept_task(
+        &mut self,
+        session: &HarnessSession,
+        task: &crate::task::TaskRecord,
+        goal: &GoalRecord,
+        plan: &PlanRecord,
+        execution: &PlanExecutionRecord,
+        lifecycle: &PlanLifecycleRecord,
+        client_id: &str,
+    ) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM session_record WHERE id=?1",
+            [&session.id],
+            |row| row.get(0),
+        )?;
         let owner = decode_current_session(&payload)?.context("session format changed")?;
-        anyhow::ensure!(owner.lease_owner.as_deref() == Some(client_id), "plan acceptance lost session ownership");
+        anyhow::ensure!(
+            owner.lease_owner.as_deref() == Some(client_id),
+            "plan acceptance lost session ownership"
+        );
         for (table, id, mut payload, schema) in [
-            ("task_record", task.id.as_str(), serde_json::to_value(task)?, false),
-            ("goal_record", goal.id.as_str(), serde_json::to_value(goal)?, false),
-            ("plan_record", plan.id.as_str(), serde_json::to_value(plan)?, true),
-            ("plan_execution_record", execution.id.as_str(), serde_json::to_value(execution)?, true),
-            ("plan_lifecycle_record", lifecycle.id.as_str(), serde_json::to_value(lifecycle)?, true),
+            (
+                "task_record",
+                task.id.as_str(),
+                serde_json::to_value(task)?,
+                false,
+            ),
+            (
+                "goal_record",
+                goal.id.as_str(),
+                serde_json::to_value(goal)?,
+                false,
+            ),
+            (
+                "plan_record",
+                plan.id.as_str(),
+                serde_json::to_value(plan)?,
+                true,
+            ),
+            (
+                "plan_execution_record",
+                execution.id.as_str(),
+                serde_json::to_value(execution)?,
+                true,
+            ),
+            (
+                "plan_lifecycle_record",
+                lifecycle.id.as_str(),
+                serde_json::to_value(lifecycle)?,
+                true,
+            ),
         ] {
-            if schema { payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION); }
+            if schema {
+                payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+            }
             transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id, session.id, encode(&payload)?])?;
         }
-        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1", params![session.id,encode_session(session)?,session.updated_at_ms])?;
+        transaction.execute(
+            "UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1",
+            params![session.id, encode_session(session)?, session.updated_at_ms],
+        )?;
         transaction.commit()?;
         Ok(())
     }
@@ -125,10 +222,16 @@ impl SqliteStore {
     pub fn admit_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<bool> {
         let changed = self.connection.execute(
             "INSERT OR IGNORE INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
-            params![operation.id, operation.session_id, encode(operation)?])?;
+            params![operation.id, operation.session_id, encode(operation)?],
+        )?;
         if changed == 0 {
-            let previous = self.load_task_operation(&operation.session_id, &operation.id)?.context("operation ID belongs to another conversation")?;
-            anyhow::ensure!(previous.action == operation.action, "operation ID was reused for a different action");
+            let previous = self
+                .load_task_operation(&operation.session_id, &operation.id)?
+                .context("operation ID belongs to another conversation")?;
+            anyhow::ensure!(
+                previous.action == operation.action,
+                "operation ID was reused for a different action"
+            );
         }
         Ok(changed != 0)
     }
@@ -141,18 +244,36 @@ impl SqliteStore {
     }
 
     /// Queries an intent by its original identity after uncertain delivery.
-    pub fn load_task_operation(&self, session_id: &str, id: &str) -> Result<Option<crate::task::TaskOperation>> {
-        self.load_payload("SELECT payload FROM task_operation WHERE session_id=?1 AND id=?2", params![session_id,id])
+    pub fn load_task_operation(
+        &self,
+        session_id: &str,
+        id: &str,
+    ) -> Result<Option<crate::task::TaskOperation>> {
+        self.load_payload(
+            "SELECT payload FROM task_operation WHERE session_id=?1 AND id=?2",
+            params![session_id, id],
+        )
     }
 
     /// Publishes a settled intent without dispatching its action again.
     pub fn save_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<()> {
-        self.save_scoped_payload("task_operation", &operation.id, &operation.session_id, operation)
+        self.save_scoped_payload(
+            "task_operation",
+            &operation.id,
+            &operation.session_id,
+            operation,
+        )
     }
 
     /// Tests whether a later intent has superseded this pending activation.
-    pub fn latest_task_operation(&self, session_id: &str) -> Result<Option<crate::task::TaskOperation>> {
-        self.load_payload("SELECT payload FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1", [session_id])
+    pub fn latest_task_operation(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<crate::task::TaskOperation>> {
+        self.load_payload(
+            "SELECT payload FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1",
+            [session_id],
+        )
     }
 
     /// Open durable storage for the current Harness format.
@@ -319,10 +440,15 @@ impl SqliteStore {
             "SELECT payload FROM preference_record WHERE workspace = ?1 AND backend = ?2",
             params![workspace, backend],
         )?;
-        let Some(payload) = payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION) else {
+        let Some(payload) =
+            payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION)
+        else {
             return Ok(None);
         };
-        let Some(preference) = payload.get("preference").filter(|preference| preference.is_object()) else {
+        let Some(preference) = payload
+            .get("preference")
+            .filter(|preference| preference.is_object())
+        else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_value(preference.clone())?))
@@ -478,7 +604,10 @@ impl SqliteStore {
         Ok(())
     }
 
-    fn write_exchange(transaction: &rusqlite::Transaction<'_>, interaction: &Exchange) -> Result<()> {
+    fn write_exchange(
+        transaction: &rusqlite::Transaction<'_>,
+        interaction: &Exchange,
+    ) -> Result<()> {
         let belongs: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
             params![interaction.agent_id, interaction.session_id],
@@ -536,21 +665,41 @@ impl SqliteStore {
     }
 
     /// Commit a child identity, causal delegation, exchange, and task before dispatch.
-    pub fn admit_agent_task(&mut self, agent: &Agent, task: &crate::agent::AgentTask, parent: &Exchange) -> Result<()> {
-        anyhow::ensure!(agent.session_id == task.session_id && parent.session_id == task.session_id,
-            "agent admission crosses session ownership");
-        anyhow::ensure!(agent.id == task.agent_id && parent.id == task.parent_exchange_id,
-            "agent admission has inconsistent causal ownership");
-        anyhow::ensure!(!agent.is_primary() && parent.agent_id == crate::session::HarnessSession::primary_agent_id(&parent.session_id), "only the root can delegate child work");
+    pub fn admit_agent_task(
+        &mut self,
+        agent: &Agent,
+        task: &crate::agent::AgentTask,
+        parent: &Exchange,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            agent.session_id == task.session_id && parent.session_id == task.session_id,
+            "agent admission crosses session ownership"
+        );
+        anyhow::ensure!(
+            agent.id == task.agent_id && parent.id == task.parent_exchange_id,
+            "agent admission has inconsistent causal ownership"
+        );
+        anyhow::ensure!(
+            !agent.is_primary()
+                && parent.agent_id
+                    == crate::session::HarnessSession::primary_agent_id(&parent.session_id),
+            "only the root can delegate child work"
+        );
         anyhow::ensure!(parent.node_list.iter().any(|node| matches!(node,
             crate::exchange::ExchangeNode::AgentReference { agent: delegation }
                 if delegation.child_agent_id == agent.id && delegation.child_exchange_id == task.id)),
             "agent task has no matching parent delegation");
-        let transaction = self.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let conflict: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE session_id=?1 AND id!=?2 AND json_extract(payload,'$.task_name')=?3)",
             params![agent.session_id, agent.id, agent.task_name], |row| row.get(0))?;
-        anyhow::ensure!(!conflict, "task name is already admitted in this session: {}", agent.task_name);
+        anyhow::ensure!(
+            !conflict,
+            "task name is already admitted in this session: {}",
+            agent.task_name
+        );
         let written = transaction.execute(
             "INSERT INTO agent_run_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE agent_run_record.session_id=excluded.session_id",
             params![agent.id, agent.session_id, encode(agent)?])?;
@@ -562,32 +711,56 @@ impl SqliteStore {
     }
 
     /// Commits one child's durable outcome without exposing a partially completed task.
-    pub fn complete_agent_task(&mut self, agent: &Agent, task: &crate::agent::AgentTask, exchange: &Exchange) -> Result<()> {
-        anyhow::ensure!(agent.session_id == task.session_id && exchange.session_id == task.session_id
-            && agent.id == task.agent_id && exchange.agent_id == task.agent_id && exchange.id == task.id,
-            "child completion crosses execution ownership");
-        anyhow::ensure!(task.completed_at_ms.is_some() && exchange.state == task.state,
-            "child completion has inconsistent task and exchange outcomes");
-        let transaction = self.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    pub fn complete_agent_task(
+        &mut self,
+        agent: &Agent,
+        task: &crate::agent::AgentTask,
+        exchange: &Exchange,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            agent.session_id == task.session_id
+                && exchange.session_id == task.session_id
+                && agent.id == task.agent_id
+                && exchange.agent_id == task.agent_id
+                && exchange.id == task.id,
+            "child completion crosses execution ownership"
+        );
+        anyhow::ensure!(
+            task.completed_at_ms.is_some() && exchange.state == task.state,
+            "child completion has inconsistent task and exchange outcomes"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         Self::write_exchange(&transaction, exchange)?;
         Self::write_agent_task(&transaction, task)?;
         let written = transaction.execute(
             "UPDATE agent_run_record SET payload=?1 WHERE id=?2 AND session_id=?3",
-            params![encode(agent)?, agent.id, agent.session_id])?;
+            params![encode(agent)?, agent.id, agent.session_id],
+        )?;
         anyhow::ensure!(written == 1, "child completion has no admitted identity");
         transaction.commit()?;
         Ok(())
     }
 
-    fn write_agent_task(connection: &rusqlite::Connection, task: &crate::agent::AgentTask) -> Result<()> {
+    fn write_agent_task(
+        connection: &rusqlite::Connection,
+        task: &crate::agent::AgentTask,
+    ) -> Result<()> {
         let belongs: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE id=?1 AND session_id=?2 AND agent_id=?3)",
             params![task.id, task.session_id, task.agent_id], |row| row.get(0))?;
-        anyhow::ensure!(belongs, "task exchange does not belong to its agent and session");
+        anyhow::ensure!(
+            belongs,
+            "task exchange does not belong to its agent and session"
+        );
         let written = connection.execute(
             "INSERT INTO agent_task_record(id,session_id,agent_id,operation_id,ordinal,payload) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE agent_task_record.session_id=excluded.session_id AND agent_task_record.agent_id=excluded.agent_id AND agent_task_record.operation_id=excluded.operation_id AND agent_task_record.ordinal=excluded.ordinal",
             params![task.id, task.session_id, task.agent_id, task.operation_id, task.ordinal as i64, encode(task)?])?;
-        anyhow::ensure!(written == 1, "task cannot change its execution ownership or admission identity");
+        anyhow::ensure!(
+            written == 1,
+            "task cannot change its execution ownership or admission identity"
+        );
         Ok(())
     }
 
@@ -598,7 +771,10 @@ impl SqliteStore {
 
     /// Restore ordered task outcomes within one visible root session.
     pub fn list_agent_task(&self, session_id: &str) -> Result<Vec<crate::agent::AgentTask>> {
-        self.list_payload("SELECT payload FROM agent_task_record WHERE session_id=?1 ORDER BY rowid", [session_id])
+        self.list_payload(
+            "SELECT payload FROM agent_task_record WHERE session_id=?1 ORDER BY rowid",
+            [session_id],
+        )
     }
 
     /// Remove one provisional interaction after its provider turn is retracted.
@@ -610,7 +786,9 @@ impl SqliteStore {
 
     /// Load one exchange with its retained tool output.
     pub fn load_exchange(&self, id: &str) -> Result<Option<Exchange>> {
-        Ok(self.list_exchange_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?.pop())
+        Ok(self
+            .list_exchange_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?
+            .pop())
     }
 
     /// Load the owner of a provider turn without hydrating unrelated exchange bodies.
@@ -619,17 +797,23 @@ impl SqliteStore {
         session_id: &str,
         address: &crate::backend::ProviderAddress,
     ) -> Result<Option<Exchange>> {
-        Ok(self.list_exchange_payload(
-            "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(\
+        Ok(self
+            .list_exchange_payload(
+                "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(\
                 SELECT 1 FROM json_each(exchange_record.payload, '$.turn') AS provider_turn \
                 WHERE json_extract(provider_turn.value, '$.provider.thread_id')=?2 \
                 AND json_extract(provider_turn.value, '$.provider.turn_id')=?3) LIMIT 1",
-            params![session_id, address.thread_id, address.turn_id],
-        )?.pop())
+                params![session_id, address.thread_id, address.turn_id],
+            )?
+            .pop())
     }
 
     /// Load only the last exchange owned by an execution, leaving unrelated output unloaded.
-    pub(crate) fn latest_execution_exchange(&self, session_id: &str, execution_id: &str) -> Result<Option<Exchange>> {
+    pub(crate) fn latest_execution_exchange(
+        &self,
+        session_id: &str,
+        execution_id: &str,
+    ) -> Result<Option<Exchange>> {
         Ok(self.list_exchange_payload(
             "SELECT payload FROM exchange_record WHERE session_id=?1 AND json_extract(payload, '$.execution_id')=?2 ORDER BY ordinal DESC LIMIT 1",
             params![session_id, execution_id],
@@ -673,18 +857,34 @@ impl SqliteStore {
     }
 
     /// Atomically commits execution state, its goal and optional plan, exchange, and lifecycle event.
-    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>, exchange: Option<&Exchange>, lifecycle: Option<&PlanLifecycleRecord>) -> Result<()> {
+    pub fn save_execution_transition(
+        &mut self,
+        execution: &PlanExecutionRecord,
+        goal: &GoalRecord,
+        plan: Option<&PlanRecord>,
+        exchange: Option<&Exchange>,
+        lifecycle: Option<&PlanLifecycleRecord>,
+    ) -> Result<()> {
         let mut execution_payload = serde_json::to_value(execution)?;
         execution_payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
-        let mut rows = vec![("plan_execution_record", execution.id.as_str(), execution_payload),
-            ("goal_record", goal.id.as_str(), serde_json::to_value(goal)?)];
+        let mut rows = vec![
+            (
+                "plan_execution_record",
+                execution.id.as_str(),
+                execution_payload,
+            ),
+            ("goal_record", goal.id.as_str(), serde_json::to_value(goal)?),
+        ];
         if let Some(plan) = plan {
             let mut payload = serde_json::to_value(plan)?;
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
             rows.push(("plan_record", plan.id.as_str(), payload));
         }
         if let Some(lifecycle) = lifecycle {
-            anyhow::ensure!(lifecycle.session_id == execution.session_id, "lifecycle belongs to another conversation");
+            anyhow::ensure!(
+                lifecycle.session_id == execution.session_id,
+                "lifecycle belongs to another conversation"
+            );
             let mut payload = serde_json::to_value(lifecycle)?;
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
             rows.push(("plan_lifecycle_record", lifecycle.id.as_str(), payload));
@@ -970,7 +1170,11 @@ impl SqliteStore {
     }
 
     /// Record one globally shared prompt and retain only the newest bounded history.
-    pub fn record_prompt_history(&mut self, draft: &crate::attachment::PromptDraft, created_at_ms: i64) -> Result<()> {
+    pub fn record_prompt_history(
+        &mut self,
+        draft: &crate::attachment::PromptDraft,
+        created_at_ms: i64,
+    ) -> Result<()> {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -980,7 +1184,10 @@ impl SqliteStore {
         )?;
         transaction.execute(
             "INSERT INTO prompt_attachment_record(history_id,payload) VALUES(?1,?2)",
-            params![transaction.last_insert_rowid(), serde_json::to_string(&draft.attachments)?],
+            params![
+                transaction.last_insert_rowid(),
+                serde_json::to_string(&draft.attachments)?
+            ],
         )?;
         transaction.commit()?;
         Ok(())
@@ -991,11 +1198,18 @@ impl SqliteStore {
         let mut statement = self
             .connection
             .prepare("SELECT h.text, COALESCE(a.payload, '[]') FROM prompt_history_record h LEFT JOIN prompt_attachment_record a ON a.history_id=h.id ORDER BY h.id DESC")?;
-        let row_list = statement.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
-        row_list.map(|row| {
-            let (text, attachments) = row?;
-            Ok(crate::attachment::PromptDraft { text, attachments: serde_json::from_str(&attachments)? })
-        }).collect()
+        let row_list = statement.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?;
+        row_list
+            .map(|row| {
+                let (text, attachments) = row?;
+                Ok(crate::attachment::PromptDraft {
+                    text,
+                    attachments: serde_json::from_str(&attachments)?,
+                })
+            })
+            .collect()
     }
 
     /// Write one concrete child-agent run into its owning Harness session.
@@ -1124,7 +1338,8 @@ impl SessionStore for SqliteStore {
 
     fn list_session(&self, workspace: Option<&str>) -> Result<Vec<HarnessSession>> {
         let mut sessions = self.list_current_session(
-            "SELECT payload FROM session_record ORDER BY updated_at_ms DESC", [],
+            "SELECT payload FROM session_record ORDER BY updated_at_ms DESC",
+            [],
         )?;
         if let Some(path) = workspace {
             sessions.retain(|session| crate::workspace::same(&session.workspace, path));
@@ -1155,7 +1370,9 @@ fn discard_incompatible_plan_state(
         let incompatible: bool = connection.query_row(
             "SELECT EXISTS(SELECT 1 FROM task_record task JOIN plan_record plan ON plan.id=json_extract(task.payload,'$.plan_id') WHERE task.id=?1 AND coalesce(json_extract(plan.payload,'$.schema_version'),0)<>?2)",
             params![task_id, crate::plan::PLAN_SCHEMA_VERSION], |row| row.get(0))?;
-        if incompatible { session.current_task_id = None; }
+        if incompatible {
+            session.current_task_id = None;
+        }
     }
 
     if let Some(goal_id) = session.goal_id.as_ref() {
@@ -1195,47 +1412,90 @@ mod test {
 
     #[test]
     fn child_admission_is_atomic_and_reopening_retains_outcomes_without_replay() -> Result<()> {
-        use crate::agent::{AgentSource,AgentTask};
+        use crate::agent::{AgentSource, AgentTask};
         let temporary = tempfile::tempdir()?;
         let mut store = SqliteStore::open(temporary.path())?;
-        store.save_session(&session("session","D:/work"))?;
-        store.save_agent_run(&Agent::primary("session",0))?;
-        let mut agent = Agent::pending("session","review","review",1);
-        let mut parent = Exchange::agent_admission("session",1,"manual spawn".into(),1);
-        let task = AgentTask {id:"child-task".into(),session_id:"session".into(),agent_id:agent.id.clone(),operation_id:"operation".into(),
-            ordinal:1,source:AgentSource::User,parent_exchange_id:parent.id.clone(),message:"review".into(),state:crate::exchange::ExchangeState::Queued,
-            final_response:None,error:None,parent_reported:false,created_at_ms:1,last_activity_at_ms:None,completed_at_ms:None};
+        store.save_session(&session("session", "D:/work"))?;
+        store.save_agent_run(&Agent::primary("session", 0))?;
+        let mut agent = Agent::pending("session", "review", "review", 1);
+        let mut parent = Exchange::agent_admission("session", 1, "manual spawn".into(), 1);
+        let task = AgentTask {
+            id: "child-task".into(),
+            session_id: "session".into(),
+            agent_id: agent.id.clone(),
+            operation_id: "operation".into(),
+            ordinal: 1,
+            source: AgentSource::User,
+            parent_exchange_id: parent.id.clone(),
+            message: "review".into(),
+            state: crate::exchange::ExchangeState::Queued,
+            final_response: None,
+            error: None,
+            parent_reported: false,
+            created_at_ms: 1,
+            last_activity_at_ms: None,
+            completed_at_ms: None,
+        };
         parent.append_agent_task(&task)?;
         agent.inbox.push(crate::agent::AgentMessage {
-            id:"retained-information".into(),ordinal:1,message:"Inspect this after recovery".into(),
-            delivery:crate::agent::MessageDelivery::Attached,task_id:Some(task.id.clone()),created_at_ms:1,
+            id: "retained-information".into(),
+            ordinal: 1,
+            message: "Inspect this after recovery".into(),
+            delivery: crate::agent::MessageDelivery::Attached,
+            task_id: Some(task.id.clone()),
+            created_at_ms: 1,
         });
-        store.admit_agent_task(&agent,&task,&parent)?;
-        assert_eq!(store.list_agent_task("session")?.len(),1);
-        assert_eq!(store.list_agent_exchange(&agent.id)?.len(),1);
-        let other = Agent::pending("session","different","another task",2);
+        store.admit_agent_task(&agent, &task, &parent)?;
+        assert_eq!(store.list_agent_task("session")?.len(), 1);
+        assert_eq!(store.list_agent_exchange(&agent.id)?.len(), 1);
+        let other = Agent::pending("session", "different", "another task", 2);
         let mut invalid_task = task.clone();
         invalid_task.id = "invalid-task".into();
         invalid_task.agent_id = other.id.clone();
-        let mut invalid_parent = Exchange::agent_admission("session",2,"manual spawn".into(),2);
+        let mut invalid_parent = Exchange::agent_admission("session", 2, "manual spawn".into(), 2);
         invalid_task.parent_exchange_id = invalid_parent.id.clone();
         invalid_parent.append_agent_task(&invalid_task)?;
-        assert!(store.admit_agent_task(&other,&invalid_task,&invalid_parent).is_err());
+        assert!(
+            store
+                .admit_agent_task(&other, &invalid_task, &invalid_parent)
+                .is_err()
+        );
         assert!(store.load_exchange("invalid-task")?.is_none());
         assert!(store.load_exchange(&invalid_parent.id)?.is_none());
-        assert!(!store.list_agent_run("session")?.iter().any(|agent|agent.id == other.id));
+        assert!(
+            !store
+                .list_agent_run("session")?
+                .iter()
+                .any(|agent| agent.id == other.id)
+        );
         drop(store);
         let mut reopened = SqliteStore::open(temporary.path())?;
         reopened.interrupt_detached_execution("session")?;
         let restored = reopened.list_agent_task("session")?;
-        assert_eq!(restored[0].state,crate::exchange::ExchangeState::Interrupted);
+        assert_eq!(
+            restored[0].state,
+            crate::exchange::ExchangeState::Interrupted
+        );
         assert!(restored[0].parent_reported);
         assert!(restored[0].completed_at_ms.is_some());
-        assert_eq!(reopened.list_agent_exchange(&agent.id)?[0].state,crate::exchange::ExchangeState::Interrupted);
-        let restored_agent = reopened.list_agent_run("session")?.into_iter().find(|candidate|candidate.id == agent.id).unwrap();
-        assert_eq!(restored_agent.inbox[0].delivery,crate::agent::MessageDelivery::Queued);
-        assert_eq!(restored_agent.inbox[0].task_id,None);
-        assert_eq!(restored_agent.inbox[0].message,"Inspect this after recovery");
+        assert_eq!(
+            reopened.list_agent_exchange(&agent.id)?[0].state,
+            crate::exchange::ExchangeState::Interrupted
+        );
+        let restored_agent = reopened
+            .list_agent_run("session")?
+            .into_iter()
+            .find(|candidate| candidate.id == agent.id)
+            .unwrap();
+        assert_eq!(
+            restored_agent.inbox[0].delivery,
+            crate::agent::MessageDelivery::Queued
+        );
+        assert_eq!(restored_agent.inbox[0].task_id, None);
+        assert_eq!(
+            restored_agent.inbox[0].message,
+            "Inspect this after recovery"
+        );
         Ok(())
     }
 
@@ -1245,12 +1505,24 @@ mod test {
         let mut store = SqliteStore::open(directory.path())?;
         store.save_session(&session("legacy", "D:/work"))?;
         store.connection.execute("UPDATE session_record SET payload=json_set(payload,'$.format_version',40) WHERE id='legacy'", [])?;
-        store.connection.execute("INSERT INTO checkpoint_record(id,session_id,payload) VALUES('old','legacy','{}')", [])?;
+        store.connection.execute(
+            "INSERT INTO checkpoint_record(id,session_id,payload) VALUES('old','legacy','{}')",
+            [],
+        )?;
         store.connection.execute("INSERT INTO preference_record(workspace,backend,payload) VALUES('D:/work','mock','{}')", [])?;
-        store.connection.execute("INSERT INTO prompt_history_record(text,created_at_ms) VALUES('keep',1)", [])?;
+        store.connection.execute(
+            "INSERT INTO prompt_history_record(text,created_at_ms) VALUES('keep',1)",
+            [],
+        )?;
         drop(store);
         let store = SqliteStore::open(directory.path())?;
-        let count = |table: &str| -> Result<i64> { Ok(store.connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?) };
+        let count = |table: &str| -> Result<i64> {
+            Ok(store
+                .connection
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })?)
+        };
         assert_eq!(count("session_record")?, 1);
         assert_eq!(count("checkpoint_record")?, 1);
         assert_eq!(count("preference_record")?, 1);
@@ -1262,10 +1534,10 @@ mod test {
 
     #[test]
     fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {
-        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         let directory = tempfile::tempdir()?;
         let mut store = SqliteStore::open(directory.path())?;
-        store.save_session(&session("session","D:/work"))?;
+        store.save_session(&session("session", "D:/work"))?;
         let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
             "id":"stream","session_id":"session","agent_id":"session:agent:primary",
             "ordinal":1,"prompt":"read","kind":"chat","state":"running",
@@ -1273,45 +1545,105 @@ mod test {
             "awaiting_input":false,"duration_ms":0,"metrics":{},"comment":[],
             "attributed_matches_checkpoint":false
         }))?;
-        let address = ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"provider-turn".into() };
-        exchange.start_turn(address.clone(),1)?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "provider-turn".into(),
+        };
+        exchange.start_turn(address.clone(), 1)?;
         let mut event = BackendEvent {
-            received_at_ms: None, address:Some(address),turn_boundary:None,kind:"tool".into(),
-            text:None,data:serde_json::json!({}),summary:None,task_update:None,
-            activity:Some(ToolActivity { id:"call".into(),kind:ToolActivityKind::Command,
-                title:"read".into(),output:None,status:Some("inProgress".into()),
-                change:Default::default(),output_delta:false }) };
-        exchange.observe_turn(&event,2)?;
+            received_at_ms: None,
+            address: Some(address),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::json!({}),
+            summary: None,
+            task_update: None,
+            activity: Some(ToolActivity {
+                id: "call".into(),
+                kind: ToolActivityKind::Command,
+                title: "read".into(),
+                output: None,
+                status: Some("inProgress".into()),
+                change: Default::default(),
+                output_delta: false,
+            }),
+        };
+        exchange.observe_turn(&event, 2)?;
         store.save_exchange(&exchange)?;
         event.activity.as_mut().unwrap().output_delta = true;
         for chunk in ["\u{1b}[31", "mλ\r\n", "tail"] {
             event.activity.as_mut().unwrap().output = Some(chunk.into());
-            exchange.observe_turn(&event,3)?;
-            store.save_tool_output_delta(&exchange,&event)?;
+            exchange.observe_turn(&event, 3)?;
+            store.save_tool_output_delta(&exchange, &event)?;
         }
         let expected = "\u{1b}[31mλ\r\ntail";
-        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
-        let payload: String = store.connection.query_row("SELECT payload FROM exchange_record WHERE id='stream'",[],|row|row.get(0))?;
+        assert_eq!(
+            store.list_exchange("session")?[0].turn[0]
+                .tools()
+                .next()
+                .unwrap()
+                .output,
+            expected
+        );
+        let payload: String = store.connection.query_row(
+            "SELECT payload FROM exchange_record WHERE id='stream'",
+            [],
+            |row| row.get(0),
+        )?;
         assert!(!payload.contains("tail"));
         drop(store);
         let store = SqliteStore::open(directory.path())?;
-        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
-        store.connection.execute("UPDATE exchange_record SET payload=?1 WHERE id='stream'",[encode(&exchange)?])?;
+        assert_eq!(
+            store.list_exchange("session")?[0].turn[0]
+                .tools()
+                .next()
+                .unwrap()
+                .output,
+            expected
+        );
+        store.connection.execute(
+            "UPDATE exchange_record SET payload=?1 WHERE id='stream'",
+            [encode(&exchange)?],
+        )?;
         drop(store);
         let mut store = SqliteStore::open(directory.path())?;
-        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
+        assert_eq!(
+            store.list_exchange("session")?[0].turn[0]
+                .tools()
+                .next()
+                .unwrap()
+                .output,
+            expected
+        );
         event.activity.as_mut().unwrap().output_delta = false;
         event.activity.as_mut().unwrap().output = Some("authoritative λ\n".into());
         event.activity.as_mut().unwrap().status = Some("completed".into());
-        exchange.observe_turn(&event,4)?;
+        exchange.observe_turn(&event, 4)?;
         store.connection.execute_batch("CREATE TRIGGER reject_chunk BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'storage failure'); END;")?;
         assert!(store.save_exchange(&exchange).is_err());
         let recovered = store.list_exchange("session")?;
-        assert_eq!(recovered[0].turn[0].tools().next().unwrap().output,expected);
-        assert_eq!(recovered[0].turn[0].tools().next().unwrap().state(),crate::turn::ToolState::Running);
-        store.connection.execute_batch("DROP TRIGGER reject_chunk")?;
+        assert_eq!(
+            recovered[0].turn[0].tools().next().unwrap().output,
+            expected
+        );
+        assert_eq!(
+            recovered[0].turn[0].tools().next().unwrap().state(),
+            crate::turn::ToolState::Running
+        );
+        store
+            .connection
+            .execute_batch("DROP TRIGGER reject_chunk")?;
         store.save_exchange(&exchange)?;
-        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,"authoritative λ\n");
+        assert_eq!(
+            store.list_exchange("session")?[0].turn[0]
+                .tools()
+                .next()
+                .unwrap()
+                .output,
+            "authoritative λ\n"
+        );
         Ok(())
     }
 
@@ -1332,8 +1664,13 @@ mod test {
             .unwrap();
         store.connection.execute("INSERT INTO plan_execution_record(id,session_id,payload) VALUES('old-execution','current',?1)",
             [r#"{"id":"old-execution","goal_id":"old-goal","schema_version":4}"#]).unwrap();
-        store.connection.execute("INSERT INTO task_record(id,session_id,payload) VALUES('old-task','current',?1)",
-            [r#"{"plan_id":"old-plan"}"#]).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO task_record(id,session_id,payload) VALUES('old-task','current',?1)",
+                [r#"{"plan_id":"old-plan"}"#],
+            )
+            .unwrap();
         assert!(store.list_plan("current").unwrap().is_empty());
         assert!(store.list_plan_execution("current").unwrap().is_empty());
         let reopened = store.load_session("current").unwrap().unwrap();
@@ -1369,7 +1706,9 @@ mod test {
             access: Default::default(),
             shell: Default::default(),
             execution_mode: crate::session::PermissionMode::Read,
-            current_task_id: None, default_write_permission: crate::session::PermissionMode::Write, plan_permission: None,
+            current_task_id: None,
+            default_write_permission: crate::session::PermissionMode::Write,
+            plan_permission: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             goal_id: None,
@@ -1378,7 +1717,9 @@ mod test {
             native_fork: false,
             native_compact: false,
             context_usage: None,
-            background: None, auto_compaction: Default::default(), last_compaction_turn: None,
+            background: None,
+            auto_compaction: Default::default(),
+            last_compaction_turn: None,
         }
     }
 
@@ -1393,7 +1734,9 @@ mod test {
         assert_eq!(store.list_session(None).unwrap().len(), 2);
         let workspace = tempfile::tempdir().unwrap();
         let path = workspace.path().to_string_lossy();
-        store.save_session(&session("alternate", &format!("{path}//./"))).unwrap();
+        store
+            .save_session(&session("alternate", &format!("{path}//./")))
+            .unwrap();
         assert_eq!(store.list_session(Some(&path)).unwrap()[0].id, "alternate");
     }
 
@@ -1403,14 +1746,26 @@ mod test {
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         for index in 0..105 {
             store
-                .record_prompt_history(&crate::attachment::PromptDraft { text: format!("prompt-{index}"), attachments: Vec::new() }, index)
+                .record_prompt_history(
+                    &crate::attachment::PromptDraft {
+                        text: format!("prompt-{index}"),
+                        attachments: Vec::new(),
+                    },
+                    index,
+                )
                 .unwrap();
         }
 
         let history = store.list_prompt_history().unwrap();
         assert_eq!(history.len(), 105);
-        assert_eq!(history.first().map(|draft| draft.text.as_str()), Some("prompt-104"));
-        assert_eq!(history.last().map(|draft| draft.text.as_str()), Some("prompt-0"));
+        assert_eq!(
+            history.first().map(|draft| draft.text.as_str()),
+            Some("prompt-104")
+        );
+        assert_eq!(
+            history.last().map(|draft| draft.text.as_str()),
+            Some("prompt-0")
+        );
 
         let reopened = SqliteStore::open(temporary.path()).unwrap();
         assert_eq!(reopened.list_prompt_history().unwrap(), history);
@@ -1425,7 +1780,8 @@ mod test {
         store.save_agent_run(&Agent::primary("session", 0)).unwrap();
         let mut exchange = Exchange {
             lifecycle: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: "session:agent:primary".into(),
             id: "active".into(),
@@ -1514,7 +1870,8 @@ mod test {
         store.save_agent_run(&second).unwrap();
         let mut interaction = Exchange {
             lifecycle: None,
-            finalization_error: None, check_owner: None,
+            finalization_error: None,
+            check_owner: None,
             finalization_outcome: None,
             agent_id: "session:agent:primary".into(),
             id: "interaction".into(),
@@ -1595,9 +1952,15 @@ mod test {
         first
             .renew_session_lease("session", "client-one", 25)
             .unwrap();
-        assert!(second.acquire_session_lease("session", "client-two", 30_026).is_err(),
-            "lease expiry must not replace a live runtime owner");
-        first.release_session_lease("session", "client-one").unwrap();
+        assert!(
+            second
+                .acquire_session_lease("session", "client-two", 30_026)
+                .is_err(),
+            "lease expiry must not replace a live runtime owner"
+        );
+        first
+            .release_session_lease("session", "client-one")
+            .unwrap();
         let replacement = second
             .acquire_session_lease("session", "client-two", 30_026)
             .unwrap();
@@ -1775,9 +2138,18 @@ mod test {
         let temporary = tempfile::tempdir().unwrap();
         let store = SqliteStore::open(temporary.path()).unwrap();
         for (workspace, payload) in [
-            ("flat", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "model": "old", "effort": "low"})),
-            ("null", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": null})),
-            ("scalar", serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": 1})),
+            (
+                "flat",
+                serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "model": "old", "effort": "low"}),
+            ),
+            (
+                "null",
+                serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": null}),
+            ),
+            (
+                "scalar",
+                serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION, "preference": 1}),
+            ),
         ] {
             let encoded = encode(&payload).unwrap();
             store.connection.execute(
@@ -1785,10 +2157,14 @@ mod test {
                 params![workspace, encoded],
             ).unwrap();
             assert!(store.load_preference(workspace, "codex").unwrap().is_none());
-            let retained: String = store.connection.query_row(
-                "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='codex'",
-                [workspace], |row| row.get(0),
-            ).unwrap();
+            let retained: String = store
+                .connection
+                .query_row(
+                    "SELECT payload FROM preference_record WHERE workspace=?1 AND backend='codex'",
+                    [workspace],
+                    |row| row.get(0),
+                )
+                .unwrap();
             assert_eq!(retained, encoded);
         }
         store.connection.execute(
@@ -1796,7 +2172,14 @@ mod test {
             [encode(&serde_json::json!({"format_version": PREFERENCE_FORMAT_VERSION,
                 "preference": {"model":"current-model", "effort":"high"}})).unwrap()],
         ).unwrap();
-        assert_eq!(store.load_preference("current", "codex").unwrap().unwrap().model, "current-model");
+        assert_eq!(
+            store
+                .load_preference("current", "codex")
+                .unwrap()
+                .unwrap()
+                .model,
+            "current-model"
+        );
     }
 
     #[test]

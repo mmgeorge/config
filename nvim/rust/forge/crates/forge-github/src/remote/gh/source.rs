@@ -5,8 +5,8 @@ use serde_json::{Value, json};
 use super::{GhClient, classify_failure, diagnostic, remote_result};
 use crate::remote::{RemoteFailure, RemoteFailureKind};
 use crate::review_source::{
-    ReviewCommitDetail, ReviewCommitDetailRequest, ReviewCommitFile,
-    ReviewComparison, ReviewComparisonRequest, ReviewSource, ReviewSourceRequest, valid_object_id,
+    ReviewCommitDetail, ReviewCommitDetailRequest, ReviewCommitFile, ReviewComparison,
+    ReviewComparisonRequest, ReviewSource, ReviewSourceRequest, valid_object_id,
 };
 
 const SOURCE_QUERY: &str = "query($owner:String!,$name:String!,$commit:String!,$expression:String!){repository(owner:$owner,name:$name){commit:object(expression:$commit){__typename oid} source:object(expression:$expression){__typename oid ... on Blob{byteSize}}}}";
@@ -154,8 +154,13 @@ impl GhClient {
     }
 }
 
-fn decode_commit_pages(value: Value, requested_commit: &str) -> Result<ReviewCommitDetail, RemoteFailure> {
-    let pages = value.as_array().ok_or_else(|| invalid("commit detail pages are not a collection"))?;
+fn decode_commit_pages(
+    value: Value,
+    requested_commit: &str,
+) -> Result<ReviewCommitDetail, RemoteFailure> {
+    let pages = value
+        .as_array()
+        .ok_or_else(|| invalid("commit detail pages are not a collection"))?;
     let mut detail: Option<ReviewCommitDetail> = None;
     for page in pages {
         let mut next = decode_commit_detail(page.clone(), requested_commit)?;
@@ -306,7 +311,9 @@ fn decode_identity(value: Value, commit: &str) -> Result<Option<(String, usize)>
         .get("byteSize")
         .and_then(Value::as_u64)
         .and_then(|size| usize::try_from(size).ok())
-        .ok_or_else(|| invalid("source byteSize is missing or exceeds this platform's addressable size"))?;
+        .ok_or_else(|| {
+            invalid("source byteSize is missing or exceeds this platform's addressable size")
+        })?;
     Ok(Some((blob.into(), size)))
 }
 
@@ -346,7 +353,7 @@ mod tests {
             "files":[{"filename":"first.rs","status":"modified","patch":patch}]});
         let second = json!({"sha":commit,"commit":{"message":"subject"},"parents":[],
             "files":(0..301).map(|index| json!({"filename":format!("next-{index}.rs"),"status":"added"})).collect::<Vec<_>>()});
-        let detail = decode_commit_pages(json!([first,second]), &commit).unwrap();
+        let detail = decode_commit_pages(json!([first, second]), &commit).unwrap();
         assert_eq!(detail.file.len(), 302);
         assert_eq!(detail.file[0].patch.as_ref().unwrap(), &patch);
         assert_eq!(detail.file[301].path, "next-300.rs");
@@ -390,7 +397,9 @@ mod tests {
         );
         assert_eq!(
             decode_identity(
-                source_value(json!({"__typename":"Blob","oid":blob,"byteSize":8 * 1024 * 1024 + 1})),
+                source_value(
+                    json!({"__typename":"Blob","oid":blob,"byteSize":8 * 1024 * 1024 + 1})
+                ),
                 &"a".repeat(40)
             )
             .unwrap(),

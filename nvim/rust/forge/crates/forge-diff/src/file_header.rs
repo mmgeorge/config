@@ -44,7 +44,10 @@ impl FileChange {
                 capture: capture.into(),
             },
             TextChunk {
-                text: format!("{}{path}", " ".repeat(9usize.saturating_sub(label.len()).max(1))),
+                text: format!(
+                    "{}{path}",
+                    " ".repeat(9usize.saturating_sub(label.len()).max(1))
+                ),
                 capture: "ForgeStatusPath".into(),
             },
         ];

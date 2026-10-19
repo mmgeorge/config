@@ -232,8 +232,14 @@ fn decode_rest(value: Value, collection: bool, page: u32) -> Result<ReviewPage, 
         vec![value]
     };
     let next_cursor = if collection && records.len() >= 100 {
-        Some(page.checked_add(1).ok_or_else(|| invalid("REST page number overflow"))?.to_string())
-    } else { None };
+        Some(
+            page.checked_add(1)
+                .ok_or_else(|| invalid("REST page number overflow"))?
+                .to_string(),
+        )
+    } else {
+        None
+    };
     Ok(ReviewPage {
         records,
         complete: next_cursor.is_none(),

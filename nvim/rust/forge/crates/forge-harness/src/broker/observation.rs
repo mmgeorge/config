@@ -30,24 +30,41 @@ pub(super) struct ObservationMetadata {
 impl BrokerObserver {
     /// Persists conversation-scoped check editing without starting or interrupting a turn.
     pub(super) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
-        let session = SqliteStore::open(&self.data_root)?.load_session(&self.session_id)?
+        let session = SqliteStore::open(&self.data_root)?
+            .load_session(&self.session_id)?
             .context("observed session is missing")?;
         let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
         let snapshot = settings.get(&session.workspace, &session.id, &session.backend)?;
-        let mut desired = settings.layer_settings(crate::settings::SettingScope::Session, &session.workspace, &session.id)?;
+        let mut desired = settings.layer_settings(
+            crate::settings::SettingScope::Session,
+            &session.workspace,
+            &session.id,
+        )?;
         desired.check_editing = Some(enabled);
-        settings.update(snapshot.revision, crate::settings::SettingScope::Session, &session.workspace, &session.id, &desired)?;
+        settings.update(
+            snapshot.revision,
+            crate::settings::SettingScope::Session,
+            &session.workspace,
+            &session.id,
+            &desired,
+        )?;
         self.check_editing.store(enabled, Ordering::Release);
         Ok(json!({"check_editing": enabled}))
     }
 
     /// Adopts a current host's ordered queue publication independently of execution.
     pub(crate) fn update_queue(&self, params: &Value) -> Result<()> {
-        anyhow::ensure!(params["runtime_epoch"].as_str() == Some(&self.runtime_epoch),
-            "queue update belongs to a retired Harness host");
+        anyhow::ensure!(
+            params["runtime_epoch"].as_str() == Some(&self.runtime_epoch),
+            "queue update belongs to a retired Harness host"
+        );
         self.completion_queue.update(
-            params["revision"].as_u64().context("queue update requires revision")?,
-            params["pending"].as_bool().context("queue update requires pending")?,
+            params["revision"]
+                .as_u64()
+                .context("queue update requires revision")?,
+            params["pending"]
+                .as_bool()
+                .context("queue update requires pending")?,
         )
     }
 
@@ -56,8 +73,14 @@ impl BrokerObserver {
         let revision = self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1;
         let store = SqliteStore::open(&self.data_root)?;
         store.read_snapshot(|| {
-            let session = store.load_session(&self.session_id)?.context("observed session is missing")?;
-            let metadata = self.metadata.read().map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?.clone();
+            let session = store
+                .load_session(&self.session_id)?
+                .context("observed session is missing")?;
+            let metadata = self
+                .metadata
+                .read()
+                .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?
+                .clone();
             let agents = load_agent_registry(&store, &session.id)?.list();
             self.build(&store, &session, &metadata, agents, revision)
         })
@@ -71,37 +94,69 @@ impl BrokerObserver {
             active_wait: broker.active_wait_projection.clone(),
             no_checkpoint: matches!(broker.workspace_kind, WorkspaceKind::Untracked(_)),
         };
-        let result = self.build(&broker.store, &broker.session, &metadata, broker.agent_registry.list(), revision)?;
+        let result = self.build(
+            &broker.store,
+            &broker.session,
+            &metadata,
+            broker.agent_registry.list(),
+            revision,
+        )?;
         if broker.session.id == self.session_id {
-            let mut published = self.metadata.write().map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
-            if metadata.revision >= published.revision { *published = metadata; }
+            let mut published = self
+                .metadata
+                .write()
+                .map_err(|_| anyhow::anyhow!("observation metadata lock poisoned"))?;
+            if metadata.revision >= published.revision {
+                *published = metadata;
+            }
         }
         Ok(result)
     }
-    fn build(&self, store: &SqliteStore, source_session: &HarnessSession, metadata: &ObservationMetadata, agent_run_list: Vec<Agent>, revision: u64) -> Result<BrokerSnapshot> {
+    fn build(
+        &self,
+        store: &SqliteStore,
+        source_session: &HarnessSession,
+        metadata: &ObservationMetadata,
+        agent_run_list: Vec<Agent>,
+        revision: u64,
+    ) -> Result<BrokerSnapshot> {
         let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
         let settings = crate::settings::SettingsStore::open(&self.data_root)?
-            .get(&session.workspace, &session.id, &session.backend)?.desired;
+            .get(&session.workspace, &session.id, &session.backend)?
+            .desired;
         let check_timing = settings.check_timing.unwrap_or_default();
-        (session.approval_timeout, session.answer_timeout) = self.permission_coordinator.input_timeouts(&session.id)?;
+        (session.approval_timeout, session.answer_timeout) =
+            self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = source_session
             .goal_id
             .as_deref()
             .map(|id| store.load_goal(id))
             .transpose()?
             .flatten();
-        let task = store.list_task(&source_session.id)?.into_iter()
+        let task = store
+            .list_task(&source_session.id)?
+            .into_iter()
             .find(|task| Some(&task.id) == source_session.current_task_id.as_ref());
-        let active_plan = task.as_ref()
+        let active_plan = task
+            .as_ref()
             .and_then(|task| task.plan_id.as_deref())
-            .map(|id| store.load_plan(id)).transpose()?.flatten();
+            .map(|id| store.load_plan(id))
+            .transpose()?
+            .flatten();
         if let Some(plan) = active_plan.as_ref() {
-            self.trace.record(&source_session.id, "snapshot_plan_state", plan_trace_fields(plan));
+            self.trace.record(
+                &source_session.id,
+                "snapshot_plan_state",
+                plan_trace_fields(plan),
+            );
         }
         let interaction = store.list_exchange(&source_session.id)?;
-        let plan_input = active_plan.as_ref().filter(|_| !task.as_ref()
-            .is_some_and(|task| task.status == crate::task::TaskStatus::Paused));
+        let plan_input = active_plan.as_ref().filter(|_| {
+            !task
+                .as_ref()
+                .is_some_and(|task| task.status == crate::task::TaskStatus::Paused)
+        });
         let active_elicitation = plan_input
             .and_then(|plan| {
                 plan.acceptance
@@ -126,17 +181,21 @@ impl BrokerObserver {
                 })
             })
             .or_else(|| {
-                interaction.iter().rev().filter(|interaction| interaction.awaiting_input).find_map(|interaction| {
-                    interaction
-                        .elicitation
-                        .clone()
-                        .map(|elicitation| ActiveElicitation {
-                            owner: ElicitationOwner::Interaction,
-                            plan_id: interaction.plan_id.clone(),
-                            exchange_id: Some(interaction.id.clone()),
-                            elicitation,
-                        })
-                })
+                interaction
+                    .iter()
+                    .rev()
+                    .filter(|interaction| interaction.awaiting_input)
+                    .find_map(|interaction| {
+                        interaction
+                            .elicitation
+                            .clone()
+                            .map(|elicitation| ActiveElicitation {
+                                owner: ElicitationOwner::Interaction,
+                                plan_id: interaction.plan_id.clone(),
+                                exchange_id: Some(interaction.id.clone()),
+                                elicitation,
+                            })
+                    })
             });
         let plan_list = store.list_plan(&source_session.id)?;
         let lifecycle_list = store.list_plan_lifecycle(&source_session.id)?;
@@ -155,23 +214,42 @@ impl BrokerObserver {
             active_wait.as_ref(),
             interaction.last(),
         );
-        if task.as_ref().is_some_and(|task| task.status == crate::task::TaskStatus::Paused) {
+        if task
+            .as_ref()
+            .is_some_and(|task| task.status == crate::task::TaskStatus::Paused)
+        {
             status = crate::session::state_machine::SessionPhase::Paused;
         }
-        if status == crate::session::state_machine::SessionPhase::Idle && self.agent_coordinator.active_count() > 0 {
-            status = crate::session::state_machine::SessionPhase::WaitingForAgent {agent_count:self.agent_coordinator.active_count()};
+        if status == crate::session::state_machine::SessionPhase::Idle
+            && self.agent_coordinator.active_count() > 0
+        {
+            status = crate::session::state_machine::SessionPhase::WaitingForAgent {
+                agent_count: self.agent_coordinator.active_count(),
+            };
         }
-        if let Some(execution) = goal_execution.as_ref() { HarnessBroker::execution_status(&mut status, execution); }
-        if let Some(started_at_ms) = session_event_list.iter().rev().find_map(|event| match &event.detail {
-            SessionEventKind::Compaction { compaction }
-                if compaction.state == crate::backend::CompactionState::Running =>
-                    Some(compaction.started_at_ms.unwrap_or(event.created_at_ms)),
-            _ => None,
-        }) {
+        if let Some(execution) = goal_execution.as_ref() {
+            HarnessBroker::execution_status(&mut status, execution);
+        }
+        if let Some(started_at_ms) = session_event_list
+            .iter()
+            .rev()
+            .find_map(|event| match &event.detail {
+                SessionEventKind::Compaction { compaction }
+                    if compaction.state == crate::backend::CompactionState::Running =>
+                {
+                    Some(compaction.started_at_ms.unwrap_or(event.created_at_ms))
+                }
+                _ => None,
+            })
+        {
             status = crate::session::state_machine::SessionPhase::Compacting { started_at_ms };
         }
-        self.trace.record(&source_session.id, "status_projected", json!({ "session_id": source_session.id, "status": status }));
-        
+        self.trace.record(
+            &source_session.id,
+            "status_projected",
+            json!({ "session_id": source_session.id, "status": status }),
+        );
+
         let mut agent_exchange_list = Vec::new();
         for run in &agent_run_list {
             agent_exchange_list.extend(store.list_agent_exchange(&run.id)?);
@@ -192,15 +270,19 @@ impl BrokerObserver {
         let check_snapshot = self.check_runner.snapshot()?;
         let check_history = check_snapshot.history;
         let active_check_run = check_snapshot.active_run;
-        let checks = active_check_run.as_ref().and_then(|id| check_history.iter().find(|run| &run.id == id))
+        let checks = active_check_run
+            .as_ref()
+            .and_then(|id| check_history.iter().find(|run| &run.id == id))
             .and_then(crate::checks::CheckActivity::from_run);
         let checks_running = checks.is_some();
         let mut timeline = TimelineProjector::with_checks(timeline, check_history);
-        timeline.push(TimelineEntry::Status { checks, agent_count: self.agent_coordinator.active_count(),
-                status_thoughts,
-                id: format!("{}:status", source_session.id),
-                created_at_ms: 0,
-                status: status.clone(),
+        timeline.push(TimelineEntry::Status {
+            checks,
+            agent_count: self.agent_coordinator.active_count(),
+            status_thoughts,
+            id: format!("{}:status", source_session.id),
+            created_at_ms: 0,
+            status: status.clone(),
         });
         let approval = self
             .permission_coordinator
@@ -214,8 +296,8 @@ impl BrokerObserver {
             })
             .collect();
         Ok(BrokerSnapshot {
-            subagent_tools:self.agent_coordinator.enabled(),
-            lsp_tools:self.lsp.enabled(&source_session.id),
+            subagent_tools: self.agent_coordinator.enabled(),
+            lsp_tools: self.lsp.enabled(&source_session.id),
             status_thoughts,
             check_editing: self.check_editing.load(Ordering::Acquire),
             runtime_epoch: self.runtime_epoch.clone(),
@@ -224,18 +306,27 @@ impl BrokerObserver {
             check_timing,
             checks_deferred: self.completion_queue.deferred()?,
             active_check_run,
-            task_operation: store.latest_task_operation(&source_session.id)?
-                .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
-                    || operation.exchange_id.as_deref() == interaction.last().map(|exchange| exchange.id.as_str()))
+            task_operation: store
+                .latest_task_operation(&source_session.id)?
+                .filter(|operation| {
+                    !matches!(
+                        operation.state.as_str(),
+                        "failed" | "cancelled" | "completed" | "superseded"
+                    ) || operation.exchange_id.as_deref()
+                        == interaction.last().map(|exchange| exchange.id.as_str())
+                })
                 .map(|operation| operation.view()),
             session,
             task: store.list_task(&source_session.id)?,
             exchange: interaction,
             capability: metadata.capability.clone(),
             no_checkpoint: metadata.no_checkpoint,
-            restore_recovery: crate::checkpoint::RestoreJournal::progress(&store.objects, &source_session.id)?
-                .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
-                .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
+            restore_recovery: crate::checkpoint::RestoreJournal::progress(
+                &store.objects,
+                &source_session.id,
+            )?
+            .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
+            .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
             goal,
             active_plan,
             active_elicitation,
@@ -262,16 +353,24 @@ impl BrokerObserver {
     /// Handles session queries and independent metadata writes without a provider turn lock.
     pub(crate) fn query(&self, method: HarnessMethod, params: Value) -> Result<Option<Value>> {
         let result = match method {
-            HarnessMethod::ChecksEditing => self.set_check_editing(params["enabled"].as_bool().context("check editing requires enabled")?)?,
+            HarnessMethod::ChecksEditing => self.set_check_editing(
+                params["enabled"]
+                    .as_bool()
+                    .context("check editing requires enabled")?,
+            )?,
             HarnessMethod::StateGet => serde_json::to_value(self.snapshot()?)?,
-            HarnessMethod::TaskList => serde_json::to_value(SqliteStore::open(&self.data_root)?.list_task(&self.session_id)?)?,
+            HarnessMethod::TaskList => serde_json::to_value(
+                SqliteStore::open(&self.data_root)?.list_task(&self.session_id)?,
+            )?,
             HarnessMethod::AgentList => serde_json::to_value(self.snapshot()?.agent)?,
             HarnessMethod::SessionList => self.list_session(params)?.0,
             HarnessMethod::SessionPreview => self.preview_session(params)?.0,
             HarnessMethod::PlanList => self.list_replanning_choices()?.0,
             HarnessMethod::PlanGet => self.plan(params)?,
             HarnessMethod::ExchangeList => serde_json::to_value(self.list_exchange_review()?)?,
-            HarnessMethod::HistoryRecord => self.record_prompt_history(params, SystemClock.now_ms())?.0,
+            HarnessMethod::HistoryRecord => {
+                self.record_prompt_history(params, SystemClock.now_ms())?.0
+            }
             HarnessMethod::PermissionsOpen => self.open_permission_document()?.0,
             HarnessMethod::PermissionsSave => self.save_permission_document(params)?.0,
             _ => return Ok(None),
@@ -283,14 +382,24 @@ impl BrokerObserver {
     pub(super) fn plan(&self, params: Value) -> Result<Value> {
         let plan_id = required_text(&params, "plan_id")?;
         let store = SqliteStore::open(&self.data_root)?;
-        let plan = store.load_plan(&plan_id)?.context("plan artifact not found")?;
-        anyhow::ensure!(plan.session_id == self.session_id, "plan belongs to another session");
+        let plan = store
+            .load_plan(&plan_id)?
+            .context("plan artifact not found")?;
+        anyhow::ensure!(
+            plan.session_id == self.session_id,
+            "plan belongs to another session"
+        );
         anyhow::ensure!(plan.review_digest.is_some(), "plan has no submitted review");
         if let Some(revision) = params.get("revision").filter(|value| !value.is_null()) {
             let revision: u32 = serde_json::from_value(revision.clone())?;
             let stranded = plan.state == PlanState::Accepted
-                && !store.list_plan_execution(&self.session_id)?.iter().any(|execution| execution.plan_id == plan.id);
-            if revision != plan.model_revision || (plan.state != PlanState::AwaitingReview && !stranded) {
+                && !store
+                    .list_plan_execution(&self.session_id)?
+                    .iter()
+                    .any(|execution| execution.plan_id == plan.id);
+            if revision != plan.model_revision
+                || (plan.state != PlanState::AwaitingReview && !stranded)
+            {
                 let source = self.capture_plan_revision(&plan.id, revision)?;
                 let mut historical = serde_json::to_value(&plan)?;
                 historical["title"] = json!(source.document.title);
@@ -298,7 +407,8 @@ impl BrokerObserver {
                 historical["document_version"] = json!(source.document.version);
                 historical["model_revision"] = json!(revision);
                 historical["historical_revision"] = json!(revision);
-                historical["review_digest"] = json!(crate::plan::digest(&serde_json::to_vec(&source.document)?));
+                historical["review_digest"] =
+                    json!(crate::plan::digest(&serde_json::to_vec(&source.document)?));
                 return Ok(historical);
             }
         }
@@ -307,7 +417,9 @@ impl BrokerObserver {
 
     pub(super) fn list_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let store = SqliteStore::open(&self.data_root)?;
-        let session = store.load_session(&self.session_id)?.context("observed session is missing")?;
+        let session = store
+            .load_session(&self.session_id)?
+            .context("observed session is missing")?;
         let scope = params
             .get("scope")
             .and_then(Value::as_str)
@@ -329,7 +441,15 @@ impl BrokerObserver {
                 .unwrap_or_else(|| session.workspace.clone());
             store.list_session(Some(&workspace))?
         };
-        Ok((serde_json::to_value(session.into_iter().filter(|session| session.background.is_none()).collect::<Vec<_>>())?, Vec::new()))
+        Ok((
+            serde_json::to_value(
+                session
+                    .into_iter()
+                    .filter(|session| session.background.is_none())
+                    .collect::<Vec<_>>(),
+            )?,
+            Vec::new(),
+        ))
     }
 
     pub(super) fn preview_session(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -362,7 +482,12 @@ impl BrokerObserver {
             session_event_list: store.list_session_event(&session_id)?,
             plan_file: &self.plan_file,
         })?;
-        let timeline = TimelineProjector::with_checks(timeline,crate::checks::CheckSupervisor::saved_history(&self.data_root.join(&session_id).join("checks"))?);
+        let timeline = TimelineProjector::with_checks(
+            timeline,
+            crate::checks::CheckSupervisor::saved_history(
+                &self.data_root.join(&session_id).join("checks"),
+            )?,
+        );
         let preview = SessionPreview {
             lines: preview_lines(&timeline)?,
             session: preview_session,
@@ -379,7 +504,9 @@ impl BrokerObserver {
 
     pub(super) fn list_exchange_review(&self) -> Result<Vec<Exchange>> {
         let store = SqliteStore::open(&self.data_root)?;
-        let session = store.load_session(&self.session_id)?.context("observed session is missing")?;
+        let session = store
+            .load_session(&self.session_id)?
+            .context("observed session is missing")?;
         let mut interaction_list = store.list_exchange(&session.id)?;
         for interaction in &mut interaction_list {
             interaction.comment = store.list_exchange_comment(&interaction.id)?;
@@ -387,11 +514,18 @@ impl BrokerObserver {
         Ok(interaction_list)
     }
 
-    pub(super) fn record_prompt_history(&self, params: Value, now_ms: i64) -> Result<(Value, Vec<SessionEvent>)> {
+    pub(super) fn record_prompt_history(
+        &self,
+        params: Value,
+        now_ms: i64,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut store = SqliteStore::open(&self.data_root)?;
         let draft: crate::attachment::PromptDraft = serde_json::from_value(params)?;
         store.record_prompt_history(&draft, now_ms)?;
-        Ok((serde_json::to_value(store.list_prompt_history()?)?,Vec::new()))
+        Ok((
+            serde_json::to_value(store.list_prompt_history()?)?,
+            Vec::new(),
+        ))
     }
 
     pub(super) fn open_permission_document(&self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -403,7 +537,10 @@ impl BrokerObserver {
         Ok((json!({ "path": path, "source": source }), Vec::new()))
     }
 
-    pub(super) fn save_permission_document(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+    pub(super) fn save_permission_document(
+        &self,
+        params: Value,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         let source = required_text(&params, "source")?;
         self.permission_store
             .write()
@@ -414,7 +551,9 @@ impl BrokerObserver {
 
     pub(super) fn list_replanning_choices(&self) -> Result<(Value, Vec<SessionEvent>)> {
         let store = SqliteStore::open(&self.data_root)?;
-        let session = store.load_session(&self.session_id)?.context("observed session is missing")?;
+        let session = store
+            .load_session(&self.session_id)?
+            .context("observed session is missing")?;
         let mut choices = Vec::new();
         for session in [&session] {
             let execution = store.list_plan_execution(&session.id)?;
@@ -423,7 +562,10 @@ impl BrokerObserver {
                     implemented: execution.iter().any(|record| {
                         record.plan_id == plan.id && record.state == PlanExecutionState::Complete
                     }),
-                    task: store.list_task(&session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id)),
+                    task: store
+                        .list_task(&session.id)?
+                        .into_iter()
+                        .find(|task| task.plan_id.as_deref() == Some(&plan.id)),
                     digest: plan.review_digest.clone(),
                     id: plan.id,
                     created_at_ms: plan.created_at_ms,
@@ -436,7 +578,6 @@ impl BrokerObserver {
         }
         Ok((serde_json::to_value(choices)?, Vec::new()))
     }
-
 
     pub(crate) fn capture_plan_review(
         &self,
@@ -463,7 +604,12 @@ impl BrokerObserver {
             &self.session_id,
             &plan.id,
             (plan.submitted_version == Some(plan.document_version)).then_some(
-                if plan.state == PlanState::Accepted { plan.accepted_revision.unwrap_or(plan.model_revision) } else { plan.model_revision }),
+                if plan.state == PlanState::Accepted {
+                    plan.accepted_revision.unwrap_or(plan.model_revision)
+                } else {
+                    plan.model_revision
+                },
+            ),
             expected_digest,
         )?;
         source.execution_review = self.execution_review(plan_id)?;
@@ -476,10 +622,20 @@ impl BrokerObserver {
         revision: u32,
     ) -> Result<crate::plan::review_source::PlanReviewSource> {
         let store = SqliteStore::open(&self.data_root)?;
-        let plan = store.load_plan(plan_id)?.context("plan artifact not found")?;
-        anyhow::ensure!(plan.session_id == self.session_id, "plan belongs to another session");
-        anyhow::ensure!(revision > 0 && revision <= plan.model_revision, "plan revision is unavailable");
-        let mut source = self.plan_file.capture_revision_source(&self.session_id, &plan.id, revision)?;
+        let plan = store
+            .load_plan(plan_id)?
+            .context("plan artifact not found")?;
+        anyhow::ensure!(
+            plan.session_id == self.session_id,
+            "plan belongs to another session"
+        );
+        anyhow::ensure!(
+            revision > 0 && revision <= plan.model_revision,
+            "plan revision is unavailable"
+        );
+        let mut source =
+            self.plan_file
+                .capture_revision_source(&self.session_id, &plan.id, revision)?;
         source.execution_review = self.execution_review(plan_id)?;
         Ok(source)
     }
@@ -495,7 +651,10 @@ impl BrokerObserver {
         };
         let mut report = format!(
             "## {}: {:?}\n\nOriginal approved revision: {}. Current accepted revision: {}.\n\n### Semantic comparison\n\n",
-            execution.phase.label(), execution.state, execution.original_revision, execution.revision
+            execution.phase.label(),
+            execution.state,
+            execution.original_revision,
+            execution.revision
         );
         for (label, paths) in [
             ("Matched", &execution.progress.matched),

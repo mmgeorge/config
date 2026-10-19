@@ -21,8 +21,12 @@ pub enum TextGeneration {
 impl TextGeneration {
     /// Repeat the current task and response contract within a shared conversation.
     pub fn background_input(self, evidence: &str) -> String {
-        format!("Current Background task: {}\n\nResponse requirements:\n{}\n\nCurrent authoritative evidence:\n{}",
-            self.name(), self.instructions(), evidence)
+        format!(
+            "Current Background task: {}\n\nResponse requirements:\n{}\n\nCurrent authoritative evidence:\n{}",
+            self.name(),
+            self.instructions(),
+            evidence
+        )
     }
 
     /// Identify isolated provider requests in diagnostic logs.
@@ -67,7 +71,11 @@ impl TextGeneration {
                 text = text.split_once('\n').map(|(_, body)| body).unwrap_or(text);
                 text = text.strip_suffix("```").unwrap_or(text).trim();
             }
-            ensure!(!text.is_empty(), "model returned empty {} text", self.name());
+            ensure!(
+                !text.is_empty(),
+                "model returned empty {} text",
+                self.name()
+            );
             return Ok(text.to_owned());
         }
         if self != Self::SessionName {
@@ -164,22 +172,54 @@ mod tests {
     fn commit_message_preserves_body_and_large_output_and_rejects_empty_output() {
         let purpose = TextGeneration::CommitMessage;
         let message = "fix: preserve commit drafts\n\nKeep user edits while generation runs.";
-        assert_eq!(purpose.validate(&format!("  ```text\n{message}\n```  ")).unwrap(), message);
-        assert_eq!(purpose.input("Staged diff:\n+change"), "Staged diff:\n+change");
+        assert_eq!(
+            purpose
+                .validate(&format!("  ```text\n{message}\n```  "))
+                .unwrap(),
+            message
+        );
+        assert_eq!(
+            purpose.input("Staged diff:\n+change"),
+            "Staged diff:\n+change"
+        );
         assert!(purpose.validate(" \n ").is_err());
         assert!(purpose.validate("```text\n```").is_err());
-        assert_eq!(purpose.validate(&"x".repeat(16 * 1024 + 1)).unwrap().len(), 16 * 1024 + 1);
-        assert_eq!(TextGeneration::Recap.validate(&"x".repeat(8193)).unwrap().len(), 8193);
-        assert_eq!(purpose.validate(&"x".repeat(16 * 1024)).unwrap().len(), 16 * 1024);
-        assert_eq!(TextGeneration::Recap.input("User: question"), "Conversation:\nUser: question");
-        assert_eq!(TextGeneration::Recap.validate("first\n\nsecond").unwrap(), "first second");
+        assert_eq!(
+            purpose.validate(&"x".repeat(16 * 1024 + 1)).unwrap().len(),
+            16 * 1024 + 1
+        );
+        assert_eq!(
+            TextGeneration::Recap
+                .validate(&"x".repeat(8193))
+                .unwrap()
+                .len(),
+            8193
+        );
+        assert_eq!(
+            purpose.validate(&"x".repeat(16 * 1024)).unwrap().len(),
+            16 * 1024
+        );
+        assert_eq!(
+            TextGeneration::Recap.input("User: question"),
+            "Conversation:\nUser: question"
+        );
+        assert_eq!(
+            TextGeneration::Recap.validate("first\n\nsecond").unwrap(),
+            "first second"
+        );
     }
 
     #[test]
     fn pull_request_description_preserves_paragraphs_and_rejects_empty_output() {
         let purpose = TextGeneration::PullRequestDescription;
-        let description = "Preserves the selected branch.\n\nReports provider failures before publication.";
-        assert_eq!(purpose.validate(&format!("```text\n{description}\n```")).unwrap(), description);
+        let description =
+            "Preserves the selected branch.\n\nReports provider failures before publication.";
+        assert_eq!(
+            purpose
+                .validate(&format!("```text\n{description}\n```"))
+                .unwrap(),
+            description
+        );
         assert_eq!(purpose.input(description), description);
         assert!(purpose.validate(" \n ").is_err());
         assert!(purpose.validate("```text\n```").is_err());
@@ -314,7 +354,8 @@ mod tests {
             id: "entry".into(),
             created_at_ms: 1,
             exchange,
-            check_runs: Vec::new(), agent_by_id: Default::default(),
+            check_runs: Vec::new(),
+            agent_by_id: Default::default(),
         }];
         let captured = history(&entries).unwrap();
         assert_eq!(captured, "User: Fix this\n\nAssistant: Visible progress");
@@ -322,7 +363,10 @@ mod tests {
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
             exchange.prompt = large_prompt.clone();
         }
-        assert_eq!(history(&entries).unwrap(), format!("User: {large_prompt}\n\nAssistant: Visible progress"));
+        assert_eq!(
+            history(&entries).unwrap(),
+            format!("User: {large_prompt}\n\nAssistant: Visible progress")
+        );
         if let TimelineEntry::Exchange { exchange, .. } = &mut entries[0] {
             exchange.disposition = HistoryDisposition::Superseded;
         }
@@ -332,7 +376,10 @@ mod tests {
     #[test]
     fn rejects_empty_recaps_preserves_large_text_and_normalizes_lines() {
         assert!(super::validate("  \n").is_err());
-        assert_eq!(super::validate(&"x".repeat(8193)).unwrap(), "x".repeat(8193));
+        assert_eq!(
+            super::validate(&"x".repeat(8193)).unwrap(),
+            "x".repeat(8193)
+        );
         assert_eq!(
             super::validate("Recent work.\nNext step.").unwrap(),
             "Recent work. Next step."

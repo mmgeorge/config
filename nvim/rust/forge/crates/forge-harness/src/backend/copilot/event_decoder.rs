@@ -33,57 +33,103 @@ impl CopilotEventDecoder {
         }
         match provider_event.event_type.as_str() {
             "assistant.idle" | "session.idle" if provider_event.agent_id.is_none() => {
-                let unfinished = output.event.iter().enumerate().filter_map(|(index, event)| {
-                    if !matches!(event.turn_boundary, Some(crate::backend::TurnBoundary::Started)) {
-                        return None;
-                    }
-                    let address = event.address.as_ref()?;
-                    if Some(&address.thread_id) != output.backend_session_id.as_ref()
-                        || output.event[index + 1..].iter().any(|later| {
-                            later.address.as_ref() == Some(address)
-                                && matches!(later.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
-                        }) {
-                        return None;
-                    }
-                    Some(address.clone())
-                }).collect::<Vec<_>>();
+                let unfinished = output
+                    .event
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, event)| {
+                        if !matches!(
+                            event.turn_boundary,
+                            Some(crate::backend::TurnBoundary::Started)
+                        ) {
+                            return None;
+                        }
+                        let address = event.address.as_ref()?;
+                        if Some(&address.thread_id) != output.backend_session_id.as_ref()
+                            || output.event[index + 1..].iter().any(|later| {
+                                later.address.as_ref() == Some(address)
+                                    && matches!(
+                                        later.turn_boundary,
+                                        Some(crate::backend::TurnBoundary::Finished { .. })
+                                    )
+                            })
+                        {
+                            return None;
+                        }
+                        Some(address.clone())
+                    })
+                    .collect::<Vec<_>>();
                 for address in unfinished {
-                    publish(BackendEvent {
-                        received_at_ms: None,
-                        address: Some(address),
-                        turn_boundary: Some(crate::backend::TurnBoundary::Finished {
-                            outcome: crate::turn::TurnOutcome::Completed,
-                        }),
-                        kind: "turn_completed".into(),
-                        text: None,
-                        data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
-                        activity: None,
-                        summary: None,
-                        task_update: None,
-                    }, output, event_sink).await;
+                    publish(
+                        BackendEvent {
+                            received_at_ms: None,
+                            address: Some(address),
+                            turn_boundary: Some(crate::backend::TurnBoundary::Finished {
+                                outcome: crate::turn::TurnOutcome::Completed,
+                            }),
+                            kind: "turn_completed".into(),
+                            text: None,
+                            data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
+                            activity: None,
+                            summary: None,
+                            task_update: None,
+                        },
+                        output,
+                        event_sink,
+                    )
+                    .await;
                 }
             }
             "session.compaction_start" | "session.compaction_complete" => {
-                let thread_id = provider_event.agent_id.clone().or_else(|| output.backend_session_id.clone());
-                let Some(thread_id) = thread_id else { return; };
+                let thread_id = provider_event
+                    .agent_id
+                    .clone()
+                    .or_else(|| output.backend_session_id.clone());
+                let Some(thread_id) = thread_id else {
+                    return;
+                };
                 let complete = provider_event.event_type == "session.compaction_complete";
                 let id = if complete {
-                    output.event.iter().rev()
-                        .find(|event| event.kind == "compaction"
-                            && event.data.get("provider_event_id").and_then(Value::as_str) == Some(provider_event.id.as_str()))
-                        .and_then(|event| event.compaction().ok().flatten()).map(|compaction| compaction.id)
-                        .or_else(|| output.event.iter().rev().filter_map(|event| event.compaction().ok().flatten())
-                        .find(|compaction| compaction.thread_id == thread_id
-                            && compaction.state == crate::backend::CompactionState::Running)
-                        .map(|compaction| compaction.id))
+                    output
+                        .event
+                        .iter()
+                        .rev()
+                        .find(|event| {
+                            event.kind == "compaction"
+                                && event.data.get("provider_event_id").and_then(Value::as_str)
+                                    == Some(provider_event.id.as_str())
+                        })
+                        .and_then(|event| event.compaction().ok().flatten())
+                        .map(|compaction| compaction.id)
+                        .or_else(|| {
+                            output
+                                .event
+                                .iter()
+                                .rev()
+                                .filter_map(|event| event.compaction().ok().flatten())
+                                .find(|compaction| {
+                                    compaction.thread_id == thread_id
+                                        && compaction.state
+                                            == crate::backend::CompactionState::Running
+                                })
+                                .map(|compaction| compaction.id)
+                        })
                         .unwrap_or_else(|| provider_event.id.clone())
-                } else { provider_event.id.clone() };
+                } else {
+                    provider_event.id.clone()
+                };
                 let result = serde_json::from_value(provider_event.data.clone());
                 let mut result: crate::backend::CompactionResult = match result {
                     Ok(result) => result,
                     Err(error) => {
-                        self.publish_text("error", Some(format!("Invalid Copilot compaction result: {error}")),
-                            provider_event, output, event_sink).await;
+                        self.publish_text(
+                            "error",
+                            Some(format!("Invalid Copilot compaction result: {error}")),
+                            provider_event,
+                            output,
+                            event_sink,
+                        )
+                        .await;
                         return;
                     }
                 };
@@ -95,20 +141,32 @@ impl CopilotEventDecoder {
                         ..Default::default()
                     });
                     if let Some(context) = &mut result.before_context {
-                        context.current_tokens = context.conversation_tokens.zip(context.system_tokens)
+                        context.current_tokens = context
+                            .conversation_tokens
+                            .zip(context.system_tokens)
                             .zip(context.tool_definitions_tokens)
-                            .and_then(|((conversation, system), tools)| conversation.checked_add(system)?.checked_add(tools));
+                            .and_then(|((conversation, system), tools)| {
+                                conversation.checked_add(system)?.checked_add(tools)
+                            });
                         result.context_tokens_before = context.current_tokens;
                     }
                 }
                 let compaction = crate::backend::Compaction {
-                    id, thread_id,
-                    state: if !complete { crate::backend::CompactionState::Running }
-                        else if provider_event.data.get("success").and_then(Value::as_bool) == Some(true) {
-                            crate::backend::CompactionState::Completed
-                        } else { crate::backend::CompactionState::Failed },
+                    id,
+                    thread_id,
+                    state: if !complete {
+                        crate::backend::CompactionState::Running
+                    } else if provider_event.data.get("success").and_then(Value::as_bool)
+                        == Some(true)
+                    {
+                        crate::backend::CompactionState::Completed
+                    } else {
+                        crate::backend::CompactionState::Failed
+                    },
                     manual: provider_event.data.get("customInstructions").is_some(),
-                    started_at_ms: None, completed_at_ms: None, result,
+                    started_at_ms: None,
+                    completed_at_ms: None,
+                    result,
                 };
                 let mut event = BackendEvent::from_compaction(compaction, None);
                 event.data["provider_event_id"] = Value::String(provider_event.id.clone());
@@ -117,7 +175,7 @@ impl CopilotEventDecoder {
             "assistant.turn_start" | "assistant.turn_end" => {
                 publish(
                     BackendEvent {
-            received_at_ms: None,
+                        received_at_ms: None,
                         address: None,
                         turn_boundary: Some(
                             if provider_event.event_type == "assistant.turn_start" {
@@ -197,12 +255,19 @@ impl CopilotEventDecoder {
                     && provider_event.event_type == "tool.execution_complete"
                 {
                     match super::file_change::from_output(
-                        activity.output.as_deref().unwrap_or_default(), &self.workspace,
+                        activity.output.as_deref().unwrap_or_default(),
+                        &self.workspace,
                     ) {
                         Ok(change) => activity.change = change,
                         Err(error) => {
-                            self.publish_text("error", Some(format!("Invalid Copilot file changes: {error:#}")),
-                                provider_event, output, event_sink).await;
+                            self.publish_text(
+                                "error",
+                                Some(format!("Invalid Copilot file changes: {error:#}")),
+                                provider_event,
+                                output,
+                                event_sink,
+                            )
+                            .await;
                         }
                     }
                 }
@@ -212,7 +277,7 @@ impl CopilotEventDecoder {
                 if let Some(activity) = activity {
                     publish(
                         BackendEvent {
-            received_at_ms: None,
+                            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "tool".into(),
@@ -237,7 +302,7 @@ impl CopilotEventDecoder {
                     output.metrics.context_usage = Some(context_usage.clone());
                     publish(
                         BackendEvent {
-            received_at_ms: None,
+                            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "context_usage".into(),
@@ -268,7 +333,7 @@ impl CopilotEventDecoder {
                     cumulative_total: None,
                 };
                 let mut event = BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "usage".into(),
@@ -280,13 +345,14 @@ impl CopilotEventDecoder {
                     task_update: None,
                 };
                 address_event(&mut event, output);
-                event.data = serde_json::to_value(update).expect("usage update is JSON serializable");
+                event.data =
+                    serde_json::to_value(update).expect("usage update is JSON serializable");
                 publish(event, output, event_sink).await;
             }
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 publish(
                     BackendEvent {
-            received_at_ms: None,
+                        received_at_ms: None,
                         address: None,
                         turn_boundary: None,
                         kind: "agent_lifecycle".into(),
@@ -329,7 +395,7 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "plan".into(),
@@ -359,19 +425,29 @@ impl CopilotEventDecoder {
         let mut data = serde_json::to_value(provider_event).unwrap_or(Value::Null);
         if kind == "assistant_message" {
             let final_answer = provider_event.event_type == "assistant.message"
-                && !provider_event.data.get("toolRequests").and_then(Value::as_array)
+                && !provider_event
+                    .data
+                    .get("toolRequests")
+                    .and_then(Value::as_array)
                     .is_some_and(|requests| !requests.is_empty());
             data["phase"] = json!(if final_answer { "final" } else { "commentary" });
         }
-        if let Some(id) = provider_event.data.get("reasoningId").and_then(Value::as_str) {
+        if let Some(id) = provider_event
+            .data
+            .get("reasoningId")
+            .and_then(Value::as_str)
+        {
             data["provider_message_id"] = json!(id);
         }
-        if matches!(provider_event.event_type.as_str(), "assistant.message" | "assistant.reasoning") {
+        if matches!(
+            provider_event.event_type.as_str(),
+            "assistant.message" | "assistant.reasoning"
+        ) {
             data["message_update"] = json!("snapshot");
         }
         publish(
             BackendEvent {
-            received_at_ms: None,
+                received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: kind.into(),
@@ -402,17 +478,39 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
             .or_else(|| output.backend_session_id.clone());
         if let Some(thread_id) = thread_id {
             let native_turn_id = event.data.pointer("/data/turnId").and_then(Value::as_str);
-            let turn_id = native_turn_id.map(|native| {
-                if let Some(interaction) = event.data.pointer("/data/interactionId").and_then(Value::as_str) {
-                    return format!("{interaction}:{native}");
-                }
-                output.event.iter().rev().find(|previous| {
-                    previous.kind == "turn_started"
-                        && previous.data.pointer("/data/turnId").and_then(Value::as_str) == Some(native)
-                        && previous.address.as_ref().is_some_and(|address|address.thread_id == thread_id)
-                }).and_then(|previous|previous.address.as_ref().map(|address|address.turn_id.clone()))
-                    .unwrap_or_else(||native.to_owned())
-            })
+            let turn_id = native_turn_id
+                .map(|native| {
+                    if let Some(interaction) = event
+                        .data
+                        .pointer("/data/interactionId")
+                        .and_then(Value::as_str)
+                    {
+                        return format!("{interaction}:{native}");
+                    }
+                    output
+                        .event
+                        .iter()
+                        .rev()
+                        .find(|previous| {
+                            previous.kind == "turn_started"
+                                && previous
+                                    .data
+                                    .pointer("/data/turnId")
+                                    .and_then(Value::as_str)
+                                    == Some(native)
+                                && previous
+                                    .address
+                                    .as_ref()
+                                    .is_some_and(|address| address.thread_id == thread_id)
+                        })
+                        .and_then(|previous| {
+                            previous
+                                .address
+                                .as_ref()
+                                .map(|address| address.turn_id.clone())
+                        })
+                        .unwrap_or_else(|| native.to_owned())
+                })
                 .or_else(|| {
                     output.event.iter().rev().find_map(|previous| {
                         previous
@@ -422,8 +520,11 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
                             .map(|address| address.turn_id.clone())
                     })
                 });
-            event.address =
-                turn_id.map(|turn_id| crate::backend::ProviderAddress { owner: None, thread_id, turn_id });
+            event.address = turn_id.map(|turn_id| crate::backend::ProviderAddress {
+                owner: None,
+                thread_id,
+                turn_id,
+            });
         }
     }
 }
@@ -436,16 +537,29 @@ async fn publish(
     address_event(&mut event, output);
     if let Some(compaction) = event.compaction().ok().flatten() {
         if let Some(previous) = output.event.iter_mut().find(|previous| {
-            previous.compaction().ok().flatten().is_some_and(|existing|
-                existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+            previous
+                .compaction()
+                .ok()
+                .flatten()
+                .is_some_and(|existing| {
+                    existing.id == compaction.id && existing.thread_id == compaction.thread_id
+                })
         }) {
-            if let Some(event_sink) = event_sink { let _ = event_sink.send_wait(event.clone()).await; }
-            if previous.compaction().ok().flatten().is_some_and(|existing|
-                existing.state == crate::backend::CompactionState::Running) {
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send_wait(event.clone()).await;
+            }
+            if previous
+                .compaction()
+                .ok()
+                .flatten()
+                .is_some_and(|existing| existing.state == crate::backend::CompactionState::Running)
+            {
                 if let Some(existing) = previous.compaction().ok().flatten() {
                     let provider_event_id = event.data.get("provider_event_id").cloned();
                     let mut retained = compaction;
-                    retained.result.context_tokens_before = existing.result.context_tokens_before
+                    retained.result.context_tokens_before = existing
+                        .result
+                        .context_tokens_before
                         .or(retained.result.context_tokens_before);
                     retained.result.before_context = existing.result.before_context;
                     retained.result.model = retained.result.model.or(existing.result.model);
@@ -487,7 +601,9 @@ async fn publish(
         if event.message_snapshot() {
             previous.text = event.text;
         } else {
-            previous.text.get_or_insert_with(String::new)
+            previous
+                .text
+                .get_or_insert_with(String::new)
                 .push_str(event.text.as_deref().unwrap_or_default());
         }
         previous.data = event.data;
@@ -510,7 +626,10 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
         return;
     }
     if update.title != "Copilot tool"
-        && (incoming.data.pointer("/data/arguments").is_some_and(|arguments| !arguments.is_null())
+        && (incoming
+            .data
+            .pointer("/data/arguments")
+            .is_some_and(|arguments| !arguments.is_null())
             || existing.title == "Copilot tool")
     {
         existing.title = update.title;
@@ -540,9 +659,15 @@ fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Optio
     let data = &provider_event.data;
     let id = string_field(data, &["toolCallId", "id"])?;
     let previous = output.event.iter().rev().find_map(|event| {
-        let agent_id = event.data.get("agentId").or_else(|| event.data.get("agent_id")).and_then(Value::as_str);
-        event.activity.as_ref().filter(|activity| activity.id == id
-            && agent_id == provider_event.agent_id.as_deref())
+        let agent_id = event
+            .data
+            .get("agentId")
+            .or_else(|| event.data.get("agent_id"))
+            .and_then(Value::as_str);
+        event
+            .activity
+            .as_ref()
+            .filter(|activity| activity.id == id && agent_id == provider_event.agent_id.as_deref())
     });
     let file_tool = previous.is_some_and(|activity| activity.kind == ToolActivityKind::FileChange)
         || match data.get("toolName").and_then(Value::as_str) {
@@ -555,7 +680,9 @@ fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Optio
         };
     let title = string_field(data, &["toolName", "name", "toolDescription"])
         .unwrap_or_else(|| "Copilot tool".into());
-    let title = data.get("arguments").filter(|arguments| !arguments.is_null())
+    let title = data
+        .get("arguments")
+        .filter(|arguments| !arguments.is_null())
         .and_then(|arguments| ToolActivity::call_title(&title, arguments))
         .unwrap_or(title);
     let (status, output, output_delta) = match provider_event.event_type.as_str() {
@@ -735,16 +862,55 @@ mod test {
     async fn repeated_native_turn_numbers_keep_distinct_interaction_addresses() {
         let mut address = Vec::new();
         for interaction in ["first-prompt", "second-prompt"] {
-            let mut output = BackendOutput { backend_session_id:Some("same-session".into()), ..Default::default() };
-            CopilotEventDecoder::default().decode(&event("assistant.turn_start", serde_json::json!({
-                "turnId":"0", "interactionId":interaction
-            })), &mut output, None).await;
-            CopilotEventDecoder::default().decode(&event("assistant.message_delta", serde_json::json!({
-                "messageId":interaction, "deltaContent":"visible answer"
-            })), &mut output, None).await;
-            CopilotEventDecoder::default().decode(&event("assistant.turn_end", serde_json::json!({"turnId":"0"})), &mut output, None).await;
-            let started = output.event.iter().find(|event|event.kind == "turn_started").unwrap().address.clone().unwrap();
-            assert!(output.event.iter().all(|event|event.address.as_ref() == Some(&started)));
+            let mut output = BackendOutput {
+                backend_session_id: Some("same-session".into()),
+                ..Default::default()
+            };
+            CopilotEventDecoder::default()
+                .decode(
+                    &event(
+                        "assistant.turn_start",
+                        serde_json::json!({
+                            "turnId":"0", "interactionId":interaction
+                        }),
+                    ),
+                    &mut output,
+                    None,
+                )
+                .await;
+            CopilotEventDecoder::default()
+                .decode(
+                    &event(
+                        "assistant.message_delta",
+                        serde_json::json!({
+                            "messageId":interaction, "deltaContent":"visible answer"
+                        }),
+                    ),
+                    &mut output,
+                    None,
+                )
+                .await;
+            CopilotEventDecoder::default()
+                .decode(
+                    &event("assistant.turn_end", serde_json::json!({"turnId":"0"})),
+                    &mut output,
+                    None,
+                )
+                .await;
+            let started = output
+                .event
+                .iter()
+                .find(|event| event.kind == "turn_started")
+                .unwrap()
+                .address
+                .clone()
+                .unwrap();
+            assert!(
+                output
+                    .event
+                    .iter()
+                    .all(|event| event.address.as_ref() == Some(&started))
+            );
             address.push(started);
         }
         assert_eq!(address[0].thread_id, address[1].thread_id);
@@ -755,10 +921,16 @@ mod test {
     use serde_json::json;
 
     #[tokio::test]
-    async fn native_patch_results_render_as_changed_files_after_streaming_and_reload() -> anyhow::Result<()> {
+    async fn native_patch_results_render_as_changed_files_after_streaming_and_reload()
+    -> anyhow::Result<()> {
         use crate::buffer::projection::{ProjectionSource, project};
-        let decoder = CopilotEventDecoder { workspace: "/Users/me/project".into() };
-        let mut output = BackendOutput { backend_session_id: Some("root".into()), ..Default::default() };
+        let decoder = CopilotEventDecoder {
+            workspace: "/Users/me/project".into(),
+        };
+        let mut output = BackendOutput {
+            backend_session_id: Some("root".into()),
+            ..Default::default()
+        };
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
             "id":"patches", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"Fix the file", "kind":"plan_execution", "state":"running", "created_at_ms":0,
@@ -789,15 +961,31 @@ mod test {
             }
         }
         assert!(output.evidence.workspace_changed);
-        let activity = output.event.iter().find_map(|event| event.activity.as_ref()).unwrap();
+        let activity = output
+            .event
+            .iter()
+            .find_map(|event| event.activity.as_ref())
+            .unwrap();
         assert_eq!(activity.kind, ToolActivityKind::FileChange);
         assert_eq!(activity.change.file[0].path, "src/lib.rs");
         assert_eq!(activity.change.file[0].diff, "@@ -40 +40 @@\n-old\n+new\n");
         exchange.finish(crate::exchange::ExchangeState::Complete, 10)?;
-        let restored: crate::exchange::Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
-        let rendered = project(ProjectionSource::Exchange(&restored), &Default::default(),
-            false, &Default::default(), &Default::default())?;
-        let text = rendered.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        let restored: crate::exchange::Exchange =
+            serde_json::from_value(serde_json::to_value(exchange)?)?;
+        let rendered = project(
+            ProjectionSource::Exchange(&restored),
+            &Default::default(),
+            false,
+            &Default::default(),
+            &Default::default(),
+        )?;
+        let text = rendered
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("Changed 1 file"));
         assert!(text.contains("lib.rs"));
         assert!(!text.contains("Ran 1 tool"));
@@ -812,14 +1000,38 @@ mod test {
         let decoder = CopilotEventDecoder::default();
         let diff = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n+new\n";
         for (name, arguments, success, expected) in [
-            ("apply_patch", Value::Null, false, ToolActivityKind::FileChange),
-            ("bash", json!({"command":"git diff"}), true, ToolActivityKind::ToolCall),
-            ("str_replace_editor", json!({"command":"view", "path":"file"}), true, ToolActivityKind::ToolCall),
+            (
+                "apply_patch",
+                Value::Null,
+                false,
+                ToolActivityKind::FileChange,
+            ),
+            (
+                "bash",
+                json!({"command":"git diff"}),
+                true,
+                ToolActivityKind::ToolCall,
+            ),
+            (
+                "str_replace_editor",
+                json!({"command":"view", "path":"file"}),
+                true,
+                ToolActivityKind::ToolCall,
+            ),
         ] {
             let mut output = BackendOutput::default();
-            decoder.decode(&event("tool.execution_start", json!({
-                "toolCallId":"tool", "toolName":name, "arguments":arguments,
-            })), &mut output, None).await;
+            decoder
+                .decode(
+                    &event(
+                        "tool.execution_start",
+                        json!({
+                            "toolCallId":"tool", "toolName":name, "arguments":arguments,
+                        }),
+                    ),
+                    &mut output,
+                    None,
+                )
+                .await;
             decoder.decode(&event("tool.execution_complete", json!({
                 "toolCallId":"tool", "success":success, "result":{"detailedContent":diff},
             })), &mut output, None).await;
@@ -838,14 +1050,39 @@ mod test {
     async fn malformed_file_diffs_report_errors_without_losing_tool_completion() {
         let decoder = CopilotEventDecoder::default();
         let mut output = BackendOutput::default();
-        decoder.decode(&event("tool.execution_start", json!({"toolCallId":"patch", "toolName":"apply_patch"})),
-            &mut output, None).await;
-        decoder.decode(&event("tool.execution_complete", json!({"toolCallId":"patch", "success":true,
-            "result":{"detailedContent":"diff --git a/file b/file\n@@ -1 +1 @@\n-old\n"}})),
-            &mut output, None).await;
-        assert!(output.event.iter().any(|event| event.kind == "error"
-            && event.text.as_deref().unwrap().contains("truncated saved patch hunk")));
-        assert_eq!(output.event[0].activity.as_ref().unwrap().status.as_deref(), Some("completed"));
+        decoder
+            .decode(
+                &event(
+                    "tool.execution_start",
+                    json!({"toolCallId":"patch", "toolName":"apply_patch"}),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event(
+                    "tool.execution_complete",
+                    json!({"toolCallId":"patch", "success":true,
+            "result":{"detailedContent":"diff --git a/file b/file\n@@ -1 +1 @@\n-old\n"}}),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        assert!(output.event.iter().any(|event| {
+            event.kind == "error"
+                && event
+                    .text
+                    .as_deref()
+                    .unwrap()
+                    .contains("truncated saved patch hunk")
+        }));
+        assert_eq!(
+            output.event[0].activity.as_ref().unwrap().status.as_deref(),
+            Some("completed")
+        );
         assert!(!output.evidence.workspace_changed);
     }
 
@@ -858,14 +1095,28 @@ mod test {
             json!({"toolCallId":"tool", "toolName":"custom_edit"}),
             json!({"toolCallId":"tool", "changes":[{"path":"file", "diff":"@@ -1 +1 @@\n-old\n+new\n"}]}),
         ] {
-            decoder.decode(&event("tool.execution_start", data), &mut output, None).await;
+            decoder
+                .decode(&event("tool.execution_start", data), &mut output, None)
+                .await;
             tools.merge(output.event[0].activity.as_ref().unwrap(), 1);
         }
-        decoder.decode(&event("tool.execution_complete", json!({"toolCallId":"tool", "success":true,
-            "result":{"content":"done"}})), &mut output, None).await;
+        decoder
+            .decode(
+                &event(
+                    "tool.execution_complete",
+                    json!({"toolCallId":"tool", "success":true,
+            "result":{"content":"done"}}),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
         tools.merge(output.event[0].activity.as_ref().unwrap(), 2);
         assert!(output.evidence.workspace_changed);
-        assert_eq!(output.event[0].activity.as_ref().unwrap().kind, ToolActivityKind::FileChange);
+        assert_eq!(
+            output.event[0].activity.as_ref().unwrap().kind,
+            ToolActivityKind::FileChange
+        );
         assert_eq!(tools.get("tool").unwrap().kind, "file_change");
         assert_eq!(tools.get("tool").unwrap().change.file.len(), 1);
     }
@@ -873,14 +1124,23 @@ mod test {
     #[tokio::test]
     async fn compaction_retains_summary_failure_and_identity_across_replays() {
         let decoder = CopilotEventDecoder::default();
-        let mut output = BackendOutput { backend_session_id: Some("root".into()), ..Default::default() };
-        let start = event("session.compaction_start", json!({"model":"summary-model", "conversationTokens":100}));
-        let complete = event("session.compaction_complete", json!({
-            "success":false, "error":"summary request failed", "summaryContent":"Retain the contract.",
-            "preCompactionTokens":100, "postCompactionTokens":40, "tokensRemoved":60,
-            "messagesRemoved":0, "compactionTokensUsed":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":0,
-                "copilotUsage":{"totalNanoAiu":1.5,"tokenDetails":[{"tokenType":"input","tokenCount":100}]}}
-        }));
+        let mut output = BackendOutput {
+            backend_session_id: Some("root".into()),
+            ..Default::default()
+        };
+        let start = event(
+            "session.compaction_start",
+            json!({"model":"summary-model", "conversationTokens":100}),
+        );
+        let complete = event(
+            "session.compaction_complete",
+            json!({
+                "success":false, "error":"summary request failed", "summaryContent":"Retain the contract.",
+                "preCompactionTokens":100, "postCompactionTokens":40, "tokensRemoved":60,
+                "messagesRemoved":0, "compactionTokensUsed":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":0,
+                    "copilotUsage":{"totalNanoAiu":1.5,"tokenDetails":[{"tokenType":"input","tokenCount":100}]}}
+            }),
+        );
         for update in [&start, &complete, &complete, &start] {
             decoder.decode(update, &mut output, None).await;
         }
@@ -888,11 +1148,24 @@ mod test {
         let compaction = output.event[0].compaction().unwrap().unwrap();
         assert_eq!(compaction.id, start.id);
         assert_eq!(compaction.state, crate::backend::CompactionState::Failed);
-        assert_eq!(compaction.result.summary_content.as_deref(), Some("Retain the contract."));
-        assert_eq!(compaction.result.error.as_deref(), Some("summary request failed"));
+        assert_eq!(
+            compaction.result.summary_content.as_deref(),
+            Some("Retain the contract.")
+        );
+        assert_eq!(
+            compaction.result.error.as_deref(),
+            Some("summary request failed")
+        );
         assert_eq!(compaction.result.messages_removed, Some(0));
         assert_eq!(compaction.result.model.as_deref(), Some("summary-model"));
-        assert_eq!(compaction.result.before_context.unwrap().conversation_tokens, Some(100));
+        assert_eq!(
+            compaction
+                .result
+                .before_context
+                .unwrap()
+                .conversation_tokens,
+            Some(100)
+        );
         assert_eq!(output.event[0].data["provider_event_id"], complete.id);
         let usage = compaction.result.compaction_tokens_used.unwrap();
         assert_eq!(usage.cached_input, Some(0));
@@ -901,7 +1174,15 @@ mod test {
         orphan.id = "other-operation".into();
         decoder.decode(&orphan, &mut output, None).await;
         assert_eq!(output.event.len(), 2);
-        assert_eq!(output.event[1].compaction().unwrap().unwrap().result.pre_compaction_tokens, None);
+        assert_eq!(
+            output.event[1]
+                .compaction()
+                .unwrap()
+                .unwrap()
+                .result
+                .pre_compaction_tokens,
+            None
+        );
     }
 
     fn event(event_type: &str, data: Value) -> SessionEvent {
@@ -928,7 +1209,13 @@ mod test {
             },
             ..BackendOutput::default()
         };
-        decoder.decode(&event("session.start", json!({"model":"root-model"})), &mut output, None).await;
+        decoder
+            .decode(
+                &event("session.start", json!({"model":"root-model"})),
+                &mut output,
+                None,
+            )
+            .await;
         assert_eq!(output.event.len(), 1);
         assert_eq!(output.event[0].kind, "runtime_resolved");
         assert_eq!(output.event[0].data["model"], "root-model");
@@ -937,7 +1224,13 @@ mod test {
         let mut child = event("session.start", json!({"model":"child-model"}));
         child.agent_id = Some("child".into());
         decoder.decode(&child, &mut output, None).await;
-        decoder.decode(&event("session.start", json!({"model":"root-model"})), &mut output, None).await;
+        decoder
+            .decode(
+                &event("session.start", json!({"model":"root-model"})),
+                &mut output,
+                None,
+            )
+            .await;
         assert_eq!(output.runtime.model.as_deref(), Some("root-model"));
         assert_eq!(output.event.len(), 1);
     }
@@ -999,15 +1292,31 @@ mod test {
         };
         for (kind, data) in [
             ("assistant.turn_start", json!({"turnId":"one"})),
-            ("tool.execution_start", json!({"toolCallId":"shell", "toolName":"powershell"})),
-            ("tool.execution_partial_result", json!({"toolCallId":"shell", "partialOutput":"hello"})),
-            ("tool.execution_complete", json!({"toolCallId":"shell", "success":true, "result":{"content":"hello"}})),
+            (
+                "tool.execution_start",
+                json!({"toolCallId":"shell", "toolName":"powershell"}),
+            ),
+            (
+                "tool.execution_partial_result",
+                json!({"toolCallId":"shell", "partialOutput":"hello"}),
+            ),
+            (
+                "tool.execution_complete",
+                json!({"toolCallId":"shell", "success":true, "result":{"content":"hello"}}),
+            ),
             ("assistant.turn_start", json!({"turnId":"two"})),
-            ("tool.execution_partial_result", json!({"toolCallId":"shell", "partialOutput":"hello"})),
+            (
+                "tool.execution_partial_result",
+                json!({"toolCallId":"shell", "partialOutput":"hello"}),
+            ),
         ] {
             decoder.decode(&event(kind, data), &mut output, None).await;
         }
-        let tools = output.event.iter().filter(|event| event.activity.is_some()).collect::<Vec<_>>();
+        let tools = output
+            .event
+            .iter()
+            .filter(|event| event.activity.is_some())
+            .collect::<Vec<_>>();
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0].address.as_ref().unwrap().turn_id, "one");
         let activity = tools[0].activity.as_ref().unwrap();

@@ -8,6 +8,7 @@ local picker_filter = require("forge.views.picker.filter")
 ---@field draft_by_page table<string, string>
 ---@field selected_set_by_page table<string, table<string, boolean>>
 ---@field query_by_page table<string, string>
+---@field field_by_page table<string, table<string, string>>
 
 ---@param spec table
 ---@return ForgePickerState
@@ -26,6 +27,14 @@ function PickerState.new(spec)
     local option_id_set = {}
     for _, option in ipairs(page.option_list) do
       assert(option.label, "picker option requires a label")
+      if option.fields then
+        assert(option.id and #option.fields > 0, "structured picker rows require an id and fields")
+        local field_id_set = {}
+        for _, field in ipairs(option.fields) do
+          assert(type(field.id) == "string" and not field_id_set[field.id], "picker field ids must be unique within a row")
+          field_id_set[field.id] = true
+        end
+      end
       if option.key then
         assert(not key_set[option.key], "picker option keys must be unique within a page")
         key_set[option.key] = true
@@ -44,6 +53,7 @@ function PickerState.new(spec)
     draft_by_page = draft_by_page,
     selected_set_by_page = {},
     query_by_page = query_by_page,
+    field_by_page = {},
   }
 end
 
@@ -144,6 +154,33 @@ function PickerState.selected_option_list(state, spec)
     if selected_set[option_id] then result[#result + 1] = option end
   end
   return result
+end
+
+---@param state ForgePickerState
+---@param spec table
+---@return ForgePickerField?, integer?
+function PickerState.selected_field(state, spec)
+  local option = PickerState.selected_option(state, spec)
+  if not option or not option.fields or #option.fields == 0 then return end
+  local page = PickerState.page(state, spec)
+  local selected = (state.field_by_page[page.id] or {})[option.id]
+  for index, field in ipairs(option.fields) do
+    if field.id == selected then return field, index end
+  end
+  return option.fields[1], 1
+end
+
+---@param state ForgePickerState
+---@param spec table
+---@param direction integer
+function PickerState.move_field(state, spec, direction)
+  local _, index = PickerState.selected_field(state, spec)
+  if not index then return end
+  local page = PickerState.page(state, spec)
+  local option = PickerState.selected_option(state, spec)
+  if not option then return end
+  state.field_by_page[page.id] = state.field_by_page[page.id] or {}
+  state.field_by_page[page.id][option.id] = option.fields[(index - 1 + direction) % #option.fields + 1].id
 end
 
 return PickerState

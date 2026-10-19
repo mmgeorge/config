@@ -442,11 +442,7 @@ fn decode_page(output: Output, repository: &str) -> std::result::Result<IssuePag
         .issues;
     let next_cursor = if connection.page_info.has_next_page {
         match connection.page_info.end_cursor {
-            Some(cursor)
-                if !cursor.is_empty() && !connection.nodes.is_empty() =>
-            {
-                Some(cursor)
-            }
+            Some(cursor) if !cursor.is_empty() && !connection.nodes.is_empty() => Some(cursor),
             _ => {
                 return Err(RemoteFailure {
                     kind: RemoteFailureKind::InvalidResponse,
@@ -614,15 +610,29 @@ mod tests {
                 .len(),
             100
         );
-        assert_eq!(decode_page(output(response(101)), "owner/repo").unwrap().issues.len(), 101);
+        assert_eq!(
+            decode_page(output(response(101)), "owner/repo")
+                .unwrap()
+                .issues
+                .len(),
+            101
+        );
         let labels = serde_json::json!({"nodes":vec![serde_json::json!({"name":"label"});51]});
-        assert_eq!(serde_json::from_value::<GraphLabels>(labels).unwrap().nodes.len(), 51);
+        assert_eq!(
+            serde_json::from_value::<GraphLabels>(labels)
+                .unwrap()
+                .nodes
+                .len(),
+            51
+        );
         assert_eq!(
             serde_json::from_value::<Vec<GraphFailure>>(serde_json::json!(vec![
                 serde_json::json!({"message":"failure"});
                 33
             ]))
-            .unwrap().len(), 33
+            .unwrap()
+            .len(),
+            33
         );
     }
 

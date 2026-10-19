@@ -1,9 +1,9 @@
-pub mod history;
 pub mod checkpoint;
 pub mod completion;
 pub mod config_location;
 pub mod content;
 pub mod coordinator;
+pub mod history;
 pub mod identity;
 pub mod mutation;
 pub mod read_pool;

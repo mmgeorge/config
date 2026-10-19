@@ -164,14 +164,13 @@ pub struct ReviewerSelection {
 impl ReviewerSelection {
     fn validate(&self) -> Result<()> {
         ensure!(
-            self
-                    .reviewer
-                    .iter()
-                    .chain(&self.team)
-                    .all(|name| !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
+            self.reviewer
+                .iter()
+                .chain(&self.team)
+                .all(|name| !name.is_empty()
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
             "invalid reviewer set"
         );
         Ok(())
@@ -313,8 +312,7 @@ impl ReviewMutationRequest {
             );
             for comment in comment {
                 ensure!(
-                    !comment.body.trim().is_empty()
-                        && !comment.body.contains('\0'),
+                    !comment.body.trim().is_empty() && !comment.body.contains('\0'),
                     "invalid submitted review comment body"
                 );
                 validate_path(&comment.path)?;
@@ -394,8 +392,7 @@ impl ReviewMutationRequest {
                 .validate()?;
                 for branch in [base, head] {
                     ensure!(
-                        !branch.is_empty()
-                            && !branch.chars().any(char::is_control),
+                        !branch.is_empty() && !branch.chars().any(char::is_control),
                         "invalid captured creation branch"
                     );
                 }
@@ -485,9 +482,9 @@ impl ReviewMutationRequest {
             ReviewMutation::ReviewerAdd { reviewer, team }
             | ReviewMutation::ReviewerRemove { reviewer, team } => ensure!(
                 reviewer.iter().chain(team).all(|name| !name.is_empty()
-                        && name
-                            .bytes()
-                            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
+                    && name
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')),
                 "invalid reviewer set"
             ),
             ReviewMutation::MilestoneCreate { title }
@@ -514,8 +511,9 @@ impl ReviewMutationRequest {
                         || body.is_some()
                         || !add_assignees.is_empty()
                         || !remove_assignees.is_empty())
-                        && title.as_ref().is_none_or(|title| !title.trim().is_empty()
-                            && !title.contains('\0')),
+                        && title
+                            .as_ref()
+                            .is_none_or(|title| !title.trim().is_empty() && !title.contains('\0')),
                     "invalid issue edit"
                 );
             }

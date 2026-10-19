@@ -74,7 +74,13 @@ pub(crate) fn inspect_in_workspace(
         let findings = compare(path, expected, source)?;
         let mut changes = Vec::new();
         if !findings.is_empty() {
-            changes.push(declaration_mismatch(path, "Configuration", expected, source, &findings[0])?);
+            changes.push(declaration_mismatch(
+                path,
+                "Configuration",
+                expected,
+                source,
+                &findings[0],
+            )?);
         }
         return Ok((findings, changes));
     }
@@ -84,19 +90,40 @@ pub(crate) fn inspect_in_workspace(
         DeclarationContract::parse(path, expected).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     let actual = contract(workspace, path, &overview)?;
     let changes = planned.changes(&actual);
-    let differences = changes.iter().map(|change| change.message.clone()).collect();
-    let changes = changes.into_iter().map(|change|
-        declaration_mismatch(path, &change.identity, &change.expected, &change.observed, &change.message)
-    ).collect::<Result<Vec<_>>>()?;
+    let differences = changes
+        .iter()
+        .map(|change| change.message.clone())
+        .collect();
+    let changes = changes
+        .into_iter()
+        .map(|change| {
+            declaration_mismatch(
+                path,
+                &change.identity,
+                &change.expected,
+                &change.observed,
+                &change.message,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     Ok((differences, changes))
 }
 
-pub(crate) fn declaration_mismatch(path: &str, name: &str, expected: &str, observed: &str, finding: &str)
-    -> Result<super::execution::DeclarationMismatch>
-{
+pub(crate) fn declaration_mismatch(
+    path: &str,
+    name: &str,
+    expected: &str,
+    observed: &str,
+    finding: &str,
+) -> Result<super::execution::DeclarationMismatch> {
     let mut patch = Vec::new();
     super::revision::write_file(path, path, Some(expected), Some(observed), &mut patch)?;
-    Ok(super::execution::DeclarationMismatch { path: path.into(), name: name.into(), diff: String::from_utf8(patch)?, finding: format!("{path}: {finding}") })
+    Ok(super::execution::DeclarationMismatch {
+        path: path.into(),
+        name: name.into(),
+        diff: String::from_utf8(patch)?,
+        finding: format!("{path}: {finding}"),
+    })
 }
 
 #[cfg(test)]
@@ -105,9 +132,13 @@ mod tests {
     #[test]
     fn declaration_changes_keep_source_signatures_without_implementation_bodies() {
         let workspace = tempfile::tempdir().unwrap();
-        let (findings, changes) = inspect_in_workspace(workspace.path(), "src/lib.rs",
+        let (findings, changes) = inspect_in_workspace(
+            workspace.path(),
+            "src/lib.rs",
             "#[inline]\npub fn update(value: u32);",
-            "#[inline]\npub fn update(mut value: u32) { value += 1; }").unwrap();
+            "#[inline]\npub fn update(mut value: u32) { value += 1; }",
+        )
+        .unwrap();
         assert_eq!(findings.len(), 1);
         assert_eq!(changes.len(), 1);
         let change = &changes[0];
@@ -116,9 +147,19 @@ mod tests {
         assert!(!change.diff.contains("value += 1"));
         assert!(!change.diff.contains("function_signature_item"));
         assert_eq!(change.finding, format!("src/lib.rs: {}", findings[0]));
-        let (_, fields) = inspect_in_workspace(workspace.path(), "src/lib.rs",
-            "pub struct State { pub count: u32 }", "pub struct State { pub count: bool }").unwrap();
-        assert!(fields.iter().any(|change| change.diff.contains("pub count: u32") && change.diff.contains("pub count: bool")));
+        let (_, fields) = inspect_in_workspace(
+            workspace.path(),
+            "src/lib.rs",
+            "pub struct State { pub count: u32 }",
+            "pub struct State { pub count: bool }",
+        )
+        .unwrap();
+        assert!(
+            fields
+                .iter()
+                .any(|change| change.diff.contains("pub count: u32")
+                    && change.diff.contains("pub count: bool"))
+        );
     }
 
     #[test]

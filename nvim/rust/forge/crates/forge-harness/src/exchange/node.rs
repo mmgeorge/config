@@ -7,9 +7,16 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
     /// Records one successful selected-skill read per provider turn.
-    SkillRead { id: String, turn_id: String, read: crate::skill::SkillRead },
+    SkillRead {
+        id: String,
+        turn_id: String,
+        read: crate::skill::SkillRead,
+    },
     /// Retains provider context replacement separately from model text and tool calls.
-    Compaction { id: String, compaction: crate::backend::Compaction },
+    Compaction {
+        id: String,
+        compaction: crate::backend::Compaction,
+    },
     ImplementationReport {
         id: String,
         reference: crate::plan::implementation_report::ImplementationReportRef,
@@ -21,7 +28,9 @@ pub enum ExchangeNode {
         question: crate::plan::PlanQuestionSet,
         answer: Option<String>,
     },
-    PlanEvent { event: Box<crate::plan::ExchangePlanEvent> },
+    PlanEvent {
+        event: Box<crate::plan::ExchangePlanEvent>,
+    },
     TurnContent {
         id: String,
         turn_id: String,

@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::{HashMap, BTreeSet};
+use std::collections::{BTreeSet, HashMap};
 
 use super::TimelineEntry;
 
@@ -9,12 +9,33 @@ use super::TimelineEntry;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineOperation {
-    Insert { index: usize, entry: TimelineEntry },
-    Replace { index: usize, entry: TimelineEntry },
-    Remove { index: usize, id: String },
-    ToolOutput { index: usize, entry_id: String, exchange_id: String, call_id: String, delta: String },
-    Message { index: usize, entry_id: String, exchange_id: String,
-        turn_id: String, block_id: String, message: crate::turn::Message },
+    Insert {
+        index: usize,
+        entry: TimelineEntry,
+    },
+    Replace {
+        index: usize,
+        entry: TimelineEntry,
+    },
+    Remove {
+        index: usize,
+        id: String,
+    },
+    ToolOutput {
+        index: usize,
+        entry_id: String,
+        exchange_id: String,
+        call_id: String,
+        delta: String,
+    },
+    Message {
+        index: usize,
+        entry_id: String,
+        exchange_id: String,
+        turn_id: String,
+        block_id: String,
+        message: crate::turn::Message,
+    },
 }
 
 /// Represents one causally ordered timeline revision for a single session.
@@ -29,17 +50,29 @@ pub struct TimelinePatch {
 impl TimelinePatch {
     /// Describes changed presentation state without copying exchange contents.
     pub fn notification(&self) -> Value {
-        let mut notification = serde_json::json!({"session_id":self.session_id,"revision":self.revision});
+        let mut notification =
+            serde_json::json!({"session_id":self.session_id,"revision":self.revision});
         for operation in &self.operation {
             match operation {
-                TimelineOperation::Insert { entry: TimelineEntry::Status { status, checks, .. }, .. }
-                | TimelineOperation::Replace { entry: TimelineEntry::Status { status, checks, .. }, .. } => {
-                    notification["status"] = serde_json::to_value(status).expect("serializable status");
-                    notification["checks_running"] = Value::Bool(checks.is_some());
-                    notification["active_check_run"] = checks.as_ref().map_or(Value::Null,
-                        |activity| Value::String(activity.run_id.clone()));
+                TimelineOperation::Insert {
+                    entry: TimelineEntry::Status { status, checks, .. },
+                    ..
                 }
-                TimelineOperation::Remove { id, .. } if id == &format!("{}:status", self.session_id) => {
+                | TimelineOperation::Replace {
+                    entry: TimelineEntry::Status { status, checks, .. },
+                    ..
+                } => {
+                    notification["status"] =
+                        serde_json::to_value(status).expect("serializable status");
+                    notification["checks_running"] = Value::Bool(checks.is_some());
+                    notification["active_check_run"] =
+                        checks.as_ref().map_or(Value::Null, |activity| {
+                            Value::String(activity.run_id.clone())
+                        });
+                }
+                TimelineOperation::Remove { id, .. }
+                    if id == &format!("{}:status", self.session_id) =>
+                {
                     notification["status"] = serde_json::json!({"kind":"idle"});
                     notification["checks_running"] = Value::Bool(false);
                     notification["active_check_run"] = Value::Null;
@@ -68,72 +101,153 @@ pub struct TimelineStream {
 }
 
 impl TimelineStream {
-    pub(crate) fn update_message(&mut self, exchange: &crate::exchange::Exchange,
-        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
-        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else { return Ok(None); };
-        let Some(address) = event.address.as_ref() else { return Ok(None); };
-        let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else { return Ok(None); };
+    pub(crate) fn update_message(
+        &mut self,
+        exchange: &crate::exchange::Exchange,
+        event: &crate::backend::BackendEvent,
+    ) -> Result<Option<TimelinePatch>> {
+        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
+            return Ok(None);
+        };
+        let Some(address) = event.address.as_ref() else {
+            return Ok(None);
+        };
+        let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else {
+            return Ok(None);
+        };
         let kind = match event.kind.as_str() {
             "assistant_message" => crate::turn::MessageKind::Assistant,
             "reasoning" => crate::turn::MessageKind::Reasoning,
             "reasoning_summary" => crate::turn::MessageKind::ReasoningSummary,
             _ => return Ok(None),
         };
-        let Some(message) = source.messages().iter().rev().find(|message|
-            message.kind() == kind && event.message_id().is_none_or(|id|message.provider_id() == Some(id)))
-            else { return Ok(None); };
+        let Some(message) = source.messages().iter().rev().find(|message| {
+            message.kind() == kind
+                && event
+                    .message_id()
+                    .is_none_or(|id| message.provider_id() == Some(id))
+        }) else {
+            return Ok(None);
+        };
         let entry_id = self.entry_list[index].id();
         let main_exchange = matches!(&self.entry_list[index],TimelineEntry::Exchange { exchange:owner,.. } if owner.id == exchange.id);
-        let target = self.entry_list[index].exchange_mut(&exchange.id).expect("indexed exchange");
-        if !target.turn.iter().any(|turn| turn.provider() == address
-            && turn.messages().iter().any(|existing| existing.id() == message.id()
-                && existing.delivery() == message.delivery())) { return Ok(None); }
-        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
-        target.observe_turn(event,exchange.created_at_ms)?;
+        let target = self.entry_list[index]
+            .exchange_mut(&exchange.id)
+            .expect("indexed exchange");
+        if !target.turn.iter().any(|turn| {
+            turn.provider() == address
+                && turn.messages().iter().any(|existing| {
+                    existing.id() == message.id() && existing.delivery() == message.delivery()
+                })
+        }) {
+            return Ok(None);
+        }
+        ensure!(
+            self.revision < forge_buffer::MAX_COUNTER,
+            "timeline revision exhausted"
+        );
+        target.observe_turn(event, exchange.created_at_ms)?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
         self.revision += 1;
         self.value_list[index] = Value::Null;
-        let mut operation = vec![TimelineOperation::Message { index,entry_id,exchange_id:exchange.id.clone(),
-                turn_id:source.id().to_owned(), block_id:format!("{}:content:{}",source.id(),message.id()),
-                message:message.clone() }];
-        if main_exchange && let Some(status_index) = self.entry_index.get(&format!("{}:status",self.session_id)).copied()
-            && let TimelineEntry::Status { status_thoughts, status:crate::session::state_machine::SessionPhase::Working { reasoning_summary,.. },.. }
-                = &mut self.entry_list[status_index] {
+        let mut operation = vec![TimelineOperation::Message {
+            index,
+            entry_id,
+            exchange_id: exchange.id.clone(),
+            turn_id: source.id().to_owned(),
+            block_id: format!("{}:content:{}", source.id(), message.id()),
+            message: message.clone(),
+        }];
+        if main_exchange
+            && let Some(status_index) = self
+                .entry_index
+                .get(&format!("{}:status", self.session_id))
+                .copied()
+            && let TimelineEntry::Status {
+                status_thoughts,
+                status:
+                    crate::session::state_machine::SessionPhase::Working {
+                        reasoning_summary, ..
+                    },
+                ..
+            } = &mut self.entry_list[status_index]
+        {
             let summary = exchange.latest_reasoning_summary().map(str::to_owned);
             if *reasoning_summary != summary {
                 *reasoning_summary = summary;
                 let visible = *status_thoughts;
-                self.value_list[status_index] = serde_json::to_value(&self.entry_list[status_index])?;
+                self.value_list[status_index] =
+                    serde_json::to_value(&self.entry_list[status_index])?;
                 if visible {
-                    operation.push(TimelineOperation::Replace { index:status_index,entry:self.entry_list[status_index].clone() });
+                    operation.push(TimelineOperation::Replace {
+                        index: status_index,
+                        entry: self.entry_list[status_index].clone(),
+                    });
                 }
             }
         }
-        Ok(Some(TimelinePatch { session_id:self.session_id.clone(),base_revision,revision:self.revision,operation }))
+        Ok(Some(TimelinePatch {
+            session_id: self.session_id.clone(),
+            base_revision,
+            revision: self.revision,
+            operation,
+        }))
     }
 
-    pub(crate) fn append_tool_output(&mut self, exchange: &crate::exchange::Exchange,
-        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
-        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else { return Ok(None); };
-        let Some(address) = event.address.as_ref() else { return Ok(None); };
-        let Some(activity) = event.activity.as_ref() else { return Ok(None); };
-        if activity.kind == crate::backend::ToolActivityKind::FileChange { return Ok(None); }
+    pub(crate) fn append_tool_output(
+        &mut self,
+        exchange: &crate::exchange::Exchange,
+        event: &crate::backend::BackendEvent,
+    ) -> Result<Option<TimelinePatch>> {
+        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else {
+            return Ok(None);
+        };
+        let Some(address) = event.address.as_ref() else {
+            return Ok(None);
+        };
+        let Some(activity) = event.activity.as_ref() else {
+            return Ok(None);
+        };
+        if activity.kind == crate::backend::ToolActivityKind::FileChange {
+            return Ok(None);
+        }
         let entry_id = self.entry_list[index].id();
-        let target = self.entry_list[index].exchange_mut(&exchange.id).expect("indexed exchange");
-        let Some(turn) = target.turn.iter_mut().find(|turn| turn.provider() == address) else { return Ok(None); };
-        if !turn.tools().any(|tool| tool.id == activity.id) { return Ok(None); }
-        let call_id = format!("{}:{}",turn.id(),activity.id);
+        let target = self.entry_list[index]
+            .exchange_mut(&exchange.id)
+            .expect("indexed exchange");
+        let Some(turn) = target
+            .turn
+            .iter_mut()
+            .find(|turn| turn.provider() == address)
+        else {
+            return Ok(None);
+        };
+        if !turn.tools().any(|tool| tool.id == activity.id) {
+            return Ok(None);
+        }
+        let call_id = format!("{}:{}", turn.id(), activity.id);
         turn.record_tool_event(event, exchange.created_at_ms)?;
         target.metrics = exchange.metrics.clone();
         let base_revision = self.revision;
-        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+        ensure!(
+            self.revision < forge_buffer::MAX_COUNTER,
+            "timeline revision exhausted"
+        );
         self.revision += 1;
         self.value_list[index] = Value::Null;
-        Ok(Some(TimelinePatch { session_id: self.session_id.clone(), base_revision,
-            revision: self.revision, operation: vec![TimelineOperation::ToolOutput {
-                index, entry_id, exchange_id:exchange.id.clone(), call_id, delta: activity.output.clone().unwrap_or_default(),
-            }] }))
+        Ok(Some(TimelinePatch {
+            session_id: self.session_id.clone(),
+            base_revision,
+            revision: self.revision,
+            operation: vec![TimelineOperation::ToolOutput {
+                index,
+                entry_id,
+                exchange_id: exchange.id.clone(),
+                call_id,
+                delta: activity.output.clone().unwrap_or_default(),
+            }],
+        }))
     }
 
     /// Create an empty revision stream for one durable Harness session.
@@ -169,25 +283,41 @@ impl TimelineStream {
         &self.entry_list
     }
 
-    pub(crate) fn ticking_entries(&self) -> impl Iterator<Item=&TimelineEntry> {
-        self.ticking.iter().map(|index|&self.entry_list[*index])
+    pub(crate) fn ticking_entries(&self) -> impl Iterator<Item = &TimelineEntry> {
+        self.ticking.iter().map(|index| &self.entry_list[*index])
     }
 
     /// Toggles the current status preview while retaining streamed messages and phase state.
     pub(crate) fn set_status_thoughts(&mut self, enabled: bool) -> Result<TimelinePatch> {
         let base_revision = self.revision;
         let mut operation = Vec::new();
-        if let Some(index) = self.entry_index.get(&format!("{}:status", self.session_id)).copied()
-            && let TimelineEntry::Status { status_thoughts, .. } = &mut self.entry_list[index]
+        if let Some(index) = self
+            .entry_index
+            .get(&format!("{}:status", self.session_id))
+            .copied()
+            && let TimelineEntry::Status {
+                status_thoughts, ..
+            } = &mut self.entry_list[index]
             && *status_thoughts != enabled
         {
-            ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+            ensure!(
+                self.revision < forge_buffer::MAX_COUNTER,
+                "timeline revision exhausted"
+            );
             *status_thoughts = enabled;
             self.value_list[index] = serde_json::to_value(&self.entry_list[index])?;
-            operation.push(TimelineOperation::Replace { index, entry: self.entry_list[index].clone() });
+            operation.push(TimelineOperation::Replace {
+                index,
+                entry: self.entry_list[index].clone(),
+            });
             self.revision += 1;
         }
-        Ok(TimelinePatch { session_id: self.session_id.clone(), base_revision, revision: self.revision, operation })
+        Ok(TimelinePatch {
+            session_id: self.session_id.clone(),
+            base_revision,
+            revision: self.revision,
+            operation,
+        })
     }
 
     /// Updates only the active interaction and transient status without copying settled history.
@@ -204,8 +334,15 @@ impl TimelineStream {
         );
         let next_interaction = interaction.map(|interaction| {
             if let Some(index) = self.exchange_owner.get(&interaction.id) {
-                if let TimelineEntry::Exchange { id, created_at_ms, exchange, agent_by_id, check_runs } = &self.entry_list[*index]
-                    && exchange.id == interaction.id {
+                if let TimelineEntry::Exchange {
+                    id,
+                    created_at_ms,
+                    exchange,
+                    agent_by_id,
+                    check_runs,
+                } = &self.entry_list[*index]
+                    && exchange.id == interaction.id
+                {
                     return TimelineEntry::Exchange {
                         id: id.clone(),
                         created_at_ms: *created_at_ms,
@@ -223,18 +360,30 @@ impl TimelineStream {
                 id: interaction.id.clone(),
                 created_at_ms: interaction.created_at_ms,
                 exchange: interaction.clone(),
-                check_runs: Vec::new(), agent_by_id: HashMap::new(),
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
             }
         });
         let status_id = format!("{}:status", self.session_id);
-        let agent_count = self.entry_list.iter().find_map(|entry|match entry {
-            TimelineEntry::Status {agent_count,..} => Some(*agent_count),_=>None,
-        }).unwrap_or(0);
-        let checks = self.entry_index.get(&status_id).and_then(|index| match &self.entry_list[*index] {
-            TimelineEntry::Status { checks, .. } => checks.clone(),
-            _ => None,
-        });
-        let next_status = TimelineEntry::Status { checks, agent_count, status_thoughts,
+        let agent_count = self
+            .entry_list
+            .iter()
+            .find_map(|entry| match entry {
+                TimelineEntry::Status { agent_count, .. } => Some(*agent_count),
+                _ => None,
+            })
+            .unwrap_or(0);
+        let checks =
+            self.entry_index
+                .get(&status_id)
+                .and_then(|index| match &self.entry_list[*index] {
+                    TimelineEntry::Status { checks, .. } => checks.clone(),
+                    _ => None,
+                });
+        let next_status = TimelineEntry::Status {
+            checks,
+            agent_count,
+            status_thoughts,
             id: status_id.clone(),
             created_at_ms: 0,
             status,
@@ -266,7 +415,12 @@ impl TimelineStream {
                 .unwrap_or(self.entry_list.len());
             self.upsert(entry, value, insertion, &mut operation);
         }
-        self.upsert(next_status, status_value, self.entry_list.len(), &mut operation);
+        self.upsert(
+            next_status,
+            status_value,
+            self.entry_list.len(),
+            &mut operation,
+        );
         if !operation.is_empty() {
             self.revision += 1;
         }
@@ -292,7 +446,11 @@ impl TimelineStream {
                 operation.push(TimelineOperation::Replace { index, entry });
                 self.exchange_owner.retain(|_, owner| *owner != index);
                 self.entry_list[index].index_exchanges(index, &mut self.exchange_owner);
-                if ticking(&self.entry_list[index]) { self.ticking.insert(index); } else { self.ticking.remove(&index); }
+                if ticking(&self.entry_list[index]) {
+                    self.ticking.insert(index);
+                } else {
+                    self.ticking.remove(&index);
+                }
             }
         } else {
             self.entry_list.insert(insertion, entry.clone());
@@ -316,13 +474,18 @@ impl TimelineStream {
         self.ticking.clear();
         for (index, entry) in self.entry_list.iter().enumerate() {
             entry.index_exchanges(index, &mut self.exchange_owner);
-            if ticking(entry) { self.ticking.insert(index); }
+            if ticking(entry) {
+                self.ticking.insert(index);
+            }
         }
     }
 
     /// Publish live checks under status and insert one history result after completion.
     pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
-        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+        ensure!(
+            self.revision < forge_buffer::MAX_COUNTER,
+            "timeline revision exhausted"
+        );
         let base_revision = self.revision;
         let mut operation = Vec::new();
         let activity = crate::checks::CheckActivity::from_run(run);
@@ -338,31 +501,54 @@ impl TimelineStream {
                 }
             } else {
                 let entry = TimelineEntry::Checks {
-                    id: run.id.clone(), created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms), run: run.clone(),
+                    id: run.id.clone(),
+                    created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms),
+                    run: run.clone(),
                 };
-                let insertion = self.entry_index.get(&status_id).copied().unwrap_or(self.entry_list.len());
+                let insertion = self
+                    .entry_index
+                    .get(&status_id)
+                    .copied()
+                    .unwrap_or(self.entry_list.len());
                 let value = serde_json::to_value(&entry)?;
                 self.upsert(entry, value, insertion, &mut operation);
             }
         }
-        let previous = self.entry_index.get(&status_id).map(|index| self.entry_list[*index].clone());
+        let previous = self
+            .entry_index
+            .get(&status_id)
+            .map(|index| self.entry_list[*index].clone());
         if previous.is_some() || activity.is_some() {
             let mut entry = previous.unwrap_or_else(|| TimelineEntry::Status {
-                id: status_id, created_at_ms: 0, status: crate::session::state_machine::SessionPhase::Idle,
-                status_thoughts: true, agent_count: 0, checks: None,
+                id: status_id,
+                created_at_ms: 0,
+                status: crate::session::state_machine::SessionPhase::Idle,
+                status_thoughts: true,
+                agent_count: 0,
+                checks: None,
             });
             if let TimelineEntry::Status { checks, .. } = &mut entry {
                 if let Some(activity) = activity {
                     *checks = Some(activity);
-                } else if checks.as_ref().is_some_and(|checks| checks.run_id == run.id) {
+                } else if checks
+                    .as_ref()
+                    .is_some_and(|checks| checks.run_id == run.id)
+                {
                     *checks = None;
                 }
             }
             let value = serde_json::to_value(&entry)?;
             self.upsert(entry, value, self.entry_list.len(), &mut operation);
         }
-        if !operation.is_empty() { self.revision += 1; }
-        Ok(TimelinePatch { session_id: self.session_id.clone(), base_revision, revision: self.revision, operation })
+        if !operation.is_empty() {
+            self.revision += 1;
+        }
+        Ok(TimelinePatch {
+            session_id: self.session_id.clone(),
+            base_revision,
+            revision: self.revision,
+            operation,
+        })
     }
 
     pub fn reconcile(&mut self, next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
@@ -443,16 +629,37 @@ impl TimelineStream {
 
 fn ticking(entry: &TimelineEntry) -> bool {
     match entry {
-        TimelineEntry::Exchange { exchange,agent_by_id,.. } =>
-            exchange.completed_at_ms.is_none() && (exchange.execution_started_at_ms.is_some()
-                || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running)))
-                || agent_by_id.values().any(ticking),
-        TimelineEntry::AgentLifecycle { run, exchange, agent, .. } =>
-            matches!(run.state, crate::agent::AgentState::Starting | crate::agent::AgentState::Closing)
-                || exchange.iter().any(|exchange| exchange.completed_at_ms.is_none()
+        TimelineEntry::Exchange {
+            exchange,
+            agent_by_id,
+            ..
+        } => {
+            exchange.completed_at_ms.is_none()
+                && (exchange.execution_started_at_ms.is_some()
+                    || exchange.turn.iter().any(|turn| {
+                        turn.tools()
+                            .any(|tool| tool.state() == crate::turn::ToolState::Running)
+                    }))
+                || agent_by_id.values().any(ticking)
+        }
+        TimelineEntry::AgentLifecycle {
+            run,
+            exchange,
+            agent,
+            ..
+        } => {
+            matches!(
+                run.state,
+                crate::agent::AgentState::Starting | crate::agent::AgentState::Closing
+            ) || exchange.iter().any(|exchange| {
+                exchange.completed_at_ms.is_none()
                     && (exchange.execution_started_at_ms.is_some()
-                        || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running))))
-                || agent.iter().any(ticking),
+                        || exchange.turn.iter().any(|turn| {
+                            turn.tools()
+                                .any(|tool| tool.state() == crate::turn::ToolState::Running)
+                        }))
+            }) || agent.iter().any(ticking)
+        }
         TimelineEntry::Status { status, checks, .. } => status.ticking() || checks.is_some(),
         TimelineEntry::Checks { .. } => false,
         _ => false,
@@ -476,7 +683,9 @@ mod test {
     };
 
     fn status(kind: SessionPhase) -> TimelineEntry {
-        TimelineEntry::Status { checks: None, agent_count: 0,
+        TimelineEntry::Status {
+            checks: None,
+            agent_count: 0,
             status_thoughts: true,
             id: "session:status".into(),
             created_at_ms: 0,
@@ -497,45 +706,87 @@ mod test {
             }]
         }))?;
         let primary = SessionPhase::Working {
-            duration_ms: 10, started_at_ms: Some(1), activity: WorkflowActivity::Working,
-            reasoning_summary: Some("Provider thought".into()), execution: None,
+            duration_ms: 10,
+            started_at_ms: Some(1),
+            activity: WorkflowActivity::Working,
+            reasoning_summary: Some("Provider thought".into()),
+            execution: None,
         };
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(vec![status(primary.clone())])?;
         let patch = stream.update_checks(&run)?;
-        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { entry: TimelineEntry::Status { status, checks: Some(_), .. }, .. }] if *status == primary));
+        assert!(
+            matches!(patch.operation.as_slice(), [TimelineOperation::Replace { entry: TimelineEntry::Status { status, checks: Some(_), .. }, .. }] if *status == primary)
+        );
         assert_eq!(stream.entry_list().len(), 1);
         assert_eq!(stream.ticking_entries().count(), 1);
         run.commands[0].preview = "Output remains in the check store".into();
         run.commands[0].output_bytes = 9000;
         let preview = stream.update_checks(&run)?;
-        assert!(matches!(preview.operation.as_slice(), [TimelineOperation::Replace {
+        assert!(
+            matches!(preview.operation.as_slice(), [TimelineOperation::Replace {
             entry: TimelineEntry::Status { checks: Some(checks), .. }, ..
-        }] if checks.command_list[0].output_line.as_deref() == Some("Output remains in the check store")));
+        }] if checks.command_list[0].output_line.as_deref() == Some("Output remains in the check store"))
+        );
         run.commands[0].output_bytes += 1000;
-        assert!(stream.update_checks(&run)?.is_empty(), "unchanged previews changed the timeline");
+        assert!(
+            stream.update_checks(&run)?.is_empty(),
+            "unchanged previews changed the timeline"
+        );
         stream.update_live(None, None, SessionPhase::Idle, false)?;
-        assert!(matches!(&stream.entry_list()[0], TimelineEntry::Status { status: SessionPhase::Idle, checks: Some(_), .. }));
-        assert_eq!(stream.ticking_entries().count(), 1, "independent checks stopped ticking while primary became idle");
+        assert!(matches!(
+            &stream.entry_list()[0],
+            TimelineEntry::Status {
+                status: SessionPhase::Idle,
+                checks: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(
+            stream.ticking_entries().count(),
+            1,
+            "independent checks stopped ticking while primary became idle"
+        );
         run.state = crate::checks::CheckState::Passed;
         run.completed_at_ms = Some(2000);
         run.commands[0].state = crate::checks::CheckState::Passed;
         run.commands[0].completed_at_ms = Some(2000);
         let patch = stream.update_checks(&run)?;
         assert_eq!(patch.operation.len(), 2);
-        assert!(matches!(stream.entry_list(), [TimelineEntry::Checks { .. }, TimelineEntry::Status { checks: None, .. }]));
+        assert!(matches!(
+            stream.entry_list(),
+            [
+                TimelineEntry::Checks { .. },
+                TimelineEntry::Status { checks: None, .. }
+            ]
+        ));
         assert_eq!(stream.ticking_entries().count(), 0);
-        assert!(stream.update_checks(&run)?.is_empty(), "completion added duplicate history");
+        assert!(
+            stream.update_checks(&run)?.is_empty(),
+            "completion added duplicate history"
+        );
         let mut next = run.clone();
         next.id = "next-checks".into();
         next.state = crate::checks::CheckState::Running;
         stream.update_checks(&next)?;
         stream.update_checks(&run)?;
-        assert!(matches!(stream.entry_list().last(), Some(TimelineEntry::Status { checks: Some(activity), .. }) if activity.run_id == next.id));
+        assert!(
+            matches!(stream.entry_list().last(), Some(TimelineEntry::Status { checks: Some(activity), .. }) if activity.run_id == next.id)
+        );
         next.state = crate::checks::CheckState::Interrupted;
         stream.update_checks(&next)?;
-        assert!(matches!(stream.entry_list().last(), Some(TimelineEntry::Status { checks: None, .. })));
-        assert_eq!(stream.entry_list().iter().filter(|entry| matches!(entry, TimelineEntry::Checks { .. })).count(), 2);
+        assert!(matches!(
+            stream.entry_list().last(),
+            Some(TimelineEntry::Status { checks: None, .. })
+        ));
+        assert_eq!(
+            stream
+                .entry_list()
+                .iter()
+                .filter(|entry| matches!(entry, TimelineEntry::Checks { .. }))
+                .count(),
+            2
+        );
         Ok(())
     }
 
@@ -546,8 +797,13 @@ mod test {
             "prompt":"Change source", "state":"complete", "created_at_ms":0,
             "completed_at_ms":1, "attributed_matches_checkpoint":true, "node_list":[]
         }))?;
-        let entry = TimelineEntry::Exchange { id:exchange.id.clone(), created_at_ms:0,
-            exchange:exchange.clone(), agent_by_id:Default::default(), check_runs:Vec::new() };
+        let entry = TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            agent_by_id: Default::default(),
+            check_runs: Vec::new(),
+        };
         let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
             "id":"checks", "exchange_id":"work", "revision":1, "completed_plan":null,
             "shell":"system", "executable":null, "workspace":".", "environment_digest":"environment",
@@ -564,14 +820,28 @@ mod test {
         assert!(patch.operation.iter().any(|operation| matches!(operation,
             TimelineOperation::Replace { entry:TimelineEntry::Exchange { id,check_runs,.. },.. }
                 if id == "work" && check_runs.len() == 1)));
-        assert!(!stream.entry_list().iter().any(|entry| matches!(entry,TimelineEntry::Checks { .. })));
+        assert!(
+            !stream
+                .entry_list()
+                .iter()
+                .any(|entry| matches!(entry, TimelineEntry::Checks { .. }))
+        );
         assert!(stream.update_checks(&run)?.is_empty());
         stream.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
-        assert!(matches!(&stream.entry_list()[0],TimelineEntry::Exchange { check_runs,.. } if check_runs.len() == 1));
-        let rebuilt = crate::timeline::TimelineProjector::with_checks(vec![entry],vec![run.clone(),run.clone()]);
-        assert!(matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { check_runs,.. }] if check_runs.len() == 1));
-        assert!(crate::timeline::TimelineProjector::with_checks(Vec::new(),vec![run]).is_empty(),
-            "checks belonging to a removed exchange must not reappear as standalone history");
+        assert!(
+            matches!(&stream.entry_list()[0],TimelineEntry::Exchange { check_runs,.. } if check_runs.len() == 1)
+        );
+        let rebuilt = crate::timeline::TimelineProjector::with_checks(
+            vec![entry],
+            vec![run.clone(), run.clone()],
+        );
+        assert!(
+            matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { check_runs,.. }] if check_runs.len() == 1)
+        );
+        assert!(
+            crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]).is_empty(),
+            "checks belonging to a removed exchange must not reappear as standalone history"
+        );
         Ok(())
     }
 
@@ -584,20 +854,39 @@ mod test {
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
-        let address = ProviderAddress { owner: None, thread_id:"thread".into(), turn_id:"turn".into() };
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
-            received_at_ms:None, address:Some(address), turn_boundary:None, kind:"tool".into(),
-            text:None, data:serde_json::Value::Null, summary:None, task_update:None,
-            activity:Some(ToolActivity {
-                id:"patch".into(), kind:ToolActivityKind::FileChange, title:"file changes".into(),
-                output:None, output_delta:false, status:Some("running".into()), change:Default::default(),
+            received_at_ms: None,
+            address: Some(address),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::Value::Null,
+            summary: None,
+            task_update: None,
+            activity: Some(ToolActivity {
+                id: "patch".into(),
+                kind: ToolActivityKind::FileChange,
+                title: "file changes".into(),
+                output: None,
+                output_delta: false,
+                status: Some("running".into()),
+                change: Default::default(),
             }),
         };
         exchange.observe_turn(&event, 1)?;
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(vec![TimelineEntry::Exchange {
-            id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), check_runs: Vec::new(), agent_by_id:Default::default(),
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: Default::default(),
         }])?;
         let activity = event.activity.as_mut().unwrap();
         activity.output = Some("Patch context did not match".into());
@@ -607,8 +896,23 @@ mod test {
         assert!(stream.append_tool_output(&exchange, &event)?.is_none());
         assert_eq!(stream.revision(), 1);
         let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
-        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { .. }, TimelineOperation::Insert { entry: TimelineEntry::Status { status: SessionPhase::Idle, .. }, .. }]));
-        let TimelineEntry::Exchange { exchange:updated, .. } = &stream.entry_list()[0] else {
+        assert!(matches!(
+            patch.operation.as_slice(),
+            [
+                TimelineOperation::Replace { .. },
+                TimelineOperation::Insert {
+                    entry: TimelineEntry::Status {
+                        status: SessionPhase::Idle,
+                        ..
+                    },
+                    ..
+                }
+            ]
+        ));
+        let TimelineEntry::Exchange {
+            exchange: updated, ..
+        } = &stream.entry_list()[0]
+        else {
             panic!("expected reconciled exchange");
         };
         let tool = updated.turn[0].tools().next().unwrap();
@@ -622,7 +926,8 @@ mod test {
         let mut stream = TimelineStream::new("session".into());
         stream
             .initialize(vec![status(SessionPhase::Working {
-                duration_ms: 0, started_at_ms: Some(10),
+                duration_ms: 0,
+                started_at_ms: Some(10),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -656,29 +961,69 @@ mod test {
             reasoning_summary: Some("Inspect the configuration".into()),
         };
         stream.update_live(None, None, phase(), true)?;
-        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: true, .. }]));
+        assert!(matches!(
+            stream.entry_list(),
+            [TimelineEntry::Status {
+                status_thoughts: true,
+                ..
+            }]
+        ));
         let idle = stream.update_live(None, None, SessionPhase::Idle, true)?;
-        assert!(matches!(idle.operation.as_slice(), [TimelineOperation::Replace { .. }]));
-        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status: SessionPhase::Idle, .. }]));
+        assert!(matches!(
+            idle.operation.as_slice(),
+            [TimelineOperation::Replace { .. }]
+        ));
+        assert!(matches!(
+            stream.entry_list(),
+            [TimelineEntry::Status {
+                status: SessionPhase::Idle,
+                ..
+            }]
+        ));
         let resumed = stream.update_live(None, None, phase(), false)?;
-        assert!(matches!(resumed.operation.as_slice(), [TimelineOperation::Replace { .. }]));
-        assert!(matches!(stream.entry_list(), [TimelineEntry::Status { status_thoughts: false, .. }]));
+        assert!(matches!(
+            resumed.operation.as_slice(),
+            [TimelineOperation::Replace { .. }]
+        ));
+        assert!(matches!(
+            stream.entry_list(),
+            [TimelineEntry::Status {
+                status_thoughts: false,
+                ..
+            }]
+        ));
         Ok(())
     }
 
     #[test]
     fn planning_retry_refreshes_only_its_live_clock_and_stops_for_user_waits() {
         let mut stream = TimelineStream::new("session".into());
-        stream.initialize(vec![status(SessionPhase::RetryingPlanGeneration {
-            plan_id:"plan".into(),turn:2,max_turn:20,duration_ms:3000,
-            started_at_ms:Some(90_000),activity:WorkflowActivity::Planning,
-        })]).unwrap();
-        assert_eq!(stream.ticking_entries().count(),1);
-        for phase in [SessionPhase::AwaitingApproval {exchange_id:"exchange".into()},SessionPhase::Paused,
-            SessionPhase::Working {duration_ms:3000,started_at_ms:None,activity:WorkflowActivity::Working,
-                reasoning_summary:None,execution:None}] {
+        stream
+            .initialize(vec![status(SessionPhase::RetryingPlanGeneration {
+                plan_id: "plan".into(),
+                turn: 2,
+                max_turn: 20,
+                duration_ms: 3000,
+                started_at_ms: Some(90_000),
+                activity: WorkflowActivity::Planning,
+            })])
+            .unwrap();
+        assert_eq!(stream.ticking_entries().count(), 1);
+        for phase in [
+            SessionPhase::AwaitingApproval {
+                exchange_id: "exchange".into(),
+            },
+            SessionPhase::Paused,
+            SessionPhase::Working {
+                duration_ms: 3000,
+                started_at_ms: None,
+                activity: WorkflowActivity::Working,
+                reasoning_summary: None,
+                execution: None,
+            },
+        ] {
             stream.reconcile(vec![status(phase)]).unwrap();
-            assert_eq!(stream.ticking_entries().count(),0);
+            assert_eq!(stream.ticking_entries().count(), 0);
         }
     }
 
@@ -694,30 +1039,57 @@ mod test {
     #[test]
     fn reconciliation_preserves_patch_order_across_moves_removals_and_replacements() {
         let entry = |id: &str, name: &str| TimelineEntry::SessionEvent {
-            id: id.into(), created_at_ms: 0,
+            id: id.into(),
+            created_at_ms: 0,
             event: crate::timeline::SessionEventRecord {
-                id: id.into(), session_id: "session".into(), created_at_ms: 0,
+                id: id.into(),
+                session_id: "session".into(),
+                created_at_ms: 0,
                 detail: crate::timeline::SessionEventKind::Renamed { name: name.into() },
             },
         };
-        let original = vec![entry("first", "original"), entry("removed", "removed"), entry("last", "last")];
-        let mut replica: Vec<_> = original.iter().map(|entry| serde_json::to_value(entry).unwrap()).collect();
+        let original = vec![
+            entry("first", "original"),
+            entry("removed", "removed"),
+            entry("last", "last"),
+        ];
+        let mut replica: Vec<_> = original
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap())
+            .collect();
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(original).unwrap();
-        let next = vec![entry("last", "last"), entry("first", "changed"), entry("new", "new")];
-        let expected: Vec<_> = next.iter().map(|entry| serde_json::to_value(entry).unwrap()).collect();
+        let next = vec![
+            entry("last", "last"),
+            entry("first", "changed"),
+            entry("new", "new"),
+        ];
+        let expected: Vec<_> = next
+            .iter()
+            .map(|entry| serde_json::to_value(entry).unwrap())
+            .collect();
         let patch = stream.reconcile(next).unwrap();
         for operation in patch.operation {
             match operation {
-                TimelineOperation::Remove { index, .. } => { replica.remove(index); }
-                TimelineOperation::Insert { index, entry } => replica.insert(index, serde_json::to_value(entry).unwrap()),
-                TimelineOperation::Replace { index, entry } => replica[index] = serde_json::to_value(entry).unwrap(),
+                TimelineOperation::Remove { index, .. } => {
+                    replica.remove(index);
+                }
+                TimelineOperation::Insert { index, entry } => {
+                    replica.insert(index, serde_json::to_value(entry).unwrap())
+                }
+                TimelineOperation::Replace { index, entry } => {
+                    replica[index] = serde_json::to_value(entry).unwrap()
+                }
                 _ => panic!("reconciliation emitted a streaming operation"),
             }
         }
         assert_eq!(replica, expected);
         assert_eq!(stream.value_list, expected);
-        let unchanged = vec![entry("last", "last"), entry("first", "changed"), entry("new", "new")];
+        let unchanged = vec![
+            entry("last", "last"),
+            entry("first", "changed"),
+            entry("new", "new"),
+        ];
         assert!(stream.reconcile(unchanged).unwrap().is_empty());
     }
 
@@ -730,7 +1102,8 @@ mod test {
 
         let first_patch = first
             .reconcile(vec![status(SessionPhase::Working {
-                duration_ms: 0, started_at_ms: Some(5),
+                duration_ms: 0,
+                started_at_ms: Some(5),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -760,7 +1133,8 @@ mod test {
             })
             .collect::<Vec<_>>();
         history.push(status(SessionPhase::Working {
-            duration_ms: 0, started_at_ms: Some(1),
+            duration_ms: 0,
+            started_at_ms: Some(1),
             activity: WorkflowActivity::Working,
             execution: None,
             reasoning_summary: None,
@@ -775,7 +1149,8 @@ mod test {
                 None,
                 None,
                 SessionPhase::Working {
-                    duration_ms: 0, started_at_ms: Some(2),
+                    duration_ms: 0,
+                    started_at_ms: Some(2),
                     activity: WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: None,
@@ -800,7 +1175,8 @@ mod test {
                     None,
                     None,
                     SessionPhase::Working {
-                        duration_ms: 0, started_at_ms: Some(2),
+                        duration_ms: 0,
+                        started_at_ms: Some(2),
                         activity: WorkflowActivity::Working,
                         execution: None,
                         reasoning_summary: None,

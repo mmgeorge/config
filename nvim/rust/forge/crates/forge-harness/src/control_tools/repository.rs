@@ -9,9 +9,7 @@ use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::workers::WorkPriority;
 use forge_git::RepositoryPath;
-use forge_git::content::{
-    ContentRequest, ContentResult, ContentSource, WorktreeConversion,
-};
+use forge_git::content::{ContentRequest, ContentResult, ContentSource, WorktreeConversion};
 use forge_git::repository::RepositoryState;
 use forge_git::snapshot::{ChangeKind, HeadState, PathRecord, PathState};
 use forge_git::store::RepositoryStore;
@@ -214,10 +212,7 @@ impl RepositoryToolScope {
             self.check()?;
             let mut result = Vec::new();
             let mut retained = 0usize;
-            let is_diff = matches!(
-                name,
-                "repository_diff" | "repository_file_diff"
-            );
+            let is_diff = matches!(name, "repository_diff" | "repository_file_diff");
             let limit = if is_diff { 8 } else { 256 };
             let selected: Vec<_> = snapshot
                 .path
@@ -241,8 +236,7 @@ impl RepositoryToolScope {
             };
             let envelope = json!({ "session": self.session, "interaction": self.interaction, "head": head,
                 "items": [], "total": selected.len(), "next_offset": selected.len(), "fresh_observation": true });
-            let capacity = MAX_REPLY_BYTES
-                .saturating_sub(serde_json::to_vec(&envelope)?.len() + 1);
+            let capacity = MAX_REPLY_BYTES.saturating_sub(serde_json::to_vec(&envelope)?.len() + 1);
             drop(envelope);
             for observed in selected.iter().skip(input.offset).take(limit) {
                 self.authorize(&repository, &observed.change.path).await?;
@@ -476,10 +470,15 @@ mod tests {
         assert_eq!(retained, accepted);
         assert!(retained > 200000);
         let mut large = Vec::new();
-        assert!(append_record(
-            &mut large, &mut 0,
-            json!({ "text": "x".repeat(MAX_REPLY_BYTES) }), MAX_REPLY_BYTES,
-        ).unwrap());
+        assert!(
+            append_record(
+                &mut large,
+                &mut 0,
+                json!({ "text": "x".repeat(MAX_REPLY_BYTES) }),
+                MAX_REPLY_BYTES,
+            )
+            .unwrap()
+        );
         assert_eq!(large[0]["text"].as_str().unwrap().len(), MAX_REPLY_BYTES);
     }
 
@@ -594,10 +593,7 @@ mod tests {
         .unwrap();
         assert!(
             scope
-                .invoke(
-                    "repository_status",
-                    json!({ "workspace": "another" })
-                )
+                .invoke("repository_status", json!({ "workspace": "another" }))
                 .await
                 .is_err()
         );
@@ -633,7 +629,9 @@ mod tests {
         let initialization_workspace = workspace.clone();
         let output = tokio::task::spawn_blocking(move || {
             let mut command = std::process::Command::new("git");
-            command.args(["init", "--quiet"]).current_dir(initialization_workspace);
+            command
+                .args(["init", "--quiet"])
+                .current_dir(initialization_workspace);
             forge_git::command::write_command(
                 &mut command,
                 forge_git::command::CommandLimits {
@@ -643,7 +641,10 @@ mod tests {
                 &[],
                 || Ok(()),
             )
-        }).await.unwrap().unwrap();
+        })
+        .await
+        .unwrap()
+        .unwrap();
         assert!(output.status.success());
         std::fs::write(workspace.join("example.txt"), "literal **content**\n").unwrap();
         let (repository, diff) = services();
@@ -663,13 +664,9 @@ mod tests {
             Arc::clone(&diff),
         )
         .unwrap();
-        let status: Value = serde_json::from_str(
-            &scope
-                .invoke("repository_status", json!({}))
-                .await
-                .unwrap(),
-        )
-        .unwrap();
+        let status: Value =
+            serde_json::from_str(&scope.invoke("repository_status", json!({})).await.unwrap())
+                .unwrap();
         assert_eq!(status["session"], "session");
         assert_eq!(
             status["items"][0]["path"]["path_hex"],
@@ -689,11 +686,7 @@ mod tests {
             result["items"][0]["hunks"][0]["added"], "literal **content**\n",
             "repository file diff result: {result}"
         );
-        std::fs::write(
-            scope.workspace.join("quoted.txt"),
-            "\\".repeat(128 * 1024),
-        )
-        .unwrap();
+        std::fs::write(scope.workspace.join("quoted.txt"), "\\".repeat(128 * 1024)).unwrap();
         let bounded: Value = serde_json::from_str(
             &scope
                 .invoke(
@@ -705,7 +698,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(bounded["items"][0]["state"], "ready");
-        assert_eq!(bounded["items"][0]["hunks"][0]["added"], "\\".repeat(128 * 1024));
+        assert_eq!(
+            bounded["items"][0]["hunks"][0]["added"],
+            "\\".repeat(128 * 1024)
+        );
         assert!(state.current_observation().is_none());
         drop(lease);
         assert!(scope.check().is_err());

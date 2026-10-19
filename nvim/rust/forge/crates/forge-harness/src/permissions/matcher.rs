@@ -77,14 +77,26 @@ pub struct CommandAnalysisError {
 impl std::fmt::Display for CommandAnalysisError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.failure {
-            CommandAnalysisFailure::MalformedTransport => write!(formatter,
-                "shell_command_parse_error: Harness could not decode the {:?} command transport. No command was executed.", self.shell),
-            CommandAnalysisFailure::Syntax => write!(formatter,
-                "shell_command_parse_error: Harness could not parse the {:?} command syntax. Simplify it or split independent operations into separate tool calls, keeping pipelines intact. No command was executed.", self.shell),
-            CommandAnalysisFailure::Unsupported(construct) => write!(formatter,
-                "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.", self.shell),
-            CommandAnalysisFailure::Incomplete(reason) => write!(formatter,
-                "shell_command_analysis_failed: Harness could not finish {:?} command analysis: {reason}. No command was executed.", self.shell),
+            CommandAnalysisFailure::MalformedTransport => write!(
+                formatter,
+                "shell_command_parse_error: Harness could not decode the {:?} command transport. No command was executed.",
+                self.shell
+            ),
+            CommandAnalysisFailure::Syntax => write!(
+                formatter,
+                "shell_command_parse_error: Harness could not parse the {:?} command syntax. Simplify it or split independent operations into separate tool calls, keeping pipelines intact. No command was executed.",
+                self.shell
+            ),
+            CommandAnalysisFailure::Unsupported(construct) => write!(
+                formatter,
+                "shell_command_unsupported: Harness does not support {construct} in {:?} command analysis. Rewrite the unsupported construct while keeping pipelines intact. No command was executed.",
+                self.shell
+            ),
+            CommandAnalysisFailure::Incomplete(reason) => write!(
+                formatter,
+                "shell_command_analysis_failed: Harness could not finish {:?} command analysis: {reason}. No command was executed.",
+                self.shell
+            ),
         }
     }
 }
@@ -195,7 +207,9 @@ fn path_pattern_score(pattern: &str, target: &str, workspace: &Path) -> Option<u
     let root = normalized_path(&root)?;
     let target = normalized_path(Path::new(target))?;
     let score = root.components().count();
-    if path_starts_with(&target, &root) { return Some(score); }
+    if path_starts_with(&target, &root) {
+        return Some(score);
+    }
     let root = super::directory::resolve_path(&root, workspace).ok()?;
     let target = super::directory::resolve_path(&target, workspace).ok()?;
     path_starts_with(&target, &root).then_some(score)
@@ -330,8 +344,12 @@ impl CompiledPermissionDocument {
                 continue;
             }
             if matches!(target, PermissionTarget::UnknownFile { .. }) {
-                result_list.push(TargetEvaluation { target: target.clone(), decision: PermissionDecision::Ask,
-                    matched_pattern: None, command: None });
+                result_list.push(TargetEvaluation {
+                    target: target.clone(),
+                    decision: PermissionDecision::Ask,
+                    matched_pattern: None,
+                    command: None,
+                });
                 continue;
             }
             if mode == PermissionMode::Yolo {
@@ -344,7 +362,9 @@ impl CompiledPermissionDocument {
                 continue;
             }
             let (decision, matched_pattern) = match target {
-                PermissionTarget::UnknownFile { .. } => unreachable!("unknown file targets require explicit approval"),
+                PermissionTarget::UnknownFile { .. } => {
+                    unreachable!("unknown file targets require explicit approval")
+                }
                 PermissionTarget::Command { .. } => {
                     unreachable!("commands are parsed before policy evaluation")
                 }
