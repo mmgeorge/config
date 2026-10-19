@@ -105,7 +105,7 @@ impl CompactionMonitor {
                                 turn_boundary: None,
                                 kind: "error".into(),
                                 text: Some(format!(
-                                    "Copilot compaction subscription failed: {error}"
+                                    "Copilot compaction subscription failed: {error:#}"
                                 )),
                                 data: serde_json::Value::Null,
                                 activity: None,

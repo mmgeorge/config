@@ -31,7 +31,11 @@ impl fmt::Display for EventDeliveryFailure {
     }
 }
 
-impl std::error::Error for EventDeliveryFailure {}
+impl std::error::Error for EventDeliveryFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
 
 pub fn channel() -> (BackendEventSink, BackendEventStream) {
     let (sender, receiver) = outbound::channel();
@@ -80,9 +84,12 @@ impl BackendEventSink {
                 .as_ref()
                 .is_some_and(|observed| observed != owner)
             {
-                return Err(EventDeliveryFailure(io::Error::other(
-                    "provider delivery crosses execution ownership",
-                )));
+                let error = io::Error::other(format!(
+                    "provider event {} crosses execution ownership: expected {owner:?}, received {:?}",
+                    event.kind, address.owner
+                ));
+                self.sender.record_failure(&error);
+                return Err(EventDeliveryFailure(error));
             }
             address.owner = Some(owner.clone());
         }
@@ -97,7 +104,12 @@ impl BackendEventSink {
             skill
                 .lock()
                 .map_err(|_| {
-                    EventDeliveryFailure(io::Error::other("skill observer lock poisoned"))
+                    let error = io::Error::other(format!(
+                        "observe skills for provider event {}: skill observer lock poisoned",
+                        event.kind
+                    ));
+                    self.sender.record_failure(&error);
+                    EventDeliveryFailure(error)
                 })?
                 .observe(&mut event);
         }
@@ -136,10 +148,11 @@ impl BackendEventStream {
         let value: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
         let Some(part) = value.get("forge_event_part") else {
-            if self.transfer.is_some() {
-                return Err(EventDeliveryFailure(io::Error::other(
-                    "interrupted event transfer",
-                )));
+            if let Some((sequence, count, bytes, payload)) = &self.transfer {
+                return Err(EventDeliveryFailure(io::Error::other(format!(
+                    "provider event interrupted transfer after {sequence}/{count} parts and {}/{bytes} bytes",
+                    payload.len()
+                ))));
             }
             return serde_json::from_value(value)
                 .map(Some)
@@ -152,9 +165,13 @@ impl BackendEventStream {
             || part.payload.is_empty()
             || part.payload.len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES
         {
-            return Err(EventDeliveryFailure(io::Error::other(
-                "event transfer exceeds its limit",
-            )));
+            return Err(EventDeliveryFailure(io::Error::other(format!(
+                "invalid provider event transfer part: sequence {}, count {}, total bytes {}, payload bytes {}",
+                part.sequence,
+                part.part_count,
+                part.total_bytes,
+                part.payload.len()
+            ))));
         }
         let transfer = self
             .transfer
@@ -164,9 +181,17 @@ impl BackendEventStream {
             || part.total_bytes != transfer.2
             || transfer.3.len() + part.payload.len() > transfer.2
         {
-            return Err(EventDeliveryFailure(io::Error::other(
-                "invalid event transfer sequence",
-            )));
+            return Err(EventDeliveryFailure(io::Error::other(format!(
+                "provider event transfer mismatch: expected sequence {}, count {}, bytes {} with {} bytes retained; received sequence {}, count {}, bytes {}, payload bytes {}",
+                transfer.0,
+                transfer.1,
+                transfer.2,
+                transfer.3.len(),
+                part.sequence,
+                part.part_count,
+                part.total_bytes,
+                part.payload.len()
+            ))));
         }
         transfer.0 += 1;
         transfer.3.push_str(&part.payload);
@@ -175,9 +200,10 @@ impl BackendEventStream {
         }
         let (_, _, length, payload) = self.transfer.take().expect("active transfer");
         if payload.len() != length {
-            return Err(EventDeliveryFailure(io::Error::other(
-                "incomplete event transfer",
-            )));
+            return Err(EventDeliveryFailure(io::Error::other(format!(
+                "provider event transfer completed with {} bytes, expected {length}",
+                payload.len()
+            ))));
         }
         decode(payload.as_bytes()).map(Some)
     }
@@ -191,9 +217,11 @@ impl BackendEventStream {
                     }
                 }
                 None if self.transfer.is_some() => {
-                    return Err(EventDeliveryFailure(io::Error::other(
-                        "event transfer ended early",
-                    )));
+                    let (sequence, count, bytes, payload) = self.transfer.as_ref().unwrap();
+                    return Err(EventDeliveryFailure(io::Error::other(format!(
+                        "provider event stream closed after {sequence}/{count} transfer parts and {}/{bytes} bytes",
+                        payload.len()
+                    ))));
                 }
                 None => return Ok(None),
             }
@@ -343,6 +371,33 @@ pub async fn failed(sink: Option<&BackendEventSink>) -> EventDeliveryFailure {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn malformed_transfer_reports_expected_and_received_sequence() {
+        let (sink, mut stream) = channel();
+        sink.sender
+            .send(json!({"forge_event_part": {
+                "sequence": 1, "part_count": 2, "total_bytes": 4, "payload": "ab"
+            }}))
+            .unwrap();
+        let error = stream.recv().await.unwrap_err().to_string();
+        assert!(error.contains("expected sequence 0"), "{error}");
+        assert!(error.contains("received sequence 1"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn closed_transfer_reports_progress_instead_of_generic_eof() {
+        let (sink, mut stream) = channel();
+        sink.sender
+            .send(json!({"forge_event_part": {
+                "sequence": 0, "part_count": 2, "total_bytes": 4, "payload": "ab"
+            }}))
+            .unwrap();
+        drop(sink);
+        let error = stream.recv().await.unwrap_err().to_string();
+        assert!(error.contains("1/2 transfer parts"), "{error}");
+        assert!(error.contains("2/4 bytes"), "{error}");
+    }
 
     #[tokio::test]
     async fn receipt_time_survives_forwarding_without_replacing_scalar_provider_data() {

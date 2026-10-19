@@ -371,7 +371,10 @@ impl CopilotEventDecoder {
             "session.error" if !provider_event.is_transient_error() => {
                 self.publish_text(
                     "error",
-                    string_field(&provider_event.data, &["message", "error"]),
+                    Some(session_error(
+                        provider_event,
+                        output.backend_session_id.as_deref(),
+                    )),
                     provider_event,
                     output,
                     event_sink,
@@ -529,6 +532,20 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
     }
 }
 
+pub(super) fn session_error(event: &SessionEvent, session_id: Option<&str>) -> String {
+    let detail = string_field(&event.data, &["message", "error"])
+        .filter(|detail| !detail.trim().is_empty())
+        .unwrap_or_else(|| "provider omitted both message and error details".into());
+    let code =
+        string_field(&event.data, &["errorType", "code"]).unwrap_or_else(|| "unreported".into());
+    format!(
+        "Copilot session {} reported {} (event {}, code {code}): {detail}",
+        session_id.unwrap_or("unattached"),
+        event.event_type,
+        event.id,
+    )
+}
+
 async fn publish(
     mut event: BackendEvent,
     output: &mut BackendOutput,
@@ -591,8 +608,10 @@ async fn publish(
     if let Some(event_sink) = event_sink {
         let _ = event_sink.send_wait(event.clone()).await;
     }
-    if matches!(event.kind.as_str(), "reasoning_summary" | "assistant_message")
-        && let Some(previous) = output.event.last_mut()
+    if matches!(
+        event.kind.as_str(),
+        "reasoning_summary" | "assistant_message"
+    ) && let Some(previous) = output.event.last_mut()
         && previous.kind == event.kind
         && previous.address == event.address
         && previous.message_id() == event.message_id()
@@ -921,6 +940,39 @@ mod test {
     use serde_json::json;
 
     #[tokio::test]
+    async fn session_errors_retain_identity_code_and_missing_detail_diagnostics() {
+        for data in [
+            json!({"message":"quota exhausted","errorType":"quota"}),
+            json!({"error":"connection reset","code":"transport"}),
+            json!({"message":" "}),
+        ] {
+            let provider_event = event("session.error", data.clone());
+            let mut output = BackendOutput {
+                backend_session_id: Some("native-session".into()),
+                ..Default::default()
+            };
+            CopilotEventDecoder::default()
+                .decode(&provider_event, &mut output, None)
+                .await;
+            let expected = session_error(&provider_event, Some("native-session"));
+            assert!(expected.contains("native-session"), "{expected}");
+            assert!(expected.contains(&provider_event.id), "{expected}");
+            let detail = if data.get("errorType").is_some() {
+                "quota exhausted"
+            } else if data.get("code").is_some() {
+                "connection reset"
+            } else {
+                "provider omitted both message and error details"
+            };
+            assert!(expected.contains(detail), "{expected}");
+            assert_eq!(
+                output.event.last().unwrap().text.as_deref(),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn concise_reasoning_updates_status_without_becoming_assistant_commentary()
     -> anyhow::Result<()> {
         let decoder = CopilotEventDecoder::default();
@@ -958,7 +1010,10 @@ mod test {
         assert_eq!(thoughts.len(), 1);
         assert_eq!(thoughts[0].message_id(), Some("thought"));
         assert!(thoughts[0].message_snapshot());
-        assert_eq!(thoughts[0].text.as_deref(), Some("Testing Git filter behaviors"));
+        assert_eq!(
+            thoughts[0].text.as_deref(),
+            Some("Testing Git filter behaviors")
+        );
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
             "id":"exchange","session_id":"session","agent_id":"primary","ordinal":1,
             "prompt":"Inspect filters","kind":"chat","state":"running",
@@ -968,12 +1023,21 @@ mod test {
         for event in &output.event {
             exchange.observe_turn(event, 1)?;
         }
-        assert_eq!(exchange.latest_reasoning_summary(), Some("Testing Git filter behaviors"));
+        assert_eq!(
+            exchange.latest_reasoning_summary(),
+            Some("Testing Git filter behaviors")
+        );
         let messages = exchange.turn[0].messages();
         assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0].kind(), crate::turn::MessageKind::ReasoningSummary);
+        assert_eq!(
+            messages[0].kind(),
+            crate::turn::MessageKind::ReasoningSummary
+        );
         assert_eq!(messages[1].kind(), crate::turn::MessageKind::Assistant);
-        assert_eq!(messages[1].delivery(), crate::turn::MessageDelivery::Commentary);
+        assert_eq!(
+            messages[1].delivery(),
+            crate::turn::MessageDelivery::Commentary
+        );
         Ok(())
     }
 

@@ -158,6 +158,9 @@ releases its reservation only after writing completes or fails. Reservation uses
 frame size before serialization and refunds unused bytes afterward.
 
 Serialization failure, output saturation, or a closed output channel poisons the connection.
+The first producer failure remains the diagnostic returned to later senders and receivers.
+Receivers recheck that failure after channel wakeup so producer shutdown cannot replace it
+with clean EOF. Admission and encoding diagnostics include the observed queue or frame sizes.
 The root input loop observes that failure independently of the writer, including while stdout
 is blocked. It stops the connection instead of continuing after a missing event. Reserved control
 records remain in the same FIFO and cannot overtake earlier document events. This is a hard

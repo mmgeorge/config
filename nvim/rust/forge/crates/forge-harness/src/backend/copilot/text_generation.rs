@@ -22,7 +22,8 @@ pub(super) async fn generate(
     }
     let client = tokio::time::timeout(Duration::from_secs(20), Client::start(options))
         .await
-        .context("Isolated provider startup timed out")??;
+        .context("isolated Copilot SDK startup exceeded 20 seconds")?
+        .context("start isolated Copilot SDK client")?;
     let result = summarize(
         &client,
         workspace,
@@ -32,11 +33,17 @@ pub(super) async fn generate(
         history,
     )
     .await;
-    tokio::time::timeout(Duration::from_secs(8), client.stop())
+    let shutdown = tokio::time::timeout(Duration::from_secs(8), client.stop())
         .await
-        .context("Isolated provider shutdown timed out")?
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    result
+        .context("isolated Copilot SDK shutdown exceeded 8 seconds")
+        .and_then(|result| result.context("stop isolated Copilot SDK client"));
+    match (result, shutdown) {
+        (Err(error), Err(shutdown)) => {
+            Err(error.context(format!("Copilot SDK shutdown also failed: {shutdown:#}")))
+        }
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(text), Ok(())) => Ok(text),
+    }
 }
 
 /// Own the temporary session and remove its stored state before the isolated client stops.
@@ -55,12 +62,15 @@ async fn summarize(
     } else if purpose == TextGeneration::SessionName && model != "default" && model != "auto" {
         let catalog = tokio::time::timeout(Duration::from_secs(20), client.list_models())
             .await
-            .context("Isolated model discovery timed out")??;
+            .context("isolated Copilot model discovery exceeded 20 seconds")?
+            .context("list isolated Copilot models")?;
         let descriptor = catalog
             .into_iter()
             .map(super::model_descriptor)
             .find(|entry| entry.id == model)
-            .context("Selected model is missing from the Copilot model catalog")?;
+            .with_context(|| {
+                format!("selected model {model} is absent from the Copilot model catalog")
+            })?;
         config.reasoning_effort = crate::backend::text_generation::lowest_effort(&descriptor)?;
     }
     config.streaming = Some(true);
@@ -85,36 +95,82 @@ async fn summarize(
         ),
     )
     .await
-    .context("Isolated session creation timed out")??;
+    .context("isolated Copilot session creation exceeded 20 seconds")?
+    .context("create isolated Copilot text-generation session")?;
     let result = tokio::time::timeout(
         Duration::from_secs(60),
         session.send_and_wait(MessageOptions::new(purpose.input(history))),
     )
     .await
-    .context("Isolated text generation timed out")
-    .and_then(|result| result.map_err(anyhow::Error::from))
-    .and_then(|event| event.context("Text generation completed without an assistant message"))
-    .and_then(|event| {
-        purpose.validate(
-            event
-                .data
-                .get("content")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or_default(),
+    .with_context(|| {
+        format!(
+            "Copilot session {} text generation exceeded 60 seconds",
+            session.id()
         )
+    })
+    .and_then(|result| result.context("send isolated Copilot text-generation prompt"))
+    .and_then(|event| {
+        event.with_context(|| {
+            format!(
+                "Copilot session {} completed text generation without an assistant message",
+                session.id()
+            )
+        })
+    })
+    .and_then(|event| {
+        let content = event
+            .data
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .with_context(|| {
+                format!(
+                    "Copilot session {} text-generation event {} omitted string content",
+                    session.id(),
+                    event.id
+                )
+            })?;
+        purpose.validate(content).with_context(|| {
+            format!(
+                "validate Copilot session {} text-generation event {}",
+                session.id(),
+                event.id
+            )
+        })
     });
     let cleanup = tokio::time::timeout(Duration::from_secs(8), async {
-        let aborted = if result.is_err() {
-            session.abort().await
-        } else {
-            Ok(())
-        };
-        let disconnected = session.disconnect().await;
-        let deleted = client.delete_session(session.id()).await;
-        deleted.and(disconnected).and(aborted)
+        let mut failures = Vec::new();
+        if result.is_err()
+            && let Err(error) = session.abort().await
+        {
+            failures.push(format!("abort: {error}"));
+        }
+        if let Err(error) = session.disconnect().await {
+            failures.push(format!("disconnect: {error}"));
+        }
+        if let Err(error) = client.delete_session(session.id()).await {
+            failures.push(format!("delete: {error}"));
+        }
+        anyhow::ensure!(
+            failures.is_empty(),
+            "Copilot session {} cleanup failed: {}",
+            session.id(),
+            failures.join(", ")
+        );
+        Ok(())
     })
     .await
-    .context("Isolated session cleanup timed out")?;
-    cleanup.context("Remove temporary generation session")?;
-    result
+    .with_context(|| {
+        format!(
+            "Copilot session {} cleanup exceeded 8 seconds",
+            session.id()
+        )
+    })
+    .and_then(|result| result);
+    match (result, cleanup) {
+        (Err(error), Err(cleanup)) => {
+            Err(error.context(format!("Copilot session cleanup also failed: {cleanup:#}")))
+        }
+        (Err(error), Ok(())) | (Ok(_), Err(error)) => Err(error),
+        (Ok(text), Ok(())) => Ok(text),
+    }
 }

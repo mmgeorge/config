@@ -236,8 +236,10 @@ Copilot SDK subscriptions drain through independent `SessionEventStream` tasks b
 provider RPCs, or presentation processing. The prompt stream excludes raw
 `assistant.streaming_delta` and `assistant.tool_call_delta` telemetry, while retaining structured
 message, reasoning, tool, usage, and lifecycle events. Compaction and terminal monitors admit only
-their event types. Each intake uses the shared encoded outbound queue limits and preserves event
-order, waiting for queue capacity when required. Dropping a consumer aborts its intake task.
+their event types. Each intake uses a typed queue with the shared pending-frame count as its
+capacity and preserves event order while waiting for space. SDK events do not pass through host
+JSON frame encoding, so complete tool requests remain admissible regardless of payload size.
+Dropping a consumer aborts its intake task.
 Intake retains a client handle and session identity rather than owning the SDK session. Before a
 tool-schema rebind, the adapter stops and joins the old terminal monitor, then disconnects and drops
 the old session before registering its replacement. Catalog requests reuse an attached session
@@ -246,7 +248,15 @@ schema, so catalog reads cannot disconnect an executing turn from its event stre
 SDK lag notices are logged without ending the turn. Intake compares the next queued event's
 parent with its last durable event and replays any missing durable history before that event.
 Missing transient deltas are superseded by completed message snapshots. Closed subscriptions,
-missing recovery anchors, and failed history reads remain explicit errors.
+missing recovery anchors, and failed history reads remain explicit errors. Intake records
+subscription failures with their full cause chain and native session identity. After draining
+accepted events, the consumer joins the intake task to distinguish subscription failure, panic,
+cancellation, and an unexpected successful exit. Terminal and compaction monitors preserve that
+cause chain. Provider session errors retain event identity and error code, and explicitly identify
+missing provider diagnostics rather than substituting a generic failure.
+Isolated text generation identifies failed SDK operations and deadlines. Cleanup collects abort,
+disconnect, and deletion failures without replacing the generation error, and SDK shutdown retains
+both errors when generation and shutdown fail together.
 
 `CapabilityManifest` records required and optional operations, support, ownership, application boundary,
 and runtime availability. The `Backend` trait requires explicit identity, streaming, shutdown,

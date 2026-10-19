@@ -258,11 +258,8 @@ impl MessageSender {
     }
 
     fn try_admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
-        if self.failure.borrow().is_some() {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "output connection is poisoned",
-            ));
+        if let Some(failure) = self.failure.borrow().clone() {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, failure));
         }
         let limit = if control {
             MAX_CONTROL_BYTES
@@ -283,7 +280,10 @@ impl MessageSender {
             {
                 return Err(io::Error::new(
                     io::ErrorKind::WouldBlock,
-                    "output admission budget exhausted",
+                    format!(
+                        "output admission budget exhausted: {} queued frames ({} normal), {} queued bytes, requested frame reservation {limit}, byte budget {byte_limit}",
+                        budget.frames, budget.normal, budget.bytes
+                    ),
                 ));
             }
             budget.bytes += limit;
@@ -329,6 +329,9 @@ impl MessageReceiver {
             return Ok(frame);
         }
         self.receiver.try_recv().map_err(|error| {
+            if let Err(failure) = self.check() {
+                return failure;
+            }
             let kind = match error {
                 mpsc::error::TryRecvError::Empty => io::ErrorKind::WouldBlock,
                 mpsc::error::TryRecvError::Disconnected => io::ErrorKind::UnexpectedEof,
@@ -344,21 +347,22 @@ impl MessageReceiver {
         if let Ok(frame) = self.control_receiver.try_recv() {
             return Ok(Some(frame));
         }
-        tokio::select! {
+        let frame = tokio::select! {
             biased;
-            frame = self.control_receiver.recv() => match frame {
-                Some(frame) => Ok(Some(frame)),
-                None => Ok(self.receiver.recv().await),
-            },
             changed = self.failure.changed() => {
                 if changed.is_ok() {
-                    return Err(io::Error::new(io::ErrorKind::BrokenPipe,
-                        self.failure.borrow().clone().unwrap_or_else(|| "output failed".into())));
+                    self.check()?;
                 }
-                Ok(self.receiver.recv().await)
+                self.receiver.recv().await
             }
-            frame = self.receiver.recv() => Ok(frame),
-        }
+            frame = self.control_receiver.recv() => match frame {
+                Some(frame) => Some(frame),
+                None => self.receiver.recv().await,
+            },
+            frame = self.receiver.recv() => frame,
+        };
+        self.check()?;
+        Ok(frame)
     }
 }
 
@@ -387,7 +391,11 @@ impl Write for LimitedWriter {
         if bytes.len() > self.limit - self.bytes.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "encoded frame exceeds its limit",
+                format!(
+                    "protocol frame encoding requires at least {} bytes, frame budget is {} bytes",
+                    self.bytes.len() + bytes.len(),
+                    self.limit
+                ),
             ));
         }
         self.bytes.extend_from_slice(bytes);
@@ -403,6 +411,42 @@ mod tests {
     use super::*;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn producer_failure_survives_sender_drop_while_receiver_waits() {
+        let (sender, mut receiver) = channel();
+        let waiting = receiver.recv();
+        tokio::pin!(waiting);
+        assert!(
+            poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context)))
+                .await
+                .is_pending()
+        );
+        sender.record_failure(&io::Error::other(
+            "SDK subscription disconnected: socket reset",
+        ));
+        drop(sender);
+        let error = waiting
+            .await
+            .err()
+            .expect("producer failure must not become EOF");
+        assert_eq!(
+            error.to_string(),
+            "SDK subscription disconnected: socket reset"
+        );
+    }
+
+    #[tokio::test]
+    async fn later_senders_retain_the_first_producer_failure() {
+        let (sender, mut receiver) = channel();
+        sender.record_failure(&io::Error::other("serialize event 42: invalid value"));
+        let error = sender.send_wait("later").await.unwrap_err();
+        assert_eq!(error.to_string(), "serialize event 42: invalid value");
+        assert_eq!(
+            receiver.try_recv().err().unwrap().to_string(),
+            error.to_string()
+        );
+    }
 
     #[tokio::test]
     async fn large_responses_transfer_losslessly_and_leave_the_connection_usable() {

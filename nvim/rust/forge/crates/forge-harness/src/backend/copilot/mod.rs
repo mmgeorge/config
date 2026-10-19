@@ -132,7 +132,7 @@ impl CopilotTerminalMonitor {
                 .await
                 .context("Copilot terminal query timed out")
                 .and_then(|result| result)
-                .map_err(|error: anyhow::Error| error.to_string());
+                .map_err(|error: anyhow::Error| format!("{error:#}"));
                 let has_terminals = result
                     .as_ref()
                     .is_ok_and(|snapshot| !snapshot.terminal.is_empty());
@@ -155,7 +155,7 @@ impl CopilotTerminalMonitor {
                             Ok(update) if update.event_type == "session.background_tasks_changed" => break,
                             Ok(_) => {},
                             Err(error) => {
-                                let _ = send.send(Some(Err(format!("Copilot terminal event stream closed: {error}"))));
+                                let _ = send.send(Some(Err(format!("Copilot terminal event stream closed: {error:#}"))));
                                 return;
                             },
                         }
@@ -794,7 +794,7 @@ impl Backend for CopilotBackend {
             "copilot.generation.result",
             match &result {
                 Ok(text) => json!({"text":text}),
-                Err(error) => json!({"error":error.to_string()}),
+                Err(error) => json!({"error":format!("{error:#}")}),
             },
         );
         result
@@ -1125,11 +1125,7 @@ impl Backend for CopilotBackend {
                         }
                     }
                     if terminal_error {
-                        let detail = provider_event
-                            .data
-                            .get("message")
-                            .and_then(Value::as_str)
-                            .unwrap_or("Copilot session failed");
+                        let detail = event_decoder::session_error(&provider_event, Some(session.id()));
                         anyhow::bail!("{detail}");
                     }
                 }
