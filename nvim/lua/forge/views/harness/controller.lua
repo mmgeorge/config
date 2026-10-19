@@ -1028,6 +1028,8 @@ resume_check_interrupted_prompt = function(state, interrupted)
   if state.check_interrupt_pending ~= interrupted or not state.session
     or state.session.id ~= interrupted.session_id or state.runtime_epoch ~= interrupted.runtime_epoch
     or not interrupted.cancel_complete or interrupted.old_prompt_pending then return end
+  local operation = state.task_operation
+  if operation and ({ submitting = true, accepted = true, stopping = true, running = true })[operation.state] then return end
   state.check_interrupt_pending = nil
   begin_request(interrupted.text, true, interrupted.attachments, interrupted.prompt)
 end
@@ -1061,7 +1063,11 @@ end
 function M.drain()
   local state = harness_state()
   if not state.host_error and check_queue.publish(state, function() vim.schedule(M.drain) end) then return end
-  if state.check_interrupt_pending or state.checks_running then return end
+  if state.check_interrupt_pending then
+    resume_check_interrupted_prompt(state, state.check_interrupt_pending)
+    return
+  end
+  if state.checks_running then return end
   if state.host_error or state.execution_notice or state.task_operation or state.sync_error or state.connection_error then return end
   if state.aborting_plan then return end
   if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
@@ -1953,7 +1959,7 @@ function M.submit()
     M.agent_action("followup", state.selected_agent_run_id, text)
     return
   end
-  if state.task_operation and state.task_operation.state ~= "running" then
+  if state.task_operation and state.task_operation.state ~= "running" and not state.checks_running then
     M.refresh_winbar()
     return
   end

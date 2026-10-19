@@ -1030,16 +1030,11 @@ impl SessionPresentation {
                         TimelineOperation::ToolOutput { call_id, .. } => {
                             open.sections.nodes.tool.contains_key(call_id)
                         }
-                        TimelineOperation::Message {
-                            block_id, message, ..
-                        } => {
-                            message.kind() != crate::turn::MessageKind::Assistant
-                                || open
-                                    .transcript
-                                    .document
-                                    .block(&forge_buffer::identity::BlockId(block_id.clone()))
-                                    .is_some()
-                        }
+                        TimelineOperation::Message { block_id, .. } => open
+                            .transcript
+                            .document
+                            .block(&forge_buffer::identity::BlockId(block_id.clone()))
+                            .is_some(),
                         _ => false,
                     })
                     .collect();
@@ -1051,16 +1046,11 @@ impl SessionPresentation {
             TimelineOperation::ToolOutput { call_id, .. } => {
                 !open.sections.nodes.tool.contains_key(call_id)
             }
-            TimelineOperation::Message {
-                block_id, message, ..
-            } => {
-                message.kind() == crate::turn::MessageKind::Assistant
-                    && open
-                        .transcript
-                        .document
-                        .block(&forge_buffer::identity::BlockId(block_id.clone()))
-                        .is_none()
-            }
+            TimelineOperation::Message { block_id, .. } => open
+                .transcript
+                .document
+                .block(&forge_buffer::identity::BlockId(block_id.clone()))
+                .is_none(),
             _ => false,
         }) {
             reflow(open, self.timeline.entry_list(), self.timeline.revision())
@@ -1488,7 +1478,12 @@ fn apply_projection<'operation>(
                 message,
                 ..
             } => {
-                if message.kind() != crate::turn::MessageKind::Assistant {
+                if !matches!(
+                    message.kind(),
+                    crate::turn::MessageKind::Assistant
+                        | crate::turn::MessageKind::Reasoning
+                        | crate::turn::MessageKind::ReasoningSummary
+                ) {
                     continue;
                 }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
@@ -4127,12 +4122,21 @@ mod tests {
             exchange.observe_turn(&event, 3)?;
             let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle, true)?;
             assert_eq!(
-                owner.timeline.entry_list().len(),
+                owner
+                    .timeline
+                    .entry_list()
+                    .iter()
+                    .filter(|entry| !matches!(entry, TimelineEntry::Status { .. }))
+                    .count(),
                 1,
                 "{nesting} duplicated its exchange"
             );
             assert!(
-                matches!(&patch.operation[..], [TimelineOperation::Replace { entry, .. }] if entry.id() == owner_id)
+                patch.operation.iter().filter(|operation| !matches!(operation,
+                    TimelineOperation::Insert { entry: TimelineEntry::Status { .. }, .. }
+                    | TimelineOperation::Replace { entry: TimelineEntry::Status { .. }, .. }))
+                    .count() == 1 && patch.operation.iter().any(|operation|
+                        matches!(operation, TimelineOperation::Replace { entry, .. } if entry.id() == owner_id))
             );
             owner.sync(&document, opened.transcript.revision)?;
             let snapshot = owner.snapshot(&document)?;
@@ -4163,7 +4167,12 @@ mod tests {
             owner.update_live(None, Some(&exchange.id), SessionPhase::Idle, true)?;
             owner.sync(&document, snapshot.revision)?;
             assert_eq!(
-                owner.timeline.entry_list().len(),
+                owner
+                    .timeline
+                    .entry_list()
+                    .iter()
+                    .filter(|entry| !matches!(entry, TimelineEntry::Status { .. }))
+                    .count(),
                 if nesting == "plan" { 0 } else { 1 }
             );
             assert!(
@@ -4558,12 +4567,19 @@ mod tests {
                 .animated
         );
         owner.update_live(None, None, SessionPhase::Idle, true)?;
+        let idle = owner.snapshot(&document)?;
+        let status = idle
+            .block
+            .iter()
+            .find(|block| block.id.0 == "session:status")
+            .expect("idle status remains visible");
+        assert!(!status.metadata.status.as_ref().unwrap().animated);
         assert!(
-            !owner
-                .snapshot(&document)?
-                .block
+            status
+                .text
+                .wire_rows()
                 .iter()
-                .any(|block| block.id.0 == "session:status")
+                .any(|row| row.contains("Idle"))
         );
         Ok(())
     }

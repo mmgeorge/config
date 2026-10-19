@@ -691,8 +691,11 @@ execution is collected, then releases the prompt and either retracts or cancels 
 Submitting a replacement prompt during checks uses the same ownership order. The editor sends
 `checks.cancel` with `interrupt_execution`, and the service acknowledges it only after native
 cleanup. Direct prompt admission and check cancellation during a provider turn enforce the
-same boundary. Cancelling a manual run without an active provider affects only that run. A newly
-submitted `prompt.submit` remains retractable only while the provider has produced no assistant
+same boundary. Cancelling a manual run without an active provider affects only that run.
+A pause cancels any active check before waiting for its execution permit, including
+manual checks without a provider cancellation token. If a replacement prompt arrives while
+that pause is pending, Lua retains it until check cleanup and the task operation both settle.
+A newly submitted `prompt.submit` remains retractable only while the provider has produced no assistant
 message, tool activity, task update, or workspace delta. Context usage and reasoning status alone
 do not consume that eligibility. Codex maps an eligible retraction to app-server
 `thread/rollback`. Copilot uses the pinned SDK's typed `session.history.truncate` API,

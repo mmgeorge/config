@@ -438,12 +438,17 @@ mod tests {
             sink.send_wait(output("second", "other")).await.unwrap();
         };
         let consumer = async move {
-            let combined = stream.recv().await.unwrap().unwrap();
-            assert_eq!(
-                combined.activity.unwrap().output.unwrap(),
-                "λ\n".repeat(792)
-            );
-            assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(1));
+            let mut combined = String::new();
+            loop {
+                let received = stream.recv().await.unwrap().unwrap();
+                let Some(activity) = received.activity else {
+                    assert_eq!(received.data, json!(1));
+                    break;
+                };
+                assert_eq!(activity.id, "first");
+                combined.push_str(activity.output.as_deref().unwrap());
+            }
+            assert_eq!(combined, "λ\n".repeat(792));
             assert_eq!(
                 stream.recv().await.unwrap().unwrap().activity.unwrap().id,
                 "second"

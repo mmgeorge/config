@@ -743,6 +743,8 @@ impl CheckSupervisor {
                         }
                     } else if command.context.as_ref().map(|context| &context.selection)
                         == check.context.as_ref().map(|context| &context.selection)
+                        && previous.workspace_identity == run.workspace_identity
+                        && previous.workspace_digest == run.workspace_digest
                         && super::evidence::signature(&previous, command)?
                             == super::evidence::signature(run, check)?
                     {

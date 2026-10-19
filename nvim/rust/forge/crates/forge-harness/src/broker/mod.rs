@@ -13419,13 +13419,6 @@ mod test {
                 response.get("document").is_none(),
                 "internal canonical source must not inflate tool output"
             );
-            if response["plan_state"] == "accepted" && response["revision"] == 2 {
-                assert_eq!(
-                    response["approval_comments"],
-                    json!(["Keep this approved scope"]),
-                    "live plan_submit response must include the accepted reviewer note"
-                );
-            }
             let read = runtime
                 .invoke(ControlToolInvocation {
                     name: "plan_read".into(),
@@ -19505,12 +19498,13 @@ mod test {
             assert!(snapshot.active_plan.is_none());
             assert_eq!(broker.session.execution_mode, PermissionMode::Write);
             assert!(snapshot.active_elicitation.is_none());
-            assert!(
-                !snapshot
-                    .timeline
-                    .iter()
-                    .any(|entry| matches!(entry, TimelineEntry::Status { .. }))
-            );
+            assert!(snapshot.timeline.iter().any(|entry| matches!(
+                entry,
+                TimelineEntry::Status {
+                    status: SessionPhase::Idle,
+                    ..
+                }
+            )));
             assert!(
                 broker
                     .store

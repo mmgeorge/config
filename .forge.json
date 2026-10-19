@@ -91,7 +91,9 @@
             "dev",
             "--locked",
             "--workspace",
-            "--tests"
+            "--tests",
+            "--",
+            "--test-threads=2"
           ]
         },
         "files": {
@@ -103,7 +105,9 @@
             "--locked",
             "--package",
             "{package.name}",
-            "--tests"
+            "--tests",
+            "--",
+            "--test-threads=2"
           ],
           "package_manager": "cargo"
         },
@@ -119,7 +123,8 @@
             "{case.target_args}",
             "--",
             "{case.name}",
-            "--exact"
+            "--exact",
+            "--test-threads=2"
           ],
           "package_manager": "cargo"
         },
@@ -160,7 +165,9 @@
             "dev",
             "--locked",
             "--workspace",
-            "--tests"
+            "--tests",
+            "--",
+            "--test-threads=2"
           ]
         },
         "files": null,

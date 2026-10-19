@@ -90,6 +90,12 @@ pub fn signature(
         .args([
             "-c",
             "core.splitIndex=false",
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.required=false",
             "status",
             "--porcelain=v2",
             "-z",

@@ -1536,12 +1536,7 @@ impl TimelineRenderer<'_> {
                     .iter()
                     .find(|message| message.id() == id)
                     .context("timeline content references a missing message")?;
-                if matches!(
-                    message.kind(),
-                    crate::turn::MessageKind::Reasoning
-                        | crate::turn::MessageKind::ReasoningSummary
-                ) || message.text().trim().is_empty()
-                {
+                if message.text().trim().is_empty() {
                     continue;
                 }
             }
@@ -4449,8 +4444,12 @@ mod tests {
             6,
         )
         .unwrap();
-        let text = projected
-            .entry
+        let visible = super::super::sections::preview(super::super::document::TranscriptEntry {
+            id: projected.entry.id.clone(),
+            block: projected.entry.block.clone(),
+        })
+        .unwrap();
+        let text = visible
             .block
             .iter()
             .flat_map(|block| block.text.wire_rows())

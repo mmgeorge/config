@@ -2821,6 +2821,9 @@ async fn execute_task_transition(
             controller
                 .cancellation
                 .begin_cleanup(restart, restore_prompt)?;
+            if let Some(run_id) = controller.checks.active()? {
+                controller.checks.cancel(&run_id)?;
+            }
             let approval_owner = crate::backend::ExecutionOwner::root(
                 &controller.catalog_request.read().await.harness_session_id,
             );

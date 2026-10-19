@@ -113,6 +113,26 @@ for _, cancellation_first in ipairs({ true, false }) do
   complete_snapshot()
 end
 
+for _, operation_state in ipairs({ "submitting", "accepted", "stopping", "running" }) do
+  state.task_operation = { action = "pause", state = operation_state }
+  state.checks_running, state.active_check_run = true, "paused-check"
+  compose("replace paused check")
+  controller.submit()
+  local cancellation = requests[#requests]
+  assert(cancellation.method == "checks.cancel", "pending pause discarded the replacement prompt")
+  local count = #requests
+  cancellation.callback({})
+  state.checks_running, state.active_check_run = false, nil
+  controller.drain()
+  assert(#requests == count and state.check_interrupt_pending, "replacement raced the pause operation")
+  state.task_operation = nil
+  controller.drain()
+  local next_prompt = requests[#requests]
+  assert(next_prompt.method == "prompt.submit" and next_prompt.params.text == "replace paused check")
+  next_prompt.callback({})
+  complete_snapshot()
+end
+
 local failures = { { message = "cancelled", detail = { code = "turn_cancelled" } },
   { message = "host stopped", detail = { code = "outcome_unknown" } } }
 for _, failure in ipairs(failures) do

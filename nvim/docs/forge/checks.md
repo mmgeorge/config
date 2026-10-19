@@ -207,6 +207,8 @@ Submitting a prompt while checks run interrupts those checks and starts the prom
 after their processes stop. Explicitly queueing a prompt leaves checks running and
 waits for completion. A directly submitted prompt takes precedence over queued
 prompts, and edits made to the composer during cancellation remain unsent.
+`Ctrl-C` with an empty composer stops running checks and pauses work. `Ctrl-S`
+submits the composer even while that pause is pending, after cleanup finishes.
 
 
 Cancelling a check stops its owned process tree. Automatic completion does not retry
