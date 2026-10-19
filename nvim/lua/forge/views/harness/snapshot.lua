@@ -62,6 +62,7 @@ function HarnessSnapshot.apply(state, result)
   state.check_editing = result.check_editing == true
   state.checks_running = result.checks_running == true
   state.check_timing = result.check_timing or "after_queue"
+  state.automatic_checks = result.automatic_checks ~= false
   state.checks_deferred = result.checks_deferred == true
   state.active_check_run = result.active_check_run
   state.timeline_revision = result.timeline_revision or 0

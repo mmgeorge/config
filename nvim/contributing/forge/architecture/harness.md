@@ -13,6 +13,16 @@ enclosing host request lifecycle on the normal worker stack.
 
 ## Timeline storage and incremental projection
 
+Portable settings retain automatic completion-check enablement independently of
+queue timing. Enablement defaults on. The completion gate reads the effective
+setting before loading check configuration. Live changes use the settings route
+without acquiring provider execution ownership. Disabling the gate releases its
+deferred queue obligation and leaves explicit runs and plan Checking available.
+The provider `checks_list` tool and public checks catalog read effective settings
+on each request and expose `automatic_checks` and `check_timing`. Existing tool
+scopes observe live changes without restarting the provider. Agents use this
+policy to choose between the completion gate and explicit verification.
+
 The status entry combines the primary `SessionPhase` with an optional `CheckActivity`.
 `buffer/status.rs` owns their layout. The primary label and action keep their own
 row, and check progress appears directly below it before the reasoning preview.

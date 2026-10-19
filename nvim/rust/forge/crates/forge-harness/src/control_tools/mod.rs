@@ -304,7 +304,7 @@ impl ControlToolRegistry {
         definitions.extend([
             ControlToolDefinition {
                 name: "checks_list",
-                description: "Read project check configuration, revision, overrides, history, and concrete command previews before configuring or running checks.",
+                description: "Read live automatic_checks enablement and check_timing, project check configuration, revision, overrides, history, and concrete command previews. Check this before deciding whether manual checks_run is needed. When automatic_checks is true, normally rely on the completion gate. When false, explicitly run applicable checks when verification is needed.",
                 input_schema: strict_object_input_schema(vec![], &[]),
             },
             ControlToolDefinition {

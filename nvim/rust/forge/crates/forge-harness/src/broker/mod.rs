@@ -164,6 +164,8 @@ pub struct BrokerSnapshot {
     pub snapshot_revision: u64,
     pub checks_running: bool,
     pub check_timing: crate::checks::CheckTiming,
+    /// Effective completion-check enablement, independent of manual and plan checks.
+    pub automatic_checks: bool,
     pub checks_deferred: bool,
     pub active_check_run: Option<String>,
     pub task_operation: Option<Value>,
@@ -4907,6 +4909,18 @@ Planning continuation: turn {} of {}.",
         {
             return Ok(result);
         }
+        let settings = crate::settings::SettingsStore::open(&self.data_root)?;
+        let check_settings = settings
+            .get(
+                &self.session.workspace,
+                &self.session.id,
+                &self.session.backend,
+            )?
+            .desired;
+        if check_settings.automatic_checks == Some(false) {
+            self.observer.completion_queue.finish()?;
+            return Ok(result);
+        }
         if crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_err() {
             let catalog = self.check_runner.catalog(None)?;
             if catalog["configured"] == false {
@@ -4926,15 +4940,7 @@ Planning continuation: turn {} of {}.",
             .map(|task| task.id.clone())
             .unwrap_or(change_owner.clone());
         let mut automatic = AutomaticChecks::open(&self.check_runner.root, &owner)?;
-        let timing = crate::settings::SettingsStore::open(&self.data_root)?
-            .get(
-                &self.session.workspace,
-                &self.session.id,
-                &self.session.backend,
-            )?
-            .desired
-            .check_timing
-            .unwrap_or_default();
+        let timing = check_settings.check_timing.unwrap_or_default();
         if self
             .observer
             .completion_queue
@@ -4946,6 +4952,25 @@ Planning continuation: turn {} of {}.",
             return Ok(result);
         }
         loop {
+            if settings
+                .get(
+                    &self.session.workspace,
+                    &self.session.id,
+                    &self.session.backend,
+                )?
+                .desired
+                .automatic_checks
+                == Some(false)
+            {
+                automatic.pending = false;
+                automatic.blocked = None;
+                automatic.delivered.clear();
+                automatic.repair_prompt = None;
+                automatic.repair_exchange = None;
+                automatic.save()?;
+                self.observer.completion_queue.finish()?;
+                return Ok(result);
+            }
             if self.turn_cancellation.requested.load(Ordering::Acquire) {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
@@ -4995,6 +5020,18 @@ Planning continuation: turn {} of {}.",
                 .await?;
             if run.state == CheckState::Interrupted {
                 return Err(anyhow::Error::new(TurnCancelled));
+            }
+            if settings
+                .get(
+                    &self.session.workspace,
+                    &self.session.id,
+                    &self.session.backend,
+                )?
+                .desired
+                .automatic_checks
+                == Some(false)
+            {
+                continue;
             }
             if run.state == CheckState::Stale {
                 continue;
@@ -5758,6 +5795,8 @@ Planning continuation: turn {} of {}.",
         let (check_scope, _check_lease) = crate::checks::CheckToolScope::open(
             Arc::clone(&self.check_runner),
             crate::checks::CheckAuthority {
+                data_root: self.data_root.clone(),
+                backend: self.session.backend.clone(),
                 task_id: self
                     .current_task()?
                     .filter(|task| !task.status.terminal())
@@ -9633,6 +9672,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .get("check_timing")
             .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone()))
             .transpose()?;
+        let automatic_checks = params
+            .get("automatic_checks")
+            .map(|value| serde_json::from_value::<bool>(value.clone()))
+            .transpose()?;
         if let Some(value) = params.get("auto_compaction") {
             let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
             policy.validate(configured.context_usage.as_ref())?;
@@ -9910,6 +9953,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
             if let Some(value) = check_timing {
                 portable.check_timing = Some(value);
+                changed = true;
+            }
+            if let Some(value) = automatic_checks {
+                portable.automatic_checks = Some(value);
                 changed = true;
             }
             if params.get("default_write_permission").is_some() {
@@ -10712,9 +10759,10 @@ mod test {
 
     #[tokio::test]
     async fn automatic_checks_preserve_the_queue_baseline_and_timing() -> Result<()> {
-        for timing in [
-            crate::checks::CheckTiming::AfterQueue,
-            crate::checks::CheckTiming::BetweenWork,
+        for (timing, enabled) in [
+            (crate::checks::CheckTiming::AfterQueue, true),
+            (crate::checks::CheckTiming::BetweenWork, true),
+            (crate::checks::CheckTiming::BetweenWork, false),
         ] {
             let repository = repository();
             let data = tempfile::tempdir()?;
@@ -10722,9 +10770,10 @@ mod test {
             broker.session.execution_mode = PermissionMode::Yolo;
             broker.session.shell = crate::session::CheckShell::Nushell;
             broker
-                .configure_session(json!({"check_timing":timing}))
+                .configure_session(json!({"check_timing":timing,"automatic_checks":enabled}))
                 .await?;
             assert_eq!(broker.snapshot()?.check_timing, timing);
+            assert_eq!(broker.snapshot()?.automatic_checks, enabled);
             let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
             broker.backend = Arc::new(AutomaticCheckBackend {
                 turns: turns.clone(),
@@ -10753,7 +10802,7 @@ mod test {
             let first_history = broker.check_runner.snapshot()?.history;
             assert_eq!(
                 first_history.len(),
-                usize::from(timing == crate::checks::CheckTiming::BetweenWork)
+                usize::from(enabled && timing == crate::checks::CheckTiming::BetweenWork)
             );
             broker.observer.completion_queue.update(2, false)?;
             broker.observer.completion_queue.update(1, true)?;
@@ -10773,7 +10822,7 @@ mod test {
                     .flat_map(|run| &run.commands)
                     .filter(|command| command.state == crate::checks::CheckState::Passed)
                     .count(),
-                1
+                usize::from(enabled)
             );
             assert!(!broker.snapshot()?.checks_deferred);
             if timing == crate::checks::CheckTiming::AfterQueue {
@@ -10794,6 +10843,7 @@ mod test {
                 &broker.session.backend,
             )?;
             assert_eq!(reopened.desired.check_timing, Some(timing));
+            assert_eq!(reopened.desired.automatic_checks, Some(enabled));
         }
         Ok(())
     }
@@ -17668,14 +17718,16 @@ mod test {
     }
 
     #[tokio::test]
-    async fn check_editing_permission_controls_existing_tool_scope() -> Result<()> {
+    async fn check_tool_scope_observes_live_settings_and_editing_permission() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
-        let broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let (sink, _events) = crate::backend::events::channel();
         let (scope, _lease) = crate::checks::CheckToolScope::open(
             Arc::clone(&broker.check_runner),
             crate::checks::CheckAuthority {
+                data_root: broker.data_root.clone(),
+                backend: broker.session.backend.clone(),
                 task_id: None,
                 shell: broker.session.shell,
                 mode: PromptMode::Chat,
@@ -17696,6 +17748,26 @@ mod test {
                 sink: None,
             },
         );
+        let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", json!({})).await?)?;
+        assert_eq!(catalog["automatic_checks"], true);
+        assert_eq!(catalog["check_timing"], "after_queue");
+        let configured = catalog["configured"].clone();
+        for (automatic_checks, check_timing) in [
+            (false, crate::checks::CheckTiming::BetweenWork),
+            (true, crate::checks::CheckTiming::AfterQueue),
+        ] {
+            broker
+                .configure_session(json!({
+                    "automatic_checks": automatic_checks, "check_timing": check_timing
+                }))
+                .await?;
+            let catalog: Value =
+                serde_json::from_str(&scope.invoke("checks_list", json!({})).await?)?;
+            assert_eq!(catalog["automatic_checks"], json!(automatic_checks));
+            assert_eq!(catalog["check_timing"], json!(check_timing));
+            assert_eq!(catalog["configured"], configured);
+            assert!(catalog["history"].as_array().unwrap().is_empty());
+        }
         let request = || -> Result<Value> {
             Ok(json!({
                 "expected_revision": broker.check_runner.catalog(None)?["revision"],

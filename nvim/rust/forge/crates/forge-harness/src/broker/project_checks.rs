@@ -209,8 +209,15 @@ impl HarnessBroker {
             .map(|task| task.id);
         let result = match method {
             HarnessMethod::ChecksList => {
+                let settings = crate::settings::SettingsStore::open(&self.data_root)?
+                    .get(
+                        &self.session.workspace,
+                        &self.session.id,
+                        &self.session.backend,
+                    )?
+                    .desired;
                 self.check_runner
-                    .catalog_preview(task_id.as_deref(), self.session.shell)
+                    .catalog_preview(task_id.as_deref(), self.session.shell, &settings)
                     .await?
             }
             HarnessMethod::ChecksOverride => {

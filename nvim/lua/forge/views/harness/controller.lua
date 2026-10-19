@@ -2542,13 +2542,13 @@ end
 function M.configure(next_config, validate_selection, completed)
   local state = harness_state()
   local only_field = next(next_config)
-  if only_field == "check_timing" and next(next_config, only_field) == nil then
+  if (only_field == "check_timing" or only_field == "automatic_checks") and next(next_config, only_field) == nil then
     local session_id, epoch = state.session.id, state.runtime_epoch
-    state.check_timing_request = (state.check_timing_request or 0) + 1
-    local revision = state.check_timing_request
+    state.check_settings_request = (state.check_settings_request or 0) + 1
+    local revision = state.check_settings_request
     client.request_for(session_id, "session.configure", next_config, function(result, failure)
       if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
-      if state.check_timing_request ~= revision then
+      if state.check_settings_request ~= revision then
         if completed then completed(false) end
         return
       end
@@ -2558,7 +2558,10 @@ function M.configure(next_config, validate_selection, completed)
         return
       end
       state.check_timing = result.check_timing
+      state.automatic_checks = result.automatic_checks ~= false
+      if result.checks_deferred ~= nil then state.checks_deferred = result.checks_deferred end
       M.render()
+      vim.schedule(M.drain)
       if completed then completed(true) end
     end)
     return

@@ -60,6 +60,7 @@ controller.configure = function(params, _, completed)
     state.session = result
     if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
     if params.check_timing then state.check_timing = params.check_timing end
+    if params.automatic_checks ~= nil then state.automatic_checks = params.automatic_checks end
     completed(true)
   end)
 end
@@ -97,7 +98,7 @@ local success, failure = xpcall(function()
     assert(mapping.callback, "missing key " .. binding)
     mapping.callback()
   end
-  assert(#instance.spec.page_list[1].option_list == 19, "settings are not grouped into 19 rows")
+  assert(#instance.spec.page_list[1].option_list == 20, "settings are not grouped into 20 rows")
   assert(find("check-timing").section == "Checks")
   assert(find("plan-permission").section == "Planning")
   assert(find("plan-revisions").section == "Planning")
@@ -109,6 +110,14 @@ local success, failure = xpcall(function()
   assert(state.check_timing == "between_work")
   key("check-timing", "<Left>")
   assert(state.check_timing == "after_queue")
+  assert(find("automatic-checks").section == "Checks")
+  key("automatic-checks", "<Right>")
+  assert(state.automatic_checks ~= false, "arrows toggled automatic checks")
+  key("automatic-checks", "<Space>")
+  assert(state.automatic_checks == false and state.check_timing == "after_queue")
+  assert(find("automatic-checks").fields[1].value == false)
+  key("automatic-checks", "<Space>")
+  assert(state.automatic_checks == true and state.check_timing == "after_queue")
   key("status-thoughts", "<Right>")
   assert(state.status_thoughts ~= true, "arrows must not toggle booleans")
   key("status-thoughts", "<Space>")
@@ -121,7 +130,8 @@ local success, failure = xpcall(function()
   assert(subagent_row ~= lsp_row and #subagent_row.fields == 1 and #lsp_row.fields == 1)
   assert(subagent_row.section == "Tools" and lsp_row.section == "Tools")
   assert(find("status-thoughts").section == "Display")
-  local last = picker._state_for_test().spec.page_list[1].option_list[19]
+  local rows = picker._state_for_test().spec.page_list[1].option_list
+  local last = rows[#rows]
   assert(last.id == "logging" and last.section == "Debug", "Debug must be the final category")
   key("subagent-tools", "<Tab>")
   focused = require("forge.views.picker.state").selected_field(picker._state_for_test().state, picker._state_for_test().spec)

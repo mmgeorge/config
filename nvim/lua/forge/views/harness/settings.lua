@@ -177,6 +177,7 @@ function M.open(state, host)
       state.pending_config or {}, state.task_config or {})
     active.status_thoughts = state.status_thoughts == true
     active.check_timing = state.check_timing or "after_queue"
+    active.automatic_checks = state.automatic_checks ~= false
     local configuration_revision = 0
     local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
@@ -201,6 +202,7 @@ function M.open(state, host)
           state.pending_config or {}, state.task_config or {})
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
+        active.automatic_checks = state.automatic_checks ~= false
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -283,6 +285,8 @@ function M.open(state, host)
         configure({ status_thoughts = active.status_thoughts ~= true })
       elseif id == "check-timing" then
         configure({ check_timing = active.check_timing == "between_work" and "after_queue" or "between_work" })
+      elseif id == "automatic-checks" then
+        configure({ automatic_checks = active.automatic_checks == false })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -431,6 +435,9 @@ function M.open(state, host)
             row("background-compaction", "Compaction", "Background", { background.compact, background.threshold }),
             row("check-execution", "Checks", "Execution", {
               field("shell", "choice", active.shell == "nushell" and "Nushell" or "System", "Shell", "Shell used for saved checks. Nushell is available when installed."),
+            }),
+            row("automatic-checks", "Checks", "Automatic", {
+              field("automatic-checks", "toggle", active.automatic_checks ~= false, "Enabled", "Run applicable checks when work completes. Explicit runs and plan Checking remain available when disabled."),
               field("check-timing", "choice", active.check_timing == "between_work" and "Between queued work" or "After queue", "Timing", "Run checks after each work item or once the queue finishes."),
             }),
             row("check-editing", "Checks", "Setup", {

@@ -1623,13 +1623,23 @@ async fn route_request(
         return Ok(());
     }
     if method == HarnessMethod::SessionConfigure
-        && request
-            .params
-            .as_object()
-            .is_some_and(|fields| fields.len() == 1 && fields.contains_key("check_timing"))
+        && request.params.as_object().is_some_and(|fields| {
+            !fields.is_empty()
+                && fields
+                    .keys()
+                    .all(|field| matches!(field.as_str(), "check_timing" | "automatic_checks"))
+        })
     {
-        let timing: crate::checks::CheckTiming =
-            serde_json::from_value(request.params["check_timing"].clone())?;
+        let timing = request
+            .params
+            .get("check_timing")
+            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone()))
+            .transpose()?;
+        let enabled = request
+            .params
+            .get("automatic_checks")
+            .map(|value| serde_json::from_value::<bool>(value.clone()))
+            .transpose()?;
         let catalog = controller.catalog_request.read().await.clone();
         let mut settings = crate::settings::SettingsStore::open(
             PathBuf::from(&registry.initialize.data_root).as_path(),
@@ -1644,7 +1654,12 @@ async fn route_request(
             &catalog.workspace,
             &session_id,
         )?;
-        desired.check_timing = Some(timing);
+        if let Some(timing) = timing {
+            desired.check_timing = Some(timing);
+        }
+        if let Some(enabled) = enabled {
+            desired.automatic_checks = Some(enabled);
+        }
         settings.update(
             snapshot.revision,
             crate::settings::SettingScope::Global,
@@ -1652,19 +1667,20 @@ async fn route_request(
             &session_id,
             &desired,
         )?;
-        let timing = settings
+        let desired = settings
             .get(
                 &catalog.workspace,
                 &session_id,
                 &registry.initialize.backend.kind,
             )?
-            .desired
-            .check_timing
-            .unwrap_or_default();
+            .desired;
+        if desired.automatic_checks == Some(false) {
+            controller.observer.completion_queue.finish()?;
+        }
         message_sink
             .send_response(Response::success(
                 request.id,
-                json!({"check_timing":timing}),
+                json!({"check_timing":desired.check_timing.unwrap_or_default(), "automatic_checks":desired.automatic_checks.unwrap_or(true), "checks_deferred":controller.observer.completion_queue.deferred()?}),
             )?)
             .await?;
         return Ok(());
@@ -2090,9 +2106,14 @@ async fn route_request(
         let task_id = task.as_ref().map(|task| task.id.as_str());
         let result = match method {
             HarnessMethod::ChecksList => {
+                let settings = crate::settings::SettingsStore::open(
+                    PathBuf::from(&registry.initialize.data_root).as_path(),
+                )?
+                .get(&session.workspace, &session.id, &session.backend)?
+                .desired;
                 controller
                     .checks
-                    .catalog_preview(task_id, session.shell)
+                    .catalog_preview(task_id, session.shell, &settings)
                     .await?
             }
             HarnessMethod::ChecksStatus => {

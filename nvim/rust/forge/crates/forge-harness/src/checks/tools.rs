@@ -51,6 +51,8 @@ pub(crate) struct ConfigureChecks {
 /// Restricts provider check tools to one authenticated root interaction and captured task.
 pub(crate) struct CheckToolScope {
     runner: Arc<CheckSupervisor>,
+    data_root: PathBuf,
+    backend: String,
     task_id: Option<String>,
     shell: CheckShell,
     mode: PromptMode,
@@ -74,6 +76,8 @@ struct CheckDelivery {
 
 /// Binds check operations to the live root turn and its setup/write authority.
 pub(crate) struct CheckAuthority {
+    pub data_root: PathBuf,
+    pub backend: String,
     pub task_id: Option<String>,
     pub shell: CheckShell,
     pub mode: PromptMode,
@@ -119,6 +123,8 @@ impl CheckToolScope {
         authority: CheckAuthority,
     ) -> (Arc<Self>, CheckToolLease) {
         let CheckAuthority {
+            data_root,
+            backend,
             task_id,
             shell,
             mode,
@@ -136,6 +142,8 @@ impl CheckToolScope {
         } = authority;
         let scope = Arc::new(Self {
             runner,
+            data_root,
+            backend,
             task_id,
             shell,
             mode,
@@ -172,8 +180,15 @@ impl CheckToolScope {
         }
         let result = match name {
             "checks_list" => {
+                let settings = crate::settings::SettingsStore::open(&self.data_root)?
+                    .get(
+                        &self.runner.workspace.to_string_lossy(),
+                        &self.address.thread_id,
+                        &self.backend,
+                    )?
+                    .desired;
                 self.runner
-                    .catalog_preview(self.task_id.as_deref(), self.shell)
+                    .catalog_preview(self.task_id.as_deref(), self.shell, &settings)
                     .await?
             }
             "checks_configure" => {
@@ -333,13 +348,16 @@ impl CheckToolScope {
 }
 
 impl CheckSupervisor {
-    /// Adds concrete task commands without starting checks or publishing run history.
+    /// Adds effective completion policy and concrete task commands without running checks.
     pub(crate) async fn catalog_preview(
         &self,
         task_id: Option<&str>,
         shell: CheckShell,
+        settings: &crate::settings::PortableSettings,
     ) -> Result<Value> {
         let mut catalog = self.catalog(task_id)?;
+        catalog["automatic_checks"] = json!(settings.automatic_checks.unwrap_or(true));
+        catalog["check_timing"] = json!(settings.check_timing.unwrap_or_default());
         if let Ok(snapshot) = ConfigSnapshot::load(&self.workspace) {
             let overrides = self.overrides(task_id)?;
             let mut config = snapshot.config;

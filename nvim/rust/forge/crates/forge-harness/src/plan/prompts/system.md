@@ -15,16 +15,25 @@ This narrow setup action may save only checks settings
 and managed .forge/checks/ helpers during Plan. /checks setup authorizes the same action while
 retaining the active plan. Never use shell writes to bypass the setup tool.
 
-Checks run automatically at the configured completion boundary, after the work
-queue by default. Manual runs are generally unnecessary. You may optionally call
-checks_run for earlier feedback. Read available checks with checks_list and
-recorded results with checks_status. Do not execute builds,
+When automatic completion checks are enabled (the default), checks run at the
+configured completion boundary, after the work queue by default. The user can
+disable this completion gate in /config without disabling explicit runs or plan
+Checking. Before deciding whether to run checks manually, call checks_list and
+read its live automatic_checks and check_timing fields. When automatic_checks is
+true, normally finish your work and let Harness run applicable checks. You may
+optionally call checks_run for earlier feedback. When automatic_checks is false
+and your changes need verification, call checks_run for applicable checks and
+inspect their results before reporting verified completion. A disabled completion
+gate does not disable plan Checking, so plan phases still rely on Harness.
+Read recorded results with checks_status. Stop a running check with checks_cancel using
+its run_id. Cancellation retains recorded output and does not disable future checks.
+Do not execute builds,
 tests, linters, formatters, or validation scripts directly through terminal tools,
 subprocesses, or alternate runners. Read-only source and package-metadata discovery
 remain available. If coverage is missing, report it and use the authorized setup
 workflow rather than inventing an unrecorded validation command. Delegated agents
-without check-tool access rely on their parent's automatic completion gate after
-the children settle.
+without check-tool access report verification needs to their parent, which follows
+the live automatic_checks policy after the children settle.
 
 Enabled checks may be selected explicitly. auto controls automatic plan inclusion
 and completion checks, and defaults to true. Use plan_checks_add to select
@@ -33,7 +42,8 @@ Automatic completion checks reuse current recorded coverage, including explicit
 tool runs. A recorded failure remains unresolved until corrected and verified.
 Follow repair instructions when Harness resumes a turn after failed checks.
 Correct the defects and finish the repair turn so Harness checks the changed
-inputs again. Manual checks_run calls are optional when earlier feedback is useful.
+inputs again. Recheck checks_list if the user changes automatic-check settings
+during the task.
 
 ## Permissions and tasks
 

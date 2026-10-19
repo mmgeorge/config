@@ -29,6 +29,8 @@ pub struct PortableSettings {
     pub shell: Option<crate::session::CheckShell>,
     /// Automatic validation boundary for the editor's work queue.
     pub check_timing: Option<crate::checks::CheckTiming>,
+    /// Enables automatic completion checks, defaulting to enabled when omitted.
+    pub automatic_checks: Option<bool>,
     /// Allows the root agent to edit project checks in this conversation.
     pub check_editing: Option<bool>,
     /// Selects the ordinary writable approval mode.
@@ -70,6 +72,9 @@ impl PortableSettings {
         }
         if overriding.check_timing.is_some() {
             self.check_timing = overriding.check_timing;
+        }
+        if overriding.automatic_checks.is_some() {
+            self.automatic_checks = overriding.automatic_checks;
         }
         if overriding.check_editing.is_some() {
             self.check_editing = overriding.check_editing;

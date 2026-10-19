@@ -88,7 +88,8 @@ M.empty_diff_rows = {}
 ---@field task_config? table
 ---@field check_editing? boolean
 ---@field check_timing? 'after_queue'|'between_work'
----@field check_timing_request? integer
+---@field automatic_checks? boolean
+---@field check_settings_request? integer
 ---@field checks_deferred? boolean
 ---@field configuring? boolean
 ---@field configuring_config? table

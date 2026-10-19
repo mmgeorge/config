@@ -126,6 +126,7 @@ impl BrokerObserver {
             .get(&session.workspace, &session.id, &session.backend)?
             .desired;
         let check_timing = settings.check_timing.unwrap_or_default();
+        let automatic_checks = settings.automatic_checks.unwrap_or(true);
         (session.approval_timeout, session.answer_timeout) =
             self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = source_session
@@ -304,6 +305,7 @@ impl BrokerObserver {
             snapshot_revision: revision,
             checks_running,
             check_timing,
+            automatic_checks,
             checks_deferred: self.completion_queue.deferred()?,
             active_check_run,
             task_operation: store

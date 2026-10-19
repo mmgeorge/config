@@ -61,8 +61,13 @@ local success, failure = xpcall(function()
   } } })
   require("forge.views.harness").open()
   await(function() return state.session ~= nil end, "startup timeout")
+  await(completed, "startup configuration did not settle")
   request("session.configure", { shell = "nushell" })
   assert(request("state.get").check_timing == "after_queue")
+  assert(request("state.get").automatic_checks == true, "automatic checks must default on")
+  local check_policy = request("checks.list")
+  assert(check_policy.automatic_checks == true, "check catalog must expose default enablement")
+  assert(check_policy.check_timing == "after_queue", "check catalog must expose default timing")
 
   submit("First queued change")
   await(function() return starts == 1 end, "first item did not start")
@@ -114,6 +119,40 @@ local success, failure = xpcall(function()
   await(completed, "removing the final queued item did not run checks")
   assert(starts == 5 and executed() == 3, "queue removal lost validation or started deleted work: "
     .. vim.inspect({ starts = starts, history = request("checks.list").history }))
+
+  submit("Work with automatic checks disabled")
+  await(function() return starts == 6 end, "disabled-check work did not start")
+  applied = nil
+  controller.configure({ automatic_checks = false }, false, function(value) applied = value end)
+  await(function() return applied end, "automatic checks could not be disabled during work")
+  assert(starts == 6 and state.busy, "disabling checks restarted the provider")
+  assert(request("state.get").automatic_checks == false and state.automatic_checks == false)
+  assert(request("settings.get").desired.automatic_checks == false, "disabled setting was not persisted")
+  assert(request("checks.list").automatic_checks == false, "check catalog did not observe live disablement")
+  vim.fn.writefile({ "edit with completion checking disabled" }, workspace .. "/source.txt")
+  await(completed, "disabled-check work did not complete")
+  assert(executed() == 3 and state.check_timing == "after_queue", "disabled gate ran or lost its timing")
+  local explicit = request("checks.run", { ids = { "verify" } })
+  local checked = request("checks.status", { run_id = explicit.run_id, wait_for_completion = true })
+  assert(checked.state == "passed" and executed() == 4, "disabling automatic checks disabled explicit runs")
+  applied = nil
+  controller.configure({ automatic_checks = true }, false, function(value) applied = value end)
+  await(function() return applied end, "automatic checks could not be enabled")
+  assert(request("checks.list").automatic_checks == true, "check catalog did not observe live enablement")
+  owner = vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner
+  submit("Work after automatic checks are enabled")
+  await(function() return starts == 7 end, "enabled-check work did not start")
+  await(function() return vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner ~= owner end,
+    "enabled-check work did not capture its baseline")
+  vim.fn.writefile({ "edit after completion checking enabled" }, workspace .. "/source.txt")
+  await(completed, "enabled-check work did not complete")
+  assert(executed() == 5, "re-enabling did not restore the completion gate: "
+    .. vim.inspect({ automatic_checks = request("state.get").automatic_checks,
+      history = vim.tbl_map(function(run)
+        return { trigger = run.context.trigger, state = run.state, commands = vim.tbl_map(function(command)
+          return { state = command.state, started_at_ms = command.started_at_ms }
+        end, run.commands) }
+      end, request("checks.list").history) }))
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

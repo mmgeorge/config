@@ -68,24 +68,37 @@ plan version unchanged. The tool is available during plan authoring and Resolve.
 `all: true` for every enabled check. Explicit runs execute even when earlier
 evidence remains current.
 
-Checks run automatically at the configured queue boundary, so agents generally
-do not need to run them manually. Agents may optionally call `checks_run` for
-earlier feedback. Direct
+Agents can stop a running check with `checks_cancel`, supplying its `run_id`
+from `checks_run` or `checks_list`. Cancellation preserves output and check
+history. It stops that run without disabling future automatic checks.
+
+`checks_list` returns the live `automatic_checks` boolean and `check_timing`
+(`after_queue` or `between_work`) alongside the catalog. Agents read these fields
+before deciding whether to run checks manually. When enabled, they normally
+rely on the completion gate and may call `checks_run` for earlier feedback. When
+disabled, they explicitly run applicable checks if their changes need verification.
+Direct
 terminal builds, tests, linters, formatters, and validation scripts do not record
 coverage and must not replace check runs. During plan implementation and
 resolution, agents finish the phase and let Harness Checking run validation.
 
 ## Completion and repair
 
-The **Automatic checks** setting in `/config` selects **After queue** by default.
+In `/config` under **Checks → Automatic**, **Enabled** starts on. Space toggles
+it using `●` for enabled and `○` for disabled. Turning it off suppresses automatic
+completion checks. Explicit runs and plan Checking remain available. An already
+running check finishes unless stopped explicitly.
+
+The **Timing** field selects **After queue** by default and retains its value
+when automatic checks are disabled.
 Harness runs applicable automatic checks after the last queued work item finishes.
 Select **Between queued work** to run them after each item before starting the next.
-The setting saves a global default and can change while work is running without
+Both settings save global defaults and can change while work is running without
 interrupting the model. Already running checks finish before queued work resumes.
 Removing the remaining queued items also releases the pending completion check.
 The final check includes changes from the entire queue, using its first change baseline.
 
-Before ordinary work becomes idle, Harness runs applicable automatic checks.
+When enabled, Harness runs applicable automatic checks before ordinary work becomes idle.
 Intermediate goal turns do not trigger this gate. Successful goal completion
 does. Questions, pending approvals, cancellation, and paused work do not start
 automatic checks.
