@@ -23,7 +23,7 @@ state.presentation = { capture_prompt = function()
   return { buffer = state.composer_buf, document = "original", is_current = function() return current end }
 end }
 local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
 end
 local function complete_snapshot()
   local request = requests[#requests]
@@ -31,10 +31,12 @@ local function complete_snapshot()
   request.callback({ session = state.session, capability = state.capability, status = { kind = "idle" } })
 end
 
-compose("first prompt")
+local path_prompt = "/workspace/Screen shot.png\n[Image #1]\n\n"
+compose(path_prompt)
 controller.submit()
 local first = requests[1]
 assert(first.method == "prompt.submit" and state.busy and state.prompt_submission)
+assert(first.params.text == path_prompt, "absolute-path submission changed the complete captured draft")
 compose("first follow-up")
 controller.queue_submit()
 compose("second follow-up")

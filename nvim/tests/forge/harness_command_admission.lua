@@ -7,25 +7,37 @@ assert(source.accepts_prompt("/sessions anything /unrecognized"))
 assert(source.accepts_prompt("/plan arbitrary prompt"))
 assert(source.accepts_prompt("/plan"))
 assert(source.accepts_prompt("Explain /sess"))
+assert(not source.queues_execution("/plan inspect screenshot.png"),
+  "filename arguments must not override supported command routing")
+assert(not source.accepts_prompt("/spawn\nscreenshot.png"),
+  "an extension on a later line must not unlock an unknown slash command")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
+local notifications = require("forge.infra.notifications")
+local warnings = {}
+notifications.warn = function(message) warnings[#warnings + 1] = message end
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.queue = {}
-for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/sess" })
-  submit()
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "/sess")
-  assert(#state.queue == 0)
+for _, prompt in ipairs({ "/sess", "/spawn", "/unrecognized extra text", "/workspace/example",
+  "/workspace/", "/workspace.name/README", "/sessions-extra" }) do
+  for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
+    local warning_count = #warnings
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })
+    submit()
+    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == prompt)
+    assert(#state.queue == 0)
+    assert(#warnings == warning_count + 1 and warnings[#warnings]:find(prompt:match("^%S+"), 1, true),
+      "rejected slash commands must explain why the draft was retained")
+  end
 end
+warnings = {}
 local client = require("forge.client")
-local notifications = require("forge.infra.notifications")
 require("forge.views.harness.prompt_history").record = function() end
-local requests, warnings = {}, {}
+local requests = {}
 client.request_for = function(_, method, params, callback)
   requests[#requests + 1] = { method = method, params = params }
   callback({})
 end
-notifications.warn = function(message) warnings[#warnings + 1] = message end
 controller.refresh_winbar = function() end
 state.session = { id = "plan-mode", mode = "write", execution_mode = "write" }
 state.transcript_win, state.composer_win = vim.api.nvim_get_current_win(), vim.api.nvim_get_current_win()
@@ -54,6 +66,22 @@ for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
     assert(#state.queue == 0, "service-tier command was queued as a prompt")
   end
 end
+state.busy = true
+controller.drain = function() end
+for _, prompt in ipairs({ "/workspace/example.png", "  /workspace/example.PNG\n[Image #1]", "/plan/design.md",
+  "/workspace/report.pdf", "/workspace/archive.tar.gz", "/workspace/source.rs explain this", "/sess.png",
+  "/workspace/Screen shot 2026-10-19.png\n[Image #1]", "/workspace/example.custom",
+  "C:\\workspace\\example.png", "\\\\server\\share\\example.png" }) do
+  assert(source.accepts_prompt(prompt) and source.queues_execution(prompt), "ordinary text was treated as a command")
+  for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(prompt, "\n", { plain = true }))
+    submit()
+    assert(#state.queue == 1 and state.queue[1].text == vim.trim(prompt), "ordinary prompt did not enter the queue")
+    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
+    state.queue = {}
+  end
+end
+assert(#warnings == 0, "ordinary prompts emitted an admission warning")
 vim.cmd("new")
 vim.api.nvim_set_current_buf(state.composer_buf)
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/x" })

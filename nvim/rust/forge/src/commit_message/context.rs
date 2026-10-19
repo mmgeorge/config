@@ -72,10 +72,40 @@ pub async fn collect(
             .value
             .path
     };
+    let lfs_paths = {
+        let root = repository
+            .identity
+            .worktree_root
+            .clone()
+            .context("generation requires a worktree")?;
+        let mut candidates = std::collections::BTreeSet::new();
+        for record in &paths {
+            candidates.insert(forge_git::checkpoint::path_key(record.path.raw()));
+            if let PathState::Tracked {
+                relocation: Some(relocation),
+                ..
+            } = &record.state
+            {
+                candidates.insert(forge_git::checkpoint::path_key(relocation.origin.raw()));
+            }
+        }
+        store
+            .read(Arc::clone(&repository), 0, move |_local, cancellation| {
+                cancellation.check()?;
+                let excluded = forge_git::checkpoint::lfs_paths(&root, &candidates)?;
+                cancellation.check()?;
+                Ok(excluded)
+            })
+            .await?
+            .value
+    };
     let mut files = Vec::new();
     let mut source_requests = 0;
     let mut diff_pairs = 0;
     for record in &paths {
+        if lfs_paths.contains(&forge_git::checkpoint::path_key(record.path.raw())) {
+            continue;
+        }
         if request
             .ignored_paths
             .iter()
@@ -96,6 +126,11 @@ pub async fn collect(
             PathState::Conflict { .. } => bail!("generation requires resolved index conflicts"),
             _ => continue,
         };
+        if relocation.is_some_and(|relocation| {
+            lfs_paths.contains(&forge_git::checkpoint::path_key(relocation.origin.raw()))
+        }) {
+            continue;
+        }
         ensure!(
             record.submodule.is_none(),
             "generation cannot describe a changed submodule as a text diff"
@@ -343,6 +378,109 @@ mod tests {
             output.status.success(),
             "{}",
             String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[tokio::test]
+    async fn lfs_files_are_excluded_before_content_acquisition_in_every_comparison() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path();
+        git(root, &["init", "--quiet"]);
+        git(root, &["config", "user.name", "Forge Test"]);
+        git(root, &["config", "user.email", "forge@example.invalid"]);
+        git(root, &["config", "core.autocrlf", "false"]);
+        std::fs::write(root.join(".gitattributes"), "*.asset filter=lfs\n").unwrap();
+        for path in ["tracked.asset", "deleted.asset", "renamed.asset"] {
+            std::fs::write(root.join(path), "original filtered content\n").unwrap();
+        }
+        std::fs::write(root.join("source.txt"), "before\n").unwrap();
+        let add = [
+            "-c",
+            "filter.lfs.process=",
+            "-c",
+            "filter.lfs.clean=",
+            "-c",
+            "filter.lfs.required=false",
+            "add",
+            ".",
+        ];
+        git(root, &add);
+        git(root, &["commit", "--quiet", "-m", "initial"]);
+        let blocked = "echo invoked > filter-invoked; exit 9";
+        git(root, &["config", "filter.lfs.process", ""]);
+        git(root, &["config", "filter.lfs.clean", blocked]);
+        git(root, &["config", "filter.lfs.required", "true"]);
+        std::fs::write(root.join("tracked.asset"), "changed filtered content\n").unwrap();
+        std::fs::write(root.join("untracked.asset"), "new filtered content\n").unwrap();
+        std::fs::remove_file(root.join("deleted.asset")).unwrap();
+        git(root, &["mv", "renamed.asset", "replacement.txt"]);
+        std::fs::write(root.join("source.txt"), "after\n").unwrap();
+        let store = RepositoryStore::default();
+        let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
+        let syntax = SyntaxEngine::new(diff.analysis_pool());
+        let mut request = GenerationRequest {
+            operation: "generate".into(),
+            workspace: root.to_string_lossy().into_owned(),
+            comparison: Comparison::Head,
+            base: None,
+            head: None,
+            max_bytes: None,
+            ignored_paths: vec![],
+            generation: None,
+            input: None,
+        };
+        let context = collect(&store, &diff, &syntax, &request).await.unwrap();
+        let prompt = context.prompt.unwrap();
+        assert!(
+            prompt.contains("- before") && prompt.contains("+ after"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains(".asset"), "{prompt}");
+        assert!(!prompt.contains("filtered content"), "{prompt}");
+        assert_eq!(context.source_requests, 2);
+        assert_eq!(context.diff_pairs, 1);
+        assert!(!root.join("filter-invoked").exists());
+
+        git(root, &add);
+        std::fs::remove_file(root.join("tracked.asset")).unwrap();
+        std::fs::remove_file(root.join("untracked.asset")).unwrap();
+        for comparison in [
+            Comparison::Head,
+            Comparison::Staged,
+            Comparison::LatestCommit,
+            Comparison::PullRequest,
+        ] {
+            if comparison == Comparison::LatestCommit {
+                git(root, &["commit", "--quiet", "-m", "changed"]);
+            }
+            if comparison == Comparison::PullRequest {
+                request.base = Some("HEAD^".into());
+                request.head = Some("HEAD".into());
+            }
+            request.comparison = comparison;
+            let context = collect(&store, &diff, &syntax, &request).await.unwrap();
+            let prompt = context.prompt.unwrap();
+            assert!(
+                prompt.contains("- before") && prompt.contains("+ after"),
+                "{prompt}"
+            );
+            assert!(
+                !prompt.contains(".asset") && !prompt.contains("replacement.txt"),
+                "{prompt}"
+            );
+            assert!(!prompt.contains("filtered content"), "{prompt}");
+            assert_eq!(context.source_requests, 2);
+            assert_eq!(context.diff_pairs, 1);
+            assert!(!root.join("filter-invoked").exists());
+        }
+        std::fs::write(root.join("tracked.asset"), "only LFS changes remain\n").unwrap();
+        request.comparison = Comparison::Head;
+        assert!(
+            collect(&store, &diff, &syntax, &request)
+                .await
+                .unwrap()
+                .prompt
+                .is_none()
         );
     }
 

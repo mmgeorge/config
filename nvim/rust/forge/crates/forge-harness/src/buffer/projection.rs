@@ -943,11 +943,7 @@ impl TimelineRenderer<'_> {
                     turn.messages().iter().rev().find(|message| {
                         !message.text().is_empty()
                             && message.delivery() != crate::turn::MessageDelivery::Final
-                            && matches!(
-                                message.kind(),
-                                crate::turn::MessageKind::Assistant
-                                    | crate::turn::MessageKind::ReasoningSummary
-                            )
+                            && message.kind() == crate::turn::MessageKind::Assistant
                     })
                 }) {
                     self.markdown(
@@ -1536,7 +1532,9 @@ impl TimelineRenderer<'_> {
                     .iter()
                     .find(|message| message.id() == id)
                     .context("timeline content references a missing message")?;
-                if message.text().trim().is_empty() {
+                if message.kind() != crate::turn::MessageKind::Assistant
+                    || message.text().trim().is_empty()
+                {
                     continue;
                 }
             }
@@ -5093,10 +5091,12 @@ mod tests {
             event.text = None;
             exchange.observe_turn(&event, ordinal * 10)?;
             event.turn_boundary = None;
-            event.kind = "reasoning".into();
-            event.text = Some(" \n ".into());
-            event.data = json!({"message_id":format!("thought-{ordinal}")});
-            exchange.observe_turn(&event, ordinal * 10 + 1)?;
+            for kind in ["reasoning", "reasoning_summary"] {
+                event.kind = kind.into();
+                event.text = Some("Thoughts must not become commentary".into());
+                event.data = json!({"message_id":format!("{kind}-{ordinal}")});
+                exchange.observe_turn(&event, ordinal * 10 + 1)?;
+            }
             event.kind = "tool".into();
             event.text = None;
             event.data = Value::Null;
@@ -5111,6 +5111,9 @@ mod tests {
             });
             exchange.observe_turn(&event, ordinal * 10 + 2)?;
             let projected = render(&exchange)?;
+            assert!(!projected.entry.block.iter().any(|block| {
+                block.text.wire_rows().iter().any(|row| row.contains("Thoughts must not"))
+            }));
             let groups = projected
                 .entry
                 .block

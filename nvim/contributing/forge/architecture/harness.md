@@ -130,7 +130,9 @@ begins, which folds that response even after an explicit expansion. Older explic
 remain stable. Folded messages show their first three display rows with a right-pointing
 caret, while expanded messages retain their complete Markdown, links, and text. The canonical
 block keeps the full message and the preview boundary. Resize recomputes that boundary without
-changing the expansion choice. Commentary and reasoning keep their existing presentation.
+changing the expansion choice. Assistant commentary retains its separate presentation.
+Reasoning messages and summaries remain in durable turn history but do not render as
+timeline commentary, including in active child previews and reopened history.
 
 Tool activation binds to the captured document, view, block, and target identity. A later
 transcript revision can still activate that same retained tool target, so streaming output
@@ -317,6 +319,12 @@ and restores the unsent draft with its attachments. Alt-Up and Alt-Down remain a
 Snapshot refreshes and history-record responses preserve the selected occurrence and unsent
 draft while adopting new history entries. Each composer owns its history-edit listener.
 The shared history store retains all submitted entries across sessions and host restarts.
+
+Command admission and queue classification share the same leading-token parser in
+`completion/command_source.lua`. Unknown and incomplete slash commands retain the
+draft and notify. A filename extension on the leading token or the complete first
+line identifies a path prompt instead. Exact supported commands take priority over
+this extension check. Submission, queueing, and queued editing share that classification.
 
 Request admission resolves only the explicit attachment list. `BackendInput` carries
 the resolved objects through provider requests and user steering. Provider adapters
@@ -1755,8 +1763,10 @@ Verified, and Resolved. Idle remains the primary label when only independent che
 Active status headings show the phase and elapsed time. The portable
 `status_thoughts` preference controls whether the latest reasoning preview appears
 below independent check progress in italics, aligned with the phase label and
-wrapped within the content width. It defaults to false and leaves timeline message retention and
-rendering unchanged. A presentation-only `session.configure` request persists the
+wrapped within the content width. It defaults to false. Reasoning messages never render
+as timeline commentary regardless of this preference. Copilot's concise reasoning deltas
+and completed snapshots normalize as readable reasoning summaries for this status path.
+A presentation-only `session.configure` request persists the
 preference and updates the observer and status entry without acquiring the provider
 execution owner or interrupting its response. The preview renders at most two
 rows of the complete normalized summary without retaining its emphasis markers. Execution comparisons may

@@ -192,8 +192,12 @@ the complete event has been assembled and validated.
 commit-message regeneration. HEAD includes tracked worktree changes and untracked files,
 staged generation compares the index with HEAD, and amend generation reads the latest
 commit's immutable old and new objects. All three routes use the same native diff and
-excerpt formatter. Ignored paths remain excluded. Binary and unsupported sources retain
-an inventory entry without a text excerpt.
+excerpt formatter. Ignored paths remain excluded. The collector reuses the checkpoint
+attribute resolver to exclude `filter=lfs` paths before acquiring content, including
+untracked files and either endpoint of a rename. LFS files appear in neither the file
+inventory nor text excerpts across HEAD, staged, amend, and pull-request comparisons.
+The resolver does not open asset contents or execute filters. Other binary and
+unsupported sources retain an inventory entry without a text excerpt.
 
 The Lua generation owner maintains a persistent spinner with the resolved model,
 reasoning effort, elapsed time, and provider-supplied readable reasoning summaries.

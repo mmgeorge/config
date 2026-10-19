@@ -67,22 +67,36 @@ local command_list = {
 }
 
 ---@param text string
----@return boolean
-function CommandSource.accepts_prompt(text)
+---@return string?
+local function command_token(text)
   local token = text:match("^%s*(%S+)")
-  if not token or token:sub(1, 1) ~= "/" then return true end
+  if not token or token:sub(1, 1) ~= "/" then return nil end
+  for _, command in ipairs(command_list) do
+    if command.label:match("^(%S+)") == token then return token end
+  end
+  local first_line = vim.trim(text:match("^%s*([^\r\n]+)") or "")
+  if token:match("%.[%w]+$") or first_line:match("%.[%w]+$") then return nil end
+  return token
+end
+
+---@param text string
+---@return boolean accepted
+---@return string? failure
+function CommandSource.accepts_prompt(text)
+  local token = command_token(text)
+  if not token then return true end
   for _, command in ipairs(command_list) do
     if command.label:match("^(%S+)") == token then return true end
   end
-  return false
+  return false, "Unknown or incomplete Harness command: " .. token .. ". Complete the command or start the prompt with text."
 end
 
 ---@param text string
 ---@return boolean
 function CommandSource.queues_execution(text)
-  local token = text:match("^%s*(%S+)")
+  local token = command_token(text)
   if token == "/model" then return text:match("^%s*/model%s+%S+%s+%S+%s+%S") ~= nil end
-  return not token or token:sub(1, 1) ~= "/" or token == "/compact"
+  return not token or token == "/compact"
 end
 
 ---@return ForgeHarnessCommandSource

@@ -32,6 +32,11 @@ selected model. A persistent notification shows an animated spinner, model name,
 and elapsed seconds until generation completes. Readable provider reasoning summaries appear
 when available. Failures preserve the existing draft, including edits made while waiting.
 
+Git LFS files are excluded from both the changed-file inventory and compact diff before
+Forge reads their content. This applies to automatic drafts, staged regeneration, amend
+generation, and pull-request descriptions, including untracked files and renamed LFS
+paths. LFS-only changes produce no generation request.
+
 Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
 default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
 provides the **Background** row in **Models** for model and thinking choices, and
@@ -116,7 +121,8 @@ The live status line shows the current phase, elapsed time, and interrupt key.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
 italics, aligned with the phase label and wrapped into at most two preview rows. The option
 defaults to Off, persists across sessions, and applies without interrupting an
-active response. Thought messages remain available in the timeline either way.
+active response. Thoughts never appear as commentary in the timeline. Only the latest
+readable reasoning summary appears in status when this option is On.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.
@@ -133,6 +139,12 @@ Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` an
 draft and attachments. Inside a multiline draft, the arrows move between lines.
 `Alt-Up` and `Alt-Down` also browse history. Timeline folding, navigation, help,
 and close shortcuts remain in the upper pane.
+
+Unknown or unfinished slash commands keep the draft and show a warning. A leading
+path with a filename extension, such as `/workspace/screenshot.png`, submits and
+queues as ordinary text. Extension detection also accepts spaces in a path on the
+first line and attachments on later lines. Supported commands still take priority,
+so `/plan inspect screenshot.png` starts planning rather than sending an ordinary prompt.
 
 `M-s` edits the newest queued prompt in place. Repeating it moves backward through
 the queue, and `M-t` moves forward while editing. Navigation preserves message order

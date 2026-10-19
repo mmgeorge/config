@@ -1504,12 +1504,7 @@ fn apply_projection<'operation>(
                 message,
                 ..
             } => {
-                if !matches!(
-                    message.kind(),
-                    crate::turn::MessageKind::Assistant
-                        | crate::turn::MessageKind::Reasoning
-                        | crate::turn::MessageKind::ReasoningSummary
-                ) {
+                if message.kind() != crate::turn::MessageKind::Assistant {
                     continue;
                 }
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
@@ -2879,7 +2874,7 @@ mod tests {
     }
 
     #[test]
-    fn streamed_thoughts_remain_in_the_timeline_when_status_thoughts_are_hidden() -> Result<()> {
+    fn streamed_thoughts_appear_only_in_status_when_enabled() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress};
         for status_thoughts in [false, true] {
             let mut active = serde_json::to_value(interaction_entry("active"))?;
@@ -2946,7 +2941,7 @@ mod tests {
             assert_eq!(patch.operation.len(), if status_thoughts { 2 } else { 1 });
             let snapshot = owner.snapshot(&document)?;
             assert!(
-                snapshot
+                !snapshot
                     .block
                     .iter()
                     .filter(|block| block.id.0 != "session:status")
@@ -2992,7 +2987,7 @@ mod tests {
                 !status_thoughts
             );
             assert!(
-                toggled
+                !toggled
                     .block
                     .iter()
                     .filter(|block| block.id.0 != "session:status")

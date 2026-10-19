@@ -1677,7 +1677,8 @@ function M.submit()
     require("forge.views.harness.capability_picker").open(picker_host(state))
     return
   end
-  if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
+  local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)
+  if not accepted then notifications.warn(admission_failure, "ForgeHarness") return end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
     if text == "/task" then task_control.open(state, picker_host(state), M.task_transition)
@@ -2116,7 +2117,8 @@ function M.queue_submit()
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
-  if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
+  local accepted, admission_failure = require("forge.views.harness.completion.command_source").accepts_prompt(text)
+  if not accepted then notifications.warn(admission_failure, "ForgeHarness") return end
   if not require("forge.views.harness.completion.command_source").queues_execution(text) then
     M.submit()
     return

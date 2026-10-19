@@ -205,7 +205,7 @@ impl CopilotEventDecoder {
             }
             "assistant.reasoning_delta" => {
                 self.publish_text(
-                    "reasoning",
+                    "reasoning_summary",
                     string_field(&provider_event.data, &["deltaContent", "delta"]),
                     provider_event,
                     output,
@@ -225,7 +225,7 @@ impl CopilotEventDecoder {
             }
             "assistant.reasoning" => {
                 self.publish_text(
-                    "reasoning",
+                    "reasoning_summary",
                     string_field(&provider_event.data, &["content", "text"]),
                     provider_event,
                     output,
@@ -591,7 +591,7 @@ async fn publish(
     if let Some(event_sink) = event_sink {
         let _ = event_sink.send_wait(event.clone()).await;
     }
-    if matches!(event.kind.as_str(), "reasoning" | "assistant_message")
+    if matches!(event.kind.as_str(), "reasoning_summary" | "assistant_message")
         && let Some(previous) = output.event.last_mut()
         && previous.kind == event.kind
         && previous.address == event.address
@@ -919,6 +919,63 @@ mod test {
 
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn concise_reasoning_updates_status_without_becoming_assistant_commentary()
+    -> anyhow::Result<()> {
+        let decoder = CopilotEventDecoder::default();
+        let mut output = BackendOutput {
+            backend_session_id: Some("session".into()),
+            ..Default::default()
+        };
+        for provider_event in [
+            event("assistant.turn_start", json!({"turnId":"turn"})),
+            event(
+                "assistant.reasoning_delta",
+                json!({"reasoningId":"thought","deltaContent":"Simplifying "}),
+            ),
+            event(
+                "assistant.reasoning_delta",
+                json!({"reasoningId":"thought","deltaContent":"note handling"}),
+            ),
+            event(
+                "assistant.reasoning",
+                json!({"reasoningId":"thought","content":"Testing Git filter behaviors"}),
+            ),
+            event(
+                "assistant.message",
+                json!({"messageId":"commentary","content":"The file uses Git LFS.",
+                    "toolRequests":[{"toolCallId":"inspect","name":"read"}]}),
+            ),
+        ] {
+            decoder.decode(&provider_event, &mut output, None).await;
+        }
+        let thoughts = output
+            .event
+            .iter()
+            .filter(|event| event.kind == "reasoning_summary")
+            .collect::<Vec<_>>();
+        assert_eq!(thoughts.len(), 1);
+        assert_eq!(thoughts[0].message_id(), Some("thought"));
+        assert!(thoughts[0].message_snapshot());
+        assert_eq!(thoughts[0].text.as_deref(), Some("Testing Git filter behaviors"));
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+            "id":"exchange","session_id":"session","agent_id":"primary","ordinal":1,
+            "prompt":"Inspect filters","kind":"chat","state":"running",
+            "created_at_ms":0,"attributed_matches_checkpoint":false,"node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        for event in &output.event {
+            exchange.observe_turn(event, 1)?;
+        }
+        assert_eq!(exchange.latest_reasoning_summary(), Some("Testing Git filter behaviors"));
+        let messages = exchange.turn[0].messages();
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].kind(), crate::turn::MessageKind::ReasoningSummary);
+        assert_eq!(messages[1].kind(), crate::turn::MessageKind::Assistant);
+        assert_eq!(messages[1].delivery(), crate::turn::MessageDelivery::Commentary);
+        Ok(())
+    }
 
     #[tokio::test]
     async fn native_patch_results_render_as_changed_files_after_streaming_and_reload()
