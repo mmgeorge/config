@@ -61,6 +61,7 @@ impl HarnessBroker {
         }
         let mut admission = ExchangeAdmission::chat(prompt);
         admission.plan_id = Some(plan_id);
+        self.observer.set_check_editing(true)?;
         self.check_setup = true;
         let result = self.run_interaction(format!(
             "The user requested a plan. Project checks are missing or invalid, so configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{}\n\n{}",
@@ -222,12 +223,13 @@ impl HarnessBroker {
                             .any(|execution| execution.state == PlanExecutionState::Active),
                     "checks cannot race active plan execution or writing agents"
                 );
-                let run = self.check_runner.prepare_request(
+                let mut run = self.check_runner.prepare_request(
                     serde_json::from_value(params)?,
                     task_id,
                     self.session.shell,
                     "User requested".into(),
                 )?;
+                run.exchange_id = self.store.list_exchange(&self.session.id)?.last().map(|exchange| exchange.id.clone());
                 json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
             }
             HarnessMethod::ChecksStatus => {
@@ -285,6 +287,7 @@ impl HarnessBroker {
             .map(|document| serde_json::to_string(&document))
             .transpose()?
             .unwrap_or_else(|| "No active plan.".into());
+        self.observer.set_check_editing(true)?;
         self.check_setup = true;
         let result = self.run_interaction(format!("Configure project checks through checks_configure. Focus: {selected}.\n\nActive proposed plan (read-only context):\n{plan}\n\n{prompt}"), PromptMode::Chat, Some(admission)).await;
         self.check_setup = false;

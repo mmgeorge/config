@@ -56,14 +56,13 @@ end
 
 ---@param state ForgeHarnessPresentationState
 ---@param host table
----@param setup fun(check_id: string?)
-function Checks.open(state, host, setup)
+function Checks.open(state, host)
   if not state.session then return end
   local session_id = state.session.id
   ---@type ForgeCheckCatalog
   local catalog = { configured = false, revision = "", overrides = { enabled = vim.empty_dict(), scopes = vim.empty_dict() }, history = {} }
   local selected_id
-  local active_field = "enabled"
+  local active_field = "scope"
   local expanded = {}
   local busy = false
   local closed = false
@@ -139,30 +138,21 @@ function Checks.open(state, host, setup)
   local function latest(check)
     for index = #(catalog.history or {}), 1, -1 do
       local matches = {}
-      local duration_ms = 0
       local priority = { configuration_error = 8, failed = 7, blocked = 6, interrupted = 5, running = 4, pending = 3, skipped = 2, passed = 1 }
       local result
       for _, command in ipairs(catalog.history[index].commands or {}) do
         if present(command.context) and command.context.definition_id == check.id then
           matches[#matches + 1] = command
-          local completed = command.completed_at_ms
-          if type(completed) ~= "number" and command.state == "running" then
-            local seconds, microseconds = vim.uv.gettimeofday()
-            completed = seconds * 1000 + microseconds / 1000
-          end
-          if type(command.started_at_ms) == "number" and type(completed) == "number" then
-            duration_ms = duration_ms + completed - command.started_at_ms
-          end
           if not result or (priority[command.state] or 0) > (priority[result.state] or 0) then result = command end
         end
       end
       if result then
         result = vim.deepcopy(result)
         result.expanded = matches
-        return result, duration_ms > 0 and string.format("%.1fs", duration_ms / 1000) or ""
+        return result
       end
     end
-    return nil, ""
+    return nil
   end
 
   local function details(check)
@@ -203,13 +193,13 @@ function Checks.open(state, host, setup)
     return result
   end
 
-  local function change(direction)
+  local function change(field_name, direction)
     local check = selected()
     if not check then return end
     local enabled, scope, automatic = effective(check)
     local overrides = vim.deepcopy(catalog.overrides)
-    if active_field == "enabled" then overrides.enabled[check.id] = not enabled
-    elseif active_field == "auto" then
+    if field_name == "enabled" then overrides.enabled[check.id] = not enabled
+    elseif field_name == "auto" then
       overrides.auto = overrides.auto or {}
       overrides.auto[check.id] = not automatic
     else
@@ -222,63 +212,19 @@ function Checks.open(state, host, setup)
     request("checks.override", overrides, function(result) catalog = result picker.update(build_spec()) end)
   end
 
-  local function run(check, selection, all)
-    local params = { ids = check and { check.id } or {}, selections = vim.empty_dict() }
-    if all then params.all = true end
-    if selection then params.selections[check.id] = selection end
-    request("checks.run", params)
-  end
-
-  local function select_scope(kind)
-    local check = selected()
-    if not check then return end
-    if not present(check[kind]) then notifications.error("This check does not support " .. kind .. ". Fix its definition with setup.", "Harness checks") return end
-    closed = true
-    picker.open({ owner = owner .. "-selection", host = host,
-      page_list = {{ id = "selection", title = "Run " .. check.name, allow_input = true,
-        option_list = {{ id = "selection", label = kind == "files" and "Files: one project-relative path per line" or "Cases: file:name, one per line", input_kind = "other" }} }},
-      on_confirm = function(result)
-        local selection = { kind = kind, [kind] = {} }
-        for line in (result.text or ""):gmatch("[^\r\n]+") do
-          if kind == "files" then selection.files[#selection.files + 1] = vim.trim(line)
-          else
-            local path, name = line:match("^([^:]+):(.+)$")
-            if not path then notifications.error("Use project-relative file:name for each case", "Harness checks") return false end
-            selection.cases[#selection.cases + 1] = { file = vim.trim(path), name = vim.trim(name) }
-          end
-        end
-        client.request_for(session_id, "checks.run", { ids = { check.id }, selections = { [check.id] = selection } }, function(_, failure)
-          if failure then notifications.error(failure, "Harness checks") end
-          Checks.open(state, host, setup)
-        end)
-      end,
-    })
-  end
-
   build_spec = function()
-    local unavailable = load_error or (not present(catalog.snapshot) and (catalog.error or "Configure checks first"))
-    local rows = {
-      { id = "setup", label = "Setup / edit with agent", wrap_label = true },
-      { id = "run", label = "Run applicable checks", wrap_label = true, disabled_reason = unavailable },
-      { id = "run-all", label = "Run all enabled checks (ignore triggers)", wrap_label = true, disabled_reason = unavailable },
-      { id = "reset", label = "Reset task overrides", wrap_label = true, disabled_reason = unavailable },
-      { id = "save", label = "Save as project defaults", wrap_label = true, disabled_reason = unavailable },
-    }
+    local rows = {}
     if type(catalog.active_run) == "string" then rows[#rows + 1] = { id = "cancel", label = "Cancel active checks", wrap_label = true } end
     if load_error or (catalog.configured and type(catalog.error) == "string") then
       rows[#rows + 1] = { id = "error", label = "Fix checks: " .. (load_error or catalog.error), wrap_label = true }
     end
-    for index, check in ipairs(definitions()) do
+    for _, check in ipairs(definitions()) do
       local enabled, scope, automatic = effective(check)
-      local command, duration = latest(check)
-      local result = command and ({ pending = "Pending", running = "Running", passed = "Passed", failed = "Failed", blocked = "Blocked", interrupted = "Interrupted", skipped = "Not run", configuration_error = "Configuration error" })[command.state] or "Not run"
-      if command and present(command.reused_from) then result = "Reused: " .. result end
       local focus = selected_id == check.id and active_field
       rows[#rows + 1] = { id = check.id, label = check.name, value = check,
-        columns = { string.format("%d. %s", index, check.name), check.category,
-          field.render(enabled and "Enabled" or "Disabled", focus == "enabled"), field.render(scope_label(scope), focus == "scope"),
-          field.render(automatic and "Yes" or "No", focus == "auto"),
-          result, duration, check.area },
+        columns = { (enabled and "● " or "○ ") .. check.name, check.category,
+          field.render(scope_label(scope), focus == "scope"),
+          field.render(automatic and "Yes" or "No", focus == "auto"), check.area },
         child_line_list = expanded[check.id] and details(check) or nil }
     end
     local history = {}
@@ -293,19 +239,14 @@ function Checks.open(state, host, setup)
     return { owner = owner, host = host,
       page_list = {
         { id = "checks", title = "Project checks · " .. (load_error and "Unavailable" or catalog.configured and (present(catalog.snapshot) and "Configured" or "Configuration error") or "Unconfigured"),
-          subtitle = selected() and (selected().area .. " · " .. selected().name .. "\n" .. applicability(selected()))
-            or (load_error and "Check configuration could not be loaded. Fix the error below, then refresh."
-              or catalog.configured and "Automatic checks follow task changes. Select a check to inspect its applicability."
-              or "No checks configured. Use Setup / edit with agent to choose coverage."),
-          column_headers = { "Check", "Category", "State", "Scope", "Auto", "Result", "Duration", "Area" }, option_list = rows,
-          footer = "↑↓ select ←→ value Tab field [] pages ↵ run i info e edit f/T scope q close",
+          column_headers = { "Check", "Category", "Scope", "Auto", "Area" }, option_list = rows,
+          empty_text = "No checks configured. Use /checks setup.",
+          footer = "↑↓ select  Space enable/disable  Tab field  ←→ value  [] pages  ↵ run  i details  q close",
           action_list = {
-            { id = "field", key = "<Tab>", callback = function() active_field = ({ enabled = "scope", scope = "auto", auto = "enabled" })[active_field] picker.update(build_spec()) end },
-            { id = "previous", command = "previous_value", callback = function() change(-1) end },
-            { id = "next", command = "next_value", callback = function() change(1) end },
-            { id = "edit", key = "e", callback = function() local check = selected() setup(check and check.id) end },
-            { id = "files", key = "f", callback = function() select_scope("files") end },
-            { id = "cases", key = "T", callback = function() select_scope("cases") end },
+            { id = "toggle", key = "<Space>", callback = function() change("enabled", 1) end },
+            { id = "field", key = "<Tab>", callback = function() active_field = active_field == "scope" and "auto" or "scope" picker.update(build_spec()) end },
+            { id = "previous", command = "previous_value", callback = function() change(active_field, -1) end },
+            { id = "next", command = "next_value", callback = function() change(active_field, 1) end },
           } },
         { id = "history", title = "Check history", option_list = history, empty_text = "No check runs yet.", footer = "[ ] pages  ↑↓ select  i details  q close" },
       },
@@ -319,13 +260,8 @@ function Checks.open(state, host, setup)
       on_cancel = function() closed = true stop_poll() end,
       on_confirm = function(result)
         local option = result.option
-        if option.id == "setup" then setup() return end
-        if option.id == "run" then run() return false end
-        if option.id == "run-all" then run(nil, nil, true) return false end
-        if option.id == "reset" then request("checks.override", { enabled = vim.empty_dict(), scopes = vim.empty_dict() }) return false end
-        if option.id == "save" then request("checks.save_defaults", {}) return false end
         if option.id == "cancel" then request("checks.cancel", { run_id = catalog.active_run }) return false end
-        if option.value and option.value.category then run(option.value) return false end
+        if option.value and option.value.category then request("checks.run", { ids = { option.id } }) return false end
         return false
       end,
       action_list = {

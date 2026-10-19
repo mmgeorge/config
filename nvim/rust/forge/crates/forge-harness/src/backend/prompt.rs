@@ -61,8 +61,14 @@ impl BackendRequest {
         } else {
             ""
         };
+        let check_editing = if self.control_context.as_ref().and_then(|context| context.checks.as_ref())
+            .is_some_and(|scope| scope.editing_enabled()) {
+            "enabled. Use checks_configure for authorized edits. Guided setup still requires answers before saving."
+        } else {
+            "disabled. The user can enable it with /checks setup on or start guided /checks setup."
+        };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. All automated validation must use checks_run and checks_status outside plan execution. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must ask the parent to schedule validation.\n{question}{lsp}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call checks_run for earlier feedback. Read recorded results through checks_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }

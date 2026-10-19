@@ -27,6 +27,10 @@ pub struct PortableSettings {
     pub access: Option<crate::session::AccessPolicy>,
     /// Selects the check shell used by Harness execution.
     pub shell: Option<crate::session::CheckShell>,
+    /// Automatic validation boundary for the editor's work queue.
+    pub check_timing: Option<crate::checks::CheckTiming>,
+    /// Allows the root agent to edit project checks in this conversation.
+    pub check_editing: Option<bool>,
     /// Selects the ordinary writable approval mode.
     pub default_write_permission: Option<crate::session::PermissionMode>,
     /// Selects the permission used when planning.
@@ -58,6 +62,8 @@ impl PortableSettings {
         if overriding.auto_compaction.is_some() { self.auto_compaction = overriding.auto_compaction; }
         if overriding.access.is_some() { self.access = overriding.access; }
         if overriding.shell.is_some() { self.shell = overriding.shell; }
+        if overriding.check_timing.is_some() { self.check_timing = overriding.check_timing; }
+        if overriding.check_editing.is_some() { self.check_editing = overriding.check_editing; }
         if overriding.default_write_permission.is_some() { self.default_write_permission = overriding.default_write_permission; }
         if overriding.plan_permission.is_some() { self.plan_permission = overriding.plan_permission; }
         if overriding.plan_compact.is_some() { self.plan_compact = overriding.plan_compact; }

@@ -15,10 +15,16 @@ pub enum HarnessMethod {
     ChecksList,
     #[serde(rename = "checks.setup")]
     ChecksSetup,
+    #[serde(rename = "checks.editing")]
+    ChecksEditing,
     #[serde(rename = "checks.override")]
     ChecksOverride,
     #[serde(rename = "checks.run")]
     ChecksRun,
+    #[serde(rename = "checks.complete")]
+    ChecksComplete,
+    #[serde(rename = "queue.update")]
+    QueueUpdate,
     #[serde(rename = "checks.status")]
     ChecksStatus,
     #[serde(rename = "checks.cancel")]
@@ -213,7 +219,7 @@ impl HarnessMethod {
     /// Identifies explicit workflow operations whose outcome may settle the selected task.
     pub fn settles_task(self) -> bool {
         matches!(self,
-            Self::TaskTransition | Self::PromptSubmit | Self::ExchangeResume
+            Self::TaskTransition | Self::PromptSubmit | Self::ExchangeResume | Self::ChecksComplete
             | Self::PlanAccept | Self::PlanAcceptanceBegin | Self::PlanRequestChanges
             | Self::QuestionAnswer | Self::QuestionSkip | Self::QuestionAsk | Self::QuestionContinue
             | Self::ApprovalContinue | Self::GoalSet | Self::GoalPause | Self::GoalResume
@@ -225,6 +231,7 @@ impl HarnessMethod {
         matches!(
             self,
             Self::PromptSubmit
+                | Self::ChecksComplete
                 | Self::ChecksSetup
                 | Self::AgentStart
                 | Self::ExchangeResume

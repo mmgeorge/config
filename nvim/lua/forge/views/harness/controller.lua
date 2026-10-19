@@ -20,6 +20,7 @@ local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
 local task_control = require("forge.views.harness.task")
 local queue_editor = require("forge.views.harness.queue_editor")
+local check_queue = require("forge.views.harness.check_queue")
 local attachment = require("forge.views.harness.attachment")
 local prompt_submission = require("forge.views.harness.prompt_submission")
 local tabline = require("forge.views.harness.tabline")
@@ -243,6 +244,10 @@ local function status_text()
   if (active_session.access or {}).sandbox ~= false then
     segment_list[#segment_list + 1] = { text = " • sandbox", group = "ForgeStatusLabel" }
   end
+  segment_list[#segment_list + 1] = {
+    text = " • check editing " .. (state.check_editing and "on" or "off"),
+    group = "ForgeStatusLabel",
+  }
   local selected_run = selected_agent_run(state)
   segment_list[#segment_list + 1] = {
     text = selected_run and (" • " .. (selected_run.nickname or selected_run.definition)) or " • Main",
@@ -329,6 +334,7 @@ end
 
 function M.render()
   local state = harness_state()
+  if not state.host_error then check_queue.publish(state, function() vim.schedule(M.drain) end) end
   render_status_hint(state)
   if state.host_error then M.refresh_winbar() return end
   if state.switching_backend then M.refresh_winbar() return end
@@ -1054,6 +1060,7 @@ end
 
 function M.drain()
   local state = harness_state()
+  if not state.host_error and check_queue.publish(state, function() vim.schedule(M.drain) end) then return end
   if state.check_interrupt_pending or state.checks_running then return end
   if state.host_error or state.execution_notice or state.task_operation or state.sync_error or state.connection_error then return end
   if state.aborting_plan then return end
@@ -1111,7 +1118,16 @@ function M.drain()
     if text == "/compact" then M.compact() else begin_request(text, false, type(entry) == "table" and entry.attachments or {}) end
     return
   end
-
+  if not text and state.checks_deferred then
+    local session_id, epoch = state.session.id, state.runtime_epoch
+    set_busy(true)
+    client.request_for(session_id, "checks.complete", {}, function(_, failure, detail)
+      if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
+      if finish_execution(failure, detail) then return end
+      if failure then notifications.error(failure, "Harness checks") end
+      synchronize_state(M.drain)
+    end)
+  end
 end
 
 ---@param name string
@@ -1740,10 +1756,22 @@ function M.submit()
   end
   if text == "/checks" then
     set_composer_text(state.composer_buf, "")
-    require("forge.views.harness.checks").open(state, picker_host(state), function(check_id)
-      require("forge.views.picker").close()
-      set_composer_text(state.composer_buf, "/checks setup" .. (check_id and " " .. check_id or ""))
-      M.submit()
+    require("forge.views.harness.checks").open(state, picker_host(state))
+    return
+  end
+  local check_editing = text:match("^/checks setup%s+(%S+)$")
+  if check_editing == "on" or check_editing == "off" then
+    set_composer_text(state.composer_buf, "")
+    local session_id = state.session.id
+    client.request_for(session_id, "checks.editing", { enabled = check_editing == "on" }, function(result, failure)
+      if not state.session or state.session.id ~= session_id then return end
+      if failure then
+        notifications.error(failure, "Harness checks")
+      else
+        state.check_editing = result.check_editing == true
+        M.refresh_winbar()
+      end
+      synchronize_state()
     end)
     return
   end
@@ -2491,6 +2519,27 @@ end
 function M.configure(next_config, validate_selection, completed)
   local state = harness_state()
   local only_field = next(next_config)
+  if only_field == "check_timing" and next(next_config, only_field) == nil then
+    local session_id, epoch = state.session.id, state.runtime_epoch
+    state.check_timing_request = (state.check_timing_request or 0) + 1
+    local revision = state.check_timing_request
+    client.request_for(session_id, "session.configure", next_config, function(result, failure)
+      if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
+      if state.check_timing_request ~= revision then
+        if completed then completed(false) end
+        return
+      end
+      if failure then
+        report_configuration_error(failure)
+        if completed then completed(false) end
+        return
+      end
+      state.check_timing = result.check_timing
+      M.render()
+      if completed then completed(true) end
+    end)
+    return
+  end
   if only_field == "status_thoughts" and next(next_config, only_field) == nil then
     local session_id = state.session.id
     local generation = client.host_generation()

@@ -4,6 +4,13 @@ Harness owns durable sessions, exchanges, tasks, goals, child agents, approvals,
 
 Provider-specific transport behavior is described in [Providers](providers.md). Plan lifecycle and checking gates are described in [Planning](planning.md).
 
+Provider polling runs in an owned Tokio task. The broker pins the provider lifecycle,
+event loop, and event-processing futures separately so their state does not accumulate
+inline along a permission-change resume and automatic repair. Compaction processing
+has its own handler so ordinary streamed messages do not reserve its temporary storage.
+The resumed-repair regression runs with a 1 MiB worker stack to leave room for the
+enclosing host request lifecycle on the normal worker stack.
+
 ## Timeline storage and incremental projection
 
 The status entry combines the primary `SessionPhase` with an optional `CheckActivity`.
@@ -18,6 +25,16 @@ Active checks never become historical entries. `TimelineStream::update_checks`
 publishes a lightweight status replacement during execution and atomically removes
 the matching activity when it inserts the final result. Normal status updates retain
 independent check activity. Full snapshot reconstruction applies the same boundary.
+
+Each run retains an optional `exchange_id` assigned at admission. Completed runs
+with an owner are nested in that exchange's timeline entry, while runs started
+without an exchange remain standalone. Incremental publication and full reload
+use the same identity and retain one copy per run. Replacing an exchange during
+provider updates preserves its attached results. Removing the exchange also
+removes those results from the transcript, while the check store retains history.
+Automatic repair reopens the completed owning exchange through a dedicated check
+transition and preserves its prompt, usage, and original checkpoint. Ordinary
+continuation still rejects completed exchanges.
 
 `CheckSupervisor` owns run admission, cancellation, records, and worker lifetimes.
 Admission and the corresponding record share one state lock, as do terminal
@@ -501,6 +518,11 @@ terminal's previous state. Models, effort, service tier, artifacts, agents, inte
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
 
+Boolean row enablement uses a leading `●` for enabled and `○` for disabled, toggled
+with Space. Keep that state out of editable text columns. Tab selects the next
+editable field, such as Scope or Auto, and the left/right arrows change its value.
+The checks picker follows this pattern alongside the MCP picker's Space toggle.
+
 Configuration pickers never depend on the serialized provider-turn request lane to become visible.
 Harness resolves and caches backend model metadata when the view activates, then `/model` refreshes
 the catalog when it opens so persisted model and effort selections remain current during provider work.
@@ -509,7 +531,8 @@ execution-mode selections continue through their normal mutation owners. Configu
 that affect execution always use `task.transition`, including when Lua currently reports idle.
 The host determines whether execution needs collection, so a delayed busy snapshot cannot route
 a thinking or model change through the settled-session guard. Presentation-only status thoughts
-and input timeouts retain their independent live-update paths. Configuration changes
+and input timeouts retain their independent live-update paths. Automatic check timing
+also updates independently and applies at the next queue completion decision. Configuration changes
 interrupt active work immediately, collect the current execution, apply and verify the requested
 revision, and resume the same exchange when its task remains active. Durable timeline events report
 interruption, application, verification, and resume. Provider changes require idle work and an
@@ -1639,6 +1662,22 @@ the source is busy, leaving the source independently accessible instead of steer
 Goal control admission requires an active goal, matching the goal observer's mutation boundary.
 Controls for paused, blocked, stalled, or completed goals reject rather than reporting success
 for a state transition that the observer will discard.
+
+## Check-editing permission
+
+`checks.editing` persists `check_editing` in the session settings layer and updates
+shared live authority without acquiring provider execution admission. New conversations
+default to off. The broker snapshot supplies the permission for the Harness winbar.
+`/checks setup on` and `/checks setup off` send this control request without creating
+an exchange, interrupting active work, or issuing a model prompt.
+
+Guided `/checks setup` enables the same permission after setup admission. Its exchange
+still requires a recorded answer before publication. Outside guided setup, explicit
+permission allows `checks_configure` without a setup exchange. Check tools read the
+shared permission at invocation and before publication, so revocation also applies to
+already-open tool scopes. Configuration still validates revisions, managed helpers,
+write approval, and active-agent exclusion. The permission does not enable check runs
+or change the automatic completion boundary.
 
 ## Harness status presentation and lifecycle vocabulary
 

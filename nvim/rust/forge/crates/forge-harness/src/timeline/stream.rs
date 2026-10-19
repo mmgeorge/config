@@ -204,13 +204,14 @@ impl TimelineStream {
         );
         let next_interaction = interaction.map(|interaction| {
             if let Some(index) = self.exchange_owner.get(&interaction.id) {
-                if let TimelineEntry::Exchange { id, created_at_ms, exchange, agent_by_id } = &self.entry_list[*index]
+                if let TimelineEntry::Exchange { id, created_at_ms, exchange, agent_by_id, check_runs } = &self.entry_list[*index]
                     && exchange.id == interaction.id {
                     return TimelineEntry::Exchange {
                         id: id.clone(),
                         created_at_ms: *created_at_ms,
                         exchange: crate::plan::event::replacement_exchange(exchange, interaction),
                         agent_by_id: agent_by_id.clone(),
+                        check_runs: check_runs.clone(),
                     };
                 }
                 let mut entry = self.entry_list[*index].clone();
@@ -222,7 +223,7 @@ impl TimelineStream {
                 id: interaction.id.clone(),
                 created_at_ms: interaction.created_at_ms,
                 exchange: interaction.clone(),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }
         });
         let status_id = format!("{}:status", self.session_id);
@@ -327,12 +328,22 @@ impl TimelineStream {
         let activity = crate::checks::CheckActivity::from_run(run);
         let status_id = format!("{}:status", self.session_id);
         if activity.is_none() {
-            let entry = TimelineEntry::Checks {
-                id: run.id.clone(), created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms), run: run.clone(),
-            };
-            let insertion = self.entry_index.get(&status_id).copied().unwrap_or(self.entry_list.len());
-            let value = serde_json::to_value(&entry)?;
-            self.upsert(entry, value, insertion, &mut operation);
+            if let Some(owner) = run.exchange_id.as_ref() {
+                if let Some(index) = self.exchange_owner.get(owner).copied() {
+                    let mut entry = self.entry_list[index].clone();
+                    if entry.attach_check(run) {
+                        let value = serde_json::to_value(&entry)?;
+                        self.upsert(entry, value, index, &mut operation);
+                    }
+                }
+            } else {
+                let entry = TimelineEntry::Checks {
+                    id: run.id.clone(), created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms), run: run.clone(),
+                };
+                let insertion = self.entry_index.get(&status_id).copied().unwrap_or(self.entry_list.len());
+                let value = serde_json::to_value(&entry)?;
+                self.upsert(entry, value, insertion, &mut operation);
+            }
         }
         let previous = self.entry_index.get(&status_id).map(|index| self.entry_list[*index].clone());
         if previous.is_some() || activity.is_some() {
@@ -497,7 +508,12 @@ mod test {
         assert_eq!(stream.ticking_entries().count(), 1);
         run.commands[0].preview = "Output remains in the check store".into();
         run.commands[0].output_bytes = 9000;
-        assert!(stream.update_checks(&run)?.is_empty(), "output-only updates changed the timeline");
+        let preview = stream.update_checks(&run)?;
+        assert!(matches!(preview.operation.as_slice(), [TimelineOperation::Replace {
+            entry: TimelineEntry::Status { checks: Some(checks), .. }, ..
+        }] if checks.command_list[0].output_line.as_deref() == Some("Output remains in the check store")));
+        run.commands[0].output_bytes += 1000;
+        assert!(stream.update_checks(&run)?.is_empty(), "unchanged previews changed the timeline");
         stream.update_live(None, None, SessionPhase::Idle, false)?;
         assert!(matches!(&stream.entry_list()[0], TimelineEntry::Status { status: SessionPhase::Idle, checks: Some(_), .. }));
         assert_eq!(stream.ticking_entries().count(), 1, "independent checks stopped ticking while primary became idle");
@@ -524,6 +540,42 @@ mod test {
     }
 
     #[test]
+    fn owned_checks_remain_in_the_exchange_after_updates_and_reload() -> anyhow::Result<()> {
+        let exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
+            "id":"work", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Change source", "state":"complete", "created_at_ms":0,
+            "completed_at_ms":1, "attributed_matches_checkpoint":true, "node_list":[]
+        }))?;
+        let entry = TimelineEntry::Exchange { id:exchange.id.clone(), created_at_ms:0,
+            exchange:exchange.clone(), agent_by_id:Default::default(), check_runs:Vec::new() };
+        let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"checks", "exchange_id":"work", "revision":1, "completed_plan":null,
+            "shell":"system", "executable":null, "workspace":".", "environment_digest":"environment",
+            "started_at_ms":1, "completed_at_ms":null, "state":"running",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null, "workspace_digest":{}, "commands":[]
+        }))?;
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![entry.clone(), status(SessionPhase::Idle)])?;
+        stream.update_checks(&run)?;
+        run.state = crate::checks::CheckState::Passed;
+        run.completed_at_ms = Some(2);
+        let patch = stream.update_checks(&run)?;
+        assert!(patch.operation.iter().any(|operation| matches!(operation,
+            TimelineOperation::Replace { entry:TimelineEntry::Exchange { id,check_runs,.. },.. }
+                if id == "work" && check_runs.len() == 1)));
+        assert!(!stream.entry_list().iter().any(|entry| matches!(entry,TimelineEntry::Checks { .. })));
+        assert!(stream.update_checks(&run)?.is_empty());
+        stream.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
+        assert!(matches!(&stream.entry_list()[0],TimelineEntry::Exchange { check_runs,.. } if check_runs.len() == 1));
+        let rebuilt = crate::timeline::TimelineProjector::with_checks(vec![entry],vec![run.clone(),run.clone()]);
+        assert!(matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { check_runs,.. }] if check_runs.len() == 1));
+        assert!(crate::timeline::TimelineProjector::with_checks(Vec::new(),vec![run]).is_empty(),
+            "checks belonging to a removed exchange must not reappear as standalone history");
+        Ok(())
+    }
+
+    #[test]
     fn file_edit_output_reconciles_the_change_node_without_a_tool_cache() -> anyhow::Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
@@ -545,7 +597,7 @@ mod test {
         exchange.observe_turn(&event, 1)?;
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(vec![TimelineEntry::Exchange {
-            id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:Default::default(),
+            id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), check_runs: Vec::new(), agent_by_id:Default::default(),
         }])?;
         let activity = event.activity.as_mut().unwrap();
         activity.output = Some("Patch context did not match".into());

@@ -1,14 +1,23 @@
 # Project checks
 
 `/checks setup` configures the commands that Harness runs during Checking.
-`/checks` shows their selection reasons, proposed commands, and saved results.
+`/checks` lists configured checks and their task-specific settings. Expand a check
+with `i` to inspect selection reasons, proposed commands, and saved results.
 Definitions live in the `checks` section of `.forge.json`. Setup preserves other
 repository settings and asks for your choices before saving.
+
+`/checks setup on` enables check-editing permission without sending a prompt.
+`/checks setup off` disables it without sending a prompt, including during active work.
+The permission starts off, applies to this Harness conversation, and survives reopening.
+The winbar shows `check editing on` or `check editing off`. Guided `/checks setup`
+also enables permission, but still asks for your choices before saving. Enabling
+permission does not run checks or change which checks are enabled.
 
 Follow-up messages and interrupted setup retain your recorded choices. Setup still
 requires a user answer before saving. After configuration is saved, subsequent
 messages return to ordinary chat. Cancellation, rollback, or starting another task
-does not transfer the earlier setup's approval to that task.
+does not transfer the earlier setup's recorded answers to that task. Check-editing
+permission remains a separate conversation-level setting until you disable it.
 
 ## Automatic and explicit checks
 
@@ -32,9 +41,12 @@ and defaults to `true` when omitted. An enabled check with `auto: false` remains
 available for explicit runs and explicit plan selection. Prerequisites run when
 required by a selected check, including prerequisites with `auto: false`.
 
-The Auto field in `/checks` changes the task override. Saving defaults writes it
-to project configuration. Plan review shows automatic selection reasons and
-checks explicitly requested by the plan.
+In `/checks`, `●` marks an enabled check and `○` marks a disabled check. Space
+toggles the selected check. Tab moves between Scope and Auto, and the left/right
+arrows change the focused field. These changes affect task overrides. Enter runs
+the selected check, and the History page retains previous runs. Use `/checks setup`
+to edit project defaults. Plan review shows automatic selection reasons and checks
+explicitly requested by the plan.
 
 While viewing a plan, press `oc` to open its checks picker. `●` marks an enabled
 check and `○` marks a disabled check. Press Space or Enter to toggle the selected
@@ -55,12 +67,22 @@ plan version unchanged. The tool is available during plan authoring and Resolve.
 `all: true` for every enabled check. Explicit runs execute even when earlier
 evidence remains current.
 
-Agents must run automated validation through the checks interface. Direct
+Checks run automatically at the configured queue boundary, so agents generally
+do not need to run them manually. Agents may optionally call `checks_run` for
+earlier feedback. Direct
 terminal builds, tests, linters, formatters, and validation scripts do not record
 coverage and must not replace check runs. During plan implementation and
 resolution, agents finish the phase and let Harness Checking run validation.
 
 ## Completion and repair
+
+The **Automatic checks** setting in `/config` selects **After queue** by default.
+Harness runs applicable automatic checks after the last queued work item finishes.
+Select **Between queued work** to run them after each item before starting the next.
+The setting saves a global default and can change while work is running without
+interrupting the model. Already running checks finish before queued work resumes.
+Removing the remaining queued items also releases the pending completion check.
+The final check includes changes from the entire queue, using its first change baseline.
 
 Before ordinary work becomes idle, Harness runs applicable automatic checks.
 Intermediate goal turns do not trigger this gate. Successful goal completion
@@ -72,7 +94,11 @@ result is reused instead of executing the same check again. Package A's result
 does not satisfy package B, and partial selections do not satisfy wider coverage.
 Relevant edits, changed commands, or changed configuration require new evidence.
 
-A failed result starts a repair turn with its saved diagnostics and output.
+A check run attaches to the exchange whose work it validates. Its saved results
+remain with that exchange on reload. A failed result starts a repair turn within
+the same exchange, retaining the original prompt, change baseline, and accumulated
+provider usage. Repair does not create a separate conversation entry.
+The model corrects the failure and finishes its turn so Harness checks again.
 Harness also uses failures already recorded through the run tool without
 repeating the unchanged command. If repair ends with the same failures and no
 relevant changes, automatic repair stops with the failure unresolved.

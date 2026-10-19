@@ -400,12 +400,14 @@ impl TimelineRenderer<'_> {
             TimelineEntry::Exchange {
                 exchange: interaction,
                 agent_by_id,
+                check_runs,
                 ..
             } => {
                 let agents = agent_by_id.iter().map(|(id, entry)| (id.as_str(), entry)).collect();
                 self.interaction(interaction, &agents, depth)?;
+                for run in check_runs { self.checks(run, false)?; }
             }
-            TimelineEntry::Checks { run, .. } => self.checks(run)?,
+            TimelineEntry::Checks { run, .. } => self.checks(run, true)?,
             TimelineEntry::SessionEvent { id, event, .. } => {
                 if let SessionEventKind::Compaction { compaction } = &event.detail {
                     self.compaction(id, compaction)?;
@@ -1475,9 +1477,9 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn checks(&mut self, run: &crate::checks::CheckRun) -> Result<()> {
+    fn checks(&mut self, run: &crate::checks::CheckRun, separate: bool) -> Result<()> {
         ensure!(run.state != crate::checks::CheckState::Running, "active checks belong to session status");
-        if self.leading_separator {
+        if separate && self.leading_separator {
             self.literal(&format!("{}:separator", run.id), "", None)?;
         }
         let heading = if run.context.is_some() {
@@ -2001,7 +2003,7 @@ mod tests {
             exchange.observe_compaction(completed, 16_000);
             let waiting = project_at(&TimelineEntry::Exchange {
                 id: "exchange".into(), created_at_ms: 0,
-                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), 16_000)?;
             assert!(!waiting.entry.block.iter().flat_map(|block| block.text.wire_rows())
                 .any(|row| row.contains("→")));
@@ -2010,7 +2012,7 @@ mod tests {
             exchange.observe_compaction(running, 20_000);
             let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
             let projected = project_at(&TimelineEntry::Exchange {
-                id: "exchange".into(), created_at_ms: 0, exchange: restored, agent_by_id: HashMap::new(),
+                id: "exchange".into(), created_at_ms: 0, exchange: restored, check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), 20_000)?;
             let header = projected.entry.block.iter().find(|block|
                 block.text.row(0).is_some_and(|row| row.contains("Context compacted"))).unwrap();
@@ -2077,7 +2079,7 @@ mod tests {
         exchange.observe_compaction(compaction.clone(), 1000);
         let id = exchange.node_list[0].id().to_owned();
         let running = TimelineEntry::Exchange { id: "exchange".into(), created_at_ms: 0,
-            exchange: exchange.clone(), agent_by_id: HashMap::new() };
+            exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() };
         let projected = project_at(&running, &WidthProfile::default(), 1500)?;
         assert!(!projected.entry.block.iter().any(|block| block.id.0 == id));
         exchange.append_input(crate::exchange::InputIntent::Steering, "Continue".into(), 1500)?;
@@ -2093,7 +2095,7 @@ mod tests {
         assert_eq!(restored.node_list.len(), 2);
         assert_eq!(restored.node_list[0].id(), id);
         let entry = TimelineEntry::Exchange { id:"exchange".into(), created_at_ms:0,
-            exchange:restored, agent_by_id:HashMap::new() };
+            exchange:restored, check_runs: Vec::new(), agent_by_id:HashMap::new() };
         let projected = project_at(&entry, &WidthProfile::default(), 5000)?;
         let activity = projected.entry.block.iter().find(|block| block.id.0 == "exchange:summary").unwrap();
         assert!(activity.text.row(0).unwrap().contains("Compactions 1"));
@@ -2132,7 +2134,7 @@ mod tests {
         }))?;
         let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
         let projection = project_at(&TimelineEntry::Exchange { id:"verify".into(), created_at_ms:0,
-            exchange, agent_by_id:HashMap::new() }, &WidthProfile::default(), 1000)?;
+            exchange, check_runs: Vec::new(), agent_by_id:HashMap::new() }, &WidthProfile::default(), 1000)?;
         let blocks = &projection.entry.block;
         let rows = blocks.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
         let text = rows.join("\n");
@@ -2176,7 +2178,7 @@ mod tests {
             }))?;
             let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
             let projected = project_at(&TimelineEntry::Exchange {
-                id:"verify-result".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+                id:"verify-result".into(), created_at_ms:0, exchange, check_runs: Vec::new(), agent_by_id:HashMap::new(),
             }, &WidthProfile::default(), 18000)?;
             let blocks = &projected.entry.block;
             let result_index = blocks.iter().position(|block| block.id.0 == "verify-result:verification-result").unwrap();
@@ -2242,7 +2244,7 @@ mod tests {
             let exchange: Exchange = serde_json::from_value(value).unwrap();
             let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
             let projected = project_at(&TimelineEntry::Exchange {
-                id:"phase".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+                id:"phase".into(), created_at_ms:0, exchange, check_runs: Vec::new(), agent_by_id:HashMap::new(),
             }, &WidthProfile::default(), 1000).unwrap();
             let blocks = &projected.entry.block;
             assert_eq!(blocks[0].id.0, "phase:lifecycle");
@@ -2312,7 +2314,7 @@ mod tests {
                 id: "review".into(),
                 created_at_ms: 0,
                 exchange,
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile {
                 columns: 40,
@@ -2362,7 +2364,7 @@ mod tests {
                         id: "colored".into(),
                         created_at_ms: 0,
                         exchange: restored,
-                        agent_by_id: HashMap::new(),
+                        check_runs: Vec::new(), agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
                     2000,
@@ -2398,7 +2400,7 @@ mod tests {
                     id: "legacy".into(),
                     created_at_ms: 0,
                     exchange,
-                    agent_by_id: HashMap::new(),
+                    check_runs: Vec::new(), agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
                 2000,
@@ -2488,7 +2490,7 @@ mod tests {
             exchange.observe_turn(&event, 6).unwrap();
 
             let render = |exchange: &Exchange| project_at(&TimelineEntry::Exchange {
-                id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:HashMap::new(),
+                id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), check_runs: Vec::new(), agent_by_id:HashMap::new(),
             }, &WidthProfile::default(), 10).unwrap();
             let initial = render(&exchange);
             let response_position = initial.entry.block.iter().position(|block|
@@ -2617,7 +2619,7 @@ mod tests {
             exchange.awaiting_input=true;
             exchange.pause(3);
             let render = |exchange: Exchange| project_at(&TimelineEntry::Exchange {
-                id:exchange.id.clone(),created_at_ms:0,exchange,agent_by_id:HashMap::new(),
+                id:exchange.id.clone(),created_at_ms:0,exchange,check_runs: Vec::new(), agent_by_id:HashMap::new(),
             }, &WidthProfile::default(), 4).unwrap();
             let restored = serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
             let projected = render(restored);
@@ -2714,7 +2716,7 @@ mod tests {
         exchange.pause(6);
         let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
         let projected = project_at(&TimelineEntry::Exchange {
-            id: restored.id.clone(), created_at_ms: 0, exchange: restored, agent_by_id: HashMap::new(),
+            id: restored.id.clone(), created_at_ms: 0, exchange: restored, check_runs: Vec::new(), agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 6).unwrap();
         let text = projected.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("▸ You asked: What do you mean?"));
@@ -2738,7 +2740,7 @@ mod tests {
         let mut cancelled = exchange.clone();
         cancelled.finish(ExchangeState::Cancelled, 7).unwrap();
         let cancelled = project_at(&TimelineEntry::Exchange {
-            id: cancelled.id.clone(), created_at_ms: 0, exchange: cancelled, agent_by_id: HashMap::new(),
+            id: cancelled.id.clone(), created_at_ms: 0, exchange: cancelled, check_runs: Vec::new(), agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 7).unwrap();
         let text = cancelled.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.find("I mean a Rust CLI").unwrap() < text.find("You answered: Scope: Rust CLI").unwrap());
@@ -2754,7 +2756,7 @@ mod tests {
         exchange.observe_turn(&event, 9).unwrap();
         exchange.finish(ExchangeState::Complete, 9).unwrap();
         let completed = project_at(&TimelineEntry::Exchange {
-            id: exchange.id.clone(), created_at_ms: 0, exchange, agent_by_id: HashMap::new(),
+            id: exchange.id.clone(), created_at_ms: 0, exchange, check_runs: Vec::new(), agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 9).unwrap();
         let text = completed.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.find("I mean a Rust CLI").unwrap() < text.find("You answered: Scope: Rust CLI").unwrap());
@@ -2798,7 +2800,7 @@ mod tests {
             exchange.observe_turn(&event, index as i64 * 10 + 1)?;
             if file_change {
                 let projected = project_at(&TimelineEntry::Exchange {
-                    id:"edits".into(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:HashMap::new(),
+                    id:"edits".into(), created_at_ms:0, exchange:exchange.clone(), check_runs: Vec::new(), agent_by_id:HashMap::new(),
                 }, &WidthProfile::default(), 100)?;
                 assert!(projected.entry.block.iter().any(|block| block.text.wire_rows().join("").contains("Changing 1 file")));
             }
@@ -2811,7 +2813,7 @@ mod tests {
         exchange.finish(crate::exchange::ExchangeState::Complete, 70)?;
         let restored = serde_json::from_value(serde_json::to_value(exchange)?)?;
         let projected = project_at(&TimelineEntry::Exchange {
-            id:"edits".into(), created_at_ms:0, exchange:restored, agent_by_id:HashMap::new(),
+            id:"edits".into(), created_at_ms:0, exchange:restored, check_runs: Vec::new(), agent_by_id:HashMap::new(),
         }, &WidthProfile::default(), 100)?;
         let blocks = &projected.entry.block;
         let groups: Vec<_> = blocks.iter().filter(|block| block.id.0.ends_with(":tools")).collect();
@@ -2870,7 +2872,7 @@ mod tests {
         }
         for now in [clock, clock + 10_000_000] {
             let projected = project_at(&TimelineEntry::Exchange {
-                id: exchange.id.clone(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                id: exchange.id.clone(), created_at_ms: 0, exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), now).unwrap();
             let headings = projected.entry.block.iter().filter_map(|block| block.text.row(0))
                 .filter(|row| row.contains("• ")).collect::<Vec<_>>();
@@ -2885,7 +2887,7 @@ mod tests {
             let document = forge_buffer::document::BufferDocument::new(
                 forge_buffer::identity::DocumentId("group-timer".into()), projected.entry.block.clone()).unwrap();
             let refreshed = super::timing_blocks(&TimelineEntry::Exchange {
-                id: exchange.id.clone(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                id: exchange.id.clone(), created_at_ms: 0, exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), &document, &Default::default(), &projected.tool).unwrap();
             let refreshed_group = refreshed.iter().find(|block| block.id == group.id).unwrap();
             assert!(refreshed_group.text.row(0).unwrap().starts_with("▸ Running 5 tools · "));
@@ -2953,7 +2955,7 @@ mod tests {
         let render = |exchange: &Exchange| {
             project_at(&TimelineEntry::Exchange {
                 id: exchange.id.clone(), created_at_ms: 0,
-                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), 100)
         };
         let mut first_group_id = None;
@@ -2993,7 +2995,7 @@ mod tests {
                 forge_buffer::identity::DocumentId("cross-turn-clock".into()), projected.entry.block.clone())?;
             let refreshed = super::timing_blocks(&TimelineEntry::Exchange {
                 id: exchange.id.clone(), created_at_ms: 0,
-                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }, &WidthProfile::default(), &document, &Default::default(), &projected.tool)?;
             let refreshed_group = refreshed.iter().find(|block| block.id == groups[0].id).unwrap();
             assert!(refreshed_group.text.row(0).unwrap().starts_with(&format!("▸ Running {ordinal} tool")),
@@ -3098,7 +3100,7 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    agent_by_id: HashMap::new(),
+                    check_runs: Vec::new(), agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
                 10,
@@ -3245,7 +3247,7 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             10,
@@ -3313,7 +3315,7 @@ mod tests {
         });
         let exchange: Exchange = serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
         let projected = project_at(&TimelineEntry::Exchange {
-            id: exchange.id.clone(), created_at_ms: 0, exchange, agent_by_id: HashMap::new(),
+            id: exchange.id.clone(), created_at_ms: 0, exchange, check_runs: Vec::new(), agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 10).unwrap();
         let text = projected.entry.block.iter().flat_map(|block|
             (0..block.text.row_count()).map(|row| block.text.row(row).unwrap())).collect::<Vec<_>>().join("\n");
@@ -3395,7 +3397,7 @@ mod tests {
             });
         let entry = TimelineEntry::Exchange {
                 id: "parent".into(), created_at_ms: 0,exchange:parent,
-                agent_by_id:HashMap::from([("nested-agent".into(),TimelineEntry::AgentLifecycle {
+                check_runs:Vec::new(), agent_by_id:HashMap::from([("nested-agent".into(),TimelineEntry::AgentLifecycle {
                     id: "nested-agent".into(),
                     created_at_ms: 0,
                     run: crate::agent::Agent::pending("session", "Nested", "Inspect", 0),
@@ -3561,7 +3563,7 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    agent_by_id: HashMap::new(),
+                    check_runs: Vec::new(), agent_by_id: HashMap::new(),
                 },
                 &width,
                 21_000,
@@ -3698,7 +3700,7 @@ mod tests {
         let streaming = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(), created_at_ms: 0,
-                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(), 4,
         ).unwrap();
@@ -3725,7 +3727,7 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange: exchange.clone(),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             5,
@@ -3789,7 +3791,7 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             6,
@@ -4086,7 +4088,7 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction,
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             1_000,
@@ -4109,7 +4111,7 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction.clone(),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             1_000,
@@ -4123,7 +4125,7 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction,
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             }),
             &WidthProfile::default(),
             1_000,
@@ -4396,7 +4398,7 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 1000,
                 exchange: exchange.clone(),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             };
             let projected = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
             let summary = projected
@@ -4504,7 +4506,7 @@ mod tests {
             (3000, "1s", "1 s"), (4500, "2.5s", "2.5 s")] {
             let entry = crate::timeline::TimelineEntry::Exchange {
                 id: exchange.id.clone(), created_at_ms: 1000, exchange: exchange.clone(),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             };
             let rendered = project_at(&entry, &WidthProfile::default(), now_ms).unwrap();
             assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
@@ -4526,7 +4528,7 @@ mod tests {
         exchange.observe_turn(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {
             id: exchange.id.clone(), created_at_ms: 1000, exchange: exchange.clone(),
-            agent_by_id: HashMap::new(),
+            check_runs: Vec::new(), agent_by_id: HashMap::new(),
         };
         let rendered = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
         assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
@@ -4711,7 +4713,7 @@ mod tests {
             report:Some(std::sync::Arc::new(report)),
         });
         let render = |exchange| project_at(&TimelineEntry::Exchange {
-            id:"report-exchange".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+            id:"report-exchange".into(), created_at_ms:0, exchange, check_runs: Vec::new(), agent_by_id:HashMap::new(),
         }, &WidthProfile::default(), 1).unwrap();
         let projected = render(exchange.clone());
         for identity in ["report", "report:file:0"] {

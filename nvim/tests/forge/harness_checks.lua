@@ -31,8 +31,7 @@ end
 session.harness.session = { id = "checks-fixture", workspace = "fixture" }
 local window = vim.api.nvim_get_current_win()
 local host = { window_list = { window }, control_win = window }
-local setup_id
-checks.open(session.harness, host, function(id) setup_id = id or "all" end)
+checks.open(session.harness, host)
 
 local function row(id)
   local current = picker._state_for_test()
@@ -64,72 +63,97 @@ local function select(id)
   error("missing check row " .. id)
 end
 
-assert(row("screenshots").columns[2] == "test", "screenshot suites must remain dynamic named test checks")
-assert(row("unit").columns[7] == "Core", "functional area must be visible")
-local current = picker._state_for_test()
-current.spec.on_confirm({option = row("run-all")})
-assert(calls[#calls - 1].method == "checks.run" and calls[#calls - 1].params.all == true, "full-suite execution must be explicit")
-select("unit")
-assert(picker_state.page(picker._state_for_test().state, picker._state_for_test().spec).subtitle:find("Selected: Changed: src/core.rs", 1, true), "selected checks must explain applicability")
-action("next")
-assert(catalog.overrides.enabled.unit == false, "arrow keys must change task state through the host")
-assert(catalog.snapshot.config.definitions[1].enabled, "temporary toggles must preserve project defaults")
-action("field")
-action("next")
-assert(catalog.overrides.scopes.unit == "changed_files", "scope must cycle inline using the shared field control")
-action("details", { option = row("unit") })
-assert(row("unit").child_line_list[2] == "All: runner all", "expanded rows must show concrete commands")
-action("details", { option = row("screenshots") })
-assert(row("screenshots").child_line_list[3] == "Prerequisites: unit", "details must expose dependencies")
-local frame = require("forge.views.picker.layout").build(picker_state.page(picker._state_for_test().state, picker._state_for_test().spec), 1, 80)
-assert(table.concat(frame.lines, "\n"):find("Run all enabled checks (ignore triggers)", 1, true), "action labels must use the available row width")
-for _, range in pairs(frame.child_range) do
-  for line = range.first, range.last do
-    assert(vim.fn.strdisplaywidth(frame.lines[line]) <= 76, "long output paths must remain inside picker borders")
-  end
-end
-assert(table.concat(frame.lines):gsub("%s", ""):find(output_path, 1, true), "wrapping must preserve the full output path")
-action("edit")
-assert(setup_id == "unit", "editing must identify the selected check")
-current = picker._state_for_test()
-select("setup")
-local call_count = #calls
-action("next")
-assert(#calls == call_count, "value keys on an action row must not mutate the previously selected check")
 local function key(value)
   local mapping = vim.fn.maparg(value, "n", false, true)
   assert(type(mapping.callback) == "function", "missing mapping " .. value)
   mapping.callback()
   vim.wait(20, function() return false end)
 end
+
+assert(row("screenshots").columns[2] == "test", "screenshot suites must remain dynamic named test checks")
+assert(row("unit").columns[5] == "Core", "functional area must be visible")
+assert(row("unit").columns[1] == "● Unit tests", "enabled checks need a filled circle without numbering")
+assert(row("screenshots").columns[1] == "○ Screenshot tests", "disabled checks need an empty circle")
+local current = picker._state_for_test()
+local page = picker_state.page(current.state, current.spec)
+assert(vim.deep_equal(page.column_headers, { "Check", "Category", "Scope", "Auto", "Area" }))
+assert(#page.option_list == 2, "the definitions page must only contain check rows")
+for _, option in ipairs(page.option_list) do
+  assert(option.value and option.value.category, "setup, run, reset, and save actions must be absent")
+end
+for _, operation in ipairs(page.action_list) do
+  assert(operation.id ~= "edit" and operation.id ~= "files" and operation.id ~= "cases",
+    "setup and scope selection must not have dedicated hotkeys")
+end
+select("unit")
+current = picker._state_for_test()
+assert(picker_state.page(current.state, current.spec).subtitle == nil, "selection details must not appear above the table")
+current.spec.on_confirm({ option = row("unit") })
+assert(calls[#calls - 1].method == "checks.run"
+  and vim.deep_equal(calls[#calls - 1].params, { ids = { "unit" } }), "Enter must run only the selected check")
+
+key("<Space>")
+assert(catalog.overrides.enabled.unit == false, "Space must toggle the selected check through the host")
+assert(row("unit").columns[1] == "○ Unit tests")
+assert(catalog.snapshot.config.definitions[1].enabled, "temporary toggles must preserve project defaults")
+key("<Right>")
+assert(catalog.overrides.scopes.unit == "changed_files", "arrows must change the focused scope")
+key("<Tab>")
+key("<Right>")
+assert(catalog.overrides.auto.unit == false, "Tab must focus Auto for arrow-key changes")
+key("<Space>")
+assert(catalog.overrides.enabled.unit and catalog.overrides.auto.unit == false,
+  "Space must toggle enabled state independently of the focused field")
+key("<Tab>")
+key("<Left>")
+assert(catalog.overrides.scopes.unit == "all", "Tab must cycle back to Scope")
+
+action("details", { option = row("unit") })
+assert(row("unit").child_line_list[2] == "All: runner all", "expanded rows must show concrete commands")
+action("details", { option = row("screenshots") })
+assert(row("screenshots").child_line_list[3] == "Prerequisites: unit", "details must expose dependencies")
+local frame = require("forge.views.picker.layout").build(picker_state.page(picker._state_for_test().state, picker._state_for_test().spec), 1, 80)
+assert(not table.concat(frame.lines, "\n"):find("Run all enabled checks", 1, true), "removed actions must not render")
+for _, range in pairs(frame.child_range) do
+  for line = range.first, range.last do
+    assert(vim.fn.strdisplaywidth(frame.lines[line]) <= 76, "long output paths must remain inside picker borders")
+  end
+end
+assert(table.concat(frame.lines):gsub("%s", ""):find(output_path, 1, true), "wrapping must preserve the full output path")
+
+select("unit")
 key("t")
 current = picker._state_for_test()
-assert(picker_state.selected_option(current.state, current.spec).id == "run", "case selection must not replace the configured next-option alias")
+assert(picker_state.selected_option(current.state, current.spec).id == "screenshots", "scope actions must preserve the next-option alias")
 key("]")
 current = picker._state_for_test()
 assert(picker_state.page(current.state, current.spec).id == "history", "history must be reachable while arrows edit values")
 key("R")
 current = picker._state_for_test()
-assert(picker_state.page(current.state, current.spec).id == "history", "refresh must preserve the user's history page")
+assert(picker_state.page(current.state, current.spec).id == "history", "refresh must preserve the history page")
+assert(vim.fn.maparg("<Space>", "n") == "", "the history page must not retain the enabled toggle")
 key("<Left>")
 current = picker._state_for_test()
-assert(picker_state.page(current.state, current.spec).id == "checks", "history arrows must restore page navigation instead of stale value actions")
+assert(picker_state.page(current.state, current.spec).id == "checks", "history arrows must restore page navigation")
 picker.close(false)
 catalog.configured, catalog.snapshot, catalog.error = false, nil, "checks_not_configured: use /checks setup"
-checks.open(session.harness, host, function() end)
+checks.open(session.harness, host)
 current = picker._state_for_test()
-assert(picker_state.page(current.state, current.spec).title:find("Unconfigured", 1, true))
-assert(row("run").disabled_reason, "missing configuration must disable execution actions")
-for _, option in ipairs(picker_state.page(current.state, current.spec).option_list) do
-  assert(option.id ~= "error", "an uninitialized project must not report malformed configuration")
-end
+page = picker_state.page(current.state, current.spec)
+assert(page.title:find("Unconfigured", 1, true))
+assert(#page.option_list == 0, "missing configuration must leave no execution actions")
+assert(page.empty_text:find("/checks setup", 1, true))
 picker.close(false)
 load_failure = "invalid .forge.json: expected a JSON object"
-checks.open(session.harness, host, function() end)
+checks.open(session.harness, host)
 current = picker._state_for_test()
-assert(picker_state.page(current.state, current.spec).title:find("Unavailable", 1, true), "load failures must leave a visible repair surface")
+assert(picker_state.page(current.state, current.spec).title:find("Unavailable", 1, true))
 assert(row("error").label:find(load_failure, 1, true), "repair surface must retain the actual failure")
-assert(row("run-all").disabled_reason, "unavailable configuration must not admit execution")
+local call_count = #calls
+current.spec.on_confirm({ option = row("error") })
+action("toggle")
+action("next")
+assert(#calls == call_count, "error rows must not run or change a previously selected check")
 picker.close(false)
 client.request_for = original
 io.write("harness_checks OK\n")

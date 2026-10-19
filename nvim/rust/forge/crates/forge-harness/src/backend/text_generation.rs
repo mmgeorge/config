@@ -314,7 +314,7 @@ mod tests {
             id: "entry".into(),
             created_at_ms: 1,
             exchange,
-            agent_by_id: Default::default(),
+            check_runs: Vec::new(), agent_by_id: Default::default(),
         }];
         let captured = history(&entries).unwrap();
         assert_eq!(captured, "User: Fix this\n\nAssistant: Visible progress");

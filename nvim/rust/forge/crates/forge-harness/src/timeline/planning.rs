@@ -416,7 +416,7 @@ mod tests {
                 id: "exchange".into(),
                 created_at_ms: 1,
                 exchange: projected.remove(0),
-                agent_by_id: HashMap::new(),
+                check_runs: Vec::new(), agent_by_id: HashMap::new(),
             };
             let rendered =
                 crate::buffer::projection::project(&entry, &Default::default(), false, &Default::default(), &Default::default()).unwrap();

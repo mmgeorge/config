@@ -142,6 +142,7 @@ impl HarnessBroker {
             },
         )?;
         run.context.as_mut().unwrap().automatic = true;
+        run.exchange_id = self.store.list_exchange(&self.session.id)?.last().map(|exchange| exchange.id.clone());
         run.progress = progress;
         run.workspace_identity = workspace_identity.clone();
         run.workspace_digest = run.progress.source_digest.clone();

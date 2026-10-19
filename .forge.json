@@ -28,8 +28,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--bin",
             "forge"
           ]
@@ -56,8 +54,6 @@
             "build",
             "--release",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--bin",
             "forge"
           ]
@@ -94,8 +90,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--workspace",
             "--tests"
           ]
@@ -107,8 +101,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--package",
             "{package.name}",
             "--tests"
@@ -122,8 +114,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--package",
             "{package.name}",
             "{case.target_args}",
@@ -165,8 +155,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--workspace",
             "--tests"
           ]
@@ -201,8 +189,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--workspace",
             "--all-targets",
             "--",
@@ -217,8 +203,6 @@
             "--profile",
             "dev",
             "--locked",
-            "--target-dir",
-            "D:/.cache/nvim/rust-sidecar/forge/build",
             "--package",
             "{package.name}",
             "--all-targets",

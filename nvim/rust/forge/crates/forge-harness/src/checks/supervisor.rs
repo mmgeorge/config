@@ -318,6 +318,7 @@ impl CheckSupervisor {
         let directory = self.root.join(&id);
         let mut run = CheckRun {
             id: id.clone(),
+            exchange_id: None,
             revision,
             context: Some(CheckRunContext {
                 automatic: false,

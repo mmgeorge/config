@@ -171,7 +171,9 @@ imports before submitting. Attempts during import retain the draft and show a no
 changing interactive plan navigation or starting language servers.
 
 `/checks` opens project checks, and `/checks setup` configures their commands and
-selection policies. See [Project checks](checks.md) for package-aware commands and
+selection policies through a guided conversation. `/checks setup on` and
+`/checks setup off` toggle check-editing permission without sending a prompt.
+The Harness winbar shows the current permission. See [Project checks](checks.md) for package-aware commands and
 new-test selection.
 
 PlanReview shows declaration changes with nearby context lines and enclosing

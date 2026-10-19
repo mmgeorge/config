@@ -11,6 +11,13 @@ globs:
 
 # Forge Plugin Rules
 
+## Picker Enablement Controls
+
+Represent row enablement with a leading `●` for enabled and `○` for disabled.
+Space toggles that state. Keep enablement out of editable text columns. Tab selects
+the next editable field, and the left/right arrows change the focused value.
+Use the checks and MCP pickers as the existing interaction references.
+
 ## No Arbitrary Content-Size Limits
 
 Never reject, truncate, disable, or leave loading a valid file, document, plan,
@@ -30,15 +37,21 @@ user's explicit approval before introducing a rejection or truncation policy.
 
 ## Harness Check Ownership
 
-Inside Forge Harness, agents must perform automated validation through the checks
-interface. List configured checks, run selected IDs through `checks_run`,
-and inspect recorded results with `checks_status`. Do not run builds,
+Inside Forge Harness, checks run automatically at the configured queue boundary,
+after the queue by default. Manual runs are generally unnecessary. You may
+optionally call `checks_run` for earlier feedback. List configured checks and
+inspect recorded results with `checks_status`. During automatic repair,
+fix the failures and finish the turn so Harness checks again. Do not run builds,
 tests, linters, formatters, or validation scripts directly through terminal tools
 or alternate subprocesses. During plan execution, finish the active phase and
 let Harness Checking execute validation. Delegated agents without check tools
-must ask their parent to schedule it after child work settles. Missing coverage
+rely on their parent's automatic completion gate after child work settles. Missing coverage
 requires the authorized check-configuration workflow rather than an unrecorded
-command. Read-only source and package-metadata discovery are unaffected.
+command. Check-editing permission is shown in the Harness winbar. `/checks setup`
+enables it and starts guided setup. `/checks setup on` or `/checks setup off`
+toggles it without sending a prompt. With permission enabled outside guided setup,
+use `checks_configure` for requested changes. Guided setup still requires answers
+before saving. Read-only source and package-metadata discovery are unaffected.
 
 The build commands below define the required artifact and flags. Harness agents
 must execute them as configured checks when working inside Harness.

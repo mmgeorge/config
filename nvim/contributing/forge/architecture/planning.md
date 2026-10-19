@@ -662,12 +662,13 @@ the lease revokes tool access and releases those senders even if a persistent pr
 retains its control context. Request completion can then drain the event stream and publish pending
 questions to the UI. A retained context cannot keep the broker locked after the turn returns.
 
-`/checks` shows ordered definitions, areas, enabled state, scope, prerequisites, result, duration,
-and each check's applicability reason in its subtitle and details. Run applicable checks uses
-current task changes. Run all enabled checks explicitly requests complete suites regardless of triggers.
+`/checks` shows ordered definitions with enabled circles, categories, scope, automatic selection,
+and areas. Space toggles the selected definition. Tab selects Scope or Auto, and arrow keys
+change that field. Enter runs the selected check. The picker omits setup, batch-run, reset,
+and save-defaults action rows, along with result and duration columns and selection subtitles.
 Shared inline picker fields change task overrides without editing project defaults. Overrides
 persist by task identity across resume and revisions. Ad hoc conversations use a separate
-conversation identity. Saving defaults writes `.forge.json` explicitly. Details expose commands,
+conversation identity. Project setup writes `.forge.json` explicitly. Details expose commands,
 requested and resolved coverage, error reasons, and saved output. History retains completed
 and interrupted runs. Read, status, cancel, and override requests remain responsive outside
 the active provider or automatic-gate broker lock.
@@ -686,12 +687,25 @@ configuration, refreshes the projection, and requires reopening the review. Impl
 Resolve write source without executing validation. Their completion persists Checking before
 process admission. Manual Verify begins only after the declaration scan and enabled checks pass.
 
+The completion gate defaults to `after_queue`. `/config` can select `between_work`
+instead, and the settings store persists that choice globally. Lua publishes ordered,
+host-identified queue snapshots through `queue.update` before admitting more work.
+The service accepts these updates independently of the active broker lock.
+`CompletionQueue` retains deferred validation and the original change owner across
+queued interactions. The final interaction therefore checks changes from the entire
+batch. If queue editing removes the remaining work, Lua invokes `checks.complete`
+under normal execution admission. Failed, paused, or waiting work retains its existing
+admission boundaries. Plan Checking and explicitly requested runs remain independent.
+
 One Rust-owned runner serves the automatic gate and `checks_run`. Its provider-neutral
 tools list configuration, save authorized setup captures, start runs, read status, and cancel
 owned runs. Model-triggered commands follow the existing permission coordinator. The narrow
 setup action writes only checks settings and managed helpers while retaining the active plan.
 Disabled checks cannot be selected by the model. Source-writing phases and active children
-exclude on-demand runs. Automatic checking does not admit a model exchange or report tokens.
+exclude on-demand runs. Models normally finish work and leave checking to the gate.
+Manual runs are generally unnecessary, but models may optionally call `checks_run`
+for earlier feedback where on-demand runs are available.
+Automatic checking does not admit a model exchange or report tokens.
 
 Checks execute serially in explicit dependency order through `/config Shell`. Independent
 checks continue after failures. Dependents of failed prerequisites are skipped with a reason.

@@ -1677,13 +1677,13 @@ mod tests {
     }
 
     #[test]
-    fn accepted_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
+    fn attached_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
         let directory=tempfile::tempdir()?;
         let output=directory.path().join("command.output");
         let text="saved command output\n".repeat(15000);
         std::fs::write(&output,&text)?;
         let run:crate::checks::CheckRun=serde_json::from_value(serde_json::json!({
-            "id":"gate","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "id":"gate","exchange_id":"implementation","revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
             "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
             "workspace_identity":null,"workspace_digest":{},"commands":[{
@@ -1693,16 +1693,16 @@ mod tests {
             }]
         }))?;
         let mut owner=SessionPresentation::new("session".into());
-        owner.initialize(vec![interaction_entry("implementation"),
-            TimelineEntry::Checks { id:"gate".into(),created_at_ms:1,run }])?;
+        owner.initialize(crate::timeline::TimelineProjector::with_checks(
+            vec![interaction_entry("implementation")], vec![run],
+        ))?;
         let document=DocumentId("check-output".into());
         owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
         assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes(),0);
         expand_sections(&mut owner,"view")?;
         let collapsed=owner.snapshot(&document)?;
         let checks_position=collapsed.block.iter().position(|block|block.id.0=="gate:checks").unwrap();
-        assert_eq!(collapsed.block[checks_position-1].id.0,"gate:separator");
-        assert_eq!(collapsed.block[checks_position-1].text.wire_rows(),vec![""]);
+        assert!(!collapsed.block.iter().any(|block| block.id.0 == "gate:separator"));
         let checks=&collapsed.block[checks_position];
         assert!(checks.metadata.node.as_ref().unwrap().parent.is_none());
         for identity in ["gate:declarations","gate:0:tool"] {
@@ -1717,7 +1717,7 @@ mod tests {
             retain_patches(open,Vec::new())?;
         }
         assert!(owner.snapshot(&document)?.block.iter().any(|block|block.id.0=="gate:0:tool"),
-            "collapsing implementation must not hide the separate checks section");
+            "collapsing implementation activity must not hide its check results");
         assert!(!collapsed.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output") || row.contains("must not render"))));
         for (sequence,action) in [(100,super::super::nodes::NodeAction::SetExpansion { expanded:true }),
             (101,super::super::nodes::NodeAction::LoadMore),(102,super::super::nodes::NodeAction::SetExpansion { expanded:false })] {
@@ -1811,7 +1811,7 @@ mod tests {
         active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
         active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
         let mut exchange:Exchange = serde_json::from_value(active["exchange"].take())?;
-        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),agent_by_id:HashMap::new() };
+        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() };
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![entry])?;
         let document = DocumentId("expanded-stream".into());
@@ -1858,7 +1858,7 @@ mod tests {
         }
         assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("new 99 🦀"))));
         refresh_activity(owner.open.as_mut().unwrap(), &[TimelineEntry::Exchange {
-            id:"active".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+            id:"active".into(), created_at_ms:0, exchange, check_runs: Vec::new(), agent_by_id:HashMap::new(),
         }])?;
         let timed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap().to_owned();
         assert_eq!(pointer(&owner,&settled),settled_pointer);
@@ -1884,7 +1884,7 @@ mod tests {
             turn_boundary:None,kind:"assistant_message".into(),text:Some("First [link](https://example.com)".into()),
             data:serde_json::json!({"provider_message_id":"message"}),summary:None,task_update:None,activity:None };
         exchange.observe_turn(&event,2)?;
-        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),agent_by_id:HashMap::new() };
+        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() };
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![interaction_entry("settled"),entry])?;
         let document = DocumentId("streamed-message".into());
@@ -1929,7 +1929,7 @@ mod tests {
             exchange.observe_turn(&event, 2)?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![
-                TimelineEntry::Exchange { id: "active".into(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new() },
+                TimelineEntry::Exchange { id: "active".into(), created_at_ms: 0, exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() },
                 TimelineEntry::Status { checks: None,
                     id: "session:status".into(),
                     created_at_ms: 0,
@@ -1987,7 +1987,7 @@ mod tests {
         active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
         active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
         let active = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
-            exchange:serde_json::from_value(active["exchange"].take())?,agent_by_id:HashMap::new() };
+            exchange:serde_json::from_value(active["exchange"].take())?,check_runs: Vec::new(), agent_by_id:HashMap::new() };
         let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else { unreachable!() };
         let mut entries: Vec<_> = (0..3000).map(|index| interaction_entry(&format!("history-{index}"))).collect();
         entries.push(active);
@@ -2049,7 +2049,7 @@ mod tests {
         exchange.observe_turn(&event, 2)?;
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange: exchange.clone(), agent_by_id: HashMap::new() }])?;
+            exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
         let document = DocumentId("hidden-parallel".into());
         let view = ViewId("hidden-parallel-view".into());
         let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
@@ -2086,7 +2086,7 @@ mod tests {
             status: Some("inProgress".into()), output_delta: false, change: Default::default() });
         exchange.observe_turn(&event, 4)?;
         owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange: exchange.clone(), agent_by_id: HashMap::new() }])?;
+            exchange: exchange.clone(), check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
         assert_eq!(owner.snapshot(&document)?.block.iter().filter(|block|
             block.metadata.node.as_ref().is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)).count(), 1,
             "new calls must replace the preview even after explicit group expansion");
@@ -2095,7 +2095,7 @@ mod tests {
         exchange.state = crate::exchange::ExchangeState::Complete;
         exchange.completed_at_ms = Some(5);
         owner.reconcile(vec![TimelineEntry::Exchange { id: "parallel".into(), created_at_ms: 0,
-            exchange, agent_by_id: HashMap::new() }])?;
+            exchange, check_runs: Vec::new(), agent_by_id: HashMap::new() }])?;
         let activity = "parallel:exchange";
         let generation = owner.open.as_ref().unwrap().sections.nodes.generation(activity).unwrap();
         owner.dispatch(PresentationRequest::Node { request: NodeRequest {
@@ -2346,7 +2346,7 @@ mod tests {
         TimelineEntry::Exchange {
             id: identity.into(),
             created_at_ms: 0,
-            agent_by_id: HashMap::new(),
+            check_runs: Vec::new(), agent_by_id: HashMap::new(),
             exchange: interaction,
         }
     }
@@ -2425,7 +2425,7 @@ mod tests {
             let mut exchange:Exchange = serde_json::from_value(value["exchange"].take())?;
             let mut owner = SessionPresentation::new("session".into());
             owner.initialize(vec![TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
-                exchange:exchange.clone(),agent_by_id:HashMap::new() }])?;
+                exchange:exchange.clone(),check_runs: Vec::new(), agent_by_id:HashMap::new() }])?;
             let document = DocumentId("stream-page".into());
             let view = ViewId("view".into());
             owner.open(document.clone(),view.clone(),WidthProfile::default())?;
@@ -2464,7 +2464,7 @@ mod tests {
         entry["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![TimelineEntry::Exchange { id:"paged".into(), created_at_ms:0,
-            exchange:serde_json::from_value(entry["exchange"].take())?, agent_by_id:HashMap::new() }])?;
+            exchange:serde_json::from_value(entry["exchange"].take())?, check_runs: Vec::new(), agent_by_id:HashMap::new() }])?;
         let document = DocumentId("paged-tools".into());
         let view = ViewId("view:paged".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
@@ -2644,7 +2644,7 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: exchange.created_at_ms,
                     exchange: exchange.clone(),
-                    agent_by_id: HashMap::new(),
+                    check_runs: Vec::new(), agent_by_id: HashMap::new(),
                 }
             } else {
                 let child = agent_entry("child", vec![exchange.clone()], Vec::new());
@@ -2769,7 +2769,7 @@ mod tests {
         } });
         let entry = |child: Exchange| TimelineEntry::Exchange {
             id: parent.id.clone(), created_at_ms: 0, exchange: parent.clone(),
-            agent_by_id: HashMap::from([(run.id.clone(), TimelineEntry::AgentLifecycle {
+            check_runs: Vec::new(), agent_by_id: HashMap::from([(run.id.clone(), TimelineEntry::AgentLifecycle {
                 id: run.id.clone(), created_at_ms: 0, run: run.clone(), exchange: vec![child], agent: Vec::new(),
             })]),
         };

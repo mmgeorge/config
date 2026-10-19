@@ -176,6 +176,7 @@ function M.open(state, host)
     local active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
       state.pending_config or {}, state.task_config or {})
     active.status_thoughts = state.status_thoughts == true
+    active.check_timing = state.check_timing or "after_queue"
     local configuration_revision = 0
     local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
@@ -199,6 +200,7 @@ function M.open(state, host)
         active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
           state.pending_config or {}, state.task_config or {})
         active.status_thoughts = state.status_thoughts == true
+        active.check_timing = state.check_timing or "after_queue"
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -279,6 +281,8 @@ function M.open(state, host)
         configure({ lsp_tools = (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) ~= true })
       elseif id == "status-thoughts" then
         configure({ status_thoughts = active.status_thoughts ~= true })
+      elseif id == "check-timing" then
+        configure({ check_timing = active.check_timing == "between_work" and "after_queue" or "between_work" })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -311,6 +315,7 @@ function M.open(state, host)
             { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
             { id = "answer_timeout", label = "Answer timeout", columns = { "Answer timeout", duration.render(duration.value(active.answer_timeout), timeout_focus.answer_timeout), "Automatically answer questions using recommended defaults · 0 disables" } },
             { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
+            { id = "check-timing", label = "Automatic checks", columns = { "Automatic checks", picker_field.render(active.check_timing == "between_work" and "Between queued work" or "After queue", true), "Run after each work item or once the queue finishes" } },
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },

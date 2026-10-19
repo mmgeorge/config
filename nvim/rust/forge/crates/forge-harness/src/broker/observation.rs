@@ -4,6 +4,8 @@ use super::*;
 pub(crate) struct BrokerObserver {
     pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
     pub(crate) status_thoughts: AtomicBool,
+    pub(crate) check_editing: Arc<AtomicBool>,
+    pub(crate) completion_queue: crate::checks::CompletionQueue,
     pub(super) data_root: PathBuf,
     pub(super) session_id: String,
     pub(super) runtime_epoch: String,
@@ -26,6 +28,29 @@ pub(super) struct ObservationMetadata {
 }
 
 impl BrokerObserver {
+    /// Persists conversation-scoped check editing without starting or interrupting a turn.
+    pub(super) fn set_check_editing(&self, enabled: bool) -> Result<Value> {
+        let session = SqliteStore::open(&self.data_root)?.load_session(&self.session_id)?
+            .context("observed session is missing")?;
+        let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
+        let snapshot = settings.get(&session.workspace, &session.id, &session.backend)?;
+        let mut desired = settings.layer_settings(crate::settings::SettingScope::Session, &session.workspace, &session.id)?;
+        desired.check_editing = Some(enabled);
+        settings.update(snapshot.revision, crate::settings::SettingScope::Session, &session.workspace, &session.id, &desired)?;
+        self.check_editing.store(enabled, Ordering::Release);
+        Ok(json!({"check_editing": enabled}))
+    }
+
+    /// Adopts a current host's ordered queue publication independently of execution.
+    pub(crate) fn update_queue(&self, params: &Value) -> Result<()> {
+        anyhow::ensure!(params["runtime_epoch"].as_str() == Some(&self.runtime_epoch),
+            "queue update belongs to a retired Harness host");
+        self.completion_queue.update(
+            params["revision"].as_u64().context("queue update requires revision")?,
+            params["pending"].as_bool().context("queue update requires pending")?,
+        )
+    }
+
     /// Reads current durable state together with the last published runtime metadata.
     pub(crate) fn snapshot(&self) -> Result<BrokerSnapshot> {
         let revision = self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1;
@@ -56,6 +81,9 @@ impl BrokerObserver {
     fn build(&self, store: &SqliteStore, source_session: &HarnessSession, metadata: &ObservationMetadata, agent_run_list: Vec<Agent>, revision: u64) -> Result<BrokerSnapshot> {
         let status_thoughts = self.status_thoughts.load(Ordering::Relaxed);
         let mut session = source_session.clone();
+        let settings = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(&session.workspace, &session.id, &session.backend)?.desired;
+        let check_timing = settings.check_timing.unwrap_or_default();
         (session.approval_timeout, session.answer_timeout) = self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = source_session
             .goal_id
@@ -189,9 +217,12 @@ impl BrokerObserver {
             subagent_tools:self.agent_coordinator.enabled(),
             lsp_tools:self.lsp.enabled(&source_session.id),
             status_thoughts,
+            check_editing: self.check_editing.load(Ordering::Acquire),
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: revision,
             checks_running,
+            check_timing,
+            checks_deferred: self.completion_queue.deferred()?,
             active_check_run,
             task_operation: store.latest_task_operation(&source_session.id)?
                 .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
@@ -231,6 +262,7 @@ impl BrokerObserver {
     /// Handles session queries and independent metadata writes without a provider turn lock.
     pub(crate) fn query(&self, method: HarnessMethod, params: Value) -> Result<Option<Value>> {
         let result = match method {
+            HarnessMethod::ChecksEditing => self.set_check_editing(params["enabled"].as_bool().context("check editing requires enabled")?)?,
             HarnessMethod::StateGet => serde_json::to_value(self.snapshot()?)?,
             HarnessMethod::TaskList => serde_json::to_value(SqliteStore::open(&self.data_root)?.list_task(&self.session_id)?)?,
             HarnessMethod::AgentList => serde_json::to_value(self.snapshot()?.agent)?,

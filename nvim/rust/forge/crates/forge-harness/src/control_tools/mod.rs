@@ -226,13 +226,13 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "checks_configure",
-                description: "Save project checks and managed Nushell helpers during /checks setup after the user answers the setup questions. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
+                description: "Save project checks and managed Nushell helpers when check editing is enabled by /checks setup on or guided /checks setup. Guided setup requires answers to its setup questions. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))
                     .expect("check configuration schema is serializable"),
             },
             ControlToolDefinition {
                 name: "checks_run",
-                description: "Run enabled configured checks by ID with optional file or exact test-case selections. Never supplies replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
+                description: "Optionally run enabled configured checks for earlier feedback. Checks run automatically at the configured queue boundary, so manual runs are generally unnecessary. Supports IDs and optional file or exact test-case selections, never replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest))
                     .expect("check run schema is serializable"),
             },

@@ -2261,7 +2261,7 @@ mod test {
             let rendered = crate::buffer::projection::project(
                 &crate::timeline::TimelineEntry::Exchange {
                     id: exchange.id.clone(), created_at_ms: 0, exchange,
-                    agent_by_id: std::collections::HashMap::new(),
+                    check_runs: Vec::new(), agent_by_id: std::collections::HashMap::new(),
                 }, &forge_buffer::width::WidthProfile::default(), false, &std::collections::HashMap::new(), &std::collections::HashMap::new(),
             )?;
             assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter().any(|text| text.contains("CURRENT"))));

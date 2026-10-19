@@ -55,6 +55,7 @@ controller.configure = function(params, _, completed)
   client.request_for("settings-session", "session.configure", params, function(result)
     state.session = result
     if params.status_thoughts ~= nil then state.status_thoughts = params.status_thoughts end
+    if params.check_timing then state.check_timing = params.check_timing end
     completed(true)
   end)
 end
@@ -69,6 +70,14 @@ local success, failure = xpcall(function()
   assert(not text:find("[←", 1, true), text)
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
+  local timing = options["check-timing"]
+  assert(timing.columns[2]:find("After queue", 1, true), "queue completion is not the default")
+  instance.spec.action_list[2].callback({ option = timing })
+  assert(state.check_timing == "between_work", "queue timing did not toggle")
+  local updated_text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
+  assert(updated_text:find("Between queued work", 1, true), updated_text)
+  instance.spec.action_list[1].callback({ option = timing })
+  assert(state.check_timing == "after_queue", "queue timing did not return to its default")
   local status_thoughts = options["status-thoughts"]
   assert(status_thoughts.label == "Status thoughts")
   assert(status_thoughts.columns[1] == "Status thoughts" and status_thoughts.columns[2]:find("Off", 1, true))

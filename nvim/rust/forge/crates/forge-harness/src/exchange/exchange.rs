@@ -63,7 +63,7 @@ pub(crate) enum ExchangeActivity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
     #[serde(default)]
-    /// Retains one check baseline across automatic repair exchanges.
+    /// Retains one check baseline across queued work and automatic repair turns.
     pub check_owner: Option<String>,
     /// Durable failure that keeps cleanup retryable without replaying execution.
     #[serde(default)]
@@ -472,6 +472,18 @@ impl Exchange {
             self.execution_started_at_ms.get_or_insert(now_ms);
         }
         Ok(())
+    }
+
+    /// Reopen completed source work for its automatic check repair without replacing its identity.
+    pub(crate) fn repair_checks(&mut self, now_ms: i64) -> anyhow::Result<()> {
+        anyhow::ensure!(self.state == ExchangeState::Complete && !self.awaiting_input
+            && self.elicitation.is_none() && self.check_owner.is_some(),
+            "automatic repair requires a completed exchange with check ownership");
+        self.state = ExchangeState::Running;
+        self.completed_at_ms = None;
+        self.finalization_outcome = None;
+        self.finalization_error = None;
+        self.resume(now_ms)
     }
 
     /// Settle interrupted provider turns while retaining the request and its original checkpoint.

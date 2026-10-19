@@ -80,7 +80,12 @@ M.empty_diff_rows = {}
 ---@field render_namespace integer?
 ---@field render_initialized boolean
 ---@field render_fold_signature? string
----@field queue (string|{text: string, config: table})[]
+---@field queue (string|ForgeQueuedPrompt)[]
+---@field check_queue? ForgeCheckQueuePublication
+---@field check_editing? boolean
+---@field check_timing? 'after_queue'|'between_work'
+---@field check_timing_request? integer
+---@field checks_deferred? boolean
 ---@field configuring? boolean
 ---@field configuring_config? table
 ---@field configuration_revision? integer

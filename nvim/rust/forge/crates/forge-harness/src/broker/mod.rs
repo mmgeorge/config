@@ -148,9 +148,12 @@ pub struct BrokerSnapshot {
     pub subagent_tools:bool,
     pub lsp_tools:bool,
     pub status_thoughts: bool,
+    pub check_editing: bool,
     pub runtime_epoch: String,
     pub snapshot_revision: u64,
     pub checks_running: bool,
+    pub check_timing: crate::checks::CheckTiming,
+    pub checks_deferred: bool,
     pub active_check_run: Option<String>,
     pub task_operation: Option<Value>,
     pub session: HarnessSession,
@@ -779,6 +782,8 @@ impl HarnessBroker {
         let observer = Arc::new(observation::BrokerObserver {
             lsp: runtime.lsp.clone(),
             status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
+            check_editing: Arc::new(AtomicBool::new(shared.desired.check_editing.unwrap_or(false))),
+            completion_queue: Default::default(),
             data_root: data_root.clone(), session_id: session.id.clone(),
             runtime_epoch: Uuid::new_v4().to_string(), snapshot_revision: AtomicU64::new(0),
             metadata: RwLock::new(observation::ObservationMetadata {
@@ -1191,6 +1196,10 @@ impl HarnessBroker {
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Value, Vec<SessionEvent>)>> + Send + '_>> {
         match method {
             HarnessMethod::ChecksSetup => Box::pin(self.setup_checks(params)),
+            HarnessMethod::ChecksComplete => Box::pin(async move {
+                let result = (serde_json::to_value(self.snapshot()?)?, Vec::new());
+                self.settle_automatic_checks(result, PromptMode::Chat).await
+            }),
             HarnessMethod::ChecksList | HarnessMethod::ChecksOverride | HarnessMethod::ChecksRun | HarnessMethod::ChecksStatus | HarnessMethod::ChecksCancel | HarnessMethod::ChecksSaveDefaults => Box::pin(self.project_checks(method, params)),
             HarnessMethod::TaskTransition => self.transition_task(params),
             HarnessMethod::BackendModels => Box::pin(self.list_backend_model()),
@@ -1234,6 +1243,7 @@ impl HarnessBroker {
             self.refresh_lease()?;
         }
         match method {
+            HarnessMethod::ChecksEditing => Ok((self.observer.set_check_editing(params["enabled"].as_bool().context("check editing requires enabled")?)?, Vec::new())),
             HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
             HarnessMethod::LspAuthorize
             | HarnessMethod::AttachmentImport
@@ -3752,6 +3762,15 @@ Planning continuation: turn {} of {}.",
         let task = self.current_task()?.filter(|task| !task.status.terminal());
         let owner = task.as_ref().map(|task| task.id.clone()).unwrap_or(change_owner.clone());
         let mut automatic = AutomaticChecks::open(&self.check_runner.root, &owner)?;
+        let timing = crate::settings::SettingsStore::open(&self.data_root)?
+            .get(&self.session.workspace, &self.session.id, &self.session.backend)?
+            .desired.check_timing.unwrap_or_default();
+        if self.observer.completion_queue.defer(timing, &change_owner)? {
+            automatic.pending = true;
+            automatic.save()?;
+            result.0["checks_deferred"] = json!(true);
+            return Ok(result);
+        }
         loop {
             if self.turn_cancellation.requested.load(Ordering::Acquire) { return Err(anyhow::Error::new(TurnCancelled)); }
             if let Some(id) = self.check_runner.active()? {
@@ -3760,7 +3779,9 @@ Planning continuation: turn {} of {}.",
             }
             self.check_runner.refresh_changes().await?;
             let mut run = self.check_runner.prepare_request(RunRequest::default(), task.as_ref().map(|task| task.id.clone()), self.session.shell, "Automatic completion checks".into())?;
+            run.exchange_id = Some(interaction.id.clone());
             if !run.commands.iter().any(|command| command.state != CheckState::Skipped) {
+                self.observer.completion_queue.finish()?;
                 automatic.pending = false;
                 automatic.blocked = None;
                 automatic.delivered.clear();
@@ -3801,6 +3822,7 @@ Planning continuation: turn {} of {}.",
                 return Ok(result);
             }
             let Some(prompt) = repair else {
+                self.observer.completion_queue.finish()?;
                 result.0["automatic_checks"] = json!({"run_id":run.id,"state":run.state});
                 return Ok(result);
             };
@@ -3819,7 +3841,6 @@ Planning continuation: turn {} of {}.",
             let mut admission = ExchangeAdmission::chat(String::new());
             admission.check_owner = Some(change_owner.clone());
             admission.automatic_owner = Some(owner.clone());
-            admission.lifecycle = Some("Check repair started".into());
             let repaired = Box::pin(self.run_interaction_input_inner(prompt.clone(), PromptMode::Chat, Some(admission), BackendInput::from_text(prompt))).await?;
             result.0 = repaired.0;
             result.1.extend(repaired.1);
@@ -3920,7 +3941,10 @@ Planning continuation: turn {} of {}.",
     ) -> Result<()> {
         runtime.checkpoint.take();
         let saved = result.and_then(|checkpoint| {
-            let owner = interaction.check_owner.as_ref().or(interaction.execution_id.as_ref()).or(interaction.goal_id.as_ref()).unwrap_or(&interaction.id).clone();
+            let queued_owner = if interaction.execution_id.is_none() {
+                self.observer.completion_queue.owner()?
+            } else { None };
+            let owner = interaction.check_owner.as_ref().or(queued_owner.as_ref()).or(interaction.execution_id.as_ref()).or(interaction.goal_id.as_ref()).unwrap_or(&interaction.id).clone();
             interaction.check_owner = Some(owner.clone());
             self.check_runner.begin_changes(owner, &checkpoint)?;
             interaction.checkpoint_before = Some(checkpoint.id.clone());
@@ -4070,7 +4094,8 @@ Planning continuation: turn {} of {}.",
             if self.turn_cancellation.requested.load(Ordering::Acquire) {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
-            let output = self
+            // Heap-owned child futures keep resumed repair polling within the worker stack.
+            let output = Box::pin(self
                 .prompt_provider_with_timeline(
                     request.clone(),
                     interaction,
@@ -4078,7 +4103,7 @@ Planning continuation: turn {} of {}.",
                     &continuation_result,
                     &mut parent_input,
                     &mut deferred_input,
-                )
+                ))
                 .await?;
             for task in continuation_result.drain(..) {
                 self.acknowledge_agent_result(task)?;
@@ -4350,6 +4375,7 @@ Planning continuation: turn {} of {}.",
             permissions:Arc::clone(&self.permission_coordinator),
             address:crate::backend::ProviderAddress {owner:Some(request.owner()?),thread_id:self.session.id.clone(),turn_id:interaction.id.clone()},
             authorization_sink:backend_event_sink.clone(),
+            editing:Arc::clone(&self.observer.check_editing),
             setup:interaction.check_setup.is_some(),
             setup_reviewed:interaction.check_setup == Some(crate::checks::CheckSetupState::Reviewed),
             can_run:interaction.check_setup.is_none() && self.agent_coordinator.active_count() == 0 && execution.is_none(),
@@ -4382,7 +4408,8 @@ Planning continuation: turn {} of {}.",
                     .prompt_stream(request, Some(backend_event_sink))
                     .await
         });
-        let outcome = async {
+        // Event-loop state must not remain inline in the provider lifecycle future.
+        let outcome = Box::pin(async {
             loop {
                 tokio::select! {
                     biased;
@@ -4562,7 +4589,7 @@ Planning continuation: turn {} of {}.",
                     },
                 }
             }
-        }.await;
+        }).await;
         provider_task.shutdown().await;
         let outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
             Err(anyhow::Error::new(TurnCancelled))
@@ -4886,428 +4913,473 @@ Planning continuation: turn {} of {}.",
         Ok(())
     }
 
-    async fn process_backend_event(
+    // Allocate before returning so callers never embed the event future in their own state.
+    fn process_backend_event<'event>(
+        &'event mut self,
+        runtime: &'event mut ExchangeRuntime,
+        interaction: &'event mut Exchange,
+        mut backend_event: BackendEvent,
+        event: &'event mut Vec<SessionEvent>,
+    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + Send + 'event>> {
+        Box::pin(async move {
+            if backend_event.kind == "directory_access_granted" {
+                let grants: Vec<crate::permissions::directory::DirectoryGrant> =
+                    serde_json::from_value(backend_event.data)?;
+                for grant in grants {
+                    let directories = match grant.operation {
+                        crate::permissions::directory::DirectoryOperation::Read => &mut self.session.access.readable_directory,
+                        crate::permissions::directory::DirectoryOperation::Write => &mut self.session.access.writable_directory,
+                    };
+                    if !directories.contains(&grant.path) { directories.push(grant.path); }
+                }
+                self.save_session()?;
+                let goal = self.session.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten();
+                let goal_execution = self.store.list_plan_execution(&self.session.id)?
+                    .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
+                self.emit_backend_event(BackendEvent { address: None, turn_boundary: None,
+                    received_at_ms: None, kind: "execution_state".into(), text: None,
+                    activity: None, summary: None, task_update: None,
+                    data: json!({ "session": self.session, "task": self.store.list_task(&self.session.id)?, "goal": goal,
+                        "goal_execution": goal_execution }) }, event).await?;
+                return Ok(());
+            }
+            if backend_event.address.as_ref().and_then(|address| address.owner.as_ref())
+                .is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id)) {
+                self.trace.record(&self.session.id,"provider.event.rejected",json!({
+                    "event_type":backend_event.kind,"code":"foreign_execution_owner",
+                }));
+                return Ok(());
+            }
+            if backend_event.kind == "error" {
+                self.emit_backend_event(backend_event,event).await?;
+                return Ok(());
+            }
+            if backend_event.kind == "runtime_resolved" {
+                let resolved: crate::backend::BackendRuntime =
+                    serde_json::from_value(backend_event.data.clone())?;
+                anyhow::ensure!(backend_event.address.is_none(), "runtime identity must belong to the session stream");
+                if !resolved.provider.is_empty() {
+                    self.session.provider_label = resolved.provider;
+                }
+                if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
+                    self.session.resolved_model = Some(model);
+                }
+                self.save_session()?;
+                backend_event.data = json!({
+                    "session_id": self.session.id,
+                    "provider": self.session.provider_label,
+                    "model": self.session.resolved_model,
+                });
+                self.emit_backend_event(backend_event, event).await?;
+                return Ok(());
+            }
+            if let Some(compaction) = backend_event.compaction()? {
+                return Box::pin(self.process_compaction_event(runtime, interaction, backend_event, compaction, event)).await;
+            }
+            if !self.capability.compaction.background
+                && matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
+                && let Some(address) = &backend_event.address {
+                let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+                interaction.unconfirm_compaction(&address.thread_id, now_ms);
+                for child in self.child_exchange_runtime_by_agent.values_mut() {
+                    child.exchange.unconfirm_compaction(&address.thread_id, now_ms);
+                }
+            }
+            if let Some(received) = backend_event.received_at_ms {
+                self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
+                    "event_type":backend_event.kind,
+                    "tool_id":backend_event.activity.as_ref().map(|activity|activity.id.as_str()),
+                    "received_at_ms":received,
+                    "queue_delay_ms":self.clock.now_ms().saturating_sub(received).max(0),
+                    "provider_at_ms":backend_event.observed_at_ms(received),
+                }));
+            }
+            if backend_event.kind == "approval_requested" {
+                let request_id = backend_event.data["id"].as_str().context("approval request omitted its id")?;
+                if !self.permission_coordinator.pending_list()?.iter().any(|approval| approval.id == request_id) { return Ok(()); }
+                let execution_owner = backend_event.address.as_ref().and_then(|address|address.owner.as_ref());
+                if let Some(owner) = execution_owner {
+                    anyhow::ensure!(owner.session_id == self.session.id, "approval crosses session ownership");
+                }
+                let owner = if let Some(execution_owner) = execution_owner {
+                    if execution_owner.is_root() { &mut *interaction }
+                    else { &mut self.child_exchange_runtime_by_agent.get_mut(&execution_owner.agent_id)
+                        .context("approval refers to an inactive child execution")?.exchange }
+                } else if let Some(address) = backend_event.address.as_ref() {
+                    if interaction
+                        .turn
+                        .iter()
+                        .any(|turn| turn.provider() == address)
+                    {
+                        &mut *interaction
+                    } else {
+                        &mut self
+                            .child_exchange_runtime_by_agent
+                            .values_mut()
+                            .find(|child| {
+                                child
+                                    .exchange
+                                    .turn
+                                    .iter()
+                                    .any(|turn| turn.provider() == address)
+                            })
+                            .context("approval refers to an unknown child execution")?
+                            .exchange
+                    }
+                } else {
+                    &mut *interaction
+                };
+                let turn = owner.turn.iter().find(|turn| {
+                    turn.state() == crate::turn::TurnState::Running
+                        && backend_event
+                            .address
+                            .as_ref()
+                            .is_none_or(|address| turn.provider() == address
+                                || (execution_owner.is_some() && address.turn_id.is_empty()
+                                    && turn.provider().thread_id == address.thread_id))
+                });
+                let id = backend_event
+                    .data
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .context("approval request omitted its id")?;
+                let Some(approval) = self.permission_coordinator.bind_owner(
+                    id,
+                    &owner.id,
+                    turn.map(|turn| turn.id()),
+                )? else { return Ok(()); };
+                owner.observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
+                self.store.save_exchange(owner)?;
+                backend_event.data = serde_json::to_value(approval)?;
+                self.emit_live(backend_event, event).await?;
+                return Ok(());
+            }
+            if matches!(
+                backend_event.kind.as_str(),
+                "approval_resolved" | "approval_cancelled"
+            ) {
+                let approval: ApprovalRequestView = serde_json::from_value(backend_event.data.clone())?;
+                let now_ms = self.clock.now_ms();
+                if approval.exchange_id.as_deref() == Some(interaction.id.as_str())
+                    || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_none_or(|owner| owner.is_root())) {
+                    interaction.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                    interaction.approval_resolution.push(approval.clone());
+                    self.store.save_exchange(interaction)?;
+                } else if let Some(owner) = self
+                    .child_exchange_runtime_by_agent
+                    .values_mut()
+                    .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str())
+                        || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_some_and(|identity| identity.agent_id == owner.exchange.agent_id)))
+                {
+                    owner.exchange.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                    owner.exchange.approval_resolution.push(approval.clone());
+                    self.store.save_exchange(&owner.exchange)?;
+                }
+                self.emit_live(backend_event, event).await?;
+                return Ok(());
+            }
+            if backend_event.kind == "parent_boundary" {
+                let boundary = backend_event
+                    .data
+                    .get("boundary")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let now_ms = self.clock.now_ms();
+                match boundary {
+                    "wait_started" => {
+                        interaction.observe_blocker("agent_wait".into(), true, now_ms);
+                        interaction.close_running_messages();
+                        runtime.active_wait = Some(ActiveWait {
+                            exchange_id: interaction.id.clone(),
+                            started_at_ms: now_ms,
+                            agent_count: backend_event
+                                .data
+                                .get("agent_count")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default() as usize,
+                        });
+                        self.store.save_exchange(interaction)?;
+                    }
+                    "wait_updated" => {
+                        if let Some(wait) = runtime.active_wait.as_mut() {
+                            wait.agent_count = backend_event
+                                .data
+                                .get("agent_count")
+                                .and_then(Value::as_u64)
+                                .unwrap_or_default()
+                                as usize;
+                        }
+                    }
+                    "wait_ended" => {
+                        interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                        runtime.active_wait = None;
+                        self.store.save_exchange(interaction)?;
+                    }
+                    _ => return Ok(()),
+                }
+                self.emit_active_wait(interaction, runtime, event).await?;
+                return Ok(());
+            }
+            if backend_event.kind == "agent_lifecycle" {
+                self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event).await?;
+                return Ok(());
+            }
+            if backend_event.address.as_ref().is_some_and(|address| {
+                address.owner.as_ref().is_some_and(|owner| {
+                    owner != &crate::backend::ExecutionOwner::root(&self.session.id)
+                }) || self.diagnostic_native_thread.contains(&address.thread_id)
+                    || self
+                        .agent_registry
+                        .get_by_thread(&address.thread_id)
+                        .is_some_and(|agent| !agent.is_primary())
+            }) {
+                self.trace.record(
+                    &self.session.id,
+                    "provider.event.rejected",
+                    json!({
+                    "event_type":backend_event.kind,"code":"foreign_or_native_child_execution",
+                    }),
+                );
+                return Ok(());
+            }
+            if Box::pin(self.route_settled_parent_event(interaction, &backend_event, event)).await? {
+                return Ok(());
+            }
+            Box::pin(self.admit_native_goal_continuation(runtime, interaction, &backend_event, event)).await?;
+            let started_provider_thread = if matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Started)) {
+                backend_event.address.as_ref().map(|address| address.thread_id.clone())
+            } else { None };
+            admit_addressless_turn(
+                interaction,
+                &mut runtime.synthetic_turn,
+                &mut backend_event,
+                self.clock.now_ms(),
+            )?;
+            if !interaction.observe_turn(&backend_event, self.clock.now_ms())? {
+                self.trace.record(
+                    &self.session.id,
+                    "provider.event.rejected",
+                    json!({
+                        "exchange_id": interaction.id,
+                        "thread_id": backend_event.address.as_ref().map(|address| &address.thread_id),
+                        "turn_id": backend_event.address.as_ref().map(|address| &address.turn_id),
+                        "event_type": backend_event.kind,
+                        "code": "execution_unknown_or_settled",
+                    }),
+                );
+                return Ok(());
+            }
+            if let Some(thread_id) = started_provider_thread
+                && self.session.backend_session_id.as_deref() != Some(thread_id.as_str())
+            {
+                self.session.backend_session_id = Some(thread_id);
+                self.save_session()?;
+            }
+            if backend_event.turn_boundary.is_some() {
+                self.store.save_exchange(interaction)?;
+                if backend_event.kind == "turn_started" {
+                    self.emit_backend_event(backend_event, event).await?;
+                }
+                return Ok(());
+            }
+            if backend_event.kind == "steering_input" {
+                runtime.retraction_eligible = false;
+                let now_ms = self.clock.now_ms();
+                interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                runtime.active_wait = None;
+                interaction.append_input(
+                    crate::exchange::InputIntent::Steering,
+                    backend_event.text.unwrap_or_default(),
+                    now_ms,
+                )?;
+                self.store.save_exchange(interaction)?;
+                self.emit_live_interaction(
+                    BackendEvent {
+                received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "timeline_node_updated".into(),
+                        text: None,
+                        data: json!({
+                            "exchange_id": interaction.id,
+                            "node": interaction.node_list.last(),
+                        }),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    },
+                    interaction,
+                    event,
+                )
+                .await?;
+                self.emit_active_wait(interaction, runtime, event).await?;
+                return Ok(());
+            }
+            if backend_event.task_update.is_some()
+                || backend_event.activity.is_some()
+                || (backend_event.kind == "assistant_message"
+                    && backend_event
+                        .text
+                        .as_deref()
+                        .is_some_and(|text| !text.is_empty()))
+                || backend_event.kind == "error"
+            {
+                runtime.retraction_eligible = false;
+            }
+            if backend_event.kind == "context_usage" {
+                let context_usage: ContextUsage = serde_json::from_value(backend_event.data.clone())?;
+                let thread_id = backend_event.address.as_ref().map(|address| address.thread_id.as_str())
+                    .or(self.session.backend_session_id.as_deref());
+                if let Some(thread_id) = thread_id
+                    && interaction.observe_compaction_usage(thread_id, context_usage.used) {
+                    self.store.save_exchange(interaction)?;
+                    let patch = self.reconcile_timeline()?;
+                    self.emit_timeline_patch(patch, event).await?;
+                } else if let Some(thread_id) = thread_id
+                    && !interaction.node_list.iter().any(|node| matches!(node,
+                        ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id))
+                    && let Some(mut record) = self.store.list_session_event(&self.session.id)?.into_iter().rev()
+                        .find(|record| matches!(&record.detail, SessionEventKind::Compaction { compaction }
+                            if compaction.thread_id == thread_id))
+                    && let SessionEventKind::Compaction { compaction } = &mut record.detail
+                    && compaction.state == crate::backend::CompactionState::Completed
+                    && compaction.result.context_tokens_before.is_some()
+                    && compaction.result.context_tokens_after.is_none()
+                    && !self.store.list_exchange(&self.session.id)?.iter().any(|exchange|
+                        exchange.node_list.iter().any(|node| matches!(node,
+                            ExchangeNode::Compaction { compaction, .. }
+                                if compaction.thread_id == thread_id
+                                    && compaction.started_at_ms.unwrap_or(exchange.created_at_ms) >= record.created_at_ms)))
+                    && compaction.observe_context_usage(context_usage.used) {
+                    self.store.save_session_event(&record)?;
+                    let patch = self.reconcile_timeline()?;
+                    self.emit_timeline_patch(patch, event).await?;
+                }
+                if backend_event.address.as_ref().is_none_or(|address|
+                    self.session.backend_session_id.as_deref() == Some(address.thread_id.as_str())) {
+                    self.session.context_usage = Some(context_usage);
+                self.context_usage_fresh = true;
+                }
+                self.emit_backend_event(backend_event, event).await?;
+                return Ok(());
+            }
+            if let Some(update) = backend_event.task_update.as_ref() {
+                runtime.task.replace(update);
+                interaction.task = Some(runtime.task.snapshot().clone());
+                self.store.save_exchange(interaction)?;
+                self.emit_live_interaction(
+                    BackendEvent {
+                received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "timeline_task_updated".into(),
+                        text: None,
+                        data: serde_json::to_value(runtime.task.snapshot())?,
+                        activity: None,
+                        summary: None,
+                        task_update: Some(update.clone()),
+                    },
+                    interaction,
+                    event,
+                )
+                .await?;
+            }
+            if backend_event.address.is_some() {
+                attribute_provider_tool(interaction, &mut runtime.task, &backend_event)?;
+                if backend_event.tool_output_delta().is_some() {
+                    self.store.save_tool_output_delta(interaction, &backend_event)?;
+                } else {
+                    self.store.save_exchange(interaction)?;
+                }
+                self.emit_live_interaction(backend_event, interaction, event)
+                    .await?;
+                return Ok(());
+            }
+            Ok(())
+        })
+    }
+
+    async fn process_compaction_event(
         &mut self,
         runtime: &mut ExchangeRuntime,
         interaction: &mut Exchange,
-        mut backend_event: BackendEvent,
+        backend_event: BackendEvent,
+        mut compaction: crate::backend::Compaction,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        if backend_event.kind == "directory_access_granted" {
-            let grants: Vec<crate::permissions::directory::DirectoryGrant> =
-                serde_json::from_value(backend_event.data)?;
-            for grant in grants {
-                let directories = match grant.operation {
-                    crate::permissions::directory::DirectoryOperation::Read => &mut self.session.access.readable_directory,
-                    crate::permissions::directory::DirectoryOperation::Write => &mut self.session.access.writable_directory,
-                };
-                if !directories.contains(&grant.path) { directories.push(grant.path); }
-            }
-            self.save_session()?;
-            let goal = self.session.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten();
-            let goal_execution = self.store.list_plan_execution(&self.session.id)?
-                .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
-            self.emit_backend_event(BackendEvent { address: None, turn_boundary: None,
-                received_at_ms: None, kind: "execution_state".into(), text: None,
-                activity: None, summary: None, task_update: None,
-                data: json!({ "session": self.session, "task": self.store.list_task(&self.session.id)?, "goal": goal,
-                    "goal_execution": goal_execution }) }, event).await?;
+        if compaction.state == crate::backend::CompactionState::Running
+            && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+        {
+            compaction.result.context_tokens_before = compaction
+                .result
+                .context_tokens_before
+                .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
+        }
+        let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+        let previous_owner = self.compaction_exchange_owner(&compaction)?;
+        let owns_other_exchange = previous_owner.as_ref().is_some_and(|owner| {
+            owner.id != interaction.id
+                && !self
+                    .child_exchange_runtime_by_agent
+                    .values()
+                    .any(|child| child.exchange.id == owner.id)
+        });
+        let owns_session_event =
+            self.store
+                .list_session_event(&self.session.id)?
+                .iter()
+                .any(|record| {
+                    matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
+                if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+                });
+        if owns_other_exchange || owns_session_event {
+            self.retain_external_compaction(compaction, now_ms)?;
+            let patch = self.reconcile_timeline()?;
+            self.emit_timeline_patch(patch, event).await?;
             return Ok(());
         }
-        if backend_event.address.as_ref().and_then(|address| address.owner.as_ref())
-            .is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id)) {
-            self.trace.record(&self.session.id,"provider.event.rejected",json!({
-                "event_type":backend_event.kind,"code":"foreign_execution_owner",
-            }));
-            return Ok(());
-        }
-        if backend_event.kind == "error" {
-            self.emit_backend_event(backend_event,event).await?;
-            return Ok(());
-        }
-        if backend_event.kind == "runtime_resolved" {
-            let resolved: crate::backend::BackendRuntime =
-                serde_json::from_value(backend_event.data.clone())?;
-            anyhow::ensure!(backend_event.address.is_none(), "runtime identity must belong to the session stream");
-            if !resolved.provider.is_empty() {
-                self.session.provider_label = resolved.provider;
-            }
-            if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
-                self.session.resolved_model = Some(model);
-            }
-            self.save_session()?;
-            backend_event.data = json!({
-                "session_id": self.session.id,
-                "provider": self.session.provider_label,
-                "model": self.session.resolved_model,
-            });
-            self.emit_backend_event(backend_event, event).await?;
-            return Ok(());
-        }
-        if let Some(mut compaction) = backend_event.compaction()? {
-            if compaction.state == crate::backend::CompactionState::Running
-                && self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str()) {
-                compaction.result.context_tokens_before = compaction.result.context_tokens_before
-                    .or_else(|| self.session.context_usage.as_ref().map(|usage| usage.used));
-            }
-            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
-            let previous_owner = self.compaction_exchange_owner(&compaction)?;
-            let owns_other_exchange = previous_owner.as_ref().is_some_and(|owner|
-                owner.id != interaction.id && !self.child_exchange_runtime_by_agent.values()
-                    .any(|child| child.exchange.id == owner.id));
-            let owns_session_event = self.store.list_session_event(&self.session.id)?.iter().any(|record|
-                matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
-                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id));
-            if owns_other_exchange || owns_session_event {
-                self.retain_external_compaction(compaction, now_ms)?;
-                let patch = self.reconcile_timeline()?;
-                self.emit_timeline_patch(patch, event).await?;
-                return Ok(());
-            }
-            let child_id = self.agent_registry.get_by_thread(&compaction.thread_id)
-                .map(|agent| agent.id.clone())
-                .filter(|id| self.child_exchange_runtime_by_agent.contains_key(id))
-                .or_else(|| self.child_exchange_runtime_by_agent.iter().find(|(_, child)| {
-                child.exchange.turn.iter().any(|turn| turn.provider().thread_id == compaction.thread_id)
-            }).map(|(id, _)| id.clone()));
-            if let Some(child_id) = child_id {
-                let mut child = self.child_exchange_runtime_by_agent.remove(&child_id)
-                    .context("compaction owner disappeared")?;
-                child.exchange.observe_compaction(compaction, now_ms);
-                let result = async {
-                    self.store.save_exchange(&child.exchange)?;
-                    self.emit_live_interaction(backend_event, &child.exchange, event).await
-                }.await;
-                self.child_exchange_runtime_by_agent.insert(child_id, child);
-                result?;
-            } else if self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
-                || interaction.turn.iter().any(|turn| turn.provider().thread_id == compaction.thread_id)
-            {
-                runtime.retraction_eligible = false;
-                interaction.observe_compaction(compaction, now_ms);
-                self.store.save_exchange(interaction)?;
-                self.emit_live_interaction(backend_event, interaction, event).await?;
-            }
-            return Ok(());
-        }
-        if !self.capability.compaction.background
-            && matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
-            && let Some(address) = &backend_event.address {
-            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
-            interaction.unconfirm_compaction(&address.thread_id, now_ms);
-            for child in self.child_exchange_runtime_by_agent.values_mut() {
-                child.exchange.unconfirm_compaction(&address.thread_id, now_ms);
-            }
-        }
-        if let Some(received) = backend_event.received_at_ms {
-            self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
-                "event_type":backend_event.kind,
-                "tool_id":backend_event.activity.as_ref().map(|activity|activity.id.as_str()),
-                "received_at_ms":received,
-                "queue_delay_ms":self.clock.now_ms().saturating_sub(received).max(0),
-                "provider_at_ms":backend_event.observed_at_ms(received),
-            }));
-        }
-        if backend_event.kind == "approval_requested" {
-            let request_id = backend_event.data["id"].as_str().context("approval request omitted its id")?;
-            if !self.permission_coordinator.pending_list()?.iter().any(|approval| approval.id == request_id) { return Ok(()); }
-            let execution_owner = backend_event.address.as_ref().and_then(|address|address.owner.as_ref());
-            if let Some(owner) = execution_owner {
-                anyhow::ensure!(owner.session_id == self.session.id, "approval crosses session ownership");
-            }
-            let owner = if let Some(execution_owner) = execution_owner {
-                if execution_owner.is_root() { &mut *interaction }
-                else { &mut self.child_exchange_runtime_by_agent.get_mut(&execution_owner.agent_id)
-                    .context("approval refers to an inactive child execution")?.exchange }
-            } else if let Some(address) = backend_event.address.as_ref() {
-                if interaction
-                    .turn
+        let child_id = self
+            .agent_registry
+            .get_by_thread(&compaction.thread_id)
+            .map(|agent| agent.id.clone())
+            .filter(|id| self.child_exchange_runtime_by_agent.contains_key(id))
+            .or_else(|| {
+                self.child_exchange_runtime_by_agent
                     .iter()
-                    .any(|turn| turn.provider() == address)
-                {
-                    &mut *interaction
-                } else {
-                    &mut self
-                        .child_exchange_runtime_by_agent
-                        .values_mut()
-                        .find(|child| {
-                            child
-                                .exchange
-                                .turn
-                                .iter()
-                                .any(|turn| turn.provider() == address)
-                        })
-                        .context("approval refers to an unknown child execution")?
-                        .exchange
-                }
-            } else {
-                &mut *interaction
-            };
-            let turn = owner.turn.iter().find(|turn| {
-                turn.state() == crate::turn::TurnState::Running
-                    && backend_event
-                        .address
-                        .as_ref()
-                        .is_none_or(|address| turn.provider() == address
-                            || (execution_owner.is_some() && address.turn_id.is_empty()
-                                && turn.provider().thread_id == address.thread_id))
+                    .find(|(_, child)| {
+                        child
+                            .exchange
+                            .turn
+                            .iter()
+                            .any(|turn| turn.provider().thread_id == compaction.thread_id)
+                    })
+                    .map(|(id, _)| id.clone())
             });
-            let id = backend_event
-                .data
-                .get("id")
-                .and_then(Value::as_str)
-                .context("approval request omitted its id")?;
-            let Some(approval) = self.permission_coordinator.bind_owner(
-                id,
-                &owner.id,
-                turn.map(|turn| turn.id()),
-            )? else { return Ok(()); };
-            owner.observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
-            self.store.save_exchange(owner)?;
-            backend_event.data = serde_json::to_value(approval)?;
-            self.emit_live(backend_event, event).await?;
-            return Ok(());
-        }
-        if matches!(
-            backend_event.kind.as_str(),
-            "approval_resolved" | "approval_cancelled"
-        ) {
-            let approval: ApprovalRequestView = serde_json::from_value(backend_event.data.clone())?;
-            let now_ms = self.clock.now_ms();
-            if approval.exchange_id.as_deref() == Some(interaction.id.as_str())
-                || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_none_or(|owner| owner.is_root())) {
-                interaction.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
-                interaction.approval_resolution.push(approval.clone());
-                self.store.save_exchange(interaction)?;
-            } else if let Some(owner) = self
+        if let Some(child_id) = child_id {
+            let mut child = self
                 .child_exchange_runtime_by_agent
-                .values_mut()
-                .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str())
-                    || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_some_and(|identity| identity.agent_id == owner.exchange.agent_id)))
-            {
-                owner.exchange.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
-                owner.exchange.approval_resolution.push(approval.clone());
-                self.store.save_exchange(&owner.exchange)?;
+                .remove(&child_id)
+                .context("compaction owner disappeared")?;
+            child.exchange.observe_compaction(compaction, now_ms);
+            let result = async {
+                self.store.save_exchange(&child.exchange)?;
+                self.emit_live_interaction(backend_event, &child.exchange, event)
+                    .await
             }
-            self.emit_live(backend_event, event).await?;
-            return Ok(());
-        }
-        if backend_event.kind == "parent_boundary" {
-            let boundary = backend_event
-                .data
-                .get("boundary")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let now_ms = self.clock.now_ms();
-            match boundary {
-                "wait_started" => {
-                    interaction.observe_blocker("agent_wait".into(), true, now_ms);
-                    interaction.close_running_messages();
-                    runtime.active_wait = Some(ActiveWait {
-                        exchange_id: interaction.id.clone(),
-                        started_at_ms: now_ms,
-                        agent_count: backend_event
-                            .data
-                            .get("agent_count")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default() as usize,
-                    });
-                    self.store.save_exchange(interaction)?;
-                }
-                "wait_updated" => {
-                    if let Some(wait) = runtime.active_wait.as_mut() {
-                        wait.agent_count = backend_event
-                            .data
-                            .get("agent_count")
-                            .and_then(Value::as_u64)
-                            .unwrap_or_default()
-                            as usize;
-                    }
-                }
-                "wait_ended" => {
-                    interaction.observe_blocker("agent_wait".into(), false, now_ms);
-                    runtime.active_wait = None;
-                    self.store.save_exchange(interaction)?;
-                }
-                _ => return Ok(()),
-            }
-            self.emit_active_wait(interaction, runtime, event).await?;
-            return Ok(());
-        }
-        if backend_event.kind == "agent_lifecycle" {
-            self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event).await?;
-            return Ok(());
-        }
-        if backend_event.address.as_ref().is_some_and(|address| {
-            address.owner.as_ref().is_some_and(|owner| {
-                owner != &crate::backend::ExecutionOwner::root(&self.session.id)
-            }) || self.diagnostic_native_thread.contains(&address.thread_id)
-                || self
-                    .agent_registry
-                    .get_by_thread(&address.thread_id)
-                    .is_some_and(|agent| !agent.is_primary())
-        }) {
-            self.trace.record(
-                &self.session.id,
-                "provider.event.rejected",
-                json!({
-                "event_type":backend_event.kind,"code":"foreign_or_native_child_execution",
-                }),
-            );
-            return Ok(());
-        }
-        if self.route_settled_parent_event(interaction, &backend_event, event).await? {
-            return Ok(());
-        }
-        self.admit_native_goal_continuation(runtime, interaction, &backend_event, event).await?;
-        let started_provider_thread = if matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Started)) {
-            backend_event.address.as_ref().map(|address| address.thread_id.clone())
-        } else { None };
-        admit_addressless_turn(
-            interaction,
-            &mut runtime.synthetic_turn,
-            &mut backend_event,
-            self.clock.now_ms(),
-        )?;
-        if !interaction.observe_turn(&backend_event, self.clock.now_ms())? {
-            self.trace.record(
-                &self.session.id,
-                "provider.event.rejected",
-                json!({
-                    "exchange_id": interaction.id,
-                    "thread_id": backend_event.address.as_ref().map(|address| &address.thread_id),
-                    "turn_id": backend_event.address.as_ref().map(|address| &address.turn_id),
-                    "event_type": backend_event.kind,
-                    "code": "execution_unknown_or_settled",
-                }),
-            );
-            return Ok(());
-        }
-        if let Some(thread_id) = started_provider_thread
-            && self.session.backend_session_id.as_deref() != Some(thread_id.as_str())
-        {
-            self.session.backend_session_id = Some(thread_id);
-            self.save_session()?;
-        }
-        if backend_event.turn_boundary.is_some() {
-            self.store.save_exchange(interaction)?;
-            if backend_event.kind == "turn_started" {
-                self.emit_backend_event(backend_event, event).await?;
-            }
-            return Ok(());
-        }
-        if backend_event.kind == "steering_input" {
-            runtime.retraction_eligible = false;
-            let now_ms = self.clock.now_ms();
-            interaction.observe_blocker("agent_wait".into(), false, now_ms);
-            runtime.active_wait = None;
-            interaction.append_input(
-                crate::exchange::InputIntent::Steering,
-                backend_event.text.unwrap_or_default(),
-                now_ms,
-            )?;
-            self.store.save_exchange(interaction)?;
-            self.emit_live_interaction(
-                BackendEvent {
-            received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "timeline_node_updated".into(),
-                    text: None,
-                    data: json!({
-                        "exchange_id": interaction.id,
-                        "node": interaction.node_list.last(),
-                    }),
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                },
-                interaction,
-                event,
-            )
-            .await?;
-            self.emit_active_wait(interaction, runtime, event).await?;
-            return Ok(());
-        }
-        if backend_event.task_update.is_some()
-            || backend_event.activity.is_some()
-            || (backend_event.kind == "assistant_message"
-                && backend_event
-                    .text
-                    .as_deref()
-                    .is_some_and(|text| !text.is_empty()))
-            || backend_event.kind == "error"
+            .await;
+            self.child_exchange_runtime_by_agent.insert(child_id, child);
+            result?;
+        } else if self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+            || interaction
+                .turn
+                .iter()
+                .any(|turn| turn.provider().thread_id == compaction.thread_id)
         {
             runtime.retraction_eligible = false;
-        }
-        if backend_event.kind == "context_usage" {
-            let context_usage: ContextUsage = serde_json::from_value(backend_event.data.clone())?;
-            let thread_id = backend_event.address.as_ref().map(|address| address.thread_id.as_str())
-                .or(self.session.backend_session_id.as_deref());
-            if let Some(thread_id) = thread_id
-                && interaction.observe_compaction_usage(thread_id, context_usage.used) {
-                self.store.save_exchange(interaction)?;
-                let patch = self.reconcile_timeline()?;
-                self.emit_timeline_patch(patch, event).await?;
-            } else if let Some(thread_id) = thread_id
-                && !interaction.node_list.iter().any(|node| matches!(node,
-                    ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id))
-                && let Some(mut record) = self.store.list_session_event(&self.session.id)?.into_iter().rev()
-                    .find(|record| matches!(&record.detail, SessionEventKind::Compaction { compaction }
-                        if compaction.thread_id == thread_id))
-                && let SessionEventKind::Compaction { compaction } = &mut record.detail
-                && compaction.state == crate::backend::CompactionState::Completed
-                && compaction.result.context_tokens_before.is_some()
-                && compaction.result.context_tokens_after.is_none()
-                && !self.store.list_exchange(&self.session.id)?.iter().any(|exchange|
-                    exchange.node_list.iter().any(|node| matches!(node,
-                        ExchangeNode::Compaction { compaction, .. }
-                            if compaction.thread_id == thread_id
-                                && compaction.started_at_ms.unwrap_or(exchange.created_at_ms) >= record.created_at_ms)))
-                && compaction.observe_context_usage(context_usage.used) {
-                self.store.save_session_event(&record)?;
-                let patch = self.reconcile_timeline()?;
-                self.emit_timeline_patch(patch, event).await?;
-            }
-            if backend_event.address.as_ref().is_none_or(|address|
-                self.session.backend_session_id.as_deref() == Some(address.thread_id.as_str())) {
-                self.session.context_usage = Some(context_usage);
-            self.context_usage_fresh = true;
-            }
-            self.emit_backend_event(backend_event, event).await?;
-            return Ok(());
-        }
-        if let Some(update) = backend_event.task_update.as_ref() {
-            runtime.task.replace(update);
-            interaction.task = Some(runtime.task.snapshot().clone());
+            interaction.observe_compaction(compaction, now_ms);
             self.store.save_exchange(interaction)?;
-            self.emit_live_interaction(
-                BackendEvent {
-            received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "timeline_task_updated".into(),
-                    text: None,
-                    data: serde_json::to_value(runtime.task.snapshot())?,
-                    activity: None,
-                    summary: None,
-                    task_update: Some(update.clone()),
-                },
-                interaction,
-                event,
-            )
-            .await?;
-        }
-        if backend_event.address.is_some() {
-            attribute_provider_tool(interaction, &mut runtime.task, &backend_event)?;
-            if backend_event.tool_output_delta().is_some() {
-                self.store.save_tool_output_delta(interaction, &backend_event)?;
-            } else {
-                self.store.save_exchange(interaction)?;
-            }
             self.emit_live_interaction(backend_event, interaction, event)
                 .await?;
-            return Ok(());
         }
         Ok(())
     }
@@ -7263,6 +7335,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             resource_selection = Some(settings.desired);
         }
         let mut configured = self.session.clone();
+        let check_timing = params.get("check_timing")
+            .map(|value| serde_json::from_value::<crate::checks::CheckTiming>(value.clone())).transpose()?;
         if let Some(value) = params.get("auto_compaction") {
             let policy: crate::session::AutoCompaction = serde_json::from_value(value.clone())?;
             policy.validate(configured.context_usage.as_ref())?;
@@ -7449,6 +7523,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             let mut changed = false;
             if params.get("access").is_some() { portable.access = Some(self.session.access.clone()); changed = true; }
             if params.get("shell").is_some() { portable.shell = Some(self.session.shell); changed = true; }
+            if let Some(value) = check_timing {
+                portable.check_timing = Some(value);
+                changed = true;
+            }
             if params.get("default_write_permission").is_some() { portable.default_write_permission = Some(self.session.default_write_permission); changed = true; }
             if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
             if params.get("auto_compaction").is_some() { portable.auto_compaction = Some(self.session.auto_compaction.clone()); changed = true; }
@@ -7997,8 +8075,10 @@ mod test {
         async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
         async fn active_session_id_for(&self, _: &str) -> Option<String> { None }
         async fn rollback_cancelled_turn_for(&self, _: &str) -> Result<bool> { Ok(false) }
-        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
-            request.control_context.as_ref().unwrap().checkpoint.as_ref().unwrap().wait().await?;
+        async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            if let Some(checkpoint) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref()) {
+                checkpoint.wait().await?;
+            }
             let turn = self.turns.fetch_add(1, Ordering::SeqCst);
             if turn == 0 || self.repair {
                 std::fs::write(Path::new(&request.workspace).join("seed.txt"), if turn > 0 { "fixed" } else { "broken" })?;
@@ -8015,8 +8095,159 @@ mod test {
                     if run["state"] != "running" { break; }
                 }
             }
+            if let Some(sink) = sink {
+                let address = crate::backend::ProviderAddress {
+                    owner: Some(request.owner()?), thread_id: "automatic-check-stream".into(), turn_id: turn.to_string(),
+                };
+                for (kind, boundary, text) in [
+                    ("turn_started", Some(crate::backend::TurnBoundary::Started), None),
+                    ("assistant_message", None, Some("")),
+                    ("assistant_message", None, Some("Check repair response")),
+                    ("turn_completed", Some(crate::backend::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed }), None),
+                ] {
+                    sink.send_wait(BackendEvent {
+                        received_at_ms: None, address: Some(address.clone()), turn_boundary: boundary,
+                        kind: kind.into(), text: text.map(str::to_owned), data: json!({"provider_message_id":"repair-message","provider_message_phase":"commentary"}),
+                        activity: None, summary: None, task_update: None,
+                    }).await?;
+                }
+            }
             Ok(crate::backend::BackendOutput::default())
         }
+    }
+
+    #[tokio::test]
+    async fn automatic_checks_preserve_the_queue_baseline_and_timing() -> Result<()> {
+        for timing in [crate::checks::CheckTiming::AfterQueue, crate::checks::CheckTiming::BetweenWork] {
+            let repository = repository();
+            let data = tempfile::tempdir()?;
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            broker.session.execution_mode = PermissionMode::Yolo;
+            broker.session.shell = crate::session::CheckShell::Nushell;
+            broker.configure_session(json!({"check_timing":timing})).await?;
+            assert_eq!(broker.snapshot()?.check_timing, timing);
+            let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            broker.backend = Arc::new(AutomaticCheckBackend { turns: turns.clone(), repair: false, explicit: false });
+            std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
+                "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
+                "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
+            }]}}).to_string())?;
+            broker.observer.completion_queue.update(1, true)?;
+            broker.run_interaction("First queued edit".into(), PromptMode::Chat,
+                Some(ExchangeAdmission::chat("First queued edit".into()))).await?;
+            let first_owner = broker.store.list_exchange(&broker.session.id)?.last().unwrap().check_owner.clone();
+            let first_history = broker.check_runner.snapshot()?.history;
+            assert_eq!(first_history.len(), usize::from(timing == crate::checks::CheckTiming::BetweenWork));
+            broker.observer.completion_queue.update(2, false)?;
+            broker.observer.completion_queue.update(1, true)?;
+            broker.run_interaction("Last queued item without edits".into(), PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Last queued item without edits".into()))).await?;
+            let history = broker.check_runner.snapshot()?.history;
+            assert_eq!(history.iter().flat_map(|run| &run.commands)
+                .filter(|command| command.state == crate::checks::CheckState::Passed).count(), 1);
+            assert!(!broker.snapshot()?.checks_deferred);
+            if timing == crate::checks::CheckTiming::AfterQueue {
+                assert_eq!(broker.store.list_exchange(&broker.session.id)?.last().unwrap().check_owner, first_owner);
+            }
+            assert_eq!(turns.load(Ordering::SeqCst), 2);
+            let reopened = crate::settings::SettingsStore::open(data.path())?
+                .get(&broker.session.workspace, &broker.session.id, &broker.session.backend)?;
+            assert_eq!(reopened.desired.check_timing, Some(timing));
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_checks_complete_when_remaining_queue_is_removed() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.execution_mode = PermissionMode::Yolo;
+        broker.session.shell = crate::session::CheckShell::Nushell;
+        let turns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        broker.backend = Arc::new(AutomaticCheckBackend { turns: turns.clone(), repair: false, explicit: false });
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
+            "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
+            "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
+        }]}}).to_string())?;
+        assert_eq!(broker.snapshot()?.check_timing, crate::checks::CheckTiming::AfterQueue);
+        broker.observer.completion_queue.update(1, true)?;
+        broker.run_interaction("Queued edit".into(), PromptMode::Chat,
+            Some(ExchangeAdmission::chat("Queued edit".into()))).await?;
+        assert!(broker.snapshot()?.checks_deferred);
+        broker.observer.completion_queue.update(2, false)?;
+        let result = broker.dispatch(Request { id: 1, method: "checks.complete".into(), params: json!({}) }).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        assert_eq!(broker.check_runner.snapshot()?.history.len(), 1);
+        assert!(!broker.snapshot()?.checks_deferred);
+        assert_eq!(turns.load(Ordering::SeqCst), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn automatic_checks_repair_after_permission_resume_on_worker() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.shell = crate::session::CheckShell::Nushell;
+        broker.backend = Arc::new(AutomaticCheckBackend {
+            turns: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            repair: true,
+            explicit: false,
+        });
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
+            "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,
+            "trigger":{"kind":"files_changed","include":["seed.txt"]},
+            "all":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }"}
+        }]}}).to_string())?;
+        let (mut exchange, _, _) = broker
+            .interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
+            .await?;
+        broker
+            .start_exchange_runtime(&mut exchange, broker.clock.now_ms())
+            .await?;
+        let mut runtime = broker.exchange_runtime.take().unwrap();
+        broker
+            .collect_initial_checkpoint(&mut runtime, &mut exchange)
+            .await?;
+        broker.exchange_runtime = Some(runtime);
+        exchange.pause(broker.clock.now_ms());
+        broker.store.save_exchange(&exchange)?;
+        let worker = std::thread::spawn(move || -> Result<()> {
+            // Reserve half the normal worker stack for the enclosing host request lifecycle.
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_stack_size(1024 * 1024)
+                .enable_all()
+                .build()?;
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    let result = broker
+                        .dispatch(Request {
+                            id: 1,
+                            method: "task.transition".into(),
+                            params: json!({"action":"permission","mode":"write","resume":true}),
+                        })
+                        .await;
+                    anyhow::ensure!(
+                        result.response.error().is_none(),
+                        "{:?}",
+                        result.response.error()
+                    );
+                    anyhow::ensure!(
+                        broker
+                            .check_runner
+                            .history()?
+                            .iter()
+                            .any(|run| run.state == crate::checks::CheckState::Passed),
+                        "resumed repair did not pass"
+                    );
+                    Ok::<_, anyhow::Error>(())
+                })
+                .await?
+            })
+        });
+        worker.join().expect("repair worker panicked")
     }
 
     #[tokio::test]
@@ -8032,7 +8263,19 @@ mod test {
             std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{"id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,"trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }"}}]}}).to_string())?;
             let result = tokio::time::timeout(std::time::Duration::from_secs(10), broker.run_interaction("Change source".into(), PromptMode::Chat, Some(ExchangeAdmission::chat("Change source".into())))).await.context("automatic repair did not settle within ten seconds")??;
             assert_eq!(turns.load(Ordering::SeqCst), 2);
+            let exchanges = broker.store.list_exchange(&broker.session.id)?;
+            assert_eq!(exchanges.len(), 1, "automatic repair must remain in the original exchange");
+            assert_eq!(exchanges[0].prompt, "Change source");
+            assert_eq!(exchanges[0].turn.len(), 2);
             let history = broker.check_runner.history()?;
+            assert!(history.iter().all(|run| run.exchange_id.as_deref() == Some(exchanges[0].id.as_str())));
+            let timeline = broker.snapshot()?.timeline;
+            assert!(!timeline.iter().any(|entry| matches!(entry, TimelineEntry::Checks { .. })));
+            let attached = timeline.iter().find_map(|entry| match entry {
+                TimelineEntry::Exchange { exchange, check_runs, .. } if exchange.id == exchanges[0].id => Some(check_runs),
+                _ => None,
+            }).unwrap();
+            assert_eq!(attached.len(), history.len());
             assert_eq!(history.iter().flat_map(|run| &run.commands).filter(|command| command.started_at_ms.is_some()).count(), if repair { 2 } else { 1 });
             assert_eq!(result.0["automatic_checks"].get("blocked").is_some(), !repair);
         }
@@ -12290,6 +12533,33 @@ mod test {
     }
 
     #[tokio::test]
+    async fn check_editing_permission_controls_existing_tool_scope() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let broker = planning_question_broker(repository.path(), data.path(), false);
+        let (sink, _events) = crate::backend::events::channel();
+        let (scope, _lease) = crate::checks::CheckToolScope::open(Arc::clone(&broker.check_runner), crate::checks::CheckAuthority {
+            task_id: None, shell: broker.session.shell, mode: PromptMode::Chat,
+            permission: PermissionMode::Yolo, permissions: Arc::clone(&broker.permission_coordinator),
+            address: crate::backend::ProviderAddress {owner: None, thread_id: broker.session.id.clone(), turn_id: "editing-test".into()},
+            authorization_sink: sink, editing: Arc::clone(&broker.observer.check_editing),
+            setup: false, setup_reviewed: false, can_run: true,
+            agent: Arc::clone(&broker.agent_coordinator), cancelled: Arc::new(AtomicBool::new(false)), sink: None,
+        });
+        let request = || -> Result<Value> { Ok(json!({
+            "expected_revision": broker.check_runner.catalog(None)?["revision"],
+            "config": {"version": 2, "definitions": []}
+        })) };
+        assert!(scope.invoke("checks_configure", request()?).await.unwrap_err().to_string().contains("disabled"));
+        broker.observer.set_check_editing(true)?;
+        scope.invoke("checks_configure", request()?).await?;
+        broker.observer.set_check_editing(false)?;
+        assert!(scope.invoke("checks_configure", request()?).await.unwrap_err().to_string().contains("disabled"));
+        assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn check_setup_followups_stop_after_configuration_publication() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -12316,6 +12586,7 @@ mod test {
                     "config": {"version": 2, "definitions": []}
                 }))
                 .unwrap(),
+                None,
                 None,
             )
             .await

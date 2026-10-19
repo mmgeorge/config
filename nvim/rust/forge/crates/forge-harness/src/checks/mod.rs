@@ -1,6 +1,7 @@
 mod applicability;
 mod activity;
 mod automatic;
+mod queue;
 mod changes;
 mod config;
 mod evidence;
@@ -33,3 +34,5 @@ pub(crate) use tools::CheckAuthority;
 pub(crate) use tools::CheckToolScope;
 pub(crate) use tools::ConfigureChecks;
 pub(crate) use automatic::AutomaticChecks;
+pub use queue::CheckTiming;
+pub(crate) use queue::CompletionQueue;

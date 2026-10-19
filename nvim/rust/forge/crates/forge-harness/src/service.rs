@@ -404,6 +404,10 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.unwrap_or(&registry.initial_session_id);
         let controller = registry.resolve(session_id).await?;
+        if request.method == "queue.update" {
+            controller.observer.update_queue(&request.params)?;
+            return Ok(());
+        }
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         admit_task_intent(&controller, session_id, request, &mut store)?;
         Ok(())
@@ -1251,6 +1255,11 @@ async fn route_request(
     }
     let controller = registry.resolve(&session_id).await?;
     controller.attach_compaction(message_sink).await?;
+    if method == HarnessMethod::QueueUpdate {
+        controller.observer.update_queue(&request.params)?;
+        message_sink.send_response(Response::success(request.id, json!({"revision":request.params["revision"]}))?).await?;
+        return Ok(());
+    }
     if let Some(value) = controller.observer.query(method, request.params.clone())? {
         message_sink.send_response(Response::success(request.id, value)?).await?;
         return Ok(());
@@ -1284,6 +1293,21 @@ async fn route_request(
         };
         for event in event { message_sink.send_event(event).await?; }
         message_sink.send_response(Response::success(request.id, model_list)?).await?;
+        return Ok(());
+    }
+    if method == HarnessMethod::SessionConfigure
+        && request.params.as_object().is_some_and(|fields|
+            fields.len() == 1 && fields.contains_key("check_timing"))
+    {
+        let timing: crate::checks::CheckTiming = serde_json::from_value(request.params["check_timing"].clone())?;
+        let catalog = controller.catalog_request.read().await.clone();
+        let mut settings = crate::settings::SettingsStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let snapshot = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?;
+        let mut desired = settings.layer_settings(crate::settings::SettingScope::Global, &catalog.workspace, &session_id)?;
+        desired.check_timing = Some(timing);
+        settings.update(snapshot.revision, crate::settings::SettingScope::Global, &catalog.workspace, &session_id, &desired)?;
+        let timing = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?.desired.check_timing.unwrap_or_default();
+        message_sink.send_response(Response::success(request.id, json!({"check_timing":timing}))?).await?;
         return Ok(());
     }
     if method == HarnessMethod::SessionConfigure
@@ -2725,6 +2749,37 @@ mod tests {
         drop(execution);
         let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
         assert_eq!(settings.get(&fixture.path().to_string_lossy(), &session_id, "mock")?.desired.answer_timeout, Some(answer));
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn check_editing_toggles_without_prompt_or_execution_admission() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        assert_eq!(opened.result().unwrap()["check_editing"], false);
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let execution = controller.execution_admission.acquire().await?;
+        let broker = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        for (index, enabled) in [true, false, true].into_iter().enumerate() {
+            assert!(service.prepare(Some(&session_id), HarnessMethod::ChecksEditing).await?.is_none());
+            tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
+                id: index as u64 + 2, method: "checks.editing".into(), params: json!({"enabled": enabled}),
+            }, &sink)).await??;
+            let snapshot = controller.observer.snapshot()?;
+            assert_eq!(snapshot.check_editing, enabled);
+            assert!(snapshot.exchange.is_empty());
+            assert!(controller.execution_admission.try_acquire().is_err());
+            let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
+            assert_eq!(settings.layer_settings(crate::settings::SettingScope::Session, &snapshot.session.workspace, &session_id)?.check_editing, Some(enabled));
+            assert_eq!(settings.get(&snapshot.session.workspace, "another-session", "mock")?.desired.check_editing, None);
+        }
+        drop(broker);
+        drop(execution);
         service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }

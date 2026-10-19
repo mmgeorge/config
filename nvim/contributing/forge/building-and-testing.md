@@ -140,6 +140,7 @@ the repository root in a fresh Neovim, with an external 30-second deadline:
 ```nu
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_package_checks.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_automatic_checks.lua
+nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_check_queue_host.lua
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_check_lifecycle_host.lua
 ```
 
@@ -152,6 +153,9 @@ cleanup. Use [Extending project checks](extending-project-checks.md) to choose
 additional cases when changing supported package managers or case runners.
 
 The automatic-check fixture exercises the completion gate through a fresh host.
+The queue fixture verifies both timing choices, persistence, the first change
+baseline across queued work, and validation after deleting the final queued item.
+Allow a 60-second external deadline for its five delayed provider turns.
 It verifies one executed failure, one reused failure, a repair turn stopping
 without progress, and explicit multi-check execution including a nonautomatic
 check. It uses a three-second mock provider and a temporary Git repository.
@@ -257,6 +261,11 @@ Run `harness_prompt_lifecycle.lua` for composer preservation during check interr
 `harness_configuration_host.lua` against the rebuilt executable for thinking changes with
 stale editor busy state. Terminal inventory tests assert a configuration-free attachment
 and connection reuse across both pagination and repeated polls.
+
+Run `harness_check_repair_resume_host.lua` for a permission change that resumes an
+ordinary exchange, fails its automatic check, and retains one exchange through its
+repair attempt and attached results. The `automatic_checks_repair_after_permission_resume_on_worker` Rust test
+also streams provider events through that lifecycle with a 1 MiB worker stack.
 
 From the repository root, verify whitespace and the affected documentation links:
 

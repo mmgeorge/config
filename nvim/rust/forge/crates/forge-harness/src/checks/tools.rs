@@ -57,6 +57,7 @@ pub(crate) struct CheckToolScope {
     permission: PermissionMode,
     permissions: Arc<crate::backend::approval::PermissionCoordinator>,
     address: crate::backend::ProviderAddress,
+    editing: Arc<AtomicBool>,
     setup: bool,
     setup_reviewed: bool,
     can_run: bool,
@@ -80,6 +81,7 @@ pub(crate) struct CheckAuthority {
     pub permissions: Arc<crate::backend::approval::PermissionCoordinator>,
     pub address: crate::backend::ProviderAddress,
     pub authorization_sink: BackendEventSink,
+    pub editing: Arc<AtomicBool>,
     pub setup: bool,
     /// Whether this setup exchange consumed an explicit user answer.
     pub setup_reviewed: bool,
@@ -102,7 +104,12 @@ impl Drop for CheckToolLease {
 }
 
 impl CheckToolScope {
-    /// Reports the host-owned setup decision state to the deterministic fixture provider.
+    /// Reads live permission so an existing turn observes user revocation.
+    pub(crate) fn editing_enabled(&self) -> bool {
+        self.editing.load(Ordering::Acquire)
+    }
+
+    /// Reports the guided setup decision state to the deterministic fixture provider.
     pub(crate) fn setup_reviewed(&self) -> Option<bool> {
         self.setup.then_some(self.setup_reviewed)
     }
@@ -119,6 +126,7 @@ impl CheckToolScope {
             permissions,
             address,
             authorization_sink,
+            editing,
             setup,
             setup_reviewed,
             can_run,
@@ -134,6 +142,7 @@ impl CheckToolScope {
             permission,
             permissions,
             address,
+            editing,
             setup,
             setup_reviewed,
             can_run,
@@ -165,7 +174,11 @@ impl CheckToolScope {
             "checks_list" => self.runner.catalog_preview(self.task_id.as_deref(), self.shell).await?,
             "checks_configure" => {
                 ensure!(
-                    self.setup && self.setup_reviewed,
+                    self.editing_enabled(),
+                    "Check editing is disabled. The user can enable it with /checks setup on or start guided /checks setup."
+                );
+                ensure!(
+                    !self.setup || self.setup_reviewed,
                     "Check setup must ask the user about functional areas, automatic suites, and coverage cost with question_ask before saving. Continue /checks setup after the user answers."
                 );
                 ensure!(
@@ -201,7 +214,7 @@ impl CheckToolScope {
                     "an agent started during check configuration authorization"
                 );
                 self.runner
-                    .configure(request, delivery.lifecycle.as_ref())
+                    .configure(request, delivery.lifecycle.as_ref(), Some(&self.editing))
                     .await?
             }
             "checks_run" => {
@@ -218,12 +231,13 @@ impl CheckToolScope {
                     "automated checks are owned by Harness during plan execution and cannot race active writing agents"
                 );
                 let request = serde_json::from_value(arguments)?;
-                let run = self.runner.prepare_request(
+                let mut run = self.runner.prepare_request(
                     request,
                     self.task_id.clone(),
                     self.shell,
                     "Agent requested".into(),
                 )?;
+                run.exchange_id = Some(self.address.turn_id.clone());
                 let run = self.runner.resolve(run).await?;
                 let target_list = run
                     .commands
@@ -500,6 +514,7 @@ impl CheckSupervisor {
                 helpers: Vec::new(),
             },
             sink,
+            None,
         )
         .await?;
         self.set_overrides(task_id, Default::default())
@@ -510,6 +525,7 @@ impl CheckSupervisor {
         &self,
         request: ConfigureChecks,
         sink: Option<&BackendEventSink>,
+        editing: Option<&AtomicBool>,
     ) -> Result<Value> {
         ensure!(
             self.active()?.is_none(),
@@ -627,6 +643,8 @@ impl CheckSupervisor {
         let temporary = self
             .workspace
             .join(format!(".forge.json.{}.tmp", uuid::Uuid::new_v4()));
+        ensure!(editing.is_none_or(|permission| permission.load(Ordering::Acquire)),
+            "Check editing was disabled before configuration publication");
         let publication = (|| {
             for (path, _, source) in &helpers {
                 super::config::reject_links(&self.workspace, path)?;

@@ -1037,6 +1037,7 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
                 helpers: vec![helper],
             },
             None,
+            None,
         )
         .await?;
     assert_eq!(std::fs::read_to_string(workspace.path().join(".forge/checks/select.nu"))?, helper_source);
@@ -1057,6 +1058,7 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
                     config,
                     helpers: vec![helper]
                 },
+                None,
                 None
             )
             .await
@@ -1087,6 +1089,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
                 },
                 helpers: Vec::new(),
             },
+            None,
             None,
         )
         .await?;
@@ -1129,6 +1132,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
                     },
                     helpers: Vec::new()
                 },
+                None,
                 None
             )
             .await
@@ -1155,6 +1159,7 @@ async fn setup_bootstraps_an_empty_non_git_directory_and_records_configuration_e
                 },
                 helpers: Vec::new(),
             },
+            None,
             None,
         )
         .await?;

@@ -14,7 +14,7 @@ end
 ---@param state table
 ---@param result table
 function HarnessSnapshot.apply(state, result)
-  result = presentation_value(result)
+  result = assert(presentation_value(result), "Harness snapshot is missing")
   if state.session and result.session and state.session.id == result.session.id
     and state.runtime_epoch == result.runtime_epoch
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
@@ -56,7 +56,10 @@ function HarnessSnapshot.apply(state, result)
   state.subagent_tools = result.subagent_tools == true
   state.lsp_tools = result.lsp_tools == true
   state.status_thoughts = result.status_thoughts == true
+  state.check_editing = result.check_editing == true
   state.checks_running = result.checks_running == true
+  state.check_timing = result.check_timing or "after_queue"
+  state.checks_deferred = result.checks_deferred == true
   state.active_check_run = result.active_check_run
   state.timeline_revision = result.timeline_revision or 0
   state.status = result.status or { kind = "idle" }
