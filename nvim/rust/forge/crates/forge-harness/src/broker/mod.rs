@@ -4996,7 +4996,24 @@ Planning continuation: turn {} of {}.",
             if run.state == CheckState::Interrupted {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
+            if run.state == CheckState::Stale {
+                continue;
+            }
             let repair = automatic.observe(&run)?;
+            if matches!(run.state, CheckState::Stopped | CheckState::ExecutionError) {
+                if let Some(mut task) = self.current_task()? {
+                    task.status = crate::task::TaskStatus::Paused;
+                    task.reason = Some(if run.state == CheckState::Stopped {
+                        "Checks stopped. Run checks explicitly to retry unchanged inputs.".into()
+                    } else {
+                        "Check execution needs attention. Inspect the recorded execution error."
+                            .into()
+                    });
+                    self.store.save_task(&task)?;
+                }
+                result.0["automatic_checks"] = json!({"run_id":run.id,"state":run.state});
+                return Ok(result);
+            }
             if let Some(reason) = &automatic.blocked {
                 if let Some(mut task) = self.current_task()? {
                     task.status = crate::task::TaskStatus::Blocked;
@@ -11413,6 +11430,77 @@ mod test {
     }
 
     #[tokio::test]
+    async fn reopened_pause_finalizes_before_admitting_the_next_prompt() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let session_id = broker.session.id.clone();
+        let mut interrupted =
+            completed_interaction("stopped-before-checkpoint", &session_id, Vec::new());
+        interrupted.state = ExchangeState::Finalizing;
+        interrupted.completed_at_ms = None;
+        interrupted.finalization_outcome = Some(ExchangeState::Cancelled);
+        broker.store.save_exchange(&interrupted)?;
+        broker
+            .store
+            .save_task_operation(&crate::task::TaskOperation {
+            id: "pause-before-close".into(),
+            session_id: session_id.clone(),
+            action: json!({"action":"pause"}),
+            state: "outcome_unknown".into(),
+            error: Some(
+                "Runtime stopped before the operation settled. Inspect task state before resuming"
+                    .into(),
+            ),
+            exchange_id: Some(interrupted.id.clone()),
+            created_at_ms: 3,
+            resume_after_transition: false,
+        })?;
+        drop(broker);
+        let mut reopened = planning_question_broker(repository.path(), data.path(), false);
+        assert_eq!(reopened.session.id, session_id);
+        let occupied: Vec<_> = (0..4)
+            .map(|_| reopened.repositories.reads.submit(0, |_| Ok(())).unwrap())
+            .collect();
+        let error = reopened
+            .run_interaction(
+                "Wait for recovery".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Wait for recovery".into())),
+            )
+            .await
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("capacity is full"));
+        let pending = reopened.store.list_exchange(&session_id)?;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, ExchangeState::Finalizing);
+        assert!(pending[0].finalization_error.is_some());
+        for task in occupied {
+            task.finish().await?;
+        }
+        reopened
+            .run_interaction(
+                "Continue after reopening".into(),
+                PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Continue after reopening".into())),
+            )
+            .await?;
+        let history = reopened.store.list_exchange(&session_id)?;
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].state, ExchangeState::Cancelled);
+        assert!(history[0].checkpoint_after.is_some());
+        assert!(history[0].finalization_error.is_none());
+        assert_eq!(history[1].state, ExchangeState::Complete);
+        let pause = reopened
+            .store
+            .load_task_operation(&session_id, "pause-before-close")?
+            .unwrap();
+        assert_eq!(pause.state, "cancelled");
+        assert!(pause.error.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn initial_checkpoint_failure_can_finalize_without_replaying_provider_work() -> Result<()>
     {
         let repository = repository();
@@ -11960,6 +12048,7 @@ mod test {
                     id: format!("check-{index}"),
                     name: format!("Check {index}"),
                     category: crate::checks::CheckCategory::Check,
+                    purpose: crate::checks::CheckPurpose::Verify,
                     enabled: true,
                     area: "Fixture".into(),
                     trigger: crate::checks::CheckTrigger::AnyChange,

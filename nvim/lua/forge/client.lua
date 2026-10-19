@@ -641,10 +641,10 @@ local function spawn(binary, callback, launch_token, lease)
     session.harness.ready = false
     local stop_reason = current.stop_reason or ("Forge host stopped (exit " .. tostring(result.code) .. ")")
     for _, subscriber in pairs(current.subscriber) do
-      local ok, failure = pcall(subscriber, "host_stopped", { message = stop_reason })
+      local ok, failure = pcall(subscriber, "host_stopped", { message = stop_reason, expected = current.stop_reason ~= nil })
       if not ok then notifications.error("Harness stop handler failed: " .. tostring(failure), "ForgeHarness") end
     end
-    if result.code ~= 0 then
+    if result.code ~= 0 and not current.stop_reason then
       local message = vim.trim(current.stderr)
       notifications.error("Harness broker exited " .. tostring(result.code) .. (message ~= "" and (": " .. message) or ""), "ForgeHarness")
     end
@@ -793,7 +793,7 @@ function M.start_harness(callback, initialize_options)
     local generation = client.generation
     vim.schedule(function()
       if generation ~= client.generation or not client.harness_ready or not client.process then
-        callback(nil, "Forge host generation changed during Harness startup")
+        callback(nil, "Forge host generation changed during Harness startup", { code = "not_admitted" })
       else callback(client.snapshot or {}, nil) end
     end)
     return
@@ -956,12 +956,12 @@ function M.request_for(session_id, method, params, callback)
   local session_callback = scope_callback(session.harness, callback)
   local id = admit_request(method, session_callback)
   if not id then return end
-  M.start_harness(function(_, start_error)
+  M.start_harness(function(_, start_error, error_detail)
     local client = state()
     if not client.pending[id] then return end
     if start_error then
       client.pending[id] = nil
-      session_callback(nil, start_error)
+      session_callback(nil, start_error, error_detail)
       return
     end
     write_request(id, method, params or {}, session_id)

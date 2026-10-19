@@ -2,6 +2,7 @@ local M = {}
 local client = require("forge.client")
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
+local diagnostic = require("forge.views.harness.diagnostic")
 local operation_sequence = 0
 
 ---@param state table
@@ -40,10 +41,21 @@ function M.transition(state, action, refresh, settled, admitted, method)
   local function receive(result, failure, detail)
     if not current() then return end
     if failure then
+      if detail and detail.code == "not_admitted" then
+        diagnostic.set(state, "execution_notice", "Waiting to submit task control: " .. failure,
+          { owner = identity, category = "admission", severity = "info" })
+        vim.defer_fn(function()
+          if current() and not operation.admitted then
+            client.request_for(session_id, method or "task.transition", action, receive)
+          end
+        end, 1000)
+        refresh()
+        return
+      end
       if detail and detail.code ~= "outcome_unknown" then
         state.task_operation = previous
-        state.execution_notice = "Task request rejected: " .. failure
-        notifications.error(state.execution_notice, "Harness task")
+        diagnostic.set(state, "execution_notice", "Not submitted: " .. failure,
+          { owner = identity, category = "admission", severity = "warning", recovery = "resubmit" })
         if previous then
           state.task_config = previous.config
           if previous.poll then previous.poll() end
@@ -53,18 +65,21 @@ function M.transition(state, action, refresh, settled, admitted, method)
         settled(state.execution_notice)
         return
       end
-      state.execution_notice = "Task outcome unknown: " .. failure
+      diagnostic.set(state, "execution_notice", "Checking the original task operation: " .. failure,
+        { owner = identity, category = "uncertain", severity = "info" })
       operation.state = "outcome_unknown"
       refresh()
       return
     end
     if not result or result == vim.NIL then
       operation.state = "outcome_unknown"
-      state.execution_notice = "Task acknowledgement unknown. Check task status before retrying."
+      diagnostic.set(state, "execution_notice", "Task acknowledgement unknown. Check task status before retrying.",
+        { owner = identity, category = "uncertain", severity = "info" })
       refresh()
       return
     end
-    local rank = { submitting = 0, accepted = 1, stopping = 2, running = 3 }
+    diagnostic.set(state, "execution_notice", nil)
+    local rank = { submitting = 0, accepted = 1, stopping = 2, running = 3, applying = 4, verifying = 5, resuming = 6 }
     if rank[result.state] and rank[operation.state] and rank[result.state] < rank[operation.state] then return end
     operation.state = result.state
     if not operation.admitted then
@@ -76,9 +91,13 @@ function M.transition(state, action, refresh, settled, admitted, method)
       local message = result.error ~= vim.NIL and result.error or nil
       if result.state == "failed" or result.state == "outcome_unknown" then
         message = message or "Task transition failed"
-        state.execution_notice = message
+        diagnostic.set(state, "execution_notice", message, { owner = identity, category = result.state,
+          severity = result.state == "failed" and "error" or "warning", recovery = "inspect" })
         state.execution_notice_operation = { id = operation.id, message = message }
-        notifications.error(message, "Harness task")
+        if result.state == "failed" then notifications.error(message, "Harness task") end
+      else
+        diagnostic.set(state, "execution_notice", nil)
+        state.execution_notice_operation = nil
       end
       settled(message)
     else
@@ -96,10 +115,9 @@ function M.transition(state, action, refresh, settled, admitted, method)
         operation.poll_pending = false
         if not current() then return end
         if failure then
-          local notice = "Task status check failed: " .. failure .. ". Checking again."
-          if operation.poll_error ~= notice then notifications.error(notice, "Harness task") end
+          local notice = "Retrying task status: " .. failure
           operation.poll_error = notice
-          state.execution_notice = notice
+          diagnostic.set(state, "execution_notice", notice, { owner = identity, category = "poll", severity = "info" })
           refresh()
           return
         end
@@ -116,7 +134,8 @@ function M.transition(state, action, refresh, settled, admitted, method)
   end
   vim.defer_fn(function()
     if current() and operation.state == "submitting" then
-      state.execution_notice = "Task acknowledgement unknown. Checking the original operation."
+      diagnostic.set(state, "execution_notice", "Task acknowledgement unknown. Checking the original operation.",
+        { owner = identity, category = "uncertain", severity = "info" })
       refresh()
     end
     operation.poll()

@@ -40,6 +40,8 @@ struct OpenPresentation {
     pending_submission: Option<u64>,
     accepted_submission: Option<u64>,
     staging: Option<StagingContent>,
+    staging_sequence: u64,
+    selection_sequence: u64,
     entry: HashMap<String, EntryPresentation>,
     action: HashMap<TargetId, TranscriptAction>,
     output: HashMap<DocumentId, OutputDocument>,
@@ -139,6 +141,7 @@ pub enum PresentationRequest {
     },
     Staging {
         document: DocumentId,
+        sequence: u64,
         #[serde(default)]
         queue: Vec<String>,
         #[serde(default)]
@@ -156,6 +159,7 @@ pub enum PresentationRequest {
     },
     SelectAgent {
         document: DocumentId,
+        sequence: u64,
         run_id: Option<String>,
     },
     Close {
@@ -296,7 +300,11 @@ impl SessionPresentation {
                 open.input.entry(view).or_insert(InputSequence(0));
                 Ok(json!({}))
             }
-            PresentationRequest::SelectAgent { document, run_id } => {
+            PresentationRequest::SelectAgent {
+                document,
+                sequence,
+                run_id,
+            } => {
                 if let Some(run_id) = &run_id {
                     ensure!(
                         !run_id.is_empty() && run_id.len() <= 256,
@@ -315,6 +323,9 @@ impl SessionPresentation {
                     open.transcript_id == document,
                     "transcript document lifetime changed"
                 );
+                if sequence <= open.selection_sequence {
+                    return Ok(json!({}));
+                }
                 let previous = std::mem::replace(&mut open.agent_scope, run_id);
                 if let Err(failure) =
                     reflow(open, self.timeline.entry_list(), self.timeline.revision())
@@ -322,6 +333,7 @@ impl SessionPresentation {
                     open.agent_scope = previous;
                     return Err(failure);
                 }
+                open.selection_sequence = sequence;
                 Ok(json!({}))
             }
             PresentationRequest::NavigatePrompt { input, previous } => {
@@ -384,10 +396,11 @@ impl SessionPresentation {
             }
             PresentationRequest::Staging {
                 document,
+                sequence,
                 queue,
                 steering,
             } => {
-                self.set_staging(&document, queue, steering)?;
+                self.set_staging(&document, sequence, queue, steering)?;
                 Ok(json!({"updated":true}))
             }
             PresentationRequest::Snapshot { document } => Ok(to_value(self.snapshot(&document)?)?),
@@ -570,6 +583,8 @@ impl SessionPresentation {
             sections,
             transcript_id: document,
             submission_sequence: 0,
+            staging_sequence: 0,
+            selection_sequence: 0,
             pending_submission: None,
             accepted_submission: None,
             staging: None,
@@ -638,6 +653,7 @@ impl SessionPresentation {
     fn set_staging(
         &mut self,
         document: &DocumentId,
+        sequence: u64,
         queue: Vec<String>,
         steering: Vec<String>,
     ) -> Result<()> {
@@ -649,16 +665,26 @@ impl SessionPresentation {
             open.transcript_id == *document,
             "transcript document identity changed"
         );
-        let staging = StagingContent { queue, steering };
-        if open.staging.as_ref() == Some(&staging) {
+        if sequence <= open.staging_sequence {
             return Ok(());
         }
+        let staging = StagingContent { queue, steering };
+        if open.staging.as_ref() == Some(&staging) {
+            open.staging_sequence = sequence;
+            return Ok(());
+        }
+        let previous = open.staging.clone();
         open.staging = if staging.queue.is_empty() && staging.steering.is_empty() {
             None
         } else {
             Some(staging)
         };
-        update_staging_block(open)
+        if let Err(error) = update_staging_block(open) {
+            open.staging = previous;
+            return Err(error);
+        }
+        open.staging_sequence = sequence;
+        Ok(())
     }
 
     /// Capture one syntax source while keeping asynchronous work outside the presentation lock.
@@ -2082,6 +2108,7 @@ mod tests {
         )?;
         let request: PresentationRequest = serde_json::from_value(serde_json::json!({
             "operation": "staging",
+            "sequence": 1,
             "document": document,
             "queue": ["queued first", "queued second"],
             "steering": ["active direction"]
@@ -2107,6 +2134,22 @@ mod tests {
         ));
 
         owner.dispatch(PresentationRequest::Staging {
+            document: document.clone(),
+            sequence: 1,
+            queue: vec!["late retry".into()],
+            steering: Vec::new(),
+        })?;
+        assert_eq!(
+            owner.snapshot(&document)?.block[staging_index]
+                .text
+                .wire_rows()
+                .join("\n"),
+            rows,
+            "a repeated staging identity replaced newer presentation state"
+        );
+
+        owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
             queue: Vec::new(),
             steering: Vec::new(),
@@ -2136,6 +2179,7 @@ mod tests {
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let prompt = "a Harness execution request is already running: no permits available\nwhen I entered this prompt it failed\n    never lose this indentation 界";
         owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
             queue: vec![prompt.into()],
             steering: vec![
@@ -2196,6 +2240,7 @@ mod tests {
         let last = queue.last().unwrap().clone();
         let steering = "steering-λ".repeat(256);
         owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
             queue,
             steering: vec![steering.clone()],
@@ -2237,6 +2282,7 @@ mod tests {
             "harness:staging"
         );
         owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
             queue: vec![last.clone()],
             steering: vec![steering.clone()],
@@ -4275,6 +4321,7 @@ mod tests {
         };
         owner.dispatch(expand(1))?;
         owner.dispatch(PresentationRequest::SelectAgent {
+            sequence: owner.open.as_ref().unwrap().selection_sequence + 1,
             document: document.clone(),
             run_id: Some(run.id.clone()),
         })?;
@@ -4283,6 +4330,7 @@ mod tests {
                 && !contents(&owner)?.contains("Prompt parent")
         );
         owner.dispatch(PresentationRequest::SelectAgent {
+            sequence: owner.open.as_ref().unwrap().selection_sequence + 1,
             document: document.clone(),
             run_id: None,
         })?;
@@ -4364,6 +4412,7 @@ mod tests {
         })?;
         assert!(contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
         owner.dispatch(PresentationRequest::SelectAgent {
+            sequence: owner.open.as_ref().unwrap().selection_sequence + 1,
             document: document.clone(),
             run_id: Some(run.id),
         })?;
@@ -4423,11 +4472,13 @@ mod tests {
         )?;
         owner.begin_submission(&document, 1, "retained submission")?;
         owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
             queue: vec!["queued while selecting agent".into()],
             steering: vec!["keep active guidance".into()],
         })?;
         owner.dispatch(PresentationRequest::SelectAgent {
+            sequence: owner.open.as_ref().unwrap().selection_sequence + 1,
             document: document.clone(),
             run_id: Some("child-run".into()),
         })?;
@@ -4493,6 +4544,7 @@ mod tests {
         owner.reconcile(vec![interaction_entry("other-main"), agent])?;
         assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         owner.dispatch(PresentationRequest::SelectAgent {
+            sequence: owner.open.as_ref().unwrap().selection_sequence + 1,
             document: document.clone(),
             run_id: None,
         })?;

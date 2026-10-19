@@ -98,7 +98,12 @@ function M.open()
   layout.attach_scroll_boundary(state.transcript_buf, state.transcript_win)
   controller.attach()
   controller.render()
-  client.start_harness(function(result, start_error, error_detail) finish_start(state, result, start_error, error_detail) end)
+  local transcript_buffer = state.transcript_buf
+  client.start_harness(function(result, start_error, error_detail)
+    if state.transcript_buf ~= transcript_buffer or not vim.api.nvim_buf_is_valid(transcript_buffer)
+      or not valid_window(state.composer_win) then return end
+    finish_start(state, result, start_error, error_detail)
+  end)
   vim.api.nvim_set_current_win(state.composer_win)
 end
 

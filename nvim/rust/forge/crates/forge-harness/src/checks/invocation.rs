@@ -472,6 +472,43 @@ fn target_args(package: &Package, case: &CheckCase) -> Result<Vec<String>> {
     }
 }
 
+#[derive(Debug)]
+/// Retains unsuccessful discovery output independently of selector configuration errors.
+pub(super) struct DiscoveryFailure {
+    pub exit_code: Option<i32>,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+}
+
+impl std::fmt::Display for DiscoveryFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "Check discovery exited {:?}\n{}\n{}",
+            self.exit_code,
+            String::from_utf8_lossy(&self.stdout),
+            String::from_utf8_lossy(&self.stderr)
+        )
+    }
+}
+
+impl std::error::Error for DiscoveryFailure {}
+
+impl DiscoveryFailure {
+    /// Writes complete discovery logs under the command's final output identities.
+    pub(super) fn record(&self, command: &mut super::CommandCheck) -> Result<()> {
+        command.exit_code = self.exit_code;
+        std::fs::write(&command.stdout, &self.stdout)?;
+        std::fs::write(&command.stderr, &self.stderr)?;
+        let mut output = self.stdout.clone();
+        output.extend_from_slice(&self.stderr);
+        std::fs::write(&command.output, &output)?;
+        command.output_bytes = output.len() as u64;
+        command.preview = String::from_utf8_lossy(&output).into_owned();
+        Ok(())
+    }
+}
+
 /// Capture discovery output while retaining process-tree cancellation ownership.
 pub(super) async fn capture(
     program: &str,
@@ -487,7 +524,9 @@ pub(super) async fn capture(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped());
-    let mut child = crate::process::spawn_owned(command).context("start check discovery")?;
+    let mut child = crate::process::spawn_owned(command)
+        .map_err(super::failure::CheckFailure::launch)
+        .context("start check discovery")?;
     let mut stdout = child.stdout().take().context("discovery stdout missing")?;
     let mut stderr = child.stderr().take().context("discovery stderr missing")?;
     let work = async {
@@ -498,11 +537,14 @@ pub(super) async fn capture(
             stderr.read_to_end(&mut errors),
             child.wait()
         )?;
-        ensure!(
-            status.success(),
-            "check discovery failed ({status}): {}",
-            String::from_utf8_lossy(&errors)
-        );
+        if !status.success() {
+            return Err(DiscoveryFailure {
+                exit_code: status.code(),
+                stdout: output,
+                stderr: errors,
+            }
+            .into());
+        }
         Ok(output)
     };
     tokio::pin!(work);
@@ -512,7 +554,8 @@ pub(super) async fn capture(
     loop {
         tokio::select! {
             result = &mut work => return result,
-            _ = &mut deadline => bail!("check discovery timed out after {seconds}s"),
+            _ = &mut deadline => return Err(super::failure::CheckFailure::classified(super::CheckState::Blocked,
+                anyhow::anyhow!("check discovery timed out after {seconds}s"))),
             _ = ticker.tick() => ensure!(!cancelled.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)) && !external.is_some_and(|cancelled| cancelled.load(Ordering::Acquire)), "check discovery interrupted"),
         }
     }

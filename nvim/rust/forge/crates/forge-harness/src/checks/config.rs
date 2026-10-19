@@ -19,6 +19,17 @@ pub enum CheckCategory {
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
+/// Determines whether successful execution certifies stable inputs or prepares new inputs.
+pub enum CheckPurpose {
+    #[default]
+    /// Certifies unchanged inputs after successful execution.
+    Verify,
+    /// Permits source edits and records the resulting inputs after successful execution.
+    Prepare,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
 /// Selects project-wide or task-derived coverage without changing command text.
 pub enum CheckScope {
     #[default]
@@ -60,6 +71,9 @@ pub struct CheckDefinition {
     pub id: String,
     pub name: String,
     pub category: CheckCategory,
+    #[serde(default)]
+    /// Source mutation contract, defaulting to read-only verification.
+    pub purpose: CheckPurpose,
     pub enabled: bool,
     #[serde(default = "automatic_default")]
     /// Selects this check automatically when its trigger matches.

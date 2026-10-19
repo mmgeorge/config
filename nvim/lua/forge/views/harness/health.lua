@@ -1,5 +1,6 @@
 local M = {}
 local client = require("forge.client")
+local diagnostic = require("forge.views.harness.diagnostic")
 
 ---@class HarnessStatusNotice
 ---@field text string
@@ -10,11 +11,14 @@ local client = require("forge.client")
 ---@param state table
 ---@return HarnessStatusNotice?
 function M.notice(state)
-  local failure = state.presentation and state.presentation.failure or state.execution_notice
-    or state.host_error or state.connection_error or state.sync_error
-    or state.presentation and state.presentation.section_error
-  if failure then return { text = failure, animated = false, failed = failure ~= "Paused" } end
-  return nil
+  local notice = state.presentation and diagnostic.get(state.presentation, "failure", "error")
+    or diagnostic.get(state, "host_error", "error")
+    or diagnostic.get(state, "execution_notice", "warning")
+    or diagnostic.get(state, "queue_notice", "info")
+    or diagnostic.get(state, "connection_error", "info")
+    or diagnostic.get(state, "sync_error", "info")
+    or state.presentation and diagnostic.get(state.presentation, "sync_failure", "info")
+  if notice then return notice end
 end
 
 ---@param state table

@@ -35,7 +35,7 @@ assert(query.method == "task.operation" and query.params.operation_id == origina
   "uncertain acknowledgement must query the original operation instead of replaying")
 query.reply({ state = "outcome_unknown", error = "Provider acknowledgement lost" })
 assert(settled == 2 and state.execution_notice:find("Provider acknowledgement lost", 1, true))
-assert(#failures == 1)
+assert(#failures == 0, "uncertain acknowledgement was displayed as a failed operation")
 
 begin({ action = "plan", text = "Retain this pending task" })
 local retained = requests[#requests]
@@ -54,7 +54,8 @@ timers[#timers]()
 requests[#requests].reply(nil, "Forge request admission is full", { code = "not_admitted" })
 assert(state.task_operation.state == "running" and settled == 3,
   "a failed status read changed the admitted operation outcome")
-assert(state.execution_notice:find("Task status check failed", 1, true))
+assert(state.execution_notice:find("Retrying task status", 1, true))
+assert(not require("forge.views.harness.health").notice(state).failed)
 timers[#timers]()
 requests[#requests].reply({ state = "running" })
 assert(state.execution_notice == nil, "a successful status read retained the transient failure")
@@ -87,5 +88,17 @@ assert(inspection.method == "task.operation" and inspection.params.operation_id 
   "unknown import acknowledgement replayed the settings mutation")
 inspection.reply({ state = "completed" })
 assert(settled == 6 and state.task_operation == nil)
+begin({ action = "pause" })
+local queued_control = requests[#requests]
+queued_control.reply(nil, "admission full", { code = "not_admitted" })
+assert(state.task_operation and not require("forge.views.harness.health").notice(state).failed)
+timers[#timers]()
+local retry = requests[#requests]
+assert(retry.method == queued_control.method and retry.params.operation_id == queued_control.params.operation_id,
+  "a local admission retry changed operation identity")
+retry.reply({ state = "accepted" })
+assert(not state.execution_notice, "admission success retained a waiting diagnostic")
+task.receive(state, { id = retry.params.operation_id, state = "completed" })
+assert(settled == 7)
 print("harness_tasks: passed")
 vim.cmd("qa!")

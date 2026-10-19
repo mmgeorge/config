@@ -157,6 +157,7 @@ pub(crate) fn status(tool: &ToolCall) -> &'static str {
         ToolState::Running => "running",
         ToolState::Completed => "completed",
         ToolState::Failed => "failed",
+        ToolState::Denied => "denied",
         ToolState::Cancelled => "cancelled",
         ToolState::Interrupted => "interrupted",
     }

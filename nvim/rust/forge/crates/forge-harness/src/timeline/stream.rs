@@ -558,6 +558,11 @@ impl TimelineStream {
         );
         let base_revision = self.revision;
         let next_value_list = serialize_entry_list(&next_entry_list)?;
+        for (index, value) in self.value_list.iter_mut().enumerate() {
+            if value.is_null() {
+                *value = serde_json::to_value(&self.entry_list[index])?;
+            }
+        }
         let mut working_entry_list: Vec<_> = self.entry_list.iter().collect();
         let mut working_value_list: Vec<_> = self.value_list.iter().collect();
         let mut operation = Vec::new();

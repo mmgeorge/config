@@ -24,6 +24,9 @@ pub enum CheckState {
     Interrupted,
     Skipped,
     ConfigurationError,
+    ExecutionError,
+    Stale,
+    Stopped,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -137,7 +140,7 @@ impl CheckRun {
         if self.commands.iter().any(|check| {
             matches!(
                 check.state,
-                CheckState::ConfigurationError | CheckState::Blocked
+                CheckState::ConfigurationError | CheckState::Blocked | CheckState::ExecutionError
             )
         }) {
             return VerificationOutcome::Blocked;
@@ -211,6 +214,7 @@ pub enum CheckEventKind {
     CheckFinished,
     CheckSkipped,
     ConfigurationError,
+    ExecutionError,
     Interrupted,
     Resumed,
     Finished,
@@ -260,6 +264,9 @@ impl CheckRun {
             (CheckState::Interrupted, "interrupted"),
             (CheckState::Blocked, "blocked"),
             (CheckState::ConfigurationError, "configuration errors"),
+            (CheckState::ExecutionError, "execution errors"),
+            (CheckState::Stale, "stale"),
+            (CheckState::Stopped, "stopped"),
         ] {
             let total = count(state);
             if total > 0 {

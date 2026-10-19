@@ -531,6 +531,7 @@ impl CheckSupervisor {
     pub(crate) async fn resolve(&self, mut run: CheckRun) -> Result<CheckRun> {
         let mut resolver = super::invocation::InvocationResolver::default();
         let mut commands = Vec::new();
+        let mut failures = Vec::new();
         for mut check in std::mem::take(&mut run.commands) {
             let context = check.context.as_ref().context("check context is missing")?;
             if check.state != CheckState::Pending
@@ -585,8 +586,9 @@ impl CheckSupervisor {
                     }
                 }
                 Err(error) => {
-                    check.state = CheckState::ConfigurationError;
+                    check.state = super::failure::classify(&error, CheckState::ConfigurationError);
                     check.error = Some(format!("{error:#}"));
+                    failures.push((commands.len(), error));
                     commands.push(check);
                 }
             }
@@ -601,6 +603,12 @@ impl CheckSupervisor {
                 directory.join(format!("{position}.selection.json"));
         }
         run.commands = commands;
+        for (position, error) in failures {
+            if let Some(discovery) = error.downcast_ref::<super::invocation::DiscoveryFailure>() {
+                std::fs::create_dir_all(self.root.join(&run.id))?;
+                discovery.record(&mut run.commands[position])?;
+            }
+        }
         Ok(run)
     }
 
@@ -776,16 +784,16 @@ impl CheckSupervisor {
         .await
         .unwrap_or_else(|_| Err(anyhow::anyhow!("check worker panicked")));
         if let Err(error) = &result {
-            run.state = CheckState::ConfigurationError;
+            run.state = CheckState::ExecutionError;
             for command in &mut run.commands {
                 if command.state == CheckState::Running {
-                    command.state = CheckState::ConfigurationError;
+                    command.state = CheckState::ExecutionError;
                     command.completed_at_ms = Some(now_ms());
                     command.error = Some(format!("{error:#}"));
                 }
             }
             run.record(
-                CheckEventKind::ConfigurationError,
+                CheckEventKind::ExecutionError,
                 None,
                 format!("Check execution error: {error:#}"),
             );
@@ -796,9 +804,9 @@ impl CheckSupervisor {
         run.completed_at_ms = Some(now_ms());
         self.update(&run, sink.as_ref())?;
         if let Err(error) = publication.finish(&run).await {
-            run.state = CheckState::ConfigurationError;
+            run.state = CheckState::ExecutionError;
             run.record(
-                CheckEventKind::ConfigurationError,
+                CheckEventKind::ExecutionError,
                 None,
                 format!("Check history could not be saved: {error:#}"),
             );
@@ -857,11 +865,18 @@ impl CheckSupervisor {
                 }
             }
             match run.commands[index].state {
-                CheckState::Skipped | CheckState::ConfigurationError => {
+                CheckState::Skipped
+                | CheckState::ConfigurationError
+                | CheckState::ExecutionError
+                | CheckState::Blocked
+                | CheckState::Stale
+                | CheckState::Stopped => {
                     let kind = if run.commands[index].state == CheckState::Skipped {
                         CheckEventKind::CheckSkipped
-                    } else {
+                    } else if run.commands[index].state == CheckState::ConfigurationError {
                         CheckEventKind::ConfigurationError
+                    } else {
+                        CheckEventKind::CheckFinished
                     };
                     run.record(
                         kind,
@@ -895,7 +910,7 @@ impl CheckSupervisor {
                 && let Some(previous) =
                     self.cancelled_attempt(run, &run.commands[index], before.as_ref())?
             {
-                run.commands[index].state = CheckState::Blocked;
+                run.commands[index].state = CheckState::Stopped;
                 run.cancelled_run_id = Some(previous.clone());
                 run.commands[index].error = Some(format!(
                     "Cancelled in run {previous}. Run this check explicitly to retry unchanged inputs."
@@ -955,8 +970,12 @@ impl CheckSupervisor {
                 {
                     CheckState::Interrupted
                 } else {
-                    CheckState::ConfigurationError
+                    super::failure::classify(&error, CheckState::ExecutionError)
                 };
+                if let Some(discovery) = error.downcast_ref::<super::invocation::DiscoveryFailure>()
+                {
+                    discovery.record(&mut run.commands[index])?;
+                }
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
@@ -981,7 +1000,7 @@ impl CheckSupervisor {
                     if run.commands[index].state == CheckState::Passed
                         && run.commands[index].evidence.is_none()
                     {
-                        run.commands[index].state = CheckState::Failed;
+                        run.commands[index].state = CheckState::Stale;
                         run.commands[index].error = Some("Check inputs changed during execution. Verify again after source changes settle.".into());
                     }
                 }
@@ -1011,8 +1030,45 @@ impl CheckSupervisor {
                 return Ok(());
             }
         }
+        let Some(checkpoint) = cancelled
+            .read(external_cancelled, self.changes.snapshot())
+            .await?
+        else {
+            run.interrupt();
+            return Ok(());
+        };
+        if let Some(checkpoint) = checkpoint {
+            for index in 0..run.commands.len() {
+                let command = &run.commands[index];
+                if command.state == CheckState::Passed
+                    && let Some(evidence) = &command.evidence
+                    && !evidence.covers(command, run, command, &checkpoint)?
+                {
+                    run.commands[index].state = CheckState::Stale;
+                    run.commands[index].error = Some("Later source changes superseded this check's evidence. Verify current inputs again.".into());
+                }
+            }
+        }
         run.completed_at_ms = Some(now_ms());
         run.state = if run
+            .commands
+            .iter()
+            .any(|check| check.state == CheckState::ExecutionError)
+        {
+            CheckState::ExecutionError
+        } else if run
+            .commands
+            .iter()
+            .any(|check| check.state == CheckState::Stopped)
+        {
+            CheckState::Stopped
+        } else if run
+            .commands
+            .iter()
+            .any(|check| check.state == CheckState::Stale)
+        {
+            CheckState::Stale
+        } else if run
             .commands
             .iter()
             .any(|check| check.state == CheckState::ConfigurationError)
@@ -1075,10 +1131,14 @@ impl CheckSupervisor {
             for (path, expected) in &invocation.inputs {
                 let actual =
                     std::fs::read(self.workspace.join(super::config::relative_path(path)?))?;
-                ensure!(
-                    &crate::plan::digest(&actual) == expected,
-                    "Package configuration changed after check resolution: {path}. Refresh and rerun checks."
-                );
+                if &crate::plan::digest(&actual) != expected {
+                    return Err(super::failure::CheckFailure::classified(
+                        CheckState::Stale,
+                        anyhow::anyhow!(
+                            "Package configuration changed after check resolution: {path}. Refresh and rerun checks."
+                        ),
+                    ));
+                }
             }
         }
         if let Some(invocation) = native
@@ -1099,11 +1159,15 @@ impl CheckSupervisor {
                 .filter_map(|line| line.strip_suffix(": test"))
                 .collect();
             for case in &invocation.cases {
-                ensure!(
-                    names.contains(case.name.as_str()),
-                    "Declared test was not discovered in the selected Cargo target: {}",
-                    case.name
-                );
+                if !names.contains(case.name.as_str()) {
+                    return Err(super::failure::CheckFailure::classified(
+                        CheckState::ConfigurationError,
+                        anyhow::anyhow!(
+                            "Declared test was not discovered in the selected Cargo target: {}",
+                            case.name
+                        ),
+                    ));
+                }
             }
             run.commands[index].context.as_mut().unwrap().resolved = Some(CheckSelection::Cases {
                 cases: invocation.cases.clone(),
@@ -1120,17 +1184,21 @@ impl CheckSupervisor {
             command.stdin(std::process::Stdio::null());
             command
         } else {
-            let executable = run
-                .executable
-                .as_ref()
-                .context("configured check shell is unavailable")?;
+            let executable = run.executable.as_ref().ok_or_else(|| {
+                super::failure::CheckFailure::classified(
+                    CheckState::Blocked,
+                    anyhow::anyhow!("configured check shell is unavailable"),
+                )
+            })?;
             run.shell.command(executable, &source, scoped)?
         };
         command
             .current_dir(directory)
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
-        let mut child = crate::process::spawn_owned(command).context("start configured check")?;
+        let mut child = crate::process::spawn_owned(command)
+            .map_err(super::failure::CheckFailure::launch)
+            .context("start configured check")?;
         let input = if scoped {
             Some(
                 child
@@ -1227,7 +1295,10 @@ impl CheckSupervisor {
             let output = strip_ansi_escapes::strip(&output);
             let output = String::from_utf8_lossy(&output);
             for case in &invocation.cases {
-                ensure!(output.lines().any(|line| line.trim() == format!("test {} ... ok", case.name)), "Declared test did not execute successfully: {}. Zero matches, ignored tests, and nonstandard output cannot prove coverage.", case.name);
+                if !output.lines().any(|line| line.trim() == format!("test {} ... ok", case.name)) {
+                    return Err(super::failure::CheckFailure::classified(CheckState::ConfigurationError,
+                        anyhow::anyhow!("Declared test did not execute successfully: {}. Zero matches, ignored tests, and nonstandard output cannot prove coverage.", case.name)));
+                }
             }
         }
         run.commands[index].exit_code = status.code();
@@ -1239,11 +1310,13 @@ impl CheckSupervisor {
             CheckState::Failed
         };
         if scoped && !killed {
-            let source = std::fs::read(&context.receipt)
-                .context("scoped check did not produce a selection receipt; fix its definition")?;
-            let mut receipt: CheckReceipt =
-                serde_json::from_slice(&source).context("invalid selection receipt")?;
-            receipt.validate_request(&context.selection)?;
+            let receipt = (|| -> Result<CheckReceipt> {
+                let source = std::fs::read(&context.receipt)
+                    .context("scoped check did not produce a selection receipt; fix its definition")?;
+                let mut receipt: CheckReceipt = serde_json::from_slice(&source).context("invalid selection receipt")?;
+                receipt.validate_request(&context.selection)?;
+                Ok(receipt)
+            })().map_err(|error| super::failure::CheckFailure::classified(CheckState::ConfigurationError, error))?;
             run.commands[index].context.as_mut().unwrap().resolved = Some(receipt.selection);
         }
         Ok(())
@@ -1298,7 +1371,12 @@ impl CheckSupervisor {
         let error = run
             .lifecycle
             .last()
-            .filter(|event| matches!(event.kind, CheckEventKind::ConfigurationError))
+            .filter(|event| {
+                matches!(
+                    event.kind,
+                    CheckEventKind::ConfigurationError | CheckEventKind::ExecutionError
+                )
+            })
             .filter(|event| state.notified.insert(event.id.clone()))
             .cloned();
         drop(state);

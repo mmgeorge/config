@@ -2081,7 +2081,12 @@ impl TimelineRenderer<'_> {
             details.push(format!("Service request ID: `{request}`"));
         }
         if let Some(error) = &compaction.result.error {
-            details.push(format!("Failure: {error}"));
+            let label = if compaction.state == CompactionState::Failed {
+                "Failure"
+            } else {
+                "Explanation"
+            };
+            details.push(format!("{label}: {error}"));
         }
         if let Some(count) = compaction.result.tokens_removed {
             details.push(format!("Tokens removed: {count}"));
@@ -2378,6 +2383,7 @@ impl TimelineRenderer<'_> {
             ToolState::Completed if !tool.failed => "Changed files · details unavailable".into(),
             ToolState::Completed | ToolState::Failed => "File changes failed".into(),
             ToolState::Cancelled => "File changes cancelled".into(),
+            ToolState::Denied => "File changes denied".into(),
             ToolState::Interrupted => "File changes interrupted".into(),
         };
         let details = tool.state() != ToolState::Running && !tool.output.trim().is_empty();
@@ -2484,6 +2490,7 @@ impl TimelineRenderer<'_> {
                     crate::checks::CheckState::Failed
                         | crate::checks::CheckState::Blocked
                         | crate::checks::CheckState::ConfigurationError
+                        | crate::checks::CheckState::ExecutionError
                 ),
                 change: Default::default(),
             };
@@ -3266,6 +3273,51 @@ mod tests {
                     .unwrap()
                     .text,
                 "◇"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn uncertain_compaction_retains_explanation_without_failure_wording() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::{Compaction, CompactionResult, CompactionState};
+        for state in [CompactionState::Unconfirmed, CompactionState::Failed] {
+            let entry = TimelineEntry::SessionEvent {
+                id: "compact".into(),
+                created_at_ms: 1,
+                event: crate::timeline::SessionEventRecord {
+                    id: "compact".into(),
+                    session_id: "session".into(),
+                    created_at_ms: 1,
+                    detail: SessionEventKind::Compaction {
+                        compaction: Compaction {
+                            id: "operation".into(),
+                            thread_id: "provider".into(),
+                            state,
+                            manual: true,
+                            started_at_ms: Some(1),
+                            completed_at_ms: Some(2),
+                            result: CompactionResult {
+                                error: Some("Runtime closed".into()),
+                                ..Default::default()
+                            },
+                        },
+                    },
+                },
+            };
+            let projected = project_at(&entry, &WidthProfile::default(), 2)?;
+            let text = projected
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert_eq!(text.contains("Failure:"), state == CompactionState::Failed);
+            assert_eq!(
+                text.contains("Explanation:"),
+                state == CompactionState::Unconfirmed
             );
         }
         Ok(())
@@ -5042,7 +5094,7 @@ mod tests {
             exchange.observe_turn(&event, ordinal * 10)?;
             event.turn_boundary = None;
             event.kind = "reasoning".into();
-            event.text = Some("Inspecting the next file".into());
+            event.text = Some(" \n ".into());
             event.data = json!({"message_id":format!("thought-{ordinal}")});
             exchange.observe_turn(&event, ordinal * 10 + 1)?;
             event.kind = "tool".into();

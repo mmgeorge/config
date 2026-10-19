@@ -17,8 +17,11 @@ current revision, definitions, overrides, and history. Preserve existing project
 checks that remain useful. Do not run configured checks during setup.
 
 Categories are format, lint, check, test, and build. Unit, integration, screenshot, accessibility,
-and other suites are named test definitions, not new categories. Format commands verify without
-rewriting files. Build is optional and defaults to development unless the project explicitly
+and other suites are named test definitions, not new categories. Commands default to
+purpose:"verify" and certify unchanged source. When the user wants automatic formatting fixes,
+use purpose:"prepare" for the mutating formatter. Successful preparation establishes the new
+source baseline, and dependent verification runs against that source. Do not configure a
+mutating formatter as a verifier. Build is optional and defaults to development unless the project explicitly
 requires another profile. Enabled checks can run. auto:true selects a check automatically
 when its trigger matches, while auto:false keeps it available for explicit plan selection or
 tool runs. Ask which checks should be automatic. Disabled checks cannot be run by
@@ -44,7 +47,8 @@ Each definition also has
 enabled, auto (defaults to true), scope (all, changed_files, changed_cases, new_cases), directory (project-relative, default "."),
 all: {command}, optional files: {command}, optional cases: {command}, and depends_on: [id].
 Use static single-line commands for the configured shell. Choose execution order in definitions.
-Prefer build/check, test, lint, then format when no project constraint requires another order.
+Run preparation before dependent verification. For read-only checks, prefer build/check, test,
+lint, then format when no project constraint requires another order.
 Declare dependencies only when a check truly requires a successful prerequisite. Independent
 checks continue after failures. An explicitly empty definitions list is valid for projects
 without automated checks. Do not introduce dummy successful commands.

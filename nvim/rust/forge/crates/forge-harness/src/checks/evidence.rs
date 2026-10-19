@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Retains the exact source boundary and execution contract for a completed attempt.
 pub struct CheckEvidence {
-    /// Captured inputs before and after the command, verified to be stable.
+    /// Inputs certified by verification or produced by successful preparation.
     pub checkpoint: CheckpointRecord,
     /// Command, definition, helper, interpreter, and environment identity.
     pub signature: String,
@@ -15,16 +15,31 @@ pub struct CheckEvidence {
 }
 
 impl CheckEvidence {
-    /// Captures an attempt only when its relevant inputs stayed unchanged.
+    /// Captures stable verifier inputs or resulting preparation inputs.
     pub(super) fn capture(
         run: &CheckRun,
         command: &CommandCheck,
         before: CheckpointRecord,
         after: &CheckpointRecord,
     ) -> Result<Option<Self>> {
-        if !unchanged(command, &before, after)? {
+        let preparation = run.context.as_ref().is_some_and(|context| {
+            context
+                .snapshot
+                .config
+                .definitions
+                .iter()
+                .any(|definition| {
+                    command
+                        .context
+                        .as_ref()
+                        .is_some_and(|command| command.definition_id == definition.id)
+                        && definition.purpose == super::config::CheckPurpose::Prepare
+                })
+        });
+        if !preparation && !unchanged(command, &before, after)? {
             return Ok(None);
         }
+        let before = if preparation { after.clone() } else { before };
         let invocation = command
             .context
             .as_ref()

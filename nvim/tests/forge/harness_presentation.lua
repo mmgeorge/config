@@ -187,7 +187,24 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_win_call(window, vim.fn.winsaveview).topline == reading_view.topline,
     "composer focus resumed following while the transcript was scrolled up")
   vim.api.nvim_win_close(composer_window, true)
-  refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
+  local retry = refresh()
+  local revision = owner.transcript.revision
+  retry.callback(nil, "temporary admission contention", { code = "not_admitted" })
+  assert(not owner.failure and owner.transcript.revision == revision)
+  local previous = #requests
+  assert(vim.wait(2000, function() return #requests > previous end, 1), "transcript read did not retry")
+  requests[#requests].callback({ patch = {} })
+  assert(not owner.failure and not owner.sync_failure, "successful retry retained its diagnostic")
+  owner.set_staging({ "queued draft" }, {})
+  local staging = requests[#requests]
+  assert(staging.params.operation == "staging" and staging.params.sequence)
+  previous = #requests
+  staging.callback(nil, "response lost after application", { code = "outcome_unknown" })
+  assert(vim.wait(2000, function() return #requests > previous end, 1))
+  assert(requests[#requests].params.sequence == staging.params.sequence, "staging retry changed mutation identity")
+  requests[#requests].callback({})
+  assert(not owner.failure)
+  refresh().callback(nil, "duplicate block identity", { code = "invalid_state" })
   local failed_count = #requests
   for _ = 1, 3 do owner.sync() end
   assert(#requests == failed_count, "failed presentation retried a request requiring reopening")

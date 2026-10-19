@@ -113,7 +113,7 @@ for _, cancellation_first in ipairs({ true, false }) do
   complete_snapshot()
 end
 
-for _, operation_state in ipairs({ "submitting", "accepted", "stopping", "running" }) do
+for _, operation_state in ipairs({ "submitting", "accepted", "stopping", "running", "applying", "verifying", "resuming", "outcome_unknown" }) do
   state.task_operation = { action = "pause", state = operation_state }
   state.checks_running, state.active_check_run = true, "paused-check"
   compose("replace paused check")

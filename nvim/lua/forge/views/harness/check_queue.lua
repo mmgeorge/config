@@ -1,5 +1,5 @@
 local client = require("forge.client")
-local notifications = require("forge.infra.notifications")
+local diagnostic = require("forge.views.harness.diagnostic")
 local M = {}
 
 ---@class ForgeCheckQueuePublication
@@ -34,10 +34,14 @@ function M.publish(state, changed)
     publication.waiting = false
     if failure then
       publication.pending = nil
-      state.execution_notice = "Queue synchronization failed: " .. failure
-      notifications.error(failure, "Harness queue")
+      diagnostic.set(state, "queue_notice", "Retrying queue synchronization: " .. failure,
+        { owner = identity, category = "queue", severity = "info" })
+      vim.defer_fn(function()
+        if state.check_queue == publication and publication.revision == revision then changed() end
+      end, 1000)
       return
     end
+    diagnostic.set(state, "queue_notice", nil)
     changed()
   end)
   return true

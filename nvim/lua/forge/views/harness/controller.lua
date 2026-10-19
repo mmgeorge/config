@@ -5,6 +5,7 @@ local command_set = require("forge.shared.view_command_set")
 local config = require("forge.infra.config")
 local keymaps = require("forge.shared.keymaps")
 local notifications = require("forge.infra.notifications")
+local diagnostic = require("forge.views.harness.diagnostic")
 local perf = require("forge.infra.perf")
 local layout = require("forge.views.harness.layout")
 local session = require("forge.session")
@@ -473,40 +474,49 @@ local function synchronize_state(callback, target_state)
     return
   end
   synchronized_state.state_sync_pending = true
-  client.request_for(synchronized_session, "state.get", {}, function(result, request_error)
+  client.request_for(synchronized_session, "state.get", {}, function(result, request_error, error_detail)
     synchronized_state.state_sync_pending = false
     if client.host_generation() ~= synchronized_generation or not synchronized_state.session
       or synchronized_state.session.id ~= synchronized_session then return end
     if result and result.session and result.session.id ~= synchronized_session then
-      request_error = "Snapshot belongs to another conversation"
-    end
-    if result and result.runtime_epoch == synchronized_state.runtime_epoch
-      and (result.timeline_revision or 0) < (synchronized_state.timeline_revision or 0) then
-      request_error = "Snapshot predates the displayed transcript"
-    end
-    if result and result.runtime_epoch == synchronized_state.runtime_epoch
-      and (result.snapshot_revision or 0) < (synchronized_state.snapshot_revision or 0) then
-      request_error = "Snapshot predates the displayed task state"
-    end
-    if request_error or not result then
-      local failure = request_error or "Harness broker returned an empty state snapshot"
-      synchronized_state.sync_error = failure
-      synchronized_state.state_sync_again = nil
+      local failure = "Snapshot belongs to another conversation"
+      diagnostic.set(synchronized_state, "sync_error", failure,
+        { owner = synchronized_session, category = "protocol", severity = "error", recovery = "reconnect" })
       local callbacks = synchronized_state.state_sync_callback or {}
       synchronized_state.state_sync_callback = nil
       for _, completed in ipairs(callbacks) do completed(nil, failure) end
-      notifications.error(failure, "Harness state")
+      if harness_state() == synchronized_state then M.render() end
+      return
+    end
+    if result and result.runtime_epoch == synchronized_state.runtime_epoch
+      and (result.timeline_revision or 0) < (synchronized_state.timeline_revision or 0) then
+      synchronized_state.state_sync_again = nil
+      vim.schedule(function() synchronize_state(nil, synchronized_state) end)
+      return
+    end
+    if result and result.runtime_epoch == synchronized_state.runtime_epoch
+      and (result.snapshot_revision or 0) < (synchronized_state.snapshot_revision or 0) then
+      synchronized_state.state_sync_again = nil
+      vim.schedule(function() synchronize_state(nil, synchronized_state) end)
+      return
+    end
+    if request_error or not result then
+      local failure = request_error or "Harness broker returned an empty state snapshot"
+      local code = error_detail and error_detail.code
+      diagnostic.set(synchronized_state, "sync_error", failure,
+        { owner = synchronized_session, category = "snapshot", recovery = "retry",
+          severity = (not request_error or error_detail and code ~= "not_admitted" and code ~= "outcome_unknown") and "error" or "info" })
+      synchronized_state.state_sync_again = nil
       if harness_state() == synchronized_state then M.render() end
       local retry = (synchronized_state.state_sync_retry or 0) + 1
       synchronized_state.state_sync_retry = retry
-      if retry <= 3 then
-        vim.defer_fn(function()
-          if harness_state() == synchronized_state and client.host_generation() == synchronized_generation then synchronize_state() end
-        end, 1000 * 2 ^ (retry - 1))
-      end
+      vim.defer_fn(function()
+        if harness_state() == synchronized_state and client.host_generation() == synchronized_generation then synchronize_state(nil, synchronized_state) end
+      end, math.min(8000, 1000 * 2 ^ math.min(retry - 1, 3)))
       return
     end
-    synchronized_state.sync_error, synchronized_state.state_sync_retry = nil, nil
+    diagnostic.set(synchronized_state, "sync_error", nil)
+    synchronized_state.state_sync_retry = nil
     if synchronized_state.state_sync_again then
       synchronized_state.state_sync_again = nil
       synchronize_state(nil, synchronized_state)
@@ -561,7 +571,9 @@ local function on_event(event, payload)
   if event == "task_operation" then task_control.receive(state, payload) return end
   if event == "host_stopped" then
     state.check_interrupt_pending = nil
-    state.host_error = payload.message
+    diagnostic.set(state, "host_error", payload.message,
+      { owner = tostring(client.host_generation()), category = "host", severity = payload.expected and "info" or "error",
+        recovery = "reconnect", clear_when = "new host generation" })
     state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
     state.pending_mode = nil
     state.cancel_requested = false
@@ -947,14 +959,19 @@ finish_execution = function(request_error, error_detail)
   if state.host_error then set_busy(false) return true end
   if state.task_operation then return true end
   if request_error and error_detail and error_detail.code == "turn_cancelled" then
-    state.execution_notice = "Paused"
+    diagnostic.set(state, "execution_notice", "Paused", { owner = state.session.id, category = "cancelled", severity = "info", recovery = "resume" })
     set_busy(false)
     synchronize_state()
     return true
   end
   if request_error and not (error_detail and error_detail.code == "turn_retracted") then
-    state.execution_notice = error_detail and error_detail.code == "turn_cancelled" and "Paused"
+    local code = error_detail and error_detail.code
+    local message = code == "not_admitted" and ("Not submitted · " .. request_error)
+      or code == "outcome_unknown" and ("Checking submission · " .. request_error)
       or ("Stopped · " .. request_error)
+    diagnostic.set(state, "execution_notice", message, { owner = state.session.id, category = code or "execution",
+      severity = code == "not_admitted" and "info" or code == "outcome_unknown" and "warning" or "error",
+      recovery = code == "not_admitted" and "resubmit" or "inspect" })
   end
   set_busy(false)
   return false
@@ -1008,7 +1025,9 @@ begin_request = function(text, from_composer, attachments, captured_prompt)
         synchronize_state(M.drain)
         return
       end
-      notifications.error(request_error, "ForgeHarness")
+      if not error_detail or (error_detail.code ~= "not_admitted" and error_detail.code ~= "outcome_unknown") then
+        notifications.error(request_error, "ForgeHarness")
+      end
       synchronize_state()
       return
     elseif result then
@@ -1029,7 +1048,7 @@ resume_check_interrupted_prompt = function(state, interrupted)
     or state.session.id ~= interrupted.session_id or state.runtime_epoch ~= interrupted.runtime_epoch
     or not interrupted.cancel_complete or interrupted.old_prompt_pending then return end
   local operation = state.task_operation
-  if operation and ({ submitting = true, accepted = true, stopping = true, running = true })[operation.state] then return end
+  if operation then return end
   state.check_interrupt_pending = nil
   begin_request(interrupted.text, true, interrupted.attachments, interrupted.prompt)
 end
@@ -1047,9 +1066,7 @@ function M.cancel_turn()
     return
   end
   local operation = state.task_operation
-  if operation and operation.action == "pause"
-    and ({ submitting = true, accepted = true, stopping = true, running = true })[operation.state]
-  then return end
+  if operation and operation.action == "pause" then return end
   M.task_transition({ action = "pause", restore_prompt_if_no_output = true })
 end
 function M.compact()
@@ -2724,6 +2741,7 @@ end
 
 ---@param buf integer
 function M.attach_transcript(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then return end
   local state = harness_state()
   for _, key in ipairs(keymaps.view_keys_for("harness", "open_timeline")) do
     pcall(vim.keymap.del, "n", key, { buffer = buf })
@@ -2785,7 +2803,8 @@ function M.attach()
     session.activate_harness(state)
     local ok, failure = xpcall(function() on_event(event, payload) end, debug.traceback)
     if not ok then
-      state.sync_error = "Presentation failed: " .. tostring(failure)
+      diagnostic.set(state, "sync_error", "Presentation failed: " .. tostring(failure),
+        { owner = state.session and state.session.id or "presentation", category = "internal", severity = "error", recovery = "reconnect" })
       state.busy = false
       notifications.error(state.sync_error, "ForgeHarness")
       pcall(M.refresh_winbar)

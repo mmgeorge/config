@@ -54,6 +54,17 @@ impl AutomaticChecks {
     /// Returns one repair instruction, or blocks repeated unchanged failure delivery.
     pub(crate) fn observe(&mut self, run: &CheckRun) -> Result<Option<String>> {
         self.run_id = Some(run.id.clone());
+        if matches!(
+            run.state,
+            CheckState::Stopped | CheckState::Stale | CheckState::ExecutionError
+        ) {
+            self.pending = true;
+            self.blocked = None;
+            self.repair_prompt = None;
+            self.repair_exchange = None;
+            self.save()?;
+            return Ok(None);
+        }
         let failures = run
             .commands
             .iter()

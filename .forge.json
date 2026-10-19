@@ -232,6 +232,7 @@
       },
       {
         "id": "forge-rust-format-fix",
+        "purpose": "prepare",
         "name": "Affected Rust package formatting fix",
         "category": "format",
         "enabled": true,
@@ -276,6 +277,7 @@
       },
       {
         "id": "forge-rust-workspace-format-fix",
+        "purpose": "prepare",
         "name": "Shared-configuration Rust formatting fix",
         "category": "format",
         "enabled": true,

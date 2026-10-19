@@ -69,7 +69,7 @@ client.request_for = function(session_id, method, params, callback)
     else vim.schedule(function() callback({ updated = true }) end) end
   elseif params.operation == "select_agent" and fail_selection then
     fail_selection = false
-    vim.schedule(function() callback(nil, "selection unavailable") end)
+    vim.schedule(function() callback(nil, "selection unavailable", { code = "request_failed" }) end)
   elseif params.operation == "sync" then
     sync_count = sync_count + 1
     local result = staged_response and { snapshot = staged_response } or { patch = {} }
@@ -102,6 +102,26 @@ local success, failure = xpcall(function()
   receive("plan_changes_requested", {}, "native-controller")
   assert(synchronized and not state.state_sync_pending, "reject snapshot synchronization did not settle")
   assert(state.goal == nil and state.active_elicitation == nil, "reject snapshot retained nullable state")
+  local reads, completed = {}, 0
+  state.runtime_epoch, state.timeline_revision, state.snapshot_revision = "ordering", 10, 20
+  state.state_sync_callback = { function(result, failure)
+    assert(result and not failure)
+    completed = completed + 1
+  end }
+  client.request_for = function(_, method, _, callback)
+    assert(method == "state.get")
+    reads[#reads + 1] = callback
+  end
+  receive("plan_changes_requested", {}, "native-controller")
+  local stale = vim.deepcopy(null_snapshot)
+  stale.runtime_epoch, stale.timeline_revision, stale.snapshot_revision = "ordering", 9, 19
+  reads[1](stale)
+  assert(completed == 0 and not state.sync_error, "an older snapshot failed pending callers")
+  assert(vim.wait(500, function() return #reads == 2 end, 1))
+  stale.timeline_revision, stale.snapshot_revision = 10, 20
+  reads[2](stale)
+  assert(completed == 1 and not state.sync_error, "snapshot reconciliation lost a waiting caller")
+  state.runtime_epoch, state.timeline_revision, state.snapshot_revision = nil, 0, 0
   client.request_for = original_state_request
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   local approval_view = require("forge.views.harness.approval")
@@ -136,7 +156,7 @@ local success, failure = xpcall(function()
   assert(not approval_view.is_open() and vim.api.nvim_get_current_win() == timeline_window,
     "snapshot refresh reopened a dismissed approval and stole timeline focus")
   local notice = require("forge.views.harness.health").notice(state)
-  assert(notice.text == "Waiting for your approval" and notice.waiting and notice.hint == "permission")
+  assert(notice == nil, "dismissed approval replaced the native lifecycle status")
   controller.reopen_question()
   assert(approval_view.is_open(), "explicit reopen must restore the pending approval")
   vim.fn.maparg("q", "n", false, true).callback()
@@ -354,14 +374,17 @@ local success, failure = xpcall(function()
     turn = { { state = { kind = "running" }, provider = { thread_id = "child-thread", turn_id = "child-turn" } } } }
   state.timeline = { { kind = "agent_lifecycle", run = state.agent.run[1], exchange = { child_exchange }, agent = {} } }
   state.agent.summary = { child = { state = "running", target = { thread_id = "child-thread", turn_id = "child-turn" } } }
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.cancel_turn()
   assert(child_request[1].method == "agent.interrupt" and child_request[1].params.target == "child")
   assert(not state.cancel_requested, "settled child cancellation retained the parent cancellation flag")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "child instruction" })
   controller.steer_submit()
   assert(child_request[2].method == "agent.message" and child_request[2].params.target == "child")
   state.cancel_requested = false
   child_exchange.state = "complete"
   state.agent.summary.child = { state = "complete" }
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.cancel_turn()
   assert(child_request[#child_request].method == "agent.interrupt" and child_request[#child_request].params.target == "child",
     "completed-child interruption must remain scoped to the child")

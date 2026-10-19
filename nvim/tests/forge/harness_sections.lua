@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 local client = require("forge.client")
-local expanded, revision = false, 0
+local expanded, revision, generation = false, 0, 1
 local requests, notices = {}, {}
 local held, deferred = {}, false
 local owner
@@ -11,7 +11,7 @@ vim.api.nvim_win_set_buf(window, transcript)
 local function snapshot(document)
   local value = { document = document, revision = revision, block = {
     { id = "heading", text = { "Tools" }, metadata = {
-      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = 1, order = 0, more = false,
+      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = generation, order = 0, more = false,
         content_revision = revision, loaded_rows = expanded and 1 or 0, loaded_bytes = 0,
         display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
       target = {}, decoration = {}, editable_region = {},
@@ -44,9 +44,9 @@ client.request_for = function(_, _, params, callback)
 end
 local function respond(failure)
   local pending = assert(table.remove(held, 1), "no held request")
-  if failure then pending.callback(nil, failure)
+  if failure then pending.callback(nil, failure, { code = "request_failed" })
   elseif pending.params.operation == "node" then
-    expanded = pending.params.expanded
+    if pending.params.generation == generation then expanded = pending.params.expanded end
     revision = revision + 1
     pending.callback({})
   else pending.callback({ snapshot = snapshot(pending.params.document) }) end
@@ -100,10 +100,25 @@ local ok, failure = xpcall(function()
   respond("fixture delivery failure")
   assert(owner.transcript.block.heading.metadata.node.display == "heading" and not body_loaded())
   assert(not owner.transcript.fold_loading[window], "failed request retained loading state")
-  assert(#notices == 1 and notices[1]:find("fixture delivery failure", 1, true))
+  assert(#notices == 0 and owner.section_failure.tools:find("fixture delivery failure", 1, true))
+  assert(not require("forge.views.harness.health").notice({ presentation = owner }), "section failure escaped its local scope")
   deferred = false
   assert(owner.toggle_heading(window))
   assert(vim.wait(1000, function() return body_loaded() and owner.transcript.block.heading.metadata.node.display == "full" end, 1), "failed opening was not retryable")
+  assert(owner.toggle_heading(window))
+  assert(vim.wait(1000, function() return not body_loaded() end, 1))
+  deferred = true
+  assert(owner.toggle_heading(window))
+  generation = generation + 1
+  assert(respond() == "node")
+  assert(vim.wait(1000, function() return #held > 0 end, 1))
+  assert(respond() == "sync")
+  assert(vim.wait(1000, function() return #held > 0 end, 1), "retired node generation did not reconcile the opening")
+  assert(held[1].params.operation == "node" and held[1].params.generation == generation)
+  assert(respond() == "node")
+  assert(vim.wait(1000, function() return #held > 0 end, 1))
+  assert(respond() == "sync")
+  assert(body_loaded() and not owner.section_failure.tools, "generation replacement became a section failure")
   local sequence = 0
   for _, request in ipairs(requests) do
     if request.operation == "node" then

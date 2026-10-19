@@ -3,6 +3,7 @@ local client = require("forge.client")
 local replica = require("forge.buffer")
 local input = require("forge.input")
 local perf = require("forge.infra.perf")
+local diagnostic = require("forge.views.harness.diagnostic")
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
@@ -124,29 +125,43 @@ function M.open(options, callback)
     perf.event("harness", "ui.request", { phase = "begin", session_id = options.session_id,
       operation = current.params.operation, revision = current.params.revision,
       queue_count = #queued, elapsed_ms = perf.elapsed_ms(current.queued_at) })
-    local function receive(result, failure)
+    local function receive(result, failure, detail)
       if completed then return end
       completed = true
       if deadline then deadline:stop() deadline:close() deadline = nil end
+      local operation = current.params.operation
+      local code = detail and detail.code
+      local read = operation == "sync" or operation == "snapshot" or operation == "open"
+      local retryable = code == "not_admitted"
+        or (read and code ~= "invalid_state" and code ~= "invalid_request" and code ~= -32602)
+        or ((not detail or code == "outcome_unknown")
+          and (operation == "staging" or operation == "node" or operation == "select_agent"))
+      if failure and retryable and valid_request(current) then
+        diagnostic.set(owner, "sync_failure", "Retrying transcript " .. operation .. ": " .. tostring(failure),
+          { owner = identity, category = "presentation", severity = "info" })
+        if options.on_update then options.on_update() end
+        table.insert(queued, 1, current)
+        vim.defer_fn(function() active = false dispatch_next() end, 1000)
+        return
+      end
+      if not failure then diagnostic.set(owner, "sync_failure", nil) end
       perf.event("harness", "ui.request", { phase = "end", session_id = options.session_id,
         operation = current.params.operation, revision = current.params.revision,
         elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
       local accepted, callback_error = pcall(perf.trace, "harness", "ui.response", {
         session_id = options.session_id, operation = current.params.operation,
         revision = current.params.revision }, function()
-          if valid_request(current) then current.done(result, failure)
+          if valid_request(current) then current.done(result, failure, detail)
           elseif current.cancel then current.cancel() end
         end)
       active = false
       if not accepted and alive() then fail("Presentation callback failed: " .. tostring(callback_error)) end
+      if failure and code == "outcome_unknown" and alive() and owner.ready then owner.sync() end
       dispatch_next()
     end
     deadline = vim.defer_fn(function()
       if completed then return end
-      if alive() and current.epoch == owner.epoch then
-        fail("Presentation request timed out (" .. current.params.operation .. "); its outcome is unknown")
-      end
-      receive(nil, "Presentation request timed out")
+      receive(nil, "Presentation response is delayed", { code = "outcome_unknown" })
     end, 30000)
     if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
@@ -158,7 +173,6 @@ function M.open(options, callback)
       done(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
-    if #queued >= 63 and params.operation ~= "close" then done(nil, "Harness presentation request capacity is full") return end
     queued[#queued + 1] = { params = params, done = done, queued_at = perf.now(), epoch = owner.epoch,
       valid = valid, cancel = cancel }
     dispatch_next()
@@ -256,7 +270,9 @@ function M.open(options, callback)
       or owner.staging_inflight or vim.deep_equal(owner.staging, owner.applied_staging) then return end
     local pending = vim.deepcopy(owner.staging)
     owner.staging_inflight = true
-    request({ operation = "staging", document = identity, queue = pending.queue, steering = pending.steering }, function(_, failure)
+    owner.staging_sequence = (owner.staging_sequence or 0) + 1
+    request({ operation = "staging", document = identity, sequence = owner.staging_sequence,
+      queue = pending.queue, steering = pending.steering }, function(_, failure)
       owner.staging_inflight = false
       if failure then fail("Staging update failed: " .. tostring(failure)) return end
       owner.applied_staging = pending
@@ -349,12 +365,14 @@ function M.open(options, callback)
       if section.id == id and section.more then more = true break end
     end
     if not more then return nil end
+    local node = section_state(id)
+    local cursor = node and table.concat({ tostring(node.generation), tostring(node.loaded_rows), tostring(node.loaded_bytes) }, ":") or id
     local _, row = owner.transcript.sequence:position(boundary_id)
-    if not row or row == 0 then return id .. ":empty" end
+    if not row or row == 0 then return cursor .. ":empty" end
     local previous = replica.locate(owner.transcript, row - 1, 0)
-    if not previous then return id .. ":empty" end
+    if not previous then return cursor .. ":empty" end
     local text = vim.api.nvim_buf_get_lines(owner.transcript.buffer, row - 1, row, false)[1] or ""
-    return previous.block .. ":" .. previous.position.row .. ":" .. text
+    return cursor .. ":" .. previous.block .. ":" .. previous.position.row .. ":" .. text
   end
 
   local function section_pending(id)
@@ -366,10 +384,17 @@ function M.open(options, callback)
 
   local function section_failed(id, message)
     owner.section_failure = owner.section_failure or {}
-    local changed = owner.section_failure[id] ~= tostring(message)
     owner.section_failure[id] = tostring(message)
-    owner.section_error = "Section could not be loaded: " .. tostring(message)
-    if changed then notice(owner.section_error) end
+    local node = section_state(id)
+    owner.section_failure_revision = owner.section_failure_revision or {}
+    owner.section_failure_revision[id] = node and tostring(node.generation) .. ":" .. tostring(node.content_revision)
+    local header = owner.transcript.node_owner[id]
+    local _, row = owner.transcript.sequence:position(header)
+    if row then
+      if loading_mark[id] then vim.api.nvim_buf_del_extmark(options.transcript_buffer, loading_namespace, loading_mark[id]) end
+      loading_mark[id] = vim.api.nvim_buf_set_extmark(options.transcript_buffer, loading_namespace, row, 0,
+        { virt_text = { { " Section unavailable · reopen to retry", "Comment" } }, virt_text_pos = "eol" })
+    end
     if options.on_update then options.on_update() end
   end
 
@@ -377,10 +402,33 @@ function M.open(options, callback)
     for _, requests in pairs(owner.section_inflight or {}) do
       for id, pending in pairs(requests) do
         if pending.ready then
-          if pending.more and pending.boundary and page_boundary(id) == pending.boundary then
-            section_failed(id, "Loading made no progress. Close and reopen the section to retry.")
+          local node = section_state(id)
+          if node and node.generation ~= pending.generation then
+            requests[id] = nil
+            local intent = owner.section_intent and owner.section_intent[pending.view]
+            for window, view in pairs(owner.views) do
+              if view.id == pending.view and (not intent or intent[id] ~= false) then
+                local opening = owner.transcript.fold_loading[window]
+                if opening and opening[id] then opening[id].ready = false end
+                vim.schedule(function()
+                  local current = owner.section_request and owner.section_request[view.id]
+                  if alive() and current and current[id] == pending.sequence then owner.set_section(id, true, false, view) end
+                end)
+              end
+            end
+          elseif pending.more and pending.boundary and page_boundary(id) == pending.boundary then
+            local node = section_state(id)
+            local observation = node and tostring(node.generation) .. ":" .. tostring(node.content_revision)
+            if observation and pending.observation ~= observation then
+              pending.observation = observation
+              owner.pending = true
+            else
+              section_failed(id, "The current page is unchanged. Reopen the section to retry.")
+              requests[id] = nil
+            end
+          else
+            requests[id] = nil
           end
-          requests[id] = nil
         end
       end
     end
@@ -394,8 +442,16 @@ function M.open(options, callback)
         elseif pending.ready and section.display ~= "heading" then
           clear_opening(window, id)
         elseif pending.ready then
-          clear_opening(window, id)
-          section_failed(id, "The requested content was not published. Reopen the section to retry.")
+          local intent = owner.section_intent and owner.section_intent[view.id]
+          local observation = tostring(section.generation) .. ":" .. tostring(section.content_revision)
+          if not intent or not intent[id] then clear_opening(window, id)
+          elseif pending.observation ~= observation then
+            pending.observation = observation
+            owner.pending = true
+          else
+            clear_opening(window, id)
+            section_failed(id, "Section content is unavailable. Reopen the section to retry.")
+          end
         end
       end
     end
@@ -481,7 +537,7 @@ function M.open(options, callback)
           if applied.kind ~= "Applied" then
             owner.applying, owner.syncing = false, false
             reject_openings()
-            fail("Harness transcript update failed: " .. tostring(applied.diagnostic or applied.kind))
+            recovery(owner.transcript)
             dispatch_next()
             return
           end
@@ -501,8 +557,10 @@ function M.open(options, callback)
     if expanded and not more then
       owner.section_failure[section] = nil
       if owner.section_page then owner.section_page[section] = nil end
-      local _, failure = next(owner.section_failure)
-      owner.section_error = failure and ("Section could not be loaded: " .. failure) or nil
+      if retry and loading_mark[section] then
+        vim.api.nvim_buf_del_extmark(options.transcript_buffer, loading_namespace, loading_mark[section])
+        loading_mark[section] = nil
+      end
     elseif more and owner.section_failure[section] then return end
     owner.section_intent = owner.section_intent or {}
     local intent = owner.section_intent[view.id] or {}
@@ -518,7 +576,7 @@ function M.open(options, callback)
     local pending = owner.section_inflight[view.id] or {}
     owner.section_inflight[view.id] = pending
     pending[section] = { sequence = sequence, ready = false, view = view.id,
-      more = more, boundary = more and page_boundary(section) or nil }
+      generation = node.generation, more = more, boundary = more and page_boundary(section) or nil }
     request({ operation = "node", document = identity, view = view.id,
       sequence = sequence, node = section, generation = node.generation,
       action = more and "load_more" or (retry and "retry_loading" or "set_expansion"), expanded = expanded,
@@ -599,6 +657,12 @@ function M.open(options, callback)
                 local loading = owner.transcript.fold_loading[window]
                 local active = section_pending(section.id)
                 local failed = owner.section_failure and owner.section_failure[section.id]
+                local current_node = section_state(section.id)
+                if failed and current_node and owner.section_failure_revision
+                  and owner.section_failure_revision[section.id] ~= tostring(current_node.generation) .. ":" .. tostring(current_node.content_revision) then
+                  owner.section_failure[section.id], owner.section_page[section.id] = nil, nil
+                  failed = false
+                end
                 if not active and not (loading and loading[section.id]) then
                   local expanded = closed == -1
                   local node = section_state(section.id)
@@ -770,12 +834,15 @@ function M.open(options, callback)
     clear_loading()
     owner.transcript.fold_loading = {}
     owner.selecting = true
-    request({ operation = "select_agent", document = identity, run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
+    owner.selection_sequence = (owner.selection_sequence or 0) + 1
+    request({ operation = "select_agent", document = identity, sequence = owner.selection_sequence,
+      run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
       owner.selecting = false
       if not alive() then return end
       if failure then notice(failure) flush_staging() return end
       owner.save_timeline = owner.timeline_key
       owner.timeline_key, owner.restore_timeline = target, target
+      flush_staging()
       owner.sync()
     end)
   end
@@ -830,7 +897,7 @@ function M.open(options, callback)
       vim.api.nvim_buf_delete(options.composer_buffer, { force = true })
     end
     request({ operation = "close", document = identity }, function(_, failure)
-      if failure then notice(failure) end
+      if failure and owner.host_generation == client.host_generation() and client.host_accepting() then notice(failure) end
     end)
     return true
   end

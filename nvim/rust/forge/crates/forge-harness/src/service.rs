@@ -2754,12 +2754,9 @@ async fn execute_task_transition(
     ) {
         action["resume"] = json!(operation.resume_after_transition);
     }
-    let control = tokio::time::timeout(
-        Duration::from_secs(10),
-        Arc::clone(&controller.control_admission).acquire_owned(),
-    )
-    .await
-    .context("task transition is waiting for previous cleanup. Execution state is unknown")??;
+    let control = Arc::clone(&controller.control_admission)
+        .acquire_owned()
+        .await?;
     if store
         .latest_task_operation(&operation.session_id)?
         .is_none_or(|latest| latest.id != operation.id)
@@ -2841,8 +2838,9 @@ async fn execute_task_transition(
             }
             controller.cancellation.request(restore_prompt);
             // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
-            tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
-                .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??
+            Arc::clone(&controller.execution_admission)
+                .acquire_owned()
+                .await?
         }
     };
     operation.exchange_id = store
@@ -5362,6 +5360,50 @@ mod tests {
             );
             service.shutdown(Duration::from_secs(1)).await?;
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn task_control_waits_for_cleanup_past_the_former_deadline() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let control = controller.control_admission.acquire().await?;
+        let execution = controller.execution_admission.acquire().await?;
+        let mut operation = admit_task_intent(
+            &controller,
+            &session_id,
+            &Request {
+                id: 2,
+                method: "task.transition".into(),
+                params: json!({"operation_id":"slow-cleanup", "action":"pause"}),
+            },
+            &mut store,
+        )?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let release = async {
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            drop(control);
+            tokio::time::sleep(Duration::from_secs(11)).await;
+            drop(execution);
+        };
+        let (result, ()) = tokio::join!(
+            execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink),
+            release
+        );
+        result?;
+        assert_ne!(operation.state, "failed");
+        assert!(operation.error.is_none());
+        service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }
 

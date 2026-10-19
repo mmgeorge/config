@@ -11,6 +11,7 @@ fn definition(id: &str, command: &str) -> CheckDefinition {
         id: id.into(),
         name: id.into(),
         category: CheckCategory::Test,
+        purpose: CheckPurpose::Verify,
         enabled: true,
         area: "Project".into(),
         trigger: CheckTrigger::AnyChange,
@@ -486,6 +487,95 @@ async fn plan_check_choices_disable_automatic_dependents_and_restore_prerequisit
 }
 
 #[tokio::test]
+async fn preparation_changes_inputs_and_allows_dependent_verification() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::write(workspace.path().join("source.txt"), "before")?;
+    let mut preparation = definition("prepare", "'after' | save --force source.txt");
+    preparation.purpose = CheckPurpose::Prepare;
+    let mut verification = definition("verify", "if (open --raw source.txt) != 'after' { exit 1 }");
+    verification.depends_on = vec!["prepare".into()];
+    save(workspace.path(), vec![preparation, verification]);
+    let runner = make_runner(workspace.path(), data.path());
+    begin_recorded_task(workspace.path(), data.path(), &runner).await?;
+    let run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
+    let run = runner.run(run, None, None).await?;
+    assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
+    assert!(
+        run.commands
+            .iter()
+            .all(|command| command.evidence.is_some())
+    );
+    assert_eq!(run.commands[0].exit_code, Some(0));
+    assert!(run.commands[1].started_at_ms.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn discovery_compilation_failure_preserves_project_output() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::create_dir(workspace.path().join("src"))?;
+    std::fs::write(
+        workspace.path().join("Cargo.toml"),
+        "[package]\nname='broken-discovery'\nversion='0.1.0'\nedition='2024'\n",
+    )?;
+    std::fs::write(
+        workspace.path().join("src/lib.rs"),
+        "#[test] fn selected() { unavailable_symbol(); }\n",
+    )?;
+    let mut check = definition("tests", "exit 99");
+    check.cases = Some(direct_operation(
+        "cargo",
+        &[
+            "test",
+            "--offline",
+            "--package",
+            "{package.name}",
+            "{case.target_args}",
+            "--",
+            "{case.name}",
+            "--exact",
+        ],
+        Some(PackageManager::Cargo),
+    ));
+    save(workspace.path(), vec![check]);
+    let runner = make_runner(workspace.path(), data.path());
+    let run = runner.prepare_request(
+        RunRequest {
+            selections: BTreeMap::from([(
+                "tests".into(),
+                CheckSelection::Cases {
+                    cases: vec![CheckCase {
+                        file: "src/lib.rs".into(),
+                        name: "selected".into(),
+                        target: Some("lib".into()),
+                    }],
+                },
+            )]),
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
+    let run = runner.run(run, None, None).await?;
+    assert_eq!(run.state, CheckState::Failed, "{:?}", run.commands);
+    assert_ne!(run.commands[0].exit_code, Some(0));
+    assert!(std::fs::read_to_string(&run.commands[0].stderr)?.contains("unavailable_symbol"));
+    assert!(std::fs::read_to_string(&run.commands[0].output)?.contains("E0425"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
@@ -506,7 +596,7 @@ async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<
         "Explicit".into(),
     )?;
     let run = runner.run(run, None, None).await?;
-    assert_eq!(run.state, CheckState::Failed);
+    assert_eq!(run.state, CheckState::Stale);
     assert!(run.commands[0].evidence.is_none());
     assert!(
         run.commands[0]
@@ -1122,7 +1212,7 @@ async fn preview_matches_execution_and_manifest_changes_invalidate_bindings() ->
         r#"{"name":"renamed"}"#,
     )?;
     let run = runner.run(resolved, None, None).await?;
-    assert_eq!(run.state, CheckState::ConfigurationError);
+    assert_eq!(run.state, CheckState::Stale);
     assert!(
         run.commands[0]
             .error
@@ -1884,7 +1974,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         runner.run(automatic, None, None),
     )
     .await??;
-    assert_eq!(stopped.state, CheckState::Blocked);
+    assert_eq!(stopped.state, CheckState::Stopped);
     assert!(stopped.commands[0].started_at_ms.is_none());
     Ok(())
 }
@@ -2060,11 +2150,11 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     automatic.context.as_mut().unwrap().automatic = true;
     let blocked =
         tokio::time::timeout(Duration::from_secs(2), runner.run(automatic, None, None)).await??;
-    assert_eq!(blocked.commands[0].state, CheckState::Blocked);
+    assert_eq!(blocked.commands[0].state, CheckState::Stopped);
     assert!(blocked.commands[0].started_at_ms.is_none());
     let mut policy = AutomaticChecks::open(data.path(), "recorded-task")?;
     assert!(policy.observe(&blocked)?.is_none());
-    assert!(policy.pending && policy.blocked.is_some());
+    assert!(policy.pending && policy.blocked.is_none());
     let reopened = make_runner(workspace.path(), data.path());
     let mut recovered = reopened.prepare_request(
         RunRequest {
@@ -2078,7 +2168,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     recovered.context.as_mut().unwrap().automatic = true;
     assert_eq!(
         reopened.run(recovered, None, None).await?.state,
-        CheckState::Blocked
+        CheckState::Stopped
     );
     std::fs::write(&allow, "allow")?;
     let retry = runner.run(prepare()?, None, None).await?;
@@ -2154,7 +2244,7 @@ async fn output_failure_collects_the_process_before_releasing_admission() -> Res
         runner.run(run, None, None),
     )
     .await??;
-    assert_eq!(run.state, CheckState::ConfigurationError);
+    assert_eq!(run.state, CheckState::ExecutionError);
     assert!(runner.active()?.is_none());
     tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     assert!(!workspace.path().join("orphan.txt").exists());

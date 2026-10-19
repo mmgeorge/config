@@ -103,7 +103,7 @@ local ok, failure = xpcall(function()
         if request.method == "github.sync" then
           local messages = {
             { request_id = request.id, event = "github.sync.progress", payload = { phase = "reading", fetched = 0 } },
-            { request_id = request.id, event = "unrelated.progress", payload = {} },
+            { request_id = request.id, event = "status.progress", payload = {} },
             { id = request.id, result = { refreshed = true, fetched = 1, pages = 1 } },
             { request_id = request.id, event = "github.sync.progress", payload = { phase = "late" } },
           }

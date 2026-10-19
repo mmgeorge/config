@@ -14,6 +14,8 @@ end }
 local client = require("forge.client")
 client._set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
+local errors = {}
+require("forge.infra.notifications").error = function(message) errors[#errors + 1] = debug.traceback(message, 2) end
 local function request(method, params)
   local done, result, failure
   client.request(method, params or {}, function(value, problem) result, failure, done = value, problem, true end)
@@ -86,5 +88,6 @@ client.stop()
 local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
 vim.fn.stdpath = original_stdpath
 assert(succeeded and collected, failure or "host did not stop")
+assert(#errors == 0, table.concat(errors, "\n"))
 print("harness_check_shortcuts_host: passed")
 vim.cmd("qa!")

@@ -49,8 +49,22 @@ record persistence, or UI delivery cannot delay the termination request.
 worker and flushes the terminal snapshot before the run result returns. Notification
 delivery coalesces view invalidations separately from persistence. Complete process
 output stays in its stdout, stderr, and combined files. Persistence failures become
-explicit configuration errors in the live record, with the previous disk record
+explicit execution errors in the live record, with the previous disk record
 available for recovery. The UI does not own execution or infer completion.
+
+Transcript reads retain the committed view while retrying transient transport
+and admission failures. State reads that predate displayed revisions coalesce
+another read and retain waiting callbacks. Queue publication owns a separate
+diagnostic that clears only after its matching successful retry. Diagnostic
+severity belongs to the owning operation, not to its message text. Section
+loading failures remain attached to their section after reconciling the current
+node generation and page boundary.
+
+Staging writes carry a monotonic sequence within the document lifetime. Retrying
+the same sequence cannot replace newer staging. Task controls retain their
+operation identity while polling an uncertain acknowledgement. Waiting for
+execution ownership includes checkpoint finalization and has no ten-second
+failure boundary. Explicit shutdown remains a neutral lifecycle notice.
 
 
 `NodeMap` owns the shared expansion choices, node incarnations, and tool output sources for
@@ -659,8 +673,9 @@ commit together. Rollback changes history disposition while preserving execution
 Cancelled finalization displays Stopping across status, exchange, and agent headings. Saving
 exchange describes finalization for other outcomes.
 Checkpoint capture errors include the source path and retain the finalizing exchange. Ctrl-C
-retries finalization even when no provider request is active. Goal resume retries finalization
-before activating the goal, so a failed retry leaves the goal paused and admits no new work.
+retries finalization even when no provider request is active. New prompt admission and goal
+resume also retry finalization before starting provider work. A failed retry retains the
+previous exchange and its error without admitting a new exchange.
 Explicit pause and clear also finalize an exchange waiting for user input. Closed exchanges
 retain their recorded questions in history but cannot expose them as active questions.
 Unanswered question rows in a cancelled exchange display Cancelled and cannot reopen a prompt.
@@ -1616,6 +1631,9 @@ accepted revision, and acceptance event together. Session ownership includes an 
 file lock, so an expired timestamp cannot admit a second live runtime. Restart recovery retains
 committed phase and completion evidence, suspends unfinished attempts, and marks unsettled
 operations outcome-unknown. No recovered task starts a provider automatically.
+Pause operations recover as cancelled without an unknown-write warning. A stopped runtime
+cannot continue execution, and recovery preserves paused tasks and interrupted check results.
+The same recovery repairs pause records previously marked outcome-unknown by runtime shutdown.
 Exchange recovery retains the last persisted active elapsed coordinate. It excludes the
 offline interval and may omit activity after the last saved provider event.
 Recovery also settles unfinished provider turns in a finalizing exchange. A pending success

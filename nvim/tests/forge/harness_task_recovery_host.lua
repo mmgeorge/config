@@ -43,6 +43,7 @@ local function snapshot(session_id)
   return current
 end
 local success, failure = xpcall(function()
+  vim.fn.writefile({ '{"checks":{"version":2,"definitions":[]}}' }, workspace .. "/.forge.json")
   vim.fn.chdir(workspace)
   require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "blocking" } } } } })
   local initial = open()

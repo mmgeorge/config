@@ -241,13 +241,9 @@ impl HarnessBroker {
         mode: PromptMode,
         admission: Option<&ExchangeAdmission>,
     ) -> Result<(Exchange, Vec<SessionEvent>)> {
-        anyhow::ensure!(
-            self.store
-                .list_exchange(&self.session.id)?
-                .iter()
-                .all(|exchange| exchange.state != ExchangeState::Finalizing),
-            "an exchange is still finalizing; retry cleanup before starting more work"
-        );
+        let (_, mut event) = Box::pin(self.retry_finalization())
+            .await
+            .context("finish previous exchange before starting more work")?;
         self.backend.prepare_turn(&self.session.id).await?;
         let now_ms = self.clock.now_ms();
         let admitted_prompt = admission.map(|value| value.prompt.as_str()).unwrap_or(text);
@@ -267,12 +263,14 @@ impl HarnessBroker {
             previous.repair_checks(now_ms)?;
             self.store.save_exchange(&previous)?;
         }
-        let (mut interaction, new_interaction, mut event) = Box::pin(self.interaction_for_turn(
-            admitted_prompt,
-            admission.is_some() && !automatic_repair,
-            now_ms,
-        ))
-        .await?;
+        let (mut interaction, new_interaction, mut admission_event) =
+            Box::pin(self.interaction_for_turn(
+                admitted_prompt,
+                admission.is_some() && !automatic_repair,
+                now_ms,
+            ))
+            .await?;
+        event.append(&mut admission_event);
         interaction.mode = Some(self.session.execution_mode);
         if new_interaction && let Some(admission) = admission {
             if self.check_setup {

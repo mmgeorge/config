@@ -257,7 +257,8 @@ impl SqliteStore {
             transaction.execute("UPDATE task_record SET payload=json_set(payload,'$.status','cancelled','$.reason','Clear request recovered after runtime shutdown') WHERE id=(SELECT json_extract(payload,'$.session.current_task_id') FROM session_record WHERE id=?1) AND json_extract(payload,'$.status') NOT IN ('completed','cancelled')", [session_id])?;
             transaction.execute("UPDATE session_record SET payload=json_set(payload,'$.session.current_task_id',NULL,'$.session.goal_id',NULL) WHERE id=?1", [session_id])?;
         }
-        transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','outcome_unknown','$.error','Runtime stopped before the operation settled. Inspect task state before resuming') WHERE session_id=?1 AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running')", [session_id])?;
+        transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','cancelled','$.error',NULL) WHERE session_id=?1 AND json_extract(payload,'$.action.action')='pause' AND (json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running') OR (json_extract(payload,'$.state')='outcome_unknown' AND json_extract(payload,'$.error')='Runtime stopped before the operation settled. Inspect task state before resuming'))", [session_id])?;
+        transaction.execute("UPDATE task_operation SET payload=json_set(payload,'$.state','outcome_unknown','$.error','Runtime stopped before the operation settled. Inspect task state before resuming') WHERE session_id=?1 AND json_extract(payload,'$.state') IN ('admitted','accepted','stopping','running','applying','verifying','resuming')", [session_id])?;
         transaction.commit()?;
         Ok(())
     }

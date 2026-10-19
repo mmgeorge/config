@@ -4,6 +4,7 @@ mod automatic;
 mod changes;
 mod config;
 mod evidence;
+mod failure;
 mod invocation;
 mod model;
 mod packages;
@@ -22,7 +23,8 @@ pub(crate) use automatic::AutomaticChecks;
 #[cfg(test)]
 pub(crate) use config::configure_fixture;
 pub use config::{
-    CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckScope, ConfigSnapshot,
+    CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckPurpose, CheckScope,
+    ConfigSnapshot,
 };
 pub use model::{CheckEvent, CheckEventKind, CheckRun, CheckSetupState, CheckState, CommandCheck};
 pub use packages::PackageManager;

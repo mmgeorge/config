@@ -8,6 +8,7 @@ pub enum ToolState {
     Running,
     Completed,
     Failed,
+    Denied,
     Cancelled,
     Interrupted,
 }
@@ -45,7 +46,8 @@ impl ToolCall {
     pub fn state(&self) -> ToolState {
         match self.status.to_ascii_lowercase().as_str() {
             "completed" | "complete" | "success" | "succeeded" => ToolState::Completed,
-            "failed" | "error" | "denied" | "declined" | "rejected" => ToolState::Failed,
+            "failed" | "error" => ToolState::Failed,
+            "denied" | "declined" | "rejected" => ToolState::Denied,
             "cancelled" | "canceled" => ToolState::Cancelled,
             "interrupted" => ToolState::Interrupted,
             _ => ToolState::Running,
@@ -130,7 +132,6 @@ impl ToolStore {
         {
             tool.status.clone_from(status);
         }
-        let previous_bytes = tool.output.len();
         if let Some(output) = activity.output.as_ref() {
             if activity.output_delta {
                 tool.output.push_str(output);
@@ -144,15 +145,7 @@ impl ToolStore {
         if !activity.change.is_empty() {
             tool.change.clone_from(&activity.change);
         }
-        if activity.output_delta {
-            let mut start = previous_bytes.saturating_sub(16);
-            while !tool.output.is_char_boundary(start) {
-                start += 1;
-            }
-            tool.failed = tool.failed || tool_failed(&tool.status, &tool.output[start..]);
-        } else {
-            tool.failed = tool_failed(&tool.status, &tool.output);
-        }
+        tool.failed = tool_failed(&tool.status);
         if tool.state() != ToolState::Running && tool.completed_at_ms.is_none() {
             tool.completed_at_ms = Some(now_ms.max(tool.started_at_ms.unwrap_or(now_ms)));
         }
@@ -195,9 +188,40 @@ fn tool_kind(activity: &ToolActivity) -> String {
         .unwrap_or_else(|| "tool_call".into())
 }
 
-fn tool_failed(status: &str, output: &str) -> bool {
-    matches!(
-        status.to_ascii_lowercase().as_str(),
-        "failed" | "error" | "denied" | "declined" | "rejected" | "cancelled" | "canceled"
-    ) || output.to_ascii_lowercase().contains(" rejected:")
+fn tool_failed(status: &str) -> bool {
+    matches!(status.to_ascii_lowercase().as_str(), "failed" | "error")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_structured_execution_failures_count_as_failed_tools() {
+        for status in [
+            "denied",
+            "declined",
+            "rejected",
+            "cancelled",
+            "canceled",
+            "interrupted",
+            "completed",
+        ] {
+            assert!(!tool_failed(status), "{status}");
+        }
+        assert!(tool_failed("error"));
+        assert!(tool_failed("failed"));
+        let mut store = ToolStore::default();
+        let activity: ToolActivity = serde_json::from_value(serde_json::json!({
+            "id":"successful", "kind":"tool_call", "title":"test", "status":"completed",
+            "output":"0 rejected: valid output", "output_delta":false
+        }))
+        .unwrap();
+        store.merge(&activity, 1);
+        assert!(!store.get("successful").unwrap().failed);
+        assert_eq!(
+            store.get("successful").unwrap().state(),
+            ToolState::Completed
+        );
+    }
 }

@@ -105,6 +105,21 @@ repeating the unchanged command. If repair ends with the same failures and no
 relevant changes, automatic repair stops with the failure unresolved.
 Configuration errors require correction through the authorized setup workflow.
 
+Definitions default to `purpose: "verify"`. Use `purpose: "prepare"` for commands
+that intentionally change source, such as a formatter in fix mode. A successful
+preparation records its resulting source as the baseline. Dependent checks run
+against that source. Source changes during verification produce `Stale`, and
+automatic checking verifies the current inputs again without asking the model
+to repair a successful command. Later preparation also invalidates earlier
+verification when it changes those inputs.
+
+Compiler failures during test discovery remain failed checks with their full
+compiler output. Invalid definitions and selectors remain configuration errors.
+Unavailable executables block execution, and storage or internal failures appear
+as execution errors. Explicit cancellation suppresses automatic retries of
+unchanged inputs with `Stopped`. An explicit run or relevant source changes
+permit another attempt.
+
 ## Tests for changed packages
 
 One definition can run every affected package without naming packages in advance.
@@ -209,6 +224,10 @@ waits for completion. A directly submitted prompt takes precedence over queued
 prompts, and edits made to the composer during cancellation remain unsent.
 `Ctrl-C` with an empty composer stops running checks and pauses work. `Ctrl-S`
 submits the composer even while that pause is pending, after cleanup finishes.
+Closing the runtime during checks retains interrupted results when the session reopens.
+Checks do not restart automatically. If checkpoint saving was interrupted, the next prompt
+finishes that save before starting new work. A save failure retains the previous exchange
+and reports the underlying error.
 
 
 Cancelling a check stops its owned process tree. Automatic completion does not retry
