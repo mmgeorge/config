@@ -146,8 +146,7 @@ k.keymap('n', 'L', 'o') -- Enter insert below
 -- keymap({'n', 'x'}, 'nzzzv')
 -- keymap({'n', 'x'}, 'Nzzzv')
 
-k.keymap({ 'n', 'v', 'i' }, '<C-h>', 'dd')
-vim.keymap.set({ 'n', 'i', 'x' }, '<C-j>', '<Cmd>%delete _<CR>', { desc = 'Clear buffer text', silent = true })
+vim.keymap.set('i', '<C-j>', '<CR>', { desc = 'Insert newline', silent = true })
 k.keymap({ 'n', 'x' }, 'Z', '<C-r>') -- Redo
 
 -- vim.keymap.set({'n'}, '<CR>', 'O<ESC>') -- Insert blank line below

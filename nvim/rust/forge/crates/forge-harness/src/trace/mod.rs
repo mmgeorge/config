@@ -30,6 +30,7 @@ fn metadata_payload(payload: &Value) -> Value {
                 | "operation_id"
                 | "request_id"
                 | "session_id"
+                | "agent_id"
                 | "exchange_id"
                 | "thread_id"
                 | "turn_id"
@@ -46,6 +47,8 @@ fn metadata_payload(payload: &Value) -> Value {
                 | "elapsed_ms"
                 | "duration_ms"
                 | "count"
+                | "retry_attempt"
+                | "max_retries"
                 | "rows"
                 | "bytes"
                 | "source_bytes"
@@ -324,15 +327,11 @@ impl TraceStore {
             .write(true)
             .open(path.with_extension("lock"))?;
         lock.lock()?;
-        let mut record = json!({
+        let record = json!({
             "timestamp_ms": SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as i64,
             "session_id": session_id, "event": event, "payload": redact(payload),
         });
-        let mut line = serde_json::to_vec(&record)?;
-        if line.len() as u64 > MAX_TRACE_BYTES {
-            record["payload"] = json!({ "omitted": "record exceeds 15 MiB", "bytes": line.len() });
-            line = serde_json::to_vec(&record)?;
-        }
+        let line = serde_json::to_vec(&record)?;
         if path
             .metadata()
             .is_ok_and(|metadata| metadata.len() + line.len() as u64 + 1 > MAX_TRACE_BYTES)
@@ -450,6 +449,28 @@ mod test {
         assert!(std::fs::read_to_string(&path).unwrap().contains("second"));
         assert!(path.with_extension("jsonl.1").exists());
         assert!(path.metadata().unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn retry_error_larger_than_rotation_budget_is_retained_in_full() {
+        let directory = tempdir().unwrap();
+        let trace = TraceStore::open(directory.path()).unwrap();
+        trace.configure(true).unwrap();
+        let message = "network detail ".repeat(super::MAX_TRACE_BYTES as usize / 15 + 1);
+        trace.record(
+            "session",
+            "provider.retry",
+            json!({"status":"failed", "detail":{"error":message}}),
+        );
+        let contents = std::fs::read_to_string(trace.session_path("session")).unwrap();
+        let record: serde_json::Value = serde_json::from_str(contents.trim()).unwrap();
+        assert_eq!(
+            record["payload"]["detail"]["error"].as_str(),
+            Some(message.as_str())
+        );
+        trace.record("session", "provider.retry", json!({"status":"exhausted"}));
+        let rotated = trace.session_path("session").with_extension("jsonl.1");
+        assert_eq!(std::fs::read_to_string(rotated).unwrap(), contents);
     }
 
     #[test]

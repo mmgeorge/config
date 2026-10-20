@@ -121,6 +121,8 @@ mod test {
             access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("existing".into()),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: Some(ControlTurnContext::inactive(PromptMode::Chat)),
         };
         for permission in [

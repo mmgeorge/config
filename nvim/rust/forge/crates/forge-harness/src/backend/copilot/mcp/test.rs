@@ -215,6 +215,8 @@ impl Fixture {
             },
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         }
     }

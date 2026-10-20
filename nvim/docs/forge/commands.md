@@ -89,6 +89,21 @@ file list but have no excerpts, including license files with Markdown or text ex
 
 ## Harness and permissions
 
+Harness automatically retries recognized network and model-capacity failures
+before any tool or model output, up to five times with delays of 1, 5, 10, 30, and
+60 seconds. The status shows the retry count and a countdown, such as
+`Working · retry 2/5 · retrying in 5s`. Cancellation remains available while
+waiting. If recovery fails, Forge shows the final provider error. With tracing
+enabled, `/log` records every attempt and error. Authentication, quota, tool,
+unknown, and potentially partially executed failures do not trigger this retry.
+
+Failed prompt delivery preserves your input and attachments. Your next prompt
+includes earlier input only when Forge knows it was never delivered. Your newest
+instruction can amend or cancel that earlier context. If delivery is uncertain,
+Forge checks provider history before sending again. When acceptance cannot be
+confirmed, Forge keeps both prompts saved and displays the failure instead of
+risking duplicate execution. This also applies to live steering.
+
 A file-write request in Read mode offers **Switch to Write mode** or **Stay in Read mode**.
 Switching resumes the task under the configured directory limits and permission rules.
 Staying in Read mode rejects that request.
@@ -134,6 +149,7 @@ Queued prompts and pending steering appear below the status in the upper timelin
 pane. The lower prompt buffer contains only the draft being edited.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
+In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
 Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` and
 `Down` browse history, and `Down` past the newest entry restores your unfinished
 draft and attachments. Inside a multiline draft, the arrows move between lines.

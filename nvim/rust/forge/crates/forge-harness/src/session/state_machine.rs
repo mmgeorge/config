@@ -156,6 +156,10 @@ pub enum SessionPhase {
         started_at_ms: Option<i64>,
         activity: WorkflowActivity,
     },
+    RetryingProvider {
+        retry: crate::backend::retry::ProviderRetry,
+        activity: WorkflowActivity,
+    },
     PlanningFailed {
         plan_id: String,
         turn_count: u32,
@@ -286,6 +290,15 @@ impl SessionPhase {
                 revision: plan.model_revision,
             };
         }
+        if let Some(exchange) =
+            exchange.filter(|exchange| exchange.activity() == ExchangeActivity::Active)
+            && let Some(retry) = &exchange.provider_retry
+        {
+            return Self::RetryingProvider {
+                retry: retry.clone(),
+                activity: WorkflowActivity::from_exchange(exchange),
+            };
+        }
         let working = exchange
             .filter(|exchange| exchange.activity() == ExchangeActivity::Active)
             .map(|exchange| {
@@ -366,6 +379,7 @@ impl SessionPhase {
             self,
             Self::Working { .. }
                 | Self::RetryingPlanGeneration { .. }
+                | Self::RetryingProvider { .. }
                 | Self::Compacting { .. }
                 | Self::WaitingForAgent { .. }
                 | Self::Finalizing { error: None, .. }
@@ -383,6 +397,13 @@ impl SessionPhase {
                 started_at_ms: Some(_),
                 ..
             } | Self::Compacting { .. }
+                | Self::RetryingProvider {
+                    retry: crate::backend::retry::ProviderRetry {
+                        retry_at_ms: Some(_),
+                        ..
+                    },
+                    ..
+                }
         )
     }
 }

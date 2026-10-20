@@ -142,10 +142,44 @@ pub struct BackendRequest {
     pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
+    /// Durable acknowledgment capability attached before dispatch.
+    pub submission: Option<std::sync::Arc<super::submission::Submission>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Earlier definitely undelivered input, ordered before the current instruction.
+    pub recovered_input: Vec<BackendInput>,
+    #[serde(skip, default)]
     pub control_context: Option<crate::control_tools::ControlTurnContext>,
 }
 
 impl BackendRequest {
+    /// Renders missing user input ahead of the newest instruction without re-executing a turn.
+    pub(crate) fn recovered_text(&self, current: &str, previous: &[String]) -> String {
+        if previous.is_empty() {
+            return current.to_owned();
+        }
+        let mut text = String::from(
+            "Earlier user input was saved locally but never accepted by the provider. Treat it as context for the newest instruction, which may amend or cancel it.\n",
+        );
+        for (index, input) in previous.iter().enumerate() {
+            text.push_str(&format!(
+                "\nEarlier undelivered input {}:\n{}\n",
+                index + 1,
+                input
+            ));
+        }
+        text.push_str(&format!("\nNewest user input:\n{current}"));
+        text
+    }
+
+    /// Retains native attachment references from every recovered input and the newest input.
+    pub(crate) fn input_attachments(&self) -> Vec<crate::attachment::InputAttachment> {
+        self.recovered_input
+            .iter()
+            .chain(std::iter::once(&self.input))
+            .flat_map(|input| input.attachments().iter().cloned())
+            .collect()
+    }
+
     /// Resolve the independent runtime without changing the visible settings scope.
     pub fn runtime_key(&self) -> Result<String> {
         Ok(self.owner()?.runtime_key())
@@ -635,6 +669,16 @@ pub trait Backend: Send + Sync {
     /// Return stable provider identity and capability without starting a provider process.
     fn descriptor(&self) -> BackendDescriptor;
 
+    /// Returns a native receipt only when history proves this exact submission was accepted.
+    /// Missing history and unsupported reconciliation return None and never authorize replay.
+    async fn reconcile_submission(
+        &self,
+        _submission: &super::submission::SubmissionRecord,
+        _known_receipts: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Run one prompt and normalize provider events into Harness events.
     async fn prompt(&self, request: BackendRequest) -> Result<BackendOutput> {
         self.prompt_stream(request, None).await
@@ -1118,6 +1162,14 @@ impl Backend for MockBackend {
                 tokio::select! {
                     () = &mut delay => break,
                     Some(command) = active_steering.receive() => {
+                        if let Some(submission) = &command.submission {
+                            let admitted = submission.sending(super::submission::SubmissionTarget::Untracked)
+                                .and_then(|()| submission.accepted("local mock steering admission".into()));
+                            if let Err(error) = admitted {
+                                command.complete(Err(error)).await;
+                                continue;
+                            }
+                        }
                         steering_text_list.push(command.text.clone());
                         command.complete(Ok(())).await;
                     }
@@ -1698,6 +1750,31 @@ mod test {
 
     #[tokio::test]
     async fn applies_steering_to_the_same_planning_turn() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::backend::submission::SubmissionStore::open(
+            directory.path(),
+            Arc::new(crate::trace::TraceStore::open(directory.path()).unwrap()),
+        )
+        .unwrap();
+        let submission = store
+            .prepare_steering(
+                &super::BackendCatalogRequest {
+                    execution_owner: None,
+                    harness_session_id: "harness-session".into(),
+                    workspace: ".".into(),
+                    access: Default::default(),
+                    execution_mode: PermissionMode::Read,
+                    backend_session_id: None,
+                },
+                super::BackendInput::from_text("And be sure to modify Y"),
+                super::BackendKind::Mock,
+            )
+            .unwrap();
+        let input = super::SteeringInput::User {
+            text: "And be sure to modify Y".into(),
+            attachments: Vec::new(),
+            submission: Some(submission.clone()),
+        };
         let backend = Arc::new(MockBackend {
             lsp_probe: false,
             retained_control: None,
@@ -1727,6 +1804,8 @@ mod test {
                         access: Default::default(),
                         execution_mode: PermissionMode::Read,
                         backend_session_id: None,
+                        submission: None,
+                        recovered_input: Vec::new(),
                         control_context: None,
                     },
                     None,
@@ -1735,7 +1814,7 @@ mod test {
         });
         loop {
             match backend
-                .steer_session("harness-session", "And be sure to modify Y".into())
+                .steer_session("harness-session", input.clone())
                 .await
             {
                 Ok(()) => break,
@@ -1746,6 +1825,10 @@ mod test {
             }
         }
         let output = prompt.await.unwrap().unwrap();
+        assert!(matches!(
+            submission.record().unwrap().delivery,
+            crate::backend::submission::SubmissionState::Accepted { .. }
+        ));
         let text = output.plan_edit[0]
             .mutation
             .plan

@@ -386,7 +386,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         self.send_waiting_target_command(command, &mut pending_command).await;
                     } else {
                         let text = steering_prompt(&command);
-                        match self.start_parent_turn(text).await {
+                        match self.start_parent_turn(text, command.submission.clone()).await {
                             Ok(mut turn) => {
                                 self.clear_wait().await;
                                 command.complete(Ok(())).await;
@@ -440,21 +440,27 @@ impl<'a> CodexTurnCoordinator<'a> {
                         "Codex child synthesis exceeded {MAX_FINALIZATION_ATTEMPT} attempts"
                     );
                     parent_turn = Some(self.start_parent_turn(
-                        "All child agents have finished. Synthesize their results and answer the user. Do not merely report that the children completed.".into()
+                        "All child agents have finished. Synthesize their results and answer the user. Do not merely report that the children completed.".into(), None
                     ).await?);
                 }
             }
         }
     }
 
-    async fn start_parent_turn(&mut self, text: String) -> Result<ParentTurn> {
+    async fn start_parent_turn(
+        &mut self,
+        text: String,
+        submission: Option<std::sync::Arc<super::super::submission::Submission>>,
+    ) -> Result<ParentTurn> {
+        let mut request = self.request.clone();
+        request.submission = submission;
         let input = crate::attachment::codex_input(text, self.request.input.attachments()).await?;
         let (turn, provider_started, observed_message_list) = self
             .backend
             .start_turn(
                 self.process,
                 self.output,
-                self.request,
+                &request,
                 self.thread_id,
                 true,
                 CodexBackend::with_model(
@@ -547,7 +553,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         } else {
             None
         };
-        let (method, params) = match command.operation {
+        let (method, mut params) = match command.operation {
             ActiveTurnOperation::PauseGoal | ActiveTurnOperation::ClearGoal => {
                 if self.native_goal == NativeGoalLifetime::Disabled {
                     command.complete(Ok(())).await;
@@ -589,6 +595,17 @@ impl<'a> CodexTurnCoordinator<'a> {
                 turn_id: turn_id.into(),
             });
         }
+        if let Some(submission) = &command.submission {
+            params["clientUserMessageId"] = json!(submission.id());
+            if let Err(error) =
+                submission.sending(super::super::submission::SubmissionTarget::Codex {
+                    thread_id: thread_id.into(),
+                })
+            {
+                command.complete(Err(error)).await;
+                return;
+            }
+        }
         match self.process.send_request(method, params).await {
             Ok(request_id) => {
                 pending_command.insert(request_id, command);
@@ -622,9 +639,19 @@ impl<'a> CodexTurnCoordinator<'a> {
         let Some(command) = pending_command.remove(&request_id) else {
             return Ok(());
         };
-        let result = CodexJsonRpc::request_result(message, request_id, "active turn command")
+        let mut result = CodexJsonRpc::request_result(message, request_id, "active turn command")
             .context("Codex active-turn command response omitted its result")?
             .map(drop);
+        if let Some(submission) = &command.submission {
+            if result.is_ok() {
+                result = submission.accepted(format!("turn/steer:{message}"));
+            } else if matches!(
+                message.pointer("/error/code").and_then(Value::as_i64),
+                Some(-32600 | -32601 | -32602)
+            ) {
+                submission.rejected(result.as_ref().unwrap_err().to_string())?;
+            }
+        }
         if command.operation == ActiveTurnOperation::Interrupt && result.is_ok() {
             self.interrupted.push((
                 tokio::time::Instant::now() + std::time::Duration::from_secs(30),
@@ -998,6 +1025,8 @@ mod test {
             service_tier: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("thread".into()),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let lane = SteeringLane::default();
@@ -1130,6 +1159,8 @@ mod test {
             service_tier: crate::backend::ServiceTier::Standard,
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let lane = SteeringLane::default();
@@ -1216,6 +1247,8 @@ mod test {
             service_tier: crate::backend::ServiceTier::Ultrafast,
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let lane = crate::backend::steering::SteeringLane::default();
@@ -1366,6 +1399,8 @@ mod test {
                 access: Default::default(),
                 execution_mode: PermissionMode::Read,
                 backend_session_id: Some("parent".into()),
+                submission: None,
+                recovered_input: Vec::new(),
                 control_context: None,
             };
             let lane = SteeringLane::default();

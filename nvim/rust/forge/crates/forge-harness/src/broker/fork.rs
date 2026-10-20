@@ -113,6 +113,8 @@ pub fn prepare_provider_fork(
             access: source.access,
             execution_mode: PermissionMode::Read,
             backend_session_id: fork_point.backend_session_id,
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         },
         target_harness_session_id: target_session_id,

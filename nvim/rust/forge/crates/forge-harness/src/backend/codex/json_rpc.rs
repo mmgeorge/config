@@ -1104,6 +1104,15 @@ async fn normalize_event_in_workspace(
     let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
     let assistant_event = method_lower.contains("agentmessage");
     let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
+    if method_lower == "error"
+        && params
+            .get("error")
+            .and_then(super::retry::transient_code)
+            .is_some()
+        && crate::backend::retry::replay_safe(output)
+    {
+        return;
+    }
     let kind = if tool_event {
         output.evidence.tool_called = true;
         "tool"

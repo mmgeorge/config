@@ -11,6 +11,129 @@ enum NativeUserDelivery {
 }
 
 #[tokio::test]
+async fn copilot_retry_waits_for_idle_and_keeps_the_native_session() -> Result<()> {
+    let (fixture, backend, mut request) = fixture()?;
+    let submission_store =
+        crate::backend::submission::SubmissionStore::open(fixture.path(), backend.trace.clone())?;
+    let submission = submission_store.prepare(&request, BackendKind::Copilot)?;
+    request.submission = Some(submission.clone());
+    let (client_read, mut server_write) = tokio::io::duplex(65536);
+    let (client_write, mut server_read) = tokio::io::duplex(65536);
+    *backend.client.lock().await = Some(Client::from_streams(
+        client_read,
+        client_write,
+        PathBuf::from(&request.workspace),
+    )?);
+    let (sink, mut events) = crate::backend::events::channel();
+    let server = async {
+        let create = read_request(&mut server_read).await?;
+        assert_eq!(create["method"], "session.create");
+        let session_id = create["params"]["sessionId"]
+            .as_str()
+            .context("session identity missing")?
+            .to_owned();
+        respond(
+            &mut server_write,
+            &create,
+            json!({"result":{"sessionId":session_id,"workspacePath":"."}}),
+        )
+        .await?;
+        for attempt in 0..2 {
+            let todos = read_request(&mut server_read).await?;
+            assert_eq!(todos["method"], "session.plan.readSqlTodosWithDependencies");
+            respond(
+                &mut server_write,
+                &todos,
+                json!({"result":{"rows":[],"dependencies":[]}}),
+            )
+            .await?;
+            let tail = read_request(&mut server_read).await?;
+            assert_eq!(tail["method"], "session.eventLog.tail");
+            respond(
+                &mut server_write,
+                &tail,
+                json!({"result":{"cursor":"retained"}}),
+            )
+            .await?;
+            let send = read_request(&mut server_read).await?;
+            assert_eq!(send["method"], "session.send");
+            assert_eq!(send["params"]["sessionId"], session_id);
+            if attempt == 0 {
+                assert!(matches!(
+                    submission.record()?.delivery,
+                    crate::backend::submission::SubmissionState::Sending { .. }
+                ));
+            }
+            respond(
+                &mut server_write,
+                &send,
+                json!({"result":{"messageId":format!("message-{attempt}")}}),
+            )
+            .await?;
+            write_frame(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event","params":{
+                "sessionId":session_id,"event":{"id":format!("turn-{attempt}"),"type":"assistant.turn_start","timestamp":"2026-10-20T12:00:00Z","data":{"turnId":format!("turn-{attempt}")}}
+            }})).await?;
+            if attempt == 0 {
+                write_frame(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event","params":{
+                    "sessionId":session_id,"event":{"id":"failure","type":"session.error","timestamp":"2026-10-20T12:00:00Z","data":{"errorType":"query","statusCode":503,"message":"service temporarily unavailable"}}
+                }})).await?;
+                assert!(
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(30),
+                        read_request(&mut server_read)
+                    )
+                    .await
+                    .is_err(),
+                    "retry began before the provider became idle"
+                );
+            }
+            write_frame(&mut server_write, json!({"jsonrpc":"2.0","method":"session.event","params":{
+                "sessionId":session_id,"event":{"id":format!("idle-{attempt}"),"type":"session.idle","timestamp":"2026-10-20T12:00:00Z","data":{}}
+            }})).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::try_join!(
+            server,
+            crate::backend::retry::prompt(
+                &backend,
+                request,
+                Some(sink),
+                &backend.trace,
+                &submission_store
+            )
+        )
+    })
+    .await??;
+    assert!(matches!(
+        submission.record()?.delivery,
+        crate::backend::submission::SubmissionState::Accepted { .. }
+    ));
+    let mut retry_count = 0;
+    let mut failed_turn = false;
+    while let Ok(event) = events.try_recv() {
+        assert_ne!(
+            event.kind, "error",
+            "transient error escaped as a terminal notification"
+        );
+        if event.kind == "provider_retry" && !event.data.is_null() {
+            assert_eq!(event.data["attempt"], 1);
+            retry_count += 1;
+        }
+        failed_turn |= matches!(
+            event.turn_boundary,
+            Some(super::super::TurnBoundary::Finished {
+                outcome: crate::turn::TurnOutcome::Failed
+            })
+        );
+    }
+    assert_eq!(retry_count, 2);
+    assert!(failed_turn);
+    Ok(())
+}
+
+#[tokio::test]
 async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
     for resumed in [false, true] {
         let (_fixture, backend, mut request) = fixture()?;
@@ -519,6 +642,81 @@ fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
         backend_session_id: None,
     });
     Ok((fixture, backend, request))
+}
+
+#[tokio::test]
+async fn copilot_submission_reconciliation_excludes_known_messages_and_ambiguous_history()
+-> Result<()> {
+    for ambiguous in [false, true] {
+        let (fixture, backend, request) = fixture()?;
+        let journal = crate::backend::submission::SubmissionStore::open(
+            fixture.path(),
+            backend.trace.clone(),
+        )?;
+        let submission = journal.prepare(&request, BackendKind::Copilot)?;
+        submission.sending(crate::backend::submission::SubmissionTarget::Copilot {
+            session_id: "retained-native".into(),
+            cursor: "before-send".into(),
+            prompt: "same text".into(),
+        })?;
+        let (client_read, mut server_write) = tokio::io::duplex(65536);
+        let (client_write, mut server_read) = tokio::io::duplex(65536);
+        *backend.client.lock().await = Some(Client::from_streams(
+            client_read,
+            client_write,
+            PathBuf::from(&request.workspace),
+        )?);
+        let server = async {
+            let resume = read_request(&mut server_read).await?;
+            assert_eq!(resume["method"], "session.resume");
+            respond(
+                &mut server_write,
+                &resume,
+                json!({"result":{"sessionId":"retained-native","workspacePath":"."}}),
+            )
+            .await?;
+            let reload = read_request(&mut server_read).await?;
+            assert_eq!(reload["method"], "session.skills.reload");
+            respond(&mut server_write, &reload, json!({"result":{}})).await?;
+            for page in 0..2 {
+                let read = read_request(&mut server_read).await?;
+                assert_eq!(read["method"], "session.eventLog.read");
+                assert_eq!(
+                    read["params"]["cursor"],
+                    if page == 0 {
+                        "before-send"
+                    } else {
+                        "next-page"
+                    }
+                );
+                let message = |id: &str| json!({"id":id,"type":"user.message","timestamp":"2026-10-20T12:00:00Z","data":{"content":"same text","messageId":id}});
+                let events = if page == 0 {
+                    vec![message("already-acknowledged")]
+                } else if ambiguous {
+                    vec![message("candidate-one"), message("candidate-two")]
+                } else {
+                    vec![message("candidate-one")]
+                };
+                respond(&mut server_write, &read, json!({"result":{"cursor":"next-page","cursorStatus":"ok","hasMore":page == 0,"events":events}})).await?;
+            }
+            Ok::<_, anyhow::Error>(())
+        };
+        let known = std::collections::HashSet::from(["already-acknowledged".to_owned()]);
+        let record = submission.record()?;
+        let (_, receipt) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::try_join!(server, backend.reconcile_submission(&record, &known))
+        })
+        .await??;
+        assert_eq!(
+            receipt.as_deref(),
+            if ambiguous {
+                None
+            } else {
+                Some("candidate-one")
+            }
+        );
+    }
+    Ok(())
 }
 
 async fn read_request(reader: &mut DuplexStream) -> Result<Value> {

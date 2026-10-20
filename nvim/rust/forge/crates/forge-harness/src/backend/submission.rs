@@ -1,0 +1,760 @@
+use std::{
+    path::Path,
+    sync::{Arc, Mutex},
+};
+
+use anyhow::{Result, ensure};
+use rusqlite::{Connection, params};
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+
+use super::{Backend, BackendRequest};
+use crate::trace::TraceStore;
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+/// Durable delivery evidence. Only Prepared is safe to include in a later submission.
+pub enum SubmissionState {
+    /// No adapter has crossed the dispatch boundary.
+    Prepared,
+    /// Dispatch may have happened. Absence of an acknowledgment does not permit replay.
+    Sending { target: SubmissionTarget },
+    /// Provider acknowledgment or correlated native history proves acceptance.
+    Accepted {
+        receipt: String,
+        target: Option<SubmissionTarget>,
+    },
+    /// The user explicitly cancelled this submission.
+    Cancelled,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "provider", rename_all = "snake_case")]
+/// Evidence saved before an adapter can write a user message.
+pub enum SubmissionTarget {
+    /// Native client message identity equals the submission ID.
+    Codex { thread_id: String },
+    /// Native history cursor precedes this exact rendered message.
+    Copilot {
+        session_id: String,
+        cursor: String,
+        prompt: String,
+    },
+    /// ACP v1 has no client-assigned message ID for reconciling a lost response.
+    Acp { session_id: String, method: String },
+    /// Adapter has no read-only reconciliation contract.
+    Untracked,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Full input retained independently of exchange completion and diagnostic logging.
+pub struct SubmissionRecord {
+    /// Host-generated UUID, also used as Codex's client user message ID.
+    pub id: String,
+    /// Original request, including typed input and durable attachment references.
+    pub request: BackendRequest,
+    /// Current delivery evidence.
+    pub delivery: SubmissionState,
+    /// Earlier undelivered input included in this native message.
+    pub included: Vec<String>,
+    /// Last failure, preserved even when the next prompt cannot reconcile delivery.
+    pub error: Option<String>,
+}
+
+/// SQLite delivery journal. Commits complete before any corresponding provider write.
+pub(crate) struct SubmissionStore {
+    connection: Mutex<Connection>,
+    trace: Arc<TraceStore>,
+}
+
+impl SubmissionStore {
+    /// Opens a crash-recoverable journal without depending on trace enablement.
+    pub fn open(root: &Path, trace: Arc<TraceStore>) -> Result<Arc<Self>> {
+        std::fs::create_dir_all(root)?;
+        let connection = Connection::open(root.join("provider-submissions.sqlite3"))?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        connection.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;
+            CREATE TABLE IF NOT EXISTS submission (
+                id TEXT PRIMARY KEY, runtime TEXT NOT NULL, provider TEXT NOT NULL, payload TEXT NOT NULL
+            );")?;
+        Ok(Arc::new(Self {
+            connection: Mutex::new(connection),
+            trace,
+        }))
+    }
+
+    /// Saves the original input before host admission or provider preparation.
+    pub fn prepare(
+        self: &Arc<Self>,
+        request: &BackendRequest,
+        provider: super::BackendKind,
+    ) -> Result<Arc<Submission>> {
+        let provider = serde_json::to_string(&provider)?;
+        let record = SubmissionRecord {
+            id: uuid::Uuid::new_v4().to_string(),
+            request: request.clone(),
+            delivery: SubmissionState::Prepared,
+            included: Vec::new(),
+            error: None,
+        };
+        self.connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?
+            .execute(
+                "INSERT INTO submission(id,runtime,provider,payload) VALUES(?1,?2,?3,?4)",
+                params![
+                    record.id,
+                    request.runtime_key()?,
+                    provider,
+                    serde_json::to_string(&record)?
+                ],
+            )?;
+        self.log(&record);
+        Ok(Arc::new(Submission {
+            store: self.clone(),
+            id: record.id,
+        }))
+    }
+
+    /// Reads all unfinished inputs for the same execution owner and provider in admission order.
+    pub fn pending(
+        &self,
+        request: &BackendRequest,
+        provider: super::BackendKind,
+        before: Option<&str>,
+    ) -> Result<Vec<SubmissionRecord>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let mut statement = connection.prepare(
+            "SELECT payload FROM submission WHERE runtime=?1 AND provider=?2 AND (?3 IS NULL OR rowid < (SELECT rowid FROM submission WHERE id=?3)) ORDER BY rowid",
+        )?;
+        let rows = statement.query_map(
+            params![
+                request.runtime_key()?,
+                serde_json::to_string(&provider)?,
+                before
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        rows.map(|row| Ok(serde_json::from_str::<SubmissionRecord>(&row?)?))
+            .filter(|record| {
+                record.as_ref().map_or(true, |record| {
+                    matches!(
+                        record.delivery,
+                        SubmissionState::Prepared | SubmissionState::Sending { .. }
+                    )
+                })
+            })
+            .collect()
+    }
+
+    /// Saves steering before it enters an active turn's queue.
+    pub(crate) fn prepare_steering(
+        self: &Arc<Self>,
+        catalog: &super::BackendCatalogRequest,
+        input: super::BackendInput,
+        provider: super::BackendKind,
+    ) -> Result<Arc<Submission>> {
+        self.prepare(
+            &BackendRequest {
+                execution_owner: catalog.execution_owner.clone(),
+                harness_session_id: catalog.harness_session_id.clone(),
+                workspace: catalog.workspace.clone(),
+                input,
+                mode: super::PromptMode::Chat,
+                model: "default".into(),
+                effort: String::new(),
+                context_window: None,
+                service_tier: Default::default(),
+                access: catalog.access.clone(),
+                execution_mode: catalog.execution_mode,
+                backend_session_id: catalog.backend_session_id.clone(),
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            },
+            provider,
+        )
+    }
+
+    fn log(&self, record: &SubmissionRecord) {
+        self.trace.record(
+            &record.request.harness_session_id,
+            "provider.submission",
+            json!({
+                "submission_id": record.id, "owner": record.request.execution_owner,
+                "delivery": record.delivery, "included": record.included, "error": record.error,
+            }),
+        );
+    }
+
+    fn receipts(
+        &self,
+        request: &BackendRequest,
+        provider: super::BackendKind,
+    ) -> Result<std::collections::HashSet<String>> {
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let mut statement = connection.prepare("SELECT json_extract(payload,'$.delivery.receipt') FROM submission WHERE runtime=?1 AND provider=?2 AND json_extract(payload,'$.delivery.state')='accepted'")?;
+        Ok(statement
+            .query_map(
+                params![request.runtime_key()?, serde_json::to_string(&provider)?],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<std::result::Result<_, _>>()?)
+    }
+}
+
+impl std::fmt::Debug for SubmissionStore {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SubmissionStore")
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Debug)]
+/// Adapter-owned capability to commit one submission's delivery evidence.
+pub struct Submission {
+    store: Arc<SubmissionStore>,
+    id: String,
+}
+
+impl Submission {
+    /// Returns the stable host identity used for correlation, never a deduplication promise.
+    pub fn id(&self) -> &str {
+        &self.id
+    }
+
+    /// Loads the latest committed evidence, including after another handle reconciles it.
+    pub fn record(&self) -> Result<SubmissionRecord> {
+        let connection = self
+            .store
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let payload: String = connection.query_row(
+            "SELECT payload FROM submission WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        Ok(serde_json::from_str(&payload)?)
+    }
+
+    /// Persists the uncertain state before polling the external send future.
+    pub fn sending(&self, target: SubmissionTarget) -> Result<()> {
+        self.update(|record| {
+            ensure!(
+                record.delivery == SubmissionState::Prepared,
+                "submission already dispatched"
+            );
+            record.delivery = SubmissionState::Sending { target };
+            Ok(())
+        })
+    }
+
+    /// Atomically acknowledges this message and every earlier input it carried.
+    pub fn accepted(&self, receipt: String) -> Result<()> {
+        let mut connection = self
+            .store
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM submission WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        let mut record: SubmissionRecord = serde_json::from_str(&payload)?;
+        if matches!(record.delivery, SubmissionState::Accepted { .. }) {
+            return Ok(());
+        }
+        ensure!(
+            !matches!(record.delivery, SubmissionState::Cancelled),
+            "cancelled submission cannot be acknowledged"
+        );
+        let target = match &record.delivery {
+            SubmissionState::Sending { target } => Some(target.clone()),
+            SubmissionState::Accepted { target, .. } => target.clone(),
+            _ => None,
+        };
+        record.delivery = SubmissionState::Accepted {
+            receipt: receipt.clone(),
+            target: target.clone(),
+        };
+        let mut changed = vec![record.clone()];
+        for id in &record.included {
+            let payload: String = transaction.query_row(
+                "SELECT payload FROM submission WHERE id=?1",
+                [id],
+                |row| row.get(0),
+            )?;
+            let mut earlier: SubmissionRecord = serde_json::from_str(&payload)?;
+            ensure!(
+                earlier.delivery == SubmissionState::Prepared,
+                "included submission is no longer undelivered"
+            );
+            earlier.delivery = SubmissionState::Accepted {
+                receipt: receipt.clone(),
+                target: target.clone(),
+            };
+            changed.push(earlier);
+        }
+        for changed in &changed {
+            transaction.execute(
+                "UPDATE submission SET payload=?2 WHERE id=?1",
+                params![changed.id, serde_json::to_string(changed)?],
+            )?;
+        }
+        transaction.commit()?;
+        drop(connection);
+        for changed in &changed {
+            self.store.log(changed);
+        }
+        Ok(())
+    }
+
+    /// Records a proven pre-admission rejection. Transport errors must never call this method.
+    pub fn rejected(&self, error: String) -> Result<()> {
+        self.update(|record| {
+            ensure!(
+                matches!(record.delivery, SubmissionState::Sending { .. }),
+                "submission was not dispatched"
+            );
+            record.delivery = SubmissionState::Prepared;
+            record.error = Some(error);
+            Ok(())
+        })
+    }
+
+    /// Retains the actual failure without converting uncertain delivery into permission to replay.
+    pub fn failed(&self, error: String) -> Result<()> {
+        self.update(|record| {
+            record.error = Some(error);
+            Ok(())
+        })
+    }
+
+    /// Excludes explicitly cancelled input from automatic recovery.
+    pub fn cancel(&self) -> Result<()> {
+        self.update(|record| {
+            record.delivery = SubmissionState::Cancelled;
+            Ok(())
+        })
+    }
+
+    fn update(&self, change: impl FnOnce(&mut SubmissionRecord) -> Result<()>) -> Result<()> {
+        let mut connection = self
+            .store
+            .connection
+            .lock()
+            .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
+        let transaction = connection.transaction()?;
+        let payload: String = transaction.query_row(
+            "SELECT payload FROM submission WHERE id=?1",
+            [&self.id],
+            |row| row.get(0),
+        )?;
+        let mut record: SubmissionRecord = serde_json::from_str(&payload)?;
+        change(&mut record)?;
+        if matches!(record.delivery, SubmissionState::Sending { .. }) {
+            let unresolved: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM submission AS other JOIN submission AS current ON current.id=?1 WHERE other.id<>current.id AND other.runtime=current.runtime AND other.provider=current.provider AND json_extract(other.payload,'$.delivery.state')='sending')",
+                [&self.id], |row| row.get(0),
+            )?;
+            ensure!(
+                !unresolved,
+                "an earlier submission has uncertain delivery; input remains saved"
+            );
+        }
+        transaction.execute(
+            "UPDATE submission SET payload=?2 WHERE id=?1",
+            params![self.id, serde_json::to_string(&record)?],
+        )?;
+        transaction.commit()?;
+        drop(connection);
+        self.store.log(&record);
+        Ok(())
+    }
+
+    /// Reconciles prior uncertain input, then attaches only definitely undelivered context.
+    pub async fn recover(&self, backend: &dyn Backend, request: &mut BackendRequest) -> Result<()> {
+        let provider = backend.descriptor().kind;
+        for pending in self.store.pending(request, provider, Some(&self.id))? {
+            if pending.id == self.id {
+                continue;
+            }
+            if matches!(pending.delivery, SubmissionState::Sending { .. }) {
+                let handle = Self {
+                    store: self.store.clone(),
+                    id: pending.id.clone(),
+                };
+                let known_receipts = self.store.receipts(request, provider)?;
+                if let Some(receipt) = backend
+                    .reconcile_submission(&pending, &known_receipts)
+                    .await?
+                {
+                    handle.accepted(receipt)?;
+                    if request.backend_session_id.is_none() {
+                        request.backend_session_id = match &pending.delivery {
+                            SubmissionState::Sending {
+                                target: SubmissionTarget::Codex { thread_id },
+                            } => Some(thread_id.clone()),
+                            SubmissionState::Sending {
+                                target: SubmissionTarget::Copilot { session_id, .. },
+                            } => Some(session_id.clone()),
+                            _ => None,
+                        };
+                    }
+                } else {
+                    anyhow::bail!(
+                        "Submission {} has uncertain delivery. Both prompts remain saved. Reconciliation could not confirm provider acceptance. Last error: {}",
+                        pending.id,
+                        pending
+                            .error
+                            .as_deref()
+                            .unwrap_or("acknowledgment was not received")
+                    );
+                }
+            }
+        }
+        let pending = self.store.pending(request, provider, Some(&self.id))?;
+        let earlier = pending
+            .into_iter()
+            .filter(|pending| pending.id != self.id)
+            .collect::<Vec<_>>();
+        request.recovered_input = earlier
+            .iter()
+            .map(|pending| pending.request.input.clone())
+            .collect();
+        self.update(|record| {
+            record.included = earlier.iter().map(|pending| pending.id.clone()).collect();
+            Ok(())
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::{
+        BackendDescriptor, BackendEventSink, BackendInput, BackendKind, BackendOutput, PromptMode,
+    };
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct Provider {
+        fail_before_send: AtomicBool,
+        lose_ack: AtomicBool,
+        history_accepts: AtomicBool,
+        send_count: AtomicUsize,
+        input: Mutex<Vec<BackendRequest>>,
+    }
+
+    impl Provider {
+        fn new() -> Self {
+            Self {
+                fail_before_send: AtomicBool::new(false),
+                lose_ack: AtomicBool::new(false),
+                history_accepts: AtomicBool::new(false),
+                send_count: AtomicUsize::new(0),
+                input: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for Provider {
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+        fn descriptor(&self) -> BackendDescriptor {
+            BackendDescriptor {
+                kind: BackendKind::Codex,
+                label: "submission fixture".into(),
+                capability: Default::default(),
+            }
+        }
+        async fn has_active_turn(&self, _: &str) -> bool {
+            false
+        }
+        async fn cleanup_execution(&self, _: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn active_session_id_for(&self, _: &str) -> Option<String> {
+            Some("native-thread".into())
+        }
+        async fn reconcile_submission(
+            &self,
+            _: &SubmissionRecord,
+            _: &std::collections::HashSet<String>,
+        ) -> Result<Option<String>> {
+            Ok(self
+                .history_accepts
+                .load(Ordering::SeqCst)
+                .then(|| "history-receipt".into()))
+        }
+        async fn prompt_stream(
+            &self,
+            request: BackendRequest,
+            _: Option<BackendEventSink>,
+        ) -> Result<BackendOutput> {
+            if self.fail_before_send.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("provider startup failed");
+            }
+            let submission = request.submission.as_ref().unwrap();
+            submission.sending(SubmissionTarget::Codex {
+                thread_id: "native-thread".into(),
+            })?;
+            self.send_count.fetch_add(1, Ordering::SeqCst);
+            self.input.lock().unwrap().push(request.clone());
+            if self.lose_ack.swap(false, Ordering::SeqCst) {
+                anyhow::bail!("connection lost after write");
+            }
+            submission.accepted("native-ack".into())?;
+            Ok(BackendOutput::default())
+        }
+    }
+
+    fn request(text: &str) -> BackendRequest {
+        BackendRequest {
+            execution_owner: None,
+            harness_session_id: "submission-test".into(),
+            workspace: "workspace".into(),
+            input: BackendInput::from_text(text),
+            mode: PromptMode::Chat,
+            model: "model".into(),
+            effort: "high".into(),
+            context_window: None,
+            service_tier: Default::default(),
+            access: Default::default(),
+            execution_mode: crate::session::PermissionMode::Read,
+            backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn submission_restart_recovers_only_input_that_never_reached_dispatch() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace.clone())?;
+        let provider = Provider::new();
+        provider.fail_before_send.store(true, Ordering::SeqCst);
+        let earlier = request("earlier instruction\nwith exact whitespace\n");
+        assert!(
+            super::super::retry::prompt(&provider, earlier.clone(), None, &trace, &store)
+                .await
+                .is_err()
+        );
+        drop(store);
+        let store = SubmissionStore::open(directory.path(), trace.clone())?;
+        super::super::retry::prompt(
+            &provider,
+            request("new instruction replaces earlier scope"),
+            None,
+            &trace,
+            &store,
+        )
+        .await?;
+        let sent = provider.input.lock().unwrap();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].recovered_input, vec![earlier.input.clone()]);
+        assert_eq!(
+            sent[0].input.text(),
+            "new instruction replaces earlier scope"
+        );
+        assert!(
+            store
+                .pending(&earlier, super::super::BackendKind::Codex, None)?
+                .is_empty()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_lost_ack_blocks_replay_and_retains_every_new_prompt() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace.clone())?;
+        let provider = Provider::new();
+        provider.lose_ack.store(true, Ordering::SeqCst);
+        assert!(
+            super::super::retry::prompt(&provider, request("first"), None, &trace, &store)
+                .await
+                .is_err()
+        );
+        for text in ["second", "third"] {
+            let error = super::super::retry::prompt(&provider, request(text), None, &trace, &store)
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains("uncertain delivery"));
+            assert!(error.to_string().contains("connection lost after write"));
+        }
+        assert_eq!(provider.send_count.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            store
+                .pending(&request(""), super::super::BackendKind::Codex, None)?
+                .len(),
+            3
+        );
+        provider.history_accepts.store(true, Ordering::SeqCst);
+        super::super::retry::prompt(&provider, request("fourth"), None, &trace, &store).await?;
+        let sent = provider.input.lock().unwrap();
+        assert_eq!(sent.len(), 2);
+        assert_eq!(sent[1].backend_session_id.as_deref(), Some("native-thread"));
+        assert_eq!(
+            sent[1].recovered_input,
+            vec![
+                BackendInput::from_text("second"),
+                BackendInput::from_text("third")
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_ack_commit_is_atomic_with_recovered_inputs() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let original = store.prepare(&request("first"), super::super::BackendKind::Codex)?;
+        let next = store.prepare(&request("second"), super::super::BackendKind::Codex)?;
+        let mut combined = request("second");
+        next.recover(&Provider::new(), &mut combined).await?;
+        next.sending(SubmissionTarget::Codex {
+            thread_id: "thread".into(),
+        })?;
+        store.connection.lock().unwrap().execute_batch(&format!(
+            "CREATE TRIGGER fail_ack BEFORE UPDATE ON submission WHEN NEW.id='{}' BEGIN SELECT RAISE(ABORT,'disk commit failure'); END;", original.id()))?;
+        assert!(next.accepted("ack".into()).is_err());
+        assert_eq!(original.record()?.delivery, SubmissionState::Prepared);
+        assert!(matches!(
+            next.record()?.delivery,
+            SubmissionState::Sending { .. }
+        ));
+        store
+            .connection
+            .lock()
+            .unwrap()
+            .execute_batch("DROP TRIGGER fail_ack")?;
+        next.accepted("ack".into())?;
+        next.accepted("duplicate ack".into())?;
+        assert!(matches!(
+            original.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        assert!(matches!(
+            next.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_recovery_does_not_consume_future_queued_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let earlier = store.prepare(&request("earlier"), BackendKind::Codex)?;
+        let current = store.prepare(&request("current"), BackendKind::Codex)?;
+        let later = store.prepare(&request("later"), BackendKind::Codex)?;
+        let mut input = request("current");
+        current.recover(&Provider::new(), &mut input).await?;
+        assert_eq!(
+            input.recovered_input,
+            vec![BackendInput::from_text("earlier")]
+        );
+        current.sending(SubmissionTarget::Codex {
+            thread_id: "thread".into(),
+        })?;
+        current.accepted("ack".into())?;
+        assert!(matches!(
+            earlier.record()?.delivery,
+            SubmissionState::Accepted { .. }
+        ));
+        assert_eq!(later.record()?.delivery, SubmissionState::Prepared);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_restart_retains_skill_and_attachment_bytes() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let source = directory.path().join("source.txt");
+        let bytes = "retained attachment\n".repeat(4096).into_bytes();
+        std::fs::write(&source, &bytes)?;
+        let attachment = crate::attachment::Attachment::import(directory.path(), &source)?;
+        let attachments = crate::attachment::resolve_input(
+            directory.path(),
+            &json!({"attachments":[attachment.selection(1)?]}),
+        )
+        .await?;
+        std::fs::remove_file(&source)?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace.clone())?;
+        let mut original = request("");
+        original.input = BackendInput::Skill {
+            name: "review".into(),
+            arguments: "  exact arguments\n".into(),
+            attachments,
+        };
+        let earlier = store.prepare(&original, BackendKind::Codex)?;
+        drop(earlier);
+        drop(store);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let next = store.prepare(&request("latest"), BackendKind::Codex)?;
+        let mut input = request("latest");
+        next.recover(&Provider::new(), &mut input).await?;
+        assert_eq!(input.recovered_input, vec![original.input]);
+        let native = crate::attachment::copilot_input("context", &input.input_attachments())?;
+        let files = native.attachments.unwrap();
+        let github_copilot_sdk::types::Attachment::File { path, .. } = &files[0] else {
+            panic!("file attachment disappeared");
+        };
+        assert_eq!(std::fs::read(path)?, bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_acknowledged_stream_failure_is_not_missing_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let original = store.prepare(&request("accepted"), BackendKind::Codex)?;
+        original.sending(SubmissionTarget::Codex {
+            thread_id: "thread".into(),
+        })?;
+        original.accepted("native ack".into())?;
+        original.failed("stream timed out".into())?;
+        let next = store.prepare(&request("latest"), BackendKind::Codex)?;
+        let mut input = request("latest");
+        next.recover(&Provider::new(), &mut input).await?;
+        assert!(input.recovered_input.is_empty());
+        assert_eq!(
+            original.record()?.error.as_deref(),
+            Some("stream timed out")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn submission_cancellation_does_not_resurrect_user_input() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let store = SubmissionStore::open(directory.path(), trace)?;
+        let original = store.prepare(&request("cancel me"), super::super::BackendKind::Codex)?;
+        original.sending(SubmissionTarget::Untracked)?;
+        original.cancel()?;
+        let next = store.prepare(&request("new"), super::super::BackendKind::Codex)?;
+        let mut new = request("new");
+        next.recover(&Provider::new(), &mut new).await?;
+        assert!(new.recovered_input.is_empty());
+        Ok(())
+    }
+}

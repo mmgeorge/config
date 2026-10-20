@@ -261,6 +261,8 @@ impl AgentBackendFactory {
             access: selection.provider.resolve_access(root.access.clone()),
             execution_mode: narrow_permission(root.execution_mode, selection.execution_mode),
             backend_session_id: agent.provider_thread_id.clone(),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         })
     }

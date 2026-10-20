@@ -3,6 +3,7 @@ mod event_decoder;
 mod event_stream;
 mod file_change;
 mod mcp;
+mod retry;
 mod text_generation;
 mod turn;
 #[cfg(test)]
@@ -196,6 +197,42 @@ pub struct CopilotBackend {
 }
 
 impl CopilotBackend {
+    async fn input_text(session: &SharedCopilotSession, input: &BackendInput) -> Result<String> {
+        Ok(match input {
+            BackendInput::Text { text, .. } => text.clone(),
+            BackendInput::Skill {
+                name, arguments, ..
+            } => {
+                let skill_available = session
+                    .rpc()
+                    .skills()
+                    .list()
+                    .await
+                    .with_context(|| format!("resolve Copilot skill ${name}"))?
+                    .skills
+                    .into_iter()
+                    .any(|skill| skill.name == *name && skill.enabled && skill.user_invocable);
+                anyhow::ensure!(
+                    skill_available,
+                    "Copilot skill ${name} is unavailable or disabled"
+                );
+                match session
+                    .rpc()
+                    .commands()
+                    .invoke(CommandsInvokeRequest {
+                        name: name.clone(),
+                        input: (!arguments.is_empty()).then(|| arguments.clone()),
+                    })
+                    .await
+                    .with_context(|| format!("invoke Copilot skill ${name}"))?
+                {
+                    SlashCommandInvocationResult::AgentPrompt(result) => result.prompt,
+                    _ => anyhow::bail!("Copilot skill ${name} did not produce an agent prompt"),
+                }
+            }
+        })
+    }
+
     /// Build a Copilot backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
         let permission_coordinator = PermissionCoordinator::transient(".")?;
@@ -630,6 +667,8 @@ impl CopilotBackend {
             access: request.access.clone(),
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         }
     }
@@ -731,6 +770,78 @@ fn capability() -> BackendCapability {
 
 #[async_trait]
 impl Backend for CopilotBackend {
+    async fn reconcile_submission(
+        &self,
+        submission: &super::submission::SubmissionRecord,
+        known_receipts: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>> {
+        let super::submission::SubmissionState::Sending {
+            target:
+                super::submission::SubmissionTarget::Copilot {
+                    session_id,
+                    cursor,
+                    prompt,
+                },
+        } = &submission.delivery
+        else {
+            return Ok(None);
+        };
+        let mut request = submission.request.clone();
+        request.backend_session_id = Some(session_id.clone());
+        let session = self.session(&request).await?;
+        let mut cursor = cursor.clone();
+        let mut seen = std::collections::HashSet::new();
+        let mut receipt = None;
+        loop {
+            let history = session
+                .rpc()
+                .event_log()
+                .read(EventLogReadRequest {
+                    cursor: Some(cursor.clone()),
+                    agent_scope: Some(EventsAgentScope::Primary),
+                    types: Some(json!(["user.message"])),
+                    max: Some(100),
+                    wait_ms: Some(0),
+                })
+                .await
+                .context("reconcile Copilot submission in native history")?;
+            anyhow::ensure!(
+                history.cursor_status == EventsCursorStatus::Ok,
+                "Copilot submission history boundary expired"
+            );
+            for event in history.events {
+                if event.agent_id.is_none()
+                    && event.event_type == "user.message"
+                    && event.data.get("content").and_then(Value::as_str) == Some(prompt.as_str())
+                    && event
+                        .data
+                        .get("isAutopilotContinuation")
+                        .and_then(Value::as_bool)
+                        != Some(true)
+                    && event.data.get("source").is_none_or(Value::is_null)
+                {
+                    let Some(message_id) = event.data.get("messageId").and_then(Value::as_str)
+                    else {
+                        continue;
+                    };
+                    if !known_receipts.contains(message_id) {
+                        if receipt.is_some() {
+                            return Ok(None);
+                        }
+                        receipt = Some(message_id.to_owned());
+                    }
+                }
+            }
+            if !history.has_more {
+                return Ok(receipt);
+            }
+            anyhow::ensure!(
+                history.cursor != cursor && seen.insert(history.cursor.clone()),
+                "Copilot submission history cursor did not advance"
+            );
+            cursor = history.cursor;
+        }
+    }
     fn checkpoint_tool_gate(&self) -> bool {
         true
     }
@@ -1014,39 +1125,12 @@ impl Backend for CopilotBackend {
                 )
                 .await;
         }
-        let provider_text = match &request.input {
-            BackendInput::Text { text, .. } => text.clone(),
-            BackendInput::Skill {
-                name, arguments, ..
-            } => {
-                let skill_available = session
-                    .rpc()
-                    .skills()
-                    .list()
-                    .await
-                    .with_context(|| format!("resolve Copilot skill ${name}"))?
-                    .skills
-                    .into_iter()
-                    .any(|skill| skill.name == *name && skill.enabled && skill.user_invocable);
-                anyhow::ensure!(
-                    skill_available,
-                    "Copilot skill ${name} is unavailable or disabled"
-                );
-                match session
-                    .rpc()
-                    .commands()
-                    .invoke(CommandsInvokeRequest {
-                        name: name.clone(),
-                        input: (!arguments.is_empty()).then(|| arguments.clone()),
-                    })
-                    .await
-                    .with_context(|| format!("invoke Copilot skill ${name}"))?
-                {
-                    SlashCommandInvocationResult::AgentPrompt(result) => result.prompt,
-                    _ => anyhow::bail!("Copilot skill ${name} did not produce an agent prompt"),
-                }
-            }
-        };
+        let provider_text = Self::input_text(&session, &request.input).await?;
+        let mut recovered = Vec::new();
+        for input in &request.recovered_input {
+            recovered.push(Self::input_text(&session, input).await?);
+        }
+        let provider_text = request.recovered_text(&provider_text, &recovered);
         let prompt = format!("{}\n\n{}", request.interaction_contract(), provider_text);
         let history = session
             .rpc()
@@ -1054,8 +1138,8 @@ impl Backend for CopilotBackend {
             .tail()
             .await
             .context("capture Copilot pre-submit history boundary")?;
-        turn_event.set_history_cursor(history.cursor)?;
-        let message = crate::attachment::copilot_input(&prompt, request.input.attachments())?;
+        turn_event.set_history_cursor(history.cursor.clone())?;
+        let message = crate::attachment::copilot_input(&prompt, &request.input_attachments())?;
         turn_event
             .send(async {
                 self.trace.record(
@@ -1063,18 +1147,53 @@ impl Backend for CopilotBackend {
                     "copilot.session.send",
                     json!({"session_id":session.id().to_string(),"prompt":prompt}),
                 );
-                session.send(message).await.context("send Copilot prompt")
+                if let Some(submission) = &request.submission {
+                    submission.sending(super::submission::SubmissionTarget::Copilot {
+                        session_id: session.id().to_string(),
+                        cursor: history.cursor,
+                        prompt: message.prompt.clone(),
+                    })?;
+                }
+                let receipt = session.send(message).await.context("send Copilot prompt")?;
+                if let Some(submission) = &request.submission {
+                    submission.accepted(receipt.clone())?;
+                }
+                Ok(receipt)
             })
             .await?;
         let mut execution_control_call = std::collections::HashSet::new();
         let mut execution_turn_stopped = false;
+        let mut retry_failure = None;
+        let mut retry_idle_deadline = None;
         loop {
             tokio::select! {
+                _ = async {
+                    match retry_idle_deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    let failure: super::retry::RetryableFailure = retry_failure.take().context("missing failed Copilot turn")?;
+                    anyhow::bail!("{}: provider did not confirm idle within 30 seconds", failure.message);
+                }
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
                     turn_event.observe(&provider_event)?;
                     self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
+                        if let Some(failure) = &retry_failure {
+                            let failure: &super::retry::RetryableFailure = failure;
+                            let completed = BackendEvent {
+                                received_at_ms: None, address: Some(failure.address.clone()),
+                                turn_boundary: Some(super::TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Failed }),
+                                kind: "turn_completed".into(), text: None, data: failure.detail.clone(),
+                                activity: None, summary: None, task_update: None,
+                            };
+                            if !output.event.iter().any(|event| event.address == completed.address && matches!(event.turn_boundary, Some(super::TurnBoundary::Finished { .. }))) {
+                                if let Some(sink) = &event_sink { sink.send_wait(completed.clone()).await?; }
+                                output.event.push(completed);
+                            }
+                        }
                         decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
                         output.provider_checkpoint_id = if provider_event.ephemeral == Some(true) {
                             provider_event.parent_id.clone()
@@ -1126,6 +1245,17 @@ impl Backend for CopilotBackend {
                     }
                     if terminal_error {
                         let detail = event_decoder::session_error(&provider_event, Some(session.id()));
+                        if let Some(code) = retry::transient_code(&provider_event.data)
+                            && provider_event.agent_id.is_none()
+                            && super::retry::replay_safe(&output)
+                            && let Some(address) = output.event.iter().rev().find_map(|event| event.address.clone())
+                        {
+                            retry_failure = Some(super::retry::RetryableFailure {
+                                address, code, detail: provider_event.data.clone(), message: detail,
+                            });
+                            retry_idle_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+                            continue;
+                        }
                         anyhow::bail!("{detail}");
                     }
                 }
@@ -1143,6 +1273,12 @@ impl Backend for CopilotBackend {
             if let Err(error) = apply_invocation(&invocation, &mut output) {
                 output.control_error = Some(format!("{error:#}"));
             }
+        }
+        if let Some(failure) = retry_failure {
+            if super::retry::replay_safe(&output) {
+                return Err(failure.into());
+            }
+            anyhow::bail!("{}", failure.message);
         }
         skills.output(&mut output)?;
         Ok(output)
@@ -1641,10 +1777,31 @@ impl Backend for CopilotBackend {
         self.turn_event(session_id)
             .await
             .send(async {
-                session
+                let submission = match &input {
+                    super::SteeringInput::User { submission, .. } => submission.as_ref(),
+                    _ => None,
+                };
+                if let Some(submission) = submission {
+                    let history = session
+                        .rpc()
+                        .event_log()
+                        .tail()
+                        .await
+                        .context("capture Copilot steering history boundary")?;
+                    submission.sending(super::submission::SubmissionTarget::Copilot {
+                        session_id: session.id().to_string(),
+                        cursor: history.cursor,
+                        prompt: message.prompt.clone(),
+                    })?;
+                }
+                let receipt = session
                     .send(message)
                     .await
-                    .context("steer active Copilot turn")
+                    .context("steer active Copilot turn")?;
+                if let Some(submission) = submission {
+                    submission.accepted(receipt.clone())?;
+                }
+                Ok(receipt)
             })
             .await?;
         if matches!(input, super::SteeringInput::User { .. }) {
@@ -2448,6 +2605,8 @@ mod test {
             access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let model_list = vec![BackendModel {

@@ -63,6 +63,9 @@ pub(crate) enum ExchangeActivity {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
     #[serde(default)]
+    /// Current provider retry, cleared when execution settles.
+    pub provider_retry: Option<crate::backend::retry::ProviderRetry>,
+    #[serde(default)]
     /// Retains one check baseline across queued work and automatic repair turns.
     pub check_owner: Option<String>,
     /// Durable failure that keeps cleanup retryable without replaying execution.
@@ -205,6 +208,7 @@ impl Exchange {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            provider_retry: None,
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
@@ -258,6 +262,7 @@ impl Exchange {
         self.metrics.settle(self.elapsed(now_ms));
         self.awaiting_input = false;
         self.state = ExchangeState::Finalizing;
+        self.provider_retry = None;
         self.finalization_outcome = Some(outcome);
         Ok(())
     }
@@ -322,6 +327,19 @@ impl Exchange {
     ) -> anyhow::Result<bool> {
         use crate::backend::TurnBoundary;
         use crate::turn::TurnState;
+        if event.kind == "provider_retry" {
+            if self.state != ExchangeState::Running
+                || self.completed_at_ms.is_some()
+                || !event
+                    .address
+                    .as_ref()
+                    .is_some_and(|address| self.turn.iter().any(|turn| turn.provider() == address))
+            {
+                return Ok(false);
+            }
+            self.provider_retry = serde_json::from_value(event.data.clone())?;
+            return Ok(true);
+        }
         let Some(address) = &event.address else {
             anyhow::ensure!(
                 event.turn_boundary.is_none(),
@@ -668,6 +686,7 @@ impl Exchange {
 
     /// Settle every execution segment before publishing the terminal outcome.
     pub fn finish(&mut self, outcome: ExchangeState, now_ms: i64) -> anyhow::Result<()> {
+        self.provider_retry = None;
         anyhow::ensure!(
             matches!(
                 outcome,
@@ -953,6 +972,7 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            provider_retry: None,
             agent_id: "primary".into(),
             id: "interaction-one".into(),
             session_id: "session-one".into(),
@@ -985,6 +1005,55 @@ mod test {
             comment: Vec::new(),
             task: None,
         }
+    }
+
+    #[test]
+    fn retry_state_requires_known_turn_and_clears_after_recovery() -> anyhow::Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress};
+        use crate::session::state_machine::SessionPhase;
+        let mut exchange = interaction();
+        exchange.resume(1000)?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "failed-turn".into(),
+        };
+        let retry = crate::backend::retry::ProviderRetry {
+            attempt: 1,
+            max_attempts: 5,
+            retry_at_ms: Some(2000),
+        };
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: Some(address.clone()),
+            turn_boundary: None,
+            kind: "provider_retry".into(),
+            text: None,
+            data: serde_json::to_value(&retry)?,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        assert!(!exchange.observe_turn(&event, 1000)?);
+        exchange
+            .start_turn(address.clone(), 1000)?
+            .finish(crate::turn::TurnOutcome::Failed, 1001)?;
+        assert!(exchange.observe_turn(&event, 1001)?);
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::RetryingProvider { .. }
+        ));
+        event.data = serde_json::Value::Null;
+        assert!(exchange.observe_turn(&event, 2000)?);
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Working { .. }
+        ));
+        event.data = serde_json::to_value(&retry)?;
+        exchange.finish(ExchangeState::Failed, 2001)?;
+        assert!(!exchange.observe_turn(&event, 2002)?);
+        assert!(exchange.provider_retry.is_none());
+        Ok(())
     }
 
     #[test]

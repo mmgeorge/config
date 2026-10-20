@@ -807,6 +807,12 @@ impl Backend for AcpBackend {
                 name, arguments, ..
             } => format!("/{name} {arguments}"),
         };
+        let recovered = request
+            .recovered_input
+            .iter()
+            .map(BackendInput::text)
+            .collect::<Vec<_>>();
+        let text = request.recovered_text(&text, &recovered);
         let prompt = if text == "/compact" {
             text
         } else {
@@ -818,7 +824,7 @@ impl Backend for AcpBackend {
             .and_then(Value::as_bool)
             == Some(true);
         let prompt =
-            crate::attachment::acp_input(prompt, request.input.attachments(), image_supported)
+            crate::attachment::acp_input(prompt, &request.input_attachments(), image_supported)
                 .await?;
         session.state.begin(&request, &session.id, sink).await;
         self.conversation
@@ -827,14 +833,16 @@ impl Backend for AcpBackend {
             .insert(request.runtime_key()?, session.id.clone());
         let response = session
             .transport
-            .request(
+            .submit(
                 "session/prompt",
                 json!({"sessionId":session.id,
             "prompt":prompt}),
+                request.submission.as_deref(),
             )
             .await;
-        session.state.finish().await?;
+        let cleanup = session.state.finish().await;
         response.context("ACP prompt failed")?;
+        cleanup?;
         let mut output = std::mem::take(&mut *session.state.output.lock().await);
         output.backend_session_id = Some(session.id.clone());
         output.capability = self.runtime_capability(&session).await;
@@ -981,18 +989,19 @@ impl Backend for AcpBackend {
         let prompt =
             crate::attachment::acp_input(text.to_owned(), input.attachments(), image_supported)
                 .await?;
-        let response = session
+        let submission = match &input {
+            SteeringInput::User { submission, .. } => submission.as_deref(),
+            SteeringInput::AgentResult(_) => None,
+        };
+        session
             .transport
-            .request(
+            .submit(
                 "_session/steering",
                 json!({"sessionId":session.id,
             "prompt":prompt,"_meta":{"steering":{"idleBehavior":"promptRequired"}}}),
+                submission,
             )
             .await?;
-        ensure!(
-            response["outcome"] != "promptRequired",
-            "Active work finished before steering. Queue this prompt instead"
-        );
         Ok(())
     }
 

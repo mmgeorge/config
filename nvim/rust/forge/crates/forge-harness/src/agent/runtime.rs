@@ -9,6 +9,10 @@ use crate::backend::{Backend, BackendEvent, BackendOutput, BackendRequest, Execu
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
     pub backend: Arc<dyn Backend>,
+    /// Shared diagnostics for provider retry attempts and cancellation.
+    pub(crate) trace: Arc<crate::trace::TraceStore>,
+    /// Persistent submission journal shared by the child execution owner.
+    pub(crate) submission_store: Arc<crate::backend::submission::SubmissionStore>,
     /// Shares timeout feedback without crossing child conversation ownership.
     pub permission: Arc<crate::backend::approval::PermissionCoordinator>,
     pub request: BackendRequest,
@@ -31,8 +35,14 @@ impl AgentRuntime {
         let mut stream_open = true;
         let mut cancelled = *self.cancellation.borrow();
         let mut output = loop {
+            if request.submission.is_none() {
+                request.submission = Some(
+                    self.submission_store
+                        .prepare(&request, self.backend.descriptor().kind)?,
+                );
+            }
             let result = async {
-            let prompt = self.backend.prompt_stream(request.clone(), Some(event_sink.clone()));
+            let prompt = crate::backend::retry::prompt(self.backend.as_ref(), request.clone(), Some(event_sink.clone()), &self.trace, &self.submission_store);
             tokio::pin!(prompt);
             loop {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
@@ -56,6 +66,11 @@ impl AgentRuntime {
                 }
             }
           }.await;
+            if cancelled {
+                if let Some(submission) = &request.submission {
+                    submission.cancel()?;
+                }
+            }
             if cancelled || result.is_err() {
                 break result;
             }
@@ -68,6 +83,8 @@ impl AgentRuntime {
                 }
             }
             request.input = crate::backend::BackendInput::from_text(feedback);
+            request.submission = None;
+            request.recovered_input.clear();
         };
         drop(self.lsp_lease.take());
         let runtime_key = self.request.runtime_key()?;

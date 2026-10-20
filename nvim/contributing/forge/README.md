@@ -19,6 +19,7 @@ documents for the work at hand. Do not read every subsystem chapter for a local 
 | Change generated buffers, folds, or editing | [Building and testing](building-and-testing.md) | [Buffers and rendering](architecture/buffers-and-rendering.md) |
 | Change sessions, tasks, goals, or permissions | [Building and testing](building-and-testing.md) | [Harness](architecture/harness.md) |
 | Change a provider adapter | [Building and testing](building-and-testing.md) | [Providers](architecture/providers.md), [Harness](architecture/harness.md) |
+| Classify a new network or capacity error | [Provider retries](provider-retries.md) | [Providers](architecture/providers.md) |
 | Change plan review or validation | [Building and testing](building-and-testing.md) | [Planning](architecture/planning.md) |
 | Change repository reads, writes, or restoration | [Building and testing](building-and-testing.md) | [Git and checkpoints](architecture/git-and-checkpoints.md) |
 | Change GitHub synchronization or review editing | [Building and testing](building-and-testing.md) | [GitHub and review](architecture/github-and-review.md) |

@@ -22,6 +22,7 @@ mod json_rpc;
 mod process;
 mod request_execution;
 mod resources;
+mod retry;
 mod runtime;
 mod security;
 mod text_generation;
@@ -471,6 +472,8 @@ impl CodexBackend {
             access: request.access.clone(),
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         }
     }
@@ -1026,7 +1029,29 @@ impl CodexBackend {
         continuing_exchange: bool,
         mut params: Value,
     ) -> Result<(Value, bool, Vec<Value>)> {
+        let submission = if continuing_exchange
+            && request
+                .submission
+                .as_ref()
+                .map(|submission| submission.record())
+                .transpose()?
+                .is_some_and(|record| {
+                    matches!(
+                        record.delivery,
+                        super::submission::SubmissionState::Accepted { .. }
+                    )
+                }) {
+            None
+        } else {
+            request.submission.as_ref()
+        };
         params["summary"] = json!("concise");
+        if let Some(submission) = submission {
+            params["clientUserMessageId"] = json!(submission.id());
+            submission.sending(super::submission::SubmissionTarget::Codex {
+                thread_id: thread_id.to_owned(),
+            })?;
+        }
         let request_id = process.send_request("turn/start", params).await?;
         self.active_turn_by_session.lock().await.insert(
             request.runtime_key()?,
@@ -1047,7 +1072,19 @@ impl CodexBackend {
             };
             if let Some(response) = CodexJsonRpc::request_result(&message, request_id, "turn/start")
             {
+                if response.is_err()
+                    && let Some(submission) = submission
+                    && matches!(
+                        message.pointer("/error/code").and_then(Value::as_i64),
+                        Some(-32600 | -32601 | -32602)
+                    )
+                {
+                    submission.rejected(response.as_ref().unwrap_err().to_string())?;
+                }
                 let turn = response?;
+                if let Some(submission) = submission {
+                    submission.accepted(format!("turn/start:{turn}"))?;
+                }
                 let turn_id = turn
                     .pointer("/turn/id")
                     .or_else(|| turn.get("turnId"))
@@ -1105,6 +1142,52 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    async fn reconcile_submission(
+        &self,
+        submission: &super::submission::SubmissionRecord,
+        _known_receipts: &std::collections::HashSet<String>,
+    ) -> Result<Option<String>> {
+        let super::submission::SubmissionState::Sending {
+            target: super::submission::SubmissionTarget::Codex { thread_id },
+        } = &submission.delivery
+        else {
+            return Ok(None);
+        };
+        let mut request = Self::catalog_from_request(&submission.request);
+        request.backend_session_id = Some(thread_id.clone());
+        let (mut process, mut output) = self.catalog_process(&request).await?;
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let page = process
+                .request(
+                    "thread/items/list",
+                    json!({"threadId":thread_id,"cursor":cursor,"sortDirection":"asc","limit":100}),
+                    &mut output,
+                )
+                .await?;
+            let rows = page
+                .get("data")
+                .and_then(Value::as_array)
+                .context("Codex submission history omitted items")?;
+            for row in rows {
+                let item = row.get("item").unwrap_or(row);
+                if item.get("type").and_then(Value::as_str) == Some("userMessage")
+                    && item.get("clientId").and_then(Value::as_str) == Some(submission.id.as_str())
+                {
+                    return Ok(Some(format!("history:{thread_id}:{}", item["id"])));
+                }
+            }
+            let Some(next) = page.get("nextCursor").and_then(Value::as_str) else {
+                return Ok(None);
+            };
+            anyhow::ensure!(
+                seen.insert(next.to_owned()),
+                "Codex submission history repeated a cursor"
+            );
+            cursor = Some(next.to_owned());
+        }
+    }
     fn checkpoint_tool_gate(&self) -> bool {
         true
     }
@@ -1435,8 +1518,26 @@ impl Backend for CodexBackend {
                 prompt = "Continue working toward the active goal.".into();
             }
         }
-        let mut input = crate::attachment::codex_input(prompt, request.input.attachments()).await?;
-        if let BackendInput::Skill { name, .. } = &request.input {
+        let recovered = request
+            .recovered_input
+            .iter()
+            .map(BackendInput::text)
+            .collect::<Vec<_>>();
+        prompt = request.recovered_text(&prompt, &recovered);
+        let mut input =
+            crate::attachment::codex_input(prompt, &request.input_attachments()).await?;
+        for name in request
+            .recovered_input
+            .iter()
+            .chain(std::iter::once(&request.input))
+            .filter_map(|input| {
+                if let BackendInput::Skill { name, .. } = input {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+        {
             let catalog = if let Some(resources) = self
                 .resources(&Self::catalog_from_request(&request))
                 .await?
@@ -1455,7 +1556,8 @@ impl Backend for CodexBackend {
             input.push(json!({ "type": "skill", "name": name, "path": path }));
         }
         let native_resume = request.mode == PromptMode::GoalContinuation
-            && request_text.lines().next() == Some("/goal resume");
+            && request_text.lines().next() == Some("/goal resume")
+            && request.recovered_input.is_empty();
         let resume_message = native_resume
             .then(|| {
                 request_text
@@ -1465,8 +1567,16 @@ impl Backend for CodexBackend {
             })
             .flatten();
         let admission = if native_resume {
-            self.resume_native_goal_turn(process, &mut output, &request, &thread_id)
-                .await?
+            if let Some(submission) = &request.submission {
+                submission.sending(super::submission::SubmissionTarget::Untracked)?;
+            }
+            let admission = self
+                .resume_native_goal_turn(process, &mut output, &request, &thread_id)
+                .await?;
+            if let Some(submission) = &request.submission {
+                submission.accepted(format!("goal/resume:{thread_id}"))?;
+            }
+            admission
         } else {
             Some(
                 self.start_turn(
@@ -1528,10 +1638,37 @@ impl Backend for CodexBackend {
                 .or_else(|| completed.get("status"))
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            anyhow::ensure!(
-                !status.eq_ignore_ascii_case("failed"),
-                "Codex turn failed: {completed}"
-            );
+            if status.eq_ignore_ascii_case("failed") {
+                self.active_turn_by_session
+                    .lock()
+                    .await
+                    .insert(request.runtime_key()?, CodexTurnState::Completed);
+                let error = completed
+                    .pointer("/turn/error")
+                    .or_else(|| completed.get("error"));
+                if let Some((error, code)) =
+                    error.and_then(|error| retry::transient_code(error).map(|code| (error, code)))
+                    && super::retry::replay_safe(&output)
+                {
+                    return Err(super::retry::RetryableFailure {
+                        address: super::ProviderAddress {
+                            owner: Some(request.owner()?),
+                            thread_id: thread_id.clone(),
+                            turn_id: completed
+                                .pointer("/turn/id")
+                                .or_else(|| completed.get("turnId"))
+                                .and_then(Value::as_str)
+                                .unwrap_or(&current_turn_id)
+                                .to_owned(),
+                        },
+                        code,
+                        detail: error.clone(),
+                        message: format!("Codex turn failed: {completed}"),
+                    }
+                    .into());
+                }
+                anyhow::bail!("Codex turn failed: {completed}");
+            }
             Some(
                 completed
                     .pointer("/turn/id")
@@ -2552,6 +2689,8 @@ end
             access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("source-thread".into()),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let params = CodexBackend::fork_parameters(
@@ -2749,6 +2888,10 @@ end
                     );
                     if method == "turn/start" {
                         assert_eq!(request["params"]["summary"], "concise");
+                        uuid::Uuid::parse_str(
+                            request["params"]["clientUserMessageId"].as_str().unwrap(),
+                        )
+                        .unwrap();
                     } else {
                         assert_eq!(
                             request["params"]["config"]["model_reasoning_summary"],
@@ -2818,33 +2961,43 @@ end
                     timing: Vec::new(),
                 })),
             );
+            let mut request = BackendRequest {
+                execution_owner: None,
+                harness_session_id: "session".into(),
+                workspace,
+                input: BackendInput::from_text("new prompt"),
+                mode: PromptMode::Chat,
+                model: if default_model {
+                    "default"
+                } else {
+                    expected_model
+                }
+                .into(),
+                effort: "medium".into(),
+                context_window: None,
+                service_tier,
+                access: Default::default(),
+                execution_mode: PermissionMode::Read,
+                backend_session_id: resumed.then(|| "parent".into()),
+                submission: None,
+                recovered_input: Vec::new(),
+                control_context: None,
+            };
+            let journal = super::super::submission::SubmissionStore::open(
+                fixture.path(),
+                backend.trace.clone(),
+            )?;
+            let submission = journal.prepare(&request, BackendKind::Codex)?;
+            request.submission = Some(submission.clone());
             let output = tokio::time::timeout(
                 std::time::Duration::from_secs(2),
-                backend.prompt_stream(
-                    BackendRequest {
-                        execution_owner: None,
-                        harness_session_id: "session".into(),
-                        workspace,
-                        input: BackendInput::from_text("new prompt"),
-                        mode: PromptMode::Chat,
-                        model: if default_model {
-                            "default"
-                        } else {
-                            expected_model
-                        }
-                        .into(),
-                        effort: "medium".into(),
-                        context_window: None,
-                        service_tier,
-                        access: Default::default(),
-                        execution_mode: PermissionMode::Read,
-                        backend_session_id: resumed.then(|| "parent".into()),
-                        control_context: None,
-                    },
-                    None,
-                ),
+                backend.prompt_stream(request, None),
             )
             .await??;
+            assert!(matches!(
+                submission.record()?.delivery,
+                super::super::submission::SubmissionState::Accepted { .. }
+            ));
             assert_eq!(output.runtime.model.as_deref(), Some(expected_model));
             assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
             assert_eq!(output.evidence.native_state, None);
@@ -3091,6 +3244,8 @@ end
                         access: Default::default(),
                         execution_mode: PermissionMode::Read,
                         backend_session_id: Some("parent".into()),
+                        submission: None,
+                        recovered_input: Vec::new(),
                         control_context: None,
                     },
                     None,

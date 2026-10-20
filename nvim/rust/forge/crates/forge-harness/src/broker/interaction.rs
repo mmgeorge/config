@@ -8,6 +8,12 @@ impl HarnessBroker {
         admission: Option<ExchangeAdmission>,
         mut input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
+        let submission_store =
+            crate::backend::submission::SubmissionStore::open(&self.data_root, self.trace.clone())?;
+        let submission = submission_store.prepare(
+            &self.backend_request(input.clone(), mode),
+            self.backend.descriptor().kind,
+        )?;
         let (mut interaction, mut event) =
             Box::pin(self.admit_interaction(&text, mode, admission.as_ref())).await?;
 
@@ -60,6 +66,7 @@ impl HarnessBroker {
             input = self.rollback_context(&interaction.id, input)?;
         }
         let mut backend_request = self.backend_request(input, mode);
+        backend_request.submission = Some(submission.clone());
         let owner = crate::backend::ExecutionOwner::root(&self.session.id);
         if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
             match &mut backend_request.input {
@@ -118,6 +125,9 @@ impl HarnessBroker {
                     json!({ "error": format!("{error:#}") }),
                 );
                 let cancelled = error.downcast_ref::<TurnCancelled>().is_some();
+                if cancelled && !self.turn_cancellation.restart.load(Ordering::Acquire) {
+                    submission.cancel()?;
+                }
                 if cancelled
                     && let Some(backend_session_id) =
                         self.backend.active_session_id_for(&self.session.id).await

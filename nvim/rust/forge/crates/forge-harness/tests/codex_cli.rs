@@ -38,6 +38,8 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
             PermissionMode::Write
         },
         backend_session_id: None,
+        submission: None,
+        recovered_input: Vec::new(),
         control_context: None,
     }
 }

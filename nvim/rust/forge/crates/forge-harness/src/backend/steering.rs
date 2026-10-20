@@ -13,6 +13,8 @@ pub enum SteeringInput {
     User {
         text: String,
         attachments: Vec<crate::attachment::InputAttachment>,
+        /// Durable input ownership retained through queueing and native acknowledgment.
+        submission: Option<Arc<super::submission::Submission>>,
     },
     /// Adds an attributed child result while its transcript remains under the child.
     AgentResult(String),
@@ -33,6 +35,13 @@ impl SteeringInput {
             Self::AgentResult(_) => &[],
         }
     }
+
+    fn submission(&self) -> Option<Arc<super::submission::Submission>> {
+        match self {
+            Self::User { submission, .. } => submission.clone(),
+            Self::AgentResult(_) => None,
+        }
+    }
 }
 
 impl From<String> for SteeringInput {
@@ -40,6 +49,7 @@ impl From<String> for SteeringInput {
         Self::User {
             text,
             attachments: Vec::new(),
+            submission: None,
         }
     }
 }
@@ -82,6 +92,8 @@ pub struct SteerCommand {
     _admission: OwnedSemaphorePermit,
     pub text: String,
     pub attachments: Vec<crate::attachment::InputAttachment>,
+    /// Durable input ownership shared with the native adapter.
+    pub submission: Option<Arc<super::submission::Submission>>,
     pub target: Option<SteerTarget>,
     pub operation: ActiveTurnOperation,
     completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -128,6 +140,7 @@ impl SteeringLane {
             None,
             false,
             Vec::new(),
+            None,
         )
         .await
     }
@@ -160,6 +173,7 @@ impl SteeringLane {
             None,
             publish_input,
             input.attachments().to_vec(),
+            input.submission(),
         )
         .await
     }
@@ -172,6 +186,7 @@ impl SteeringLane {
             None,
             false,
             Vec::new(),
+            None,
         )
         .await
     }
@@ -183,6 +198,7 @@ impl SteeringLane {
         target: Option<SteerTarget>,
         publish_input: bool,
         attachments: Vec<crate::attachment::InputAttachment>,
+        submission: Option<Arc<super::submission::Submission>>,
     ) -> Result<()> {
         let sender = self
             .state
@@ -214,6 +230,7 @@ impl SteeringLane {
                 _admission: admission,
                 text,
                 attachments,
+                submission,
                 target,
                 operation,
                 completion: Some(completion),
@@ -254,8 +271,44 @@ impl Drop for ActiveSteering {
 }
 
 impl SteerCommand {
+    /// Defers only an input that never crossed native dispatch, and settles all other outcomes.
+    pub(crate) async fn settle_delivery(self, result: Result<()>) -> Result<Option<Self>> {
+        match result {
+            Ok(()) => {
+                self.complete(Ok(())).await;
+                Ok(None)
+            }
+            Err(error) => {
+                let dispatched = self
+                    .submission
+                    .as_ref()
+                    .map(|submission| submission.record())
+                    .transpose()?
+                    .is_some_and(|record| {
+                        !matches!(
+                            record.delivery,
+                            super::submission::SubmissionState::Prepared
+                        )
+                    });
+                if dispatched {
+                    self.complete(Err(anyhow::anyhow!("{error:#}"))).await;
+                    Err(error)
+                } else {
+                    Ok(Some(self))
+                }
+            }
+        }
+    }
+
     /// Resolve the originating Harness request with the provider result.
-    pub async fn complete(mut self, result: Result<()>) {
+    pub async fn complete(mut self, mut result: Result<()>) {
+        if let Err(error) = &result
+            && let Some(submission) = &self.submission
+        {
+            if let Err(persist) = submission.failed(format!("{error:#}")) {
+                result = Err(persist.context(format!("{error:#}")));
+            }
+        }
         if result.is_ok()
             && self.publish_input
             && self.operation == ActiveTurnOperation::Steer
@@ -284,6 +337,54 @@ impl Drop for SteerCommand {
 #[cfg(test)]
 mod test {
     use super::SteeringLane;
+
+    #[tokio::test]
+    async fn uncertain_steering_is_never_returned_to_the_fallback_queue() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        let store = crate::backend::submission::SubmissionStore::open(directory.path(), trace)?;
+        let catalog = crate::backend::BackendCatalogRequest {
+            execution_owner: None,
+            harness_session_id: "steering".into(),
+            workspace: "workspace".into(),
+            access: Default::default(),
+            execution_mode: crate::session::PermissionMode::Read,
+            backend_session_id: None,
+        };
+        let submission = store.prepare_steering(
+            &catalog,
+            crate::backend::BackendInput::from_text("once"),
+            crate::backend::BackendKind::Codex,
+        )?;
+        let lane = SteeringLane::default();
+        let mut active = lane.activate(None)?;
+        let mut sending = Box::pin(lane.steer(super::SteeringInput::User {
+            text: "once".into(),
+            attachments: Vec::new(),
+            submission: Some(submission.clone()),
+        }));
+        assert!(futures_util::poll!(sending.as_mut()).is_pending());
+        let command = active.receive().await.unwrap();
+        submission.sending(crate::backend::submission::SubmissionTarget::Untracked)?;
+        assert!(
+            command
+                .settle_delivery(Err(anyhow::anyhow!("acknowledgment timed out")))
+                .await
+                .is_err()
+        );
+        assert!(
+            sending
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("acknowledgment timed out")
+        );
+        assert!(matches!(
+            submission.record()?.delivery,
+            crate::backend::submission::SubmissionState::Sending { .. }
+        ));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn cleanup_after_provider_settlement_does_not_require_a_live_steering_receiver() {
@@ -329,6 +430,7 @@ mod test {
             None,
             false,
             Vec::new(),
+            None,
         ));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
         assert!(
@@ -337,7 +439,8 @@ mod test {
                 String::new(),
                 None,
                 false,
-                Vec::new()
+                Vec::new(),
+                None
             )
             .await
             .is_err()
@@ -377,6 +480,7 @@ mod test {
             }),
             true,
             Vec::new(),
+            None,
         ));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
         let command = active.receive().await.unwrap();

@@ -1612,6 +1612,8 @@ mod test {
             },
             execution_mode: PermissionMode::Write,
             backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let address = Some(crate::backend::ProviderAddress {
@@ -1817,6 +1819,8 @@ mod test {
             access: crate::session::AccessPolicy::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: None,
         };
         let address = Some(crate::backend::ProviderAddress {

@@ -65,6 +65,7 @@ impl StatusView<'_> {
                 match status {
                     SessionPhase::Working { .. }
                     | SessionPhase::RetryingPlanGeneration { .. }
+                    | SessionPhase::RetryingProvider { .. }
                     | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
                     SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
                     SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
@@ -128,6 +129,21 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
             let elapsed = status.elapsed_ms(now_ms) / 1_000;
             format!("{} · {elapsed}s", activity.active_label())
         }
+        SessionPhase::RetryingProvider { retry, activity } => {
+            let label = format!(
+                "{} · retry {}/{}",
+                activity.active_label(),
+                retry.attempt,
+                retry.max_attempts
+            );
+            match retry.retry_at_ms {
+                Some(deadline) => format!(
+                    "{label} · retrying in {}s",
+                    (deadline.saturating_sub(now_ms).max(0) as u64).div_ceil(1000)
+                ),
+                None => label,
+            }
+        }
         SessionPhase::PlanningFailed { reason, .. } => {
             format!("Planning stopped · {reason}")
         }
@@ -135,6 +151,37 @@ fn primary_text(status: &SessionPhase, now_ms: i64) -> String {
         SessionPhase::WaitingForAgent { agent_count } => {
             format!("Waiting for agents · {agent_count} running")
         }
+    }
+}
+
+#[cfg(test)]
+mod retry_tests {
+    use super::*;
+
+    #[test]
+    fn retry_status_counts_down_then_keeps_attempt_visible() {
+        let mut retry = crate::backend::retry::ProviderRetry {
+            attempt: 2,
+            max_attempts: 5,
+            retry_at_ms: Some(6000),
+        };
+        let status = SessionPhase::RetryingProvider {
+            retry: retry.clone(),
+            activity: WorkflowActivity::Working,
+        };
+        assert_eq!(
+            primary_text(&status, 1001),
+            "Working · retry 2/5 · retrying in 5s"
+        );
+        assert!(status.animated());
+        assert!(status.ticking());
+        retry.retry_at_ms = None;
+        let status = SessionPhase::RetryingProvider {
+            retry,
+            activity: WorkflowActivity::Planning,
+        };
+        assert_eq!(primary_text(&status, 6000), "Planning · retry 2/5");
+        assert!(!status.ticking());
     }
 }
 

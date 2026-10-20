@@ -579,7 +579,7 @@ pub struct HarnessBroker {
     goal_max_turns: u32,
     permission_store: Arc<RwLock<PermissionStore>>,
     permission_coordinator: Arc<PermissionCoordinator>,
-    trace: Arc<TraceStore>,
+    pub(crate) trace: Arc<TraceStore>,
     event_sink: Option<BackendEventSink>,
     clock: Box<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
@@ -3044,6 +3044,11 @@ impl HarnessBroker {
                 .insert(admission.agent.id.clone(), backend.clone());
             Ok(crate::agent::AgentRuntime {
                 backend,
+                trace: self.trace.clone(),
+                submission_store: crate::backend::submission::SubmissionStore::open(
+                    &self.data_root,
+                    self.trace.clone(),
+                )?,
                 permission: self.permission_coordinator.clone(),
                 request,
                 task_id: admission.task.id.clone(),
@@ -5542,6 +5547,7 @@ Planning continuation: turn {} of {}.",
             }
             let mut revision = self.agent_coordinator.subscribe();
             let mut continuation_input = None;
+            let mut continuation_submission = None;
             loop {
                 if self.turn_cancellation.requested.load(Ordering::Acquire) {
                     return Err(anyhow::Error::new(TurnCancelled));
@@ -5567,6 +5573,7 @@ Planning continuation: turn {} of {}.",
                         BackendInput::from_text(input.text.clone())
                             .with_attachments(input.attachments.clone()),
                     );
+                    continuation_submission = input.submission.clone();
                     input.complete(Ok(())).await;
                     continuation_result = self.agent_coordinator.unreported_result();
                     if let Some(BackendInput::Text { text, .. }) = &mut continuation_input {
@@ -5610,6 +5617,8 @@ Planning continuation: turn {} of {}.",
             self.set_parent_wait(interaction, false, event).await?;
             if let Some(input) = continuation_input {
                 request.input = input;
+                request.submission = continuation_submission;
+                request.recovered_input.clear();
             } else {
                 break;
             }
@@ -5768,6 +5777,9 @@ Planning continuation: turn {} of {}.",
             .context("active interaction timeline is missing")?;
         let backend = Arc::clone(&self.backend);
         let cancellation = Arc::clone(&self.turn_cancellation);
+        let retry_trace = Arc::clone(&self.trace);
+        let submission_store =
+            crate::backend::submission::SubmissionStore::open(&self.data_root, self.trace.clone())?;
         let mut cleanup = cancellation.cleanup.subscribe();
         let (backend_event_sink, mut backend_event_stream) = crate::backend::events::channel();
         let backend_event_sink = backend_event_sink.owned(request.owner()?);
@@ -5851,9 +5863,14 @@ Planning continuation: turn {} of {}.",
             {
                 gate.wait().await?;
             }
-            backend
-                .prompt_stream(request, Some(backend_event_sink))
-                .await
+            crate::backend::retry::prompt(
+                backend.as_ref(),
+                request,
+                Some(backend_event_sink),
+                &retry_trace,
+                &submission_store,
+            )
+            .await
         });
         // Event-loop state must not remain inline in the provider lifecycle future.
         let outcome = Box::pin(async {
@@ -5879,7 +5896,7 @@ Planning continuation: turn {} of {}.",
                             let session_id = self.session.id.clone();
                             user_delivery.spawn(async move {
                                 let result = tokio::time::timeout(std::time::Duration::from_secs(30),
-                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User { text: input.text.clone(), attachments: input.attachments.clone() }))
+                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User { text: input.text.clone(), attachments: input.attachments.clone(), submission: input.submission.clone() }))
                                     .await.context("parent input delivery exceeded 30 seconds").and_then(|result|result);
                                 (input,result)
                             });
@@ -5887,7 +5904,7 @@ Planning continuation: turn {} of {}.",
                     }
                     delivery = user_delivery.join_next(), if !user_delivery.is_empty() => {
                         let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
-                        if result.is_ok() {input.complete(Ok(())).await;} else {deferred_input.push_back(input);}
+                        if let Some(input) = input.settle_delivery(result).await? { deferred_input.push_back(input); }
                     }
                     changed = agent_revision.changed() => {
                         changed.context("agent coordinator closed during root execution")?;
@@ -6094,7 +6111,7 @@ Planning continuation: turn {} of {}.",
                 _ = cancellation.cancelled() => {user_delivery.abort_all(); break;}
                 delivery = user_delivery.join_next() => {
                     let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
-                    if result.is_ok() {input.complete(Ok(())).await;} else {deferred_input.push_back(input);}
+                    if let Some(input) = input.settle_delivery(result).await? { deferred_input.push_back(input); }
                 }
             }
         }
@@ -6427,7 +6444,40 @@ Planning continuation: turn {} of {}.",
         interaction: &'event mut Exchange,
         mut backend_event: BackendEvent,
         event: &'event mut Vec<SessionEvent>,
-    ) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<()>> + Send + 'event>> {
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
+        if backend_event.kind != "directory_access_granted" {
+            if backend_event
+                .address
+                .as_ref()
+                .and_then(|address| address.owner.as_ref())
+                .is_some_and(|owner| {
+                    owner != &crate::backend::ExecutionOwner::root(&self.session.id)
+                })
+            {
+                self.trace.record(
+                    &self.session.id,
+                    "provider.event.rejected",
+                    json!({
+                        "event_type":backend_event.kind,"code":"foreign_execution_owner",
+                    }),
+                );
+                return Box::pin(async { Ok(()) });
+            }
+        }
+        if !matches!(
+            backend_event.kind.as_str(),
+            "directory_access_granted"
+                | "error"
+                | "runtime_resolved"
+                | "compaction"
+                | "approval_requested"
+                | "approval_resolved"
+                | "approval_cancelled"
+                | "parent_boundary"
+                | "agent_lifecycle"
+        ) {
+            return self.process_exchange_content(runtime, interaction, backend_event, event);
+        }
         Box::pin(async move {
             if backend_event.kind == "directory_access_granted" {
                 let grants: Vec<crate::permissions::directory::DirectoryGrant> =
@@ -6469,23 +6519,6 @@ Planning continuation: turn {} of {}.",
                         "goal_execution": goal_execution }) }, event).await?;
                 return Ok(());
             }
-            if backend_event
-                .address
-                .as_ref()
-                .and_then(|address| address.owner.as_ref())
-                .is_some_and(|owner| {
-                    owner != &crate::backend::ExecutionOwner::root(&self.session.id)
-                })
-            {
-                self.trace.record(
-                    &self.session.id,
-                    "provider.event.rejected",
-                    json!({
-                        "event_type":backend_event.kind,"code":"foreign_execution_owner",
-                    }),
-                );
-                return Ok(());
-            }
             if backend_event.kind == "error" {
                 self.emit_backend_event(backend_event, event).await?;
                 return Ok(());
@@ -6522,30 +6555,7 @@ Planning continuation: turn {} of {}.",
                 ))
                 .await;
             }
-            if !self.capability.compaction.background
-                && matches!(
-                    backend_event.turn_boundary,
-                    Some(crate::backend::TurnBoundary::Finished { .. })
-                )
-                && let Some(address) = &backend_event.address
-            {
-                let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
-                interaction.unconfirm_compaction(&address.thread_id, now_ms);
-                for child in self.child_exchange_runtime_by_agent.values_mut() {
-                    child
-                        .exchange
-                        .unconfirm_compaction(&address.thread_id, now_ms);
-                }
-            }
-            if let Some(received) = backend_event.received_at_ms {
-                self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
-                    "event_type":backend_event.kind,
-                    "tool_id":backend_event.activity.as_ref().map(|activity|activity.id.as_str()),
-                    "received_at_ms":received,
-                    "queue_delay_ms":self.clock.now_ms().saturating_sub(received).max(0),
-                    "provider_at_ms":backend_event.observed_at_ms(received),
-                }));
-            }
+            self.prepare_backend_observation(interaction, &backend_event);
             if backend_event.kind == "approval_requested" {
                 let request_id = backend_event.data["id"]
                     .as_str()
@@ -6717,6 +6727,20 @@ Planning continuation: turn {} of {}.",
                     .await?;
                 return Ok(());
             }
+            Ok(())
+        })
+    }
+
+    // Keep ordinary content polling independent of control-event state and temporary values.
+    fn process_exchange_content<'event>(
+        &'event mut self,
+        runtime: &'event mut ExchangeRuntime,
+        interaction: &'event mut Exchange,
+        mut backend_event: BackendEvent,
+        event: &'event mut Vec<SessionEvent>,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<()>> + Send + 'event>> {
+        Box::pin(async move {
+            self.prepare_backend_observation(interaction, &backend_event);
             if backend_event.address.as_ref().is_some_and(|address| {
                 address.owner.as_ref().is_some_and(|owner| {
                     owner != &crate::backend::ExecutionOwner::root(&self.session.id)
@@ -6911,6 +6935,41 @@ Planning continuation: turn {} of {}.",
             }
             Ok(())
         })
+    }
+
+    fn prepare_backend_observation(
+        &mut self,
+        interaction: &mut Exchange,
+        backend_event: &BackendEvent,
+    ) {
+        if !self.capability.compaction.background
+            && matches!(
+                backend_event.turn_boundary,
+                Some(crate::backend::TurnBoundary::Finished { .. })
+            )
+            && let Some(address) = &backend_event.address
+        {
+            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+            interaction.unconfirm_compaction(&address.thread_id, now_ms);
+            for child in self.child_exchange_runtime_by_agent.values_mut() {
+                child
+                    .exchange
+                    .unconfirm_compaction(&address.thread_id, now_ms);
+            }
+        }
+        if let Some(received) = backend_event.received_at_ms {
+            self.trace.record(
+                &self.session.id,
+                "broker.provider.dequeued",
+                json!({
+                    "event_type":backend_event.kind,
+                    "tool_id":backend_event.activity.as_ref().map(|activity|activity.id.as_str()),
+                    "received_at_ms":received,
+                    "queue_delay_ms":self.clock.now_ms().saturating_sub(received).max(0),
+                    "provider_at_ms":backend_event.observed_at_ms(received),
+                }),
+            );
+        }
     }
 
     async fn process_compaction_event(
@@ -7416,6 +7475,7 @@ Planning continuation: turn {} of {}.",
                 finalization_error: None,
                 check_owner: None,
                 finalization_outcome: None,
+                provider_retry: None,
                 agent_id: self.session.primary_agent_id.clone(),
                 id: Uuid::new_v4().to_string(),
                 session_id: self.session.id.clone(),
@@ -10333,6 +10393,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             access: self.session.access.clone(),
             execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
+            submission: None,
+            recovered_input: Vec::new(),
             control_context: self.control_turn_context(if self.session.background.is_some() {
                 PromptMode::Background
             } else {
@@ -14326,6 +14388,7 @@ mod test {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            provider_retry: None,
             agent_id: HarnessSession::primary_agent_id(session_id),
             id: id.into(),
             session_id: session_id.into(),

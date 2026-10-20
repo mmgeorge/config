@@ -10,6 +10,22 @@ Background model and thinking settings. Each exchange repeats its own task and o
 requirements under a shared system message. Neovim owns request presentation and generated
 text application, without a separate model HTTP client or CLI generation adapter.
 
+Input delivery uses a separate durable state machine from model retries.
+`backend/submission.rs` commits input before host admission, native correlation
+before dispatch, and provider acceptance before releasing the delivery obligation.
+Unknown delivery blocks replay and retains the next prompt. The
+[provider retry and submission contract](../provider-retries.md) defines recovery,
+steering, and adapter extension requirements.
+ACP's transport owns this boundary for both prompt and steering requests. Its v1
+prompt response proves turn completion, so lost responses remain uncertain.
+The ACP v2 draft introduces earlier message acceptance receipts, but those
+semantics require explicit protocol negotiation and provider support.
+
+The broker selects ordinary exchange content separately from provider control
+events before polling either handler. This keeps control-event temporary state
+out of content rendering during nested permission-resume and check-repair work.
+The worker-stack regression test retains its one-megabyte limit.
+
 ## Backend contracts and ACP runtime
 
 Attachment objects resolve against the Harness data root during request admission and
@@ -366,6 +382,14 @@ text. The durable command stays unchanged, and expanded output includes that ori
 command above its output. These display summaries do not alter approval or execution input.
 
 ## Provider execution and cancellation
+
+Confirmed terminal network and capacity failures use one shared retry runner for
+root, child, and Background requests. Adapters must prove that the attempt
+produced no replay-sensitive output before opting in. Five retries wait 1, 5, 10,
+30, and 60 seconds. Retry status remains inside the existing exchange, cancellation
+uses its existing owner, and exhaustion exposes the final provider error.
+[Provider retries](../provider-retries.md) defines the allowlist, native recovery
+boundaries, diagnostics, and the procedure for enabling a newly observed error.
 
 `Backend` uses async trait methods for native provider operations. That interface does not
 provide execution isolation. Its default session cancellation delegates to execution cleanup,

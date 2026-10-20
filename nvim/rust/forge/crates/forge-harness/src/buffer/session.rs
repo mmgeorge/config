@@ -3529,6 +3529,7 @@ mod tests {
             finalization_error: None,
             check_owner: None,
             finalization_outcome: None,
+            provider_retry: None,
             agent_id: "primary".into(),
             id: identity.into(),
             session_id: "session".into(),

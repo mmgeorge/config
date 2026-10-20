@@ -823,6 +823,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    trace: Arc<crate::trace::TraceStore>,
     data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
     timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -943,6 +944,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            trace: broker.trace.clone(),
             data_root: broker.data_root.clone(),
             observer: broker.observer(),
             timeout_task: Mutex::new(None),
@@ -1633,6 +1635,8 @@ async fn route_request(
                     access: catalog.access,
                     execution_mode: catalog.execution_mode,
                     backend_session_id: catalog.backend_session_id,
+                    submission: None,
+                    recovered_input: Vec::new(),
                     control_context: None,
                 }),
         )
@@ -2244,6 +2248,8 @@ async fn route_request(
                     access: catalog.access,
                     execution_mode: catalog.execution_mode,
                     backend_session_id: None,
+                    submission: None,
+                    recovered_input: Vec::new(),
                     control_context: None,
                 },
             ),
@@ -3554,14 +3560,27 @@ async fn route_control_request(
                 .params
                 .get("text")
                 .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
+                .filter(|text| !text.trim().is_empty())
                 .context("turn.steer requires non-empty text")?
                 .to_owned();
             validate_root_control(request.params.get("target"))?;
             let attachments =
                 crate::attachment::resolve_input(&controller.data_root, &request.params).await?;
-            let input = crate::backend::SteeringInput::User { text, attachments };
+            let journal = crate::backend::submission::SubmissionStore::open(
+                &controller.data_root,
+                controller.trace.clone(),
+            )?;
+            let submission = journal.prepare_steering(
+                &catalog_request,
+                crate::backend::BackendInput::from_text(text.clone())
+                    .with_attachments(attachments.clone()),
+                controller.backend.descriptor().kind,
+            )?;
+            let input = crate::backend::SteeringInput::User {
+                text,
+                attachments,
+                submission: Some(submission),
+            };
             if controller.parent_input.is_active() {
                 controller.parent_input.steer(input).await?;
             } else {

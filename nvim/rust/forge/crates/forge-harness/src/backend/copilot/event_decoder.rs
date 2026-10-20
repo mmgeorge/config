@@ -369,6 +369,11 @@ impl CopilotEventDecoder {
                 .await;
             }
             "session.error" if !provider_event.is_transient_error() => {
+                if super::retry::transient_code(&provider_event.data).is_some()
+                    && crate::backend::retry::replay_safe(output)
+                {
+                    return;
+                }
                 self.publish_text(
                     "error",
                     Some(session_error(
