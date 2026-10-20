@@ -367,6 +367,8 @@ function M.open(state, host)
       local policy = access.policy(active)
       local supported = state.capability and state.capability.os_sandbox == true
       local background = commit and commit:fields() or {}
+      local background_fields = { background.model, background.thinking }
+      if background.speed then background_fields[#background_fields + 1] = background.speed end
       local capability = state.capability or {}
       ---@param id string
       ---@param kind 'choice'|'toggle'|'input'|'action'
@@ -426,7 +428,7 @@ function M.open(state, host)
           field_navigation = true, highlight_selected_text = false, compact_sections = true,
           option_list = {
             row("main-model", "Models", "Main", main),
-            row("background-model", "Models", "Background", { background.model, background.thinking }),
+            row("background-model", "Models", "Background", background_fields),
             row("main-compaction", "Compaction", "Main", {
               field("auto-compact", "toggle", compaction.enabled, "Automatic", "Compact the main conversation after completed turns.",
                 not capability.native_compact and "Compaction is unavailable for this provider" or nil),
@@ -526,6 +528,7 @@ function M.open(state, host)
     end
     commit = require("forge.views.harness.background_configuration").new({
       backend = active.backend, session_id = session_id, host = host,
+      capability = function() return state.capability or {} end,
       current = function() return M._revision == owner_revision and state.session ~= nil and state.session.id == session_id end,
       changed = function() if commit and picker.is_open("harness-config") then picker.update(build_spec()) end end,
       reopen = function() M.open(state, host) end,

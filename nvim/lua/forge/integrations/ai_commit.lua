@@ -62,7 +62,8 @@ local function native_request(cwd, ref, ignored, callback, is_current, on_model)
     if M._backend and M._backend.request_async then M._backend.request_async(params, receive)
     else
       client.request_generation(params, receive, on_model, { model = choice.model,
-        reasoning_effort = choice.thinking, auto_compaction = snapshot.settings.auto_compaction })
+        reasoning_effort = choice.thinking, service_tier = choice.service_tier,
+        auto_compaction = snapshot.settings.auto_compaction })
     end
   end
   require("forge.integrations.background_settings").request(nil, nil, function(...)

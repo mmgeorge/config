@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, ensure};
-use forge_harness::{session::AutoCompaction, settings::SettingsStore};
+use forge_harness::{backend::ServiceTier, session::AutoCompaction, settings::SettingsStore};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -11,6 +11,8 @@ use serde_json::{Value, json};
 struct ModelChoice {
     model: String,
     thinking: Option<String>,
+    #[serde(default)]
+    service_tier: ServiceTier,
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -99,9 +101,19 @@ mod tests {
         let first = apply(make())?;
         let mut update = make();
         update.settings = Some(serde_json::from_value(first["settings"].clone())?);
+        update
+            .settings
+            .as_mut()
+            .unwrap()
+            .models
+            .get_mut("codex")
+            .unwrap()
+            .service_tier = ServiceTier::Fast;
         update.expected_revision = Some(0);
-        assert_eq!(apply(update)?["revision"], 1);
-        assert_eq!(apply(make())?["settings"], first["settings"]);
+        let saved = apply(update)?;
+        assert_eq!(saved["revision"], 1);
+        assert_eq!(saved["settings"]["models"]["codex"]["service_tier"], "fast");
+        assert_eq!(apply(make())?["settings"], saved["settings"]);
         let mut stale = make();
         stale.settings = Some(stale.defaults.clone());
         stale.expected_revision = Some(0);

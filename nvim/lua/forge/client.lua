@@ -31,12 +31,14 @@ local RESERVED_METHOD = {
 ---@class ForgeBackgroundSelection
 ---@field model string
 ---@field reasoning_effort? string
+---@field service_tier? 'default'|'fast'|'ultrafast'
 ---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
 
 ---@class ForgeTextGenerationConfig
 ---@field backend {kind: string, command: string[]}
 ---@field model string
 ---@field reasoning_effort? string
+---@field service_tier? 'default'|'fast'|'ultrafast'
 ---@field auto_compaction? {enabled: boolean, threshold_tokens: integer}
 ---@field data_root string
 
@@ -858,6 +860,7 @@ function M.generation_config(selection)
     backend = { kind = backend, command = vim.deepcopy(configured.command or {}) },
     model = selection and selection.model or (selected and selected.model or harness_config.model),
     reasoning_effort = selection and selection.reasoning_effort,
+    service_tier = selection and selection.service_tier or "default",
     auto_compaction = selection and selection.auto_compaction,
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
   }

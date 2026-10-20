@@ -9,6 +9,7 @@ local notifications = require("forge.infra.notifications")
 ---@field backend string
 ---@field session_id string
 ---@field host table
+---@field capability fun(): table
 ---@field current fun(): boolean
 ---@field changed fun()
 ---@field reopen fun()
@@ -30,6 +31,15 @@ local notifications = require("forge.infra.notifications")
 ---@field save fun(self: ForgeBackgroundConfiguration, preferences: ForgeBackgroundPreferences, back?: boolean)
 ---@field preferences fun(self: ForgeBackgroundConfiguration): ForgeBackgroundPreferences
 ---@field select_model fun(self: ForgeBackgroundConfiguration, model: string, thinking?: string, back?: boolean)
+---@field speed_values fun(self: ForgeBackgroundConfiguration): string[]
+
+function BackgroundConfiguration:speed_values()
+  local capability = self.options.capability()
+  local values = { "default" }
+  if capability.fast_mode then values[#values + 1] = "fast" end
+  if capability.ultrafast_mode then values[#values + 1] = "ultrafast" end
+  return values
+end
 
 ---@param options ForgeBackgroundConfigurationOptions
 ---@return ForgeBackgroundConfiguration
@@ -82,7 +92,7 @@ function BackgroundConfiguration:fields()
   local disabled = self.pending and "Saving Background settings" or not self.snapshot and (self.failure or "Loading Background settings") or nil
   local catalog_disabled = disabled or not self.model_list and (self.failure or "Loading Background models") or nil
   local policy = self.snapshot and self.snapshot.settings.auto_compaction
-  return {
+  local fields = {
     model = { id = "background-model", kind = "choice", value = selected and selected.model or "Loading…",
       disabled_reason = catalog_disabled, description = "Model for Background requests, independent of the main conversation." },
     thinking = { id = "background-thinking", kind = "choice", label = "Thinking", value = selected and selected.thinking or "Default",
@@ -92,6 +102,12 @@ function BackgroundConfiguration:fields()
     threshold = { id = "background-threshold", kind = "input", label = "Threshold", value = tostring(policy and policy.threshold_tokens or 128000),
       disabled_reason = disabled, muted = not (policy and policy.enabled), description = "Background compaction threshold in provider-reported context tokens." },
   }
+  if #self:speed_values() > 1 then
+    fields.speed = { id = "background-speed", kind = "choice", label = "Speed",
+      value = selected and selected.service_tier or "default", disabled_reason = disabled,
+      description = "Provider service tier for Background requests, independent of the main conversation." }
+  end
+  return fields
 end
 
 function BackgroundConfiguration:save(preferences, back)
@@ -125,7 +141,9 @@ end
 function BackgroundConfiguration:select_model(model, thinking, back)
   local preferences = self:preferences()
   local key = self.options.backend
-  preferences.models[key] = { model = model, thinking = thinking }
+  preferences.models[key] = preferences.models[key] or {}
+  preferences.models[key].model = model
+  preferences.models[key].thinking = thinking
   self:save(preferences, back)
 end
 
@@ -151,6 +169,14 @@ function BackgroundConfiguration:change(id, direction)
     if #values == 0 then return true end
     local position = math.max(1, vim.fn.index(values, tostring(self:model().thinking)) + 1)
     self:select_model(model.id, values[(position - 1 + direction) % #values + 1])
+  elseif id == "background-speed" then
+    local values = self:speed_values()
+    if #values == 1 then return true end
+    local preferences = self:preferences()
+    local choice = preferences.models[self.options.backend]
+    local position = math.max(1, vim.fn.index(values, choice.service_tier or "default") + 1)
+    choice.service_tier = values[(position - 1 + direction) % #values + 1]
+    self:save(preferences)
   end
   return true
 end
@@ -175,7 +201,7 @@ function BackgroundConfiguration:open(id)
       end })
     return true
   end
-  if id == "background-compact" then return self:change(id, 1) end
+  if id == "background-compact" or id == "background-speed" then return self:change(id, 1) end
   if id == "background-threshold" then
     vim.ui.input({ prompt = "Compact at tokens: ", default = tostring(self.snapshot.settings.auto_compaction.threshold_tokens) }, function(value)
       if not value or not self.options.current() then return end

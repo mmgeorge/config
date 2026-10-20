@@ -9,6 +9,12 @@ share the same persistent, branch-aware Background session, provider thread, and
 Background model and thinking settings. Each exchange repeats its own task and output
 requirements under a shared system message. Neovim owns request presentation and generated
 text application, without a separate model HTTP client or CLI generation adapter.
+Background speed persists with each provider's model preference and travels through
+`TextGenerationConfig` into the Background exchange. The runner validates the selected
+service tier against the same capability contract as Main before admitting model work.
+It applies the captured tier on every exchange, including when reusing a conversation,
+so selecting `default` clears an earlier accelerated tier. The `/config` Background
+row exposes Speed only when the current provider advertises an accelerated tier.
 
 Input delivery uses a separate durable state machine from model retries.
 `backend/submission.rs` commits input before host admission, native correlation

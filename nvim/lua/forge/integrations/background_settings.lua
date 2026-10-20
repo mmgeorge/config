@@ -5,6 +5,7 @@ local config = require("forge.infra.config")
 ---@class ForgeBackgroundModel
 ---@field model string
 ---@field thinking? string
+---@field service_tier? 'default'|'fast'|'ultrafast'
 
 ---@class ForgeBackgroundPreferences
 ---@field models table<string, ForgeBackgroundModel>
@@ -18,7 +19,7 @@ local config = require("forge.infra.config")
 local function defaults()
   local models = {}
   for provider, choice in pairs(config.options.background_generation or {}) do
-    models[provider] = { model = choice.model, thinking = choice.reasoning_effort }
+    models[provider] = { model = choice.model, thinking = choice.reasoning_effort, service_tier = choice.service_tier or "default" }
   end
   return { models = models, auto_compaction = { enabled = true, threshold_tokens = 128000 } }
 end
@@ -32,7 +33,7 @@ function M.request(snapshot, preferences, callback)
   if not generation then callback(nil, failure) return end
   local baseline = defaults()
   baseline.models[generation.backend.kind] = baseline.models[generation.backend.kind]
-    or { model = generation.model, thinking = generation.reasoning_effort }
+    or { model = generation.model, thinking = generation.reasoning_effort, service_tier = generation.service_tier }
   client.request_host("background.settings", {
     data_root = generation.data_root, defaults = baseline,
     expected_revision = snapshot and snapshot.revision, settings = preferences,

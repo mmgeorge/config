@@ -43,6 +43,7 @@ async fn generate(
                 },
                 model: "mock-model".into(),
                 reasoning_effort: Some("low".into()),
+                service_tier: Default::default(),
                 data_root: data.into(),
                 auto_compaction: Default::default(),
             },
@@ -173,7 +174,11 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
         crate::backend::TextGeneration::PullRequestDescription,
         crate::backend::TextGeneration::CommitMessage,
     ];
-    for purpose in purposes {
+    for (purpose, service_tier) in purposes.into_iter().zip([
+        crate::backend::ServiceTier::Fast,
+        crate::backend::ServiceTier::Ultrafast,
+        crate::backend::ServiceTier::Standard,
+    ]) {
         let owner = manager();
         let context = BackgroundContext::read(&owner.repositories, root.to_str().unwrap()).await?;
         let result = owner
@@ -189,6 +194,7 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
                     },
                     model: "mock-model".into(),
                     reasoning_effort: Some("low".into()),
+                    service_tier,
                     data_root: data.clone(),
                     auto_compaction: Default::default(),
                 },
@@ -199,6 +205,10 @@ async fn background_reuses_one_provider_thread_for_commits_and_pull_requests() -
         let session = store
             .load_session(&result.session_id)?
             .context("shared session missing")?;
+        assert_eq!(
+            session.service_tier, service_tier,
+            "Background speed was reset or inherited"
+        );
         let current = (result.session_id.clone(), session.backend_session_id);
         if let Some(previous) = &identity {
             assert_eq!(&current, previous);

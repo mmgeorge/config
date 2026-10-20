@@ -39,9 +39,14 @@ paths. LFS-only changes produce no generation request.
 
 Commit generation uses a persistent, tool-free **Background session**. Codex and Copilot
 default to `gpt-6-luna` with low thinking, independently of the active chat. `/config`
-provides the **Background** row in **Models** for model and thinking choices, and
+provides the **Background** row in **Models** for model, thinking, and supported speed choices, and
 its **Background** row in **Compaction** for automatic compaction and the token threshold. Choices persist across restarts. Gemini is not part
 of this workflow. Other AI features retain their existing adapters.
+
+Background **Speed** is independent of Main and applies to subsequent Background
+requests. It offers `default`, `fast`, and `ultrafast` according to the provider's
+advertised capabilities. The control is hidden for providers without accelerated
+tiers. Codex currently exposes both accelerated tiers. Copilot does not.
 
 The first actual generation creates the session. Normal commits reuse it. Switching
 branches or rewriting history starts another conversation, with the old timeline retained.
@@ -61,7 +66,7 @@ Opening the command before any generation does not create a session.
 ```lua
 require("forge").setup({
   background_generation = {
-    codex = { model = "gpt-6-luna", reasoning_effort = "low" },
+    codex = { model = "gpt-6-luna", reasoning_effort = "low", service_tier = "fast" },
     copilot = { model = "gpt-6-luna", reasoning_effort = "low" },
   },
 })

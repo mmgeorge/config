@@ -13,7 +13,7 @@ if not stage then
   vim.cmd("qa!")
   return
 end
-local executable = require("forge.builder").binary_path()
+local executable = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
 local data = assert(arg[2])
 local workspace = vim.fs.joinpath(data, stage)
 vim.fn.mkdir(workspace, "p")
@@ -46,28 +46,35 @@ local function option(id)
 end
 require("forge").open_harness()
 wait(function() return state.ready and state.session end, "Harness did not start")
-local before = { model = state.session.model, effort = state.session.effort }
+local before = { model = state.session.model, effort = state.session.effort, service_tier = state.session.service_tier }
 settings.open(state, { window_list = { state.transcript_win, state.composer_win }, control_win = state.composer_win })
 wait(function() local model = option("background-model") return model and not model.disabled_reason end, "Background controls did not load")
 local expected = stage == "save" and "low" or "medium"
 assert(option("background-model").value:find("mock-model", 1, true))
 assert(option("background-thinking").value:find(expected, 1, true), vim.inspect(option("background-thinking")))
+assert(option("background-speed").value == (stage == "save" and "default" or "fast"))
 local lines = vim.api.nvim_buf_get_lines(picker._state_for_test().buf, 0, -1, false)
 assert(table.concat(lines, "\n"):find("Background", 1, true), "Background controls did not render")
 if stage == "save" then
   picker._state_for_test().spec.on_field_action({ field = option("background-thinking") }, "change", 1)
   wait(function() return option("background-thinking").value:find("medium", 1, true) ~= nil end, "Thinking did not save")
+  picker._state_for_test().spec.on_field_action({ field = option("background-speed") }, "change", 1)
+  wait(function() return option("background-speed").value == "fast" end, "Speed did not save")
 end
 assert(state.session.model == before.model and state.session.effort == before.effort, "Commit settings changed the chat")
+assert(state.session.service_tier == before.service_tier, "Background speed changed the chat")
 local generator = require("forge.integrations.ai_commit")
-generator.set_backend({ request_async = function(_, callback)
+local original_generation_request = client.request_generation
+client.request_generation = function(_, callback, _, selection)
+  local generation = assert(client.generation_config(selection))
+  assert(generation.service_tier == "fast", "saved Background speed did not reach generation")
   callback({ state = "ready", message = "test: use saved preferences" })
-end })
+end
 local generated
 generator.ensure(workspace, { ref = "HEAD", force = true }, function(result) generated = result end)
 wait(function() return generated ~= nil end, "Generation did not read saved settings")
 assert(generated.state == "ready" and generated.model == "mock-model · thinking medium", vim.inspect(generated))
-generator.reset_backend()
+client.request_generation = original_generation_request
 picker.close(false)
 client.stop()
 assert(vim.wait(5000, function() return not client._client.process end, 10), "Host did not stop")

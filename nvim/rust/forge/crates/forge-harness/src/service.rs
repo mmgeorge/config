@@ -32,6 +32,9 @@ pub struct TextGenerationConfig {
     pub model: String,
     /// Explicit effort for the isolated request, independent of the active conversation.
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    /// Provider speed for Background requests, independent of the active conversation.
+    pub service_tier: crate::backend::ServiceTier,
     /// Background default, overridden by saved per-session policy.
     #[serde(default = "background_compaction")]
     pub auto_compaction: crate::session::AutoCompaction,
@@ -3822,6 +3825,7 @@ mod tests {
                     },
                     model: "default".into(),
                     reasoning_effort: Some("low".into()),
+                    service_tier: Default::default(),
                     data_root,
                 },
                 &before.workspace,

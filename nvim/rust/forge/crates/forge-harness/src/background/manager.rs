@@ -210,6 +210,7 @@ impl BackgroundManager {
                     .config
                     .reasoning_effort
                     .unwrap_or_else(|| "low".into()),
+                request.config.service_tier,
                 policy,
                 sink,
             )

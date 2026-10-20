@@ -1061,6 +1061,7 @@ impl HarnessBroker {
         identity: crate::background::BackgroundIdentity,
         model: String,
         effort: String,
+        service_tier: crate::backend::ServiceTier,
         policy: crate::session::AutoCompaction,
         sink: BackendEventSink,
     ) -> Result<String> {
@@ -1068,6 +1069,7 @@ impl HarnessBroker {
             self.session.background.is_some(),
             "Background request requires a Background session"
         );
+        service_tier.validate(&self.capability)?;
         if let Some(previous) = &self.session.background {
             if !previous.reason.is_empty() && self.store.list_exchange(&self.session.id)?.is_empty()
             {
@@ -1089,7 +1091,7 @@ impl HarnessBroker {
         self.session.model = model;
         self.session.effort = effort;
         self.session.context_window = None;
-        self.session.service_tier = Default::default();
+        self.session.service_tier = service_tier;
         self.session.execution_mode = PermissionMode::Read;
         self.session.auto_compaction = policy;
         self.checkpoint = None;
@@ -9784,15 +9786,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
             .transpose()?;
         if let Some(tier) = requested_service_tier {
-            let supported = match tier {
-                crate::backend::ServiceTier::Standard => true,
-                crate::backend::ServiceTier::Fast => self.capability.fast_mode,
-                crate::backend::ServiceTier::Ultrafast => self.capability.ultrafast_mode,
-            };
-            anyhow::ensure!(
-                supported,
-                "current backend does not support the requested service tier"
-            );
+            tier.validate(&self.capability)?;
         }
         let requested_model = params.get("model").and_then(Value::as_str);
         let requested_effort = params.get("effort").and_then(Value::as_str);
