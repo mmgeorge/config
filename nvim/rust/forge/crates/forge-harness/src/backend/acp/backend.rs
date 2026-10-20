@@ -888,6 +888,7 @@ impl Backend for AcpBackend {
                 .filter_map(|option| option["value"].as_str().map(str::to_owned))
                 .collect();
             result.push(BackendModel {
+                service_tiers: vec![crate::backend::ServiceTier::Standard],
                 id: id.into(),
                 reasoning,
                 default_reasoning: None,

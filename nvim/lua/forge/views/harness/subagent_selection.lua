@@ -1,8 +1,10 @@
 local client = require("forge.client")
+local model_options = require("forge.views.harness.model_options")
 
 ---@class ForgeSubagentModel
 ---@field id string
 ---@field reasoning string[]
+---@field service_tiers? string[]
 ---@field is_default? boolean
 
 ---@class ForgeSubagentModelCatalog
@@ -37,13 +39,6 @@ end
 
 ---@param catalog ForgeSubagentModelCatalog
 ---@return string[]
-local function speed_values(catalog)
-  local values = { "default" }
-  if catalog.capability.fast_mode then values[#values + 1] = "fast" end
-  if catalog.capability.ultrafast_mode then values[#values + 1] = "ultrafast" end
-  return values
-end
-
 ---@param field string
 ---@param values table<string, string>
 ---@param catalog ForgeSubagentModelCatalog
@@ -68,7 +63,7 @@ local function choices(field, values, catalog, root)
       end
     end
   else
-    result = speed_values(catalog)
+    result = model_options.speeds(selected_model(catalog, values.model, root), catalog.capability)
     if vim.tbl_contains(result, root.service_tier or "default") then table.insert(result, 1, "inherit") end
   end
   return result

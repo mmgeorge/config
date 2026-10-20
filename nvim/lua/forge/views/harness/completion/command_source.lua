@@ -7,6 +7,7 @@ local CommandSource = {}
 local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local model_order = require("forge.views.harness.model_order")
+local model_options = require("forge.views.harness.model_options")
 local model_pins = require("forge.views.harness.model_pins")
 local provider_catalog = require("forge.views.harness.provider_catalog")
 local session = require("forge.session")
@@ -371,42 +372,59 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  if command_start then
-    local parent_command = prefix:match("^%s*(/%S+)%s+")
-    for _, command in ipairs(command_list) do
-      if parent_command and command.label:sub(1, #parent_command + 1) ~= parent_command .. " " then
-        goto continue
-      end
-      local capability = session.harness.capability or {}
-      if command.capability
-        and command.capability ~= "skill_catalog" and command.capability ~= "mcp_catalog"
-        and capability[command.capability] ~= true
-      then
-        goto continue
-      end
-      if command.capability == "skill_catalog" and not (capability.catalog and capability.catalog.skill) then
-        goto continue
-      end
-      if command.capability == "mcp_catalog" and not (capability.catalog and capability.catalog.mcp) then
-        goto continue
-      end
-      items[#items + 1] = {
-        label = command.label,
-        filterText = command.label,
-        detail = command.detail,
-        kind = vim.lsp.protocol.CompletionItemKind.Keyword,
-        textEdit = {
-          newText = command.label,
-          range = {
-            start = { line = row, character = command_start - 1 },
-            ["end"] = { line = row, character = cursor_column },
-          },
-        },
-      }
-      ::continue::
+  local function complete_commands(model_list)
+    local state = session.harness
+    local selected = state.session or {}
+    local model_id = selected.model or "default"
+    for _, configuration in ipairs({ state.task_config or {}, state.pending_config or {}, state.configuring_config or {} }) do
+      if configuration.model ~= nil then model_id = configuration.model break end
     end
+    local speed_list = model_options.speeds(model_options.find(model_list, model_id), state.capability or {})
+    if command_start then
+      local parent_command = prefix:match("^%s*(/%S+)%s+")
+      for _, command in ipairs(command_list) do
+        if parent_command and command.label:sub(1, #parent_command + 1) ~= parent_command .. " " then
+          goto continue
+        end
+        local capability = session.harness.capability or {}
+        if command.capability
+          and command.capability ~= "skill_catalog" and command.capability ~= "mcp_catalog"
+          and capability[command.capability] ~= true
+        then
+          goto continue
+        end
+        if command.label == "/ultrafast" and not vim.tbl_contains(speed_list, "ultrafast") then
+          goto continue
+        end
+        if command.capability == "skill_catalog" and not (capability.catalog and capability.catalog.skill) then
+          goto continue
+        end
+        if command.capability == "mcp_catalog" and not (capability.catalog and capability.catalog.mcp) then
+          goto continue
+        end
+        items[#items + 1] = {
+          label = command.label,
+          filterText = command.label,
+          detail = command.detail,
+          kind = vim.lsp.protocol.CompletionItemKind.Keyword,
+          textEdit = {
+            newText = command.label,
+            range = {
+              start = { line = row, character = command_start - 1 },
+              ["end"] = { line = row, character = cursor_column },
+            },
+          },
+        }
+        ::continue::
+      end
+    end
+    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
   end
-  callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+  if command_start and (session.harness.capability or {}).ultrafast_mode then
+    self:request_model_list(complete_commands)
+  else
+    complete_commands({})
+  end
 end
 
 return CommandSource

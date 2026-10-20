@@ -179,7 +179,6 @@ function M.open(state, host)
     active.check_timing = state.check_timing or "after_queue"
     active.automatic_checks = state.automatic_checks ~= false
     local configuration_revision = 0
-    local configuration_pending = false
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
     local commit
@@ -189,7 +188,6 @@ function M.open(state, host)
       if not state.session or state.session.id ~= session_id then return end
       configuration_revision = configuration_revision + 1
       local revision = configuration_revision
-      configuration_pending = true
       active = vim.tbl_extend("force", active, params)
       local session = require("forge.session")
       local previous = session.harness
@@ -197,7 +195,6 @@ function M.open(state, host)
       require("forge.views.harness.controller").configure(params, false, function(applied)
         if not state.session or state.session.id ~= session_id then return end
         if revision ~= configuration_revision then return end
-        configuration_pending = false
         active = vim.tbl_extend("force", assert(state.session), state.configuring_config or {},
           state.pending_config or {}, state.task_config or {})
         active.status_thoughts = state.status_thoughts == true
@@ -305,9 +302,7 @@ function M.open(state, host)
       if current() and picker.is_open("harness-config") then picker.update(build_spec()) end
     end
     local function model_descriptor()
-      for _, model in ipairs(commit and commit.model_list or {}) do
-        if model.id == active.model then return model end
-      end
+      return require("forge.views.harness.model_options").find(commit and commit.model_list, active.model)
     end
     local function change_main(id, direction)
       local function cycle(values, value)
@@ -321,7 +316,9 @@ function M.open(state, host)
         local selected = cycle(values, active.model)
         for _, model in ipairs(models) do
           if model.id == selected then
-            configure({ model = selected, effort = model.default_reasoning or (model.reasoning or {})[1] or active.effort })
+            local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
+            configure({ model = selected, effort = model.default_reasoning or (model.reasoning or {})[1] or active.effort,
+              service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and active.service_tier or "default" })
             return
           end
         end
@@ -329,9 +326,7 @@ function M.open(state, host)
         local model = model_descriptor()
         configure({ effort = cycle(model and model.reasoning or {}, active.effort) })
       elseif id == "main-speed" then
-        local values = { "default" }
-        if state.capability.fast_mode then values[#values + 1] = "fast" end
-        if state.capability.ultrafast_mode then values[#values + 1] = "ultrafast" end
+        local values = require("forge.views.harness.model_options").speeds(model_descriptor(), state.capability or {})
         configure({ service_tier = cycle(values, active.service_tier or "default") })
       end
     end
@@ -348,7 +343,10 @@ function M.open(state, host)
           on_close = function() if current() then M.open(state, host) end end,
           on_confirm = function(value)
             picker.close(false)
-            configure({ model = value.model, effort = value.effort, context_window = value.context_window },
+            local model = require("forge.views.harness.model_options").find(models, value.model)
+            local speeds = require("forge.views.harness.model_options").speeds(model, state.capability or {})
+            configure({ model = value.model, effort = value.effort, context_window = value.context_window,
+              service_tier = vim.tbl_contains(speeds, active.service_tier or "default") and active.service_tier or "default" },
               function() if current() then M.open(state, host) end end)
           end })
       elseif id == "native-import" then
@@ -389,7 +387,8 @@ function M.open(state, host)
         field("main-thinking", "choice", active.effort or "Default", "Thinking", "Reasoning effort for the selected main model.",
           not capability.effort_selection and "Reasoning effort selection is unavailable for this provider" or catalog_disabled),
       }
-      if capability.fast_mode or capability.ultrafast_mode then
+      if #require("forge.views.harness.model_options").speeds(model_descriptor(), capability) > 1
+        or active.service_tier and active.service_tier ~= "default" then
         main[#main + 1] = field("main-speed", "choice", active.service_tier or "default", "Speed", "Provider service tier for the main conversation.")
       end
       local compaction = active.auto_compaction or { enabled = false, threshold_tokens = 128000 }
@@ -424,7 +423,6 @@ function M.open(state, host)
         owner = "harness-config", host = host, height_ratio = 0.9, fit_content = true,
         page_list = { {
           id = "config", title = "Configuration",
-          subtitle = configuration_pending and "Changes pending" or nil,
           field_navigation = true, highlight_selected_text = false, compact_sections = true,
           option_list = {
             row("main-model", "Models", "Main", main),

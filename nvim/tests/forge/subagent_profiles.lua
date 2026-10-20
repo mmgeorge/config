@@ -10,8 +10,8 @@ local errors, saves = {}, 0
 local model_failure
 local catalog_by_provider = {
   codex = { capability = { fast_mode = true, ultrafast_mode = true }, models = {
-    { id = "fixture-model", reasoning = { "low", "high" }, default_reasoning = "low", is_default = true },
-    { id = "simple-model", reasoning = {} },
+    { id = "fixture-model", reasoning = { "low", "high" }, default_reasoning = "low", is_default = true, service_tiers = { "fast", "ultrafast" } },
+    { id = "simple-model", reasoning = {}, service_tiers = {} },
   } },
   copilot = { capability = { fast_mode = false, ultrafast_mode = false }, models = {
     { id = "copilot-first", reasoning = { "medium" }, default_reasoning = "medium" },
@@ -308,7 +308,7 @@ local succeeded, failure = xpcall(function()
   assert(current_form:values().reasoning_effort == "default", "incompatible inherited thinking was offered")
   focus("service_tier")
   current_form:cycle(1)
-  assert(current_form:values().service_tier == "fast")
+  assert(current_form:values().service_tier == "default", "model without speed tiers offered fast")
   focus("provider")
   current_form:cycle(1)
   assert(current_form:values().service_tier == "default", "full-page editor retained unsupported speed")

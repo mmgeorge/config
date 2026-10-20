@@ -4,6 +4,7 @@ local store = require("forge.integrations.background_settings")
 local client = require("forge.client")
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
+local model_options = require("forge.views.harness.model_options")
 
 ---@class ForgeBackgroundConfigurationOptions
 ---@field backend string
@@ -34,11 +35,7 @@ local notifications = require("forge.infra.notifications")
 ---@field speed_values fun(self: ForgeBackgroundConfiguration): string[]
 
 function BackgroundConfiguration:speed_values()
-  local capability = self.options.capability()
-  local values = { "default" }
-  if capability.fast_mode then values[#values + 1] = "fast" end
-  if capability.ultrafast_mode then values[#values + 1] = "ultrafast" end
-  return values
+  return model_options.speeds(self:descriptor(), self.options.capability())
 end
 
 ---@param options ForgeBackgroundConfigurationOptions
@@ -82,9 +79,7 @@ end
 
 function BackgroundConfiguration:descriptor()
   local selected = self:model()
-  for _, model in ipairs(self.model_list or {}) do
-    if selected and model.id == selected.model then return model end
-  end
+  return model_options.find(self.model_list, selected and selected.model)
 end
 
 function BackgroundConfiguration:fields()
@@ -102,9 +97,13 @@ function BackgroundConfiguration:fields()
     threshold = { id = "background-threshold", kind = "input", label = "Threshold", value = tostring(policy and policy.threshold_tokens or 128000),
       disabled_reason = disabled, muted = not (policy and policy.enabled), description = "Background compaction threshold in provider-reported context tokens." },
   }
-  if #self:speed_values() > 1 then
+  local capability = self.options.capability()
+  if #self:speed_values() > 1 or (capability.fast_mode or capability.ultrafast_mode)
+    and selected and selected.service_tier and selected.service_tier ~= "default" then
+    local tier = selected and selected.service_tier or "default"
+    local value = vim.tbl_contains(self:speed_values(), tier) and tier or (tier .. " (unsupported)")
     fields.speed = { id = "background-speed", kind = "choice", label = "Speed",
-      value = selected and selected.service_tier or "default", disabled_reason = disabled,
+      value = value, disabled_reason = disabled,
       description = "Provider service tier for Background requests, independent of the main conversation." }
   end
   return fields
@@ -144,6 +143,10 @@ function BackgroundConfiguration:select_model(model, thinking, back)
   preferences.models[key] = preferences.models[key] or {}
   preferences.models[key].model = model
   preferences.models[key].thinking = thinking
+  local speeds = model_options.speeds(model_options.find(self.model_list, model), self.options.capability())
+  if not vim.tbl_contains(speeds, preferences.models[key].service_tier or "default") then
+    preferences.models[key].service_tier = "default"
+  end
   self:save(preferences, back)
 end
 

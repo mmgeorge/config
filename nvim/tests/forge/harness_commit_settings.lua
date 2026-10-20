@@ -23,8 +23,8 @@ end
 client.request_for = function(_, method, _, callback)
   if method == "trace.status" then callback({ enabled = false })
   elseif method == "backend.models" then callback({
-    { id = "gpt-6-luna", reasoning = { "low", "medium", "high" }, default_reasoning = "low" },
-    { id = "second-model", reasoning = { "low", "high" }, default_reasoning = "low" },
+    { id = "gpt-6-luna", reasoning = { "low", "medium", "high" }, default_reasoning = "low", service_tiers = { "fast" } },
+    { id = "second-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
   })
   else error("Commit settings used a conversation mutation: " .. method) end
 end
@@ -53,14 +53,18 @@ assert(preferences.models.codex.thinking == "medium")
 change("background-speed")
 assert(preferences.models.codex.service_tier == "fast")
 change("background-speed")
-assert(preferences.models.codex.service_tier == "ultrafast")
+assert(preferences.models.codex.service_tier == "default", "Luna must not offer ultrafast")
+change("background-speed")
+assert(preferences.models.codex.service_tier == "fast")
 change("background-compact")
 assert(not preferences.auto_compaction.enabled)
 picker._state_for_test().spec.on_field_action({ field = option("background-model") }, "activate", 1)
 local model_picker = picker._state_for_test()
 model_picker.spec.on_confirm({ option = { value = { id = "second-model", picker_reasoning = "high" } } })
 assert(preferences.models.codex.model == "second-model" and preferences.models.codex.thinking == "high")
-assert(preferences.models.codex.service_tier == "ultrafast", "model change lost Background speed")
+assert(preferences.models.codex.service_tier == "fast", "model change lost valid Background speed")
+change("background-speed")
+assert(preferences.models.codex.service_tier == "ultrafast")
 assert(picker.is_open("harness-config"), "model selection did not return to config")
 fail_save = true
 change("background-thinking")

@@ -29,8 +29,8 @@ client.request_for = function(session_id, method, params, callback)
     or method == "session.configure" or method == "backend.models" or method == "checks.editing")
   if method == "backend.models" then
     callback({
-      { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium" },
-      { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low" },
+      { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium", service_tiers = { "fast", "ultrafast" } },
+      { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low", service_tiers = { "fast", "ultrafast" } },
     })
     return
   end

@@ -817,14 +817,27 @@ impl CodexBackend {
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
     ) -> Result<Vec<BackendModel>> {
-        let result = process
-            .request(
-                "model/list",
-                json!({ "cursor": null, "includeHidden": false }),
-                output,
-            )
-            .await?;
-        Ok(Self::parse_model_catalog(&result))
+        let mut models = Vec::new();
+        let mut cursor: Option<String> = None;
+        let mut seen = HashSet::new();
+        loop {
+            let result = process
+                .request(
+                    "model/list",
+                    json!({ "cursor": cursor, "includeHidden": false }),
+                    output,
+                )
+                .await?;
+            models.extend(Self::parse_model_catalog(&result));
+            let Some(next) = result.get("nextCursor").and_then(Value::as_str) else {
+                return Ok(models);
+            };
+            anyhow::ensure!(
+                seen.insert(next.to_owned()),
+                "Codex model catalog repeated a cursor"
+            );
+            cursor = Some(next.to_owned());
+        }
     }
 
     fn parse_model_catalog(result: &Value) -> Vec<BackendModel> {
@@ -851,6 +864,17 @@ impl CodexBackend {
                     })
                     .collect();
                 Some(BackendModel {
+                    service_tiers: model
+                        .get("serviceTiers")
+                        .and_then(Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|tier| match tier.get("id").and_then(Value::as_str) {
+                            Some("priority" | "fast") => Some(crate::backend::ServiceTier::Fast),
+                            Some("ultrafast") => Some(crate::backend::ServiceTier::Ultrafast),
+                            _ => None,
+                        })
+                        .collect(),
                     id: id.to_owned(),
                     default_reasoning: model
                         .get("defaultReasoningEffort")
@@ -884,21 +908,37 @@ impl CodexBackend {
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
     ) -> Result<String> {
-        if request.model != "default" {
+        if request.model != "default"
+            && request.service_tier == crate::backend::ServiceTier::Standard
+        {
             return Ok(request.model.clone());
         }
-        if let Some(model) = self.default_model.lock().await.clone() {
+        if request.service_tier == crate::backend::ServiceTier::Standard
+            && let Some(model) = self.default_model.lock().await.clone()
+        {
             return Ok(model);
         }
         let model_list = Self::model_catalog(process, output).await?;
         let model = model_list
             .iter()
-            .find(|model| model.is_default)
-            .or_else(|| model_list.first())
-            .map(|model| model.id.clone())
-            .context("Codex model/list returned no visible models")?;
-        *self.default_model.lock().await = Some(model.clone());
-        Ok(model)
+            .find(|model| {
+                if request.model == "default" {
+                    model.is_default
+                } else {
+                    model.id == request.model
+                }
+            })
+            .or_else(|| {
+                (request.model == "default")
+                    .then(|| model_list.first())
+                    .flatten()
+            })
+            .context("Selected Codex model is not in the current catalog")?;
+        request.service_tier.validate_model(model)?;
+        if request.model == "default" {
+            *self.default_model.lock().await = Some(model.id.clone());
+        }
+        Ok(model.id.clone())
     }
 
     fn notification_turn_id<'a>(message: &'a Value, method: &str) -> Option<&'a str> {
@@ -2666,12 +2706,27 @@ end
                     "model": "gpt-default",
                     "displayName": "Default model",
                     "isDefault": true,
+                    "serviceTiers": [{ "id": "priority" }],
                     "supportedReasoningEfforts": [{ "reasoningEffort": "medium" }]
                 }
             ]
         }));
         assert_eq!(catalog[0].id, "gpt-default");
         assert!(catalog[0].is_default);
+        assert_eq!(
+            catalog[0].service_tiers,
+            vec![crate::backend::ServiceTier::Fast]
+        );
+        assert!(
+            crate::backend::ServiceTier::Fast
+                .validate_model(&catalog[0])
+                .is_ok()
+        );
+        assert!(
+            crate::backend::ServiceTier::Ultrafast
+                .validate_model(&catalog[0])
+                .is_err()
+        );
     }
 
     #[test]
@@ -2702,6 +2757,103 @@ end
         assert_eq!(params.get("threadId"), Some(&json!("source-thread")));
         assert_eq!(params.get("lastTurnId"), Some(&json!("completed-turn")));
         assert_eq!(params.get("excludeTurns"), Some(&json!(true)));
+    }
+
+    #[tokio::test]
+    async fn unsupported_model_speed_is_rejected_before_native_submission() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+            None,
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for cursor in [Value::Null, json!("next-page")] {
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "model/list");
+                assert_eq!(request["params"]["cursor"], cursor);
+                let result = if cursor.is_null() {
+                    json!({"data":[],"nextCursor":"next-page"})
+                } else {
+                    json!({"data":[{"model":"gpt-6-luna","serviceTiers":[{"id":"priority"}]}]})
+                };
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({"id":request["id"],"result":result})
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), socket.next())
+                    .await
+                    .is_err(),
+                "unsupported model speed reached native submission"
+            );
+        });
+        let process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            PermissionMode::Read,
+            permission,
+            None,
+            trace.clone(),
+            "speed-test".into(),
+        )
+        .await?;
+        backend.connection_by_session.lock().await.insert(
+            "speed-test".into(),
+            Arc::new(Mutex::new(CodexConnection {
+                process,
+                timing: Vec::new(),
+            })),
+        );
+        let mut request = BackendRequest {
+            execution_owner: None,
+            harness_session_id: "speed-test".into(),
+            workspace,
+            input: BackendInput::from_text("must not dispatch"),
+            mode: PromptMode::Chat,
+            model: "gpt-6-luna".into(),
+            effort: "low".into(),
+            context_window: None,
+            service_tier: crate::backend::ServiceTier::Ultrafast,
+            access: Default::default(),
+            execution_mode: PermissionMode::Read,
+            backend_session_id: None,
+            submission: None,
+            recovered_input: Vec::new(),
+            control_context: None,
+        };
+        let store = super::super::submission::SubmissionStore::open(fixture.path(), trace)?;
+        let submission = store.prepare(&request, BackendKind::Codex)?;
+        request.submission = Some(submission.clone());
+        let error = backend.prompt_stream(request, None).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unavailable for model gpt-6-luna"),
+            "{error:#}"
+        );
+        assert_eq!(
+            submission.record()?.delivery,
+            super::super::submission::SubmissionState::Prepared
+        );
+        server.await?;
+        Ok(())
     }
 
     #[test]
@@ -2868,6 +3020,17 @@ end
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                if service_tier != crate::backend::ServiceTier::Standard {
+                    let request: Value = serde_json::from_str(
+                        socket.next().await.unwrap().unwrap().to_text().unwrap(),
+                    )
+                    .unwrap();
+                    assert_eq!(request["method"], "model/list");
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({
+                        "id":request["id"], "result":{"data":[{"model":expected_model,"isDefault":true,
+                        "serviceTiers":[{"id":"priority"},{"id":"ultrafast"}]}]}
+                    }).to_string().into())).await.unwrap();
+                }
                 for method in [
                     if resumed {
                         "thread/resume"

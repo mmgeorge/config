@@ -15,6 +15,14 @@ service tier against the same capability contract as Main before admitting model
 It applies the captured tier on every exchange, including when reusing a conversation,
 so selecting `default` clears an earlier accelerated tier. The `/config` Background
 row exposes Speed only when the current provider advertises an accelerated tier.
+Codex model discovery retains each model's `serviceTiers`, mapping its `priority`
+ID to Forge's `fast` choice. Main, Background, and subagent selectors intersect
+these model choices with provider capabilities. Missing model metadata permits
+only `default`. Codex refreshes the catalog before an accelerated request and
+rejects unsupported combinations before native thread or turn submission. The
+[native model schema](https://github.com/openai/codex/blob/main/codex-rs/app-server-protocol/src/protocol/v2/model.rs)
+defines this metadata. Provider-wide Fast or Ultrafast support alone does not
+establish support for a particular model or account.
 
 Input delivery uses a separate durable state machine from model retries.
 `backend/submission.rs` commits input before host admission, native correlation
@@ -130,7 +138,9 @@ same committed snapshot. `settings.update` and `settings.reset` require the expe
 application through task transition admission. `setting_application` distinguishes the desired revision
 from the confirmed applied revision and runtime generation. A failed continuation does not invalidate
 an already confirmed configuration. Configuration timeline records share the durable operation identity
-and contain changed field names rather than settings values. The service persists applying,
+and contain changed field names rather than settings values. Successful configuration records remain
+in storage for auditing but do not produce timeline rows. Failed configuration records remain visible.
+The service persists applying,
 verifying, and resuming phases from ordered broker events before forwarding their task state.
 Confirmation records the applied revision before any interrupted work resumes.
 Settings mutation commits its revision and operation receipt in the same transaction. A retry with

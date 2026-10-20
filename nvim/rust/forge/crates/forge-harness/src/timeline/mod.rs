@@ -346,6 +346,11 @@ impl TimelineProjector {
             .collect::<Vec<_>>();
         project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
+            if matches!(&event.detail, SessionEventKind::Configuration { state, .. }
+                if state == "completed")
+            {
+                continue;
+            }
             if matches!(&event.detail, SessionEventKind::Renamed { .. }) {
                 continue;
             }
@@ -512,6 +517,45 @@ mod test {
         exchange::{Exchange, ExchangeKind, ExchangeState},
         plan::PlanFileStore,
     };
+
+    #[test]
+    fn completed_settings_are_hidden_after_event_reload() -> anyhow::Result<()> {
+        use super::{SessionEventKind, SessionEventRecord};
+        let directory = tempfile::tempdir()?;
+        let mut retained = Vec::new();
+        for state in ["completed", "failed"] {
+            retained.push(SessionEventRecord {
+                id: state.into(),
+                session_id: "session".into(),
+                created_at_ms: 1,
+                detail: SessionEventKind::Configuration {
+                    operation_id: state.into(),
+                    state: state.into(),
+                    field: vec!["service_tier".into(), "validate".into()],
+                    reason: (state == "failed").then(|| "Unsupported service tier".into()),
+                },
+            });
+        }
+        let event: Vec<SessionEventRecord> =
+            serde_json::from_str(&serde_json::to_string(&retained)?)?;
+        assert_eq!(event.len(), 2);
+        let timeline = TimelineProjector::build(TimelineProjection {
+            interaction_list: Vec::new(),
+            plan_list: &[],
+            lifecycle_list: Vec::new(),
+            execution_list: Vec::new(),
+            deviation_list: Vec::new(),
+            audit_list: Vec::new(),
+            resolution_list: Vec::new(),
+            agent_run_list: Vec::new(),
+            agent_exchange_list: Vec::new(),
+            session_event_list: event,
+            plan_file: &PlanFileStore::new(directory.path(), directory.path()),
+        })?;
+        assert_eq!(timeline.len(), 1);
+        assert_eq!(timeline[0].id(), "failed");
+        Ok(())
+    }
 
     fn interaction(id: &str) -> Exchange {
         Exchange {

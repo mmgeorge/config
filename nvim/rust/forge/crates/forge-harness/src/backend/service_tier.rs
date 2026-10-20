@@ -15,6 +15,17 @@ pub enum ServiceTier {
 }
 
 impl ServiceTier {
+    /// Rejects accelerated tiers absent from the selected model's catalog entry.
+    pub fn validate_model(self, model: &super::BackendModel) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            self == Self::Standard || model.service_tiers.contains(&self),
+            "service tier {} is unavailable for model {}",
+            serde_json::to_value(self)?,
+            model.id
+        );
+        Ok(())
+    }
+
     /// Rejects accelerated tiers the selected provider does not advertise.
     pub fn validate(self, capability: &super::BackendCapability) -> anyhow::Result<()> {
         let supported = match self {

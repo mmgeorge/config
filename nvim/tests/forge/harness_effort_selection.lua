@@ -29,6 +29,7 @@ controller.render, controller.attach_transcript = function() controller.refresh_
 state.command_set = controller.command_set()
 state.session = { id = "effort-test", backend = "codex", model = "test", resolved_model = "test", effort = "medium" }
 state.capability = { effort_selection = true, fast_mode = true, ultrafast_mode = true }
+state.model_backend, state.model_list = "codex", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
 state.queue, state.pending_steer = {}, {}
 local function settled()
   assert(vim.wait(1000, function() return not state.configuration_debounce end, 5))
@@ -100,6 +101,7 @@ task.receive(state, { id = latest.params.operation_id, state = "completed" })
 assert(not state.task_config and not state.busy and state.session.effort == "medium")
 assert(not header:find("fast", 1, true))
 state.pending_mode = "write"
+state.model_list[#state.model_list + 1] = { id = "other-model", service_tiers = { "fast", "ultrafast" } }
 state.pending_config = { model = "other-model", effort = "high", service_tier = "fast" }
 controller.refresh_winbar()
 assert(header:find("Write", 1, true) and header:find("other-model high +", 1, true), header)
@@ -121,6 +123,16 @@ transition[#transition].callback({ state = "failed", error = "reasoning effort u
 assert(applied == false and #errors == 1 and errors[1] == "reasoning effort unavailable")
 assert(state.session.effort == "medium" and not state.task_config and not state.configuring,
   "failed configuration replaced the applied setting or retained pending state")
+state.capability.ultrafast_mode = true
+state.model_list = { { id = "test", service_tiers = { "fast" } } }
+state.session.service_tier = "default"
+local before_invalid = #transition
+controller.configure_service_tier("ultrafast")
+assert(#transition == before_invalid and state.session.service_tier == "default")
+assert(errors[#errors]:find("does not support ultrafast", 1, true))
+state.session.service_tier = "ultrafast"
+controller.refresh_winbar()
+assert(header:find("unsupported ultrafast", 1, true) and not header:find(" ++", 1, true), header)
 vim.api.nvim_buf_delete(composer, { force = true })
 print("harness_effort_selection: passed")
 vim.cmd("qa!")

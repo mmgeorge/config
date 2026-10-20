@@ -43,19 +43,19 @@ local success, failure = xpcall(function()
   local instance = picker._state_for_test()
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
-  instance.spec.action_list[2].callback({ option = options["plan-revisions"] })
-  instance.spec.action_list[2].callback({ option = options["default-write-permission"] })
+  instance.spec.on_field_action({ field = options["plan-revisions"].fields[1] }, "change", 1)
+  instance.spec.on_field_action({ field = options["execute-permission"].fields[1] }, "change", 1)
   assert(#configured == 2, "configuration picker blocked a second edit before acknowledgement")
   assert(configured[1].params.plan_auto_approve_revisions == false)
   assert(configured[2].params.default_write_permission == "yolo")
-  assert(picker._state_for_test().spec.page_list[1].subtitle:find("Changes pending", 1, true))
+  assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   configured[1].completed(false)
-  assert(picker._state_for_test().spec.page_list[1].subtitle:find("Changes pending", 1, true),
-    "an older completion cleared the latest pending edit")
+  assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true),
+    "configuration displayed pending status after an older completion")
   state.session.default_write_permission = "yolo"
   state.session.plan_auto_approve_revisions = false
   configured[2].completed(true)
-  assert(not picker._state_for_test().spec.page_list[1].subtitle:find("Changes pending", 1, true))
+  assert(not (picker._state_for_test().spec.page_list[1].subtitle or ""):find("Changes pending", 1, true))
   picker.close()
   local requested = 0
   client.request = function() requested = requested + 1 end

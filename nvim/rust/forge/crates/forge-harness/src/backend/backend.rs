@@ -617,6 +617,9 @@ pub struct BackendContextWindow {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendModel {
     pub id: String,
+    #[serde(default)]
+    /// Service tiers explicitly advertised for this model.
+    pub service_tiers: Vec<ServiceTier>,
     pub reasoning: Vec<String>,
     pub default_reasoning: Option<String>,
     pub selected_reasoning: Option<String>,
@@ -1643,6 +1646,11 @@ impl Backend for MockBackend {
 
     async fn model_list(&self, _request: BackendRequest) -> Result<Vec<BackendModel>> {
         Ok(vec![BackendModel {
+            service_tiers: vec![
+                ServiceTier::Standard,
+                ServiceTier::Fast,
+                ServiceTier::Ultrafast,
+            ],
             id: "mock-model".into(),
             reasoning: vec!["low".into(), "medium".into(), "high".into()],
             default_reasoning: Some("medium".into()),

@@ -229,6 +229,12 @@ local function status_text()
   if state.connection_error then goal = " • " .. state.connection_error end
   local tier = selected_setting(state, "service_tier")
   local tier_label = ({ fast = " +", ultrafast = " ++" })[tier] or ""
+  local speed_model = require("forge.views.harness.model_options").find(state.model_list, selected_model)
+  if speed_model and not vim.tbl_contains(require("forge.views.harness.model_options").speeds(speed_model, state.capability or {}), tier) then
+    tier_label = " [unsupported " .. tier .. "]"
+  elseif not speed_model and tier ~= "default" then
+    tier_label = " [unverified " .. tier .. "]"
+  end
   if tier ~= (active_session.service_tier or "default") and pending_marker ~= "" then
     tier_label = (tier == "default" and " standard" or tier_label) .. "*"
   end
@@ -2241,7 +2247,23 @@ function M.configure_service_tier(tier)
     M.refresh_winbar()
     return
   end
-  M.configure({ service_tier = tier })
+  if tier == "default" then M.configure({ service_tier = tier }) return end
+  local session_id = state.session and state.session.id
+  local selected_model = selected_setting(state, "model")
+  local function apply(models, failure)
+    if not state.session or state.session.id ~= session_id or selected_setting(state, "model") ~= selected_model then return end
+    local options = require("forge.views.harness.model_options")
+    local model = options.find(models, selected_model)
+    if failure or not vim.tbl_contains(options.speeds(model, state.capability), tier) then
+      state.configuration_error = failure or ("Model " .. tostring(selected_model) .. " does not support " .. tier .. " mode")
+      notifications.error(state.configuration_error, "Harness speed")
+      M.refresh_winbar()
+      return
+    end
+    M.configure({ service_tier = tier })
+  end
+  if state.model_backend == state.session.backend and state.model_list then apply(state.model_list)
+  else require("forge.views.harness.provider_catalog").models(false, apply) end
 end
 
 ---@param tier "fast"|"ultrafast"
@@ -2251,8 +2273,14 @@ function M.toggle_service_tier(tier)
 end
 
 function M.select_model(on_confirm)
-  on_confirm = type(on_confirm) == "function" and on_confirm or M.configure
   local state = harness_state()
+  on_confirm = type(on_confirm) == "function" and on_confirm or function(value)
+    local options = require("forge.views.harness.model_options")
+    local speeds = options.speeds(options.find(state.model_list, value.model), state.capability or {})
+    value.service_tier = vim.tbl_contains(speeds, selected_setting(state, "service_tier"))
+      and selected_setting(state, "service_tier") or "default"
+    M.configure(value)
+  end
   local backend = state.session and state.session.backend or config.options.harness.backend
   local session_id = state.session and state.session.id
   local loading_owner = "harness-model-loading-" .. tostring(session_id)

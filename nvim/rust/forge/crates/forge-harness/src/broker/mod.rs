@@ -9854,33 +9854,43 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             self.validate_plan_executor(&plan_executor).await?;
         }
-        if validate_selection
-            && (requested_model.is_some()
-                || requested_effort.is_some()
-                || requested_context_window.is_some())
+        let selected_tier = requested_service_tier.unwrap_or(self.session.service_tier);
+        let validate_tier = selected_tier != crate::backend::ServiceTier::Standard
+            && (requested_service_tier.is_some() || requested_model.is_some());
+        if validate_tier
+            || (validate_selection
+                && (requested_model.is_some()
+                    || requested_effort.is_some()
+                    || requested_context_window.is_some()))
         {
             let model_list = self
                 .backend
                 .model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
                 .await?;
-            let target_model = requested_model
-                .and_then(|model| model_list.iter().find(|candidate| candidate.id == model))
-                .or_else(|| {
-                    let active_model = self
-                        .session
-                        .resolved_model
-                        .as_deref()
-                        .unwrap_or(&self.session.model);
-                    model_list
-                        .iter()
-                        .find(|candidate| candidate.id == active_model)
-                })
-                .or_else(|| model_list.iter().find(|candidate| candidate.is_default));
+            let selected_model = requested_model.unwrap_or_else(|| {
+                self.session
+                    .resolved_model
+                    .as_deref()
+                    .unwrap_or(&self.session.model)
+            });
+            let target_model = model_list.iter().find(|candidate| {
+                if selected_model == "default" {
+                    candidate.is_default
+                } else {
+                    candidate.id == selected_model
+                }
+            });
             if let Some(model) = requested_model {
                 anyhow::ensure!(
-                    target_model.is_some_and(|candidate| candidate.id == model),
+                    target_model
+                        .is_some_and(|candidate| model == "default" || candidate.id == model),
                     "model {model} is unavailable for this backend"
                 );
+            }
+            if validate_tier {
+                selected_tier.validate_model(
+                    target_model.context("the selected model is unavailable for this backend")?,
+                )?;
             }
             if let Some(effort) = requested_effort {
                 let model =

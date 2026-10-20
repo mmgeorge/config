@@ -1967,6 +1967,7 @@ fn model_descriptor(model: Model) -> BackendModel {
                 .is_some_and(|limit| limit.vision.is_some())
         });
     BackendModel {
+        service_tiers: vec![crate::backend::ServiceTier::Standard],
         is_default: model.id == "auto",
         id: model.id,
         reasoning: model.supported_reasoning_efforts.unwrap_or_default(),
@@ -1982,6 +1983,7 @@ fn model_descriptor(model: Model) -> BackendModel {
 
 fn default_model_descriptor() -> BackendModel {
     BackendModel {
+        service_tiers: vec![crate::backend::ServiceTier::Standard],
         is_default: true,
         id: "default".into(),
         reasoning: Vec::new(),
@@ -2610,6 +2612,7 @@ mod test {
             control_context: None,
         };
         let model_list = vec![BackendModel {
+            service_tiers: vec![crate::backend::ServiceTier::Standard],
             id: "gpt-test".into(),
             reasoning: vec!["medium".into()],
             default_reasoning: Some("medium".into()),

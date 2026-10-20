@@ -413,7 +413,6 @@ local succeeded, failure = xpcall(function()
     end
     local resources = { { kind = "skills", definition = settings.catalog.skill[1] } }
     for _, definition in ipairs(settings.catalog.mcp) do resources[#resources + 1] = { kind = "mcp", definition = definition } end
-    local completed_skill_operation = 0
     local function set_resource(resource, enabled, timeout)
       local changed = request("backend." .. resource.kind .. ".set_enabled", {
         name = resource.definition.name, resource_id = resource.definition.id, enabled = enabled,
@@ -429,7 +428,6 @@ local succeeded, failure = xpcall(function()
         return operation and (operation.state == "completed" or operation.state == "failed")
       end, 100), "resource selection did not settle")
       assert(operation.state == "completed", vim.inspect(operation))
-      if resource.kind == "skills" then completed_skill_operation = completed_skill_operation + 1 end
       return changed.id
     end
     for _, resource in ipairs(resources) do set_resource(resource, false) end
@@ -468,10 +466,7 @@ local succeeded, failure = xpcall(function()
         end
         return count
       end
-      assert(vim.wait(5000, function() return completed_settings_count() == completed_skill_operation end, 10),
-        "earlier settings timeline rows did not render: expected " .. completed_skill_operation ..
-        ", observed " .. completed_settings_count())
-      local before_settings = completed_settings_count()
+      assert(completed_settings_count() == 0, "successful settings changes leaked into the timeline")
       local settled, failure, detail = false, nil, nil
       local phase = {}
       local unsubscribe = client.subscribe(function(event, payload)
@@ -508,9 +503,7 @@ local succeeded, failure = xpcall(function()
       for _, state_name in ipairs({ "applying", "verifying", "resuming" }) do
         assert(phase[operation_id] and phase[operation_id][state_name], "configuration phase missing: " .. state_name)
       end
-      assert(vim.wait(5000, function() return completed_settings_count() == before_settings + 1 end, 10),
-        "configuration timeline operation was lost or duplicated: before " .. before_settings ..
-        ", after " .. completed_settings_count())
+      assert(completed_settings_count() == 0, "successful settings continuation leaked into the timeline")
       unsubscribe()
       print("ACP active settings interruption, timeline, and exchange continuity passed: " .. backend)
     end

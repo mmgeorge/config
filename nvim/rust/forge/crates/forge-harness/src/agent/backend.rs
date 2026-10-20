@@ -195,6 +195,7 @@ impl AgentBackendFactory {
                 )
             })?;
             selection.model = model.id.clone();
+            selection.service_tier.validate_model(model)?;
             if selection.reasoning_effort == "default" {
                 selection.reasoning_effort = model
                     .default_reasoning

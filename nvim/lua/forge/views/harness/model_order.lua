@@ -1,6 +1,7 @@
 local ModelOrder = {}
 
 ---@class ForgeHarnessModel
+---@field service_tiers? string[] Supported processing tiers from the provider's model catalog.
 ---@field id string
 ---@field reasoning? string[]
 ---@field default_reasoning? string

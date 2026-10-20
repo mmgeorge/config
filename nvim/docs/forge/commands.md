@@ -44,9 +44,11 @@ its **Background** row in **Compaction** for automatic compaction and the token 
 of this workflow. Other AI features retain their existing adapters.
 
 Background **Speed** is independent of Main and applies to subsequent Background
-requests. It offers `default`, `fast`, and `ultrafast` according to the provider's
-advertised capabilities. The control is hidden for providers without accelerated
-tiers. Codex currently exposes both accelerated tiers. Copilot does not.
+requests. It offers `default` and the accelerated tiers advertised for the selected
+model. Codex's model catalog determines whether `fast` or `ultrafast` is available.
+Changing models resets an incompatible speed to `default`. The control is hidden
+for providers without accelerated tiers. Invalid combinations are rejected before
+provider submission, including settings supplied outside `/config`.
 
 The first actual generation creates the session. Normal commits reuse it. Switching
 branches or rewriting history starts another conversation, with the old timeline retained.
