@@ -104,4 +104,48 @@ render.present_context(replica, replica.presentation)
 assert(replica.block["status:context:pr"].row_count == 1)
 assert(replica.root == root_sequence and #notices == 0, table.concat(notices, "\n"))
 render.close(replica)
+
+replica = render.open("relative-path-test", { notice = function(message) notices[#notices + 1] = message end })
+replica.display_cwd, replica.workspace = vim.fs.joinpath(root, "nvim"), root
+snapshot = dofile("nvim/tests/forge/support/status_fixture.lua").snapshot(replica.document, { path = "a.lua" })
+snapshot.context = { workspace = root, head = vim.NIL, branch = "main", upstream = vim.NIL, push = vim.NIL,
+  recent = {}, issues = {} }
+assert(render.apply_snapshot(replica, snapshot).kind == "Applied", table.concat(notices, "\n"))
+assert(vim.tbl_contains(vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, true), "Modified ../a.lua"))
+assert(replica.file[1].display_path == "../a.lua")
+assert(replica.file[1].record.path == "a.lua", "display formatting changed the native action path")
+local relative_delivery = { document = replica.document, file = 1, generation = 1, more = false,
+  state = { state = "ready" }, snapshot = { document = "body:1:1", revision = 1,
+    block = { { id = "relative-body", text = { "body" }, metadata = metadata("relative-hunk", 1) } } } }
+assert(render.apply_body(replica, relative_delivery).kind == "Applied")
+assert(vim.tbl_contains(vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, true), "Modified ../a.lua"),
+  "body delivery reset the relative file path")
+local untracked_snapshot = dofile("nvim/tests/forge/support/status_fixture.lua").snapshot(replica.document, {
+  revision = 1, path = "new",
+})
+untracked_snapshot.file[1].section, untracked_snapshot.file[1].untracked = "untracked", true
+table.insert(untracked_snapshot.file[1].header, { text = " new", capture = "ForgeStatusPath" })
+assert(render.apply_snapshot(replica, untracked_snapshot).kind == "Applied")
+assert(vim.tbl_contains(vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, true), "Modified ../new new"),
+  "path formatting changed the untracked-file marker")
+local relative_case = {
+  { cwd = root, path = "nvim/lua/source.lua", expected = "nvim/lua/source.lua" },
+  { cwd = vim.fs.joinpath(root, "nvim"), path = "nvim/lua/source.lua", expected = "lua/source.lua" },
+  { cwd = vim.fs.joinpath(root, "nvim/lua"), path = "nvim/tests/missing 雪.lua", expected = "../tests/missing 雪.lua" },
+  { cwd = vim.fs.joinpath(root, "nvim/lua"), path = "nvim-other/source.lua", expected = "../../nvim-other/source.lua" },
+}
+for _, case in ipairs(relative_case) do
+  replica.display_cwd = case.cwd
+  local path_snapshot = dofile("nvim/tests/forge/support/status_fixture.lua").snapshot(replica.document, {
+    revision = replica.revision + 1, path = case.path,
+    view = { kind = "comparison", title = "HEAD", path = case.path, worktree = true },
+  })
+  path_snapshot.file[1].header = dofile("nvim/tests/forge/support/status_fixture.lua").header(case.path, 2, 1)
+  assert(render.apply_snapshot(replica, path_snapshot).kind == "Applied", table.concat(notices, "\n"))
+  local path_lines = vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, true)
+  assert(vim.tbl_contains(path_lines, "Modified " .. case.expected .. " +2 -1"), vim.inspect(path_lines))
+  assert(vim.tbl_contains(path_lines, "File:   " .. case.expected), "comparison retained its repository-relative path")
+  assert(replica.inventory.file[1].path == case.path, "relative display changed repository identity")
+end
+render.close(replica)
 print("semantic status rendering: passed")

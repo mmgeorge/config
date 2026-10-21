@@ -686,6 +686,7 @@ function Picker.open(spec)
     input_visible = false,
   }
   instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance, width), origin)
+  vim.b[instance.buf].miniclue_disable = true
   active = instance
   update_deadline_timer(instance)
   render_view(instance)

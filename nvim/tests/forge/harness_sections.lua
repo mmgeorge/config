@@ -79,6 +79,8 @@ local ok, failure = xpcall(function()
     return body_loaded() and owner.transcript.block.heading.metadata.node.display == "full"
   end, 1), "opening the native fold did not demand its body")
   assert(not owner.transcript.fold_loading[window], "loaded fold retained loading state")
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 1,
+    "section expansion followed the tail instead of retaining its heading")
   deferred = false
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   assert(owner.toggle_heading(window))

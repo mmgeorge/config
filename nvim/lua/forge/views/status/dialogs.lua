@@ -35,19 +35,22 @@ end
 function M.discard_message(replica, captured, selection)
   local target = selection and selection.target or { captured.location }
   local selected, path = {}, {}
-  local function add(record, kind)
+  local function add(record, kind, display_path)
     if not record then return end
-    selected[#selected + 1] = { record = record, kind = kind }
+    selected[#selected + 1] = { record = record, kind = kind, display_path = display_path or record.path }
     path[record.path] = true
   end
   for _, location in ipairs(target) do
     if location.kind == "section" then
       for _, record in ipairs(replica.inventory.file) do
-        if record.section == location.section or location.section == "unstaged" and record.section == "untracked" then add(record, "file") end
+        if record.section == location.section or location.section == "unstaged" and record.section == "untracked" then
+          local model = replica.file[record.id]
+          add(record, "file", model and model.display_path)
+        end
       end
     else
       local model = replica.file[location.id or location.file]
-      add(model and model.record, location.kind)
+      add(model and model.record, location.kind, model and model.display_path)
     end
   end
   if #selected == 0 then return nil end
@@ -55,7 +58,7 @@ function M.discard_message(replica, captured, selection)
     local item = selected[1]
     local prompt = item.kind == "body" and "Discard this hunk?"
       or item.record.untracked and "Delete untracked file?" or "Discard ALL changes to file?"
-    return { prompt, "  " .. item.record.path }
+    return { prompt, "  " .. item.display_path }
   end
   return { ("Discard changes in %d file(s)?"):format(vim.tbl_count(path)) }
 end

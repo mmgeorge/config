@@ -3,7 +3,7 @@ mod children;
 mod control_server;
 mod runtime;
 mod session;
-mod transport;
 #[cfg(test)]
 mod submission_test;
+mod transport;
 pub(crate) use backend::AcpBackend;

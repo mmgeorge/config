@@ -17,6 +17,7 @@ local navigation_grace_ms = 500
 ---@field observe fun(window: integer)
 ---@field capture fun(window: integer)
 ---@field reset fun(window: integer)
+---@field suspend fun(window: integer)
 ---@field follow fun(window: integer)
 ---@field publish fun(window: integer)
 ---@field remove fun(window: integer)
@@ -25,6 +26,7 @@ local navigation_grace_ms = 500
 ---@field sample? ForgeHarnessTailSample Last viewport observed after native publication or navigation.
 ---@field resume_at number Earliest monotonic time for automatic following.
 ---@field eligible boolean Bottom visibility captured immediately before publication.
+---@field suspended? boolean Explicit section browsing waits for navigation or a follow action.
 
 ---Own per-window tail following independently of focus and configured navigation keys.
 ---@param buffer integer
@@ -66,6 +68,7 @@ function M.new(buffer, clock)
         or previous.skipcol ~= current.skipcol or previous.leftcol ~= current.leftcol
         or previous.line ~= current.line or previous.column ~= current.column) then
       state.resume_at, state.eligible = now() + navigation_grace_ms, false
+      state.suspended = nil
     end
     state.sample, window_state[window] = current, state
   end
@@ -75,7 +78,7 @@ function M.new(buffer, clock)
   function controller.capture(window)
     controller.observe(window)
     local state = window_state[window]
-    if state then state.eligible = state.sample.bottom and now() >= state.resume_at end
+    if state then state.eligible = not state.suspended and state.sample.bottom and now() >= state.resume_at end
   end
 
   ---Record programmatic viewport changes without treating them as user navigation.
@@ -84,6 +87,14 @@ function M.new(buffer, clock)
     local state = window_state[window] or { resume_at = 0, eligible = false }
     state.sample, state.eligible = sample(window), false
     window_state[window] = state.sample and state or nil
+  end
+
+  ---Keep section expansion at the reader's position until navigation resumes following.
+  ---@param window integer
+  function controller.suspend(window)
+    controller.reset(window)
+    local state = window_state[window]
+    if state then state.suspended = true end
   end
 
   ---Resume following for an explicit submission or agent action without changing focus.

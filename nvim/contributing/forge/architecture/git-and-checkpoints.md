@@ -29,6 +29,10 @@ contains a numeric handle, source generation, section, change kind, display path
 rename origin, untracked flag, and statistics state. Initial messages contain no rendered
 blocks, row or column ranges, highlights, or diff bodies. Rust performs Git classification
 and retains raw repository paths. Lua never derives action paths from displayed text.
+`forge.status_render` resolves the repository-relative label against the worktree root,
+then displays it relative to the editor cwd captured when the view opens. Discard
+confirmations use that display path while Git actions retain their native file identity
+and repository path.
 
 `forge.status_render` owns every status header, including HEAD, upstream, push, PR, About,
 Issues, and recent commits. It formats real buffer text and cached highlight chunks. The

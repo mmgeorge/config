@@ -17865,6 +17865,95 @@ mod test {
     }
 
     #[tokio::test]
+    async fn configured_check_tools_run_without_command_approval() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let broker = planning_question_broker(repository.path(), data.path(), false);
+        std::fs::write(
+            repository.path().join(".forge.json"),
+            serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
+                "id":"configured", "name":"Configured check", "category":"test",
+                "enabled":true, "area":"Fixture", "trigger":{"kind":"manual"},
+                "all":{"command":"echo configured-check"}
+            }]}}))?,
+        )?;
+        for permission in [PermissionMode::Read, PermissionMode::Write] {
+            let (sink, mut events) = crate::backend::events::channel();
+            let (scope, lease) = crate::checks::CheckToolScope::open(
+                Arc::clone(&broker.check_runner),
+                crate::checks::CheckAuthority {
+                    data_root: broker.data_root.clone(),
+                    backend: broker.session.backend.clone(),
+                    task_id: None,
+                    shell: crate::session::CheckShell::System,
+                    mode: PromptMode::Chat,
+                    permission,
+                    permissions: Arc::clone(&broker.permission_coordinator),
+                    address: crate::backend::ProviderAddress {
+                        owner: None,
+                        thread_id: broker.session.id.clone(),
+                        turn_id: format!("configured-check-{permission:?}"),
+                    },
+                    authorization_sink: sink,
+                    editing: Arc::clone(&broker.observer.check_editing),
+                    setup: false,
+                    setup_reviewed: false,
+                    can_run: true,
+                    agent: Arc::clone(&broker.agent_coordinator),
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                    sink: None,
+                },
+            );
+            let response: Value = serde_json::from_str(
+                &tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    scope.invoke("checks_run", json!({"ids":["configured"]})),
+                )
+                .await??,
+            )?;
+            let run = broker
+                .check_runner
+                .status(response["run_id"].as_str().unwrap(), 5000, true)
+                .await?;
+            assert_eq!(run.state, crate::checks::CheckState::Passed);
+            assert_eq!(run.commands.len(), 1);
+            assert_eq!(run.commands[0].command, "echo configured-check");
+            assert_eq!(run.commands[0].exit_code, Some(0));
+            assert!(events.try_recv().is_err(), "check requested approval");
+            assert!(
+                scope
+                    .invoke(
+                        "checks_run",
+                        json!({"ids":["configured"],"command":"echo unconfigured"}),
+                    )
+                    .await
+                    .is_err(),
+                "check tools accepted a replacement command"
+            );
+            assert!(
+                scope
+                    .invoke(
+                        "checks_configure",
+                        json!({"expected_revision":"","config":{"version":2,"definitions":[]}}),
+                    )
+                    .await
+                    .unwrap_err()
+                    .to_string()
+                    .contains("disabled")
+            );
+            drop(lease);
+            assert!(
+                scope
+                    .invoke("checks_run", json!({"ids":["configured"]}))
+                    .await
+                    .is_err(),
+                "inactive check scope admitted execution"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn check_setup_followups_stop_after_configuration_publication() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();

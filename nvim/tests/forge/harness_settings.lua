@@ -10,6 +10,19 @@ vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id"
 local enabled = false
 local controller = require("forge.views.harness.controller")
 local original_configure = controller.configure
+local original_clue = package.loaded["mini.clue"]
+local source_buffer = vim.api.nvim_get_current_buf()
+local source_clue_disabled = vim.b[source_buffer].miniclue_disable
+local clue_requests = 0
+package.loaded["mini.clue"] = {
+  ensure_buf_triggers = function(buffer)
+    clue_requests = clue_requests + 1
+    if vim.b[buffer].miniclue_disable then return end
+    vim.keymap.set("n", "<Space>", function()
+      error("mini.clue replaced the settings toggle")
+    end, { buffer = buffer, nowait = true })
+  end,
+}
 local state
 local configured_session = {
   id = "settings-session", backend = "codex", model = "mock-model", effort = "medium",
@@ -68,6 +81,10 @@ local success, failure = xpcall(function()
   state = { session = configured_session, capability = { model_selection = true, effort_selection = true, fast_mode = true, ultrafast_mode = true, native_compact = true, os_sandbox = true }, busy = true }
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local instance = picker._state_for_test()
+  assert(clue_requests > 0, "settings did not exercise the mini.clue integration")
+  assert(vim.b[instance.buf].miniclue_disable == true, "picker permits leader triggers to replace its bindings")
+  assert(vim.b[source_buffer].miniclue_disable == source_clue_disabled, "picker disabled source-buffer clues")
+  package.loaded["mini.clue"].ensure_buf_triggers(instance.buf)
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
   assert(not text:find("CLI:", 1, true), text)
   assert(instance.spec.page_list[1].subtitle == nil, "settled configuration should have no subtitle")
@@ -237,6 +254,7 @@ local success, failure = xpcall(function()
   assert(not enabled)
 end, debug.traceback)
 controller.configure = original_configure
+package.loaded["mini.clue"] = original_clue
 client.request_for = original_request
 commit_settings.request = original_commit_request
 vim.fn.delete(path)

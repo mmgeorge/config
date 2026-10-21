@@ -467,6 +467,39 @@ mod test {
     }
 
     #[test]
+    fn nushell_script_files_retain_exact_rules_and_pipeline_denials() {
+        let permission = compiled(
+            r#"{"permission":{"bash":{"nu *":"allow","nu --no-config-file forbidden.nu":"deny","git reset *":"deny"}}}"#,
+        );
+        for (command, expected) in [
+            ("nu --no-config-file checks.nu", PermissionDecision::Allow),
+            ("nu --no-config-file forbidden.nu", PermissionDecision::Deny),
+            (
+                "nu --no-config-file checks.nu | git reset --hard",
+                PermissionDecision::Deny,
+            ),
+        ] {
+            let request = PermissionRequest {
+                id: "nushell-file".into(),
+                provider: "test".into(),
+                reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: command.into(),
+                    shell: Some(CommandShell::Zsh),
+                }],
+            };
+            assert_eq!(
+                permission
+                    .evaluate(PermissionMode::Read, &request)
+                    .unwrap()
+                    .decision,
+                expected,
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
     fn catch_all_command_rule_supplies_the_default_decision() {
         let request = PermissionRequest {
             id: "1".into(),

@@ -696,6 +696,7 @@ function M.open(options, callback)
     if node.kind == "message" and #(block.metadata.fold or {}) == 0 then return false end
     local view = view_for(window)
     if not view then return false end
+    tail.suspend(window)
     local desired = node.display ~= "full"
     if section_pending(node.id) then
       local intent = owner.section_intent and owner.section_intent[view.id]

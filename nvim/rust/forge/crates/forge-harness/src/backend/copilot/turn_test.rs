@@ -134,9 +134,12 @@ async fn copilot_retry_waits_for_idle_and_keeps_the_native_session() -> Result<(
 }
 
 #[tokio::test]
-async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
+async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resume() -> Result<()> {
     for resumed in [false, true] {
         let (_fixture, backend, mut request) = fixture()?;
+        let external = tempfile::tempdir()?;
+        let session_directory = external.path().join("custom state location/session notes");
+        std::fs::create_dir_all(&session_directory)?;
         request.backend_session_id = resumed.then(|| "retained-session".into());
         let (client_read, mut server_write) = tokio::io::duplex(65536);
         let (client_write, mut server_read) = tokio::io::duplex(65536);
@@ -169,7 +172,7 @@ async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
             respond(
                 &mut server_write,
                 &message,
-                json!({"result":{"sessionId":session_id,"workspacePath":"."}}),
+                json!({"result":{"sessionId":session_id,"workspacePath":session_directory}}),
             )
             .await?;
             if resumed {
@@ -179,10 +182,41 @@ async fn copilot_disables_tool_search_on_create_and_resume() -> Result<()> {
             }
             Ok::<_, anyhow::Error>(())
         };
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        let (session, ()) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             tokio::try_join!(backend.session(&request), server)
         })
         .await??;
+        let (sink, mut events) = crate::backend::events::channel();
+        let context = backend.permission_context(&request.runtime_key()?).await;
+        context.configure(
+            request.owner()?,
+            PermissionMode::Read,
+            request.workspace.clone(),
+            Some(sink),
+        )?;
+        let handler = CopilotPermissionHandler { context };
+        let PermissionResult::Decision(expected) = PermissionResult::approve_once() else {
+            unreachable!()
+        };
+        let expected = serde_json::to_value(expected)?;
+        for kind in ["read", "write"] {
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                handler.handle(
+                    session.id().clone(),
+                    RequestId::new(format!("session-{kind}")),
+                    serde_json::from_value(json!({
+                        "kind":kind, "path":session_directory.join("plan.md")
+                    }))?,
+                ),
+            )
+            .await?;
+            let PermissionResult::Decision(decision) = result else {
+                panic!("session file access returned no decision")
+            };
+            assert_eq!(serde_json::to_value(decision)?, expected);
+            assert!(events.try_recv().is_err(), "session file access requested approval");
+        }
     }
     Ok(())
 }

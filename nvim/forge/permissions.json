@@ -313,6 +313,7 @@
       "printenv *": "allow",
       "printf": "allow",
       "printf *": "allow",
+      "ps *": "allow",
       "pwd": "allow",
       "pwd *": "allow",
       "python": "allow",

@@ -5112,7 +5112,11 @@ mod tests {
             exchange.observe_turn(&event, ordinal * 10 + 2)?;
             let projected = render(&exchange)?;
             assert!(!projected.entry.block.iter().any(|block| {
-                block.text.wire_rows().iter().any(|row| row.contains("Thoughts must not"))
+                block
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .any(|row| row.contains("Thoughts must not"))
             }));
             let groups = projected
                 .entry

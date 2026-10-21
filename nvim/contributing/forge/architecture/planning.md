@@ -699,7 +699,9 @@ admission boundaries. Plan Checking and explicitly requested runs remain indepen
 
 One Rust-owned runner serves the automatic gate and `checks_run`. Its provider-neutral
 tools list configuration, save authorized setup captures, start runs, read status, and cancel
-owned runs. Model-triggered commands follow the existing permission coordinator. The narrow
+owned runs. Model-triggered runs execute enabled saved definitions without command approval,
+just like automatic checks. Requests select check IDs and coverage, never replacement commands.
+Check configuration writes still follow the existing permission coordinator. The narrow
 setup action writes only checks settings and managed helpers while retaining the active plan.
 Disabled checks cannot be selected by the model. Source-writing phases and active children
 exclude on-demand runs. Models normally finish work and leave checking to the gate.

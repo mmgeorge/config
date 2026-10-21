@@ -16,6 +16,10 @@ argument parsing and completion. Contributor documentation starts at
 | `:ForgeDiffCompactPreview` | None | Preview the compacted working-tree diff |
 | `:ForgeDiffCompactPreview!` | Bang | Preview the compacted staged diff |
 
+ForgeStatus file rows, file-specific comparison labels, and single-file discard
+confirmations show paths relative to the editor cwd in the window that opened the view.
+Git actions continue to use native file identities and repository paths.
+
 For example, `:ForgeFileRevision README.md HEAD` opens the committed README.
 Revision arguments use the shared revision completion source. File-specific
 commands complete the file argument before the revision argument.
@@ -95,6 +99,12 @@ License files and common dependency lockfiles keep their paths and change counts
 file list but have no excerpts, including license files with Markdown or text extensions.
 
 ## Harness and permissions
+
+Copilot can read and write its current session's notes directory without approval,
+including in Read mode. Harness gets that directory from the native CLI, so the
+location can differ across platforms and installations. The exception does not
+include other sessions, Copilot configuration, or symlink targets outside that
+directory. Explicit deny rules and protected Harness files still apply.
 
 Harness automatically retries recognized network and model-capacity failures
 before any tool or model output, up to five times with delays of 1, 5, 10, 30, and

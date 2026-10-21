@@ -258,29 +258,9 @@ impl CheckToolScope {
                 )?;
                 run.exchange_id = Some(self.address.turn_id.clone());
                 let run = self.runner.resolve(run).await?;
-                let target_list = run
-                    .commands
-                    .iter()
-                    .filter(|check| check.state == super::CheckState::Pending)
-                    .map(
-                        |check| crate::permissions::matcher::PermissionTarget::Command {
-                            command: check.command.clone(),
-                            shell: Some(match self.shell {
-                                CheckShell::Nushell => {
-                                    crate::permissions::shell::CommandShell::Nushell
-                                }
-                                CheckShell::System => {
-                                    crate::permissions::shell::CommandShell::default()
-                                }
-                            }),
-                        },
-                    )
-                    .collect();
-                self.authorize(self.permission, target_list, &delivery.authorization)
-                    .await?;
                 ensure!(
                     self.agent.active_count() == 0,
-                    "an agent started during check authorization"
+                    "an agent started during check resolution"
                 );
                 json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),None).await?})
             }

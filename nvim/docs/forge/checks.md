@@ -22,6 +22,11 @@ permission remains a separate conversation-level setting until you disable it.
 
 ## Automatic and explicit checks
 
+In `/config`, select **Checks → Automatic → Enabled** and press Space to disable
+or enable completion checks. Tab switches between Enabled and Timing. The setting
+applies immediately, including during active work. Disabling completion checks
+leaves explicit check runs and plan Checking available.
+
 While a check run is active, the status area shows executing checks and their latest
 nonempty output line. The line updates as output arrives, and complete logs remain
 available in the saved result.
@@ -67,6 +72,10 @@ plan version unchanged. The tool is available during plan authoring and Resolve.
 `checks_run` accepts multiple `ids`, or
 `all: true` for every enabled check. Explicit runs execute even when earlier
 evidence remains current.
+Configured checks run without executable approval prompts, whether started by an
+agent, the checks picker, or an automatic gate. Agents select saved check IDs and
+coverage rather than supplying commands. Editing check definitions still requires
+check-editing permission and write authorization.
 
 Agents can stop a running check with `checks_cancel`, supplying its `run_id`
 from `checks_run` or `checks_list`. Cancellation preserves output and check

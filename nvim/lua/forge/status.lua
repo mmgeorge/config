@@ -648,6 +648,7 @@ function M.open(options)
   options = options or {}
   local open_started = options.started_at or vim.uv.hrtime()
   local opening_window = options.window or vim.api.nvim_get_current_win()
+  local display_cwd = vim.api.nvim_win_call(opening_window, vim.fn.getcwd)
   local opening_buffer = vim.api.nvim_win_get_buf(opening_window)
   local opening_view = vim.api.nvim_win_call(opening_window, vim.fn.winsaveview)
   next_document = next_document + 1
@@ -660,6 +661,8 @@ function M.open(options)
     command_started_us = math.floor(open_started / 1000),
     entry_to_open_us = math.floor((vim.uv.hrtime() - open_started) / 1000) })
   state.replica = buffer.open(document, { filetype = options.filetype or "forge", notice = notice, recover = function() recover(state) end })
+  state.replica.display_cwd = vim.fs.normalize(display_cwd, { expand_env = false })
+  state.replica.workspace = options.workspace
   state.replica.width = math.max(1, vim.api.nvim_win_get_width(opening_window))
   state.replica.recover_body = function(file, generation)
     local model = state.replica.file[file]

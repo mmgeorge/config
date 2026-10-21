@@ -23,6 +23,11 @@ on each request and expose `automatic_checks` and `check_timing`. Existing tool
 scopes observe live changes without restarting the provider. Agents use this
 policy to choose between the completion gate and explicit verification.
 
+The shared picker owns its single-key modal bindings and disables `mini.clue`
+triggers only in its display buffer. Leader-key trigger refreshes cannot replace
+Space toggles in `/config`, including automatic-check enablement. Source buffers
+retain their normal clue configuration.
+
 The status entry combines the primary `SessionPhase` with an optional `CheckActivity`.
 `buffer/status.rs` owns their layout. The primary label and action keep their own
 row, and check progress appears directly below it before the reasoning preview.
@@ -268,6 +273,10 @@ of mouse input or configured navigation keys. Following resumes only when that g
 and the bottom is visible. Changing focus does not resume following. Each attached window tracks its
 own viewport, including wrapped final lines, and retains historical reading positions through snapshot
 recovery. Explicit prompt submission and agent actions can request tail positioning directly.
+Expanding or collapsing a timeline section suspends following in the initiating
+window, including through delayed content delivery. Native cursor or viewport
+navigation clears that suspension and applies the normal bottom-visibility grace
+period. Explicit tail actions resume following immediately.
 
 
 `client.lua` owns one persistent Forge JSONL process. Repository requests do not require Harness
@@ -1132,6 +1141,12 @@ redirections return `shell_command_unsupported`. Invalid syntax returns `shell_c
 Both failures reach the provider without creating an approval. The error directs the agent to
 rewrite the unsupported construct or split independent operations while keeping
 pipelines intact. This validation also applies to YOLO and mandatory provider callbacks.
+Nushell script-file calls retain their full executable, launcher flags, filename, and script
+arguments as one permission target. The analyzer recognizes `--no-config-file` (`-n`),
+`--no-history`, `--no-std-lib`, `--stdin`, and `--login` (`-l`) before the filename.
+After the filename, `-c` and `--commands` remain script arguments rather than inline code.
+Inline `nu -c` and `nu --commands` calls still contribute their nested command targets.
+Unknown launcher flags remain unsupported, and pipeline commands retain independent decisions.
 Unsupported string forms such as ANSI-C quoting, PowerShell here-strings, and Nushell raw strings
 return errors. Escaped newlines in Zsh also return errors because the pinned grammar can turn the
 continued word into another executable. These limitations never produce partial approval targets.

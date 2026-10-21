@@ -106,6 +106,39 @@ append_row("append after grace period")
 follow.publish(window)
 assert(vim.api.nvim_win_get_cursor(window)[1] == vim.api.nvim_buf_line_count(transcript), "tail following must resume after returning to bottom and waiting 500ms")
 
+follow.suspend(window)
+local expansion_cursor = vim.api.nvim_win_get_cursor(window)
+local expansion_view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+clock_ms = 2000
+follow.capture(window)
+append_row("delayed checkpoint expansion")
+follow.publish(window)
+assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), expansion_cursor),
+  "delayed section expansion resumed following after the navigation grace period")
+assert(vim.api.nvim_win_call(window, vim.fn.winsaveview).topline == expansion_view.topline,
+  "section expansion changed the reading viewport")
+clock_ms = 3000
+follow.capture(window)
+append_row("subsequent checkpoint publication")
+follow.publish(window)
+assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), expansion_cursor),
+  "later publication resumed following without navigation")
+set_bottom(window)
+follow.observe(window)
+clock_ms = 3500
+follow.capture(window)
+append_row("append after navigation resumes following")
+follow.publish(window)
+assert(vim.api.nvim_win_get_cursor(window)[1] == vim.api.nvim_buf_line_count(transcript),
+  "navigation back to bottom did not resume following")
+follow.suspend(window)
+follow.follow(window)
+follow.capture(window)
+append_row("append after explicit following")
+follow.publish(window)
+assert(vim.api.nvim_win_get_cursor(window)[1] == vim.api.nvim_buf_line_count(transcript),
+  "explicit following did not clear section browsing")
+
 local second_window = vim.api.nvim_open_win(transcript, false, { split = "right" })
 vim.api.nvim_win_set_cursor(window, { 1, 0 })
 follow.observe(window)

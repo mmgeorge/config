@@ -533,6 +533,13 @@ all enabled tool definitions, keeping Harness controls and MCP tools directly av
 of routing them through deferred discovery. This increases schema context usage but prevents
 an empty discovery result for an already-active tool from blocking planning.
 
+Copilot's native session metadata supplies its session-state directory. The adapter
+automatically approves file reads and writes confined to that directory for the
+matching native session, including in Read mode. It resolves paths and symlinks
+before checking containment. Other sessions, provider configuration, commands, and
+mixed requests retain normal permission handling. Explicit denials and protected
+Harness files remain denied. Missing or relative directory metadata grants no access.
+
 ## Native delegation exclusions
 
 Codex disables `agents.enabled`, Copilot excludes its builtin-qualified native delegation tools,

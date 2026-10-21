@@ -24,6 +24,7 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 
 ---@class ForgeStatusFileModel
 ---@field record ForgeStatusFileRecord
+---@field display_path string
 ---@field header table
 ---@field body? ForgeBufferFragment
 ---@field recovering? boolean
@@ -40,6 +41,8 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@class ForgeStatusReplica
 ---@field document string
 ---@field buffer integer
+---@field display_cwd? string
+---@field workspace? string
 ---@field revision? integer
 ---@field status string
 ---@field file table<integer|string, ForgeStatusFileModel>
@@ -90,17 +93,48 @@ local function entry(text, chunk, location, kind)
     metadata = empty_metadata, row_layout = empty_map, source_overlay_row = empty_map }
 end
 
-local function file_header(record, body, key)
+local function relative_file_path(session, snapshot, path)
+  local context = optional(snapshot.context)
+  local workspace = context and context.workspace or session.workspace
+  if type(workspace) ~= "string" or type(session.display_cwd) ~= "string" then return path end
+  local absolute = vim.fs.normalize(vim.fs.joinpath(workspace, path), { expand_env = false })
+  local base, parents = session.display_cwd, 0
+  local windows = vim.fn.has("win32") == 1
+  local comparison = windows and absolute:lower() or absolute
+  while true do
+    local prefix = base:sub(-1) == "/" and base or base .. "/"
+    local compared_base = windows and base:lower() or base
+    local compared_prefix = windows and prefix:lower() or prefix
+    if comparison == compared_base then
+      return parents == 0 and "." or string.rep("../", parents):sub(1, -2)
+    end
+    if comparison:sub(1, #compared_prefix) == compared_prefix then
+      return string.rep("../", parents) .. absolute:sub(#prefix + 1)
+    end
+    local parent = vim.fs.dirname(base)
+    if not parent or parent == base then return absolute end
+    base, parents = parent, parents + 1
+  end
+end
+
+local function file_header(record, body, key, display_path)
   counter(record.id)
   counter(record.generation)
   assert(type(record.path) == "string" and not record.path:find("[\n\r%z]"), "invalid status display path")
   assert(section_label[record.section] or record.section == "untracked", "unknown status section")
   assert(type(record.header) == "table" and #record.header > 0, "missing native file header")
-  local chunk = {}
+  local chunk, path_segment_seen = {}, false
   for _, segment in ipairs(record.header) do
     assert(type(segment.text) == "string" and not segment.text:find("[\n\r%z]"), "invalid file header text")
     assert(type(segment.capture) == "string", "invalid file header highlight")
-    chunk[#chunk + 1] = { segment.text, segment.capture }
+    local text = segment.text
+    local is_path_segment = segment.capture == "ForgeStatusPath" and not path_segment_seen
+    if segment.capture == "ForgeStatusPath" then path_segment_seen = true end
+    if is_path_segment and display_path ~= record.path then
+      local start = text:find(record.path, 1, true)
+      if start then text = text:sub(1, start - 1) .. display_path .. text:sub(start + #record.path) end
+    end
+    chunk[#chunk + 1] = { text, segment.capture }
   end
   local parts = {}
   for index = 1, #chunk do parts[index] = chunk[index][1] end
@@ -224,15 +258,18 @@ local function prepare(session, snapshot, checkpoint)
     else text = "Detached " .. head.object end
     push("repository", entry({ text }, { { { text, "Title" } } }, nil, "label"))
     if view.kind == "comparison" and optional(view.path) then
-      push("comparison:path", entry({ "File:   " .. view.path }, { { { "File:   ", "Title" }, { view.path, "ForgeStatusBranch" } } }, nil, "label"))
+      local path = relative_file_path(session, snapshot, view.path)
+      push("comparison:path", entry({ "File:   " .. path }, { { { "File:   ", "Title" }, { path, "ForgeStatusBranch" } } }, nil, "label"))
     end
   end
   for index, value in ipairs(snapshot.file) do
     assert(not file[value.id], "duplicate status file")
     local previous = session.file[value.id]
     local body = previous and previous.record.generation == value.generation and previous.body or nil
-    local header = previous and previous.record == value and previous.header or file_header(value, body)
-    file[value.id] = { record = value, header = header, body = body,
+    local display_path = relative_file_path(session, snapshot, value.path)
+    local same_header = previous and previous.record == value and previous.display_path == display_path
+    local header = same_header and previous.header or file_header(value, body, nil, display_path)
+    file[value.id] = { record = value, display_path = display_path, header = header, body = body,
       recovering = previous and previous.record.generation == value.generation and previous.recovering or nil }
     if checkpoint and index % 64 == 0 then checkpoint() end
   end
@@ -281,7 +318,9 @@ local function prepare(session, snapshot, checkpoint)
           local key = history.file_key(owner, record_value.id)
           local previous = session.file[key]
           local body = previous and previous.record.generation == record_value.generation and previous.body or nil
-          local model = { record = record_value, body = body, owner = owner, header = file_header(record_value, body, key),
+          local display_path = relative_file_path(session, snapshot, record_value.path)
+          local model = { record = record_value, display_path = display_path, body = body, owner = owner,
+            header = file_header(record_value, body, key, display_path),
             recovering = previous and previous.record.generation == record_value.generation and previous.recovering or nil }
           file[key] = model
           endpoint = push_file(key, model)
@@ -568,7 +607,7 @@ function M.apply_body(session, delivery)
       buffer.apply_fragment_patch(body, delivery.patch, prepared)
     else return { kind = "Applied" } end
     model.body = body
-    model.header = file_header(model.record, body, delivery.file)
+    model.header = file_header(model.record, body, delivery.file, model.display_path)
     adopt(session, prepare(session, session.inventory))
     return { kind = "Applied" }
   end)

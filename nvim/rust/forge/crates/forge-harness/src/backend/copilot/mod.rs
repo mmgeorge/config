@@ -4,6 +4,7 @@ mod event_stream;
 mod file_change;
 mod mcp;
 mod retry;
+mod session_directory;
 mod text_generation;
 mod turn;
 #[cfg(test)]
@@ -27,6 +28,7 @@ use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
+use session_directory::SessionDirectory;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::{
     CommandsInvokeRequest, EventLogReadRequest, EventsAgentScope, EventsCursorStatus,
@@ -524,6 +526,12 @@ impl CopilotBackend {
                 .await
                 .context("create Copilot session")?
         };
+        self.permission_context(&request.runtime_key()?)
+            .await
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .session_directory = SessionDirectory::new(&session)?;
         let session = Arc::new(session);
         if let Some(resources) = &resources {
             let mut stage = "inspect Copilot skill selection".to_owned();
@@ -2225,6 +2233,7 @@ struct CopilotPermissionState {
     execution_mode: PermissionMode,
     workspace: String,
     event_sink: Option<BackendEventSink>,
+    session_directory: Option<SessionDirectory>,
 }
 
 struct CopilotPermissionContext {
@@ -2242,6 +2251,7 @@ impl CopilotPermissionContext {
                 execution_mode: PermissionMode::Read,
                 workspace: ".".into(),
                 event_sink: None,
+                session_directory: None,
             }),
         }
     }
@@ -2253,17 +2263,19 @@ impl CopilotPermissionContext {
         workspace: String,
         event_sink: Option<BackendEventSink>,
     ) -> Result<()> {
-        *self
+        let mut state = self
             .state
             .lock()
-            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))? =
-            CopilotPermissionState {
-                checkpoint: None,
-                owner: Some(owner),
-                execution_mode,
-                workspace,
-                event_sink,
-            };
+            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
+        let session_directory = state.session_directory.take();
+        *state = CopilotPermissionState {
+            checkpoint: None,
+            owner: Some(owner),
+            execution_mode,
+            workspace,
+            event_sink,
+            session_directory,
+        };
         Ok(())
     }
 }
@@ -2312,17 +2324,19 @@ impl PermissionHandler for CopilotPermissionHandler {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        let (execution_mode, workspace, event_sink, owner) = match self.context.state.lock() {
-            Ok(state) => (
-                state.execution_mode,
-                state.workspace.clone(),
-                state.event_sink.clone(),
-                state.owner.clone(),
-            ),
-            Err(_) => {
-                return PermissionResult::reject(Some("permission context unavailable".into()));
-            }
-        };
+        let (execution_mode, workspace, event_sink, owner, session_directory) =
+            match self.context.state.lock() {
+                Ok(state) => (
+                    state.execution_mode,
+                    state.workspace.clone(),
+                    state.event_sink.clone(),
+                    state.owner.clone(),
+                    state.session_directory.clone(),
+                ),
+                Err(_) => {
+                    return PermissionResult::reject(Some("permission context unavailable".into()));
+                }
+            };
         let kind = permission_kind(data.kind);
         let params = serde_json::to_value(data).unwrap_or(Value::Null);
         let request = permission_from_copilot(request_id.to_string(), kind, params, &workspace);
@@ -2332,6 +2346,36 @@ impl PermissionHandler for CopilotPermissionHandler {
         };
         if protected {
             return PermissionResult::reject(Some("target is protected by Harness".into()));
+        }
+        if let Some(directory) = session_directory {
+            match directory.approves(&session_id, &request, std::path::Path::new(&workspace)) {
+                Ok(true) => {
+                    let evaluation = self
+                        .context
+                        .coordinator
+                        .store()
+                        .read()
+                        .map_err(|_| anyhow::anyhow!("permission store unavailable"))
+                        .and_then(|store| {
+                            store
+                                .compiled()
+                                .evaluate(PermissionMode::Write, &request)
+                                .map_err(anyhow::Error::from)
+                        });
+                    return match evaluation {
+                        Ok(evaluation)
+                            if evaluation.decision
+                                != crate::permissions::document::PermissionDecision::Deny =>
+                        {
+                            PermissionResult::approve_once()
+                        }
+                        Ok(_) => PermissionResult::reject(None),
+                        Err(error) => PermissionResult::reject(Some(format!("{error:#}"))),
+                    };
+                }
+                Ok(false) => {}
+                Err(error) => return PermissionResult::reject(Some(format!("{error:#}"))),
+            }
         }
         match self
             .context

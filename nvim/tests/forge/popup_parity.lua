@@ -51,6 +51,8 @@ assert(last_input.selection.target[1].id == 1 and last_input.selection.target[2]
 assert(last_input.input.action == "discard")
 state.replica.file[1].record.untracked = true
 assert(dialogs.discard_message(state.replica, { location = { kind = "file", id = 1 } })[1] == "Delete untracked file?")
+state.replica.file[1].display_path = "../source.txt"
+assert(dialogs.discard_message(state.replica, { location = { kind = "file", id = 1 } })[2] == "  ../source.txt")
 assert(dialogs.discard_message(state.replica, { location = { kind = "body", file = 1 } })[1] == "Discard this hunk?")
 assert(dialogs.discard_message(state.replica, { location = { kind = "section", section = "unstaged" } })[1] == "Discard changes in 2 file(s)?")
 local yes, no = 0, 0

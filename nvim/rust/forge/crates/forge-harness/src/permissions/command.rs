@@ -255,6 +255,11 @@ pub fn display_command(command: &str, shell: CommandShell) -> CommandDisplay {
         let interpreter = CommandShell::from_executable(&executable);
         let fish = executable.trim_end_matches(".exe") == "fish";
         let cmd = executable.trim_end_matches(".exe") == "cmd";
+        if interpreter == CommandShell::Nushell
+            && nushell_file_arguments(tokens.iter().skip(1).map(|token| token.text.as_str()))
+        {
+            break;
+        }
         if interpreter == CommandShell::Unknown && !fish && !cmd {
             break;
         }
@@ -574,7 +579,10 @@ fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> Command
     for invocation in parsed.invocation_list {
         let executable = invocation.token_list[0].to_ascii_lowercase();
         let nested_shell = CommandShell::from_executable(&executable);
-        if nested_shell == CommandShell::Unknown {
+        if nested_shell == CommandShell::Unknown
+            || (nested_shell == CommandShell::Nushell
+                && nushell_file_arguments(invocation.token_list.iter().skip(1).map(String::as_str)))
+        {
             if matches!(executable.as_str(), "cmd" | "fish") {
                 result.failure.get_or_insert_with(|| {
                     CommandAnalysisFailure::Unsupported(format!("shell {executable}"))
@@ -599,9 +607,27 @@ fn normalize_nested(command: &str, shell: CommandShell, depth: usize) -> Command
     result
 }
 
+fn nushell_file_arguments<'a>(arguments: impl Iterator<Item = &'a str>) -> bool {
+    for argument in arguments {
+        match argument {
+            "-n" | "--no-config-file" | "--no-history" | "--no-std-lib" | "--stdin" | "-l"
+            | "--login" => continue,
+            _ => {
+                return !argument.is_empty()
+                    && !argument.starts_with('-')
+                    && !argument.contains(['$', '`', '*', '?', '[', ']', '{', '}', '(', ')', '~']);
+            }
+        }
+    }
+    false
+}
+
 pub fn shell_script_argument(tokens: &[String]) -> Option<(usize, CommandShell)> {
     let shell = CommandShell::from_executable(tokens.first()?);
-    if shell == CommandShell::Unknown {
+    if shell == CommandShell::Unknown
+        || (shell == CommandShell::Nushell
+            && nushell_file_arguments(tokens.iter().skip(1).map(String::as_str)))
+    {
         return None;
     }
     let marker = tokens.iter().position(|token| match shell {
@@ -864,6 +890,76 @@ mod test {
                 assert_eq!(&display.source[range], invocation.source, "{source}");
             }
         }
+    }
+
+    #[test]
+    fn preserves_nushell_script_file_invocations_and_their_arguments() {
+        for shell in [
+            CommandShell::Bash,
+            CommandShell::Zsh,
+            CommandShell::PowerShell,
+            CommandShell::Nushell,
+        ] {
+            for source in [
+                "nu --no-config-file .forge/checks/lua-tests.nu all --all --timeout 30sec",
+                "nu --no-config-file --stdin .forge/checks/lua-tests.nu affected --timeout 30sec",
+                "nu -n 'checks with spaces.nu' --commands 'script argument'",
+                "nu checks.nu -c 'script argument'",
+                "nu --login --no-history --no-std-lib checks.nu",
+            ] {
+                let parsed = normalize_command_in(source, shell);
+                assert_eq!(parsed.failure, None, "{shell:?}: {source}");
+                assert_eq!(parsed.invocation_list.len(), 1, "{shell:?}: {source}");
+                let invocation = &parsed.invocation_list[0];
+                assert_eq!(invocation.source, source);
+                assert_eq!(invocation.source_range, 0..source.len());
+                assert_eq!(invocation.token_list[0], "nu");
+                assert!(!invocation.structural);
+                assert_eq!(display_command(source, shell).source, source);
+                assert!(shell_script_argument(&invocation.token_list).is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn retains_pipeline_and_nested_launcher_targets_around_nushell_script_files() {
+        for source in [
+            "nu --no-config-file checks.nu | git status",
+            "bash -c 'nu --no-config-file checks.nu | git status'",
+        ] {
+            let parsed = normalize_command_in(source, CommandShell::Zsh);
+            assert_eq!(parsed.failure, None, "{source}");
+            assert_eq!(parsed.invocation_list.len(), 2);
+            for (invocation, expected) in parsed
+                .invocation_list
+                .iter()
+                .zip(["nu --no-config-file checks.nu", "git status"])
+            {
+                assert_eq!(invocation.source, expected);
+                assert_eq!(&source[invocation.source_range.clone()], expected);
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_nushell_launchers_do_not_become_script_file_targets() {
+        for source in [
+            "nu --no-config-file",
+            "nu --commands",
+            "nu --unknown checks.nu",
+            "nu --commands 'git status' extra",
+            "nu --execute 'git status'",
+            "nu $launcher",
+            "nu \"$launcher\"",
+            "nu *.nu",
+        ] {
+            let parsed = normalize_command_in(source, CommandShell::Zsh);
+            assert!(parsed.failure.is_some(), "{source}");
+        }
+        let inline = normalize_command_in("nu --no-config-file -c 'git status'", CommandShell::Zsh);
+        assert_eq!(inline.failure, None);
+        assert_eq!(inline.invocation_list.len(), 1);
+        assert_eq!(inline.invocation_list[0].token_list, ["git", "status"]);
     }
 
     #[test]
