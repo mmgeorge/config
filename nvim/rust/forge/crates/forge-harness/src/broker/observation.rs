@@ -276,7 +276,11 @@ impl BrokerObserver {
             .and_then(|id| check_history.iter().find(|run| &run.id == id))
             .and_then(crate::checks::CheckActivity::from_run);
         let checks_running = checks.is_some();
-        let mut timeline = TimelineProjector::with_checks(timeline, check_history);
+        let mut timeline = store.with_fork_history(
+            &source_session.id,
+            TimelineProjector::with_checks(timeline, check_history),
+            &self.plan_file,
+        )?;
         timeline.push(TimelineEntry::Status {
             checks,
             agent_count: self.agent_coordinator.active_count(),
@@ -490,6 +494,7 @@ impl BrokerObserver {
                 &self.data_root.join(&session_id).join("checks"),
             )?,
         );
+        let timeline = store.with_fork_history(&session_id, timeline, &self.plan_file)?;
         let preview = SessionPreview {
             lines: preview_lines(&timeline)?,
             session: preview_session,

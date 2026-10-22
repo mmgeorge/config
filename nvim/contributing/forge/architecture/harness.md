@@ -107,7 +107,10 @@ without formatted blocks, including subsequent streamed tails. Reflow preserves 
 requested source extent. Closing and reopening the tool resets it to the initial prefix.
 Tool and file
 pages start at two viewport heights and extend when their boundary approaches the viewport. The latest tool in
-an active group receives the automatic four-row preview. Settled groups default to headings,
+an active group receives the automatic four-row preview. `Running` groups expose only that latest
+call, including after explicit expansion. When a group becomes `Ran`, it collapses automatically,
+clears its live expansion override, and exposes every call when reopened, even while the exchange
+continues. Settled groups default to headings,
 and an explicit closure suppresses the preview. Closing a node removes its materialized body
 without inserting a blank placeholder. Parent closure also drops descendant page quotas
 while retaining their explicit choices. The heading's node metadata remains actionable even
@@ -346,7 +349,10 @@ plan submission events, verification results, and checkpoint changes before the 
 It partitions references to durable nodes without cloning response or diff bodies. Review acceptance
 and requests for revision belong to the newly admitted implementation or revision exchange and render
 before its lifecycle heading, prompt, and metrics. Rejection without revision remains a terminal event.
-Question clarifications retain their branch ownership. Legacy activity following an intermediate final
+Question clarifications retain their branch ownership across skill reads and provider compaction.
+Those events do not end a clarification. The next user input or question lifecycle boundary does.
+Incremental message rendering preserves the nested reply's Markdown role, matching reopened history.
+Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
 retain their additional nesting. Adjacent visible tools share one group across provider-turn boundaries.
@@ -707,6 +713,11 @@ Explicit pause and clear also finalize an exchange waiting for user input. Close
 retain their recorded questions in history but cannot expose them as active questions.
 Unanswered question rows in a cancelled exchange display Cancelled and cannot reopen a prompt.
 Internal pauses for configuration changes preserve waiting questions until work resumes.
+Restarting an interrupted clarification rebuilds its pending-question context from the saved owner
+and admitted input, then appends the configuration notice. It retains the input identity, question
+target, exchange, and checkpoint without submitting the input twice. Planning clarifications remain
+clarification turns rather than resuming plan generation. An idle question wait starts no provider
+work when permission changes without a resume intent.
 Execution admission retains one permit per session from request preparation through provider
 and exchange finalization. The host transfers that permit into service dispatch, which releases
 it and the composer submission ownership before publishing the completion response. Response
@@ -896,10 +907,16 @@ An initialization collision returns structured lease metadata instead of a termi
 failure. Neovim offers Retry and Start New Session for every collision, and adds Fork Session
 only when the persisted backend capability advertises native fork. Fork recovery initializes
 an independently leased broker and forks the provider conversation without taking or releasing the
-source lease. The child deliberately starts with no copied Harness interactions, comments, plans,
-executions, goals, or agent runs because the backend-owned conversation already carries the inherited
-model context. Its local timeline begins with one durable typed `Forked` event containing the source
-session ID and display name. Explicit `/fork <name>` uses that child name. Bare `/fork` derives
+source lease. The child retains a fork-time snapshot of the source's visible history before a durable
+typed `Forked` event containing the source session ID and display name. SQLite stores these inherited
+entries separately from executable exchanges, plans, goals, and agents. The child therefore displays
+previous prompts, responses, tools, and nested history without inheriting tasks or pending questions.
+Inherited clocks remain frozen, and question, plan, and agent controls are inactive. Tool output,
+diffs, file links, and source-session navigation remain available. Reloads and session previews read
+the same immutable snapshot. Later source changes do not alter it, and subsequent forks preserve
+each inherited entry once. The child, its primary agent, snapshot, and lineage event commit together
+before provider preparation, so failed preparation still retains the copied history.
+Explicit `/fork <name>` uses that child name. Bare `/fork` derives
 `<source-name> (fork)`, or `(fork)` when the source remains unnamed, without enforcing uniqueness.
 Codex forks request `excludeTurns` because Harness does not render provider-returned history. The broker
 copies the source session's last durable `ContextUsage` into the child before returning its snapshot, so

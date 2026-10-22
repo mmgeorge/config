@@ -144,6 +144,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn typescript_imports_preserve_token_highlights_in_diff_rows() {
+        let source = concat!(
+            "import { convertAttribute, normalizePath } from \"./parquet\";\n",
+            "import type FieldsIndex from \"./FieldsIndex\";\n",
+            "import type {\n",
+            "  FilterColumn,\n",
+            "  FilterField,\n",
+            "} from \"./filters\";\n",
+        );
+        for language in [SyntaxLanguage::Typescript, SyntaxLanguage::Tsx] {
+            let handle = engine().analyze(request(language, source)).await.unwrap();
+            for (row, text) in source.lines().enumerate() {
+                let mut metadata = forge_buffer::block::BlockMetadata::default();
+                crate::projection::append_syntax_row(&mut metadata, &handle, row, 6, text).unwrap();
+                assert!(
+                    !metadata
+                        .visible_decoration
+                        .iter()
+                        .any(|span| span.capture.starts_with("@builtin.")),
+                    "{language:?}: {text}"
+                );
+                for (token, capture) in [
+                    ("import", "@keyword.import."),
+                    ("from", "@keyword.import."),
+                    ("convertAttribute", "@variable."),
+                    ("\"./", "@string."),
+                    ("{", "@punctuation.bracket."),
+                    ("}", "@punctuation.bracket."),
+                ] {
+                    if let Some(column) = text.find(token) {
+                        let winning = metadata
+                            .visible_decoration
+                            .iter()
+                            .filter(|span| {
+                                span.range.start.column <= column && span.range.end.column > column
+                            })
+                            .last()
+                            .unwrap();
+                        assert!(
+                            winning.capture.starts_with(capture),
+                            "{language:?}: {token} in {text}: {}",
+                            winning.capture
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn projected_overlapping_highlights_preserve_query_precedence() {
         for source in [
             "fn main() {\n    println!(\"before\");\n}\n",

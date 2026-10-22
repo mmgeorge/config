@@ -3314,8 +3314,78 @@ mod tests {
                 .row_count(),
             4
         );
+        for id in ["tool", "latest", "third"] {
+            let activity = event.activity.as_mut().unwrap();
+            activity.id = id.into();
+            activity.status = Some("completed".into());
+            activity.output = None;
+            exchange.observe_turn(&event, 5)?;
+        }
+        event.activity = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("Tool group complete, continuing the exchange.".into());
+        event.data = json!({ "phase": "commentary" });
+        exchange.observe_turn(&event, 6)?;
+        owner.reconcile(vec![TimelineEntry::Exchange {
+            id: "parallel".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            check_runs: Vec::new(),
+            agent_by_id: HashMap::new(),
+        }])?;
+        let settled = owner.snapshot(&document)?;
+        let group = settled
+            .block
+            .iter()
+            .find(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::ToolGroup)
+            })
+            .unwrap();
+        assert!(group.text.wire_rows().join("\n").contains("Ran 3 tools"));
+        let group_node = group.metadata.node.as_ref().unwrap();
+        assert_eq!(group_node.display, forge_buffer::node::NodeDisplay::Heading);
+        assert!(
+            !settled.block.iter().any(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool)
+            }),
+            "Ran groups must collapse even after explicit live expansion"
+        );
+        owner.dispatch(PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: view.clone(),
+                sequence: 101,
+                node: group_node.id.0.clone(),
+                generation: group_node.generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 40,
+                width: WidthProfile::default(),
+            },
+        })?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .filter(|block| block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == forge_buffer::node::NodeKind::Tool))
+                .count(),
+            3,
+            "Ran groups must expose every call before exchange completion"
+        );
         exchange.state = crate::exchange::ExchangeState::Complete;
-        exchange.completed_at_ms = Some(5);
+        exchange.completed_at_ms = Some(7);
         owner.reconcile(vec![TimelineEntry::Exchange {
             id: "parallel".into(),
             created_at_ms: 0,
@@ -3336,7 +3406,7 @@ mod tests {
             request: NodeRequest {
                 document: document.clone(),
                 view,
-                sequence: 101,
+                sequence: 102,
                 node: activity.into(),
                 generation,
                 action: NodeAction::SetExpansion { expanded: true },

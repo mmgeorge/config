@@ -35,6 +35,10 @@ the `cpp` parser. `.scm` and the `scm` alias select the Tree-sitter query gramma
 not Scheme. These languages require no editor parser installation and do not
 add declaration-planning or agent structural-query adapters.
 
+TypeScript and TSX import highlighting retains token-level keyword, identifier,
+string, and punctuation captures. The Neovim and embedded repository overrides
+do not apply a statement-wide capture that overrides those token colors.
+
 Commit excerpts select syntax automatically from the file path. They require no
 user configuration or language server. A language's signature and import support
 must be verified separately from highlighting. The current regression matrix

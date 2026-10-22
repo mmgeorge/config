@@ -419,6 +419,13 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS fork_history_record (
+                session_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                PRIMARY KEY(session_id, ordinal),
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
             "#,
         )?;
         tool_output::initialize(&mut connection)?;
@@ -994,6 +1001,59 @@ impl SqliteStore {
             "SELECT payload FROM session_event_record WHERE session_id=?1 ORDER BY rowid",
             [session_id],
         )
+    }
+
+    /// Prepend the immutable fork snapshot without exposing it to child execution queries.
+    pub(crate) fn with_fork_history(
+        &self,
+        session_id: &str,
+        timeline: Vec<crate::timeline::TimelineEntry>,
+        plan_file: &crate::plan::PlanFileStore,
+    ) -> Result<Vec<crate::timeline::TimelineEntry>> {
+        let mut history: Vec<crate::timeline::TimelineEntry> = self.list_payload(
+            "SELECT payload FROM fork_history_record WHERE session_id=?1 ORDER BY ordinal",
+            [session_id],
+        )?;
+        for entry in &mut history {
+            entry.restore_reports(plan_file);
+        }
+        history.extend(timeline);
+        Ok(history)
+    }
+
+    /// Commit the child's inherited timeline and lineage event together.
+    pub(crate) fn save_fork_history(
+        &mut self,
+        session: &HarnessSession,
+        history: &[crate::timeline::TimelineEntry],
+        event: &SessionEventRecord,
+    ) -> Result<()> {
+        let transaction = self.connection.transaction()?;
+        let primary = Agent::primary(&session.id, session.created_at_ms);
+        anyhow::ensure!(
+            session.primary_agent_id == primary.id,
+            "session primary agent identity does not belong to this session"
+        );
+        transaction.execute(
+            "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)",
+            params![session.id, session.workspace, session.updated_at_ms, encode_session(session)?],
+        )?;
+        transaction.execute(
+            "INSERT INTO agent_run_record(id, session_id, payload) VALUES(?1, ?2, ?3)",
+            params![primary.id, primary.session_id, encode(&primary)?],
+        )?;
+        for (ordinal, entry) in history.iter().enumerate() {
+            transaction.execute(
+                "INSERT INTO fork_history_record(session_id, ordinal, payload) VALUES(?1, ?2, ?3)",
+                params![session.id, ordinal as i64, encode(entry)?],
+            )?;
+        }
+        transaction.execute(
+            "INSERT INTO session_event_record(id, session_id, payload) VALUES(?1, ?2, ?3)",
+            params![event.id, event.session_id, encode(event)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Remove one provisional lifecycle event after its owning backend turn fails.

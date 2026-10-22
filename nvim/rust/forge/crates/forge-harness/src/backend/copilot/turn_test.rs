@@ -215,7 +215,10 @@ async fn copilot_disables_tool_search_and_binds_session_files_on_create_and_resu
                 panic!("session file access returned no decision")
             };
             assert_eq!(serde_json::to_value(decision)?, expected);
-            assert!(events.try_recv().is_err(), "session file access requested approval");
+            assert!(
+                events.try_recv().is_err(),
+                "session file access requested approval"
+            );
         }
     }
     Ok(())

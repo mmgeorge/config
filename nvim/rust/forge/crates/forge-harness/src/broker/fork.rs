@@ -7,7 +7,9 @@ use crate::session::{
     HarnessSession, PermissionMode, ProviderForkPoint, ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
-use crate::timeline::{SessionEventKind, SessionEventRecord};
+use crate::timeline::{
+    SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
+};
 use anyhow::{Context, Result};
 use forge_protocol::message::SessionEvent;
 use serde_json::{Value, json};
@@ -88,16 +90,62 @@ pub fn prepare_provider_fork(
     child.lease_owner = Some(client_id.to_owned());
     child.lease_expires_at_ms = Some(now_ms + 30_000);
     crate::settings::SettingsStore::open(data_root)?.fork_session(&source.id, &child.id)?;
-    store.save_session(&child)?;
-    store.save_session_event(&SessionEventRecord {
-        id: Uuid::new_v4().to_string(),
-        session_id: child.id.clone(),
-        created_at_ms: now_ms,
-        detail: SessionEventKind::Forked {
-            source_session_id: source.id.clone(),
-            source_session_name: source.name.clone(),
-        },
+    let plan_file = crate::plan::PlanFileStore::new(data_root, &source.workspace);
+    let history = store.read_snapshot(|| {
+        let plan_list = store.list_plan(&source.id)?;
+        let agent_run_list = store
+            .list_agent_run(&source.id)?
+            .into_iter()
+            .filter(|agent| !agent.is_primary())
+            .collect::<Vec<_>>();
+        let mut agent_exchange_list = Vec::new();
+        for agent in &agent_run_list {
+            agent_exchange_list.extend(store.list_agent_exchange(&agent.id)?);
+        }
+        let timeline = TimelineProjector::build(TimelineProjection {
+            interaction_list: store.list_exchange(&source.id)?,
+            plan_list: &plan_list,
+            lifecycle_list: store.list_plan_lifecycle(&source.id)?,
+            execution_list: store.list_plan_execution(&source.id)?,
+            deviation_list: store.list_plan_deviation(&source.id)?,
+            audit_list: store.list_plan_audit(&source.id)?,
+            resolution_list: store.list_plan_resolution(&source.id)?,
+            agent_run_list,
+            agent_exchange_list,
+            session_event_list: store.list_session_event(&source.id)?,
+            plan_file: &plan_file,
+        })?;
+        let timeline = TimelineProjector::with_checks(
+            timeline,
+            crate::checks::CheckSupervisor::saved_history(
+                &data_root.join(&source.id).join("checks"),
+            )?,
+        );
+        let timeline = store.with_fork_history(&source.id, timeline, &plan_file)?;
+        Ok(timeline
+            .into_iter()
+            .map(|entry| match entry {
+                TimelineEntry::Inherited { .. } => entry,
+                _ => TimelineEntry::Inherited {
+                    captured_at_ms: now_ms,
+                    entry: Box::new(entry),
+                },
+            })
+            .collect::<Vec<_>>())
     })?;
+    store.save_fork_history(
+        &child,
+        &history,
+        &SessionEventRecord {
+            id: Uuid::new_v4().to_string(),
+            session_id: child.id.clone(),
+            created_at_ms: now_ms,
+            detail: SessionEventKind::Forked {
+                source_session_id: source.id.clone(),
+                source_session_name: source.name.clone(),
+            },
+        },
+    )?;
 
     let backend_request = BackendForkRequest {
         source: BackendRequest {

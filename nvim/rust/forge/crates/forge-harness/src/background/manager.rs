@@ -488,6 +488,7 @@ impl BackgroundManager {
                 session_event_list: session_events.clone(),
                 plan_file: &plan_file,
             })?;
+        let entries = store.with_fork_history(&selected.id, entries, &plan_file)?;
         let mut presentations = self.presentation.lock().await;
         let presentation = presentations.entry(selected.id.clone()).or_insert_with(|| {
             crate::buffer::session::SessionPresentation::new(selected.id.clone())

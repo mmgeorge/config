@@ -51,9 +51,14 @@ pub struct SessionEventRecord {
 }
 
 /// Represents one fully resolved top-level Harness timeline entry.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineEntry {
+    /// Retains a fork-time view without admitting its source exchanges as child execution state.
+    Inherited {
+        captured_at_ms: i64,
+        entry: Box<TimelineEntry>,
+    },
     Exchange {
         id: String,
         created_at_ms: i64,
@@ -78,6 +83,7 @@ pub enum TimelineEntry {
         created_at_ms: i64,
         run: crate::checks::CheckRun,
     },
+    #[serde(skip_deserializing)]
     Status {
         id: String,
         created_at_ms: i64,
@@ -92,6 +98,33 @@ pub enum TimelineEntry {
 }
 
 impl TimelineEntry {
+    pub(crate) fn restore_reports(&mut self, plan_file: &PlanFileStore) {
+        match self {
+            Self::Inherited { entry, .. } => entry.restore_reports(plan_file),
+            Self::Exchange {
+                exchange,
+                agent_by_id,
+                ..
+            } => {
+                restore_exchange_reports(exchange, plan_file);
+                for agent in agent_by_id.values_mut() {
+                    agent.restore_reports(plan_file);
+                }
+            }
+            Self::AgentLifecycle {
+                exchange, agent, ..
+            } => {
+                for exchange in exchange {
+                    restore_exchange_reports(exchange, plan_file);
+                }
+                for agent in agent {
+                    agent.restore_reports(plan_file);
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Attach one completed run to its owning exchange, replacing repeated publications.
     fn attach_check(&mut self, run: &crate::checks::CheckRun) -> bool {
         let Self::Exchange {
@@ -143,6 +176,7 @@ impl TimelineEntry {
     /// Return the stable identity used by incremental timeline reconciliation.
     pub fn id(&self) -> String {
         match self {
+            Self::Inherited { entry, .. } => entry.id(),
             Self::Exchange { id, .. }
             | Self::AgentLifecycle { id, .. }
             | Self::SessionEvent { id, .. }
@@ -236,6 +270,7 @@ impl TimelineEntry {
 
     fn created_at_ms(&self) -> i64 {
         match self {
+            Self::Inherited { entry, .. } => entry.created_at_ms(),
             Self::Exchange { created_at_ms, .. }
             | Self::AgentLifecycle { created_at_ms, .. }
             | Self::SessionEvent { created_at_ms, .. }
@@ -309,18 +344,9 @@ impl TimelineProjector {
         } = projection;
         let mut interaction_list = interaction_list;
         for exchange in &mut interaction_list {
-            for node in &mut exchange.node_list {
-                if let crate::exchange::ExchangeNode::ImplementationReport {
-                    reference,
-                    report,
-                    ..
-                } = node
-                {
-                    // The reference remains renderable if historical report storage is unavailable.
-                    *report = plan_file.implementation_report(reference).ok();
-                }
-            }
+            restore_exchange_reports(exchange, plan_file);
         }
+
         let checks = execution_list
             .iter()
             .flat_map(|execution| execution.check_runs.clone())
@@ -371,6 +397,18 @@ impl TimelineProjector {
         });
         result.sort_by_key(TimelineEntry::created_at_ms);
         Ok(Self::with_checks(result, checks))
+    }
+}
+
+fn restore_exchange_reports(exchange: &mut Exchange, plan_file: &PlanFileStore) {
+    for node in &mut exchange.node_list {
+        if let crate::exchange::ExchangeNode::ImplementationReport {
+            reference, report, ..
+        } = node
+        {
+            // The reference remains renderable if historical report storage is unavailable.
+            *report = plan_file.implementation_report(reference).ok();
+        }
     }
 }
 

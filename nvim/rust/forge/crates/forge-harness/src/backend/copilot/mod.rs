@@ -28,7 +28,6 @@ use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
-use session_directory::SessionDirectory;
 use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
 use github_copilot_sdk::rpc::{
     CommandsInvokeRequest, EventLogReadRequest, EventsAgentScope, EventsCursorStatus,
@@ -46,6 +45,7 @@ use github_copilot_sdk::{
     SetModelOptions, SystemMessageConfig, Tool, ToolInvocation, ToolResult,
 };
 use serde_json::{Value, json};
+use session_directory::SessionDirectory;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{

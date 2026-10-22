@@ -79,7 +79,9 @@ mod tests {
         for outside in [
             root.join("../other/plan.md"),
             root.join("../../config.json"),
-            temporary.path().join("session-state/current-sibling/plan.md"),
+            temporary
+                .path()
+                .join("session-state/current-sibling/plan.md"),
         ] {
             request.target_list.push(PermissionTarget::Write {
                 path: outside.to_string_lossy().into_owned(),

@@ -105,7 +105,9 @@ impl NodeMap {
         let previous = self.state.get(&source.id.0);
         if matches!(
             source.kind,
-            forge_buffer::node::NodeKind::Exchange | forge_buffer::node::NodeKind::Message
+            forge_buffer::node::NodeKind::Exchange
+                | forge_buffer::node::NodeKind::Message
+                | forge_buffer::node::NodeKind::ToolGroup
         ) && source.lifecycle == forge_buffer::node::NodeLifecycle::Settled
             && previous
                 .is_some_and(|state| state.lifecycle == forge_buffer::node::NodeLifecycle::Live)

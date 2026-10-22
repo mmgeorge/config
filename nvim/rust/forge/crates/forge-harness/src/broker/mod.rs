@@ -2124,7 +2124,7 @@ impl HarnessBroker {
             return self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."})).await;
         }
         let permission_notice = (command == "permission").then(|| format!(
-            "The user changed approval mode from {} to {}. Continue the original request under the updated mode. \
+            "The user changed approval mode from {} to {}. Continue the interrupted work under the updated mode. \
              Existing filesystem access and saved approval rules still apply. Preserve completed work. \
              Before retrying an interrupted operation, inspect its recorded outcome and any affected files.",
             previous_permission.label(), permission.label()
@@ -2142,6 +2142,13 @@ impl HarnessBroker {
             self.store.save_task(&task)?;
             self.save_session()?;
             if resume {
+                if self.active_plan_awaits_input()?
+                    || self.find_active_interaction_elicitation()?.is_some()
+                {
+                    return self
+                        .resume_exchange(json!({"text":permission_notice.as_deref().unwrap_or("Continue the interrupted clarification using the updated settings.")}))
+                        .await;
+                }
                 if command == "configure" {
                     self.configuration_progress("resuming").await?;
                 }
@@ -2163,11 +2170,12 @@ impl HarnessBroker {
                 .list_exchange(&self.session.id)?
                 .pop()
                 .context("interrupted exchange is missing")?;
-            let prompt = format!(
-                "{}\n\nOriginal request: {}",
-                permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions."),
-                previous.prompt
-            );
+            let notice = permission_notice.as_deref().unwrap_or("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions.");
+            let prompt = if previous.elicitation.is_some() {
+                notice.to_owned()
+            } else {
+                format!("{notice}\n\nOriginal request: {}", previous.prompt)
+            };
             return self.resume_exchange(json!({"text":prompt})).await;
         }
         Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
@@ -2499,12 +2507,68 @@ impl HarnessBroker {
         anyhow::ensure!(
             interaction.state == ExchangeState::Running
                 && interaction.execution_started_at_ms.is_none()
-                && !interaction.awaiting_input
                 && interaction
                     .turn
                     .iter()
                     .all(|turn| turn.state() != crate::turn::TurnState::Running),
             "the latest Harness exchange is not paused for resumption"
+        );
+        let pending_plan = if self.active_plan_awaits_input()? {
+            Some(self.active_elicitation_plan()?)
+        } else {
+            None
+        };
+        let elicitation = pending_plan
+            .as_ref()
+            .and_then(|plan| plan.elicitation.as_ref())
+            .or(interaction.elicitation.as_ref());
+        if let Some(elicitation) = elicitation {
+            if !elicitation.clarification_active {
+                return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+            }
+            let clarification = interaction
+                .node_list
+                .iter()
+                .rev()
+                .find_map(|node| match node {
+                    ExchangeNode::ExchangeInput { prompt }
+                        if prompt.intent == crate::exchange::InputIntent::Clarification
+                            && prompt.question.as_ref().is_some_and(|target| {
+                                target.set_id == elicitation.question_set.id
+                            }) =>
+                    {
+                        Some(prompt)
+                    }
+                    _ => None,
+                });
+            let clarification = clarification
+                .context("interrupted clarification has no recorded question input")?;
+            let follow_up = format!("{}\n\n{text}", clarification.text);
+            let elicitation_json = serde_json::to_string_pretty(elicitation)?;
+            let prompt = if let Some(plan) = &pending_plan {
+                PlanPrompt::clarification(&plan.request, &elicitation_json, &follow_up)
+            } else {
+                PlanPrompt::question_follow_up(&elicitation_json, &follow_up)
+            };
+            let mode = if pending_plan.is_none()
+                && interaction.kind == ExchangeKind::Chat
+                && interaction.plan_id.is_some()
+                && interaction.check_setup.is_none()
+            {
+                PromptMode::PlanDiscussion
+            } else {
+                PromptMode::Chat
+            };
+            let (value, event) = self.run_interaction(prompt, mode, None).await?;
+            return if let Some(plan) = pending_plan {
+                self.finish_plan_clarification(&plan.id, value, event).await
+            } else {
+                self.finish_question_clarification(value, event).await
+            };
+        }
+        anyhow::ensure!(
+            !interaction.awaiting_input,
+            "the latest Harness exchange is awaiting a user decision"
         );
         if let Some(mut task) = self
             .current_task()?
@@ -4274,16 +4338,25 @@ impl HarnessBroker {
             Some(target),
         )?;
         self.store.save_plan(&plan)?;
-        let (mut value, mut event) = self
+        let (value, event) = self
             .run_interaction(
                 PlanPrompt::clarification(&plan.request, &elicitation_json, &text),
                 PromptMode::Chat,
                 None,
             )
             .await?;
+        self.finish_plan_clarification(&plan.id, value, event).await
+    }
+
+    async fn finish_plan_clarification(
+        &mut self,
+        plan_id: &str,
+        mut value: Value,
+        mut event: Vec<SessionEvent>,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         let current_plan = self
             .store
-            .load_plan(&plan.id)?
+            .load_plan(plan_id)?
             .context("active plan record is missing after clarification")?;
         if current_plan.elicitation.is_none()
             && matches!(
@@ -4297,7 +4370,7 @@ impl HarnessBroker {
                 .into_iter()
                 .rev()
                 .find(|lifecycle| {
-                    lifecycle.plan_id == plan.id
+                    lifecycle.plan_id == plan_id
                         && lifecycle.kind == PlanLifecycleKind::QuestionWithdrawn
                 })
                 .context("withdrawn planning question has no lifecycle record")?;
@@ -4309,7 +4382,10 @@ impl HarnessBroker {
                     .unwrap_or("no material decision remains")
             );
             let continuation = self
-                .run_planning_interaction(PlanPrompt::feedback(&plan.request, &feedback), None)
+                .run_planning_interaction(
+                    PlanPrompt::feedback(&current_plan.request, &feedback),
+                    None,
+                )
                 .await;
             match continuation {
                 Ok((next_value, mut next_event)) => {
@@ -4374,7 +4450,7 @@ impl HarnessBroker {
             self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
-        let (mut value, mut event) = self
+        let (value, event) = self
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
                 if interaction.kind == ExchangeKind::Chat
@@ -4389,6 +4465,14 @@ impl HarnessBroker {
                 None,
             )
             .await?;
+        self.finish_question_clarification(value, event).await
+    }
+
+    async fn finish_question_clarification(
+        &mut self,
+        mut value: Value,
+        mut event: Vec<SessionEvent>,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
         if self
             .find_active_interaction_elicitation()?
             .and_then(|interaction| interaction.elicitation)
@@ -14655,6 +14739,7 @@ mod test {
     struct RestartBackend {
         cancellation: Arc<TurnCancellation>,
         invocation: std::sync::atomic::AtomicUsize,
+        clarification: bool,
     }
 
     #[async_trait::async_trait]
@@ -14721,6 +14806,26 @@ mod test {
             assert_eq!(request.execution_mode, PermissionMode::Write);
             assert!(request.input.text().contains("Read to Write"));
             assert!(request.input.text().contains("saved approval rules"));
+            if self.clarification {
+                assert!(
+                    request
+                        .input
+                        .text()
+                        .contains("Why choose staged migration?")
+                );
+                assert!(request.input.text().contains("Pending elicitation:"));
+                assert!(
+                    request
+                        .input
+                        .text()
+                        .contains("Do not continue the original request")
+                        || request
+                            .input
+                            .text()
+                            .contains("Do not continue or submit the plan")
+                );
+                assert!(!request.input.text().contains("Original request:"));
+            }
             event.kind = "turn_completed".into();
             event.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
                 outcome: crate::turn::TurnOutcome::Completed,
@@ -14748,6 +14853,7 @@ mod test {
         broker.backend = Arc::new(RestartBackend {
             cancellation: Arc::clone(&broker.turn_cancellation),
             invocation: std::sync::atomic::AtomicUsize::new(0),
+            clarification: false,
         });
         let result = broker
             .run_interaction(
@@ -14805,6 +14911,7 @@ mod test {
         broker.backend = Arc::new(RestartBackend {
             cancellation: broker.turn_cancellation(),
             invocation: std::sync::atomic::AtomicUsize::new(0),
+            clarification: false,
         });
         let result = broker
             .dispatch(Request {
@@ -14836,6 +14943,151 @@ mod test {
             before.exchange[0].checkpoint_before
         );
         assert_eq!(after.active_plan.unwrap().state, PlanState::AwaitingInput);
+    }
+
+    #[tokio::test]
+    async fn permission_restart_preserves_pending_clarification_and_checkpoint() {
+        for planning in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = planning_question_broker(repository.path(), data.path(), true);
+            let prompted = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "prompt.submit".into(),
+                    params: json!({"text":if planning {
+                        "/plan Design the migration"
+                    } else {
+                        "Design the migration"
+                    }}),
+                })
+                .await;
+            assert!(prompted.response.error().is_none());
+            let pending = broker.snapshot().unwrap().active_elicitation.unwrap();
+            let question_id = pending.elicitation.current_question().unwrap().id.clone();
+            let restart = Arc::new(RestartBackend {
+                cancellation: broker.turn_cancellation(),
+                invocation: std::sync::atomic::AtomicUsize::new(0),
+                clarification: true,
+            });
+            broker.backend = restart.clone();
+            broker.capability = crate::backend::mock_capability();
+            let interrupted = broker
+                .ask_question(json!({
+                    "question_id":question_id,
+                    "text":"Why choose staged migration?"
+                }))
+                .await;
+            assert!(interrupted.is_err());
+            let before = broker.store.list_exchange(&broker.session.id).unwrap();
+            assert_eq!(before.len(), 1);
+            assert!(before[0].execution_started_at_ms.is_none());
+            broker.turn_cancellation.arm(false);
+            broker
+                .transition_task(json!({"action":"permission","mode":"write","resume":true}))
+                .await
+                .unwrap();
+            let snapshot = broker.snapshot().unwrap();
+            let after = broker.store.list_exchange(&broker.session.id).unwrap();
+            assert_eq!(after.len(), 1);
+            assert_eq!(after[0].id, before[0].id);
+            assert_eq!(after[0].checkpoint_before, before[0].checkpoint_before);
+            assert!(after[0].checkpoint_after.is_none());
+            assert_eq!(after[0].turn.len(), before[0].turn.len() + 1);
+            assert_eq!(after[0].state, ExchangeState::Running);
+            assert_eq!(restart.invocation.load(Ordering::SeqCst), 2);
+            let pending_after = snapshot.active_elicitation.unwrap();
+            assert_eq!(pending_after.owner, pending.owner);
+            assert_eq!(
+                pending_after.elicitation.question_set.id,
+                pending.elicitation.question_set.id
+            );
+            assert_eq!(
+                pending_after.elicitation.current_question().unwrap().id,
+                question_id
+            );
+            let clarification = after[0]
+                .node_list
+                .iter()
+                .filter_map(|node| match node {
+                    ExchangeNode::ExchangeInput { prompt }
+                        if prompt.intent == crate::exchange::InputIntent::Clarification =>
+                    {
+                        Some(prompt)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(clarification.len(), 1);
+            assert_eq!(clarification[0].text, "Why choose staged migration?");
+            assert_eq!(
+                clarification[0]
+                    .question
+                    .as_ref()
+                    .unwrap()
+                    .question_id
+                    .as_deref(),
+                Some(question_id.as_str())
+            );
+            if planning {
+                assert_eq!(
+                    snapshot.active_plan.unwrap().state,
+                    PlanState::AwaitingInput
+                );
+                assert_eq!(snapshot.task[0].status, crate::task::TaskStatus::Waiting);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_change_keeps_idle_questions_waiting_without_provider_work() {
+        for planning in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = planning_question_broker(repository.path(), data.path(), true);
+            let prompted = broker
+                .dispatch(Request {
+                    id: 1,
+                    method: "prompt.submit".into(),
+                    params: json!({"text":if planning {
+                        "/plan Design the migration"
+                    } else {
+                        "Design the migration"
+                    }}),
+                })
+                .await;
+            assert!(prompted.response.error().is_none());
+            let before = broker.snapshot().unwrap();
+            let restart = Arc::new(RestartBackend {
+                cancellation: broker.turn_cancellation(),
+                invocation: std::sync::atomic::AtomicUsize::new(0),
+                clarification: true,
+            });
+            broker.backend = restart.clone();
+            broker.capability = crate::backend::mock_capability();
+            broker
+                .transition_task(json!({"action":"permission","mode":"write","resume":false}))
+                .await
+                .unwrap();
+            let after = broker.snapshot().unwrap();
+            assert_eq!(restart.invocation.load(Ordering::SeqCst), 0);
+            assert_eq!(after.exchange.len(), before.exchange.len());
+            assert_eq!(after.exchange[0].id, before.exchange[0].id);
+            assert_eq!(
+                after
+                    .active_elicitation
+                    .unwrap()
+                    .elicitation
+                    .question_set
+                    .id,
+                before
+                    .active_elicitation
+                    .unwrap()
+                    .elicitation
+                    .question_set
+                    .id
+            );
+        }
     }
 
     struct CleanupRetryBackend {
@@ -18792,16 +19044,26 @@ mod test {
             Some("mock-checkpoint")
         );
         let child_session_id = preparation.child.id.clone();
+        let inherited_source = source
+            .snapshot()
+            .unwrap()
+            .timeline
+            .into_iter()
+            .filter(|entry| !matches!(entry, TimelineEntry::Status { .. }))
+            .map(|entry| serde_json::to_value(entry).unwrap())
+            .collect::<Vec<_>>();
         let backend_fork = fork_controller
             .backend
             .fork(preparation.backend_request)
             .await
             .unwrap();
         let mut child_initialize = initialize("fork-client", None);
-        child_initialize.session_id = Some(child_session_id);
-        let mut child_controller =
-            HarnessBroker::initialize_with_clock(child_initialize, Box::new(FixedClock(120)))
-                .unwrap();
+        child_initialize.session_id = Some(child_session_id.clone());
+        let mut child_controller = HarnessBroker::initialize_with_clock(
+            child_initialize,
+            Box::new(FixedClock(preparation.child.created_at_ms + 1)),
+        )
+        .unwrap();
         let ready_event = child_controller
             .complete_provider_fork(Ok(backend_fork))
             .unwrap();
@@ -18819,10 +19081,37 @@ mod test {
         );
         assert!(snapshot.get("exchange").is_none() && snapshot.get("timeline").is_none());
         let timeline = child_controller.snapshot().unwrap().timeline;
-        assert_eq!(timeline.len(), 2);
-        assert!(matches!(&timeline[0], TimelineEntry::SessionEvent { .. }));
+        assert_eq!(timeline.len(), inherited_source.len() + 2);
+        let inherited = timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Inherited { entry, .. } => {
+                    Some(serde_json::to_value(entry).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inherited, inherited_source);
+        assert!(
+            inherited
+                .iter()
+                .any(|entry| entry["exchange"]["prompt"] == "preserve this interaction")
+        );
+        assert!(
+            child_controller
+                .store
+                .list_exchange(&child_session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(child_controller.session.current_task_id.is_none());
+        assert!(child_controller.session.goal_id.is_none());
         assert!(matches!(
-            &timeline[1],
+            &timeline[inherited.len()],
+            TimelineEntry::SessionEvent { .. }
+        ));
+        assert!(matches!(
+            timeline.last().unwrap(),
             TimelineEntry::Status {
                 status: SessionPhase::Idle,
                 ..
@@ -18850,6 +19139,92 @@ mod test {
             failed_controller.provider_fork_state(),
             ProviderForkState::Failed { message, .. } if message == "native fork failed"
         ));
+        assert!(
+            failed_controller
+                .snapshot()
+                .unwrap()
+                .timeline
+                .iter()
+                .any(|entry| matches!(entry, TimelineEntry::Inherited { .. }))
+        );
+
+        let later_source = source
+            .dispatch(Request {
+                id: 2,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "source-only later message" }),
+            })
+            .await;
+        assert!(later_source.response.error().is_none());
+        let child_prompt = child_controller
+            .dispatch(Request {
+                id: 3,
+                method: "prompt.submit".into(),
+                params: json!({ "text": "child-only new message" }),
+            })
+            .await;
+        assert!(child_prompt.response.error().is_none());
+        let child_timeline = child_controller.snapshot().unwrap().timeline;
+        let child_inherited = child_timeline
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::Inherited { entry, .. } => {
+                    Some(serde_json::to_value(entry).unwrap())
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(child_inherited, inherited_source);
+        assert!(child_timeline.iter().skip(inherited_source.len() + 1).any(
+            |entry| matches!(entry, TimelineEntry::Exchange { exchange, .. }
+                if exchange.prompt == "child-only new message")
+        ));
+        let preview = source
+            .dispatch(Request {
+                id: 4,
+                method: "session.preview".into(),
+                params: json!({ "session_id": child_session_id }),
+            })
+            .await;
+        assert!(preview.response.error().is_none());
+        assert!(
+            serde_json::to_string(preview.response.result().unwrap())
+                .unwrap()
+                .contains("preserve this interaction")
+        );
+
+        let grandchild = prepare_provider_fork(
+            data.path(),
+            "fork-client",
+            "mock",
+            &child_controller.capability,
+            &child_session_id,
+            &json!({ "session_id": child_session_id }),
+        )
+        .unwrap();
+        let grandchild_history = child_controller
+            .store
+            .with_fork_history(
+                &grandchild.child.id,
+                Vec::new(),
+                &child_controller.plan_file,
+            )
+            .unwrap();
+        assert_eq!(grandchild_history.len(), child_timeline.len() - 1);
+        for (inherited, source) in grandchild_history.iter().zip(&child_timeline) {
+            let TimelineEntry::Inherited { entry, .. } = inherited else {
+                panic!("grandchild history must be presentation-only");
+            };
+            assert!(!matches!(entry.as_ref(), TimelineEntry::Inherited { .. }));
+            let source = match source {
+                TimelineEntry::Inherited { entry, .. } => entry.as_ref(),
+                source => source,
+            };
+            assert_eq!(
+                serde_json::to_value(entry).unwrap(),
+                serde_json::to_value(source).unwrap()
+            );
+        }
         let persisted_source = child_controller
             .store
             .load_session(&source_session_id)

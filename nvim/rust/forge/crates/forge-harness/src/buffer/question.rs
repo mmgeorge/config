@@ -146,6 +146,8 @@ impl<'exchange> QuestionHistory<'exchange> {
                         ExchangeNode::TurnContent { .. }
                             | ExchangeNode::AgentReference { .. }
                             | ExchangeNode::ArtifactChange { .. }
+                            | ExchangeNode::SkillRead { .. }
+                            | ExchangeNode::Compaction { .. }
                     )
                 })
                 .collect::<Vec<_>>();

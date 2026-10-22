@@ -190,7 +190,9 @@
       "file *": "allow",
       "gh": "deny",
       "gh *": "deny",
+      "git --no-pager diff --stat": "allow",
       "git --no-pager ls-files": "allow",
+      "git --no-pager status --short": "allow",
       "git blame": "allow",
       "git blame *": "allow",
       "git branch": "allow",
@@ -406,7 +408,8 @@
     "mcp": {
       "*": "ask",
       "docs/*": "allow",
-      "sem/*": "allow"
+      "sem/*": "allow",
+      "terminal-mcp/*": "allow"
     },
     "read": {
       "*": "allow"

@@ -35,8 +35,6 @@
 
 (public_field_definition) @builtin
 
-(import_statement) @builtin
-
 (null) @primitive
 
 (undefined) @primitive

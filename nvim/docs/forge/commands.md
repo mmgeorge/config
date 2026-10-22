@@ -129,6 +129,15 @@ Long prompts and responses fold to a three-line preview. Prompts fold when sent,
 previous response folds when a new exchange starts. Use the normal expansion command on
 the caret or message body to show or hide the complete text.
 
+`Running` tool groups show only the latest call and its four-row output preview.
+When a group changes to `Ran`, it folds automatically. Expanding that completed group
+shows every call in the group, with individual output available on expansion.
+
+`/fork [name]` opens a child timeline with a snapshot of the source's visible history
+above its fork marker. New child messages append below that marker. Source updates do
+not change the copied history, and pending questions, tasks, and agents do not resume
+in the child. Inherited question and plan controls are inactive.
+
 | Command | Arguments | Behavior |
 | --- | --- | --- |
 | `:ForgeHarness` | None | Open the Harness |

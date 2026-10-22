@@ -663,7 +663,7 @@
     {
       "path": "query/repository/typescript/highlights.scm",
       "origin": "nvim/queries/typescript/highlights.scm",
-      "sha256": "d456fbf8fe7b332d137023283becef5d8c48ede77356448b547f004d98aba0b5"
+      "sha256": "9c01be9351ea6f60bbe1ea76c5eda8fb2ea9db5d4037ea88d894e3a151fc5dcf"
     },
     {
       "path": "query/repository/typescript/parent.scm",

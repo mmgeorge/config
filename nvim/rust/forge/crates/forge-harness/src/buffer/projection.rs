@@ -528,7 +528,16 @@ pub(super) fn message_block(
         &previous.id.0,
         message.text(),
         if message.delivery() == crate::turn::MessageDelivery::Final {
-            MarkdownRole::Response
+            if previous
+                .metadata
+                .layout
+                .as_ref()
+                .is_some_and(|layout| layout.marker.is_none())
+            {
+                MarkdownRole::Message
+            } else {
+                MarkdownRole::Response
+            }
         } else {
             MarkdownRole::Commentary
         },
@@ -630,6 +639,42 @@ impl TimelineRenderer<'_> {
     fn entry(&mut self, entry: &TimelineEntry, depth: usize) -> Result<()> {
         ensure!(depth <= 16, "agent transcript nesting exceeds 16 levels");
         match entry {
+            TimelineEntry::Inherited {
+                captured_at_ms,
+                entry,
+            } => {
+                let previous_time = self.now_ms;
+                let first_block = self.block.len();
+                let previous_action = self
+                    .action
+                    .keys()
+                    .cloned()
+                    .collect::<std::collections::HashSet<_>>();
+                self.now_ms = *captured_at_ms;
+                let result = self.entry(entry, depth);
+                self.now_ms = previous_time;
+                result?;
+                self.action.retain(|target, action| {
+                    previous_action.contains(target)
+                        || matches!(
+                            action,
+                            TranscriptAction::Tool { .. }
+                                | TranscriptAction::Diff { .. }
+                                | TranscriptAction::File { .. }
+                                | TranscriptAction::Url { .. }
+                                | TranscriptAction::Session { .. }
+                        )
+                });
+                for block in &mut self.block[first_block..] {
+                    block
+                        .metadata
+                        .target
+                        .retain(|target| self.action.contains_key(&target.id));
+                    if let Some(node) = &mut block.metadata.node {
+                        node.lifecycle = NodeLifecycle::Settled;
+                    }
+                }
+            }
             TimelineEntry::Exchange {
                 exchange: interaction,
                 agent_by_id,
@@ -1687,7 +1732,6 @@ impl TimelineRenderer<'_> {
                             let start = self.block.len();
                             self.margin += 2;
                             let count = calls.len();
-                            let live_exchange = interaction.completed_at_ms.is_none();
                             // Provider turns can end between adjacent calls. Only a visible successor
                             // or the completed exchange prevents more tools from joining this group.
                             let settled = interaction.completed_at_ms.is_some()
@@ -1712,13 +1756,13 @@ impl TimelineRenderer<'_> {
                                     turn.id(),
                                     tool,
                                     &group_id,
-                                    live_exchange && index + 1 == count,
+                                    !settled && index + 1 == count,
                                 )?;
                                 let node = format!("{}:{}:tool", turn.id(), tool.id);
                                 self.fold(
                                     tool_start,
                                     &node,
-                                    !live_exchange || index + 1 < count,
+                                    settled || index + 1 < count,
                                     NodeKind::Tool,
                                 );
                                 if let Some(node) = &mut self.block[tool_start].metadata.node {
@@ -1728,7 +1772,7 @@ impl TimelineRenderer<'_> {
                                         } else {
                                             NodeLifecycle::Settled
                                         };
-                                    if live_exchange && index + 1 == count {
+                                    if !settled && index + 1 == count {
                                         node.default_display = NodeDisplay::Preview;
                                     }
                                     if self.expansion.get(&node.id.0) == Some(&true) {
@@ -1746,14 +1790,18 @@ impl TimelineRenderer<'_> {
                                 }
                             }
                             self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
-                            if live_exchange {
+                            {
                                 let node = self.block[start]
                                     .metadata
                                     .node
                                     .as_mut()
                                     .expect("tool group node");
                                 node.lifecycle = lifecycle;
-                                node.default_display = NodeDisplay::Preview;
+                                node.default_display = if settled {
+                                    NodeDisplay::Heading
+                                } else {
+                                    NodeDisplay::Preview
+                                };
                                 node.resolve(self.expansion.get(&group_id).copied());
                             }
                             self.margin -= 2;
@@ -4164,6 +4212,81 @@ mod tests {
     }
 
     #[test]
+    fn inherited_history_freezes_time_and_disables_question_controls() {
+        use crate::exchange::ExchangeNode;
+        let question: crate::plan::PlanQuestionSet = serde_json::from_value(json!({
+            "id":"source-question", "questions":[{
+                "id":"scope", "header":"Scope", "question":"Which scope?",
+                "options":[{"label":"All","description":"All files"}], "allow_freeform":true
+            }]
+        }))
+        .unwrap();
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"source-exchange", "session_id":"source", "agent_id":"primary", "ordinal":1,
+            "prompt":"Keep this visible", "state":"running", "created_at_ms":0,
+            "execution_started_at_ms":1,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        exchange.node_list.push(ExchangeNode::QuestionPresented {
+            id: "source-presented".into(),
+            question: question.clone(),
+            answer: None,
+        });
+        exchange.elicitation = Some(crate::plan::PlanElicitation::new(question));
+        exchange.awaiting_input = true;
+        let source = TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange,
+            agent_by_id: HashMap::new(),
+            check_runs: Vec::new(),
+        };
+        assert!(
+            project_at(&source, &WidthProfile::default(), 10)
+                .unwrap()
+                .action
+                .values()
+                .any(|action| matches!(action, super::TranscriptAction::Question { .. }))
+        );
+        let inherited = TimelineEntry::Inherited {
+            captured_at_ms: 10,
+            entry: Box::new(source),
+        };
+        let inherited: TimelineEntry =
+            serde_json::from_value(serde_json::to_value(inherited).unwrap()).unwrap();
+        let first = project_at(&inherited, &WidthProfile::default(), 20).unwrap();
+        let later = project_at(&inherited, &WidthProfile::default(), 90_000).unwrap();
+        assert_eq!(
+            serde_json::to_value(&first.entry.block).unwrap(),
+            serde_json::to_value(&later.entry.block).unwrap()
+        );
+        assert!(
+            first
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .any(|row| row.contains("Which scope?"))
+        );
+        assert!(!first.action.values().any(|action| matches!(
+            action,
+            super::TranscriptAction::Question { .. }
+                | super::TranscriptAction::Plan { .. }
+                | super::TranscriptAction::Agent { .. }
+                | super::TranscriptAction::Declaration { .. }
+        )));
+        assert!(
+            first
+                .entry
+                .block
+                .iter()
+                .filter_map(|block| block.metadata.node.as_ref())
+                .all(|node| node.lifecycle == NodeLifecycle::Settled)
+        );
+    }
+
+    #[test]
     fn question_branches_keep_targets_responses_and_folds_across_reload() {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
         use crate::exchange::{
@@ -4466,6 +4589,28 @@ mod tests {
                 4,
             )
             .unwrap();
+        exchange.node_list.push(ExchangeNode::SkillRead {
+            id: "clarification-skill".into(),
+            turn_id: "explanation-turn".into(),
+            read: crate::skill::SkillRead {
+                resource_id: "migration-guide".into(),
+                name: "migration-guide".into(),
+                path: "/skills/migration-guide/SKILL.md".into(),
+                tool_id: "read-guide".into(),
+            },
+        });
+        exchange.node_list.push(ExchangeNode::Compaction {
+            id: "clarification-compaction".into(),
+            compaction: crate::backend::Compaction {
+                id: "compaction".into(),
+                thread_id: "thread".into(),
+                state: crate::backend::CompactionState::Completed,
+                manual: false,
+                started_at_ms: Some(4),
+                completed_at_ms: Some(4),
+                result: Default::default(),
+            },
+        });
         event.address.as_mut().unwrap().turn_id = "explanation-turn".into();
         event.turn_boundary = Some(TurnBoundary::Started);
         exchange.observe_turn(&event, 4).unwrap();
@@ -4559,6 +4704,61 @@ mod tests {
         assert_eq!(
             question_block.metadata.fold[0].end.block, answer.id,
             "question owns the clarification response"
+        );
+        let clarification_history = super::super::question::QuestionHistory::new(&exchange);
+        assert!(clarification_history.nested.contains("clarification-skill"));
+        assert!(
+            clarification_history
+                .nested
+                .contains("clarification-compaction")
+        );
+        assert!(clarification_history.nested.contains(answer.id.0.as_str()));
+        let message = exchange
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .find(|message| message.text() == "I mean a Rust CLI or a redesigned TypeScript demo.")
+            .unwrap();
+        let mut updated = message.clone();
+        updated.text =
+            "I mean a Rust CLI or a redesigned TypeScript demo.\n[Guide](/migration.md)".into();
+        let incremental = super::message_block(answer, &updated, &WidthProfile::default()).unwrap();
+        let mut saved = serde_json::to_value(&exchange).unwrap();
+        let reloaded_message = saved["turn"]
+            .as_array_mut()
+            .unwrap()
+            .iter_mut()
+            .flat_map(|turn| turn["message"].as_array_mut().unwrap())
+            .find(|candidate| candidate["id"] == message.id())
+            .unwrap();
+        *reloaded_message = serde_json::to_value(updated).unwrap();
+        let reloaded: Exchange = serde_json::from_value(saved).unwrap();
+        let reloaded = project_at(
+            &TimelineEntry::Exchange {
+                id: reloaded.id.clone(),
+                created_at_ms: 0,
+                exchange: reloaded,
+                check_runs: Vec::new(),
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            6,
+        )
+        .unwrap();
+        let rebuilt = reloaded
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id == answer.id)
+            .unwrap();
+        assert_eq!(incremental.entry.block[0].text, rebuilt.text);
+        assert_eq!(
+            incremental.entry.block[0].metadata.conceal,
+            rebuilt.metadata.conceal
+        );
+        assert_eq!(
+            incremental.entry.block[0].metadata.node,
+            rebuilt.metadata.node
         );
         assert!(exchange.completed_at_ms.is_none() && exchange.checkpoint_after.is_none());
         println!(
