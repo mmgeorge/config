@@ -20,6 +20,13 @@ ForgeStatus file rows, file-specific comparison labels, and single-file discard
 confirmations show paths relative to the editor cwd in the window that opened the view.
 Git actions continue to use native file identities and repository paths.
 
+Unfolding an unloaded file keeps its heading visible until the first diff chunk has
+syntax colors and hunk context. A syntax failure reports the error and still shows the diff.
+
+Completed stage and unstage actions invalidate the native Git index cache before
+settlement. Files retain their settled section even when the replacement index has
+an older timestamp, without restarting Neovim.
+
 For example, `:ForgeFileRevision README.md HEAD` opens the committed README.
 Revision arguments use the shared revision completion source. File-specific
 commands complete the file argument before the revision argument.

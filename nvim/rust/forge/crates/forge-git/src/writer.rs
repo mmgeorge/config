@@ -851,7 +851,6 @@ impl GitWriteAction {
 
 fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     intent.store.writes.phase(intent.operation(), "validating");
-    let mut local = intent.repository.repository.to_thread_local();
     let started = Instant::now();
     let interactive = matches!(intent.action, GitWriteAction::CommitWithEditor { .. });
     let mut check = || {
@@ -863,6 +862,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         Ok(())
     };
     let prepared = (|| -> Result<()> {
+        let mut local = intent.repository.local_repository()?;
         if intent.precondition.is_none() {
             intent.precondition = Some(WritePrecondition::capture(
                 &mut local,
@@ -1455,7 +1455,7 @@ fn settle_paths(repository: &RepositoryState, paths: &[RepositoryPath]) -> Resul
         );
         Ok(())
     };
-    let local = repository.repository.to_thread_local();
+    let local = repository.local_repository()?;
     let head = crate::snapshot::read_head(&local)?;
     let index = crate::snapshot::read_index_stamp(&repository.identity.index, &mut check)?;
     let mut settled = Vec::new();

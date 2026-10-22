@@ -98,7 +98,8 @@ intent, and a late response cannot reopen the node. Errors clear loading state a
 visible through the existing notification and recovery paths.
 
 Status retains file bodies independently of visible rows. Opening an unloaded file requests
-its body before expanding. The shared projector handles file, hunk, and section expansion,
+its body before expanding. Initial demand includes syntax highlighting and structural context
+before exposing the body, avoiding a separate cold-parser repaint. The shared projector handles file, hunk, and section expansion,
 while the Git service remains responsible for paging and semantic actions. If a generation
 change discards a body delivery, the Status renderer requests a complete body snapshot before
 accepting a patch whose base is missing or ahead of the retained body revision. Demand responses

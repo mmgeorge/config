@@ -363,7 +363,7 @@ impl WritePrecondition {
             .find(|target| &target.path == path)
             .context("target was not captured")?;
         ensure!(
-            self.head == read_head(&repository.repository.to_thread_local())?,
+            self.head == read_head(&repository.local_repository()?)?,
             "HEAD changed before target execution"
         );
         ensure!(
@@ -392,7 +392,7 @@ impl WritePrecondition {
     ) -> Result<()> {
         check()?;
         ensure!(
-            self.head == read_head(&repository.repository.to_thread_local())?,
+            self.head == read_head(&repository.local_repository()?)?,
             "HEAD changed before chunk execution"
         );
         let inspected: Vec<_> = path

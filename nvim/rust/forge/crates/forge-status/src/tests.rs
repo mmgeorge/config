@@ -138,7 +138,7 @@ async fn staging_with_many_open_syntax_bodies_preserves_highlighting() {
     let mut updates = service.subscribe_updates();
     for ordinal in 0..8 {
         let snapshot = service.snapshot(&opened.document).await.unwrap();
-        service
+        let delivery = service
             .demand(input(
                 &snapshot,
                 &format!("source_{ordinal}.rs"),
@@ -147,12 +147,25 @@ async fn staging_with_many_open_syntax_bodies_preserves_highlighting() {
             ))
             .await
             .unwrap();
-        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(update.phase, "context");
-        assert!(update.diagnostic.is_empty(), "{:?}", update.diagnostic);
+        assert!(delivery.syntax_diagnostic.is_none());
+        let snapshot = delivery.snapshot.as_ref().unwrap();
+        assert!(
+            snapshot.block.iter().any(|block| {
+                block
+                    .metadata
+                    .visible_decoration
+                    .iter()
+                    .any(|decoration| decoration.capture.starts_with("@keyword.function."))
+            }),
+            "first delivery has no syntax highlighting: {ordinal}"
+        );
+        assert!(
+            matches!(
+                updates.try_recv(),
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+            ),
+            "initial demand queued a second context repaint"
+        );
     }
     for (ordinal, action) in ["stage", "unstage", "stage", "unstage"]
         .into_iter()
@@ -205,6 +218,65 @@ fn closing_pending_document_invalidates_adoption_without_releasing_live_charge()
     store.cancel_all();
     assert!(replacement.check().is_err());
     assert!(admission.iter().all(|admission| admission.check().is_err()));
+}
+
+#[tokio::test]
+async fn unstage_invalidates_cached_index_when_replacement_timestamp_moves_backwards() {
+    let (directory, service, _, writer) = fixture().await;
+    git(directory.path(), &["add", "sample.txt"]);
+    let index = directory.path().join(".git/index");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() + Duration::from_secs(3600)),
+        )
+        .unwrap();
+    let opened = service
+        .open(
+            DocumentId("unstage-index-clock".into()),
+            directory.path().to_owned(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(opened.file.len(), 1);
+    assert_eq!(opened.file[0].section, StatusSection::Staged);
+    let outcome = service
+        .input(input(&opened, "sample.txt", 1, "unstage"))
+        .await
+        .unwrap()
+        .finish()
+        .await
+        .unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
+    assert!(outcome.settlement_diagnostic.is_none());
+    assert!(git(directory.path(), &["diff", "--cached", "--name-only"]).is_empty());
+    let settled = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(settled.file.len(), 1);
+    assert_eq!(settled.file[0].section, StatusSection::Unstaged);
+    let delivery = service
+        .demand(input(&settled, "sample.txt", 2, "demand"))
+        .await
+        .unwrap();
+    let text = rows(delivery.snapshot.as_ref().unwrap()).join("\n");
+    assert!(text.contains("old") && text.contains("new"), "{text}");
+    service.refresh(&opened.document).await.unwrap();
+    let refreshed = service.snapshot(&opened.document).await.unwrap();
+    assert_eq!(refreshed.file.len(), 1);
+    assert_eq!(refreshed.file[0].section, StatusSection::Unstaged);
+    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"old\n");
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        b"new\n"
+    );
+    writer.acknowledge(outcome.operation);
 }
 
 #[tokio::test]
@@ -1532,12 +1604,10 @@ async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
         .unwrap();
     assert_eq!(delivery.state, BodyState::Ready);
     assert!(delivery.syntax_diagnostic.is_none());
-    let update = tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(update.phase, "context");
-    assert!(update.diagnostic.is_empty());
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     let refreshed = service.snapshot(&opened.document).await.unwrap();
     let loaded = body(&service, &refreshed, file(&refreshed, "syntax.rs", None)).await;
     let rows: Vec<_> = loaded
@@ -1758,11 +1828,10 @@ async fn semantic_display_group_stages_and_unstages_only_its_raw_hunks() {
             .demand(input(&opened, path, 1, "demand"))
             .await
             .unwrap();
-        let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(update.phase, "context");
+        assert!(matches!(
+            updates.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
         let snapshot = service.snapshot(&opened.document).await.unwrap();
         let selected = file(&snapshot, path, Some(StatusSection::Unstaged));
         let loaded = body(&service, &snapshot, selected).await;
@@ -1951,11 +2020,10 @@ async fn staging_one_raw_hunk_splits_shared_context_and_unstaging_merges_it_agai
         .demand(input(&opened, "engine.rs", 1, "demand"))
         .await
         .unwrap();
-    let update = tokio::time::timeout(Duration::from_secs(5), updates.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(update.phase, "context");
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     let snapshot = service.snapshot(&opened.document).await.unwrap();
     let selected = file(&snapshot, "engine.rs", Some(StatusSection::Unstaged));
     let loaded = body(&service, &snapshot, selected).await;
@@ -2354,11 +2422,10 @@ async fn optimistic_hunks_accept_stage_stage_unstage_before_git_and_preserve_con
         .demand(input(&opened, "sample.rs", 1, "demand"))
         .await
         .unwrap();
-    let update = tokio::time::timeout(std::time::Duration::from_secs(5), updates.recv())
-        .await
-        .unwrap()
-        .unwrap();
-    assert_eq!(update.phase, "context");
+    assert!(matches!(
+        updates.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
     let snapshot = service.snapshot(&opened.document).await.unwrap();
     let selected = file(&snapshot, "sample.rs", Some(StatusSection::Unstaged));
     let loaded = body(&service, &snapshot, selected).await;

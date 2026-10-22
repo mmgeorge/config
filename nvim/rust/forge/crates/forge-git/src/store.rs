@@ -138,7 +138,7 @@ impl RepositoryStore {
         let value = self
             .reads
             .submit(input_bytes, move |cancellation| {
-                let local = worker_repository.repository.to_thread_local();
+                let local = worker_repository.local_repository()?;
                 let result = work(local, cancellation);
                 drop(worker_repository);
                 result

@@ -54,12 +54,17 @@ pub struct RepositoryGeneration(u64);
 /// Owns one shared Git handle and the generation used to reject superseded read results.
 pub struct RepositoryState {
     pub identity: RepositoryIdentity,
-    pub(crate) repository: gix::ThreadSafeRepository,
+    repository: Mutex<RepositoryHandle>,
     generation: AtomicU64,
     observation: Mutex<ObservationState>,
     observation_collection: tokio::sync::Mutex<()>,
     pub(crate) revision: Mutex<RevisionState>,
     pub(crate) line_stats: crate::snapshot::LineStatsCache,
+}
+
+struct RepositoryHandle {
+    repository: gix::ThreadSafeRepository,
+    generation: RepositoryGeneration,
 }
 
 #[derive(Default)]
@@ -88,12 +93,39 @@ pub struct RepositorySnapshot {
 impl RepositoryState {
     /// Returns the repository's object format without reopening configuration or reading files.
     pub fn object_hash(&self) -> gix::hash::Kind {
-        self.repository.to_thread_local().object_hash()
+        self.repository
+            .lock()
+            .expect("repository handle lock")
+            .repository
+            .to_thread_local()
+            .object_hash()
     }
+
+    /// Acquires the generation's handle, reopening invalidated state on a blocking worker.
+    /// Reopen failures preserve the previous handle but never expose it as current.
+    pub(crate) fn local_repository(&self) -> Result<gix::Repository> {
+        let mut handle = self.repository.lock().expect("repository handle lock");
+        let generation = self.generation();
+        // gix retains its shared index when the replacement index's timestamp does not increase.
+        if handle.generation != generation {
+            let options = handle.repository.to_thread_local().open_options().clone();
+            let repository = gix::open_opts(&self.identity.git_directory, options)
+                .context("reopen invalidated Git repository")?;
+            *handle = RepositoryHandle {
+                repository: repository.into_sync(),
+                generation,
+            };
+        }
+        Ok(handle.repository.to_thread_local())
+    }
+
     pub(crate) fn new(identity: RepositoryIdentity, repository: gix::ThreadSafeRepository) -> Self {
         Self {
             identity,
-            repository,
+            repository: Mutex::new(RepositoryHandle {
+                repository,
+                generation: RepositoryGeneration(0),
+            }),
             generation: AtomicU64::new(0),
             observation: Mutex::new(ObservationState::default()),
             observation_collection: tokio::sync::Mutex::new(()),
@@ -434,6 +466,38 @@ mod tests {
                 .unwrap_err()
                 .to_string()
                 .contains("generation was superseded")
+        );
+    }
+
+    #[test]
+    fn invalidated_handle_reopen_failure_preserves_previous_handle_until_retry() {
+        let fixture = tempfile::tempdir().unwrap();
+        git(fixture.path(), &["init", "--quiet"]);
+        let (identity, shared) = crate::identity::discover_repository(fixture.path())
+            .unwrap()
+            .unwrap();
+        let repository = RepositoryState::new(identity, shared);
+        let object_hash = repository.object_hash();
+        let unavailable = fixture.path().join("git-unavailable");
+        std::fs::rename(&repository.identity.git_directory, &unavailable).unwrap();
+        repository.invalidate().unwrap();
+        let failure = repository.local_repository().unwrap_err();
+        assert!(
+            failure
+                .to_string()
+                .contains("reopen invalidated Git repository")
+        );
+        assert_eq!(repository.object_hash(), object_hash);
+        assert_eq!(
+            repository.repository.lock().unwrap().generation,
+            RepositoryGeneration(0)
+        );
+        std::fs::rename(unavailable, &repository.identity.git_directory).unwrap();
+        let local = repository.local_repository().unwrap();
+        assert_eq!(local.object_hash(), object_hash);
+        assert_eq!(
+            repository.repository.lock().unwrap().generation,
+            repository.generation()
         );
     }
 

@@ -668,6 +668,7 @@ impl StatusService {
     }
 
     pub async fn demand(&self, mut input: StatusInput) -> Result<BodyDelivery> {
+        let mut syntax_diagnostic = None;
         let owner = self.get(&input.document)?;
         let mut document = owner.lock().await;
         if matches!(input.location, StatusLocation::File { .. }) {
@@ -751,11 +752,13 @@ impl StatusService {
                 "status demand was superseded"
             );
             match loaded {
-                Ok((analysis, cursor, old_syntax, new_syntax, _diagnostic)) => {
+                Ok((analysis, cursor, old_syntax, new_syntax, diagnostic)) => {
                     file.analysis = Some(analysis);
                     file.cursor = Some(cursor);
                     file.old_syntax = old_syntax;
                     file.new_syntax = new_syntax;
+                    file.context_requested = true;
+                    syntax_diagnostic = diagnostic;
                     file.state = BodyState::Partial;
                 }
                 Err(error) => {
@@ -775,7 +778,12 @@ impl StatusService {
             .file
             .remove(&file_id)
             .context("status file disappeared")?;
-        let result = self.deliver(&mut document, &file_id, &mut file);
+        let result = self
+            .deliver(&mut document, &file_id, &mut file)
+            .map(|mut delivery| {
+                delivery.syntax_diagnostic = syntax_diagnostic;
+                delivery
+            });
         document.file.insert(file_id, file);
         self.queue_context(&mut document);
         result
@@ -1421,12 +1429,47 @@ impl StatusService {
             )
             .await?
         };
+        let (old_syntax, new_syntax, diagnostic) =
+            if let Some(language) = crate::source::language(&record.path) {
+                let ((old_syntax, old_diagnostic), (new_syntax, new_diagnostic)) = tokio::join!(
+                    optional_syntax(
+                        &self.syntax,
+                        SyntaxRequest {
+                            source: analysis.source().old.clone(),
+                            language,
+                            priority: WorkPriority::Visible,
+                            deadline: None,
+                        },
+                    ),
+                    optional_syntax(
+                        &self.syntax,
+                        SyntaxRequest {
+                            source: analysis.source().new.clone(),
+                            language,
+                            priority: WorkPriority::Visible,
+                            deadline: None,
+                        },
+                    ),
+                );
+                let diagnostic = old_diagnostic
+                    .into_iter()
+                    .chain(new_diagnostic)
+                    .collect::<Vec<_>>();
+                (
+                    old_syntax,
+                    new_syntax,
+                    (!diagnostic.is_empty()).then(|| diagnostic.join("\n")),
+                )
+            } else {
+                (None, None, None)
+            };
         ensure!(
             projected.is_some() || generation == repository.generation(),
             "status body source generation changed"
         );
-        let cursor = DisplayCursor::new(analysis.clone(), 3);
-        Ok((analysis, cursor, None, None, None))
+        let cursor = DisplayCursor::new(analysis.clone(), 3)
+            .with_syntax_context(old_syntax.as_ref(), new_syntax.as_ref());
+        Ok((analysis, cursor, old_syntax, new_syntax, diagnostic))
     }
 }
 

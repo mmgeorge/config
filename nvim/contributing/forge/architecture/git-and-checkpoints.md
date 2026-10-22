@@ -21,6 +21,14 @@ whose old directories still exist. Startup diagnostics record the cache state.
 
 ## Native status observation and mutation
 
+Repository invalidation expires the shared gix handle along with observations and
+line statistics. The next blocking worker reopens that handle with its original
+open options, and workers share it only within the same repository generation.
+This prevents gix's timestamp-based index cache from retaining staged entries when
+Git replaces the index with an equal or older timestamp. Status settlement, source
+acquisition, and explicit refresh all acquire the generation's handle. Reopen errors
+propagate without publishing cached state as a fresh observation.
+
 `StatusDocument` retains the displayed HEAD and each file's index state, worktree stamp,
 and rename-origin stamp. The private wire protocol uses the exact current version in `forge-protocol` and `protocol_contract.json`. Status, local previews,
 and comparisons publish `StatusSnapshot`, containing a document revision, view kind,
@@ -183,9 +191,13 @@ An unverified write outcome quarantines conflicting writes until a read-only rep
 observation reconciles the coordinator. A HEAD change cancels later queued mutations
 because their captured source comparison no longer has a valid base.
 
-Body delivery initially uses the available raw diff context. Native Tree-sitter analysis
-updates structural hunk context asynchronously and applies only when the file source and
-body generation still match. Rust sends semantic `StatusDelta` and `BodyDelivery` data,
+Initial body demand awaits native Tree-sitter analysis before constructing its first
+display chunk. Syntax colors and structural hunk context arrive with that chunk, rather
+than repainting an already expanded raw diff. Source and body-generation checks reject
+superseded analysis. Parsing runs outside the document lock, and Lua retains the collapsed
+heading while demand is in flight. Parse failures return the diff with an explicit syntax
+diagnostic. Later mutation-driven context work still runs asynchronously and validates
+the captured sources before adoption. Rust sends semantic `StatusDelta` and `BodyDelivery` data,
 while Lua formats text, highlights, decorations, folds, and cursor preservation. Large
 document events use bounded multipart transport and Lua publishes the update only after
 the complete event has been assembled and validated.

@@ -620,6 +620,7 @@ function M.apply_body(session, delivery)
     end
     return { kind = "Desynchronized", diagnostic = tostring(result) }
   end
+  if optional(delivery.syntax_diagnostic) then session.notice(delivery.syntax_diagnostic) end
   return result
 end
 
