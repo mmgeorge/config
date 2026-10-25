@@ -186,22 +186,78 @@ impl CheckConfig {
         Ok(())
     }
 
-    /// Orders prerequisites before dependents while preserving configured order among runnable checks.
+    /// Orders the catalog by preparation, category priority, and explicit prerequisites.
+    ///
+    /// Configured order breaks priority ties. Missing or cyclic prerequisites are errors.
     pub fn order(&self) -> Result<Vec<usize>> {
+        self.order_selected(
+            &self
+                .definitions
+                .iter()
+                .map(|definition| definition.id.clone())
+                .collect(),
+        )
+    }
+
+    /// Orders selected preparation and its prerequisites before unrelated verification.
+    ///
+    /// Includes unselected catalog entries without promoting their preparation prerequisites.
+    /// Explicit dependencies precede category priority. Missing or cyclic prerequisites are errors.
+    pub(crate) fn order_selected(&self, selected: &BTreeSet<String>) -> Result<Vec<usize>> {
+        // Promote preparation prerequisites so unrelated verification cannot precede source edits.
+        let mut preparation: BTreeSet<_> = self
+            .definitions
+            .iter()
+            .filter(|definition| {
+                selected.contains(&definition.id) && definition.purpose == CheckPurpose::Prepare
+            })
+            .map(|definition| definition.id.as_str())
+            .collect();
+        let mut pending: Vec<_> = preparation.iter().copied().collect();
+        while let Some(id) = pending.pop() {
+            let definition = self
+                .definitions
+                .iter()
+                .find(|definition| definition.id == id)
+                .with_context(|| format!("missing check prerequisite: {id}"))?;
+            for dependency in &definition.depends_on {
+                if preparation.insert(dependency.as_str()) {
+                    pending.push(dependency.as_str());
+                }
+            }
+        }
         let mut ordered = Vec::new();
-        let mut ready = BTreeSet::new();
+        let mut completed = BTreeSet::new();
+        // Apply category priority only after each check's prerequisites have been ordered.
         while ordered.len() < self.definitions.len() {
-            let next = self.definitions.iter().enumerate().find(|(_, definition)| {
-                !ready.contains(definition.id.as_str())
-                    && definition
-                        .depends_on
-                        .iter()
-                        .all(|id| ready.contains(id.as_str()))
-            });
+            let next = self
+                .definitions
+                .iter()
+                .enumerate()
+                .filter(|(_, definition)| {
+                    !completed.contains(definition.id.as_str())
+                        && definition
+                            .depends_on
+                            .iter()
+                            .all(|id| completed.contains(id.as_str()))
+                })
+                .min_by_key(|(index, definition)| {
+                    let category = match definition.category {
+                        CheckCategory::Format => 0,
+                        CheckCategory::Lint | CheckCategory::Check => 1,
+                        CheckCategory::Test => 2,
+                        CheckCategory::Build => 3,
+                    };
+                    (
+                        !preparation.contains(definition.id.as_str()),
+                        category,
+                        *index,
+                    )
+                });
             let Some((index, definition)) = next else {
                 anyhow::bail!("checks has missing or cyclic prerequisites");
             };
-            ready.insert(definition.id.as_str());
+            completed.insert(definition.id.as_str());
             ordered.push(index);
         }
         Ok(ordered)

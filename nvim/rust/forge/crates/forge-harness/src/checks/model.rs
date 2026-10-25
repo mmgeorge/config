@@ -256,10 +256,6 @@ impl CheckRun {
         if failed > 0 {
             summary.push(format!("{failed} failed"));
         }
-        let skipped = count(CheckState::Skipped) + count(CheckState::Pending);
-        if skipped > 0 {
-            summary.push(format!("{skipped} not run"));
-        }
         for (state, label) in [
             (CheckState::Interrupted, "interrupted"),
             (CheckState::Blocked, "blocked"),

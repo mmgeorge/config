@@ -421,7 +421,7 @@ impl CheckSupervisor {
                 has_scope,
             )?
         };
-        for index in effective.order()? {
+        for index in effective.order_selected(&requested)? {
             let definition = &effective.definitions[index];
             let applicability = applicability
                 .iter()

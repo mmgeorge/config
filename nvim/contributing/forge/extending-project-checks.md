@@ -19,6 +19,14 @@ configuration examples. Parser and LSP integration is separate and follows
 
 ## Current contracts
 
+Categories describe purpose and supply default execution priority, not success
+dependencies. The shared ordering policy runs selected preparation and its
+prerequisites before unrelated verification, then chooses runnable checks by
+format, lint/check, test, and build. Preserve definition order within a priority.
+Use explicit dependencies for required successful artifacts, including a build
+consumed by an integration test. Keep that consumer categorized as a test.
+Preview and execution must use the same selected set when ordering preparation.
+
 Triggers determine whether a definition applies. `files_changed` and `paths`
 match changed paths, while the definition's scope chooses all, changed-file,
 changed-case, or new-case coverage. Package membership is an operation capability

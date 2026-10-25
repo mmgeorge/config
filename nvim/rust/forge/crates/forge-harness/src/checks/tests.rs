@@ -33,6 +33,113 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
 }
 
 #[test]
+fn check_order_prioritizes_categories_and_preserves_ties() -> Result<()> {
+    let definitions = [
+        ("build", CheckCategory::Build),
+        ("test-first", CheckCategory::Test),
+        ("check", CheckCategory::Check),
+        ("lint", CheckCategory::Lint),
+        ("format", CheckCategory::Format),
+        ("test-second", CheckCategory::Test),
+    ]
+    .into_iter()
+    .map(|(id, category)| {
+        let mut check = definition(id, "exit 0");
+        check.category = category;
+        check
+    })
+    .collect();
+    let config = CheckConfig {
+        version: 2,
+        definitions,
+    };
+    assert_eq!(config.order()?, vec![4, 2, 3, 1, 5, 0]);
+    assert!(
+        CheckConfig {
+            version: 2,
+            definitions: Vec::new()
+        }
+        .order()?
+        .is_empty()
+    );
+    Ok(())
+}
+
+#[test]
+fn check_order_runs_build_consumers_after_build_without_delaying_unit_tests() -> Result<()> {
+    let mut integration = definition("integration", "exit 0");
+    integration.depends_on = vec!["build".into()];
+    let mut build = definition("build", "exit 0");
+    build.category = CheckCategory::Build;
+    let config = CheckConfig {
+        version: 2,
+        definitions: vec![integration, build, definition("unit", "exit 0")],
+    };
+    assert_eq!(config.order()?, vec![2, 1, 0]);
+    Ok(())
+}
+
+#[test]
+fn check_order_prepares_source_before_read_only_formatting() -> Result<()> {
+    let mut verification = definition("format-check", "exit 0");
+    verification.category = CheckCategory::Format;
+    let mut preparation = definition("generate", "exit 0");
+    preparation.purpose = CheckPurpose::Prepare;
+    let config = CheckConfig {
+        version: 2,
+        definitions: vec![verification, preparation],
+    };
+    assert_eq!(config.order()?, vec![1, 0]);
+    Ok(())
+}
+
+#[test]
+fn check_order_promotes_transitive_preparation_prerequisites_only_when_selected() -> Result<()> {
+    let mut build = definition("generator-build", "exit 0");
+    build.category = CheckCategory::Build;
+    build.depends_on = vec!["generator-check".into()];
+    let mut preparation = definition("generate", "exit 0");
+    preparation.purpose = CheckPurpose::Prepare;
+    preparation.depends_on = vec!["generator-build".into()];
+    let config = CheckConfig {
+        version: 2,
+        definitions: vec![
+            definition("unit", "exit 0"),
+            build,
+            preparation,
+            definition("generator-check", "exit 0"),
+        ],
+    };
+    assert_eq!(config.order()?, vec![3, 1, 2, 0]);
+    assert_eq!(
+        config.order_selected(&["unit".into(), "generator-build".into()].into())?,
+        vec![0, 3, 1, 2],
+    );
+    Ok(())
+}
+
+#[test]
+fn check_order_rejects_missing_and_cyclic_prerequisites() {
+    let mut check = definition("test", "exit 0");
+    check.depends_on = vec!["missing".into()];
+    let mut config = CheckConfig {
+        version: 2,
+        definitions: vec![check],
+    };
+    assert!(config.order().is_err());
+    config.definitions[0].purpose = CheckPurpose::Prepare;
+    assert!(config.order().is_err());
+    config.definitions[0].depends_on = vec!["test".into()];
+    assert!(config.order().is_err());
+    let mut build = definition("build", "exit 0");
+    build.category = CheckCategory::Build;
+    build.depends_on = vec!["test".into()];
+    config.definitions[0].depends_on = vec!["build".into()];
+    config.definitions.push(build);
+    assert!(config.order().is_err());
+}
+
+#[test]
 fn relative_check_paths_validate_structure_without_a_byte_ceiling() -> Result<()> {
     let path = format!("{}helper.nu", "directory/".repeat(512));
     assert_eq!(
@@ -516,6 +623,88 @@ async fn preparation_changes_inputs_and_allows_dependent_verification() -> Resul
     );
     assert_eq!(run.commands[0].exit_code, Some(0));
     assert!(run.commands[1].started_at_ms.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn check_order_matches_preview_and_execution_without_success_dependencies() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    std::fs::write(workspace.path().join("source.txt"), "before")?;
+    let mut build = definition("build", "if (open --raw source.txt) != 'after' { exit 1 }");
+    build.category = CheckCategory::Build;
+    let mut preparation = definition("prepare", "'after' | save --force source.txt");
+    preparation.purpose = CheckPurpose::Prepare;
+    let mut format = definition("format", "if (open --raw source.txt) != 'after' { exit 1 }");
+    format.category = CheckCategory::Format;
+    let mut integration = definition("integration", "exit 0");
+    integration.depends_on = vec!["build".into()];
+    save(
+        workspace.path(),
+        vec![
+            integration,
+            build,
+            definition("unit", "exit 1"),
+            format,
+            preparation,
+        ],
+    );
+    let config = ConfigSnapshot::load(workspace.path())?.config;
+    let preview = super::preview::resolve(
+        workspace.path(),
+        &config,
+        &["source.txt".into()],
+        None,
+        None,
+        false,
+        &[],
+    )
+    .await?;
+    assert_eq!(
+        preview
+            .iter()
+            .map(|check| check.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["prepare", "format", "unit", "build", "integration"],
+    );
+    let runner = make_runner(workspace.path(), data.path());
+    begin_recorded_task(workspace.path(), data.path(), &runner).await?;
+    let run = runner.prepare_request(
+        RunRequest {
+            all: true,
+            ..Default::default()
+        },
+        Some("recorded-task".into()),
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
+    assert_eq!(
+        run.commands
+            .iter()
+            .map(|command| { command.context.as_ref().unwrap().definition_id.as_str() })
+            .collect::<Vec<_>>(),
+        vec!["prepare", "format", "unit", "build", "integration"],
+    );
+    let run = runner.run(run, None, None).await?;
+    assert_eq!(run.state, CheckState::Failed, "{:?}", run.commands);
+    assert_eq!(
+        run.commands
+            .iter()
+            .map(|command| command.state)
+            .collect::<Vec<_>>(),
+        vec![
+            CheckState::Passed,
+            CheckState::Passed,
+            CheckState::Failed,
+            CheckState::Passed,
+            CheckState::Passed
+        ],
+    );
+    assert!(
+        run.commands
+            .iter()
+            .all(|command| command.evidence.is_some())
+    );
     Ok(())
 }
 
@@ -2197,6 +2386,7 @@ fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
             definition("failure", "exit 1"),
             definition("cancelled", "exit 0"),
             definition("pending", "exit 0"),
+            definition("skipped", "exit 0"),
         ],
     );
     let runner = make_runner(workspace.path(), data.path());
@@ -2211,9 +2401,11 @@ fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
     )?;
     run.commands[0].state = CheckState::Failed;
     run.commands[1].state = CheckState::Interrupted;
-    assert!(run.summary().contains("1 failed"));
-    assert!(run.summary().contains("1 interrupted"));
-    assert!(run.summary().contains("1 not run"));
+    run.commands[3].state = CheckState::Skipped;
+    assert_eq!(run.summary(), "0 passed · 1 failed · 1 interrupted");
+    run.commands[0].state = CheckState::Passed;
+    run.commands[1].state = CheckState::Stale;
+    assert_eq!(run.summary(), "1 passed · 1 stale");
     Ok(())
 }
 

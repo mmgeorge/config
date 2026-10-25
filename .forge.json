@@ -3,16 +3,61 @@
     "version": 2,
     "definitions": [
       {
-        "id": "forge-build",
-        "name": "Forge debug executable",
-        "category": "build",
+        "id": "forge-rust-format-fix",
+        "name": "Affected Rust package formatting fix",
+        "category": "format",
+        "purpose": "prepare",
         "enabled": true,
         "auto": true,
         "area": "Forge Rust",
         "trigger": {
           "kind": "paths",
           "include": [
-            "nvim/rust/forge/**"
+            "nvim/rust/forge/src/**/*.rs",
+            "nvim/rust/forge/crates/**/*.rs",
+            "nvim/rust/forge/crates/**/Cargo.toml",
+            "nvim/rust/forge/tests/**/*.rs",
+            "nvim/rust/forge/crates/**/tests/**/*.rs"
+          ],
+          "exclude": [
+            "**/target/**",
+            "**/node_modules/**"
+          ]
+        },
+        "scope": "changed_files",
+        "directory": "nvim/rust/forge",
+        "all": {
+          "command": "cargo",
+          "args": [
+            "fmt",
+            "--all"
+          ]
+        },
+        "files": {
+          "command": "cargo",
+          "args": [
+            "fmt",
+            "--package",
+            "{package.name}"
+          ],
+          "package_manager": "cargo"
+        },
+        "cases": null,
+        "depends_on": []
+      },
+      {
+        "id": "forge-rust-workspace-format-fix",
+        "name": "Shared-configuration Rust formatting fix",
+        "category": "format",
+        "purpose": "prepare",
+        "enabled": true,
+        "auto": true,
+        "area": "Forge Rust",
+        "trigger": {
+          "kind": "paths",
+          "include": [
+            "nvim/rust/forge/Cargo.toml",
+            "nvim/rust/forge/rust-toolchain.toml"
           ],
           "exclude": [
             "**/target/**",
@@ -24,38 +69,8 @@
         "all": {
           "command": "cargo",
           "args": [
-            "build",
-            "--profile",
-            "dev",
-            "--locked",
-            "--bin",
-            "forge"
-          ]
-        },
-        "files": null,
-        "cases": null,
-        "depends_on": []
-      },
-      {
-        "id": "forge-build-release",
-        "name": "Forge release executable",
-        "category": "build",
-        "enabled": true,
-        "auto": false,
-        "area": "Forge Rust",
-        "trigger": {
-          "kind": "manual"
-        },
-        "scope": "all",
-        "directory": "nvim/rust/forge",
-        "all": {
-          "command": "cargo",
-          "args": [
-            "build",
-            "--release",
-            "--locked",
-            "--bin",
-            "forge"
+            "fmt",
+            "--all"
           ]
         },
         "files": null,
@@ -66,6 +81,7 @@
         "id": "forge-rust-tests",
         "name": "Affected Forge Rust package tests",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Forge Rust",
@@ -128,16 +144,13 @@
           ],
           "package_manager": "cargo"
         },
-        "depends_on": [
-          "forge-build",
-          "forge-rust-format-fix",
-          "forge-rust-workspace-format-fix"
-        ]
+        "depends_on": []
       },
       {
         "id": "forge-rust-workspace-tests",
         "name": "Shared-configuration Rust tests",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Forge Rust",
@@ -172,16 +185,13 @@
         },
         "files": null,
         "cases": null,
-        "depends_on": [
-          "forge-build",
-          "forge-rust-format-fix",
-          "forge-rust-workspace-format-fix"
-        ]
+        "depends_on": []
       },
       {
         "id": "forge-rust-clippy",
         "name": "Forge Clippy",
         "category": "lint",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Forge Rust",
@@ -231,63 +241,17 @@
         "depends_on": []
       },
       {
-        "id": "forge-rust-format-fix",
-        "purpose": "prepare",
-        "name": "Affected Rust package formatting fix",
-        "category": "format",
+        "id": "forge-build",
+        "name": "Forge debug executable",
+        "category": "build",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Forge Rust",
         "trigger": {
           "kind": "paths",
           "include": [
-            "nvim/rust/forge/src/**/*.rs",
-            "nvim/rust/forge/crates/**/*.rs",
-            "nvim/rust/forge/crates/**/Cargo.toml",
-            "nvim/rust/forge/tests/**/*.rs",
-            "nvim/rust/forge/crates/**/tests/**/*.rs"
-          ],
-          "exclude": [
-            "**/target/**",
-            "**/node_modules/**"
-          ]
-        },
-        "scope": "changed_files",
-        "directory": "nvim/rust/forge",
-        "all": {
-          "command": "cargo",
-          "args": [
-            "fmt",
-            "--all"
-          ]
-        },
-        "files": {
-          "command": "cargo",
-          "args": [
-            "fmt",
-            "--package",
-            "{package.name}"
-          ],
-          "package_manager": "cargo"
-        },
-        "cases": null,
-        "depends_on": [
-          "forge-build"
-        ]
-      },
-      {
-        "id": "forge-rust-workspace-format-fix",
-        "purpose": "prepare",
-        "name": "Shared-configuration Rust formatting fix",
-        "category": "format",
-        "enabled": true,
-        "auto": true,
-        "area": "Forge Rust",
-        "trigger": {
-          "kind": "paths",
-          "include": [
-            "nvim/rust/forge/Cargo.toml",
-            "nvim/rust/forge/rust-toolchain.toml"
+            "nvim/rust/forge/**"
           ],
           "exclude": [
             "**/target/**",
@@ -299,20 +263,50 @@
         "all": {
           "command": "cargo",
           "args": [
-            "fmt",
-            "--all"
+            "build",
+            "--profile",
+            "dev",
+            "--locked",
+            "--bin",
+            "forge"
           ]
         },
         "files": null,
         "cases": null,
-        "depends_on": [
-          "forge-build"
-        ]
+        "depends_on": []
+      },
+      {
+        "id": "forge-build-release",
+        "name": "Forge release executable",
+        "category": "build",
+        "purpose": "verify",
+        "enabled": true,
+        "auto": false,
+        "area": "Forge Rust",
+        "trigger": {
+          "kind": "manual"
+        },
+        "scope": "all",
+        "directory": "nvim/rust/forge",
+        "all": {
+          "command": "cargo",
+          "args": [
+            "build",
+            "--release",
+            "--locked",
+            "--bin",
+            "forge"
+          ]
+        },
+        "files": null,
+        "cases": null,
+        "depends_on": []
       },
       {
         "id": "lua-affected",
         "name": "Affected Lua feature suites",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Lua",
@@ -432,6 +426,7 @@
         "id": "forge-lua-shared",
         "name": "Shared components",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Shared components",
@@ -494,6 +489,7 @@
         "id": "forge-lua-rendering",
         "name": "Rendering",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Rendering",
@@ -557,6 +553,7 @@
         "id": "forge-lua-github",
         "name": "GitHub",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua GitHub",
@@ -611,6 +608,7 @@
         "id": "forge-lua-buffer",
         "name": "Buffers and folds",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Buffers and folds",
@@ -659,6 +657,7 @@
         "id": "forge-lua-status-git",
         "name": "Status and Git",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Status and Git",
@@ -725,6 +724,7 @@
         "id": "forge-lua-extended",
         "name": "Extended integration",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Extended integration",
@@ -757,6 +757,7 @@
         "id": "forge-lua-sessions",
         "name": "Sessions",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Sessions",
@@ -830,6 +831,7 @@
         "id": "forge-lua-controls",
         "name": "Controls",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Controls",
@@ -888,6 +890,7 @@
         "id": "forge-lua-composer",
         "name": "Composer and queue",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Composer and queue",
@@ -938,6 +941,7 @@
         "id": "forge-lua-review-documents",
         "name": "Review documents",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Review documents",
@@ -1000,6 +1004,7 @@
         "id": "forge-lua-editing",
         "name": "Editing",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Editing",
@@ -1047,6 +1052,7 @@
         "id": "forge-lua-timeline-layout",
         "name": "Timeline layout",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Timeline layout",
@@ -1100,6 +1106,7 @@
         "id": "forge-lua-providers",
         "name": "Providers and settings",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Providers and settings",
@@ -1160,6 +1167,7 @@
         "id": "forge-lua-permissions",
         "name": "Permissions and questions",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Permissions and questions",
@@ -1206,6 +1214,7 @@
         "id": "forge-lua-timeline-stream",
         "name": "Timeline streaming",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Timeline streaming",
@@ -1258,6 +1267,7 @@
         "id": "forge-lua-plan-editor",
         "name": "Plan editor",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Plan editor",
@@ -1320,6 +1330,7 @@
         "id": "forge-lua-plan-workflow",
         "name": "Plan workflow",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Plan workflow",
@@ -1371,6 +1382,7 @@
         "id": "forge-lua-walkthrough",
         "name": "Walkthrough",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Walkthrough",
@@ -1410,6 +1422,7 @@
         "id": "forge-lua-lsp",
         "name": "LSP",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua LSP",
@@ -1454,6 +1467,7 @@
         "id": "forge-lua-transport",
         "name": "Transport",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Transport",
@@ -1501,6 +1515,7 @@
         "id": "forge-lua-benchmarks",
         "name": "Benchmarks and resources",
         "category": "test",
+        "purpose": "verify",
         "enabled": true,
         "auto": false,
         "area": "Lua Benchmarks and resources",
@@ -1532,6 +1547,7 @@
         "id": "nushell-syntax",
         "name": "Nushell syntax",
         "category": "check",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Nushell",
@@ -1560,6 +1576,7 @@
         "id": "rulesync-local",
         "name": "Local Rulesync dry run",
         "category": "check",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Rulesync",
@@ -1591,6 +1608,7 @@
         "id": "rulesync-global",
         "name": "Global Rulesync dry run",
         "category": "check",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Rulesync",
@@ -1626,6 +1644,7 @@
         "id": "whitespace",
         "name": "Patch whitespace",
         "category": "format",
+        "purpose": "verify",
         "enabled": true,
         "auto": true,
         "area": "Repository",

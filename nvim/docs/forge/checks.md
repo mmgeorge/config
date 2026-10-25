@@ -39,8 +39,8 @@ commands have settled.
 Submitting a new message during checks stops the previous execution and collects
 its running checks before starting the message. The composer retains newer drafts
 while that interruption finishes.
-Completed runs retain the full details. Result summaries omit configuration-error
-counts and show a failed count only when more than one check failed.
+Completed runs retain the full details. Result summaries omit not-run counts while
+preserving passed, failed, interrupted, stale, and other error counts.
 
 `enabled` controls whether a check can run. `auto` controls automatic selection
 and defaults to `true` when omitted. An enabled check with `auto: false` remains
@@ -90,6 +90,26 @@ Direct
 terminal builds, tests, linters, formatters, and validation scripts do not record
 coverage and must not replace check runs. During plan implementation and
 resolution, agents finish the phase and let Harness Checking run validation.
+
+## Execution order
+
+Harness runs selected source preparation and its transitive prerequisites before
+unrelated verification. Among checks whose prerequisites have been ordered, the
+default priority is **format → lint/check → test → build**. Lint and check share
+one priority. Definition order breaks ties.
+
+Explicit `depends_on` prerequisites take precedence over category priority.
+A host integration test remains a `test` check and depends on the `build` check
+whose executable it launches. Independent unit tests run before that build.
+Categories do not create success dependencies or select additional checks.
+A failed independent test therefore does not suppress a build unless the build
+explicitly depends on it.
+
+Use `purpose: "prepare"` for source-changing commands and reserve `depends_on`
+for checks that require a successful prerequisite. Unselected preparation does
+not promote its prerequisites ahead of selected verification. Preparation that
+requires verification can still invalidate that prerequisite's evidence when it
+changes source. Keep those dependencies only when the prerequisite is required.
 
 ## Completion and repair
 

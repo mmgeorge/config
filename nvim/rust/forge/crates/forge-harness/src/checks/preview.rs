@@ -106,7 +106,7 @@ pub(super) async fn resolve(
     };
     let mut resolver = super::invocation::InvocationResolver::default();
     let mut result = Vec::new();
-    for index in config.order()? {
+    for index in config.order_selected(&request.ids.iter().cloned().collect())? {
         let definition = &config.definitions[index];
         let applicable = applicability
             .iter()

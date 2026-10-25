@@ -63,6 +63,22 @@ before saving. Read-only source and package-metadata discovery are unaffected.
 The build commands below define the required artifact and flags. Harness agents
 must execute them as configured checks when working inside Harness.
 
+Harness prioritizes runnable checks as **format, lint/check, test, build** and runs
+selected source preparation and its prerequisites before unrelated verification.
+Explicit dependencies take precedence. Reserve dependencies for checks that
+require a successful prerequisite, not merely to reproduce category ordering.
+Do not make formatters or unit tests depend on the final executable build.
+For explicit targeted Rust runs, select the matching formatter, `forge-rust-tests`,
+and `forge-build` together, retaining the case or file selection on
+`forge-rust-tests`. Package changes use `forge-rust-format-fix`, while shared
+configuration changes use `forge-rust-workspace-format-fix`. Category ordering
+does not select additional checks. Without task-relative Rust changes, supply
+concrete formatter files or explicitly select its `all` operation if formatting
+is required. An empty formatter selection does not skip independent tests or
+builds. Host-based editor integration tests depend on `forge-build` because they
+consume its executable. Do not edit source after the final build without
+repeating the affected sequence.
+
 ## Manual Rust Builds
 
 The agent or developer changing Forge owns rebuilding its Rust executable. After

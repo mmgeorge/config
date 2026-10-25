@@ -10,6 +10,28 @@ by `nvim/rust/forge/rust-toolchain.toml`, and the platform C compiler. Real lang
 fixtures also need Git and the selected language server. TypeScript fixtures need
 Node/npm and the native TypeScript server, with their dependency installed locally.
 
+## Validation order
+
+Harness prioritizes runnable checks as format, lint/check, test, and build.
+Selected source preparation and its prerequisites run before unrelated verification.
+Explicit dependencies take precedence, and configured order breaks priority ties.
+Formatting after a successful build changes its recorded inputs and makes that
+build stale. `.forge.json` reserves explicit dependencies for host integration
+and benchmark checks that require the built executable. Category ordering does
+not require earlier checks to pass. Full workspace coverage remains selected by
+shared-configuration changes rather than every package edit.
+
+Inside Harness, use configured checks rather than executing the commands below
+directly. For a targeted Rust run, select the matching formatter,
+`forge-rust-tests`, and `forge-build` together, retaining the exact case or file
+selection on `forge-rust-tests`. Use `forge-rust-format-fix` for package changes
+or `forge-rust-workspace-format-fix` for shared configuration. Explicit selection
+does not add checks through category ordering. If the task has no Rust changes
+and formatting is required, supply concrete formatter files or explicitly select
+its `all` operation. An empty formatter selection does not skip tests or builds.
+Host-based editor integration checks run after the build because they launch the
+resulting executable. Repeat the affected sequence if source changes afterward.
+
 ## Build the development executable
 
 Start at the repository root, then change to the Rust workspace so Cargo selects

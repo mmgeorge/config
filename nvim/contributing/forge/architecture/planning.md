@@ -709,8 +709,13 @@ Manual runs are generally unnecessary, but models may optionally call `checks_ru
 for earlier feedback where on-demand runs are available.
 Automatic checking does not admit a model exchange or report tokens.
 
-Checks execute serially in explicit dependency order through `/config Shell`. Independent
-checks continue after failures. Dependents of failed prerequisites are skipped with a reason.
+Checks execute serially through `/config Shell`. `CheckConfig::order_selected` promotes selected
+preparation and its transitive prerequisites before unrelated verification, then prioritizes
+runnable checks by format, lint/check, test, and build. Lint and check share a priority, and
+configured order breaks ties. Explicit dependencies take precedence, including tests that consume
+a built host. Catalog ordering uses the same policy with every definition selected. Previews and
+execution use their actual selected set so unselected preparation cannot promote verification.
+Independent checks continue after failures. Dependents of failed prerequisites are skipped with a reason.
 An enabled check with a disabled prerequisite is a configuration error. Categories do not
 imply dependencies. Formatting and lint errors therefore do not suppress independent tests.
 Run snapshots retain configuration, helper hashes, overrides, selections, matched paths, selection

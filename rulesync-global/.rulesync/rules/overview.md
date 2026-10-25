@@ -129,6 +129,13 @@ globs:
 
 # Testing
 
+- Order source validation as **format, lint/check, test, build**. Finish selected
+  source-changing preparation before unrelated verification. Use the runner's
+  category priority when supported, otherwise configure execution order explicitly.
+  Reserve success dependencies for required prerequisites rather than ordering
+  alone. Runtime integration tests that launch the executable depend on its build
+  and remain categorized as tests. Source changes afterward require repeating
+  affected checks.
 - Use unit tests with mocks to isolate module logic and integration tests with
   real modules to cover end-to-end boundaries.
 - Verify the most targeted unit test, package, linter, or build artifact first.

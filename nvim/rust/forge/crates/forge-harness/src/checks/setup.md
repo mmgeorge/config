@@ -46,12 +46,18 @@ for checks intentionally restricted to cases added or modified by an accepted pl
 Each definition also has
 enabled, auto (defaults to true), scope (all, changed_files, changed_cases, new_cases), directory (project-relative, default "."),
 all: {command}, optional files: {command}, optional cases: {command}, and depends_on: [id].
-Use static single-line commands for the configured shell. Choose execution order in definitions.
-Run preparation before dependent verification. For read-only checks, prefer build/check, test,
-lint, then format when no project constraint requires another order.
-Declare dependencies only when a check truly requires a successful prerequisite. Independent
-checks continue after failures. An explicitly empty definitions list is valid for projects
-without automated checks. Do not introduce dummy successful commands.
+Use static single-line commands for the configured shell. Harness prioritizes selected preparation
+and its transitive prerequisites before unrelated verification. Among runnable checks, category
+priority is format, lint/check, test, then build. Lint and check share a priority, and definition
+order breaks ties. Explicit dependencies take precedence, so integration tests that consume a
+built executable remain test checks and depend on that build. Do not invent an uncategorized
+check or change its category to control execution order.
+Declare dependencies only when a check truly requires a successful prerequisite, not merely
+to reproduce category ordering. Ordering does not select otherwise unrelated checks or require
+earlier categories to pass. Independent checks continue after failures. Keep source preparation
+independent of verification where possible, since source edits can invalidate prerequisite
+verification evidence. An explicitly empty definitions list is valid for projects without
+automated checks. Do not introduce dummy successful commands.
 
 Operations also support a direct form: {command: "cargo", args: [...], package_manager: "cargo"}.
 When args is present, command is an executable and args are separate process arguments, not shell
