@@ -21,6 +21,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 /// Owns project check admission, durable run history, and process cancellation for one session.
 pub struct CheckSupervisor {
+    pub(crate) session_id: String,
+    pub(crate) data_root: PathBuf,
     pub(crate) workspace: PathBuf,
     pub(crate) root: PathBuf,
     pub(super) changes: super::changes::CheckChanges,
@@ -130,6 +132,7 @@ impl Drop for CheckProcess {
 
 /// Captures task authority and concrete selectors before command admission.
 pub(crate) struct CheckAdmission {
+    pub owner: crate::timeline::TimelineOwner,
     pub request: RunRequest,
     pub overrides: BTreeMap<String, bool>,
     /// None means the task has no complete change inventory.
@@ -146,8 +149,30 @@ pub(crate) struct CheckAdmission {
 }
 
 impl CheckSupervisor {
+    pub(crate) fn session_owner(&self) -> crate::timeline::TimelineOwner {
+        crate::timeline::TimelineOwner::session(&self.session_id)
+    }
+
+    pub(crate) fn exchange_owner(
+        &self,
+        exchange_id: &str,
+    ) -> Result<crate::timeline::TimelineOwner> {
+        crate::storage::SqliteStore::open(&self.data_root)?
+            .capture_timeline_owner(&self.session_id, exchange_id)
+    }
+
+    fn validate_owner(&self, run: &CheckRun) -> Result<()> {
+        ensure!(
+            run.owner.session_id() == self.session_id,
+            "check ownership crosses sessions"
+        );
+        crate::storage::SqliteStore::open(&self.data_root)?.validate_timeline_owner(&run.owner)
+    }
+
     /// Reopens current-format history and marks detached execution interrupted without replaying commands.
     pub fn open(
+        session_id: String,
+        data_root: PathBuf,
         workspace: PathBuf,
         root: PathBuf,
         presentation: Arc<Mutex<SessionPresentation>>,
@@ -158,6 +183,10 @@ impl CheckSupervisor {
         let changes = super::changes::CheckChanges::open(&workspace, &root, objects, repositories)?;
         let mut records = BTreeMap::new();
         for mut run in Self::saved_history(&root)? {
+            ensure!(
+                run.owner.session_id() == session_id,
+                "saved check ownership crosses sessions"
+            );
             let path = root.join(&run.id).join("record.json");
             if run.state == CheckState::Running {
                 run.state = CheckState::Interrupted;
@@ -177,6 +206,8 @@ impl CheckSupervisor {
             records.insert(run.id.clone(), run);
         }
         Ok(Arc::new(Self {
+            session_id,
+            data_root,
             workspace,
             root,
             changes,
@@ -224,11 +255,11 @@ impl CheckSupervisor {
             if !path.exists() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
-            if value["version"] != 2 {
+            let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)?;
+            if value["version"] != 3 {
                 continue;
             }
-            let run: CheckRun = serde_json::from_value(value["run"].clone())?;
+            let run: CheckRun = crate::codec::from_value(value["run"].clone())?;
             ensure!(
                 directory.file_name().to_string_lossy() == run.id,
                 "check history identity differs from its directory"
@@ -339,6 +370,7 @@ impl CheckSupervisor {
         admission: CheckAdmission,
     ) -> Result<CheckRun> {
         let CheckAdmission {
+            owner,
             request,
             overrides,
             files,
@@ -350,6 +382,10 @@ impl CheckSupervisor {
             task_id,
             revision,
         } = admission;
+        ensure!(
+            owner.session_id() == self.session_id,
+            "check ownership crosses sessions"
+        );
         let mut effective = snapshot.config.clone();
         for definition in &mut effective.definitions {
             if let Some(enabled) = overrides.get(&definition.id) {
@@ -360,7 +396,7 @@ impl CheckSupervisor {
         let directory = self.root.join(&id);
         let mut run = CheckRun {
             id: id.clone(),
-            exchange_id: None,
+            owner: Box::new(owner),
             revision,
             context: Some(CheckRunContext {
                 automatic: false,
@@ -669,6 +705,7 @@ impl CheckSupervisor {
         run: &CheckRun,
         admission: Option<tokio::sync::OwnedSemaphorePermit>,
     ) -> Result<Arc<CheckCancellation>> {
+        self.validate_owner(run)?;
         let mut state = self
             .state
             .lock()
@@ -1333,6 +1370,16 @@ impl CheckSupervisor {
         run: &CheckRun,
         sink: Option<&BackendEventSink>,
     ) -> Result<()> {
+        self.validate_owner(run)?;
+        if let Some(previous) = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?
+            .records
+            .get(&run.id)
+        {
+            ensure!(previous.owner == run.owner, "check ownership cannot change");
+        }
         let path = self.root.join(&run.id).join("record.json");
         let record = run.clone();
         tokio::task::spawn_blocking(move || write_record(&path, &record))
@@ -1482,11 +1529,18 @@ pub(super) fn operation<'definition>(
 
 /// Atomically replaces one run record on a blocking persistence worker.
 pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
+    if path.exists() {
+        let existing: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)?;
+        if existing["version"] == 3 {
+            let previous: CheckRun = crate::codec::from_value(existing["run"].clone())?;
+            ensure!(previous.owner == run.owner, "check ownership cannot change");
+        }
+    }
     std::fs::create_dir_all(path.parent().context("check history path has no parent")?)?;
     let temporary = path.with_extension("tmp");
     std::fs::write(
         &temporary,
-        serde_json::to_vec(&serde_json::json!({"version":2,"run":run}))?,
+        crate::codec::to_vec(&serde_json::json!({"version":3,"run":crate::codec::to_value(run)?}))?,
     )?;
     std::fs::rename(temporary, path)?;
     Ok(())

@@ -20,7 +20,7 @@ mod design_tests;
 pub use design_tests::DesignTestChange;
 pub(crate) use design_tests::DesignTestSelection;
 pub(crate) mod calls;
-mod codec;
+use crate::codec;
 mod references;
 mod workspace_definition;
 pub use workspace_definition::{DefinitionLocation, WorkspaceDefinition};

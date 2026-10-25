@@ -31,6 +31,8 @@ pub enum TranscriptAction {
     },
     Diff {
         text: String,
+        #[serde(skip)]
+        syntax: bool,
     },
     File {
         path: String,
@@ -637,7 +639,10 @@ fn project_at_with_separator(
 
 impl TimelineRenderer<'_> {
     fn entry(&mut self, entry: &TimelineEntry, depth: usize) -> Result<()> {
-        ensure!(depth <= 16, "agent transcript nesting exceeds 16 levels");
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || self.entry_content(entry, depth))
+    }
+
+    fn entry_content(&mut self, entry: &TimelineEntry, depth: usize) -> Result<()> {
         match entry {
             TimelineEntry::Inherited {
                 captured_at_ms,
@@ -678,7 +683,6 @@ impl TimelineRenderer<'_> {
             TimelineEntry::Exchange {
                 exchange: interaction,
                 agent_by_id,
-                check_runs,
                 ..
             } => {
                 let agents = agent_by_id
@@ -686,27 +690,9 @@ impl TimelineRenderer<'_> {
                     .map(|(id, entry)| (id.as_str(), entry))
                     .collect();
                 self.interaction(interaction, &agents, depth)?;
-                for run in check_runs {
-                    self.checks(run, false)?;
-                }
             }
             TimelineEntry::Checks { run, .. } => self.checks(run, true)?,
-            TimelineEntry::SessionEvent { id, event, .. } => {
-                if let SessionEventKind::Compaction { compaction } = &event.detail {
-                    self.compaction(id, compaction)?;
-                    return Ok(());
-                }
-                let text = format!("◇ {}", session_event_text(&event.detail));
-                let action = match &event.detail {
-                    SessionEventKind::Forked {
-                        source_session_id, ..
-                    } => Some(TranscriptAction::Session {
-                        session_id: source_session_id.clone(),
-                    }),
-                    _ => None,
-                };
-                self.literal(id, &text, action)?;
-            }
+            TimelineEntry::SessionEvent { event, .. } => self.session_event(event)?,
             TimelineEntry::Status {
                 id,
                 status,
@@ -959,7 +945,20 @@ impl TimelineRenderer<'_> {
         exchange_id: Option<&str>,
         depth: usize,
     ) -> Result<()> {
-        ensure!(depth <= 16, "agent transcript nesting exceeds 16 levels");
+        stacker::maybe_grow(64 * 1024, 1024 * 1024, || {
+            self.agent_content(id, run, interaction, agent, exchange_id, depth)
+        })
+    }
+
+    fn agent_content(
+        &mut self,
+        id: &str,
+        run: &crate::agent::Agent,
+        interaction: &[Exchange],
+        agent: &[TimelineEntry],
+        exchange_id: Option<&str>,
+        depth: usize,
+    ) -> Result<()> {
         let exchange = exchange_id
             .and_then(|id| interaction.iter().find(|exchange| exchange.id == id))
             .or_else(|| interaction.last());
@@ -1202,7 +1201,7 @@ impl TimelineRenderer<'_> {
         let capture = heading.metadata.decoration[0].capture.clone();
         TranscriptRenderer::heading_marker(&mut heading, &capture);
         self.push(heading)?;
-        let section = self.begin_section(0);
+        let section = self.begin_section(2);
         self.content(
             interaction,
             agents,
@@ -1282,14 +1281,31 @@ impl TimelineRenderer<'_> {
             Some(&layout.questions),
             MarkdownRole::Response,
         )?;
-        self.content(
-            interaction,
-            agents,
-            depth,
-            &layout.continuation,
-            Some(&layout.questions),
-            MarkdownRole::Response,
-        )?;
+        let mut continuation = layout.continuation.as_slice();
+        while let Some(node) = continuation.first() {
+            let response = super::layout::is_final_response(interaction, node)?;
+            let mut count = 1;
+            while count < continuation.len()
+                && super::layout::is_final_response(interaction, continuation[count])? == response
+            {
+                count += 1;
+            }
+            let (content, remaining) = continuation.split_at(count);
+            let start = self.block.len();
+            let indent = if response { 0 } else { 2 };
+            self.margin += indent;
+            self.content(
+                interaction,
+                agents,
+                depth,
+                content,
+                Some(&layout.questions),
+                MarkdownRole::Response,
+            )?;
+            self.margin -= indent;
+            self.offset_layout(start, indent / 2);
+            continuation = remaining;
+        }
         Ok(())
     }
 
@@ -1559,59 +1575,116 @@ impl TimelineRenderer<'_> {
         questions: Option<&super::question::QuestionHistory<'exchange>>,
         response_role: MarkdownRole,
     ) -> Result<()> {
-        let mut visible_content = Vec::with_capacity(visible.len());
-        for node in visible {
-            if let ExchangeNode::TurnContent {
-                turn_id,
-                item: crate::turn::TurnItem::Message { id },
-                ..
-            } = node
-            {
-                let turn = interaction
-                    .turn
-                    .iter()
-                    .find(|turn| turn.id() == turn_id)
-                    .context("timeline content references a missing provider turn")?;
-                let message = turn
-                    .messages()
-                    .iter()
-                    .find(|message| message.id() == id)
-                    .context("timeline content references a missing message")?;
-                if message.kind() != crate::turn::MessageKind::Assistant
-                    || message.text().trim().is_empty()
-                {
-                    continue;
+        let content = interaction.thoughts(visible)?;
+        for part in &content.part {
+            match part {
+                crate::exchange::ThoughtPart::Boundary(nodes) => {
+                    self.content_nodes(
+                        interaction,
+                        agents,
+                        depth,
+                        &content,
+                        nodes,
+                        questions,
+                        response_role,
+                    )?;
+                }
+                crate::exchange::ThoughtPart::Thought(index) => {
+                    let thought = &content.thought[*index];
+                    let message = thought.message.filter(|message| {
+                        message.delivery() != crate::turn::MessageDelivery::Final
+                    });
+                    let section = if let Some(message) = message {
+                        self.markdown(thought.id, message.text(), MarkdownRole::Commentary)?;
+                        thought.has_activity().then(|| self.begin_section(2))
+                    } else {
+                        if let Some(message) = thought.message {
+                            self.markdown(thought.id, message.text(), response_role)?;
+                        }
+                        None
+                    };
+                    self.content_nodes(
+                        interaction,
+                        agents,
+                        depth,
+                        &content,
+                        &thought.events,
+                        questions,
+                        response_role,
+                    )?;
+                    let mut nodes = thought
+                        .tools
+                        .call
+                        .iter()
+                        .map(|call| call.node)
+                        .collect::<Vec<_>>();
+                    nodes.extend(thought.writes.call.iter().map(|call| call.node));
+                    self.content_nodes(
+                        interaction,
+                        agents,
+                        depth,
+                        &content,
+                        &nodes,
+                        questions,
+                        response_role,
+                    )?;
+                    if let Some(section) = section {
+                        let tools = thought.tools.call.len();
+                        let files = thought.changed_files();
+                        let mut suffix = String::new();
+                        if tools > 0 {
+                            suffix.push_str(&format!(
+                                " · {tools} {}",
+                                if tools == 1 { "tool" } else { "tools" }
+                            ));
+                        }
+                        if files > 0 {
+                            suffix.push_str(&format!(
+                                " · {files} {} changed",
+                                if files == 1 { "file" } else { "files" }
+                            ));
+                        }
+                        let heading = &mut self.block[section.start];
+                        let mut rows = heading
+                            .text
+                            .wire_rows()
+                            .into_iter()
+                            .map(str::to_owned)
+                            .collect::<Vec<_>>();
+                        if let Some(first) = rows.first_mut() {
+                            first.push_str(&suffix);
+                        }
+                        heading.text = forge_buffer::text::BufferText::from_rows(rows)?;
+                        self.finish_section(section, thought.id, true);
+                    }
                 }
             }
-            visible_content.push(*node);
         }
-        let visible = visible_content;
-        let mut question_turn = std::collections::HashSet::new();
-        let mut preceding_turn = None;
-        for node in interaction.node_list.iter() {
-            if let ExchangeNode::TurnContent { turn_id, .. } = node {
-                preceding_turn = Some(turn_id.as_str());
-            }
-            let question = match node {
-                ExchangeNode::QuestionPresented { .. } => true,
-                ExchangeNode::PlanEvent { event } => matches!(&event.content,
-                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                        if lifecycle.kind == crate::plan::PlanLifecycleKind::QuestionAsked),
-                _ => false,
-            };
-            if question {
-                if let Some(turn_id) = preceding_turn {
-                    question_turn.insert(turn_id);
-                }
-            }
-        }
-        let mut rendered_tool = std::collections::HashSet::new();
+        Ok(())
+    }
+
+    fn content_nodes<'exchange>(
+        &mut self,
+        interaction: &'exchange Exchange,
+        agents: &HashMap<&str, &TimelineEntry>,
+        depth: usize,
+        content: &crate::exchange::ThoughtContent<'exchange>,
+        visible: &[&'exchange ExchangeNode],
+        questions: Option<&super::question::QuestionHistory<'exchange>>,
+        response_role: MarkdownRole,
+    ) -> Result<()> {
         for (position, node) in visible.iter().enumerate() {
             if let Some(group) = questions.and_then(|history| history.group.get(node.id())) {
                 self.question_group(group, interaction, agents, depth)?;
                 continue;
             }
             match node {
+                ExchangeNode::TimelineEvent { event } => match event.as_ref() {
+                    crate::timeline::TimelineEvent::Check { run } => self.checks(run, false)?,
+                    crate::timeline::TimelineEvent::Session { event } => {
+                        self.session_event(event)?
+                    }
+                },
                 ExchangeNode::SkillRead { id, read, .. } => {
                     self.literal(
                         id,
@@ -1623,121 +1696,48 @@ impl TimelineRenderer<'_> {
                     )?;
                 }
                 ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
-                ExchangeNode::TurnContent { id, turn_id, item } => {
-                    let turn = interaction
-                        .turn
-                        .iter()
-                        .find(|turn| turn.id() == turn_id)
-                        .context("timeline content references a missing provider turn")?;
+                ExchangeNode::TurnContent { id, item, .. } => {
                     match item {
-                        crate::turn::TurnItem::Message { id: message_id } => {
-                            let message = turn
-                                .messages()
-                                .iter()
-                                .find(|message| message.id() == message_id)
-                                .context("timeline content references a missing message")?;
+                        crate::turn::TurnItem::Message { .. } => {
+                            let message =
+                                content
+                                    .thought(id)
+                                    .and_then(|thought| thought.message)
+                                    .context("timeline content references a missing message")?;
                             let final_message =
                                 message.delivery() == crate::turn::MessageDelivery::Final;
                             if final_message {
                                 self.markdown(id, message.text(), response_role)?;
                             } else {
-                                let start = self.block.len();
-                                self.margin += 2;
                                 self.markdown(id, message.text(), MarkdownRole::Commentary)?;
-                                self.margin -= 2;
-                                self.offset_layout(start, 1);
                             }
                         }
-                        crate::turn::TurnItem::Tool { id: tool_id } => {
-                            if rendered_tool.contains(id) {
+                        crate::turn::TurnItem::Tool { .. } => {
+                            let Some(group) = content.group(id) else {
                                 continue;
-                            }
-                            let tool = turn
-                                .tools()
-                                .find(|tool| tool.id == *tool_id)
-                                .context("timeline content references a missing tool")?;
-                            if tool.kind == "file_change" {
-                                let start = self.block.len();
-                                self.margin += 2;
-                                self.file_change(id, tool)?;
-                                self.margin -= 2;
-                                self.offset_layout(start, 1);
-                                continue;
-                            }
-                            let group =
-                                visible.iter().skip(position).take_while(|node| match node {
-                                    ExchangeNode::TurnContent {
-                                        turn_id: owner,
-                                        item: crate::turn::TurnItem::Tool { id },
-                                        ..
-                                    } => interaction
-                                        .turn
-                                        .iter()
-                                        .find(|turn| turn.id() == owner)
-                                        .and_then(|turn| turn.tools().find(|tool| tool.id == *id))
-                                        .is_some_and(|tool| tool.kind != "file_change"),
-                                    _ => false,
-                                });
-                            let mut calls = Vec::new();
-                            let mut group_end = position;
-                            for node in group {
-                                group_end += 1;
-                                let ExchangeNode::TurnContent {
-                                    id,
-                                    turn_id: owner,
-                                    item: crate::turn::TurnItem::Tool { id: tool_id },
-                                    ..
-                                } = node
-                                else {
-                                    unreachable!()
-                                };
-                                rendered_tool.insert(id.clone());
-                                let turn = interaction
-                                    .turn
-                                    .iter()
-                                    .find(|turn| turn.id() == owner)
-                                    .context(
-                                        "timeline content references a missing provider turn",
-                                    )?;
-                                let tool = turn
-                                    .tools()
-                                    .find(|tool| tool.id == *tool_id)
-                                    .context("timeline content references a missing tool")?;
-                                let question_control = tool
-                                    .title
-                                    .split('(')
-                                    .next()
-                                    .unwrap_or("")
-                                    .trim()
-                                    .ends_with("question_ask");
-                                let admitted_spawn = tool.title.split('(').next().unwrap_or("").trim()
-                                    .ends_with("agent_spawn")
-                                    && interaction.node_list.iter().any(|node| matches!(node,
-                                        ExchangeNode::AgentReference { agent }
-                                            if agent.parent_turn_id.as_deref() == Some(owner.as_str())));
-                                if !(question_control
-                                    && question_turn.contains(owner.as_str())
-                                    && !tool.failed
-                                    && tool.state() == crate::turn::ToolState::Completed)
-                                    && !(admitted_spawn
-                                        && !tool.failed
-                                        && tool.state() == crate::turn::ToolState::Completed)
-                                {
-                                    calls.push((id, turn, tool));
-                                }
-                            }
+                            };
+                            let file_change =
+                                matches!(group.kind, crate::exchange::ThoughtGroupKind::Writes);
+                            let calls = group
+                                .call
+                                .iter()
+                                .map(|call| (call.id, call.turn, call.tool))
+                                .collect::<Vec<_>>();
                             if calls.is_empty() {
                                 continue;
                             }
+                            if file_change {
+                                self.file_change_group(
+                                    id,
+                                    &calls.iter().map(|(_, _, tool)| *tool).collect::<Vec<_>>(),
+                                )?;
+                                continue;
+                            }
                             let start = self.block.len();
-                            self.margin += 2;
                             let count = calls.len();
-                            // Provider turns can end between adjacent calls. Only a visible successor
-                            // or the completed exchange prevents more tools from joining this group.
-                            let settled = interaction.completed_at_ms.is_some()
-                                || calls.iter().all(|(_, _, tool)| {
-                                    tool.state() != crate::turn::ToolState::Running
-                                }) && group_end < visible.len();
+                            // Alternating tools and writes share an activity section across turns.
+                            // Only a section boundary or exchange completion closes its tool group.
+                            let settled = !group.live;
                             let lifecycle = if settled {
                                 NodeLifecycle::Settled
                             } else {
@@ -1804,8 +1804,6 @@ impl TimelineRenderer<'_> {
                                 };
                                 node.resolve(self.expansion.get(&group_id).copied());
                             }
-                            self.margin -= 2;
-                            self.offset_layout(start, 1);
                         }
                     }
                 }
@@ -1848,8 +1846,6 @@ impl TimelineRenderer<'_> {
                     self.push(block)?;
                 }
                 ExchangeNode::AgentReference { agent } => {
-                    let start = self.block.len();
-                    self.margin += 2;
                     if let Some(entry) = agents
                         .get(agent.id.as_str())
                         .or_else(|| agents.get(agent.child_agent_id.as_str()))
@@ -1882,8 +1878,6 @@ impl TimelineRenderer<'_> {
                             }),
                         )?;
                     }
-                    self.margin -= 2;
-                    self.offset_layout(start, 1);
                 }
                 ExchangeNode::QuestionPresented {
                     id,
@@ -2407,6 +2401,104 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
+    fn file_change_group(&mut self, id: &str, calls: &[&crate::exchange::ToolCall]) -> Result<()> {
+        use crate::turn::ToolState;
+        let identity = format!("{id}:changes");
+        let start = self.block.len();
+        let (diff, warning) = crate::exchange::ProviderDiffBuilder::build_group(calls);
+        let pending: std::collections::HashSet<_> = calls
+            .iter()
+            .filter(|tool| tool.state() == crate::turn::ToolState::Running)
+            .flat_map(|tool| tool.change.file.iter())
+            .map(|file| file.move_path.as_ref().unwrap_or(&file.path))
+            .collect();
+        let running = calls
+            .iter()
+            .any(|tool| tool.state() == crate::turn::ToolState::Running);
+        let unsuccessful: Vec<_> = calls
+            .iter()
+            .enumerate()
+            .filter(|(_, tool)| {
+                tool.state() != ToolState::Running
+                    && (tool.failed || tool.state() != ToolState::Completed)
+            })
+            .collect();
+        let unavailable = calls.iter().any(|tool| {
+            tool.state() == ToolState::Completed && !tool.failed && tool.change.file.is_empty()
+        });
+        let mut outcome = String::new();
+        if !unsuccessful.is_empty() {
+            outcome.push_str(&format!(
+                " · {} unsuccessful {}",
+                unsuccessful.len(),
+                if unsuccessful.len() == 1 {
+                    "write"
+                } else {
+                    "writes"
+                }
+            ));
+        }
+        if unavailable {
+            outcome.push_str(" · edit details unavailable");
+        }
+        if warning.is_some() {
+            outcome.push_str(" · net diff unavailable");
+        }
+        if let Some(diff) = diff {
+            let mut suffix = if running {
+                if pending.is_empty() {
+                    " · changing files".to_owned()
+                } else {
+                    format!(
+                        " · changing {} {}",
+                        pending.len(),
+                        if pending.len() == 1 { "file" } else { "files" }
+                    )
+                }
+            } else {
+                String::new()
+            };
+            suffix.push_str(&outcome);
+            self.diff(&identity, "Changed", &diff, &suffix, None, None)?;
+        } else {
+            let label = if running {
+                if pending.is_empty() {
+                    "Changing files".to_owned()
+                } else {
+                    format!(
+                        "Changing {} {}",
+                        pending.len(),
+                        if pending.len() == 1 { "file" } else { "files" }
+                    )
+                }
+            } else if unsuccessful.len() == calls.len() {
+                "File changes".to_owned()
+            } else {
+                "Changed files · details unavailable".to_owned()
+            };
+            self.literal(&identity, &format!("◇ {label}{outcome}"), None)?;
+        }
+        let details_start = self.block.len();
+        self.margin += 2;
+        if let Some(warning) = warning {
+            self.literal(
+                &format!("{identity}:warning"),
+                &format!("◇ {warning}"),
+                None,
+            )?;
+        }
+        for (index, tool) in unsuccessful {
+            self.file_change(&format!("{id}:write:{index}"), tool)?;
+        }
+        self.margin -= 2;
+        if self.block.len() > details_start {
+            self.offset_layout(details_start, 1);
+            self.block[start].metadata.fold.clear();
+            self.fold(start, &identity, true, NodeKind::Changes);
+        }
+        Ok(())
+    }
+
     fn file_change(&mut self, id: &str, tool: &crate::exchange::ToolCall) -> Result<()> {
         use crate::turn::ToolState;
         let identity = format!("{id}:changes");
@@ -2448,6 +2540,25 @@ impl TimelineRenderer<'_> {
             self.finish_section(section, &identity, true);
         }
         Ok(())
+    }
+
+    fn session_event(&mut self, event: &crate::timeline::SessionEventRecord) -> Result<()> {
+        if let SessionEventKind::Compaction { compaction } = &event.detail {
+            return self.compaction(&event.id, compaction);
+        }
+        let action = match &event.detail {
+            SessionEventKind::Forked {
+                source_session_id, ..
+            } => Some(TranscriptAction::Session {
+                session_id: source_session_id.clone(),
+            }),
+            _ => None,
+        };
+        self.literal(
+            &event.id,
+            &format!("◇ {}", session_event_text(&event.detail)),
+            action,
+        )
     }
 
     fn checks(&mut self, run: &crate::checks::CheckRun, separate: bool) -> Result<()> {
@@ -2519,7 +2630,20 @@ impl TimelineRenderer<'_> {
             }
             self.finish_section(declarations, &format!("{}:declarations", run.id), true);
         }
-        for check in &run.commands {
+        for check in run.commands.iter().filter(|check| {
+            !matches!(
+                check.state,
+                crate::checks::CheckState::Pending | crate::checks::CheckState::Skipped
+            ) && (check.started_at_ms.is_some()
+                || matches!(
+                    check.state,
+                    crate::checks::CheckState::Passed
+                        | crate::checks::CheckState::Failed
+                        | crate::checks::CheckState::Blocked
+                        | crate::checks::CheckState::ConfigurationError
+                        | crate::checks::CheckState::ExecutionError
+                ))
+        }) {
             let command_start = self.block.len();
             let call_id = check.id.clone();
             let heading = crate::turn::ToolCall {
@@ -3259,7 +3383,6 @@ mod tests {
                     id: "exchange".into(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3282,7 +3405,6 @@ mod tests {
                     id: "exchange".into(),
                     created_at_ms: 0,
                     exchange: restored,
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3335,6 +3457,7 @@ mod tests {
                 event: crate::timeline::SessionEventRecord {
                     id: "compact".into(),
                     session_id: "session".into(),
+                    owner: crate::timeline::TimelineOwner::session(&"session"),
                     created_at_ms: 1,
                     detail: SessionEventKind::Compaction {
                         compaction: Compaction {
@@ -3381,6 +3504,7 @@ mod tests {
                     event: crate::timeline::SessionEventRecord {
                         id: "compaction".into(),
                         session_id: "session".into(),
+                        owner: crate::timeline::TimelineOwner::session(&"session"),
                         created_at_ms: 1_000,
                         detail: SessionEventKind::Compaction {
                             compaction: Compaction {
@@ -3463,7 +3587,6 @@ mod tests {
             id: "exchange".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let projected = project_at(&running, &WidthProfile::default(), 1500)?;
@@ -3489,7 +3612,6 @@ mod tests {
             id: "exchange".into(),
             created_at_ms: 0,
             exchange: restored,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let projected = project_at(&entry, &WidthProfile::default(), 5000)?;
@@ -3572,7 +3694,6 @@ mod tests {
                 id: "verify".into(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -3644,7 +3765,6 @@ mod tests {
                     id: "verify-result".into(),
                     created_at_ms: 0,
                     exchange,
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3746,7 +3866,6 @@ mod tests {
                     id: "phase".into(),
                     created_at_ms: 0,
                     exchange,
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -3845,7 +3964,6 @@ mod tests {
                 id: "review".into(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile {
@@ -3896,7 +4014,6 @@ mod tests {
                         id: "colored".into(),
                         created_at_ms: 0,
                         exchange: restored,
-                        check_runs: Vec::new(),
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -3944,7 +4061,6 @@ mod tests {
                     id: "legacy".into(),
                     created_at_ms: 0,
                     exchange,
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -4075,7 +4191,6 @@ mod tests {
                         id: exchange.id.clone(),
                         created_at_ms: 0,
                         exchange: exchange.clone(),
-                        check_runs: Vec::new(),
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -4153,8 +4268,8 @@ mod tests {
                     .unwrap();
                 assert_eq!(
                     tools.metadata.layout.as_ref().unwrap().indent,
-                    4,
-                    "continued tool groups must stay one level inside the exchange"
+                    6,
+                    "continued tool groups must nest inside their thought"
                 );
                 if planning_question.is_some() {
                     let question = text.find("Questions · 1/1 answered").unwrap();
@@ -4240,7 +4355,6 @@ mod tests {
             created_at_ms: 0,
             exchange,
             agent_by_id: HashMap::new(),
-            check_runs: Vec::new(),
         };
         assert!(
             project_at(&source, &WidthProfile::default(), 10)
@@ -4397,7 +4511,6 @@ mod tests {
                         id: exchange.id.clone(),
                         created_at_ms: 0,
                         exchange,
-                        check_runs: Vec::new(),
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
@@ -4632,7 +4745,6 @@ mod tests {
                 id: restored.id.clone(),
                 created_at_ms: 0,
                 exchange: restored,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4738,7 +4850,6 @@ mod tests {
                 id: reloaded.id.clone(),
                 created_at_ms: 0,
                 exchange: reloaded,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4779,7 +4890,6 @@ mod tests {
                 id: cancelled.id.clone(),
                 created_at_ms: 0,
                 exchange: cancelled,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4815,7 +4925,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4840,7 +4949,126 @@ mod tests {
     }
 
     #[test]
-    fn file_changes_split_tool_groups_and_restore_non_git_summary() -> anyhow::Result<()> {
+    fn commentary_closes_groups_and_unsuccessful_writes_remain_nested() -> anyhow::Result<()> {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
+            ProviderFileChange, ToolActivity, ToolActivityKind,
+        };
+        for boundary in ["commentary", "failed", "cancelled", "denied", "interrupted"] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"edits", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Write", "kind":"chat", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            exchange.resume(0)?;
+            let address = ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            };
+            exchange.start_turn(address.clone(), 0)?;
+            let mut event = BackendEvent {
+                received_at_ms: None,
+                address: Some(address),
+                turn_boundary: None,
+                kind: "tool".into(),
+                text: None,
+                data: serde_json::Value::Null,
+                summary: None,
+                task_update: None,
+                activity: None,
+            };
+            for (ordinal, name) in ["first", boundary, "last"].into_iter().enumerate() {
+                if name == "commentary" {
+                    event.kind = "assistant_message".into();
+                    event.text = Some("Continue after this message".into());
+                    event.data = json!({"message_id":"message", "phase":"commentary"});
+                    event.activity = None;
+                } else {
+                    event.kind = "tool".into();
+                    event.text = None;
+                    event.data = serde_json::Value::Null;
+                    event.activity = Some(ToolActivity {
+                        id: name.into(),
+                        title: name.into(),
+                        output: Some(format!("{name} details")),
+                        output_delta: false,
+                        kind: if name == "command" {
+                            ToolActivityKind::Command
+                        } else {
+                            ToolActivityKind::FileChange
+                        },
+                        status: Some(
+                            if ordinal == 1 && name != "command" {
+                                name
+                            } else {
+                                "completed"
+                            }
+                            .into(),
+                        ),
+                        change: ProviderChangeSet {
+                            file: vec![ProviderFileChange {
+                                path: format!("{name}.txt"),
+                                move_path: None,
+                                kind: ProviderChangeKind::Add,
+                                diff: "content\n".into(),
+                            }],
+                        },
+                    });
+                }
+                exchange.observe_turn(&event, ordinal as i64 + 1)?;
+            }
+            let rendered = project_at(
+                &TimelineEntry::Exchange {
+                    id: "edits".into(),
+                    created_at_ms: 0,
+                    exchange,
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                10,
+            )?;
+            let heading: Vec<_> = rendered
+                .entry
+                .block
+                .iter()
+                .filter(|block| block.id.0.ends_with(":changes") && block.id.0 != "edits:changes")
+                .map(|block| block.text.wire_rows().join(""))
+                .collect();
+            assert_eq!(
+                heading
+                    .iter()
+                    .filter(|text| text.contains(if boundary == "commentary" {
+                        "Changed 1 file"
+                    } else {
+                        "Changed 2 files"
+                    }))
+                    .count(),
+                if boundary == "commentary" { 2 } else { 1 },
+                "{boundary}: {heading:?}"
+            );
+            if !matches!(boundary, "command" | "commentary") {
+                assert!(
+                    heading
+                        .iter()
+                        .any(|text| text.contains(&format!("File changes {boundary}"))),
+                    "{heading:?}"
+                );
+                assert!(rendered.entry.block.iter().any(|block| {
+                    block
+                        .text
+                        .wire_rows()
+                        .join("")
+                        .contains(&format!("{boundary} details"))
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn alternating_tools_and_writes_share_groups_and_restore_non_git_summary() -> anyhow::Result<()>
+    {
         use crate::backend::{
             BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
             ProviderFileChange, ToolActivity, ToolActivityKind, TurnBoundary,
@@ -4930,19 +5158,19 @@ mod tests {
                         id: "edits".into(),
                         created_at_ms: 0,
                         exchange: exchange.clone(),
-                        check_runs: Vec::new(),
                         agent_by_id: HashMap::new(),
                     },
                     &WidthProfile::default(),
                     100,
                 )?;
-                assert!(
-                    projected.entry.block.iter().any(|block| block
+                assert!(projected.entry.block.iter().any(|block| {
+                    block
                         .text
                         .wire_rows()
                         .join("")
-                        .contains("Changing 1 file"))
-                );
+                        .to_lowercase()
+                        .contains("changing 1 file")
+                }));
             }
             event.activity.as_mut().unwrap().status = Some(status.into());
             exchange.observe_turn(&event, index as i64 * 10 + 2)?;
@@ -4959,7 +5187,6 @@ mod tests {
                 id: "edits".into(),
                 created_at_ms: 0,
                 exchange: restored,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -4970,21 +5197,17 @@ mod tests {
             .iter()
             .filter(|block| block.id.0.ends_with(":tools"))
             .collect();
-        assert_eq!(groups.len(), 3);
-        assert!(
-            groups
-                .iter()
-                .all(|block| block.text.wire_rows().join("").contains("Ran 1 tool"))
-        );
+        assert_eq!(groups.len(), 1);
+        assert!(groups[0].text.wire_rows().join("").contains("Ran 3 tools"));
         let headings: Vec<_> = blocks
             .iter()
             .filter(|block| block.id.0.ends_with(":changes"))
             .map(|block| block.text.wire_rows().join(""))
             .collect();
-        assert_eq!(headings.len(), 4);
-        assert!(headings[0].contains("Changed 1 file") && headings[1].contains("Changed 1 file"));
-        assert!(headings[2].contains("File changes failed"));
-        assert!(headings[3].contains("Changed 1 file") && headings[3].contains("reported edits"));
+        assert_eq!(headings.len(), 3);
+        assert!(headings[0].contains("Changed 1 file"));
+        assert!(headings[1].contains("File changes failed"));
+        assert!(headings[2].contains("Changed 1 file") && headings[2].contains("reported edits"));
         assert_eq!(
             projected.tool.len(),
             3,
@@ -5029,7 +5252,7 @@ mod tests {
             .get(&super::TargetId("edits:changes".into()))
             .unwrap()
         {
-            super::TranscriptAction::Diff { text } => text,
+            super::TranscriptAction::Diff { text, .. } => text,
             _ => panic!("aggregate must expose its reported patch"),
         };
         assert!(
@@ -5099,7 +5322,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5150,7 +5372,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5276,7 +5497,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5353,7 +5573,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5543,7 +5762,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),
@@ -5703,7 +5921,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -5731,7 +5948,7 @@ mod tests {
         assert!(projected.action.values().any(|action| matches!(action,
             super::TranscriptAction::File { path: target, line:1 } if target == path)));
         assert!(projected.action.values().any(|action| matches!(action,
-            super::TranscriptAction::Diff { text } if text.contains(path))));
+            super::TranscriptAction::Diff { text, .. } if text.contains(path))));
     }
 
     #[test]
@@ -5785,7 +6002,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -5814,6 +6030,55 @@ mod tests {
         assert!(!text.contains("Artifact:") && !text.contains("working.md"));
         assert!(projected.action.values().any(|action| matches!(action,
             super::TranscriptAction::Declaration { path, revision: 3, document: true, .. } if path == "Description")));
+    }
+
+    #[test]
+    fn agent_history_renders_beyond_former_nesting_limit() -> anyhow::Result<()> {
+        let mut child: Option<TimelineEntry> = None;
+        for index in (0..32).rev() {
+            let id = format!("agent-{index}");
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":id,"session_id":"session","agent_id":id,"ordinal":1,
+                "prompt":format!("Request {index}"),"state":"complete",
+                "created_at_ms":0,"completed_at_ms":1,
+                "attributed_matches_checkpoint":true,"node_list":[]
+            }))?;
+            if let Some(child) = &child {
+                exchange
+                    .node_list
+                    .push(crate::exchange::ExchangeNode::AgentReference {
+                        agent: crate::agent::Delegation {
+                            id: child.id(),
+                            parent_exchange_id: id.clone(),
+                            parent_turn_id: None,
+                            child_agent_id: child.id(),
+                            child_exchange_id: child.id(),
+                            task: "Inspect nested work".into(),
+                            created_at_ms: 0,
+                        },
+                    });
+            }
+            let mut run = crate::agent::Agent::pending("session", &id, "Inspect", 0);
+            run.id = id.clone();
+            child = Some(TimelineEntry::AgentLifecycle {
+                id,
+                created_at_ms: 0,
+                run,
+                exchange: vec![exchange],
+                agent: child.into_iter().collect(),
+            });
+        }
+        let entry = child.unwrap();
+        let projected = project_at(&entry, &WidthProfile::default(), 1)?;
+        assert_eq!(projected.prompt.len(), 32);
+        assert!(
+            projected
+                .entry
+                .block
+                .iter()
+                .any(|block| block.id.0 == "agent-31:prompt")
+        );
+        Ok(())
     }
 
     #[test]
@@ -5910,7 +6175,6 @@ mod tests {
             id: "parent".into(),
             created_at_ms: 0,
             exchange: parent,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::from([(
                 "nested-agent".into(),
                 TimelineEntry::AgentLifecycle {
@@ -6272,7 +6536,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &width,
@@ -6292,11 +6555,12 @@ mod tests {
                     .iter()
                     .find(|block| block.id.0 == format!("event-{index}:comment"))
                     .unwrap();
-                assert_eq!(indentation(heading, 0), "");
+                let activity_indent = if [4, 5].contains(&index) { "" } else { "  " };
+                assert_eq!(indentation(heading, 0), activity_indent);
                 for row in 0..detail.text.row_count() {
                     assert_eq!(
                         indentation(detail, row),
-                        "  ",
+                        format!("{activity_indent}  "),
                         "detail acquired a response marker"
                     );
                 }
@@ -6407,12 +6671,36 @@ mod tests {
         event.text = Some("Finished the work".into());
         event.data = serde_json::json!({ "phase": "final_answer" });
         exchange.observe_turn(&event, 4).unwrap();
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::SkillRead {
+                id: "late-skill".into(),
+                turn_id: exchange.turn[0].id().to_owned(),
+                read: crate::skill::SkillRead {
+                    resource_id: "fixture".into(),
+                    name: "fixture".into(),
+                    path: "/skills/fixture/SKILL.md".into(),
+                    tool_id: "read-skill".into(),
+                },
+            });
+        event.text = None;
+        event.kind = "tool".into();
+        event.data = serde_json::Value::Null;
+        event.activity = Some(ToolActivity {
+            id: "interrupted-edit".into(),
+            kind: ToolActivityKind::FileChange,
+            title: "file changes".into(),
+            output: None,
+            output_delta: false,
+            status: Some("interrupted".into()),
+            change: Default::default(),
+        });
+        exchange.observe_turn(&event, 4).unwrap();
         let streaming = project_at(
             &TimelineEntry::Exchange {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange: exchange.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -6429,7 +6717,12 @@ mod tests {
             .entry
             .block
             .iter()
-            .find(|block| block.text.row(0) == Some("  Inspecting ownership"))
+            .find(|block| {
+                block
+                    .text
+                    .row(0)
+                    .is_some_and(|text| text.starts_with("  Inspecting ownership · 1 file changed"))
+            })
             .unwrap();
         assert_eq!(
             streaming_commentary
@@ -6451,6 +6744,7 @@ mod tests {
             "streaming final response must not inherit activity indentation"
         );
         event.text = None;
+        event.activity = None;
         event.turn_boundary = Some(TurnBoundary::Finished {
             outcome: crate::turn::TurnOutcome::Completed,
         });
@@ -6463,13 +6757,56 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange: exchange.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             5,
         )
         .unwrap();
+        let restored: Exchange =
+            serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let reloaded = project_at(
+            &TimelineEntry::Exchange {
+                id: restored.id.clone(),
+                created_at_ms: 0,
+                exchange: restored,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            5,
+        )
+        .unwrap();
+        for projection in [&streaming, &projected, &reloaded] {
+            let blocks = &projection.entry.block;
+            let summary = blocks
+                .iter()
+                .find(|block| block.id.0 == "native:summary")
+                .unwrap();
+            let activity_end = &summary.metadata.fold[0].end.block;
+            let end = blocks
+                .iter()
+                .position(|block| &block.id == activity_end)
+                .unwrap();
+            let response = blocks
+                .iter()
+                .position(|block| block.text.row(0) == Some("Finished the work"))
+                .unwrap();
+            for label in ["Read skill", "File changes interrupted", "Changed 1 file"] {
+                let position = blocks
+                    .iter()
+                    .position(|block| block.text.wire_rows().join("\n").contains(label))
+                    .unwrap();
+                assert!(
+                    position <= end && end < response,
+                    "{label} escaped the activity fold"
+                );
+                assert_eq!(
+                    blocks[position].metadata.layout.as_ref().unwrap().indent,
+                    if label == "Read skill" { 4 } else { 6 },
+                    "{label}"
+                );
+            }
+        }
         let text = projected
             .entry
             .block
@@ -6499,7 +6836,7 @@ mod tests {
         );
         assert!(
             projected.action.values().any(|action| matches!(action,
-            super::TranscriptAction::Diff { text } if text.contains("owned.rs"))),
+            super::TranscriptAction::Diff { text, .. } if text.contains("owned.rs"))),
             "file edit lost its derived diff"
         );
         let summary = projected
@@ -6537,7 +6874,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7074,7 +7410,6 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7111,7 +7446,6 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -7126,7 +7460,6 @@ mod tests {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             }),
             &WidthProfile::default(),
@@ -7269,11 +7602,93 @@ mod tests {
     }
 
     #[test]
+    fn owned_check_results_keep_exchange_ownership_before_the_final_response() -> anyhow::Result<()>
+    {
+        use crate::backend::ProviderAddress;
+        use crate::turn::{MessageDelivery, MessageKind, Turn, TurnOutcome};
+
+        let mut turn = Turn::new(
+            "turn".into(),
+            ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            0,
+        );
+        turn.record_provider_text(
+            MessageKind::Assistant,
+            "Work completed",
+            None,
+            MessageDelivery::Final,
+            false,
+        )?;
+        turn.finish(TurnOutcome::Completed, 20)?;
+        let exchange: Exchange = serde_json::from_value(json!({
+            "id":"work", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Check the change", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":true, "turn":[turn],
+            "node_list":[{"kind":"turn_content", "id":"final", "turn_id":"turn",
+                "item":{"kind":"message", "id":"turn:message:1"}}]
+        }))?;
+        let run: crate::checks::CheckRun = serde_json::from_value(json!({
+            "id":"checks", "owner":{"kind":"exchange","session_id":"session","exchange_id":"work","node_count":0}, "revision":1, "completed_plan":null,
+            "shell":"system", "executable":null, "workspace":".", "environment_digest":"environment",
+            "started_at_ms":5, "completed_at_ms":10, "state":"passed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null, "workspace_digest":{}, "commands":[]
+        }))?;
+        for completed in [false, true] {
+            let mut exchange = exchange.clone();
+            if completed {
+                exchange.finish(crate::exchange::ExchangeState::Complete, 20)?;
+            }
+            let entry = TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            };
+            let entry =
+                crate::timeline::TimelineProjector::with_checks(vec![entry], vec![run.clone()])?
+                    .remove(0);
+            let entry = serde_json::from_str(&serde_json::to_string(&entry)?)?;
+            let projected = project_at(&entry, &WidthProfile::default(), 20)?;
+            let blocks = &projected.entry.block;
+            let checks = blocks
+                .iter()
+                .position(|block| block.id.0 == "checks:checks")
+                .unwrap();
+            let response = blocks
+                .iter()
+                .position(|block| block.id.0 == "final")
+                .unwrap();
+            assert!(
+                checks < response,
+                "check results followed the final response"
+            );
+            assert_eq!(
+                blocks[checks]
+                    .metadata
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .parent
+                    .as_ref(),
+                Some(&forge_buffer::identity::FoldId("work:exchange".into())),
+                "check results must retain their exchange owner without an assistant thought"
+            );
+            assert_eq!(blocks[checks].metadata.layout.as_ref().unwrap().indent, 4);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn running_checks_are_status_activity_until_result_published() -> anyhow::Result<()> {
         let commands = ["passed", "running", "pending", "skipped", "failed", "configuration_error"]
             .into_iter().map(|state| json!({
                 "id": state, "command": format!("cargo test {state}"), "state": state, "selected": true,
-                "started_at_ms": 0, "completed_at_ms": null, "exit_code": null,
+                "started_at_ms": if matches!(state, "pending" | "configuration_error") { None } else { Some(0) }, "completed_at_ms": null, "exit_code": null,
                 "error": null, "stdout": "absent", "stderr": "absent",
                 "output": "absent", "output_bytes": 100,
                 "preview": "older output\n\u{1b}[32mCompiling forge-harness\u{1b}[0m\r\n\n"
@@ -7281,7 +7696,7 @@ mod tests {
         let mut run: crate::checks::CheckRun = serde_json::from_value(json!({
             "id": "check-run", "revision": 1, "completed_plan": null,
             "shell": "system", "executable": null, "workspace": ".",
-            "environment_digest": "environment", "started_at_ms": 0,
+            "owner":{"kind":"session","session_id":"session"}, "environment_digest": "environment", "started_at_ms": 0,
             "completed_at_ms": null, "state": "running",
             "progress": crate::plan::execution::SemanticProgress::default(),
             "workspace_identity": null, "workspace_digest": {}, "commands": commands,
@@ -7289,7 +7704,7 @@ mod tests {
                 "kind": "check_skipped", "check_id": "skipped", "text": "Previous check skipped"}]
         }))?;
         let history =
-            crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run.clone()]);
+            crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run.clone()])?;
         assert!(
             history.is_empty(),
             "live checks entered durable timeline history"
@@ -7324,10 +7739,23 @@ mod tests {
             || row.contains('\u{1b}')));
         assert!(projected.tool.is_empty());
         run.state = crate::checks::CheckState::Failed;
-        let history = crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]);
+        let history = crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run])?;
         assert_eq!(history.len(), 1);
         let finished = project_at(&history[0], &WidthProfile::default(), 2000)?;
-        assert_eq!(finished.tool.len(), 6);
+        assert_eq!(finished.tool.len(), 4);
+        for id in ["passed", "running", "failed", "configuration_error"] {
+            assert!(finished.tool.contains_key(id));
+        }
+        for id in ["pending", "skipped"] {
+            assert!(!finished.tool.contains_key(id));
+            assert!(
+                finished
+                    .entry
+                    .block
+                    .iter()
+                    .all(|block| !block.id.0.starts_with(id))
+            );
+        }
         assert!(
             !finished
                 .entry
@@ -7342,7 +7770,7 @@ mod tests {
     fn check_activity_clocks_do_not_read_output_or_tick_finished_history() -> anyhow::Result<()> {
         let mut run: crate::checks::CheckRun = serde_json::from_value(json!({
             "id":"check-run","revision":1,"completed_plan":null,"shell":"system","executable":null,
-            "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
+            "workspace":".","owner":{"kind":"session","session_id":"session"}, "environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
             "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
             "workspace_identity":null,"workspace_digest":{},"commands":[{
                 "id":"check-command","command":"cargo test --locked","state":"running","started_at_ms":0,
@@ -7541,7 +7969,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 1000,
                 exchange: exchange.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             };
             let projected = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
@@ -7671,7 +8098,6 @@ mod tests {
                 id: exchange.id.clone(),
                 created_at_ms: 1000,
                 exchange: exchange.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             };
             let rendered = project_at(&entry, &WidthProfile::default(), now_ms).unwrap();
@@ -7707,7 +8133,6 @@ mod tests {
             id: exchange.id.clone(),
             created_at_ms: 1000,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let rendered = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
@@ -7965,7 +8390,6 @@ mod tests {
                     id: "report-exchange".into(),
                     created_at_ms: 0,
                     exchange,
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 &WidthProfile::default(),

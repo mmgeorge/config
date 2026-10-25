@@ -29,80 +29,92 @@ impl<'exchange> ExchangeLayout<'exchange> {
             .iter()
             .filter(|node| !questions.nested.contains(node.id()))
             .collect::<Vec<_>>();
-        activity.retain(|node| match node {
-            ExchangeNode::PlanEvent { event } => match &event.content {
-                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if event.node_count == 0
-                        && matches!(
+        let thoughts = exchange.thoughts(&activity)?;
+        let owned_events = thoughts
+            .thought
+            .iter()
+            .filter(|thought| {
+                thought
+                    .message
+                    .is_some_and(|message| message.delivery() != MessageDelivery::Final)
+            })
+            .flat_map(|thought| thought.events.iter().map(|node| node.id()))
+            .collect::<std::collections::HashSet<_>>();
+        activity.retain(|node| {
+            if owned_events.contains(node.id()) {
+                return true;
+            }
+            match node {
+                ExchangeNode::PlanEvent { event } => match &event.content {
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if event.node_count == 0
+                            && matches!(
+                                lifecycle.kind,
+                                crate::plan::PlanLifecycleKind::Accepted
+                                    | crate::plan::PlanLifecycleKind::ChangesRequested
+                            ) =>
+                    {
+                        opening.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if matches!(
                             lifecycle.kind,
-                            crate::plan::PlanLifecycleKind::Accepted
-                                | crate::plan::PlanLifecycleKind::ChangesRequested
+                            crate::plan::PlanLifecycleKind::Created
+                                | crate::plan::PlanLifecycleKind::RevisionCreated
                         ) =>
-                {
-                    opening.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if matches!(
-                        lifecycle.kind,
-                        crate::plan::PlanLifecycleKind::Created
-                            | crate::plan::PlanLifecycleKind::RevisionCreated
-                    ) =>
-                {
-                    results.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Execution { event }
-                    if matches!(
-                        event,
-                        crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
-                    ) =>
-                {
-                    conclusion.push(*node);
-                    false
-                }
-                crate::plan::PlanEventContent::Execution { .. }
-                | crate::plan::PlanEventContent::Resolution { .. } => {
+                    {
+                        results.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution { event }
+                        if matches!(
+                            event,
+                            crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
+                                | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
+                        ) =>
+                    {
+                        conclusion.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution { .. }
+                    | crate::plan::PlanEventContent::Resolution { .. } => {
+                        results.push(*node);
+                        false
+                    }
+                    _ => true,
+                },
+                ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
                     results.push(*node);
                     false
                 }
                 _ => true,
-            },
-            ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
-                results.push(*node);
-                false
             }
-            _ => true,
         });
         let mut response_position = activity.len();
+        let mut response_turn = None;
         for (position, node) in activity.iter().enumerate() {
-            let ExchangeNode::TurnContent {
-                turn_id,
-                item: TurnItem::Message { id },
-                ..
-            } = node
-            else {
-                continue;
-            };
-            let turn = exchange
-                .turn
-                .iter()
-                .find(|turn| turn.id() == turn_id)
-                .context("timeline content references a missing provider turn")?;
-            let message = turn
-                .messages()
-                .iter()
-                .find(|message| message.id() == id)
-                .context("timeline content references a missing message")?;
-            if message.delivery() == MessageDelivery::Final {
+            if is_final_response(exchange, node)? {
                 response_position = position;
+                if let ExchangeNode::TurnContent { turn_id, .. } = node {
+                    response_turn = Some(turn_id.as_str());
+                }
                 break;
             }
         }
         let mut continuation = activity.split_off(response_position);
         continuation.retain(|node| {
-            if matches!(node, ExchangeNode::AgentReference { .. }) {
+            let owned_activity = match node {
+                ExchangeNode::AgentReference { .. } | ExchangeNode::TimelineEvent { .. } => true,
+                ExchangeNode::SkillRead { turn_id, .. }
+                | ExchangeNode::TurnContent {
+                    turn_id,
+                    item: TurnItem::Tool { .. },
+                    ..
+                } => Some(turn_id.as_str()) == response_turn,
+                _ => false,
+            };
+            if owned_activity {
                 activity.push(*node);
                 false
             } else {
@@ -118,6 +130,29 @@ impl<'exchange> ExchangeLayout<'exchange> {
             continuation,
         })
     }
+}
+
+/// Identify outer responses without treating later-turn commentary as final output.
+pub(super) fn is_final_response(exchange: &Exchange, node: &ExchangeNode) -> Result<bool> {
+    let ExchangeNode::TurnContent {
+        turn_id,
+        item: TurnItem::Message { id },
+        ..
+    } = node
+    else {
+        return Ok(false);
+    };
+    let turn = exchange
+        .turn
+        .iter()
+        .find(|turn| turn.id() == turn_id)
+        .context("timeline content references a missing provider turn")?;
+    let message = turn
+        .messages()
+        .iter()
+        .find(|message| message.id() == id)
+        .context("timeline content references a missing message")?;
+    Ok(message.delivery() == MessageDelivery::Final)
 }
 
 /// Materializes Markdown padding once so native wrapping shares the parser's content origin.

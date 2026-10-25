@@ -12,6 +12,8 @@ vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
     trigger = { kind = "any_change" }, all = { command = "print optional" } },
   { id = "waiting", name = "Waiting", category = "test", area = "Fixture", enabled = true, auto = false,
     trigger = { kind = "manual" }, all = { command = "sleep 30sec" } },
+  { id = "handoff", name = "Handoff", category = "test", area = "Fixture", enabled = true, auto = false,
+    trigger = { kind = "manual" }, all = { command = "sleep 200ms; print complete" } },
 } } }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
@@ -91,6 +93,26 @@ local succeeded, failure = xpcall(function()
     return false
   end, 10), "direct submission was not admitted after check interruption")
   assert(#state.queue == 1, "queued prompt overtook the direct prompt")
+  assert(vim.wait(15000, function() return not state.busy and #state.queue == 0 end, 10),
+    "existing queue did not finish: " .. tostring(state.execution_notice))
+  for attempt = 1, 3 do
+    local handoff = request("checks.run", { ids = { "handoff" } }).run_id
+    assert(vim.wait(5000, function() return state.checks_running end, 10), "handoff check did not start")
+    local prompt = "queued after normal check completion " .. attempt
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })
+    controller.queue_submit()
+    assert(#state.queue == 1, "check completion queue lost its pending message")
+    assert(vim.wait(15000, function()
+      return not state.busy and not state.prompt_submission and #state.queue == 0
+    end, 10), "normal check completion did not drain its queue: " .. tostring(state.execution_notice))
+    assert(not state.execution_notice, tostring(state.execution_notice))
+    assert(request("checks.status", { run_id = handoff }).state == "passed", "queued prompt interrupted normal checks")
+    local occurrences = 0
+    for _, entry in ipairs(request("state.get").prompt_history or {}) do
+      if entry.text == prompt then occurrences = occurrences + 1 end
+    end
+    assert(occurrences == 1, "queued prompt was lost or submitted more than once")
+  end
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

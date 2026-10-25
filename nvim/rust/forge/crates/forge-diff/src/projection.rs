@@ -492,7 +492,7 @@ mod tests {
             let heading = header(
                 BlockId("hunk".into()),
                 vec![TextChunk {
-                    text: hunk.header.into(),
+                    text: hunk.header.to_string(),
                     capture: "ForgeHunkHeader".into(),
                 }],
                 indent,

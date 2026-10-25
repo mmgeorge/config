@@ -151,8 +151,20 @@ Action-target snapshots remain separate and only validate whether a response sti
 ## Timeline node projection
 
 The timeline projects ordered exchange items into separate message, tool-group, and change
-nodes. Consecutive ordinary tools share a group. Commentary, steering, or a file edit ends that
-group. Individual tool completion and provider-turn boundaries keep the trailing group live
+nodes. `Exchange::thoughts` derives `ExchangeThought` sections from canonical ordered events,
+with events and separate tool and write groups borrowing their current streamed content.
+The model owns visible-call filtering, unique-file totals, activity presence, and group identity.
+Each thought with activity is collapsed by default and shows tool and file counts in its heading.
+Expanding it shows events in arrival order, then one tool group, then one change group, indented
+two spaces below the thought. Empty thoughts keep their open-circle marker without a container
+fold. Explicit thought expansion survives new activity and completion.
+Ordinary tools share a group across interleaved writes and events. New commentary, user input,
+and question interactions end that section. Compaction and other owned events remain inside
+the current thought. Question interactions keep their clarification history outside collapsed thoughts.
+Late results update their original operation without moving it across a boundary. Operations
+after a boundary and before another thought occupy an unlabeled section. Reload derives the
+same ownership and identities without persisting a second copy of content.
+Individual tool completion and provider-turn boundaries keep the trailing group live
 while its exchange can append more tools. Its label and fold use that same lifecycle. Timer
 refreshes aggregate every call in the group across provider turns. An active group shows its
 count, latest tool heading, and a preview of that tool's last
@@ -182,11 +194,18 @@ change node without creating a generic tool row.
 
 Codex `fileChange` items carry path, operation kind, move destination, textual diff, and final
 status. The backend replaces provisional patch revisions by provider item ID, while the timeline
-retains first-seen order. Each successful edit operation renders a `Changed N files` node at its
-original position, outside generic tool groups. An edit ends the preceding tool group. Its node
-opens directly into files and hunks, without a generic tool heading or empty output preview.
-Running edits show `Changing N files`. Failed, cancelled, and interrupted edits retain their
-outcome and available diagnostic text but never contribute to the successful change summary.
+retains first-seen order. File writes in the same activity section share one `Changed N files`
+node, keyed by the first write, even when ordinary tools intervene. Tool groups precede change
+groups regardless of arrival order. Each completed write updates the unique-file count and combined diff in place.
+The node retains its position and expansion state across updates, provider-turn boundaries,
+and hidden reasoning. Thought boundaries also end the write group.
+The change node opens directly into files and hunks,
+without a generic tool heading or empty output preview. Repeated writes compose their reported
+hunks into the original-to-final diff without reading the current workspace. Unknown unchanged
+line ranges remain sparse. Inconsistent reports retain all reported hunks with an explicit
+net-diff diagnostic. Running edits show `Changing N files`, or a changing-files suffix beside
+the completed portion of the group. Failed, cancelled, and interrupted edits retain their
+outcome and available diagnostic text inside the group but never contribute to the successful change summary.
 Commands, formatters, and generators remain ordinary tools. Their filesystem effects require a
 checkpoint comparison rather than inference from command output.
 

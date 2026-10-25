@@ -1117,7 +1117,7 @@ mod test {
         assert!(!text.contains("Ran 1 tool"));
         assert!(rendered.tool.is_empty());
         assert!(rendered.action.values().any(|action| matches!(action,
-            crate::buffer::projection::TranscriptAction::Diff { text } if text.contains("@@ -40 +40 @@\n-old\n+new"))));
+            crate::buffer::projection::TranscriptAction::Diff { text, .. } if text.contains("@@ -40 +40 @@\n-old\n+new"))));
         Ok(())
     }
 

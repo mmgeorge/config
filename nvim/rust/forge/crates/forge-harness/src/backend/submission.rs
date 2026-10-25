@@ -264,7 +264,8 @@ impl Submission {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
-        let transaction = connection.transaction()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let payload: String = transaction.query_row(
             "SELECT payload FROM submission WHERE id=?1",
             [&self.id],
@@ -354,7 +355,8 @@ impl Submission {
             .connection
             .lock()
             .map_err(|_| anyhow::anyhow!("submission journal lock poisoned"))?;
-        let transaction = connection.transaction()?;
+        let transaction =
+            connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         let payload: String = transaction.query_row(
             "SELECT payload FROM submission WHERE id=?1",
             [&self.id],

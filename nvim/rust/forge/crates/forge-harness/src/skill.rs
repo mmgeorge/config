@@ -713,6 +713,11 @@ mod tests {
             .collect();
         assert_eq!(diamonds.len(), 2);
         assert!(diamonds.iter().all(|block| block.metadata.fold.is_empty()));
+        assert!(
+            diamonds
+                .iter()
+                .all(|block| block.metadata.layout.as_ref().unwrap().indent == 4)
+        );
         assert!(rendered.action.values().any(
             |action| matches!(action,TranscriptAction::File {path,line:1}
             if Path::new(path) == dunce::canonicalize(bundle.join("SKILL.md")).unwrap())

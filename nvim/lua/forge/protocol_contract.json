@@ -253,7 +253,7 @@
     "prompt_submission": {
       "route": "handle",
       "required": {
-        "data.document": "string",
+        "data.document": "nullable_string",
         "data.token": "integer",
         "data.state": "string"
       }

@@ -517,6 +517,12 @@ impl HostRouter {
     ) -> Result<RoutedMethod> {
         let method = decode_method(&envelope.request.method)?;
         if let RoutedMethod::Harness(harness_method) = method {
+            // Queued prompts wait in their request task so the input lane can still cancel work.
+            if harness_method == HarnessMethod::PromptSubmit
+                && envelope.request.params["queued"].as_bool() == Some(true)
+            {
+                return Ok(method);
+            }
             if matches!(
                 harness_method,
                 HarnessMethod::TaskTransition | HarnessMethod::QueueUpdate

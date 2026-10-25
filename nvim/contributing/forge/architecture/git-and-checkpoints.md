@@ -399,6 +399,12 @@ provider hunks. Equal patches render one interaction-level `Changed … · check
 node. Divergent patches render independent `Changed …` and `Checkpoint total: …` nodes. The
 per-operation provider trees remain available at their original timeline positions.
 
+Saved patch presentation compares LF and CRLF lines by their text and reports line-ending
+conversions separately. Display counts and compact hunks therefore describe textual edits,
+including when reopening older checkpoints. The raw patch action, stored checkpoint bytes,
+and restore behavior retain the original line endings. Missing final newlines and bare CR
+characters remain content changes.
+
 Non-Git exchanges retain an aggregate of successful provider-reported edits at finalization,
 including edits from referenced child exchanges. That summary appears outside the activity node
 and is labeled `reported edits`. It groups repeated paths but preserves individual edit hunks,

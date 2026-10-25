@@ -16,10 +16,27 @@ local attachment = require("forge.views.harness.attachment")
 ---@field cleared_tick? integer
 ---@field accepted? boolean
 ---@field attachments table[]
+---@field queue_entry? ForgeQueuedPrompt
+
+---Transfer only the matching queue entry across the host's admission boundary.
+---@param state ForgeHarnessPresentationState
+---@param submission ForgePromptSubmission
+---@param accepted boolean
+local function settle_queue(state, submission, accepted)
+  local entry = submission.queue_entry
+  if not entry then return end
+  for index, candidate in ipairs(state.queue) do
+    if candidate == entry then
+      if accepted then table.remove(state.queue, index) end
+      return
+    end
+  end
+  if not accepted then table.insert(state.queue, 1, entry) end
+end
 
 ---Retain request completion in the session even when its composer presentation closes.
 ---@param state ForgeHarnessPresentationState
----@param prompt {text: string, attachments?: table[], context?: ForgePromptContext, source?: string[], changedtick?: integer}
+---@param prompt {text: string, attachments?: table[], context?: ForgePromptContext, source?: string[], changedtick?: integer, queue_entry?: ForgeQueuedPrompt}
 ---@param completed fun(result?: any, failure?: string, detail?: table)
 function PromptSubmission.start(state, prompt, completed)
   if state.prompt_submission then
@@ -37,16 +54,21 @@ function PromptSubmission.start(state, prompt, completed)
     token = state.prompt_sequence, context = context, source = source,
     changedtick = context and (prompt.changedtick or vim.api.nvim_buf_get_changedtick(context.buffer)) or nil,
     attachments = prompt.attachments or (context and attachment.capture(context.buffer).attachments) or {},
+    queue_entry = prompt.queue_entry,
   }
   state.prompt_submission = submission
   local function settle(result, failure, detail)
     if state.prompt_submission ~= submission then return end
+    if not failure then settle_queue(state, submission, true)
+    elseif detail and detail.code == "turn_retracted" then settle_queue(state, submission, false) end
     state.prompt_submission = nil
     completed(result, failure, detail)
   end
   local sent, failure = pcall(client.request_for, session_id, "prompt.submit", {
     text = text, attachments = submission.attachments,
-    submission = context and { document = context.document, token = submission.token } or nil,
+    queued = submission.queue_entry ~= nil,
+    queued_task_id = submission.queue_entry and submission.queue_entry.task_id or nil,
+    submission = (context or submission.queue_entry) and { document = context and context.document, token = submission.token } or nil,
   }, settle)
   if not sent then
     if state.prompt_submission ~= submission then error(failure, 0) end
@@ -62,11 +84,20 @@ function PromptSubmission.receive(state, event)
   local transition = event.data
   local submission = state.prompt_submission
   if not submission then return false end
+  if event.kind ~= "prompt_submission" or type(transition) ~= "table"
+    or transition.token ~= submission.token then return false end
+  if submission.queue_entry then
+    if transition.state == "accepted" then
+      submission.accepted = true
+      settle_queue(state, submission, true)
+    elseif transition.state == "retracted" then
+      settle_queue(state, submission, false)
+    end
+    return true
+  end
   local context = submission.context
   local source = submission.source
-  if event.kind ~= "prompt_submission" or type(transition) ~= "table" or not context
-    or not source
-    or transition.document ~= context.document or transition.token ~= submission.token
+  if not context or not source or transition.document ~= context.document
     or not context.is_current() or not vim.api.nvim_buf_is_valid(context.buffer) then return false end
   local changedtick = vim.api.nvim_buf_get_changedtick(context.buffer)
   if transition.state == "accepted" and not submission.accepted then

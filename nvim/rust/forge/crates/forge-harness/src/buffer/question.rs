@@ -144,6 +144,7 @@ impl<'exchange> QuestionHistory<'exchange> {
                     matches!(
                         node,
                         ExchangeNode::TurnContent { .. }
+                            | ExchangeNode::TimelineEvent { .. }
                             | ExchangeNode::AgentReference { .. }
                             | ExchangeNode::ArtifactChange { .. }
                             | ExchangeNode::SkillRead { .. }

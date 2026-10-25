@@ -233,7 +233,12 @@ impl CheckToolScope {
                     "an agent started during check configuration authorization"
                 );
                 self.runner
-                    .configure(request, delivery.lifecycle.as_ref(), Some(&self.editing))
+                    .configure(
+                        self.runner.exchange_owner(&self.address.turn_id)?,
+                        request,
+                        delivery.lifecycle.as_ref(),
+                        Some(&self.editing),
+                    )
                     .await?
             }
             "checks_run" => {
@@ -250,13 +255,13 @@ impl CheckToolScope {
                     "automated checks are owned by Harness during plan execution and cannot race active writing agents"
                 );
                 let request = serde_json::from_value(arguments)?;
-                let mut run = self.runner.prepare_request(
+                let run = self.runner.prepare_request(
+                    self.runner.exchange_owner(&self.address.turn_id)?,
                     request,
                     self.task_id.clone(),
                     self.shell,
                     "Agent requested".into(),
                 )?;
-                run.exchange_id = Some(self.address.turn_id.clone());
                 let run = self.runner.resolve(run).await?;
                 ensure!(
                     self.agent.active_count() == 0,
@@ -368,6 +373,7 @@ impl CheckSupervisor {
                 if let Some(checkpoint) = self.changes.snapshot().await? {
                     let run = self
                         .resolve(self.prepare_request(
+                            self.session_owner(),
                             RunRequest::default(),
                             task_id.map(str::to_owned),
                             shell,
@@ -497,6 +503,7 @@ impl CheckSupervisor {
 
     pub(crate) fn prepare_request(
         &self,
+        owner: crate::timeline::TimelineOwner,
         request: RunRequest,
         task_id: Option<String>,
         shell: CheckShell,
@@ -516,6 +523,7 @@ impl CheckSupervisor {
         self.prepare(
             snapshot,
             super::CheckAdmission {
+                owner,
                 request,
                 overrides: overrides.enabled,
                 files: changes.clone(),
@@ -551,6 +559,7 @@ impl CheckSupervisor {
             }
         }
         self.configure(
+            self.session_owner(),
             ConfigureChecks {
                 expected_revision: catalog["revision"]
                     .as_str()
@@ -569,10 +578,16 @@ impl CheckSupervisor {
     /// Validates setup captures and helper syntax before saving settings without running checks.
     pub(crate) async fn configure(
         &self,
+        owner: crate::timeline::TimelineOwner,
         request: ConfigureChecks,
         sink: Option<&BackendEventSink>,
         editing: Option<&AtomicBool>,
     ) -> Result<Value> {
+        ensure!(
+            owner.session_id() == self.session_id,
+            "check configuration crosses sessions"
+        );
+        crate::storage::SqliteStore::open(&self.data_root)?.validate_timeline_owner(&owner)?;
         ensure!(
             self.active()?.is_none(),
             "check setup cannot change an active run"
@@ -726,6 +741,7 @@ impl CheckSupervisor {
         let mut run = self.prepare(
             snapshot,
             super::CheckAdmission {
+                owner,
                 request: Default::default(),
                 overrides: BTreeMap::new(),
                 files: Some(Vec::new()),

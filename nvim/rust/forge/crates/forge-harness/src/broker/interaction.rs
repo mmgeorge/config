@@ -111,9 +111,17 @@ impl HarnessBroker {
             "model.requested",
             serde_json::to_value(&backend_request)?,
         );
-        let output =
-            Box::pin(self.prompt_with_timeline(backend_request, &mut interaction, &mut event))
-                .await;
+        let mut execution =
+            Box::pin(self.prompt_with_timeline(backend_request, &mut interaction, &mut event));
+        // Automatic repair reenters provider execution while its parent request is still polling.
+        // Grow temporary segments here without increasing the worker's stack allocation.
+        let output = std::future::poll_fn(|context| {
+            stacker::maybe_grow(768 * 1024, 1024 * 1024, || {
+                std::future::Future::poll(execution.as_mut(), context)
+            })
+        })
+        .await;
+        drop(execution);
         drop(repository_lease);
         drop(lsp_lease);
         let output = match output {
@@ -163,7 +171,9 @@ impl HarnessBroker {
                     }));
                 }
                 let final_checkpoint_id =
-                    Box::pin(self.capture_final_checkpoint(&mut interaction, outcome)).await?;
+                    Box::pin(self.capture_final_checkpoint(&mut interaction, outcome))
+                        .await
+                        .context("finalize stopped interaction")?;
                 let workspace_unchanged = if let (Some(before), Some(after)) =
                     (&interaction.checkpoint_before, &final_checkpoint_id)
                 {
@@ -217,9 +227,11 @@ impl HarnessBroker {
                     ExchangeState::Failed
                 };
                 interaction.finish(outcome, self.clock.now_ms())?;
-                self.store.save_exchange(&interaction)?;
+                self.store
+                    .save_exchange(&interaction)
+                    .context("persist stopped interaction")?;
                 Box::pin(self.pause_goal_after_turn_failure()).await?;
-                self.save_session()?;
+                self.save_session().context("persist stopped session")?;
                 if cancelled {
                     Box::pin(self.emit_live_interaction(
                         BackendEvent {

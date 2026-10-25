@@ -143,6 +143,13 @@ impl HarnessBroker {
         let mut run = self.check_runner.prepare(
             snapshot,
             crate::checks::CheckAdmission {
+                owner: {
+                    let exchange = self
+                        .store
+                        .latest_execution_exchange(&self.session.id, &execution.id)?
+                        .context("plan checks require their execution exchange")?;
+                    crate::timeline::TimelineOwner::exchange(&exchange)
+                },
                 request: crate::checks::RunRequest {
                     include: design.document.checks.clone(),
                     ..Default::default()
@@ -159,11 +166,6 @@ impl HarnessBroker {
             },
         )?;
         run.context.as_mut().unwrap().automatic = true;
-        run.exchange_id = self
-            .store
-            .list_exchange(&self.session.id)?
-            .last()
-            .map(|exchange| exchange.id.clone());
         run.progress = progress;
         run.workspace_identity = workspace_identity.clone();
         run.workspace_digest = run.progress.source_digest.clone();

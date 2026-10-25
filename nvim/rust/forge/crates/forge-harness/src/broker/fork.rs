@@ -92,6 +92,7 @@ pub fn prepare_provider_fork(
     crate::settings::SettingsStore::open(data_root)?.fork_session(&source.id, &child.id)?;
     let plan_file = crate::plan::PlanFileStore::new(data_root, &source.workspace);
     let history = store.read_snapshot(|| {
+        let interaction = store.list_exchange(&source.id)?;
         let plan_list = store.list_plan(&source.id)?;
         let agent_run_list = store
             .list_agent_run(&source.id)?
@@ -103,7 +104,7 @@ pub fn prepare_provider_fork(
             agent_exchange_list.extend(store.list_agent_exchange(&agent.id)?);
         }
         let timeline = TimelineProjector::build(TimelineProjection {
-            interaction_list: store.list_exchange(&source.id)?,
+            interaction_list: interaction.clone(),
             plan_list: &plan_list,
             lifecycle_list: store.list_plan_lifecycle(&source.id)?,
             execution_list: store.list_plan_execution(&source.id)?,
@@ -111,16 +112,17 @@ pub fn prepare_provider_fork(
             audit_list: store.list_plan_audit(&source.id)?,
             resolution_list: store.list_plan_resolution(&source.id)?,
             agent_run_list,
-            agent_exchange_list,
+            agent_exchange_list: agent_exchange_list.clone(),
             session_event_list: store.list_session_event(&source.id)?,
             plan_file: &plan_file,
         })?;
-        let timeline = TimelineProjector::with_checks(
+        let timeline = TimelineProjector::with_history(
             timeline,
             crate::checks::CheckSupervisor::saved_history(
                 &data_root.join(&source.id).join("checks"),
             )?,
-        );
+            interaction.iter().chain(&agent_exchange_list),
+        )?;
         let timeline = store.with_fork_history(&source.id, timeline, &plan_file)?;
         Ok(timeline
             .into_iter()
@@ -139,6 +141,7 @@ pub fn prepare_provider_fork(
         &SessionEventRecord {
             id: Uuid::new_v4().to_string(),
             session_id: child.id.clone(),
+            owner: crate::timeline::TimelineOwner::session(&child.id),
             created_at_ms: now_ms,
             detail: SessionEventKind::Forked {
                 source_session_id: source.id.clone(),

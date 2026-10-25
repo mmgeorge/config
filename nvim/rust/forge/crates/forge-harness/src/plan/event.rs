@@ -23,7 +23,12 @@ impl ExchangeAnchor {
             node_count: exchange
                 .node_list
                 .iter()
-                .filter(|node| !matches!(node, ExchangeNode::PlanEvent { .. }))
+                .filter(|node| {
+                    !matches!(
+                        node,
+                        ExchangeNode::PlanEvent { .. } | ExchangeNode::TimelineEvent { .. }
+                    )
+                })
                 .count(),
         }
     }
@@ -70,7 +75,8 @@ pub(crate) fn insert_events(exchange: &mut Exchange, events: Vec<ExchangePlanEve
     let source_count = source.len();
     let mut ordered = Vec::with_capacity(source_count + events.len());
     let mut events = events.into_iter().peekable();
-    for (position, node) in source.into_iter().enumerate() {
+    let mut position = 0;
+    for node in source {
         while events
             .peek()
             .is_some_and(|event| event.node_count <= position)
@@ -79,6 +85,7 @@ pub(crate) fn insert_events(exchange: &mut Exchange, events: Vec<ExchangePlanEve
                 event: Box::new(events.next().unwrap()),
             });
         }
+        position += usize::from(!matches!(node, ExchangeNode::TimelineEvent { .. }));
         ordered.push(node);
     }
     ordered.extend(events.map(|event| ExchangeNode::PlanEvent {
@@ -88,7 +95,10 @@ pub(crate) fn insert_events(exchange: &mut Exchange, events: Vec<ExchangePlanEve
 }
 
 /// Preserve derived events when live provider updates replace the exchange's source state.
-pub(crate) fn replacement_exchange(current: &Exchange, replacement: &Exchange) -> Exchange {
+pub(crate) fn replacement_exchange(
+    current: &Exchange,
+    replacement: &Exchange,
+) -> anyhow::Result<Exchange> {
     let events = current
         .node_list
         .iter()
@@ -99,5 +109,10 @@ pub(crate) fn replacement_exchange(current: &Exchange, replacement: &Exchange) -
         .collect();
     let mut replacement = replacement.clone();
     insert_events(&mut replacement, events);
-    replacement
+    for node in &current.node_list {
+        if let ExchangeNode::TimelineEvent { event } = node {
+            crate::timeline::ownership::insert_event(&mut replacement, (**event).clone())?;
+        }
+    }
+    Ok(replacement)
 }

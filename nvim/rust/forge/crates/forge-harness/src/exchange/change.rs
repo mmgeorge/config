@@ -2,6 +2,8 @@ use crate::backend::{ProviderChangeKind, ProviderFileChange};
 use crate::exchange::{Exchange, ToolCall};
 use std::collections::BTreeSet;
 
+mod net;
+
 /// Stores normalized paths from successful provider-owned file changes.
 #[derive(Default)]
 pub struct ProviderChangeIndex {
@@ -57,11 +59,46 @@ pub struct ProviderDiffBuilder {
 }
 
 impl ProviderDiffBuilder {
+    /// Count logical files across successful writes, following move destinations.
+    pub fn file_count<'tool>(tools: impl Iterator<Item = &'tool ToolCall>) -> usize {
+        let mut builder = Self::default();
+        builder.record_tools(tools);
+        builder.projection.len()
+    }
+
     /// Build a unified operation diff from successful provider file-change tools.
     pub fn build(tool_list: &[ToolCall]) -> Option<String> {
         let mut builder = Self::default();
         builder.record_tools(tool_list.iter());
         builder.finish()
+    }
+
+    /// Compose adjacent successful writes into one diff per file.
+    /// Inconsistent reports retain all operation hunks and include an explicit diagnostic.
+    pub fn build_group(tool_list: &[&ToolCall]) -> (Option<String>, Option<String>) {
+        let mut builder = Self::default();
+        builder.record_tools(tool_list.iter().copied());
+        let mut warning = Vec::new();
+        for projection in &mut builder.projection {
+            match net::compose(&projection.hunk_list) {
+                Ok(hunks) => projection.hunk_list = hunks,
+                Err(error) => warning.push(format!(
+                    "{}: {error}",
+                    projection
+                        .new_path
+                        .as_deref()
+                        .or(projection.old_path.as_deref())
+                        .unwrap_or("unknown")
+                )),
+            }
+        }
+        let warning = (!warning.is_empty()).then(|| {
+            format!(
+                "reported edits retained, net diff unavailable: {}",
+                warning.join(", ")
+            )
+        });
+        (builder.finish(), warning)
     }
 
     /// Include successful edits from each provider turn in an exchange.
@@ -127,9 +164,10 @@ fn merge_change(projection_list: &mut Vec<FileProjection>, change: &ProviderFile
             ProviderChangeKind::Add | ProviderChangeKind::Update => Some(path.clone()),
         };
     }
-    projection
-        .hunk_list
-        .extend(operation_hunk_list(change.kind, &change.diff));
+    projection.hunk_list.extend(operation_hunk_list(
+        change.kind,
+        ProviderFileChange::split_move_report(change.kind, &change.diff).0,
+    ));
 }
 
 fn operation_path(
@@ -158,7 +196,7 @@ fn normalize_path(path: &str) -> String {
 fn extract_hunk_list(diff: &str) -> Vec<String> {
     let mut hunk_list = Vec::new();
     let mut current = Vec::new();
-    for line in diff.lines() {
+    for line in diff.split_terminator('\n') {
         if line.starts_with("@@ ") {
             if !current.is_empty() {
                 hunk_list.push(current.join("\n"));
@@ -254,6 +292,26 @@ mod test {
             failed: status != "completed",
             change: ProviderChangeSet { file },
         }
+    }
+
+    #[test]
+    fn saved_move_annotations_do_not_enter_patch_hunks() {
+        let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
+        let report = format!("{patch}\n\nMoved to: D:/workspace/src/moved.rs");
+        let tool = file_tool(
+            "move",
+            "completed",
+            vec![ProviderFileChange {
+                path: "src/original.rs".into(),
+                move_path: None,
+                kind: ProviderChangeKind::Update,
+                diff: report,
+            }],
+        );
+        let diff = ProviderDiffBuilder::build(&[tool]).unwrap();
+        let parsed = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
+        assert_eq!(parsed.file[0].hunk[0].row[1].text, "Moved to: source text");
+        assert!(!diff.contains("D:/workspace/src/moved.rs"));
     }
 
     #[test]

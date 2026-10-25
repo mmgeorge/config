@@ -251,10 +251,12 @@ local function status_text()
   if (active_session.access or {}).sandbox ~= false then
     segment_list[#segment_list + 1] = { text = " • sandbox", group = "ForgeStatusLabel" }
   end
-  segment_list[#segment_list + 1] = {
-    text = " • check editing " .. (state.check_editing and "on" or "off"),
-    group = "ForgeStatusLabel",
-  }
+  if state.check_editing then
+    segment_list[#segment_list + 1] = {
+      text = " • check editing on",
+      group = "ForgeStatusLabel",
+    }
+  end
   local selected_run = selected_agent_run(state)
   segment_list[#segment_list + 1] = {
     text = selected_run and (" • " .. (selected_run.nickname or selected_run.definition)) or " • Main",
@@ -641,7 +643,7 @@ local function on_event(event, payload)
       state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
       M.refresh_winbar()
     elseif payload.kind == "prompt_submission" then
-      prompt_submission.receive(state, payload)
+      if prompt_submission.receive(state, payload) then schedule_render() end
     elseif payload.kind == "approval_requested" then
       if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
@@ -984,7 +986,7 @@ finish_execution = function(request_error, error_detail)
 end
 
 ---@param text string
-begin_request = function(text, from_composer, attachments, captured_prompt)
+begin_request = function(text, from_composer, attachments, captured_prompt, queue_entry)
   local state = harness_state()
   local request_session_id = state.session and state.session.id
   local request_epoch = state.runtime_epoch
@@ -1023,7 +1025,7 @@ begin_request = function(text, from_composer, attachments, captured_prompt)
     if request_error then
       if error_detail and error_detail.code == "turn_retracted" then
         local prompt = error_detail.data and error_detail.data.prompt or text
-        if not from_composer then restore_retracted_prompt(prompt, attachments) end
+        if not from_composer and not queue_entry then restore_retracted_prompt(prompt, attachments) end
         synchronize_state()
         return
       end
@@ -1046,6 +1048,7 @@ begin_request = function(text, from_composer, attachments, captured_prompt)
     text = text, attachments = attachments, context = context,
     source = captured_prompt and captured_prompt.source,
     changedtick = captured_prompt and captured_prompt.changedtick,
+    queue_entry = queue_entry,
   }, receive)
 end
 
@@ -1075,12 +1078,12 @@ function M.cancel_turn()
   if operation and operation.action == "pause" then return end
   M.task_transition({ action = "pause", restore_prompt_if_no_output = true })
 end
-function M.compact()
+function M.compact(completed)
   if not (harness_state().capability and harness_state().capability.native_compact) then
     notifications.error("The current backend does not support manual context compaction", "ForgeHarness")
     return
   end
-  M.task_transition({ action = "compact" })
+  M.task_transition({ action = "compact" }, nil, completed)
 end
 
 function M.drain()
@@ -1093,7 +1096,7 @@ function M.drain()
   if state.checks_running then return end
   if state.host_error or state.execution_notice or state.task_operation or state.sync_error or state.connection_error then return end
   if state.aborting_plan then return end
-  if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
+  if state.busy or state.prompt_submission or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
   if state.status and state.status.kind == "finalizing" then return end
   if state.pending_mode then
@@ -1128,6 +1131,10 @@ function M.drain()
   end
   local entry = state.queue[1]
   if state.queue_edit and state.queue_edit.barrier == entry then return end
+  if type(entry) == "string" then
+    entry = { text = entry, task_id = current_task_id }
+    state.queue[1] = entry
+  end
   local text = type(entry) == "table" and entry.text or entry
   if text and not state.queue_suspended then
     local next_config, prompt, failure = model_command(text)
@@ -1138,13 +1145,16 @@ function M.drain()
         if not applied then return end
         if state.queue[1] ~= entry then return end
         if state.queue_edit and state.queue_edit.barrier == entry then return end
-        table.remove(state.queue, 1)
-        if prompt ~= "" then begin_request(prompt, false, type(entry) == "table" and entry.attachments or {}) else M.drain() end
+        if prompt ~= "" then begin_request(prompt, false, entry.attachments or {}, nil, entry)
+        else table.remove(state.queue, 1) M.drain() end
       end)
       return
     end
-    table.remove(state.queue, 1)
-    if text == "/compact" then M.compact() else begin_request(text, false, type(entry) == "table" and entry.attachments or {}) end
+    if text == "/compact" then
+      M.compact(function(applied)
+        if applied and state.queue[1] == entry then table.remove(state.queue, 1) end
+      end)
+    else begin_request(text, false, entry.attachments or {}, nil, entry) end
     return
   end
   if not text and state.checks_deferred then
@@ -2787,12 +2797,12 @@ end
 ---@return ForgeViewCommandSet
 function M.composer_command_set()
   local set = M.command_set()
-  local controls = {
-    submit = true, queue = true, steer = true, cancel = true, edit_queued = true, next_queued = true,
-    toggle_mode = true, effort_down = true, effort_up = true,
+  local timeline_controls = {
+    visual_line_with_gutter = true, previous_prompt = true, next_prompt = true,
+    toggle_activity = true, open_timeline = true,
   }
   for _, id in ipairs(vim.deepcopy(set.order)) do
-    if not controls[id] then command_set.unregister(set, id) end
+    if timeline_controls[id] then command_set.unregister(set, id) end
   end
   command_set.register(set, "history_previous", prompt_history.previous)
   command_set.register(set, "history_next", prompt_history.next)

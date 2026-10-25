@@ -354,7 +354,6 @@ mod tests {
             id: "entry".into(),
             created_at_ms: 1,
             exchange,
-            check_runs: Vec::new(),
             agent_by_id: Default::default(),
         }];
         let captured = history(&entries).unwrap();

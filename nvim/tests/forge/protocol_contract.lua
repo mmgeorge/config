@@ -31,5 +31,11 @@ local ok, failure = xpcall(function()
   decode({ session_id = "session", event = "backend_event", payload = {
     kind = "prompt_submission", data = { document = "document", token = 1, state = "accepted" },
   } })
+  decode({ session_id = "session", event = "backend_event", payload = {
+    kind = "prompt_submission", data = { document = vim.NIL, token = 2, state = "accepted" },
+  } })
+  reject({ session_id = "session", event = "backend_event", payload = {
+    kind = "prompt_submission", data = { document = vim.NIL, token = "2", state = "accepted" },
+  } })
 end, debug.traceback)
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

@@ -481,6 +481,23 @@ pub struct ProviderFileChange {
     pub diff: String,
 }
 
+impl ProviderFileChange {
+    /// Separates a provider's trailing move annotation from complete patch content.
+    pub(crate) fn split_move_report(kind: ProviderChangeKind, diff: &str) -> (&str, Option<&str>) {
+        if matches!(kind, ProviderChangeKind::Add | ProviderChangeKind::Delete) {
+            return (diff, None);
+        }
+        let Some((patch, destination)) = diff.rsplit_once("\nMoved to: ") else {
+            return (diff, None);
+        };
+        let destination = destination.trim_end_matches(['\r', '\n']);
+        if destination.is_empty() || destination.contains(['\r', '\n']) {
+            return (diff, None);
+        }
+        (patch, Some(destination))
+    }
+}
+
 /// Stores provider-reported file edits for one tool lifecycle item.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ProviderChangeSet {

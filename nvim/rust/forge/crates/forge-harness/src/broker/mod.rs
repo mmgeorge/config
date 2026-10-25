@@ -348,6 +348,8 @@ enum ExecutionCleanup {
 
 /// Coordinates execution interruption without discarding pending provider evidence.
 pub struct TurnCancellation {
+    /// Cancellation revision captured by queued requests before waiting for admission.
+    pub(crate) request_revision: AtomicU64,
     requested: Arc<AtomicBool>,
     submission_cancelled: Arc<AtomicBool>,
     restore_prompt: AtomicBool,
@@ -360,6 +362,7 @@ pub struct TurnCancellation {
 impl TurnCancellation {
     fn new() -> Self {
         Self {
+            request_revision: AtomicU64::new(0),
             requested: Arc::new(AtomicBool::new(false)),
             submission_cancelled: Arc::new(AtomicBool::new(false)),
             restore_prompt: AtomicBool::new(false),
@@ -383,6 +386,7 @@ impl TurnCancellation {
 
     /// Request cancellation without waiting for the broker's serialized request lane.
     pub fn request(&self, restore_prompt: bool) {
+        self.request_revision.fetch_add(1, Ordering::AcqRel);
         self.submission_cancelled.store(true, Ordering::Release);
         self.restore_prompt.store(restore_prompt, Ordering::Release);
         self.requested.store(true, Ordering::Release);
@@ -591,7 +595,7 @@ pub struct HarnessBroker {
     mcp_notice: HashMap<String, String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
-    prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
+    prompt_admission: Option<(Option<forge_buffer::identity::DocumentId>, u64)>,
     submitted_attachments: Vec<crate::attachment::InputAttachment>,
     active_wait_projection: Option<ActiveWait>,
     pub(crate) parent_input: crate::backend::SteeringLane,
@@ -855,6 +859,8 @@ impl HarnessBroker {
             session.id.clone(),
         )));
         let check_runner = crate::checks::CheckSupervisor::open(
+            session.id.clone(),
+            data_root.clone(),
             PathBuf::from(&session.workspace),
             data_root.join(&session.id).join("checks"),
             Arc::clone(&presentation),
@@ -1077,6 +1083,7 @@ impl HarnessBroker {
                     .save_session_event(&crate::timeline::SessionEventRecord {
                         id: uuid::Uuid::new_v4().to_string(),
                         session_id: self.session.id.clone(),
+                        owner: crate::timeline::TimelineOwner::session(&self.session.id),
                         created_at_ms: self.clock.now_ms(),
                         detail: crate::timeline::SessionEventKind::Configuration {
                             operation_id: uuid::Uuid::new_v4().to_string(),
@@ -1133,6 +1140,7 @@ impl HarnessBroker {
             .save_session_event(&crate::timeline::SessionEventRecord {
                 id: uuid::Uuid::new_v4().to_string(),
                 session_id: self.session.id.clone(),
+                owner: crate::timeline::TimelineOwner::session(&self.session.id),
                 created_at_ms: self.clock.now_ms(),
                 detail: crate::timeline::SessionEventKind::Configuration {
                     operation_id: uuid::Uuid::new_v4().to_string(),
@@ -2044,23 +2052,25 @@ impl HarnessBroker {
                             }))
                 });
         if !preserve_exchange {
-            self.pause_task(false).await?;
+            Box::pin(self.pause_task(false)).await?;
         }
         if command == "configure" {
             self.configuration_progress("applying").await?;
         }
         match command.as_str() {
             "configure" => {
-                self.configure_session(
-                    action
-                        .get("config")
-                        .cloned()
-                        .context("configuration is required")?,
+                Box::pin(
+                    self.configure_session(
+                        action
+                            .get("config")
+                            .cloned()
+                            .context("configuration is required")?,
+                    ),
                 )
                 .await?;
             }
             "compact" => {
-                self.compact_session(true).await?;
+                Box::pin(self.compact_session(true)).await?;
             }
             _ => {
                 self.select_execution_mode(json!({"mode":permission}))?;
@@ -2121,7 +2131,7 @@ impl HarnessBroker {
         .await?;
         if preserve_exchange {
             self.configuration_progress("resuming").await?;
-            return self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."})).await;
+            return Box::pin(self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."}))).await;
         }
         let permission_notice = (command == "permission").then(|| format!(
             "The user changed approval mode from {} to {}. Continue the interrupted work under the updated mode. \
@@ -2145,8 +2155,8 @@ impl HarnessBroker {
                 if self.active_plan_awaits_input()?
                     || self.find_active_interaction_elicitation()?.is_some()
                 {
-                    return self
-                        .resume_exchange(json!({"text":permission_notice.as_deref().unwrap_or("Continue the interrupted clarification using the updated settings.")}))
+                    return Box::pin(self
+                        .resume_exchange(json!({"text":permission_notice.as_deref().unwrap_or("Continue the interrupted clarification using the updated settings.")})))
                         .await;
                 }
                 if command == "configure" {
@@ -2176,7 +2186,7 @@ impl HarnessBroker {
             } else {
                 format!("{notice}\n\nOriginal request: {}", previous.prompt)
             };
-            return self.resume_exchange(json!({"text":prompt})).await;
+            return Box::pin(self.resume_exchange(json!({"text":prompt}))).await;
         }
         Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
     }
@@ -3641,11 +3651,14 @@ impl HarnessBroker {
         {
             Box::pin(self.restore_retracted_control_state(snapshot)).await?;
             if let Some((document, token)) = submitted_prompt {
-                let transition = self
-                    .presentation
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                    .retract_submission(&document, token)?;
+                let transition = if let Some(document) = document {
+                    self.presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                        .retract_submission(&document, token)?
+                } else {
+                    Some(json!({"document":null,"token":token,"state":"retracted"}))
+                };
                 if let Some(transition) = transition {
                     Box::pin(self.emit_backend_event(
                         BackendEvent {
@@ -3676,11 +3689,16 @@ impl HarnessBroker {
         let Some((document, token)) = self.prompt_admission.take() else {
             return Ok(());
         };
-        let transition = self
-            .presentation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .complete_submission(&document, token, admitted)?;
+        let transition = if let Some(document) = document {
+            self.presentation
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .complete_submission(&document, token, admitted)?
+        } else {
+            Some(
+                json!({"document":null,"token":token,"state":if admitted { "accepted" } else { "rejected" }}),
+            )
+        };
         if let Some(transition) = transition {
             self.emit_backend_event(
                 BackendEvent {
@@ -5073,12 +5091,13 @@ Planning continuation: turn {} of {}.",
             }
             self.check_runner.refresh_changes().await?;
             let mut run = self.check_runner.prepare_request(
+                self.store
+                    .capture_timeline_owner(&self.session.id, &interaction.id)?,
                 RunRequest::default(),
                 task.as_ref().map(|task| task.id.clone()),
                 self.session.shell,
                 "Automatic completion checks".into(),
             )?;
-            run.exchange_id = Some(interaction.id.clone());
             if !run
                 .commands
                 .iter()
@@ -9740,6 +9759,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let timeline_event = SessionEventRecord {
             id: Uuid::new_v4().to_string(),
             session_id: session.id.clone(),
+            owner: crate::timeline::TimelineOwner::session(&session.id),
             created_at_ms,
             detail: SessionEventKind::Renamed {
                 name: session.name.clone(),
@@ -10299,6 +10319,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                         self.session.id, compaction.thread_id, compaction.id
                     ),
                     session_id: self.session.id.clone(),
+                    owner: crate::timeline::TimelineOwner::session(&self.session.id),
                     created_at_ms: now_ms,
                     detail: SessionEventKind::Compaction {
                         compaction: compaction.observed(now_ms),
@@ -10358,6 +10379,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let mut record = SessionEventRecord {
             id: format!("{}:compaction:{}", self.session.id, compaction.id),
             session_id: self.session.id.clone(),
+            owner: crate::timeline::TimelineOwner::session(&self.session.id),
             created_at_ms: now_ms,
             detail: SessionEventKind::Compaction {
                 compaction: compaction.clone(),
@@ -11151,7 +11173,7 @@ mod test {
             assert!(
                 history
                     .iter()
-                    .all(|run| run.exchange_id.as_deref() == Some(exchanges[0].id.as_str()))
+                    .all(|run| run.owner.exchange_id() == Some(exchanges[0].id.as_str()))
             );
             let timeline = broker.snapshot()?.timeline;
             assert!(
@@ -11162,15 +11184,19 @@ mod test {
             let attached = timeline
                 .iter()
                 .find_map(|entry| match entry {
-                    TimelineEntry::Exchange {
-                        exchange,
-                        check_runs,
-                        ..
-                    } if exchange.id == exchanges[0].id => Some(check_runs),
+                    TimelineEntry::Exchange { exchange, .. } if exchange.id == exchanges[0].id => {
+                        Some(
+                            exchange
+                                .node_list
+                                .iter()
+                                .filter(|node| matches!(node, ExchangeNode::TimelineEvent { .. }))
+                                .count(),
+                        )
+                    }
                     _ => None,
                 })
                 .unwrap();
-            assert_eq!(attached.len(), history.len());
+            assert_eq!(attached, history.len());
             assert_eq!(
                 history
                     .iter()
@@ -11225,6 +11251,7 @@ mod test {
         exchange.goal_id = Some(goal.id.clone());
         exchange.check_owner = Some(goal.id.clone());
         broker.store.save_exchange(&exchange)?;
+        broker.reconcile_timeline()?;
         broker
             .settle_automatic_checks((json!({}), Vec::new()), PromptMode::GoalContinuation)
             .await?;
@@ -11537,7 +11564,7 @@ mod test {
             )?;
             presentation.begin_submission(&document, 1, "Capture before my first tool")?;
         }
-        broker.prompt_admission = Some((document, 1));
+        broker.prompt_admission = Some((Some(document), 1));
         let (sink, mut stream) = crate::backend::events::channel();
         broker.event_sink = Some(sink);
         broker.backend = Arc::new(CheckpointBackend {
@@ -12225,6 +12252,23 @@ mod test {
 
     use super::*;
 
+    fn save_check_exchange(broker: &mut HarnessBroker, id: &str, execution: bool) -> Result<()> {
+        let exchange: Exchange = serde_json::from_value(json!({
+            "id": id, "session_id": broker.session.id,
+            "agent_id": broker.session.primary_agent_id,
+            "ordinal": broker.store.list_exchange(&broker.session.id)?.len() + 1,
+            "prompt": "Check owner", "state": "complete",
+            "kind": if execution { "plan_execution" } else { "chat" },
+            "plan_id": execution.then_some("check-plan"),
+            "execution_id": execution.then_some("check-execution"),
+            "created_at_ms": 1, "completed_at_ms": 2,
+            "attributed_matches_checkpoint": true, "node_list": []
+        }))?;
+        broker.store.save_exchange(&exchange)?;
+        broker.reconcile_timeline()?;
+        Ok(())
+    }
+
     #[cfg(windows)]
     fn check_fixture(
         repository: &Path,
@@ -12309,6 +12353,7 @@ mod test {
             "observed_source":{},"observed_generation":0,"observed_check":[],"created_at_ms":1
         })).unwrap();
         broker.store.save_plan_execution(&execution).unwrap();
+        save_check_exchange(&mut broker, "check-exchange", true).unwrap();
         broker
     }
 
@@ -12348,13 +12393,9 @@ mod test {
                 .unwrap()
                 .contains("accepted stderr")
         );
-        assert!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .is_empty()
-        );
+        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].id, "check-exchange");
         assert!(execution.verification.is_empty());
     }
 
@@ -12394,13 +12435,9 @@ mod test {
             .unwrap();
         assert_eq!(execution.phase, crate::plan::PlanPhase::Resolve);
         assert!(!execution.check_runs[0].progress.different.is_empty());
-        assert!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .is_empty()
-        );
+        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].id, "check-exchange");
     }
 
     #[cfg(windows)]
@@ -12425,13 +12462,9 @@ mod test {
             execution.check_runs[0].state,
             crate::checks::CheckState::Passed
         );
-        assert!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .is_empty()
-        );
+        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].id, "check-exchange");
     }
 
     #[cfg(windows)]
@@ -12509,13 +12542,9 @@ mod test {
         assert_eq!(execution.state, PlanExecutionState::Complete);
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Complete);
         assert!(execution.check_runs[0].completed_plan.is_some());
-        assert!(
-            broker
-                .store
-                .list_exchange(&broker.session.id)
-                .unwrap()
-                .is_empty()
-        );
+        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchange.len(), 1);
+        assert_eq!(exchange[0].id, "check-exchange");
     }
 
     #[cfg(windows)]
@@ -18041,6 +18070,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        save_check_exchange(&mut broker, "editing-test", false)?;
         let (sink, _events) = crate::backend::events::channel();
         let (scope, _lease) = crate::checks::CheckToolScope::open(
             Arc::clone(&broker.check_runner),
@@ -18112,7 +18142,7 @@ mod test {
                 .to_string()
                 .contains("disabled")
         );
-        assert!(broker.store.list_exchange(&broker.session.id)?.is_empty());
+        assert_eq!(broker.store.list_exchange(&broker.session.id)?.len(), 1);
         Ok(())
     }
 
@@ -18120,7 +18150,7 @@ mod test {
     async fn configured_check_tools_run_without_command_approval() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
-        let broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
         std::fs::write(
             repository.path().join(".forge.json"),
             serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
@@ -18130,6 +18160,11 @@ mod test {
             }]}}))?,
         )?;
         for permission in [PermissionMode::Read, PermissionMode::Write] {
+            save_check_exchange(
+                &mut broker,
+                &format!("configured-check-{permission:?}"),
+                false,
+            )?;
             let (sink, mut events) = crate::backend::events::channel();
             let (scope, lease) = crate::checks::CheckToolScope::open(
                 Arc::clone(&broker.check_runner),
@@ -18227,6 +18262,7 @@ mod test {
         broker
             .check_runner
             .configure(
+                broker.check_runner.session_owner(),
                 serde_json::from_value(json!({
                     "expected_revision": catalog["revision"],
                     "config": {"version": 2, "definitions": []}
@@ -18472,6 +18508,7 @@ mod test {
         broker.store.save_session_event(&SessionEventRecord {
             id: "native-running".into(),
             session_id: broker.session.id.clone(),
+            owner: crate::timeline::TimelineOwner::session(&broker.session.id),
             created_at_ms: 1,
             detail: SessionEventKind::Compaction {
                 compaction: crate::backend::Compaction {
@@ -19236,6 +19273,53 @@ mod test {
         );
     }
 
+    struct PreferenceBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for PreferenceBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor {
+                kind: crate::backend::BackendKind::Codex,
+                label: "Preference fixture".into(),
+                capability: crate::backend::mock_capability(),
+            }
+        }
+
+        async fn shutdown(&self) -> Result<()> {
+            Ok(())
+        }
+        async fn has_active_turn(&self, _session_id: &str) -> bool {
+            false
+        }
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            Ok(())
+        }
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> {
+            None
+        }
+        async fn prompt_stream(
+            &self,
+            _request: BackendRequest,
+            _sink: Option<BackendEventSink>,
+        ) -> Result<crate::backend::BackendOutput> {
+            anyhow::bail!("preference persistence must not start a model turn")
+        }
+
+        async fn model_list(
+            &self,
+            _request: BackendRequest,
+        ) -> Result<Vec<crate::backend::BackendModel>> {
+            ["gpt-5.6", "gpt-5.4"].into_iter().map(|id| {
+                Ok(serde_json::from_value(json!({
+                    "id": id, "reasoning": ["low", "medium", "high"],
+                    "default_reasoning": "medium", "is_default": id == "gpt-5.6", "vision": false,
+                        "service_tiers": ["default", "fast", "ultrafast"],
+                    "context_window": [{"id":"default"}, {"id":"long_context"}]
+                }))?)
+            }).collect()
+        }
+    }
+
     #[tokio::test]
     async fn carries_preferences_into_a_new_session_and_mode_into_a_resume() {
         let repository = repository();
@@ -19263,6 +19347,7 @@ mod test {
             Box::new(FixedClock(100)),
         )
         .unwrap();
+        broker.backend = Arc::new(PreferenceBackend);
         let selected = broker
             .dispatch(Request {
                 id: 0,
@@ -19283,7 +19368,11 @@ mod test {
                 }),
             })
             .await;
-        assert!(configured.response.error().is_none());
+        assert!(
+            configured.response.error().is_none(),
+            "{:?}",
+            configured.response.error()
+        );
         for invalid in [json!("warp"), json!(true), json!(null)] {
             assert!(
                 broker
@@ -19384,6 +19473,7 @@ mod test {
             Box::new(FixedClock(100)),
         )
         .unwrap();
+        broker.backend = Arc::new(PreferenceBackend);
         let selected = broker
             .dispatch(Request {
                 id: 21,

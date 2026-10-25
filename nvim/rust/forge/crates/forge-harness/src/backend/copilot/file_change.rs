@@ -29,7 +29,7 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
             };
             let mut diff = String::new();
             for hunk in file.hunk {
-                diff.push_str(hunk.header);
+                diff.push_str(&hunk.header);
                 diff.push('\n');
                 for row in hunk.row {
                     diff.push(match row.kind {

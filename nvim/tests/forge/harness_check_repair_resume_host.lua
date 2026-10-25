@@ -69,8 +69,19 @@ local success, failure = xpcall(function()
   await(function() return exchanges ~= nil end, "exchange history did not load")
   assert(#exchanges == 1 and exchanges[1].prompt == "Inspect the fixture", vim.inspect(exchanges))
   for _, run in ipairs(catalog.history) do
-    assert(run.exchange_id == exchanges[1].id, "checks lost their exchange owner")
+    assert(run.owner.kind == "exchange" and run.owner.exchange_id == exchanges[1].id
+      and run.owner.session_id == state.session.id, "checks lost their exchange owner")
   end
+  local _, summary_row = state.presentation.transcript.sequence:position(exchanges[1].id .. ":summary")
+  assert(summary_row ~= nil, "owning exchange summary is missing")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { summary_row + 1, 0 })
+  assert(state.presentation.toggle_heading(state.transcript_win), "exchange activity did not expand")
+  await(function()
+    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    local _, count = text:gsub("Checks finished", "")
+    return count == #catalog.history
+  end, "owned checks did not render inside the expanded exchange")
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(not transcript:find("Check repair started", 1, true), transcript)
   assert(transcript:find("Checks finished", 1, true), "attached check results are missing")

@@ -984,6 +984,7 @@ dependencies = [
  "shlex",
  "similar",
  "spdx",
+ "stacker",
  "strip-ansi-escapes",
  "syn 2.0.119",
  "tempfile",

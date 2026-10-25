@@ -570,7 +570,7 @@ impl SessionPresentation {
             syntax_pending: !syntax.is_empty()
                 || action
                     .values()
-                    .any(|action| matches!(action, TranscriptAction::Diff { .. })),
+                    .any(|action| matches!(action, TranscriptAction::Diff { syntax: true, .. })),
             transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
@@ -698,12 +698,16 @@ impl SessionPresentation {
             .action
             .iter()
             .find_map(|(target, action)| match action {
-                TranscriptAction::Diff { text } if !open.syntax_done.contains(target) => Some(
-                    super::syntax::TranscriptSyntax::Diff(super::syntax::SavedDiffSyntax {
-                        target: target.clone(),
-                        text: text.clone(),
-                    }),
-                ),
+                TranscriptAction::Diff { text, syntax: true }
+                    if !open.syntax_done.contains(target) =>
+                {
+                    Some(super::syntax::TranscriptSyntax::Diff(
+                        super::syntax::SavedDiffSyntax {
+                            target: target.clone(),
+                            text: text.clone(),
+                        },
+                    ))
+                }
                 _ => None,
             })
             .or_else(|| {
@@ -734,7 +738,7 @@ impl SessionPresentation {
         };
         let current_source = match job {
             super::syntax::TranscriptSyntax::Diff(job) => {
-                matches!(open.action.get(&job.target), Some(TranscriptAction::Diff { text }) if text == &job.text)
+                matches!(open.action.get(&job.target), Some(TranscriptAction::Diff { text, syntax: true }) if text == &job.text)
             }
             super::syntax::TranscriptSyntax::Markdown(job) => {
                 open.syntax.get(&job.target) == Some(job)
@@ -1094,7 +1098,8 @@ impl SessionPresentation {
 /// Identify unanalysed sources without inspecting their potentially large bodies.
 fn syntax_pending(open: &OpenPresentation) -> bool {
     open.action.iter().any(|(target, action)| {
-        matches!(action, TranscriptAction::Diff { .. }) && !open.syntax_done.contains(target)
+        matches!(action, TranscriptAction::Diff { syntax: true, .. })
+            && !open.syntax_done.contains(target)
     }) || open
         .syntax
         .keys()
@@ -2331,7 +2336,7 @@ mod tests {
         let text = "saved command output\n".repeat(15000);
         std::fs::write(&output, &text)?;
         let run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
-            "id":"gate","exchange_id":"implementation","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "id":"gate","owner":{"kind":"exchange","session_id":"session","exchange_id":"implementation","node_count":0},"revision":1,"completed_plan":null,"shell":"system","executable":null,
             "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
             "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
             "workspace_identity":null,"workspace_digest":{},"commands":[{
@@ -2344,7 +2349,7 @@ mod tests {
         owner.initialize(crate::timeline::TimelineProjector::with_checks(
             vec![interaction_entry("implementation")],
             vec![run],
-        ))?;
+        )?)?;
         let document = DocumentId("check-output".into());
         owner.open(
             document.clone(),
@@ -2371,7 +2376,18 @@ mod tests {
                 .any(|block| block.id.0 == "gate:separator")
         );
         let checks = &collapsed.block[checks_position];
-        assert!(checks.metadata.node.as_ref().unwrap().parent.is_none());
+        assert_eq!(
+            checks
+                .metadata
+                .node
+                .as_ref()
+                .unwrap()
+                .parent
+                .as_ref()
+                .unwrap()
+                .0,
+            "implementation:exchange"
+        );
         for identity in ["gate:declarations", "gate:0:tool"] {
             let child = collapsed
                 .block
@@ -2413,8 +2429,8 @@ mod tests {
                 .snapshot(&document)?
                 .block
                 .iter()
-                .any(|block| block.id.0 == "gate:0:tool"),
-            "collapsing implementation activity must not hide its check results"
+                .all(|block| block.id.0 != "gate:0:tool"),
+            "collapsing implementation activity must hide its owned check results"
         );
         assert!(!collapsed.block.iter().any(|block| {
             block
@@ -2423,14 +2439,27 @@ mod tests {
                 .iter()
                 .any(|row| row.contains("saved command output") || row.contains("must not render"))
         }));
+        {
+            let open = owner.open.as_mut().unwrap();
+            open.sections.set(
+                &mut open.transcript,
+                ViewId("view".into()),
+                100,
+                "implementation:exchange",
+                true,
+                false,
+                None,
+            )?;
+            retain_patches(open, Vec::new())?;
+        }
         for (sequence, action) in [
             (
-                100,
+                101,
                 super::super::nodes::NodeAction::SetExpansion { expanded: true },
             ),
-            (101, super::super::nodes::NodeAction::LoadMore),
+            (102, super::super::nodes::NodeAction::LoadMore),
             (
-                102,
+                103,
                 super::super::nodes::NodeAction::SetExpansion { expanded: false },
             ),
         ] {
@@ -2619,7 +2648,6 @@ mod tests {
             id: "active".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -2742,7 +2770,6 @@ mod tests {
                 id: "active".into(),
                 created_at_ms: 0,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             }],
         )?;
@@ -2818,7 +2845,6 @@ mod tests {
             id: "active".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -2905,7 +2931,6 @@ mod tests {
                     id: "active".into(),
                     created_at_ms: 0,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 },
                 TimelineEntry::Status {
@@ -3032,7 +3057,6 @@ mod tests {
             id: "active".into(),
             created_at_ms: 0,
             exchange: serde_json::from_value(active["exchange"].take())?,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         };
         let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else {
@@ -3147,6 +3171,362 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_file_writes_update_one_expanded_entry_across_turns_and_reload() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
+            ProviderFileChange, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        use forge_buffer::node::{NodeDisplay, NodeKind};
+        use serde_json::{Value, json};
+
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"writes", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Write files", "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let entry = |exchange: &Exchange| TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            agent_by_id: HashMap::new(),
+        };
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry(&exchange)])?;
+        let document = DocumentId("consecutive-writes".into());
+        let view = ViewId("write-view".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let mut group_id = None;
+        let mut group_position = None;
+        let mut first_file_id = None;
+        let mut thought_id = None;
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: None,
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: Value::Null,
+            summary: None,
+            task_update: None,
+            activity: None,
+        };
+        for (batch, (range, count)) in [(0..2, 2), (2..5, 5), (5..6, 6), (0..1, 6)]
+            .into_iter()
+            .enumerate()
+        {
+            let address = ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: format!("turn-{batch}"),
+            };
+            exchange.start_turn(address.clone(), batch as i64 * 10)?;
+            event.address = Some(address);
+            event.turn_boundary = None;
+            if batch == 0 {
+                event.kind = "assistant_message".into();
+                event.text = Some("Write the requested files.\nPreserve their content.".into());
+                event.data = json!({"params":{"itemId":"thought","phase":"commentary"}});
+                exchange.observe_turn(&event, 0)?;
+                owner.reconcile(vec![entry(&exchange)])?;
+                let snapshot = owner.snapshot(&document)?;
+                let thought = snapshot
+                    .block
+                    .iter()
+                    .find(|block| {
+                        block
+                            .text
+                            .wire_rows()
+                            .join("")
+                            .contains("Write the requested files.")
+                    })
+                    .unwrap();
+                thought_id = Some(thought.id.clone());
+                assert_eq!(
+                    thought
+                        .metadata
+                        .layout
+                        .as_ref()
+                        .unwrap()
+                        .marker
+                        .as_ref()
+                        .unwrap()
+                        .text,
+                    "○"
+                );
+                assert!(thought.metadata.fold.is_empty());
+            }
+            event.kind = "reasoning_summary".into();
+            event.text = Some("Continue writing".into());
+            event.data = json!({"provider_message_id":format!("reasoning-{batch}")});
+            exchange.observe_turn(&event, batch as i64 * 10 + 1)?;
+            event.kind = "tool".into();
+            event.text = None;
+            event.data = Value::Null;
+            event.activity = Some(ToolActivity {
+                id: format!("write-{batch}"),
+                kind: ToolActivityKind::FileChange,
+                title: "file changes".into(),
+                output: None,
+                output_delta: false,
+                status: Some("running".into()),
+                change: ProviderChangeSet {
+                    file: range
+                        .map(|index| ProviderFileChange {
+                            path: format!("file-{index}.txt"),
+                            move_path: None,
+                            kind: if batch == 3 {
+                                ProviderChangeKind::Update
+                            } else {
+                                ProviderChangeKind::Add
+                            },
+                            diff: if batch == 3 {
+                                "@@ -1 +1 @@\n-initial\n+final".into()
+                            } else {
+                                "initial\n".into()
+                            },
+                        })
+                        .collect(),
+                },
+            });
+            exchange.observe_turn(&event, batch as i64 * 10 + 2)?;
+            owner.reconcile(vec![entry(&exchange)])?;
+            if batch > 0 {
+                let snapshot = owner.snapshot(&document)?;
+                assert_eq!(
+                    snapshot
+                        .block
+                        .iter()
+                        .filter(|block| block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .is_some_and(|node| node.kind == NodeKind::Changes))
+                        .count(),
+                    1
+                );
+                let group = snapshot
+                    .block
+                    .iter()
+                    .find(|block| Some(&block.id) == group_id.as_ref())
+                    .unwrap();
+                assert!(group.text.wire_rows().join("").contains("changing"));
+            }
+            event.activity.as_mut().unwrap().status = Some("completed".into());
+            exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
+            exchange.observe_turn(&event, batch as i64 * 10 + 3)?;
+            if batch == 0 {
+                exchange
+                    .node_list
+                    .push(crate::exchange::ExchangeNode::Compaction {
+                        id: "compaction".into(),
+                        compaction: crate::backend::Compaction {
+                            id: "compaction".into(),
+                            thread_id: "thread".into(),
+                            state: crate::backend::CompactionState::Completed,
+                            manual: false,
+                            started_at_ms: Some(2),
+                            completed_at_ms: Some(3),
+                            result: Default::default(),
+                        },
+                    });
+            }
+            event.activity = Some(ToolActivity {
+                id: format!("inspect-{batch}"),
+                kind: ToolActivityKind::Command,
+                title: "Inspect file".into(),
+                output: Some("File inspected".into()),
+                output_delta: false,
+                status: Some("completed".into()),
+                change: ProviderChangeSet::default(),
+            });
+            exchange.observe_turn(&event, batch as i64 * 10 + 4)?;
+            event.activity = None;
+            event.turn_boundary = Some(TurnBoundary::Finished {
+                outcome: crate::turn::TurnOutcome::Completed,
+            });
+            exchange.observe_turn(&event, batch as i64 * 10 + 5)?;
+            exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+            owner.reconcile(vec![entry(&exchange)])?;
+            let snapshot = owner.snapshot(&document)?;
+            let thought = snapshot
+                .block
+                .iter()
+                .find(|block| Some(&block.id) == thought_id.as_ref())
+                .unwrap();
+            assert!(
+                thought
+                    .text
+                    .row(0)
+                    .unwrap()
+                    .contains(&format!("{count} files changed"))
+            );
+            let thought_node = thought.metadata.node.as_ref().unwrap();
+            assert_eq!(
+                thought_node.display,
+                if batch == 0 {
+                    NodeDisplay::Heading
+                } else {
+                    NodeDisplay::Full
+                }
+            );
+            if batch == 0 {
+                owner.dispatch(PresentationRequest::Node {
+                    request: NodeRequest {
+                        document: document.clone(),
+                        view: view.clone(),
+                        sequence: 1,
+                        node: thought_node.id.0.clone(),
+                        generation: thought_node.generation,
+                        action: NodeAction::SetExpansion { expanded: true },
+                        rows: 40,
+                        width: WidthProfile::default(),
+                    },
+                })?;
+            }
+            let snapshot = owner.snapshot(&document)?;
+            let groups: Vec<_> = snapshot
+                .block
+                .iter()
+                .enumerate()
+                .filter(|(_, block)| {
+                    block
+                        .metadata
+                        .node
+                        .as_ref()
+                        .is_some_and(|node| node.kind == NodeKind::Changes)
+                })
+                .collect();
+            assert_eq!(groups.len(), 1);
+            let (position, group) = groups[0];
+            assert!(
+                group
+                    .text
+                    .wire_rows()
+                    .join("")
+                    .contains(&format!("Changed {count} files +{count} -0"))
+            );
+            if let Some(identity) = &group_id {
+                assert_eq!(&group.id, identity);
+                assert_eq!(Some(position), group_position);
+                assert_eq!(
+                    group.metadata.node.as_ref().unwrap().display,
+                    NodeDisplay::Full
+                );
+                assert!(
+                    snapshot
+                        .block
+                        .iter()
+                        .any(|block| Some(&block.id) == first_file_id.as_ref())
+                );
+            } else {
+                group_id = Some(group.id.clone());
+                group_position = Some(position);
+                let node = group.metadata.node.as_ref().unwrap();
+                owner.dispatch(PresentationRequest::Node {
+                    request: NodeRequest {
+                        document: document.clone(),
+                        view: view.clone(),
+                        sequence: 2,
+                        node: node.id.0.clone(),
+                        generation: node.generation,
+                        action: NodeAction::SetExpansion { expanded: true },
+                        rows: 40,
+                        width: WidthProfile::default(),
+                    },
+                })?;
+                first_file_id = owner
+                    .snapshot(&document)?
+                    .block
+                    .iter()
+                    .find(|block| {
+                        block
+                            .metadata
+                            .node
+                            .as_ref()
+                            .is_some_and(|node| node.kind == NodeKind::File)
+                    })
+                    .map(|block| block.id.clone());
+                assert!(first_file_id.is_some());
+            }
+        }
+        let open = owner.open.as_ref().unwrap();
+        let identity = &group_id.unwrap().0;
+        let action = open
+            .action
+            .get(&forge_buffer::identity::TargetId(identity.clone()))
+            .unwrap();
+        let super::super::projection::TranscriptAction::Diff { text, .. } = action else {
+            panic!("missing grouped diff")
+        };
+        assert!(text.contains("+final"));
+        assert!(!text.contains("-initial"));
+        assert_eq!(text.matches("diff --git").count(), 6);
+        let snapshot = owner.snapshot(&document)?;
+        let thought_position = snapshot
+            .block
+            .iter()
+            .position(|block| Some(&block.id) == thought_id.as_ref())
+            .unwrap();
+        let event_position = snapshot
+            .block
+            .iter()
+            .position(|block| block.id.0 == "compaction")
+            .unwrap();
+        let tools_position = snapshot
+            .block
+            .iter()
+            .position(|block| block.id.0.ends_with(":tools"))
+            .unwrap();
+        let changes_position = snapshot
+            .block
+            .iter()
+            .position(|block| &block.id.0 == identity)
+            .unwrap();
+        assert!(
+            thought_position < event_position
+                && event_position < tools_position
+                && tools_position < changes_position
+        );
+        assert_eq!(
+            snapshot.block[event_position]
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .indent,
+            snapshot.block[thought_position]
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .indent
+                + 2
+        );
+        let tools: Vec<_> = snapshot
+            .block
+            .iter()
+            .filter(|block| {
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .is_some_and(|node| node.kind == NodeKind::ToolGroup)
+            })
+            .collect();
+        assert_eq!(tools.len(), 1);
+        assert!(
+            tools[0]
+                .text
+                .wire_rows()
+                .join("")
+                .contains("Running 4 tools")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn hidden_parallel_tool_output_stays_cached_until_exchange_completion() -> Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
@@ -3188,7 +3568,6 @@ mod tests {
             id: "parallel".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         }])?;
         let document = DocumentId("hidden-parallel".into());
@@ -3286,7 +3665,6 @@ mod tests {
             id: "parallel".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         }])?;
         assert_eq!(
@@ -3330,7 +3708,6 @@ mod tests {
             id: "parallel".into(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         }])?;
         let settled = owner.snapshot(&document)?;
@@ -3390,7 +3767,6 @@ mod tests {
             id: "parallel".into(),
             created_at_ms: 0,
             exchange,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         }])?;
         let activity = "parallel:exchange";
@@ -3504,6 +3880,55 @@ mod tests {
         assert!(owner.capture_syntax(&document)?.is_none());
         owner.close(&document)?;
         assert!(owner.open.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_saved_patch_retains_one_diagnostic_without_syntax_retries() -> Result<()> {
+        let mut entry = interaction_entry("invalid-diff");
+        let source = "--- a/test.rs\n+++ b/test.rs\n@@ -1 +1 @@\n-before\n+after\n+outside\n";
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.attributed_diff_text = Some(source.into());
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let document = DocumentId("transcript:invalid-diff".into());
+        let opened = owner.open(
+            document.clone(),
+            ViewId("invalid-diff".into()),
+            WidthProfile::default(),
+        )?;
+        assert!(!opened.syntax_pending);
+        for _ in 0..3 {
+            owner.reconcile(vec![entry.clone()])?;
+            assert!(owner.capture_syntax(&document)?.is_none());
+            let snapshot = owner.snapshot(&document)?;
+            let diagnostics = snapshot
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .filter(|row| row.contains("preview unavailable"))
+                .count();
+            assert_eq!(diagnostics, 1);
+        }
+        assert!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .action
+                .values()
+                .any(|action| matches!(
+                    action, TranscriptAction::Diff { text, syntax: false } if text == source
+                ))
+        );
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.attributed_diff_text = Some(source.replace("+outside\n", ""));
+        owner.reconcile(vec![entry])?;
+        assert!(owner.capture_syntax(&document)?.is_some());
         Ok(())
     }
 
@@ -3669,7 +4094,6 @@ mod tests {
         TimelineEntry::Exchange {
             id: identity.into(),
             created_at_ms: 0,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
             exchange: interaction,
         }
@@ -3774,7 +4198,6 @@ mod tests {
                 id: "active".into(),
                 created_at_ms: 0,
                 exchange: exchange.clone(),
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             }])?;
             let document = DocumentId("stream-page".into());
@@ -3863,7 +4286,6 @@ mod tests {
             id: "paged".into(),
             created_at_ms: 0,
             exchange: serde_json::from_value(entry["exchange"].take())?,
-            check_runs: Vec::new(),
             agent_by_id: HashMap::new(),
         }])?;
         let document = DocumentId("paged-tools".into());
@@ -4187,7 +4609,6 @@ mod tests {
                     id: exchange.id.clone(),
                     created_at_ms: exchange.created_at_ms,
                     exchange: exchange.clone(),
-                    check_runs: Vec::new(),
                     agent_by_id: HashMap::new(),
                 }
             } else {
@@ -4337,7 +4758,6 @@ mod tests {
             id: parent.id.clone(),
             created_at_ms: 0,
             exchange: parent.clone(),
-            check_runs: Vec::new(),
             agent_by_id: HashMap::from([(
                 run.id.clone(),
                 TimelineEntry::AgentLifecycle {

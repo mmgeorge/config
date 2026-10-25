@@ -3202,7 +3202,6 @@ end
                     id: exchange.id.clone(),
                     created_at_ms: 0,
                     exchange,
-                    check_runs: Vec::new(),
                     agent_by_id: std::collections::HashMap::new(),
                 },
                 &forge_buffer::width::WidthProfile::default(),

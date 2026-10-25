@@ -135,7 +135,7 @@ impl HarnessService {
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
             .action(input)?;
         match action {
-            crate::buffer::projection::TranscriptAction::Diff { text } => Ok(text),
+            crate::buffer::projection::TranscriptAction::Diff { text, .. } => Ok(text),
             _ => anyhow::bail!("transcript target is not a saved diff"),
         }
     }
@@ -460,6 +460,68 @@ impl HarnessService {
         Ok(None)
     }
 
+    /// Wait for queued prompt ownership without holding cleanup admission during active work.
+    async fn prepare_queued_prompt(
+        &self,
+        session_id: &str,
+        task_id: Option<&str>,
+    ) -> Result<OwnedSemaphorePermit> {
+        let registry = self.registry().await?;
+        let controller = registry.resolve(session_id).await?;
+        let request_revision = controller
+            .cancellation
+            .request_revision
+            .load(Ordering::Acquire);
+        loop {
+            let execution = Arc::clone(&controller.execution_admission)
+                .acquire_owned()
+                .await?;
+            if let Ok(_control) = Arc::clone(&controller.control_admission).try_acquire_owned() {
+                ensure!(
+                    self.accepting.load(Ordering::Acquire),
+                    "Harness service is closed"
+                );
+                ensure!(
+                    controller
+                        .cancellation
+                        .request_revision
+                        .load(Ordering::Acquire)
+                        == request_revision,
+                    "queued prompt was interrupted before admission; the message remains queued"
+                );
+                let snapshot = controller.observer.snapshot()?;
+                ensure!(
+                    snapshot.session.current_task_id.as_deref() == task_id,
+                    "queued prompt belongs to another task; the message remains queued"
+                );
+                ensure!(
+                    !snapshot
+                        .task
+                        .iter()
+                        .any(|task| Some(task.id.as_str()) == task_id
+                            && matches!(
+                                task.status,
+                                crate::task::TaskStatus::Paused
+                                    | crate::task::TaskStatus::Stopping
+                                    | crate::task::TaskStatus::Blocked
+                                    | crate::task::TaskStatus::Failed
+                                    | crate::task::TaskStatus::Cancelled
+                            )),
+                    "queued prompt is waiting for its task to resume"
+                );
+                controller.cancellation.arm(true);
+                return Ok(execution);
+            }
+            // Cleanup may itself need execution ownership. Release it before waiting for cleanup.
+            drop(execution);
+            drop(
+                Arc::clone(&controller.control_admission)
+                    .acquire_owned()
+                    .await?,
+            );
+        }
+    }
+
     /// Persist transition ordering on the host input lane before concurrent execution begins.
     pub async fn prepare_task(&self, session_id: Option<&str>, request: &Request) -> Result<()> {
         let _activity = self.admit().await?;
@@ -511,6 +573,23 @@ impl HarnessService {
         let registry = self.registry().await?;
         registry.runtime.lsp.attach(sink.clone());
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
+        if method == HarnessMethod::PromptSubmit && request.params["queued"].as_bool() == Some(true)
+        {
+            ensure!(
+                admission.is_none(),
+                "queued prompt already owns execution admission"
+            );
+            let task_id = request
+                .params
+                .get("queued_task_id")
+                .map(|value| {
+                    value
+                        .as_str()
+                        .context("queued task identity must be a string")
+                })
+                .transpose()?;
+            admission = Some(self.prepare_queued_prompt(&session_id, task_id).await?);
+        }
         if method == HarnessMethod::AttachmentImport {
             registry.resolve(&session_id).await?;
             let root = PathBuf::from(&registry.initialize.data_root);
@@ -637,12 +716,11 @@ impl HarnessService {
                 .context("prompt submission requires an object")?;
             params.remove("_prompt_admission");
             if let Some(submission) = params.remove("submission") {
-                let document = serde_json::from_value::<forge_buffer::identity::DocumentId>(
-                    submission
-                        .get("document")
-                        .cloned()
-                        .context("submission document is required")?,
-                )?;
+                let document = submission
+                    .get("document")
+                    .cloned()
+                    .map(serde_json::from_value::<forge_buffer::identity::DocumentId>)
+                    .transpose()?;
                 let token = submission
                     .get("token")
                     .and_then(Value::as_u64)
@@ -651,21 +729,23 @@ impl HarnessService {
                     .get("text")
                     .and_then(Value::as_str)
                     .context("prompt text is required")?;
-                let controller = registry.resolve(&session_id).await?;
-                controller
-                    .presentation
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                    .begin_submission(&document, token, text)?;
+                if let Some(document) = &document {
+                    let controller = registry.resolve(&session_id).await?;
+                    controller
+                        .presentation
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                        .begin_submission(document, token, text)?;
+                    prompt_admission = Some(PromptAdmission {
+                        presentation: Arc::clone(&controller.presentation),
+                        document: document.clone(),
+                        token,
+                    });
+                }
                 params.insert(
                     "_prompt_admission".into(),
                     json!({"document":document,"token":token}),
                 );
-                prompt_admission = Some(PromptAdmission {
-                    presentation: Arc::clone(&controller.presentation),
-                    document,
-                    token,
-                });
             }
         }
         let result = Box::pin(route_request(
@@ -2206,6 +2286,7 @@ async fn route_request(
                     .try_acquire_owned()
                     .context("finish active source work before checks")?;
                 let run = controller.checks.prepare_request(
+                    controller.checks.session_owner(),
                     serde_json::from_value(request.params.clone())?,
                     task_id.map(str::to_owned),
                     session.shell,
@@ -2683,11 +2764,29 @@ async fn route_task_transition(
         )?
         .begin_application(&session_id, &operation.id, revision)?;
     }
+    let exchange_list = store.list_exchange(&session_id)?;
+    let mut active = exchange_list.iter().filter(|exchange| {
+        exchange.completed_at_ms.is_none()
+            && exchange.state != crate::exchange::ExchangeState::Queued
+            && exchange.disposition == crate::exchange::HistoryDisposition::Current
+    });
+    operation.exchange_id = active.next().map(|exchange| exchange.id.clone());
+    ensure!(
+        active.next().is_none(),
+        "configuration has multiple active exchange owners"
+    );
+    if operation.exchange_id.is_none()
+        && let Some(run_id) = controller.checks.active()?
+    {
+        operation.exchange_id = controller
+            .checks
+            .status(&run_id, 0, false)
+            .await?
+            .owner
+            .exchange_id()
+            .map(str::to_owned);
+    }
     retain_configuration_event(&mut store, &operation)?;
-    operation.exchange_id = store
-        .list_exchange(&session_id)?
-        .last()
-        .map(|exchange| exchange.id.clone());
     sink.send_control_wait(Message::Response(Response::success(
         request.id,
         json!({"id":operation.id,"state":operation.state}),
@@ -2757,11 +2856,22 @@ fn retain_configuration_event(
         .into_iter()
         .find(|event| event.id == format!("configuration-{}", operation.id));
     let created_at_ms = existing
+        .as_ref()
         .map(|event| event.created_at_ms)
         .unwrap_or(operation.created_at_ms);
+    let owner = match existing {
+        Some(event) => event.owner,
+        None => match operation.exchange_id.as_deref() {
+            Some(exchange_id) => {
+                store.capture_timeline_owner(&operation.session_id, exchange_id)?
+            }
+            None => crate::timeline::TimelineOwner::session(&operation.session_id),
+        },
+    };
     store.save_session_event(&crate::timeline::SessionEventRecord {
         id: format!("configuration-{}", operation.id),
         session_id: operation.session_id.clone(),
+        owner,
         created_at_ms,
         detail: crate::timeline::SessionEventKind::Configuration {
             operation_id: operation.id.clone(),
@@ -5875,6 +5985,121 @@ mod tests {
                 break;
             }
         }
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_waits_for_execution_and_acknowledges_admission() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let session_id = registry.initial_session_id.clone();
+        let previous = service
+            .prepare(Some(&session_id), HarnessMethod::PromptSubmit)
+            .await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let mut queued = Box::pin(service.dispatch_admitted(
+            Some(session_id.clone()),
+            Request { id: 2, method: "prompt.submit".into(),
+                params: json!({"text":"Queued after finalization","queued":true,"submission":{"token":42}}) },
+            &sink, None,
+        ));
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        assert!(
+            service
+                .prepare(Some(&session_id), HarnessMethod::StateGet)
+                .await?
+                .is_none()
+        );
+        let controller = registry.resolve(&session_id).await?;
+        assert!(
+            controller.control_admission.try_acquire().is_ok(),
+            "queued work blocked cancellation"
+        );
+        drop(previous);
+        let observe = async {
+            let mut accepted = 0;
+            loop {
+                let frame = output.recv().await?.context("queued response missing")?;
+                let message: Value = serde_json::from_slice(frame.bytes())?;
+                if message["event"] == "backend_event"
+                    && message["payload"]["kind"] == "prompt_submission"
+                {
+                    assert_eq!(message["payload"]["data"]["token"], 42);
+                    assert_eq!(message["payload"]["data"]["state"], "accepted");
+                    accepted += 1;
+                }
+                if message["id"] == 2 {
+                    assert!(message.get("error").is_none(), "{message}");
+                    assert_eq!(
+                        accepted, 1,
+                        "queued admission was not acknowledged exactly once"
+                    );
+                    return Ok::<(), anyhow::Error>(());
+                }
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::try_join!(queued, observe)
+        })
+        .await??;
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_waits_for_cleanup_without_retaining_execution() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let cleanup = controller.control_admission.acquire().await?;
+        let mut queued =
+            Box::pin(service.prepare_queued_prompt(&registry.initial_session_id, None));
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        let execution = controller
+            .execution_admission
+            .try_acquire()
+            .expect("queued work blocked cleanup");
+        drop(cleanup);
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        assert!(controller.control_admission.try_acquire().is_ok());
+        drop(execution);
+        drop(tokio::time::timeout(Duration::from_secs(1), queued).await??);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn queued_prompt_does_not_resume_after_cancellation_or_task_change() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let execution = controller.execution_admission.acquire().await?;
+        let mut queued =
+            Box::pin(service.prepare_queued_prompt(&registry.initial_session_id, None));
+        assert!(futures_util::poll!(queued.as_mut()).is_pending());
+        controller.cancellation.request(false);
+        drop(execution);
+        let failure = queued.await.unwrap_err();
+        assert!(failure.to_string().contains("interrupted before admission"));
+        let failure = service
+            .prepare_queued_prompt(&registry.initial_session_id, Some("another-task"))
+            .await
+            .unwrap_err();
+        assert!(failure.to_string().contains("belongs to another task"));
+        assert!(controller.execution_admission.try_acquire().is_ok());
         service.shutdown(Duration::from_secs(1)).await?;
         Ok(())
     }

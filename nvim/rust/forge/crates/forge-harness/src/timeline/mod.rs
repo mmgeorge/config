@@ -9,8 +9,10 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+pub(crate) mod ownership;
 mod planning;
 pub mod stream;
+pub use ownership::{TimelineEvent, TimelineOwner};
 
 /// Represents one durable session action projected outside model interactions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -45,6 +47,7 @@ pub enum SessionEventKind {
 pub struct SessionEventRecord {
     pub id: String,
     pub session_id: String,
+    pub owner: TimelineOwner,
     pub created_at_ms: i64,
     #[serde(flatten)]
     pub detail: SessionEventKind,
@@ -64,7 +67,6 @@ pub enum TimelineEntry {
         created_at_ms: i64,
         exchange: Exchange,
         agent_by_id: HashMap<String, TimelineEntry>,
-        check_runs: Vec<crate::checks::CheckRun>,
     },
     AgentLifecycle {
         id: String,
@@ -125,26 +127,15 @@ impl TimelineEntry {
         }
     }
 
-    /// Attach one completed run to its owning exchange, replacing repeated publications.
-    fn attach_check(&mut self, run: &crate::checks::CheckRun) -> bool {
-        let Self::Exchange {
-            exchange,
-            check_runs,
-            ..
-        } = self
-        else {
-            return false;
+    fn attach_event(&mut self, event: &TimelineEvent) -> Result<bool> {
+        let Some(owner) = event.owner().exchange_id() else {
+            return Ok(false);
         };
-        if run.exchange_id.as_deref() != Some(exchange.id.as_str()) {
-            return false;
-        }
-        if let Some(previous) = check_runs.iter_mut().find(|previous| previous.id == run.id) {
-            *previous = run.clone();
-        } else {
-            check_runs.push(run.clone());
-            check_runs.sort_by_key(|run| run.started_at_ms);
-        }
-        true
+        let Some(exchange) = self.exchange_mut(owner) else {
+            return Ok(false);
+        };
+        ownership::insert_event(exchange, event.clone())?;
+        Ok(true)
     }
 
     fn exchange_mut(&mut self, id: &str) -> Option<&mut Exchange> {
@@ -213,7 +204,7 @@ impl TimelineEntry {
     }
 
     /// Replace a contained exchange without changing its planning events or agent ownership.
-    fn replace_exchange(&mut self, replacement: &Exchange) -> bool {
+    fn replace_exchange(&mut self, replacement: &Exchange) -> Result<bool> {
         match self {
             Self::Exchange {
                 exchange,
@@ -221,12 +212,15 @@ impl TimelineEntry {
                 ..
             } => {
                 if exchange.id == replacement.id {
-                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement);
-                    true
+                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement)?;
+                    Ok(true)
                 } else {
-                    agent_by_id
-                        .values_mut()
-                        .any(|agent| agent.replace_exchange(replacement))
+                    for agent in agent_by_id.values_mut() {
+                        if agent.replace_exchange(replacement)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
                 }
             }
             Self::AgentLifecycle {
@@ -236,15 +230,18 @@ impl TimelineEntry {
                     .iter_mut()
                     .find(|exchange| exchange.id == replacement.id)
                 {
-                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement);
-                    true
+                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement)?;
+                    Ok(true)
                 } else {
-                    agent
-                        .iter_mut()
-                        .any(|agent| agent.replace_exchange(replacement))
+                    for agent in agent.iter_mut() {
+                        if agent.replace_exchange(replacement)? {
+                            return Ok(true);
+                        }
+                    }
+                    Ok(false)
                 }
             }
-            _ => false,
+            _ => Ok(false),
         }
     }
 
@@ -278,6 +275,14 @@ impl TimelineEntry {
             | Self::Status { created_at_ms, .. } => *created_at_ms,
         }
     }
+
+    fn order_key(&self) -> (bool, i64, String) {
+        (
+            matches!(self, Self::Status { .. }),
+            self.created_at_ms(),
+            self.id(),
+        )
+    }
 }
 
 /// Resolves durable records into one ordered session presentation.
@@ -303,29 +308,59 @@ impl TimelineProjector {
     pub(crate) fn with_checks(
         mut timeline: Vec<TimelineEntry>,
         runs: Vec<crate::checks::CheckRun>,
-    ) -> Vec<TimelineEntry> {
+    ) -> Result<Vec<TimelineEntry>> {
         for run in runs
             .into_iter()
             .filter(|run| run.state != crate::checks::CheckState::Running)
         {
-            if run.exchange_id.is_some() {
+            if run.owner.exchange_id().is_some() {
+                let event = TimelineEvent::Check { run: Box::new(run) };
+                let mut attached = false;
                 for entry in &mut timeline {
-                    if entry.attach_check(&run) {
+                    if entry.attach_event(&event)? {
+                        attached = true;
                         break;
                     }
                 }
+                anyhow::ensure!(
+                    attached,
+                    "check event owner is absent from the timeline: {}",
+                    event.id()
+                );
                 continue;
             }
             if !timeline.iter().any(|entry| entry.id() == run.id) {
                 timeline.push(TimelineEntry::Checks {
                     id: run.id.clone(),
-                    created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms),
+                    created_at_ms: run.started_at_ms,
                     run,
                 });
             }
         }
-        timeline.sort_by_key(TimelineEntry::created_at_ms);
-        timeline
+        timeline.sort_by_key(TimelineEntry::order_key);
+        Ok(timeline)
+    }
+
+    pub(crate) fn with_history<'exchange>(
+        timeline: Vec<TimelineEntry>,
+        runs: Vec<crate::checks::CheckRun>,
+        exchanges: impl IntoIterator<Item = &'exchange Exchange>,
+    ) -> Result<Vec<TimelineEntry>> {
+        let retired: std::collections::HashSet<_> = exchanges
+            .into_iter()
+            .filter(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            .map(|exchange| exchange.id.as_str())
+            .collect();
+        Self::with_checks(
+            timeline,
+            runs.into_iter()
+                .filter(|run| {
+                    run.owner
+                        .exchange_id()
+                        .is_none_or(|owner| !retired.contains(owner))
+                })
+                .collect(),
+        )
     }
     /// Build one stable session timeline from interactions and plan lifecycle records.
     pub fn build(projection: TimelineProjection<'_>) -> Result<Vec<TimelineEntry>> {
@@ -342,6 +377,12 @@ impl TimelineProjector {
             session_event_list,
             plan_file,
         } = projection;
+        let retired: std::collections::HashSet<_> = interaction_list
+            .iter()
+            .chain(&agent_exchange_list)
+            .filter(|exchange| exchange.disposition != crate::exchange::HistoryDisposition::Current)
+            .map(|exchange| exchange.id.clone())
+            .collect();
         let mut interaction_list = interaction_list;
         for exchange in &mut interaction_list {
             restore_exchange_reports(exchange, plan_file);
@@ -366,14 +407,20 @@ impl TimelineProjector {
                 id: exchange.id.clone(),
                 created_at_ms: exchange.created_at_ms,
                 exchange,
-                check_runs: Vec::new(),
                 agent_by_id: HashMap::new(),
             })
             .collect::<Vec<_>>();
         project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
+            if event
+                .owner
+                .exchange_id()
+                .is_some_and(|owner| retired.contains(owner))
+            {
+                continue;
+            }
             if matches!(&event.detail, SessionEventKind::Configuration { state, .. }
-                if state == "completed")
+                if !matches!(state.as_str(), "failed" | "cancelled" | "interrupted"))
             {
                 continue;
             }
@@ -385,18 +432,47 @@ impl TimelineProjector {
             {
                 continue;
             }
+            if event.owner.exchange_id().is_some() {
+                let event = TimelineEvent::Session {
+                    event: Box::new(event),
+                };
+                let mut attached = false;
+                for entry in &mut result {
+                    if entry.attach_event(&event)? {
+                        attached = true;
+                        break;
+                    }
+                }
+                anyhow::ensure!(
+                    attached,
+                    "session event owner is absent from the timeline: {}",
+                    event.id()
+                );
+                continue;
+            }
             result.push(TimelineEntry::SessionEvent {
                 id: event.id.clone(),
                 created_at_ms: event.created_at_ms,
                 event,
             });
         }
+        let mut result = Self::with_checks(
+            result,
+            checks
+                .into_iter()
+                .filter(|run| {
+                    run.owner
+                        .exchange_id()
+                        .is_none_or(|owner| !retired.contains(owner))
+                })
+                .collect(),
+        )?;
         result.retain(|entry| {
             !matches!(entry, TimelineEntry::Exchange { exchange, .. }
             if exchange.disposition != crate::exchange::HistoryDisposition::Current)
         });
-        result.sort_by_key(TimelineEntry::created_at_ms);
-        Ok(Self::with_checks(result, checks))
+        result.sort_by_key(TimelineEntry::order_key);
+        Ok(result)
     }
 }
 
@@ -557,14 +633,27 @@ mod test {
     };
 
     #[test]
-    fn completed_settings_are_hidden_after_event_reload() -> anyhow::Result<()> {
+    fn routine_settings_are_hidden_after_event_reload() -> anyhow::Result<()> {
         use super::{SessionEventKind, SessionEventRecord};
         let directory = tempfile::tempdir()?;
         let mut retained = Vec::new();
-        for state in ["completed", "failed"] {
+        for state in [
+            "admitted",
+            "accepted",
+            "queued",
+            "running",
+            "stopping",
+            "applying",
+            "verifying",
+            "resuming",
+            "completed",
+            "superseded",
+            "failed",
+        ] {
             retained.push(SessionEventRecord {
                 id: state.into(),
                 session_id: "session".into(),
+                owner: crate::timeline::TimelineOwner::session(&"session"),
                 created_at_ms: 1,
                 detail: SessionEventKind::Configuration {
                     operation_id: state.into(),
@@ -576,7 +665,7 @@ mod test {
         }
         let event: Vec<SessionEventRecord> =
             serde_json::from_str(&serde_json::to_string(&retained)?)?;
-        assert_eq!(event.len(), 2);
+        assert_eq!(event.len(), retained.len());
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: Vec::new(),
             plan_list: &[],
@@ -833,14 +922,12 @@ mod test {
                 id: first.id.clone(),
                 created_at_ms: 1,
                 exchange: first,
-                check_runs: Vec::new(),
                 agent_by_id: std::collections::HashMap::new(),
             },
             TimelineEntry::Exchange {
                 id: second.id.clone(),
                 created_at_ms: 2,
                 exchange: second,
-                check_runs: Vec::new(),
                 agent_by_id: std::collections::HashMap::new(),
             },
         ];

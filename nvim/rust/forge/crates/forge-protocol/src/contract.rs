@@ -128,6 +128,20 @@ mod tests {
             &json!({"data":{"session_id":"session","provider":"Codex","model":null}}),
         )
         .unwrap();
+        validate(
+            "backend",
+            "prompt_submission",
+            &json!({"data":{"document":null,"token":2,"state":"accepted"}}),
+        )
+        .unwrap();
+        assert!(
+            validate(
+                "backend",
+                "prompt_submission",
+                &json!({"data":{"document":null,"token":"2","state":"accepted"}}),
+            )
+            .is_err()
+        );
     }
 
     #[test]

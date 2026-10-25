@@ -165,3 +165,37 @@ impl SqliteStore {
         }
     }
 }
+
+impl SqliteStore {
+    pub(crate) fn capture_timeline_owner(
+        &self,
+        session_id: &str,
+        exchange_id: &str,
+    ) -> Result<crate::timeline::TimelineOwner> {
+        let exchange = self
+            .load_exchange_metadata(exchange_id)?
+            .context("timeline event owner does not exist")?;
+        ensure!(
+            exchange.session_id == session_id,
+            "timeline event crosses session ownership"
+        );
+        Ok(crate::timeline::TimelineOwner::exchange(&exchange))
+    }
+
+    pub(crate) fn validate_timeline_owner(
+        &self,
+        owner: &crate::timeline::TimelineOwner,
+    ) -> Result<()> {
+        ensure!(
+            !owner.session_id().is_empty(),
+            "timeline owner requires a session identity"
+        );
+        if let Some(exchange_id) = owner.exchange_id() {
+            let exchange = self
+                .load_exchange_metadata(exchange_id)?
+                .context("timeline event owner does not exist")?;
+            owner.validate_exchange(&exchange)?;
+        }
+        Ok(())
+    }
+}

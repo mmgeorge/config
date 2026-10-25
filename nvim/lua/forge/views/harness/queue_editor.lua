@@ -42,7 +42,9 @@ function M.move(state, draft, direction)
   index = index + direction
   if index < 1 then return nil, edit and "Already editing the first queued prompt" or "No queued prompt to edit" end
   if index > #state.queue then return nil, "Already editing the last queued prompt" end
-  if index == 1 and state.configuring then return nil, "The first queued prompt is being admitted" end
+  if index == 1 and (state.configuring or state.prompt_submission and state.prompt_submission.queue_entry == state.queue[index]) then
+    return nil, "The first queued prompt is being admitted"
+  end
   local entry = state.queue[index]
   if type(entry) == "string" then
     entry = { text = entry, task_id = state.session and state.session.current_task_id }

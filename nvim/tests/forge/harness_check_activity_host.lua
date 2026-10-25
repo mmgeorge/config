@@ -1,5 +1,21 @@
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 vim.loader.enable(false)
+if not vim.g.forge_check_activity_grid and not vim.g.forge_check_activity_hold then
+  local child = vim.fn.jobstart({ vim.v.progpath, "--embed", "--headless", "-u", "NONE", "-i", "NONE" }, { rpc = true })
+  assert(child > 0)
+  local success, failure = pcall(function()
+    vim.rpcrequest(child, "nvim_ui_attach", 120, 42, { rgb = true })
+    vim.rpcrequest(child, "nvim_exec_lua", [[
+      vim.g.forge_check_activity_grid = true
+      dofile('nvim/tests/forge/harness_check_activity_host.lua')
+    ]], {})
+  end)
+  vim.fn.jobstop(child)
+  assert(success, failure)
+  print("harness_check_activity_host: passed at 120x42")
+  vim.cmd("qa!")
+  return
+end
 local original_directory = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
@@ -10,6 +26,9 @@ vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
     auto = false, trigger = { kind = "manual" }, scope = "all", directory = ".",
     all = { command = "nu", args = { "--no-config-file", "-c",
       ("sleep %dms; print 'retained check output'"):format(hold + 1200) } }, depends_on = {} },
+  { id = "unused", name = "Unused fixture", category = "test", area = "Fixture", enabled = true,
+    auto = false, trigger = { kind = "manual" }, scope = "all", directory = ".",
+    all = { command = "nu", args = { "--no-config-file", "-c", "exit 9" } }, depends_on = {} },
 } } }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
@@ -85,7 +104,8 @@ local succeeded, failure = xpcall(function()
   assert(snapshot.checks_running and snapshot.active_check_run == run_id)
   assert(snapshot.status.kind == "idle", "check replaced the primary phase")
   local running = transcript()
-  assert(running:find("Idle", 1, true) < running:find("Checks running", 1, true))
+  local phase_row, checks_row = running:find("Checking", 1, true), running:find("Checks running", 1, true)
+  assert(phase_row and checks_row and phase_row < checks_row, running)
   assert(not running:find("retained check output", 1, true), "running status exposed check output")
   assert_status_region()
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
@@ -105,11 +125,75 @@ local succeeded, failure = xpcall(function()
   local _, count = transcript():gsub("Checks finished", "")
   assert(count == 1, "result history was duplicated")
   assert(not transcript():find("retained check output", 1, true), "result output was not collapsed")
+  local _, check_row = state.presentation.transcript.sequence:position(run_id .. ":checks")
+  assert(check_row ~= nil, "check result heading is missing")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { check_row + 1, 0 })
+  assert(state.presentation.toggle_heading(state.transcript_win), "check results did not expand")
+  assert(vim.wait(3000, function()
+    return transcript():find("Activity fixture", 1, true) ~= nil
+  end, 10), "executed check is missing from expanded results")
+  assert(not transcript():find("Unused fixture", 1, true), "skipped check appeared in expanded results")
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == "Idle",
     "idle retained unused rows below the phase")
   assert_status_region()
   assert(#errors == 0, table.concat(errors, "\n"))
   if hold > 0 then vim.wait(hold, function() vim.cmd("redraw") return false end, 20) end
+
+  local session_id = state.session.id
+  local exchange = request("exchange.list")[1]
+  assert(exchange and exchange.completed_at_ms, "fixture exchange did not settle")
+  require("forge.views.harness.workspace").release(state)
+  state.presentation.close()
+  client.stop()
+  assert(vim.wait(5000, function() return client._client.process == nil end, 10), "first host did not stop")
+
+  -- Seed the provider-owned persisted form of this actual run before the next host opens it.
+  local record_path = data .. "/forge/harness/" .. session_id .. "/checks/" .. run_id .. "/record.json"
+  local record = vim.json.decode(table.concat(vim.fn.readfile(record_path), "\n"))
+  record.run.owner = { kind = "exchange", session_id = session_id, exchange_id = exchange.id, node_count = 0 }
+  vim.fn.writefile({ vim.json.encode(record) }, record_path)
+  local restored, restore_error
+  client.start_harness(function(value, problem) restored, restore_error = value, problem end, { session_id = session_id })
+  assert(vim.wait(10000, function() return restored or restore_error end, 10), "history host did not reopen")
+  assert(not restore_error, restore_error)
+  require("forge.views.harness.session_navigation").activate(restored, {
+    interaction_mode = "reconcile", open_mode = "tab",
+  })
+  state = require("forge.session").harness
+  assert(vim.wait(5000, function() return transcript():find("Checks finished", 1, true) ~= nil end, 10),
+    "restored exchange hid its check summary inside collapsed activity: " .. transcript())
+  local sequence = state.presentation.transcript.sequence
+  local function assert_visible_check()
+    local _, row = sequence:position(run_id .. ":checks")
+    assert(row, "check summary disappeared")
+    local block = state.presentation.transcript.block[run_id .. ":checks"]
+    assert(not block.metadata.node.parent or block.metadata.node.parent == vim.NIL,
+      "check summary belongs to the activity fold")
+    vim.api.nvim_set_current_win(state.transcript_win)
+    vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
+    vim.cmd("normal! zz")
+    vim.cmd("redraw!")
+    local position = vim.fn.screenpos(state.transcript_win, row + 1, 1)
+    local rendered = ""
+    for column = 1, 120 do rendered = rendered .. vim.fn.screenstring(position.row, column) end
+    assert(rendered:find("Checks finished", 1, true), "screen is missing check summary: " .. rendered)
+    assert(not transcript():find("retained check output", 1, true), "restored output was expanded")
+  end
+  assert_visible_check()
+  for _, expanded in ipairs({ true, false }) do
+    local _, row = sequence:position(exchange.id .. ":summary")
+    assert(row, "exchange activity heading is missing")
+    vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
+    assert(state.presentation.toggle_heading(state.transcript_win))
+    assert(vim.wait(3000, function()
+      local block = state.presentation.transcript.block[exchange.id .. ":summary"]
+      return (block.metadata.node.display == "full") == expanded
+    end, 10), "activity toggle did not settle")
+    assert_visible_check()
+  end
+  local _, restored_count = transcript():gsub("Checks finished", "")
+  assert(restored_count == 1, "restored check summary was duplicated")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end
@@ -119,4 +203,4 @@ vim.api.nvim_set_current_dir(original_directory)
 vim.fn.stdpath, vim.notify = original_stdpath, original_notify
 assert(succeeded and collected, failure or "check activity host was not collected")
 print("harness_check_activity_host: passed")
-vim.cmd("qa!")
+if not vim.g.forge_check_activity_grid then vim.cmd("qa!") end

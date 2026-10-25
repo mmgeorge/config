@@ -104,7 +104,7 @@ impl MarkdownSyntax {
 impl SavedDiffSyntax {
     /// Parse only included source fragments, then project captures into unchanged diff rows.
     pub async fn analyze(&self, engine: &Arc<SyntaxEngine>) -> Result<Vec<BufferBlock>> {
-        let patch = UnifiedPatch::parse(&self.text)?;
+        let patch = UnifiedPatch::parse(&self.text)?.display()?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut block = Vec::new();
         for (file_index, file) in patch.file.iter().enumerate() {

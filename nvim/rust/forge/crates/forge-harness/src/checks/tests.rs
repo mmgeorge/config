@@ -195,6 +195,8 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
     let mut presentation = crate::buffer::session::SessionPresentation::new("checks-test".into());
     presentation.initialize(Vec::new()).unwrap();
     CheckSupervisor::open(
+        "checks-test".into(),
+        data.into(),
         workspace.into(),
         data.into(),
         Arc::new(Mutex::new(presentation)),
@@ -216,6 +218,7 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     );
     let runner = make_runner(workspace.path(), data.path());
     let mut run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             ids: (0..4).map(|index| format!("check-{index}")).collect(),
             ..Default::default()
@@ -291,6 +294,7 @@ async fn completion_wait_ignores_progress_and_observes_terminal_states() -> Resu
         CheckState::ConfigurationError,
     ] {
         let run = runner.prepare_request(
+            crate::timeline::TimelineOwner::session("checks-test"),
             RunRequest {
                 all: true,
                 ..Default::default()
@@ -330,6 +334,7 @@ async fn completion_wait_returns_running_when_deadline_expires() -> Result<()> {
     save(workspace.path(), vec![definition("wait", "print done")]);
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -420,6 +425,7 @@ async fn automatic_package_coverage_reuses_only_the_package_already_checked() ->
         ..Default::default()
     };
     let first = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         explicit,
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -429,6 +435,7 @@ async fn automatic_package_coverage_reuses_only_the_package_already_checked() ->
     assert_eq!(first.state, CheckState::Passed);
     assert!(first.commands[0].evidence.is_some());
     let mut next = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -445,6 +452,7 @@ async fn automatic_package_coverage_reuses_only_the_package_already_checked() ->
     )?;
     runner.refresh_changes().await?;
     let mut changed = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -468,6 +476,7 @@ async fn automatic_failure_reuses_evidence_and_stops_unchanged_repairs() -> Resu
     std::fs::write(workspace.path().join("source.txt"), "after")?;
     runner.refresh_changes().await?;
     let first = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -484,6 +493,7 @@ async fn automatic_failure_reuses_evidence_and_stops_unchanged_repairs() -> Resu
     automatic.repair_exchange = Some("repair".into());
     automatic.save()?;
     let mut next = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -606,6 +616,7 @@ async fn preparation_changes_inputs_and_allows_dependent_verification() -> Resul
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -670,6 +681,7 @@ async fn check_order_matches_preview_and_execution_without_success_dependencies(
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -739,6 +751,7 @@ async fn discovery_compilation_failure_preserves_project_output() -> Result<()> 
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             selections: BTreeMap::from([(
                 "tests".into(),
@@ -776,6 +789,7 @@ async fn changing_source_during_a_check_cannot_certify_stale_inputs() -> Result<
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             ids: vec!["mutating".into()],
             ..Default::default()
@@ -811,6 +825,7 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
     std::fs::write(workspace.path().join("source.txt"), "after")?;
     runner.refresh_changes().await?;
     let initial = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -823,6 +838,7 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
         Some(CheckSelection::Cases { .. })
     ));
     let mut repeated = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest::default(),
         Some("recorded-task".into()),
         crate::session::CheckShell::Nushell,
@@ -973,6 +989,7 @@ async fn output_directory_failure_does_not_retain_execution_admission() -> Resul
     save(workspace.path(), vec![definition("one", "print done")]);
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -1007,6 +1024,7 @@ async fn direct_file_arguments_do_not_become_shell_source() -> Result<()> {
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/spaces $value; [quoted].rs";
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             ids: vec!["file".into()],
@@ -1050,6 +1068,7 @@ async fn every_package_prerequisite_must_pass() -> Result<()> {
     let prepared = runner.prepare(
         ConfigSnapshot::load(workspace.path())?,
         CheckAdmission {
+            owner: crate::timeline::TimelineOwner::session("checks-test"),
             request: Default::default(),
             overrides: BTreeMap::new(),
             files: Some(vec![
@@ -1249,6 +1268,7 @@ async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()
     let prepared = runner.prepare(
         ConfigSnapshot::load(workspace.path())?,
         CheckAdmission {
+            owner: crate::timeline::TimelineOwner::session("checks-test"),
             request: Default::default(),
             overrides: BTreeMap::new(),
             files: Some(vec!["src/lib.rs".into()]),
@@ -1283,6 +1303,7 @@ async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()
             ..Default::default()
         };
         let prepared = runner.prepare_request(
+            crate::timeline::TimelineOwner::session("checks-test"),
             request,
             None,
             crate::session::CheckShell::Nushell,
@@ -1323,6 +1344,7 @@ async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()
         ..Default::default()
     };
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         request,
         None,
         crate::session::CheckShell::Nushell,
@@ -1378,6 +1400,7 @@ async fn preview_matches_execution_and_manifest_changes_invalidate_bindings() ->
     let prepared = runner.prepare(
         snapshot,
         CheckAdmission {
+            owner: crate::timeline::TimelineOwner::session("checks-test"),
             request: Default::default(),
             overrides: BTreeMap::new(),
             files: Some(files),
@@ -1448,6 +1471,7 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
     let prepared = runner.prepare(
         ConfigSnapshot::load(workspace.path())?,
         super::CheckAdmission {
+            owner: crate::timeline::TimelineOwner::session("checks-test"),
             request: Default::default(),
             overrides: Default::default(),
             files: Some(vec![
@@ -1583,6 +1607,7 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
         let prepared = runner.prepare(
             ConfigSnapshot::load(workspace.path())?,
             CheckAdmission {
+                owner: crate::timeline::TimelineOwner::session("checks-test"),
                 request,
                 overrides: Default::default(),
                 files: Some(vec!["src/source.rs".into()]),
@@ -1782,6 +1807,7 @@ async fn independent_failures_continue_and_dependents_skip() -> Result<()> {
     );
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -1833,6 +1859,7 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
         )]),
     };
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         request,
         None,
         crate::session::CheckShell::Nushell,
@@ -1862,6 +1889,7 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
         files: files.clone(),
     };
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: false,
@@ -1919,6 +1947,7 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
     };
     runner
         .configure(
+            crate::timeline::TimelineOwner::session("checks-test"),
             crate::checks::ConfigureChecks {
                 expected_revision: revision,
                 config: config.clone(),
@@ -1944,6 +1973,7 @@ async fn setup_validates_helpers_before_publication() -> Result<()> {
     assert!(
         runner
             .configure(
+                crate::timeline::TimelineOwner::session("checks-test"),
                 crate::checks::ConfigureChecks {
                     expected_revision: revision,
                     config,
@@ -1975,6 +2005,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     let catalog = runner.catalog(None)?;
     runner
         .configure(
+            crate::timeline::TimelineOwner::session("checks-test"),
             crate::checks::ConfigureChecks {
                 expected_revision: catalog["revision"].as_str().unwrap().into(),
                 config: CheckConfig {
@@ -2008,6 +2039,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     assert!(
         runner
             .prepare_request(
+                crate::timeline::TimelineOwner::session("checks-test"),
                 RunRequest {
                     include: Vec::new(),
                     all: false,
@@ -2023,6 +2055,7 @@ async fn setup_preserves_fields_and_task_overrides_do_not_leak() -> Result<()> {
     assert!(
         runner
             .configure(
+                crate::timeline::TimelineOwner::session("checks-test"),
                 crate::checks::ConfigureChecks {
                     expected_revision: "stale".into(),
                     config: CheckConfig {
@@ -2050,6 +2083,7 @@ async fn setup_bootstraps_an_empty_non_git_directory_and_records_configuration_e
     assert_eq!(catalog["configured"], false);
     runner
         .configure(
+            crate::timeline::TimelineOwner::session("checks-test"),
             crate::checks::ConfigureChecks {
                 expected_revision: catalog["revision"].as_str().unwrap().into(),
                 config: CheckConfig {
@@ -2090,6 +2124,7 @@ async fn disabled_prerequisite_is_a_configuration_error_and_independent_checks_c
     );
     let runner = make_runner(workspace.path(), data.path());
     let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -2114,6 +2149,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
     save(workspace.path(), vec![definition("slow", "sleep 5sec")]);
     let runner = make_runner(workspace.path(), data.path());
     let first = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -2124,6 +2160,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         "Test".into(),
     )?;
     let second = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -2149,6 +2186,7 @@ async fn concurrent_start_is_rejected_and_cancel_preserves_admission() -> Result
         CheckState::Interrupted
     );
     let mut automatic = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -2175,6 +2213,7 @@ async fn provider_turn_cancellation_collects_its_background_checks() -> Result<(
     save(workspace.path(), vec![definition("slow", "sleep 5sec")]);
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             include: Vec::new(),
             all: true,
@@ -2238,6 +2277,7 @@ async fn cancellation_collects_process_while_progress_delivery_is_blocked() -> R
         result?;
     }
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -2315,6 +2355,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     runner.refresh_changes().await?;
     let prepare = || {
         runner.prepare_request(
+            crate::timeline::TimelineOwner::session("checks-test"),
             RunRequest {
                 all: true,
                 ..Default::default()
@@ -2346,6 +2387,7 @@ async fn cancelled_inputs_require_manual_retry_or_relevant_changes() -> Result<(
     assert!(policy.pending && policy.blocked.is_none());
     let reopened = make_runner(workspace.path(), data.path());
     let mut recovered = reopened.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -2391,6 +2433,7 @@ fn summary_retains_a_single_failure_and_interrupted_work() -> Result<()> {
     );
     let runner = make_runner(workspace.path(), data.path());
     let mut run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()
@@ -2422,6 +2465,7 @@ async fn output_failure_collects_the_process_before_releasing_admission() -> Res
     );
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
         RunRequest {
             all: true,
             ..Default::default()

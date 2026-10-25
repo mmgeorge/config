@@ -140,6 +140,18 @@ the caret or message body to show or hide the complete text.
 When a group changes to `Ran`, it folds automatically. Expanding that completed group
 shows every call in the group, with individual output available on expansion.
 
+Thoughts with activity start collapsed and show live tool and changed-file counts in their
+heading. Expanding a thought shows its events first, then its tool summary, then its file changes,
+one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
+expansion choice survives incoming activity. Tools and file writes accumulate into two entries,
+even when they alternate. Each tool updates the tool group, and each completed write updates `Changed N files`.
+Its file count, diff, and totals update in place while preserving expansion. Repeated writes
+to the same file count once and show the original-to-final diff. A pending write shows
+`Changing N files` or a changing-files suffix. A new thought, user input, or question interaction starts a new section.
+Owned events stay inside the thought, including compaction. Late results stay with their
+original operation. Failed writes retain their diagnostics inside the changes group.
+Inconsistent edit reports retain their reported hunks with a diagnostic.
+
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do
 not change the copied history, and pending questions, tasks, and agents do not resume
@@ -180,14 +192,19 @@ preserving queued follow-ups. If the active turn cannot accept it, the text join
 the follow-up queue and Harness shows a warning.
 Queued prompts and pending steering appear below the status in the upper timeline
 pane. The lower prompt buffer contains only the draft being edited.
+Queued prompts remain visible until accepted. If submission fails before acceptance,
+the message and its attachments stay queued for inspection or resubmission. Messages
+waiting for execution capacity do not interrupt the active response or checks.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
+Normal mode also supports session commands, including `oe` to reopen a pending
+question or approval, model and artifact selection, help, and closing Harness.
 In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
 Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` and
 `Down` browse history, and `Down` past the newest entry restores your unfinished
 draft and attachments. Inside a multiline draft, the arrows move between lines.
-`Alt-Up` and `Alt-Down` also browse history. Timeline folding, navigation, help,
-and close shortcuts remain in the upper pane.
+`Alt-Up` and `Alt-Down` also browse history. Timeline row activation, folding,
+and gutter selection remain in the upper pane.
 
 Unknown or unfinished slash commands keep the draft and show a warning. A leading
 path with a filename extension, such as `/workspace/screenshot.png`, submits and

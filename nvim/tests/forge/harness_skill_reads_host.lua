@@ -63,6 +63,20 @@ local succeeded, failure = xpcall(function()
   assert(next(approvals) == nil, "selected skill access opened approval: " .. vim.inspect(approvals))
   assert(#errors == 0, table.concat(errors, "\n"))
   local snapshot = request("state.get")
+  local transcript = state.presentation.transcript
+  for index = 0, transcript.sequence:count() - 1 do
+    local node = transcript.sequence:at(index)
+    local descriptor = node.entry.metadata.node
+    if descriptor and descriptor ~= vim.NIL and descriptor.kind == "exchange" and descriptor.display == "heading" then
+      local _, row = transcript.sequence:position(node.id)
+      vim.api.nvim_set_current_win(state.transcript_win)
+      vim.api.nvim_win_set_cursor(state.transcript_win, { row + 1, 0 })
+      assert(state.presentation.toggle_heading(state.transcript_win))
+    end
+  end
+  assert(vim.wait(5000, function()
+    return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n"):find("Read skill · fixture", 1, true)
+  end, 10), "skill activity did not expand")
   local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(snapshot.status.kind == "idle", "provider execution did not settle")
   local function script_output(value)
@@ -85,7 +99,8 @@ local succeeded, failure = xpcall(function()
     state.presentation.transcript.namespace, 0, -1, { details = true })) do
     local decoration = mark[4]
     local line = vim.api.nvim_buf_get_lines(state.transcript_buf, mark[2], mark[2] + 1, false)[1] or ""
-    if decoration.sign_text and vim.trim(decoration.sign_text) == "◇" and line:find("Read skill · fixture", 1, true) then
+    if decoration.virt_text and decoration.virt_text[1][1] == "◇"
+      and decoration.virt_text_win_col == 0 and line:find("Read skill · fixture", 1, true) then
       diamonds = diamonds + 1
     end
   end

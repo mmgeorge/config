@@ -278,7 +278,11 @@ impl BrokerObserver {
         let checks_running = checks.is_some();
         let mut timeline = store.with_fork_history(
             &source_session.id,
-            TimelineProjector::with_checks(timeline, check_history),
+            TimelineProjector::with_history(
+                timeline,
+                check_history,
+                interaction.iter().chain(&agent_exchange_list),
+            )?,
             &self.plan_file,
         )?;
         timeline.push(TimelineEntry::Status {
@@ -488,12 +492,13 @@ impl BrokerObserver {
             session_event_list: store.list_session_event(&session_id)?,
             plan_file: &self.plan_file,
         })?;
-        let timeline = TimelineProjector::with_checks(
+        let timeline = TimelineProjector::with_history(
             timeline,
             crate::checks::CheckSupervisor::saved_history(
                 &self.data_root.join(&session_id).join("checks"),
             )?,
-        );
+            interaction.iter().chain(&agent_exchange_list),
+        )?;
         let timeline = store.with_fork_history(&session_id, timeline, &self.plan_file)?;
         let preview = SessionPreview {
             lines: preview_lines(&timeline)?,

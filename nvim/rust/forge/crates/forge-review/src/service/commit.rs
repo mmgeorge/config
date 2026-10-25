@@ -184,7 +184,7 @@ fn diff_blocks(commit: &str, path: &str, patch: &str) -> Result<Vec<BufferBlock>
         blocks.push(presenter.hunk(
             BlockId(format!("{prefix}:hunk:{index}")),
             &group,
-            forge_diff::presentation::HunkHeading::Saved(hunk.header),
+            forge_diff::presentation::HunkHeading::Saved(&hunk.header),
         )?);
         for (batch, rows) in rows.chunks(128).enumerate() {
             blocks.push(presenter.rows(

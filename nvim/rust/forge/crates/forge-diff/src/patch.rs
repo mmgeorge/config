@@ -1,5 +1,6 @@
 //! Saved unified patches retain partial source coordinates without inventing complete files.
 
+use std::borrow::Cow;
 use std::fmt;
 use std::iter::Peekable;
 use std::ops::Range;
@@ -43,6 +44,7 @@ impl<'source> UnifiedPatch<'source> {
                     old_path: Some(old),
                     new_path: Some(new),
                     binary: false,
+                    line_ending_changes: 0,
                     hunk: Vec::new(),
                 });
                 source_header = false;
@@ -52,6 +54,7 @@ impl<'source> UnifiedPatch<'source> {
                         old_path: None,
                         new_path: None,
                         binary: false,
+                        line_ending_changes: 0,
                         hunk: Vec::new(),
                     });
                 }
@@ -118,6 +121,20 @@ impl<'source> UnifiedPatch<'source> {
         }
         Ok(result)
     }
+
+    /// Separate line-ending conversions from textual edits without changing the saved patch.
+    pub fn display(mut self) -> Result<Self, crate::source::SourceError> {
+        for file in &mut self.file {
+            let mut display = Vec::new();
+            for hunk in std::mem::take(&mut file.hunk) {
+                let (hunks, line_ending_changes) = display_hunk(hunk)?;
+                display.extend(hunks);
+                file.line_ending_changes += line_ending_changes;
+            }
+            file.hunk = display;
+        }
+        Ok(self)
+    }
 }
 
 #[derive(Debug)]
@@ -129,6 +146,8 @@ pub struct PatchFile<'source> {
     pub new_path: Option<String>,
     /// Binary content cannot be expanded as source rows.
     pub binary: bool,
+    /// Matched text lines whose LF or CRLF terminator changed in the display comparison.
+    pub line_ending_changes: usize,
     /// Hunks retain their absolute source positions and patch order.
     pub hunk: Vec<PatchHunk<'source>>,
 }
@@ -141,7 +160,7 @@ pub struct PatchHunk<'source> {
     /// Absolute new-file line range, including unchanged context.
     pub new_lines: Range<usize>,
     /// Original header, including any trailing function context.
-    pub header: &'source str,
+    pub header: Cow<'source, str>,
     /// Source text excludes patch prefixes but preserves CRLF content bytes.
     pub row: Vec<PatchRow<'source>>,
 }
@@ -202,13 +221,13 @@ impl<'source> PatchHunk<'source> {
         Ok(Self {
             old_lines,
             new_lines,
-            header,
+            header: Cow::Borrowed(header),
             row,
         })
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 /// Borrows one source row with its exact old and new file coordinates.
 pub struct PatchRow<'source> {
     /// Determines side attribution and diff highlighting.
@@ -221,6 +240,127 @@ pub struct PatchRow<'source> {
     pub new_line: Option<usize>,
     /// The patch explicitly marks this source row as lacking a final newline.
     pub no_newline: bool,
+}
+
+fn display_hunk(
+    hunk: PatchHunk<'_>,
+) -> Result<(Vec<PatchHunk<'_>>, usize), crate::source::SourceError> {
+    if !hunk
+        .row
+        .iter()
+        .any(|row| row.kind != RowKind::Context && !row.no_newline && row.text.ends_with('\r'))
+    {
+        return Ok((vec![hunk], 0));
+    }
+    let old: Vec<_> = hunk
+        .row
+        .iter()
+        .filter(|row| row.kind != RowKind::Added)
+        .collect();
+    let new: Vec<_> = hunk
+        .row
+        .iter()
+        .filter(|row| row.kind != RowKind::Removed)
+        .collect();
+    let source = |rows: &[&PatchRow<'_>]| {
+        let mut text = String::new();
+        for row in rows {
+            if row.no_newline {
+                text.push_str(row.text);
+            } else {
+                text.push_str(row.text.strip_suffix('\r').unwrap_or(row.text));
+                text.push('\n');
+            }
+        }
+        crate::source::SourceVersion::new(
+            text.into_bytes(),
+            crate::source::Representation::DisplayOnly,
+        )
+    };
+    let diff = crate::raw::compute_hunks(crate::source::SourcePair {
+        old: source(&old)?,
+        new: source(&new)?,
+    })?;
+    let mut old_position = 0;
+    let mut new_position = 0;
+    let mut line_ending_changes = 0;
+    for change in diff.hunks() {
+        while old_position < change.old_lines.start && new_position < change.new_lines.start {
+            line_ending_changes += usize::from(old[old_position].text != new[new_position].text);
+            old_position += 1;
+            new_position += 1;
+        }
+        old_position = change.old_lines.end;
+        new_position = change.new_lines.end;
+    }
+    while old_position < old.len() && new_position < new.len() {
+        line_ending_changes += usize::from(old[old_position].text != new[new_position].text);
+        old_position += 1;
+        new_position += 1;
+    }
+    if line_ending_changes == 0 {
+        return Ok((vec![hunk], 0));
+    }
+    let mut display = Vec::new();
+    for group in crate::display::group_hunks(&diff, 3) {
+        let old_lines = hunk.old_lines.start + group.old_lines.start
+            ..hunk.old_lines.start + group.old_lines.end;
+        let new_lines = hunk.new_lines.start + group.new_lines.start
+            ..hunk.new_lines.start + group.new_lines.end;
+        let range = |lines: &Range<usize>| {
+            format!(
+                "{},{}",
+                lines.start + usize::from(!lines.is_empty()),
+                lines.len()
+            )
+        };
+        let mut rows = Vec::new();
+        let mut old_position = group.old_lines.start;
+        let mut new_position = group.new_lines.start;
+        for change in &diff.hunks()[group.raw_range] {
+            while old_position < change.old_lines.start {
+                let mut row = new[new_position].clone();
+                row.kind = RowKind::Context;
+                row.old_line = old[old_position].old_line;
+                rows.push(row);
+                old_position += 1;
+                new_position += 1;
+            }
+            for row in &old[change.old_lines.clone()] {
+                let mut row = (*row).clone();
+                row.kind = RowKind::Removed;
+                row.new_line = None;
+                rows.push(row);
+            }
+            for row in &new[change.new_lines.clone()] {
+                let mut row = (*row).clone();
+                row.kind = RowKind::Added;
+                row.old_line = None;
+                rows.push(row);
+            }
+            old_position = change.old_lines.end;
+            new_position = change.new_lines.end;
+        }
+        while old_position < group.old_lines.end {
+            let mut row = new[new_position].clone();
+            row.kind = RowKind::Context;
+            row.old_line = old[old_position].old_line;
+            rows.push(row);
+            old_position += 1;
+            new_position += 1;
+        }
+        display.push(PatchHunk {
+            header: Cow::Owned(format!(
+                "@@ -{} +{} @@",
+                range(&old_lines),
+                range(&new_lines)
+            )),
+            old_lines,
+            new_lines,
+            row: rows,
+        });
+    }
+    Ok((display, line_ending_changes))
 }
 
 fn parse_range(text: &str, prefix: char) -> Result<Range<usize>, PatchParseError> {
@@ -338,6 +478,83 @@ mod tests {
     use crate::raw::compute_hunks;
     use crate::source::{Representation, SourcePair, SourceVersion};
     use crate::unified::{write_file_header, write_unified};
+
+    #[test]
+    fn display_separates_line_endings_from_large_text_changes() {
+        let old = (0..5000)
+            .map(|index| format!("line {index}\n"))
+            .collect::<String>();
+        let new = old
+            .replace("line 2500\n", "edited 2500\n")
+            .replace('\n', "\r\n");
+        let raw = compute_hunks(SourcePair {
+            old: SourceVersion::new(old.into_bytes(), Representation::Raw).unwrap(),
+            new: SourceVersion::new(new.into_bytes(), Representation::Raw).unwrap(),
+        })
+        .unwrap();
+        let mut bytes = Vec::new();
+        write_file_header("a/source.rs", "b/source.rs", &mut bytes).unwrap();
+        write_unified(&raw, "a/source.rs", "b/source.rs", 3, &mut bytes).unwrap();
+        let source = String::from_utf8(bytes).unwrap();
+        let saved = UnifiedPatch::parse(&source).unwrap();
+        assert_eq!(saved.file[0].hunk[0].row.len(), 10000);
+        let display = saved.display().unwrap();
+        assert_eq!(display.file[0].line_ending_changes, 4999);
+        let hunk = &display.file[0].hunk[0];
+        assert_eq!(hunk.old_lines, 2497..2504);
+        assert_eq!(hunk.new_lines, 2497..2504);
+        assert_eq!(hunk.row.len(), 8);
+        assert_eq!(
+            hunk.row
+                .iter()
+                .filter(|row| row.kind == RowKind::Added)
+                .count(),
+            1
+        );
+        assert_eq!(
+            hunk.row
+                .iter()
+                .filter(|row| row.kind == RowKind::Removed)
+                .count(),
+            1
+        );
+        assert_eq!(hunk.row[3].old_line, Some(2500));
+        assert_eq!(hunk.row[4].new_line, Some(2500));
+        assert_eq!(
+            UnifiedPatch::parse(&source).unwrap().file[0].hunk[0]
+                .row
+                .len(),
+            10000
+        );
+    }
+
+    #[test]
+    fn display_retains_line_ending_only_files_and_terminal_content_changes() {
+        let source =
+            "--- a/file\n+++ b/file\n@@ -90,2 +90,2 @@\n-first\n-last\n+first\r\n+last\r\n";
+        let display = UnifiedPatch::parse(source).unwrap().display().unwrap();
+        assert_eq!(display.file[0].line_ending_changes, 2);
+        assert!(display.file[0].hunk.is_empty());
+        let source = "--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n-first\n-last\n\\ No newline at end of file\n+first\r\n+last\r\n\\ No newline at end of file\n";
+        let display = UnifiedPatch::parse(source).unwrap().display().unwrap();
+        assert_eq!(display.file[0].line_ending_changes, 1);
+        assert_eq!(
+            display.file[0].hunk[0]
+                .row
+                .iter()
+                .filter(|row| row.kind == RowKind::Added)
+                .count(),
+            1
+        );
+        assert_eq!(
+            display.file[0].hunk[0]
+                .row
+                .iter()
+                .filter(|row| row.kind == RowKind::Removed)
+                .count(),
+            1
+        );
+    }
 
     #[test]
     fn generated_patches_preserve_paths_source_bytes_and_missing_newlines() {

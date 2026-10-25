@@ -101,6 +101,7 @@ async fn background_reuses_restarts_rotates_and_keeps_timeline() -> Result<()> {
         store.save_session_event(&crate::timeline::SessionEventRecord {
             id: "interrupted-compaction".into(),
             session_id: first.session_id.clone(),
+            owner: crate::timeline::TimelineOwner::session(&first.session_id),
             created_at_ms: 1,
             detail: crate::timeline::SessionEventKind::Compaction {
                 compaction: crate::backend::Compaction {

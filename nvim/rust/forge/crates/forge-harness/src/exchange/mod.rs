@@ -3,6 +3,7 @@ mod exchange;
 mod metrics;
 mod node;
 mod task;
+mod thought;
 
 pub use change::ProviderChangeIndex;
 pub(crate) use change::ProviderDiffBuilder;
@@ -16,5 +17,6 @@ pub use node::{
     PlanCommentResolution, QuestionInput,
 };
 pub use task::{TaskItem, TaskSnapshot, TaskTracker};
+pub(crate) use thought::{ThoughtContent, ThoughtGroupKind, ThoughtPart};
 
 pub use crate::turn::ToolCall;

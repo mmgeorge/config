@@ -236,17 +236,14 @@ impl HarnessBroker {
                             .any(|execution| execution.state == PlanExecutionState::Active),
                     "checks cannot race active plan execution or writing agents"
                 );
-                let mut run = self.check_runner.prepare_request(
+                let owner = self.check_runner.session_owner();
+                let run = self.check_runner.prepare_request(
+                    owner,
                     serde_json::from_value(params)?,
                     task_id,
                     self.session.shell,
                     "User requested".into(),
                 )?;
-                run.exchange_id = self
-                    .store
-                    .list_exchange(&self.session.id)?
-                    .last()
-                    .map(|exchange| exchange.id.clone());
                 json!({"run_id":self.check_runner.start(run, self.event_sink.clone(),None,None).await?})
             }
             HarnessMethod::ChecksStatus => {

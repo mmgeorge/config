@@ -77,8 +77,10 @@ local succeeded, failure = xpcall(function()
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/checks setup " .. (enabled and "on" or "off") })
     controller.submit()
     assert(vim.wait(3000, function() return state.check_editing == enabled end, 10), "editing toggle did not settle")
-    assert(vim.wo[state.transcript_win].winbar:find("check editing " .. (enabled and "on" or "off"), 1, true),
-      "winbar omitted check-editing permission")
+    local winbar = vim.wo[state.transcript_win].winbar
+    assert((winbar:find("check editing on", 1, true) ~= nil) == enabled,
+      "winbar must show check editing only when enabled")
+    assert(not winbar:find("check editing off", 1, true), "winbar must omit disabled check editing")
   end
   toggle_editing(true)
   toggle_editing(false)

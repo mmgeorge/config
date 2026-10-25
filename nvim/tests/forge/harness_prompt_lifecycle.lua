@@ -53,14 +53,24 @@ first.callback({})
 assert(not state.busy and not state.prompt_submission, "retired presentation retained request ownership")
 complete_snapshot()
 local second = requests[#requests]
-assert(second.method == "prompt.submit" and second.params.text == "first follow-up" and #state.queue == 1)
+assert(second.method == "prompt.submit" and second.params.text == "first follow-up" and #state.queue == 2)
+assert(second.params.queued and second.params.submission.token, "queued prompt has no admission identity")
 assert(state.busy and state.prompt_submission, "queued request did not acquire its own lifetime")
+state.busy = false
+local pending_count = #requests
+controller.drain()
+assert(#requests == pending_count, "idle presentation submitted an in-flight queued prompt twice")
+state.busy = true
+assert(submission.receive(state, { kind = "prompt_submission", data = {
+  token = second.params.submission.token, state = "accepted",
+} }))
+assert(#state.queue == 1, "acceptance did not remove the matching queue entry")
 first.callback({})
 assert(state.busy and state.prompt_submission and #state.queue == 1, "duplicate completion released a newer request")
 second.callback({})
 complete_snapshot()
 local third = requests[#requests]
-assert(third.method == "prompt.submit" and third.params.text == "second follow-up" and #state.queue == 0)
+assert(third.method == "prompt.submit" and third.params.text == "second follow-up" and #state.queue == 1)
 third.callback({})
 complete_snapshot()
 assert(not state.busy and not state.prompt_submission, "queue never returned to idle")
@@ -148,13 +158,62 @@ for _, failure in ipairs(failures) do
   request.callback(nil, failure.message, failure.detail)
   assert(completion_count == 1 and not state.prompt_submission)
 end
+local notices = {}
+require("forge.infra.notifications").error = function(message) notices[#notices + 1] = message end
+local retained = { text = "retained queued prompt", attachments = { { id = "queued-image", label = "[Image #1]" } },
+  config = { model = "captured-model" } }
+local following = { text = "following queued prompt" }
+state.queue = { retained, following }
+controller.drain()
+local rejected = requests[#requests]
+assert(state.queue[1] == retained and state.prompt_submission.queue_entry == retained)
+local edit, edit_failure = require("forge.views.harness.queue_editor").move(state, "", -2)
+assert(not edit and edit_failure:find("being admitted", 1, true), "in-flight queue entry was editable")
+rejected.callback(nil, "a Harness execution request is already running: no permits available", { code = "request_failed" })
+complete_snapshot()
+assert(state.queue[1] == retained and state.queue[2] == following and #state.queue == 2,
+  "rejected admission lost or reordered queued messages")
+assert(retained.config.model == "captured-model" and retained.attachments[1].id == "queued-image")
+assert(state.execution_notice and not state.prompt_submission and not state.busy)
+state.execution_notice = nil
+controller.drain()
+local retried = requests[#requests]
+assert(retried.params.text == retained.text and vim.deep_equal(retried.params.attachments, retained.attachments))
+assert(not submission.receive(state, { kind = "prompt_submission", data = {
+  token = rejected.params.submission.token, state = "accepted",
+} }), "stale acceptance removed the retried entry")
+submission.receive(state, { kind = "prompt_submission", data = { token = retried.params.submission.token, state = "accepted" } })
+submission.receive(state, { kind = "prompt_submission", data = { token = retried.params.submission.token, state = "accepted" } })
+assert(#state.queue == 1 and state.queue[1] == following, "duplicate acceptance removed a later message")
+submission.receive(state, { kind = "prompt_submission", data = { token = retried.params.submission.token, state = "retracted" } })
+retried.callback(nil, "retracted", { code = "turn_retracted" })
+complete_snapshot()
+assert(#state.queue == 2 and state.queue[1] == retained and state.queue[2] == following,
+  "retraction did not restore exactly one original entry")
+state.execution_notice = nil
+controller.drain()
+local unknown = requests[#requests]
+unknown.callback(nil, "connection closed", { code = "outcome_unknown" })
+complete_snapshot()
+assert(state.queue[1] == retained and state.execution_notice, "unknown admission lost queued input")
+state.execution_notice = nil
+controller.drain()
+local accepted = requests[#requests]
+submission.receive(state, { kind = "prompt_submission", data = { token = accepted.params.submission.token, state = "accepted" } })
+accepted.callback(nil, "provider failed after acceptance", { code = "request_failed" })
+complete_snapshot()
+assert(#state.queue == 1 and state.queue[1] == following, "accepted work was queued for duplicate execution")
+state.execution_notice = nil
+state.queue = {}
 client.request_for = function() error("transport admission failed") end
 local admission_failure
-submission.start(state, { text = "request with failed admission" }, function(_, failure)
+state.queue = { retained }
+submission.start(state, { text = retained.text, queue_entry = retained }, function(_, failure)
   admission_failure = failure
 end)
 assert(admission_failure:find("transport admission failed", 1, true) and not state.prompt_submission,
   "transport admission failure stranded request ownership")
+assert(state.queue[1] == retained, "synchronous transport rejection lost queued input")
 if state.working_timer then state.working_timer:stop() state.working_timer:close() end
 print("harness_prompt_lifecycle: passed")
 vim.cmd("qa!")

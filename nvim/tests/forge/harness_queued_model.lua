@@ -6,6 +6,8 @@ local model_picker = require("forge.views.harness.model_picker")
 local submission = require("forge.views.harness.prompt_submission")
 submission.start = function(_, prompt, callback)
   client.request("prompt.submit", { text = prompt.text, attachments = prompt.attachments or {} }, callback)
+  assert(state.queue[1] == prompt.queue_entry, "queue entry disappeared before simulated acceptance")
+  table.remove(state.queue, 1)
 end
 local history = require("forge.views.harness.prompt_history")
 local notifications = require("forge.infra.notifications")

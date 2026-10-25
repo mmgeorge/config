@@ -1235,6 +1235,7 @@ mod test {
             .node_list
             .iter()
             .map(|node| match node {
+                ExchangeNode::TimelineEvent { .. } => "timeline-event",
                 ExchangeNode::SkillRead { .. } => "skill-read",
                 ExchangeNode::Compaction { .. } => "compaction",
                 ExchangeNode::TurnContent { .. } => "content",

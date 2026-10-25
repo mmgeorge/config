@@ -93,8 +93,8 @@ impl CommandCheck {
 /// Retains a Harness-owned gate without creating a provider exchange.
 pub struct CheckRun {
     pub id: String,
-    /// Exchange whose work this run validates, when execution has an exchange owner.
-    pub exchange_id: Option<String>,
+    /// Destination and source position captured before check execution begins.
+    pub owner: Box<crate::timeline::TimelineOwner>,
     pub revision: u32,
     #[serde(default)]
     pub context: Option<CheckRunContext>,

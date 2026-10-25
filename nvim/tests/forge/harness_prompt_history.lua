@@ -4,13 +4,14 @@ local history = require("forge.views.harness.prompt_history")
 local attachment = require("forge.views.harness.attachment")
 local snapshot = require("forge.views.harness.snapshot")
 local client = require("forge.client")
+local controller = require("forge.views.harness.controller")
 local buffer = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_set_current_buf(buffer)
 state.composer_buf, state.composer_win = buffer, vim.api.nvim_get_current_win()
 attachment.attach(buffer, nil)
 history.attach(buffer)
 require("forge.shared.keymaps").setup_view_keymaps(buffer, "harness",
-  require("forge.views.harness.controller").composer_command_set())
+  controller.composer_command_set())
 
 ---@param text string
 ---@return ForgePromptDraft
@@ -33,6 +34,23 @@ end
 local function expect(expected)
   assert(attachment.capture(buffer).text == expected, vim.inspect(attachment.capture(buffer)))
 end
+
+local original_present_question = controller.present_plan_question
+local question_opened = false
+controller.present_plan_question = function(force)
+  assert(force, "prompt feedback did not explicitly reopen the question")
+  question_opened = true
+end
+state.active_elicitation = { elicitation = {} }
+write("preserved question draft")
+press("oe")
+assert(question_opened, "Normal-mode prompt feedback did not open the pending question")
+expect("preserved question draft")
+controller.present_plan_question = original_present_question
+state.active_elicitation = nil
+assert(vim.fn.maparg("oe", "i") == "", "feedback command replaced Insert-mode typing")
+assert(vim.fn.maparg("W", "n") == "", "timeline selection replaced Normal-mode word motion")
+write("")
 
 history.replace({ draft("newest"), draft("older\nsecond line") })
 press("<Up>")

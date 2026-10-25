@@ -6,6 +6,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
+    /// Keeps an owned check or session event at its captured source boundary.
+    TimelineEvent {
+        event: Box<crate::timeline::TimelineEvent>,
+    },
     /// Records one successful selected-skill read per provider turn.
     SkillRead {
         id: String,
@@ -53,6 +57,7 @@ pub enum ExchangeNode {
 impl ExchangeNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::TimelineEvent { event } => event.id(),
             Self::SkillRead { id, .. } => id,
             Self::Compaction { id, .. } => id,
             Self::ImplementationReport { id, .. } => id,

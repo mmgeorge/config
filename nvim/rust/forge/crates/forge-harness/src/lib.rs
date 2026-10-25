@@ -8,6 +8,7 @@ pub mod buffer;
 pub mod checkpoint;
 /// Project check configuration, execution, and recorded results.
 pub mod checks;
+pub(crate) mod codec;
 pub mod control_tools;
 pub(crate) mod declaration;
 pub mod exchange;

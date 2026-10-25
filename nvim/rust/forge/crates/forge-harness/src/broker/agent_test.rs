@@ -555,6 +555,7 @@ impl Backend for RoutingBackend {
     async fn active_session_id_for(&self,_session_id:&str) -> Option<String> {None}
     async fn model_list(&self,_request:BackendRequest) -> Result<Vec<crate::backend::BackendModel>> {
         Ok(vec![serde_json::from_value(json!({"id":"fixture-model","reasoning":["low"],"default_reasoning":"low",
+            "service_tiers":["default","fast"],
             "selected_reasoning":null,"context_window":[{"id":"extended","token_limit":200000}],"default_context_window":null,"selected_context_window":null,
             "vision":false,"description":null,"is_default":true}))?])
     }

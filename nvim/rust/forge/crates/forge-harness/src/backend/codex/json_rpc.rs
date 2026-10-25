@@ -1968,42 +1968,44 @@ fn normalize_file_change_set(item: &Value, envelope: &Value, workspace: &str) ->
                 .or_else(|| change.get("file_path"))
                 .and_then(Value::as_str)?;
             let path = provider_change_path(path, workspace);
+            let kind = match change
+                .get("kind")
+                .or_else(|| change.get("operation"))
+                .and_then(|kind| {
+                    kind.as_str()
+                        .or_else(|| kind.get("type").and_then(Value::as_str))
+                })
+                .unwrap_or("update")
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "add" | "create" | "created" => ProviderChangeKind::Add,
+                "delete" | "deleted" | "remove" => ProviderChangeKind::Delete,
+                "move" | "rename" => ProviderChangeKind::Move,
+                _ => ProviderChangeKind::Update,
+            };
+            let source = change
+                .get("diff")
+                .or_else(|| change.get("patch"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let (diff, reported_move) = ProviderFileChange::split_move_report(kind, source);
             let move_path = change
                 .get("movePath")
                 .or_else(|| change.get("move_path"))
                 .and_then(Value::as_str)
+                .or(reported_move)
                 .map(|path| provider_change_path(path, workspace));
             let kind = if move_path.is_some() {
                 ProviderChangeKind::Move
             } else {
-                match change
-                    .get("kind")
-                    .or_else(|| change.get("operation"))
-                    .and_then(|kind| {
-                        kind.as_str()
-                            .or_else(|| kind.get("type").and_then(Value::as_str))
-                    })
-                    .unwrap_or("update")
-                    .to_ascii_lowercase()
-                    .as_str()
-                {
-                    "add" | "create" | "created" => ProviderChangeKind::Add,
-                    "delete" | "deleted" | "remove" => ProviderChangeKind::Delete,
-                    "move" | "rename" => ProviderChangeKind::Move,
-                    _ => ProviderChangeKind::Update,
-                }
+                kind
             };
-            let diff = change
-                .get("diff")
-                .or_else(|| change.get("patch"))
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned();
             Some(ProviderFileChange {
                 path,
                 move_path,
                 kind,
-                diff,
+                diff: diff.to_owned(),
             })
         })
         .collect();
@@ -3964,6 +3966,34 @@ mod test {
             .as_ref()
             .expect("external MCP activity");
         assert_eq!(activity.title, "external-mcp.goal_complete({})");
+    }
+
+    #[test]
+    fn move_report_preserves_destination_outside_patch_content() {
+        let patch = "@@ -1 +1 @@\n-before\n+Moved to: source text\n";
+        let changes = normalize_file_change_set(
+            &json!({"changes":[{
+                "path":"D:/workspace/src/original.rs", "kind":"update",
+                "diff":format!("{patch}\nMoved to: D:/workspace/src/moved.rs")
+            }]}),
+            &Value::Null,
+            "D:/workspace",
+        );
+        assert_eq!(changes.file[0].kind, ProviderChangeKind::Move);
+        assert_eq!(changes.file[0].move_path.as_deref(), Some("src/moved.rs"));
+        assert_eq!(changes.file[0].diff, patch);
+        let content = "ordinary content\nMoved to: source text";
+        for kind in ["add", "delete"] {
+            let changes = normalize_file_change_set(
+                &json!({"changes":[{
+                    "path":"src/plain.txt", "kind":kind, "diff":content
+                }]}),
+                &Value::Null,
+                "D:/workspace",
+            );
+            assert_eq!(changes.file[0].diff, content);
+            assert!(changes.file[0].move_path.is_none());
+        }
     }
 
     #[tokio::test]

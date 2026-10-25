@@ -41,12 +41,33 @@ publishes a lightweight status replacement during execution and atomically remov
 the matching activity when it inserts the final result. Normal status updates retain
 independent check activity. Full snapshot reconstruction applies the same boundary.
 
-Each run retains an optional `exchange_id` assigned at admission. Completed runs
-with an owner are nested in that exchange's timeline entry, while runs started
-without an exchange remain standalone. Incremental publication and full reload
-use the same identity and retain one copy per run. Replacing an exchange during
-provider updates preserves its attached results. Removing the exchange also
-removes those results from the transcript, while the check store retains history.
+Check runs and retained session events require a `TimelineOwner` at creation.
+Session ownership names the session explicitly. Exchange ownership names the
+session, exchange, and a position in its source node sequence. Provider-requested
+checks capture the invoking exchange before execution. Standalone user checks
+explicitly belong to the session, while execution gates belong to their execution
+exchange. Ownership cannot change when an operation completes or resumes.
+
+Completed checks and visible exchange events enter `ExchangeNode::TimelineEvent`
+at their captured position. Check summaries render as exchange results outside
+the activity fold, before the outer final response, so completing an exchange
+does not hide its verification results. Each check group retains its own collapsed
+command details. Other exchange events render inside the activity fold.
+The projector and live stream share event insertion,
+identity replacement, and standalone ordering. Source updates preserve the same
+owned nodes, including nodes in child exchanges. Missing owners, cross-session
+owners, and invalid source positions fail explicitly. Deliberately retired
+exchange history is excluded separately while its check records remain stored.
+Routine settings progress stays hidden, and configuration failures remain visible.
+Expanded check groups contain attempted commands and failures, including failures
+before process startup. Skipped and pending selections remain in check records
+without creating transcript rows or output nodes.
+
+Timeline ownership has no event-count or history-length limit. Recursive agent
+rendering grows stack segments instead of rejecting a fixed nesting depth, and
+persisted JSON uses the shared stack-growing codec. Output paging controls the
+materialized view without discarding the underlying content.
+
 Automatic repair reopens the completed owning exchange through a dedicated check
 transition and preserves its prompt, usage, and original checkpoint. Ordinary
 continuation still rejects completed exchanges.
@@ -241,6 +262,11 @@ ownership and restore the prior clipboard mapping. Ordinary timeline cursor move
 its existing behavior. Harness keymap configuration and help expose this command only in the
 transcript, while the composer retains its normal `W` behavior.
 
+The composer shares session commands with the transcript in Normal mode, including
+question and approval reopening, model selection, artifacts, help, and closing.
+Only row-targeted timeline navigation and selection are excluded from its command
+set. Insert-mode typing and prompt-history navigation retain their own bindings.
+
 Timeline prompts and final-response bodies use `●`, thoughts use `○`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
 `▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
 file headings. Response summaries retain `●` until they own foldable content. Tool calls
@@ -252,6 +278,10 @@ fold ranges start on the same row. Native fold commands and split windows update
 shared buffer. Collapsed labels retain the same indentation and marker column as open headings.
 Tool groups inherit the same layout depth as commentary. Their rows start with the `•` marker
 without additional leading spaces. Output branches add two columns relative to that marker.
+The exchange activity section owns the shared child indentation for all event kinds,
+including skill reads and file-change failures or interruptions. Late skill and tool
+events from the response's own turn remain inside its activity fold. Later turns
+retain their chronological position and nest their activity between outer responses.
 Copilot assistant deltas render as commentary until the completed message supplies its tool
 requests. Messages that request tools retain commentary styling. Completed messages without
 tool requests become final responses. Completion replaces the streamed message by provider
@@ -303,6 +333,13 @@ closure. Duplicate completion cannot release a newer request. The controller cle
 and refreshes authoritative task state before draining queued follow-ups. Plan preparation precedes acceptance. Git checkpoint
 acquisition starts asynchronously when the exchange is admitted and does not delay acceptance or
 the initial timeline projection.
+
+Queued prompts retain their entry, attachments, task identity, and configuration until
+the matching `prompt_submission` acceptance. Queue acceptance uses the session submission
+token independently of any composer document. Admission failures leave the entry in place,
+retraction restores the original entry once, and failures after acceptance do not replay
+already-admitted work. An in-flight queue entry cannot be edited or submitted again.
+Queued compaction retains its entry until the task transition succeeds.
 
 `views/harness/attachment.lua` scopes terminal and register-paste handling to composer
 buffers. It retains the pasted path during asynchronous capture and tracks that exact
@@ -728,6 +765,10 @@ reads and approval responses remain available. Ctrl-C during a mode restart supp
 automatic resumption and waits for the existing cleanup acknowledgement and execution result.
 It then cancels the settled exchange and pauses its goal durably, preventing a reconnect from
 resuming work that the user stopped. Repeated idle cancellation leaves terminal history intact.
+Queued prompt admission waits inside its request task, leaving the host input lane available
+for cancellation and status requests. It holds neither execution nor cleanup ownership while
+waiting for the other. Admission rechecks the captured task and cancellation revision before
+starting work, so a pause, cancellation, or task switch cannot silently resume queued input.
 The shared provider instructions treat `.gitignore` as ordinary model-owned project configuration.
 When a change introduces generated files, the model inspects existing ignore rules and proposes
 needed additions or updates during planning. It edits the actual file during implementation before

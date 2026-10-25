@@ -1,8 +1,8 @@
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 
-/// Decode complete plan JSON with stack growth instead of a total nesting limit.
-pub(super) fn from_str<Value: DeserializeOwned>(source: &str) -> Result<Value, serde_json::Error> {
+/// Decode complete JSON with stack growth instead of a total nesting limit.
+pub(crate) fn from_str<Value: DeserializeOwned>(source: &str) -> Result<Value, serde_json::Error> {
     let mut reader = serde_json::Deserializer::from_str(source);
     reader.disable_recursion_limit();
     let value = Value::deserialize(serde_stacker::Deserializer::new(&mut reader))?;
@@ -10,8 +10,8 @@ pub(super) fn from_str<Value: DeserializeOwned>(source: &str) -> Result<Value, s
     Ok(value)
 }
 
-/// Decode persisted plan bytes while preserving the JSON parser's UTF-8 diagnostics.
-pub(super) fn from_slice<Value: DeserializeOwned>(
+/// Decode persisted bytes while preserving the JSON parser's UTF-8 diagnostics.
+pub(crate) fn from_slice<Value: DeserializeOwned>(
     source: &[u8],
 ) -> Result<Value, serde_json::Error> {
     let mut reader = serde_json::Deserializer::from_slice(source);
@@ -21,8 +21,8 @@ pub(super) fn from_slice<Value: DeserializeOwned>(
     Ok(value)
 }
 
-/// Serialize a complete plan without consuming call-stack space per nested branch.
-pub(super) fn to_vec<Value: Serialize + ?Sized>(
+/// Serialize complete JSON without consuming call-stack space per nested branch.
+pub(crate) fn to_vec<Value: Serialize + ?Sized>(
     value: &Value,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
@@ -32,8 +32,8 @@ pub(super) fn to_vec<Value: Serialize + ?Sized>(
     Ok(bytes)
 }
 
-/// Serialize a persisted plan with readable indentation and stack growth.
-pub(super) fn to_vec_pretty<Value: Serialize + ?Sized>(
+/// Serialize persisted JSON with readable indentation and stack growth.
+pub(crate) fn to_vec_pretty<Value: Serialize + ?Sized>(
     value: &Value,
 ) -> Result<Vec<u8>, serde_json::Error> {
     let mut bytes = Vec::new();
@@ -43,18 +43,25 @@ pub(super) fn to_vec_pretty<Value: Serialize + ?Sized>(
     Ok(bytes)
 }
 
-/// Produce editable UTF-8 JSON using the persisted plan's complete representation.
-pub(super) fn to_string_pretty<Value: Serialize + ?Sized>(
+/// Produce editable UTF-8 JSON using the complete persisted representation.
+pub(crate) fn to_string_pretty<Value: Serialize + ?Sized>(
     value: &Value,
 ) -> Result<String, serde_json::Error> {
     Ok(String::from_utf8(to_vec_pretty(value)?).expect("JSON serialization produces UTF-8"))
 }
 
-/// Build the model-facing plan value without a recursive serialization limit.
-pub(super) fn to_value<Value: Serialize>(
+/// Build a JSON value without a recursive serialization limit.
+pub(crate) fn to_value<Value: Serialize>(
     value: Value,
 ) -> Result<serde_json::Value, serde_json::Error> {
     value.serialize(serde_stacker::Serializer::new(
         serde_json::value::Serializer,
     ))
+}
+
+/// Decode a retained JSON value with the same stack behavior as persisted bytes.
+pub(crate) fn from_value<Value: DeserializeOwned>(
+    source: serde_json::Value,
+) -> Result<Value, serde_json::Error> {
+    Value::deserialize(serde_stacker::Deserializer::new(source))
 }

@@ -239,7 +239,8 @@ execution guard revokes the grants without writing the permission document.
 The shared skill observer reconciles tool inputs and successful completions across provider delivery.
 Recognized file reads and shell reads of selected `SKILL.md` files produce one durable skill-read node
 per skill per agent turn. Failed reads, listings, filenames in output, and script execution alone do not.
-The timeline displays `◇ Read skill · <name>` outside tool-output folds and opens the canonical source
+The timeline nests `◇ Read skill · <name>` inside its exchange activity, alongside tool groups,
+and opens the canonical source
 through the existing file action. Original tool history remains available. Internal provider loads that
 emit no observed read remain undetected. The current session payload retains these nodes across reload.
 Codex conversations with shared settings own a private app-server runtime. Resource changes collect

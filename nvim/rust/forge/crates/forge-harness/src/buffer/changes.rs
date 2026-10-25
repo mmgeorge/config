@@ -75,8 +75,13 @@ impl ChangeTree {
             id: target.clone(),
             range: whole_block(&replacement),
         });
-        tree.action
-            .insert(target, TranscriptAction::Diff { text: patch.into() });
+        tree.action.insert(
+            target,
+            TranscriptAction::Diff {
+                text: patch.into(),
+                syntax: true,
+            },
+        );
         tree.block[0] = replacement;
         Ok(tree)
     }
@@ -104,10 +109,17 @@ impl ChangeTree {
                     2,
                 )?;
                 TranscriptRenderer::heading_marker(&mut block, "Normal");
-                tree.push_action(block, TranscriptAction::Diff { text: text.into() })?;
+                tree.push_action(
+                    block,
+                    TranscriptAction::Diff {
+                        text: text.into(),
+                        syntax: false,
+                    },
+                )?;
                 return Ok(tree);
             }
         };
+        let patch = patch.display()?;
         if patch.file.is_empty() {
             return Ok(tree);
         }
@@ -131,8 +143,25 @@ impl ChangeTree {
         } else {
             "file"
         };
+        let line_ending_files = patch
+            .file
+            .iter()
+            .filter(|file| file.line_ending_changes > 0)
+            .count();
+        let line_ending_summary = if line_ending_files > 0 {
+            format!(
+                " · line endings changed in {line_ending_files} {}",
+                if line_ending_files == 1 {
+                    "file"
+                } else {
+                    "files"
+                }
+            )
+        } else {
+            String::new()
+        };
         let summary = format!(
-            "▸ {label} {count} {} +{added} -{removed}{suffix}",
+            "▸ {label} {count} {} +{added} -{removed}{line_ending_summary}{suffix}",
             if count == 1 {
                 unit.into()
             } else {
@@ -142,7 +171,13 @@ impl ChangeTree {
         let mut heading = renderer.literal(BlockId(id.into()), &summary, 2)?;
         TranscriptRenderer::heading_marker(&mut heading, "Normal");
         decorate_counts(&mut heading, added, removed);
-        tree.push_action(heading, TranscriptAction::Diff { text: text.into() })?;
+        tree.push_action(
+            heading,
+            TranscriptAction::Diff {
+                text: text.into(),
+                syntax: true,
+            },
+        )?;
         let presenter = forge_diff::presentation::DiffPresenter::new(Default::default());
         for (file_index, file) in patch.file.iter().enumerate() {
             let file_start = tree.block.len();
@@ -195,7 +230,17 @@ impl ChangeTree {
             } else {
                 tree.block.push(heading);
             }
-            if file.hunk.is_empty() {
+            if file.line_ending_changes > 0 {
+                tree.block.push(forge_diff::projection::header(
+                    BlockId(format!("{file_id}:line-endings")),
+                    vec![TextChunk {
+                        text: format!("Line endings changed on {} lines", file.line_ending_changes),
+                        capture: "Comment".into(),
+                    }],
+                    0,
+                )?);
+            }
+            if file.hunk.is_empty() && file.line_ending_changes == 0 {
                 let label = if file.binary {
                     "Binary file"
                 } else {
@@ -217,7 +262,7 @@ impl ChangeTree {
                 tree.block.push(presenter.hunk(
                     BlockId(hunk_id.clone()),
                     &group,
-                    forge_diff::presentation::HunkHeading::Saved(hunk.header),
+                    forge_diff::presentation::HunkHeading::Saved(&hunk.header),
                 )?);
                 for (batch_index, rows) in rows.chunks(128).enumerate() {
                     let mut block = presenter.rows(
@@ -580,7 +625,9 @@ mod tests {
         assert_eq!(
             tree.action
                 .values()
-                .filter(|action| matches!(action, TranscriptAction::Diff { text } if text == diff))
+                .filter(
+                    |action| matches!(action, TranscriptAction::Diff { text, .. } if text == diff)
+                )
                 .count(),
             1
         );
@@ -601,9 +648,9 @@ mod tests {
                 .contains("truncated saved patch hunk")
         );
         assert!(
-            tree.action
-                .values()
-                .any(|action| matches!(action, TranscriptAction::Diff { text } if text == source))
+            tree.action.values().any(
+                |action| matches!(action, TranscriptAction::Diff { text, .. } if text == source)
+            )
         );
     }
 
@@ -701,7 +748,30 @@ fn large_diff_retains_source_and_navigation_without_byte_admission() -> Result<(
     assert!(
         tree.action
             .values()
-            .any(|action| matches!(action, TranscriptAction::Diff { text } if text == &source))
+            .any(|action| matches!(action, TranscriptAction::Diff { text, .. } if text == &source))
+    );
+    Ok(())
+}
+
+#[test]
+fn line_ending_changes_have_separate_counts_and_preserve_raw_actions() -> Result<()> {
+    let width = forge_buffer::width::WidthProfile::default();
+    let renderer = TranscriptRenderer::new(&width)?;
+    let source = "--- a/file.rs\n+++ b/file.rs\n@@ -1,3 +1,3 @@\n-first\n-old\n-last\n+first\r\n+new\r\n+last\r\n";
+    let tree = ChangeTree::render(&renderer, "endings", "Changed", "", source, None, None)?;
+    assert_eq!(
+        tree.block[0].text.row(0),
+        Some("▸ Changed 1 file +1 -1 · line endings changed in 1 file")
+    );
+    assert!(
+        tree.block
+            .iter()
+            .any(|block| block.text.row(0) == Some("Line endings changed on 2 lines"))
+    );
+    assert!(
+        tree.action
+            .values()
+            .any(|action| matches!(action, TranscriptAction::Diff { text, .. } if text == source))
     );
     Ok(())
 }

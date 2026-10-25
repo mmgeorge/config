@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 47;
+const SESSION_FORMAT_VERSION: u32 = 48;
 const PREFERENCE_FORMAT_VERSION: u32 = 40;
 
 /// Stores one session with the exact durable format that produced it.
@@ -428,7 +428,7 @@ impl SqliteStore {
             );
             "#,
         )?;
-        tool_output::initialize(&mut connection)?;
+        tool_output::initialize(&mut connection).context("initialize stored tool output")?;
         Ok(Self {
             connection,
             session_lock: Default::default(),
@@ -570,7 +570,8 @@ impl SqliteStore {
     pub fn save_owned_session(&mut self, session: &HarnessSession, client_id: &str) -> Result<()> {
         let transaction = self
             .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("begin session ownership write")?;
         let payload: Option<String> = transaction
             .query_row(
                 "SELECT payload FROM session_record WHERE id=?1",
@@ -605,9 +606,10 @@ impl SqliteStore {
     pub fn save_exchange(&mut self, interaction: &Exchange) -> Result<()> {
         let transaction = self
             .connection
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        Self::write_exchange(&transaction, interaction)?;
-        transaction.commit()?;
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .context("begin exchange write")?;
+        Self::write_exchange(&transaction, interaction).context("write exchange")?;
+        transaction.commit().context("commit exchange write")?;
         Ok(())
     }
 
@@ -990,9 +992,37 @@ impl SqliteStore {
         )
     }
 
-    /// Write one immutable session-level timeline event.
+    /// Persist a timeline event without changing its admitted owner.
     pub fn save_session_event(&mut self, event: &SessionEventRecord) -> Result<()> {
-        self.save_scoped_payload("session_event_record", &event.id, &event.session_id, event)
+        anyhow::ensure!(
+            event.owner.session_id() == event.session_id,
+            "timeline event crosses session ownership"
+        );
+        let transaction = rusqlite::Transaction::new_unchecked(
+            &self.connection,
+            rusqlite::TransactionBehavior::Immediate,
+        )?;
+        self.validate_timeline_owner(&event.owner)?;
+        let existing: Option<String> = transaction
+            .query_row(
+                "SELECT payload FROM session_event_record WHERE id=?1",
+                [&event.id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(existing) = existing {
+            let existing: SessionEventRecord = decode(&existing)?;
+            anyhow::ensure!(
+                existing.session_id == event.session_id && existing.owner == event.owner,
+                "timeline event ownership cannot change"
+            );
+        }
+        transaction.execute(
+            "INSERT INTO session_event_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
+            params![event.id, event.session_id, encode(event)?],
+        )?;
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Load session-level timeline events in their insertion order.
@@ -1028,6 +1058,11 @@ impl SqliteStore {
         history: &[crate::timeline::TimelineEntry],
         event: &SessionEventRecord,
     ) -> Result<()> {
+        anyhow::ensure!(
+            event.session_id == session.id
+                && event.owner == crate::timeline::TimelineOwner::session(&session.id),
+            "fork history event must belong to its destination session"
+        );
         let transaction = self.connection.transaction()?;
         let primary = Agent::primary(&session.id, session.created_at_ms);
         anyhow::ensure!(
@@ -1415,11 +1450,12 @@ impl SessionStore for SqliteStore {
 }
 
 fn encode<T: Serialize>(value: &T) -> Result<String> {
-    serde_json::to_string(value).context("encode Harness storage payload")
+    let bytes = crate::codec::to_vec(value).context("encode Harness storage payload")?;
+    Ok(String::from_utf8(bytes).expect("JSON serialization produces UTF-8"))
 }
 
 fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
-    serde_json::from_str(value).context("decode Harness storage payload")
+    crate::codec::from_str(value).context("decode Harness storage payload")
 }
 
 fn discard_incompatible_plan_state(
@@ -1740,6 +1776,61 @@ mod test {
             .acquire_session_lease("current", "client", 10)
             .unwrap();
         assert!(leased.current_task_id.is_none() && leased.goal_id.is_none());
+    }
+
+    #[test]
+    fn storage_json_preserves_content_beyond_default_parser_nesting() -> Result<()> {
+        let source = format!("{}\"retained\"{}", "[".repeat(256), "]".repeat(256));
+        let value: serde_json::Value = super::decode(&source)?;
+        assert_eq!(super::encode(&value)?, source);
+        Ok(())
+    }
+
+    #[test]
+    fn timeline_ownership_is_validated_before_persistence() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        store.save_session(&session("session", "."))?;
+        let exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"work","session_id":"session","agent_id":"session:agent:primary",
+            "ordinal":1,"prompt":"work","state":"running","created_at_ms":0,
+            "attributed_matches_checkpoint":true,"node_list":[]
+        }))?;
+        store.save_exchange(&exchange)?;
+        let owner = store.capture_timeline_owner("session", "work")?;
+        assert!(
+            store
+                .capture_timeline_owner("other-session", "work")
+                .is_err()
+        );
+        assert!(store.capture_timeline_owner("session", "missing").is_err());
+        let mut event = SessionEventRecord {
+            id: "event".into(),
+            session_id: "session".into(),
+            owner,
+            created_at_ms: 1,
+            detail: crate::timeline::SessionEventKind::Configuration {
+                operation_id: "operation".into(),
+                state: "failed".into(),
+                field: vec!["effort".into()],
+                reason: Some("unsupported effort".into()),
+            },
+        };
+        store.save_session_event(&event)?;
+        let retained = serde_json::to_value(store.list_session_event("session")?)?;
+        event.owner = crate::timeline::TimelineOwner::session("session");
+        assert!(store.save_session_event(&event).is_err());
+        event.owner = crate::timeline::TimelineOwner::Exchange {
+            session_id: "session".into(),
+            exchange_id: "work".into(),
+            node_count: 1,
+        };
+        assert!(store.save_session_event(&event).is_err());
+        assert_eq!(
+            serde_json::to_value(store.list_session_event("session")?)?,
+            retained
+        );
+        Ok(())
     }
 
     fn session(id: &str, workspace: &str) -> HarnessSession {

@@ -63,7 +63,7 @@ impl TimelinePatch {
                     ..
                 } => {
                     notification["status"] =
-                        serde_json::to_value(status).expect("serializable status");
+                        crate::codec::to_value(status).expect("serializable status");
                     notification["checks_running"] = Value::Bool(checks.is_some());
                     notification["active_check_run"] =
                         checks.as_ref().map_or(Value::Null, |activity| {
@@ -97,6 +97,7 @@ pub struct TimelineStream {
     value_list: Vec<Value>,
     entry_index: HashMap<String, usize>,
     exchange_owner: HashMap<String, usize>,
+    removed_exchange: std::collections::HashSet<String>,
     ticking: BTreeSet<usize>,
 }
 
@@ -178,7 +179,7 @@ impl TimelineStream {
                 *reasoning_summary = summary;
                 let visible = *status_thoughts;
                 self.value_list[status_index] =
-                    serde_json::to_value(&self.entry_list[status_index])?;
+                    crate::codec::to_value(&self.entry_list[status_index])?;
                 if visible {
                     operation.push(TimelineOperation::Replace {
                         index: status_index,
@@ -259,6 +260,7 @@ impl TimelineStream {
             value_list: Vec::new(),
             entry_index: HashMap::new(),
             exchange_owner: HashMap::new(),
+            removed_exchange: Default::default(),
             ticking: BTreeSet::new(),
         }
     }
@@ -305,7 +307,7 @@ impl TimelineStream {
                 "timeline revision exhausted"
             );
             *status_thoughts = enabled;
-            self.value_list[index] = serde_json::to_value(&self.entry_list[index])?;
+            self.value_list[index] = crate::codec::to_value(&self.entry_list[index])?;
             operation.push(TimelineOperation::Replace {
                 index,
                 entry: self.entry_list[index].clone(),
@@ -332,38 +334,45 @@ impl TimelineStream {
             self.revision < forge_buffer::MAX_COUNTER,
             "timeline revision exhausted"
         );
-        let next_interaction = interaction.map(|interaction| {
-            if let Some(index) = self.exchange_owner.get(&interaction.id) {
-                if let TimelineEntry::Exchange {
-                    id,
-                    created_at_ms,
-                    exchange,
-                    agent_by_id,
-                    check_runs,
-                } = &self.entry_list[*index]
-                    && exchange.id == interaction.id
-                {
-                    return TimelineEntry::Exchange {
-                        id: id.clone(),
-                        created_at_ms: *created_at_ms,
-                        exchange: crate::plan::event::replacement_exchange(exchange, interaction),
-                        agent_by_id: agent_by_id.clone(),
-                        check_runs: check_runs.clone(),
-                    };
+        let previous_owners = if removed.is_some() {
+            self.exchange_owner.keys().cloned().collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        let next_interaction = interaction
+            .map(|interaction| -> Result<TimelineEntry> {
+                if let Some(index) = self.exchange_owner.get(&interaction.id) {
+                    if let TimelineEntry::Exchange {
+                        id,
+                        created_at_ms,
+                        exchange,
+                        agent_by_id,
+                    } = &self.entry_list[*index]
+                        && exchange.id == interaction.id
+                    {
+                        return Ok(TimelineEntry::Exchange {
+                            id: id.clone(),
+                            created_at_ms: *created_at_ms,
+                            exchange: crate::plan::event::replacement_exchange(
+                                exchange,
+                                interaction,
+                            )?,
+                            agent_by_id: agent_by_id.clone(),
+                        });
+                    }
+                    let mut entry = self.entry_list[*index].clone();
+                    let replaced = entry.replace_exchange(interaction)?;
+                    debug_assert!(replaced, "exchange owner index must resolve its exchange");
+                    return Ok(entry);
                 }
-                let mut entry = self.entry_list[*index].clone();
-                let replaced = entry.replace_exchange(interaction);
-                debug_assert!(replaced, "exchange owner index must resolve its exchange");
-                return entry;
-            }
-            TimelineEntry::Exchange {
-                id: interaction.id.clone(),
-                created_at_ms: interaction.created_at_ms,
-                exchange: interaction.clone(),
-                check_runs: Vec::new(),
-                agent_by_id: HashMap::new(),
-            }
-        });
+                Ok(TimelineEntry::Exchange {
+                    id: interaction.id.clone(),
+                    created_at_ms: interaction.created_at_ms,
+                    exchange: interaction.clone(),
+                    agent_by_id: HashMap::new(),
+                })
+            })
+            .transpose()?;
         let status_id = format!("{}:status", self.session_id);
         let agent_count = self
             .entry_list
@@ -389,12 +398,13 @@ impl TimelineStream {
             status,
         };
         let next_interaction = next_interaction
-            .map(|entry| serde_json::to_value(&entry).map(|value| (entry, value)))
+            .map(|entry| crate::codec::to_value(&entry).map(|value| (entry, value)))
             .transpose()?;
-        let status_value = serde_json::to_value(&next_status)?;
+        let status_value = crate::codec::to_value(&next_status)?;
         let base_revision = self.revision;
         let mut operation = Vec::new();
         if let Some(id) = removed {
+            self.removed_exchange.insert(id.to_owned());
             if let Some(index) = self.entry_index.get(id).copied() {
                 let id = self.entry_list.remove(index).id();
                 self.value_list.remove(index);
@@ -403,7 +413,7 @@ impl TimelineStream {
             } else if let Some(index) = self.exchange_owner.get(id).copied() {
                 let mut entry = self.entry_list[index].clone();
                 entry.remove_exchange(id);
-                let value = serde_json::to_value(&entry)?;
+                let value = crate::codec::to_value(&entry)?;
                 self.upsert(entry, value, index, &mut operation);
             }
         }
@@ -420,6 +430,11 @@ impl TimelineStream {
             status_value,
             self.entry_list.len(),
             &mut operation,
+        );
+        self.removed_exchange.extend(
+            previous_owners
+                .into_iter()
+                .filter(|owner| !self.exchange_owner.contains_key(owner)),
         );
         if !operation.is_empty() {
             self.revision += 1;
@@ -483,6 +498,10 @@ impl TimelineStream {
     /// Publish live checks under status and insert one history result after completion.
     pub(crate) fn update_checks(&mut self, run: &crate::checks::CheckRun) -> Result<TimelinePatch> {
         ensure!(
+            run.owner.session_id() == self.session_id,
+            "check event crosses timeline sessions"
+        );
+        ensure!(
             self.revision < forge_buffer::MAX_COUNTER,
             "timeline revision exhausted"
         );
@@ -491,26 +510,30 @@ impl TimelineStream {
         let activity = crate::checks::CheckActivity::from_run(run);
         let status_id = format!("{}:status", self.session_id);
         if activity.is_none() {
-            if let Some(owner) = run.exchange_id.as_ref() {
+            if let Some(owner) = run.owner.exchange_id() {
                 if let Some(index) = self.exchange_owner.get(owner).copied() {
                     let mut entry = self.entry_list[index].clone();
-                    if entry.attach_check(run) {
-                        let value = serde_json::to_value(&entry)?;
+                    if entry.attach_event(&super::TimelineEvent::Check {
+                        run: Box::new(run.clone()),
+                    })? {
+                        let value = crate::codec::to_value(&entry)?;
                         self.upsert(entry, value, index, &mut operation);
                     }
+                } else if !self.removed_exchange.contains(owner) {
+                    anyhow::bail!("check event owner is absent from the timeline: {}", run.id);
                 }
             } else {
                 let entry = TimelineEntry::Checks {
                     id: run.id.clone(),
-                    created_at_ms: run.completed_at_ms.unwrap_or(run.started_at_ms),
+                    created_at_ms: run.started_at_ms,
                     run: run.clone(),
                 };
                 let insertion = self
-                    .entry_index
-                    .get(&status_id)
-                    .copied()
+                    .entry_list
+                    .iter()
+                    .position(|current| current.order_key() > entry.order_key())
                     .unwrap_or(self.entry_list.len());
-                let value = serde_json::to_value(&entry)?;
+                let value = crate::codec::to_value(&entry)?;
                 self.upsert(entry, value, insertion, &mut operation);
             }
         }
@@ -537,7 +560,7 @@ impl TimelineStream {
                     *checks = None;
                 }
             }
-            let value = serde_json::to_value(&entry)?;
+            let value = crate::codec::to_value(&entry)?;
             self.upsert(entry, value, self.entry_list.len(), &mut operation);
         }
         if !operation.is_empty() {
@@ -560,7 +583,7 @@ impl TimelineStream {
         let next_value_list = serialize_entry_list(&next_entry_list)?;
         for (index, value) in self.value_list.iter_mut().enumerate() {
             if value.is_null() {
-                *value = serde_json::to_value(&self.entry_list[index])?;
+                *value = crate::codec::to_value(&self.entry_list[index])?;
             }
         }
         let mut working_entry_list: Vec<_> = self.entry_list.iter().collect();
@@ -619,6 +642,16 @@ impl TimelineStream {
         );
         if !operation.is_empty() {
             self.revision += 1;
+            let mut next_owner = HashMap::new();
+            for (index, entry) in next_entry_list.iter().enumerate() {
+                entry.index_exchanges(index, &mut next_owner);
+            }
+            self.removed_exchange.extend(
+                self.exchange_owner
+                    .keys()
+                    .filter(|owner| !next_owner.contains_key(*owner))
+                    .cloned(),
+            );
             self.entry_list = next_entry_list;
             self.value_list = next_value_list;
             self.reindex();
@@ -674,7 +707,7 @@ fn ticking(entry: &TimelineEntry) -> bool {
 fn serialize_entry_list(entry_list: &[TimelineEntry]) -> Result<Vec<Value>> {
     entry_list
         .iter()
-        .map(serde_json::to_value)
+        .map(crate::codec::to_value)
         .collect::<Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -702,7 +735,7 @@ mod test {
     fn check_progress_preserves_primary_status_and_publishes_one_result() -> anyhow::Result<()> {
         let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
             "id":"checks","revision":1,"completed_plan":null,"shell":"system","executable":null,
-            "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
+            "workspace":".","owner":{"kind":"session","session_id":"session"}, "environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
             "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
             "workspace_identity":null,"workspace_digest":{},"commands":[{
                 "id":"command","command":"cargo test","state":"running","started_at_ms":0,
@@ -796,6 +829,45 @@ mod test {
     }
 
     #[test]
+    fn standalone_check_order_matches_reload_and_rejects_foreign_sessions() -> anyhow::Result<()> {
+        let mut first: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"first","owner":{"kind":"session","session_id":"session"},
+            "revision":0,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","environment_digest":"test","started_at_ms":1,"completed_at_ms":9,
+            "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[]
+        }))?;
+        let mut second = first.clone();
+        second.id = "second".into();
+        second.started_at_ms = 2;
+        second.completed_at_ms = Some(3);
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![status(SessionPhase::Idle)])?;
+        stream.update_checks(&second)?;
+        stream.update_checks(&first)?;
+        let live: Vec<_> = stream
+            .entry_list()
+            .iter()
+            .filter(|entry| !matches!(entry, TimelineEntry::Status { .. }))
+            .map(TimelineEntry::id)
+            .collect();
+        let rebuilt = crate::timeline::TimelineProjector::with_checks(
+            Vec::new(),
+            vec![second, first.clone()],
+        )?;
+        assert_eq!(
+            live,
+            rebuilt.iter().map(TimelineEntry::id).collect::<Vec<_>>()
+        );
+        assert_eq!(live, ["first", "second"]);
+        let retained = crate::codec::to_value(stream.entry_list())?;
+        first.owner = Box::new(crate::timeline::TimelineOwner::session("other-session"));
+        assert!(stream.update_checks(&first).is_err());
+        assert_eq!(crate::codec::to_value(stream.entry_list())?, retained);
+        Ok(())
+    }
+
+    #[test]
     fn owned_checks_remain_in_the_exchange_after_updates_and_reload() -> anyhow::Result<()> {
         let exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
             "id":"work", "session_id":"session", "agent_id":"primary", "ordinal":1,
@@ -807,10 +879,9 @@ mod test {
             created_at_ms: 0,
             exchange: exchange.clone(),
             agent_by_id: Default::default(),
-            check_runs: Vec::new(),
         };
         let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
-            "id":"checks", "exchange_id":"work", "revision":1, "completed_plan":null,
+            "id":"checks", "owner":{"kind":"exchange","session_id":"session","exchange_id":"work","node_count":0}, "revision":1, "completed_plan":null,
             "shell":"system", "executable":null, "workspace":".", "environment_digest":"environment",
             "started_at_ms":1, "completed_at_ms":null, "state":"running",
             "progress":crate::plan::execution::SemanticProgress::default(),
@@ -823,8 +894,8 @@ mod test {
         run.completed_at_ms = Some(2);
         let patch = stream.update_checks(&run)?;
         assert!(patch.operation.iter().any(|operation| matches!(operation,
-            TimelineOperation::Replace { entry:TimelineEntry::Exchange { id,check_runs,.. },.. }
-                if id == "work" && check_runs.len() == 1)));
+            TimelineOperation::Replace { entry:TimelineEntry::Exchange { id,exchange,.. },.. }
+                if id == "work" && exchange.node_list.iter().filter(|node| matches!(node,crate::exchange::ExchangeNode::TimelineEvent {..})).count() == 1)));
         assert!(
             !stream
                 .entry_list()
@@ -834,18 +905,18 @@ mod test {
         assert!(stream.update_checks(&run)?.is_empty());
         stream.update_live(Some(&exchange), None, SessionPhase::Idle, false)?;
         assert!(
-            matches!(&stream.entry_list()[0],TimelineEntry::Exchange { check_runs,.. } if check_runs.len() == 1)
+            matches!(&stream.entry_list()[0],TimelineEntry::Exchange { exchange,.. } if exchange.node_list.len() == 1)
         );
         let rebuilt = crate::timeline::TimelineProjector::with_checks(
             vec![entry],
             vec![run.clone(), run.clone()],
+        )?;
+        assert!(
+            matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { exchange,.. }] if exchange.node_list.len() == 1)
         );
         assert!(
-            matches!(rebuilt.as_slice(),[TimelineEntry::Exchange { check_runs,.. }] if check_runs.len() == 1)
-        );
-        assert!(
-            crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]).is_empty(),
-            "checks belonging to a removed exchange must not reappear as standalone history"
+            crate::timeline::TimelineProjector::with_checks(Vec::new(), vec![run]).is_err(),
+            "an unknown exchange owner must be reported"
         );
         Ok(())
     }
@@ -890,7 +961,6 @@ mod test {
             id: exchange.id.clone(),
             created_at_ms: 0,
             exchange: exchange.clone(),
-            check_runs: Vec::new(),
             agent_by_id: Default::default(),
         }])?;
         let activity = event.activity.as_mut().unwrap();
@@ -1049,6 +1119,7 @@ mod test {
             event: crate::timeline::SessionEventRecord {
                 id: id.into(),
                 session_id: "session".into(),
+                owner: crate::timeline::TimelineOwner::session(&"session"),
                 created_at_ms: 0,
                 detail: crate::timeline::SessionEventKind::Renamed { name: name.into() },
             },
@@ -1060,7 +1131,7 @@ mod test {
         ];
         let mut replica: Vec<_> = original
             .iter()
-            .map(|entry| serde_json::to_value(entry).unwrap())
+            .map(|entry| crate::codec::to_value(entry).unwrap())
             .collect();
         let mut stream = TimelineStream::new("session".into());
         stream.initialize(original).unwrap();
@@ -1071,7 +1142,7 @@ mod test {
         ];
         let expected: Vec<_> = next
             .iter()
-            .map(|entry| serde_json::to_value(entry).unwrap())
+            .map(|entry| crate::codec::to_value(entry).unwrap())
             .collect();
         let patch = stream.reconcile(next).unwrap();
         for operation in patch.operation {
@@ -1080,10 +1151,10 @@ mod test {
                     replica.remove(index);
                 }
                 TimelineOperation::Insert { index, entry } => {
-                    replica.insert(index, serde_json::to_value(entry).unwrap())
+                    replica.insert(index, crate::codec::to_value(entry).unwrap())
                 }
                 TimelineOperation::Replace { index, entry } => {
-                    replica[index] = serde_json::to_value(entry).unwrap()
+                    replica[index] = crate::codec::to_value(entry).unwrap()
                 }
                 _ => panic!("reconciliation emitted a streaming operation"),
             }
@@ -1130,6 +1201,7 @@ mod test {
                 event: crate::timeline::SessionEventRecord {
                     id: format!("event-{ordinal}"),
                     session_id: "session".into(),
+                    owner: crate::timeline::TimelineOwner::session(&"session"),
                     created_at_ms: ordinal,
                     detail: crate::timeline::SessionEventKind::Renamed {
                         name: "settled".repeat(100),

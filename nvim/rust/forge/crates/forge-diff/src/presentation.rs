@@ -417,7 +417,7 @@ mod tests {
                 .hunk(
                     BlockId("hunk".into()),
                     &group,
-                    HunkHeading::Saved(saved.header),
+                    HunkHeading::Saved(&saved.header),
                 )
                 .unwrap();
             assert_eq!(heading.text.row(0), Some("@@ -10,2 +20,2 @@ fn run"));
