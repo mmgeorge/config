@@ -29,6 +29,14 @@ controller.render, controller.attach_transcript = function() controller.refresh_
 state.command_set = controller.command_set()
 state.session = { id = "effort-test", backend = "codex", model = "test", resolved_model = "test", effort = "medium" }
 state.capability = { effort_selection = true, fast_mode = true, ultrafast_mode = true }
+for _, tier in ipairs({ "fast", "ultrafast" }) do
+  state.session.service_tier = tier
+  controller.refresh_winbar()
+  local marker = tier == "ultrafast" and " ++" or " +"
+  assert(header:find(marker .. " •", 1, true), "startup winbar omitted the configured speed: " .. header)
+  assert(not header:find("unverified", 1, true) and not header:find("unsupported", 1, true), header)
+end
+state.session.service_tier = nil
 state.model_backend, state.model_list = "codex", { { id = "test", reasoning = { "minimal", "low", "medium", "high" }, service_tiers = { "fast", "ultrafast" } } }
 state.queue, state.pending_steer = {}, {}
 local function settled()
@@ -132,7 +140,7 @@ assert(#transition == before_invalid and state.session.service_tier == "default"
 assert(errors[#errors]:find("does not support ultrafast", 1, true))
 state.session.service_tier = "ultrafast"
 controller.refresh_winbar()
-assert(header:find("unsupported ultrafast", 1, true) and not header:find(" ++", 1, true), header)
+assert(header:find(" ++", 1, true) and not header:find("unsupported ultrafast", 1, true), header)
 vim.api.nvim_buf_delete(composer, { force = true })
 print("harness_effort_selection: passed")
 vim.cmd("qa!")

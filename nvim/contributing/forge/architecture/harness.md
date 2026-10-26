@@ -1396,6 +1396,8 @@ with the active execution mode and resolved runtime model. Its right side shows 
 context followed by the sole command hint, `? help`, using the configured help binding.
 The composer displays no key hints. `/config` displays
 the underlying CLI provider.
+The winbar renders the configured service tier as `+` for fast or `++` for ultrafast,
+including before the model catalog loads. Configuration admission validates tier support.
 The model picker and `/config` share `views/picker/field.lua` for field rendering.
 The active field uses arrows, while inactive fields retain equal-width padding.
 `/config` stores Logging preferences through the shared field picker.

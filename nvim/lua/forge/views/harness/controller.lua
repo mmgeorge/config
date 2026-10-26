@@ -229,12 +229,6 @@ local function status_text()
   if state.connection_error then goal = " • " .. state.connection_error end
   local tier = selected_setting(state, "service_tier")
   local tier_label = ({ fast = " +", ultrafast = " ++" })[tier] or ""
-  local speed_model = require("forge.views.harness.model_options").find(state.model_list, selected_model)
-  if speed_model and not vim.tbl_contains(require("forge.views.harness.model_options").speeds(speed_model, state.capability or {}), tier) then
-    tier_label = " [unsupported " .. tier .. "]"
-  elseif not speed_model and tier ~= "default" then
-    tier_label = " [unverified " .. tier .. "]"
-  end
   if tier ~= (active_session.service_tier or "default") and pending_marker ~= "" then
     tier_label = (tier == "default" and " standard" or tier_label) .. "*"
   end
