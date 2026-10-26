@@ -166,8 +166,6 @@ pub(crate) fn validate(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(feature = "live-provider-tests")]
-    use crate::backend::{Backend, BackendCatalogRequest};
 
     #[test]
     fn commit_message_preserves_body_and_large_output_and_rejects_empty_output() {
@@ -226,30 +224,6 @@ mod tests {
         assert!(purpose.validate("```text\n```").is_err());
     }
 
-    #[tokio::test]
-    #[cfg(feature = "live-provider-tests")]
-    async fn live_codex_session_name() {
-        let backend =
-            crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
-                .unwrap();
-        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol", None,
-            "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
-        backend.shutdown().await.unwrap();
-        let name = result.unwrap();
-        assert!(TextGeneration::SessionName.validate(&name).is_ok());
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "live-provider-tests")]
-    async fn live_copilot_session_name() {
-        let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
-        let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol", None,
-            "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
-        backend.shutdown().await.unwrap();
-        let name = result.unwrap();
-        assert!(TextGeneration::SessionName.validate(&name).is_ok());
-    }
-
     #[test]
     fn session_name_rejects_invalid_output_and_normalizes_a_short_title() {
         let purpose = TextGeneration::SessionName;
@@ -285,41 +259,6 @@ mod tests {
         assert_eq!(lowest_effort(&model).unwrap(), None);
         model.reasoning.push("unknown".into());
         assert!(lowest_effort(&model).is_err());
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "live-provider-tests")]
-    async fn live_codex_recap() {
-        let backend =
-            crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
-                .unwrap();
-        let result = backend.generate_text(request(), TextGeneration::Recap, "default", None, "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
-        backend.shutdown().await.unwrap();
-        assert!(!result.unwrap().is_empty());
-    }
-
-    #[tokio::test]
-    #[cfg(feature = "live-provider-tests")]
-    async fn live_copilot_recap() {
-        let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
-        let result = backend.generate_text(request(), TextGeneration::Recap, "gpt-5.6-sol", None, "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
-        backend.shutdown().await.unwrap();
-        assert!(!result.unwrap().is_empty());
-    }
-
-    #[cfg(feature = "live-provider-tests")]
-    fn request() -> BackendCatalogRequest {
-        BackendCatalogRequest {
-            execution_owner: None,
-            harness_session_id: "recap-test".into(),
-            workspace: std::env::current_dir()
-                .unwrap()
-                .to_string_lossy()
-                .into_owned(),
-            backend_session_id: None,
-            access: Default::default(),
-            execution_mode: crate::session::PermissionMode::Read,
-        }
     }
 
     #[test]

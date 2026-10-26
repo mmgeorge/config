@@ -2424,21 +2424,6 @@ mod test {
     }
 
     #[tokio::test]
-    #[cfg(feature = "live-provider-tests")]
-    async fn default_cli_resolution_starts_and_collects_without_a_session() {
-        let workspace = tempfile::tempdir().unwrap();
-        let backend = CopilotBackend::new(Vec::new()).unwrap();
-        backend
-            .client(workspace.path().to_str().unwrap())
-            .await
-            .unwrap();
-        assert_eq!(backend.client_start_count(), 1);
-        backend.shutdown().await.unwrap();
-        assert!(backend.client.lock().await.is_none());
-        assert!(backend.session_slot_by_harness.lock().await.is_empty());
-    }
-
-    #[tokio::test]
     async fn shutdown_waiter_cancellation_retains_the_same_collection_task() {
         use super::{Backend, CopilotBackend, ProviderShutdown};
         let backend = CopilotBackend::new(Vec::new()).unwrap();

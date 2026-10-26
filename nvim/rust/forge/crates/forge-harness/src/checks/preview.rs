@@ -17,7 +17,7 @@ pub struct CheckPreview {
     pub scope: CheckScope,
     /// Selection reason or the unresolved prerequisite.
     pub reason: String,
-    /// Whether package metadata or implementation is still unavailable.
+    /// Whether required input values or plan context are still unavailable.
     pub pending: bool,
     /// Whether the proposed change set selects this definition.
     pub selected: bool,
@@ -52,12 +52,6 @@ pub(crate) async fn plan(
             }
         }
     }
-    let invalidated = design.changed_paths().into_iter().any(|path| {
-        path.ends_with("Cargo.toml")
-            || path.ends_with("Cargo.lock")
-            || path.ends_with("package.json")
-            || path.ends_with("pnpm-workspace.yaml")
-    });
     let mut config = snapshot.config.clone();
     for check in &mut config.definitions {
         if design.document.disabled_checks.contains(&check.id) {
@@ -70,7 +64,6 @@ pub(crate) async fn plan(
         &files,
         Some(&changed),
         Some(&new),
-        invalidated,
         &design.document.checks,
     )
     .await
@@ -83,7 +76,6 @@ pub(super) async fn resolve(
     files: &[String],
     cases: Option<&[super::CheckCase]>,
     new_cases: Option<&[super::CheckCase]>,
-    metadata_pending: bool,
     included: &[String],
 ) -> Result<Vec<CheckPreview>> {
     let request = RunRequest {
@@ -104,7 +96,6 @@ pub(super) async fn resolve(
     } else {
         request.selections(config, files, cases, new_cases, true)?
     };
-    let mut resolver = super::invocation::InvocationResolver::default();
     let mut result = Vec::new();
     for index in config.order_selected(&request.ids.iter().cloned().collect())? {
         let definition = &config.definitions[index];
@@ -142,48 +133,41 @@ pub(super) async fn resolve(
                 "No matching changes"
             }
             .into();
-        } else if applicable.selected && operation.args.is_some() {
-            if metadata_pending && operation.package_manager.is_some() {
-                preview.pending = true;
-                preview.reason =
-                    "Package manifests change in this plan. Resolve commands after implementation."
-                        .into();
-            } else {
-                match resolver
-                    .resolve_check(
-                        workspace,
-                        &definition.directory,
-                        operation,
-                        &scope,
-                        &definition.trigger,
-                    )
-                    .await
-                {
-                    Ok(invocations) => {
-                        for invocation in invocations {
-                            let mut item = preview.clone();
+        } else if applicable.selected {
+            match super::invocation::resolve(
+                workspace,
+                &definition.directory,
+                operation,
+                &scope,
+                &applicable.matched_files,
+                cases.unwrap_or_default(),
+            ) {
+                Ok(invocations) => {
+                    for invocation in invocations {
+                        let mut item = preview.clone();
+                        if operation.args.is_some() {
                             item.command = invocation.display();
-                            if !invocation.files.is_empty() {
-                                item.reason = if included.contains(&definition.id)
-                                    || applicable.reason.starts_with("Required by")
-                                {
-                                    format!(
-                                        "{}. Inputs: {}",
-                                        applicable.reason,
-                                        invocation.files.join(", ")
-                                    )
-                                } else {
-                                    format!("Changed: {}", invocation.files.join(", "))
-                                };
-                            }
-                            result.push(item);
                         }
-                        continue;
+                        if !invocation.files.is_empty() {
+                            item.reason = if included.contains(&definition.id)
+                                || applicable.reason.starts_with("Required by")
+                            {
+                                format!(
+                                    "{}. Inputs: {}",
+                                    applicable.reason,
+                                    invocation.files.join(", ")
+                                )
+                            } else {
+                                format!("Changed: {}", invocation.files.join(", "))
+                            };
+                        }
+                        result.push(item);
                     }
-                    Err(error) => {
-                        preview.pending = true;
-                        preview.reason = format!("Pending validation: {error:#}");
-                    }
+                    continue;
+                }
+                Err(error) => {
+                    preview.pending = true;
+                    preview.reason = format!("Pending validation: {error:#}");
                 }
             }
         }

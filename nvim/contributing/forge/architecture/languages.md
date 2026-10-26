@@ -13,8 +13,8 @@ Read [Adding a language](../adding-language.md), [Updating Tree-sitter](../updat
 | Structural references | `declaration_index.rs`, `declaration_calls.rs`, and Harness plan modules | Scopes, callable owners, reference expressions, and source coordinates |
 | Commit-message excerpts | `SyntaxHandle::outline` and `src/commit_message/excerpt.rs` | Signatures and bounded changed-body excerpts, with ordinary diff fallback |
 | Workspace definitions | Shared Lua LSP adapter plus the running project server | Definition locations for captured real-source occurrences |
-| Package ownership | Harness `checks/packages.rs` and package-manager metadata | Cargo, npm, and pnpm workspace members owning changed files |
-| Test selection | Harness check selections, invocation resolver, and runner | Package checks or exact planned cases, with execution evidence |
+| Package ownership | Repository-configured callbacks | Repository-dependent mapping from changed files to packages |
+| Check invocation | Harness typed inputs and literal argv substitution | One configured opaque command with recorded input identity |
 
 The native syntax registry supports more languages than the declaration-planning
 registry. Extensions and aliases must be added to the correct registry for each
@@ -119,12 +119,10 @@ Neovim's push diagnostic store. Unknown freshness remains explicit. Diagnostic r
 to the client, provider, source version, and invalidation generation. Other semantic queries
 retain no cross-query result cache. Harness creates no dependency projects.
 
-Package discovery uses manifests and workspace membership rather than syntax or
-LSP results. The check configuration chooses the package manager explicitly.
-Cargo supports native exact-case execution through its standard test harness.
-npm and pnpm provide package ownership, while runner-specific helpers retain
-responsibility for case selection and receipts. Adding syntax support therefore
-does not imply a source-to-test mapping. See
+The check executor has no package-manager or test-runner adapters. Repository
+callbacks own any manifest lookup, exact-test selection, and coverage validation.
+Harness passes typed inputs and generic change context without inspecting command
+names. Adding syntax support does not imply a source-to-test mapping. See
 [Extending project checks](../extending-project-checks.md) for the integration
 boundary and [Planning](planning.md#project-checks-and-the-harness-checking-gate)
 for selection, preview, and execution ownership.

@@ -52,8 +52,8 @@ pub struct CheckOperation {
     /// Direct arguments. Bound values remain individual arguments, never shell source.
     pub args: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    /// Chooses workspace discovery when arguments refer to package context.
-    pub package_manager: Option<super::packages::PackageManager>,
+    /// Named arguments declared by this check, with no runner-specific semantics.
+    pub inputs: Option<super::CheckInputMap>,
 }
 
 impl CheckOperation {

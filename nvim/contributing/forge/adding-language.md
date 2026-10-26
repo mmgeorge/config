@@ -5,10 +5,10 @@ Syntax highlighting, declaration planning, source-backed LSP navigation,
 commit-message excerpts, package discovery, and test selection are separate
 capabilities. Installing a language server does not add a grammar, declaration
 projection, or plan validation rules.
-Package discovery does not require a parser or language server. Follow
+Repository check callbacks do not require a parser or language server. Follow
 [Extending project checks](extending-project-checks.md) for package ownership and
-test-runner integration. Cargo, npm, and pnpm currently provide package discovery,
-while native exact-case execution supports Cargo's standard test harness.
+test-runner integration. Harness supplies generic typed inputs and does not
+discover packages or interpret test runners.
 
 Read [Languages](architecture/languages.md) and [Planning](architecture/planning.md)
 before changing the boundary. Use [Building and testing](building-and-testing.md)

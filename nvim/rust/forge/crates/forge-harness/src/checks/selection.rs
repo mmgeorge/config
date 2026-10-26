@@ -21,14 +21,11 @@ pub struct CheckCase {
 pub enum CheckSelection {
     #[default]
     All,
+    Inputs {
+        inputs: super::CheckInputValues,
+    },
     Files {
         files: Vec<String>,
-    },
-    Packages {
-        packages: Vec<String>,
-    },
-    Tests {
-        tests: Vec<String>,
     },
     Cases {
         cases: Vec<CheckCase>,
@@ -40,32 +37,13 @@ impl CheckSelection {
     pub fn normalize(&mut self) -> Result<()> {
         match self {
             Self::All => {}
+            Self::Inputs { .. } => {}
             Self::Files { files } => {
                 for file in files.iter() {
                     super::config::relative_path(file)?;
                 }
                 files.sort();
                 files.dedup();
-            }
-            Self::Packages { packages } => {
-                ensure!(
-                    packages
-                        .iter()
-                        .all(|name| !name.is_empty() && !name.chars().any(char::is_control)),
-                    "invalid package name"
-                );
-                packages.sort();
-                packages.dedup();
-            }
-            Self::Tests { tests } => {
-                ensure!(
-                    tests.iter().all(|name| !name.is_empty()
-                        && !name.starts_with('-')
-                        && !name.chars().any(char::is_control)),
-                    "invalid test name"
-                );
-                tests.sort();
-                tests.dedup();
             }
             Self::Cases { cases } => {
                 for case in cases.iter() {
@@ -92,9 +70,8 @@ impl CheckSelection {
     pub(crate) fn empty(&self) -> bool {
         match self {
             Self::All => false,
+            Self::Inputs { .. } => false,
             Self::Files { files } => files.is_empty(),
-            Self::Packages { packages } => packages.is_empty(),
-            Self::Tests { tests } => tests.is_empty(),
             Self::Cases { cases } => cases.is_empty(),
         }
     }
@@ -106,11 +83,7 @@ impl CheckSelection {
 pub struct CheckRunRequest {
     pub check: CheckNames,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub files: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub packages: Option<Vec<String>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tests: Option<Vec<String>>,
+    pub inputs: Option<super::CheckInputValues>,
     #[serde(default)]
     pub all: bool,
 }
@@ -135,19 +108,11 @@ impl TryFrom<CheckRunRequest> for RunRequest {
             "check is required"
         );
         ensure!(
-            usize::from(request.files.is_some())
-                + usize::from(request.packages.is_some())
-                + usize::from(request.tests.is_some())
-                + usize::from(request.all)
-                <= 1,
-            "choose only one of files, packages, tests, or all"
+            !(request.inputs.is_some() && request.all),
+            "choose inputs or all, not both"
         );
-        let selection = if let Some(files) = request.files {
-            Some(CheckSelection::Files { files })
-        } else if let Some(packages) = request.packages {
-            Some(CheckSelection::Packages { packages })
-        } else if let Some(tests) = request.tests {
-            Some(CheckSelection::Tests { tests })
+        let selection = if let Some(inputs) = request.inputs {
+            Some(CheckSelection::Inputs { inputs })
         } else if request.all {
             Some(CheckSelection::All)
         } else {
@@ -232,7 +197,7 @@ impl RunRequest {
                     CheckScope::ChangedFiles => {
                         ensure!(
                             has_scope,
-                            "{} requires explicit files outside a task execution",
+                            "{} requires declared inputs or full context outside a task execution",
                             definition.id
                         );
                         CheckSelection::Files {
@@ -246,7 +211,7 @@ impl RunRequest {
                     CheckScope::ChangedCases | CheckScope::NewCases => {
                         ensure!(
                             has_scope,
-                            "{} requires explicit cases outside a task execution",
+                            "{} requires declared inputs or full context outside plan execution",
                             definition.id
                         );
                         CheckSelection::Cases {
@@ -295,17 +260,11 @@ impl CheckReceipt {
     pub(crate) fn validate_request(&mut self, requested: &CheckSelection) -> Result<()> {
         self.validate()?;
         let contained = match (requested, &self.selection) {
+            (
+                CheckSelection::Inputs { inputs: requested },
+                CheckSelection::Inputs { inputs: resolved },
+            ) => requested == resolved,
             (CheckSelection::All, _) => true,
-            (
-                CheckSelection::Packages {
-                    packages: requested,
-                },
-                CheckSelection::Packages { packages: resolved },
-            ) => resolved.iter().all(|name| requested.contains(name)),
-            (
-                CheckSelection::Tests { tests: requested },
-                CheckSelection::Tests { tests: resolved },
-            ) => resolved.iter().all(|name| requested.contains(name)),
             (
                 CheckSelection::Files { files: requested },
                 CheckSelection::Files { files: resolved },

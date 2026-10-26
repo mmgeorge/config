@@ -1,13 +1,11 @@
-use std::collections::BTreeMap;
-
+use super::{
+    CheckCategory, CheckConfig, CheckDefinition, CheckInputMap, CheckOperation, CheckPurpose,
+    CheckScope, CheckTrigger,
+};
 use anyhow::{Result, ensure};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-
-use super::{
-    CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckPurpose, CheckScope,
-    CheckTrigger, PackageManager,
-};
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -32,7 +30,7 @@ pub enum Command {
 pub struct Action {
     pub command: Command,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub package_manager: Option<PackageManager>,
+    pub inputs: Option<CheckInputMap>,
     #[serde(default = "root", skip_serializing_if = "is_root")]
     pub directory: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -62,15 +60,6 @@ fn is_root(value: &str) -> bool {
     value == "."
 }
 
-pub(super) fn package_manager(program: &str) -> Option<PackageManager> {
-    match program.rsplit(['/', '\\']).next()?.trim_end_matches(".exe") {
-        "cargo" => Some(PackageManager::Cargo),
-        "npm" | "npm.cmd" => Some(PackageManager::Npm),
-        "pnpm" | "pnpm.cmd" => Some(PackageManager::Pnpm),
-        _ => None,
-    }
-}
-
 impl TryFrom<BTreeMap<String, Check>> for CheckConfig {
     type Error = anyhow::Error;
 
@@ -88,59 +77,13 @@ impl TryFrom<BTreeMap<String, Check>> for CheckConfig {
                 }
                 Command::Shell(source) => (source, None),
             };
-            let manager = action.package_manager;
-            ensure!(
-                manager.is_none() || args.is_some(),
-                "{id}: package_manager requires an argument-array command"
-            );
-            if let (Some(selected), Some(expected)) = (manager, package_manager(&command)) {
-                ensure!(
-                    selected == expected,
-                    "{id}: package_manager does not match the action executable"
-                );
-            }
-            let mut operation = CheckOperation {
+            let operation = CheckOperation {
                 command,
                 args,
-                package_manager: manager,
+                inputs: action.inputs,
                 input: action.input,
             };
-            if let Some(args) = &mut operation.args {
-                for argument in args.iter_mut() {
-                    ensure!(
-                        !argument.contains("{file.")
-                            && !argument.contains("{package.")
-                            && !argument.contains("{case."),
-                        "{id}: use {{path}} or {{package}} in action.command"
-                    );
-                    *argument = argument
-                        .replace("{path}", "{file.path}")
-                        .replace("{package}", "{package.name}");
-                }
-            }
             super::invocation::validate(&operation)?;
-            let arguments = operation.args.as_deref().unwrap_or_default();
-            let category = action.category.unwrap_or_else(|| {
-                let verb = arguments
-                    .iter()
-                    .find(|argument| !argument.starts_with('+'))
-                    .map(String::as_str);
-                match (operation.command.as_str(), verb) {
-                    ("rustfmt", _) | ("cargo", Some("fmt")) => CheckCategory::Format,
-                    ("cargo", Some("test")) => CheckCategory::Test,
-                    ("cargo", Some("clippy")) => CheckCategory::Lint,
-                    ("cargo", Some("build")) => CheckCategory::Build,
-                    _ => CheckCategory::Check,
-                }
-            });
-            let cases = if operation.input {
-                Some(operation.clone())
-            } else {
-                (manager == Some(PackageManager::Cargo)
-                    && package_manager(&operation.command) == Some(PackageManager::Cargo)
-                    && arguments.iter().any(|arg| arg == "test"))
-                .then(|| super::invocation::case_operation(&operation))
-            };
             let trigger = if check.trigger.paths.is_empty() && check.trigger.exclude.is_empty() {
                 CheckTrigger::AnyChange
             } else {
@@ -153,14 +96,31 @@ impl TryFrom<BTreeMap<String, Check>> for CheckConfig {
                     exclude: check.trigger.exclude,
                 }
             };
-            let scoped = operation.input
-                || arguments
-                    .iter()
-                    .any(|arg| arg.contains("{file.path}") || arg.contains("{package.name}"));
+            let source = operation
+                .inputs
+                .as_ref()
+                .map(|inputs| {
+                    (
+                        inputs.values().any(|input| {
+                            input.source == Some(super::CheckInputSource::ChangedFiles)
+                        }),
+                        inputs.values().any(|input| {
+                            input.source == Some(super::CheckInputSource::PlannedCases)
+                        }),
+                    )
+                })
+                .unwrap_or_default();
+            let scope = if source.1 {
+                CheckScope::ChangedCases
+            } else if operation.input || source.0 {
+                CheckScope::ChangedFiles
+            } else {
+                CheckScope::All
+            };
             definitions.push(CheckDefinition {
                 id: id.clone(),
                 name: action.label.unwrap_or(id),
-                category,
+                category: action.category.unwrap_or(CheckCategory::Check),
                 purpose: if action.prepare {
                     CheckPurpose::Prepare
                 } else {
@@ -170,15 +130,11 @@ impl TryFrom<BTreeMap<String, Check>> for CheckConfig {
                 auto: check.trigger.auto,
                 area: action.directory.clone(),
                 trigger,
-                scope: if scoped {
-                    CheckScope::ChangedFiles
-                } else {
-                    CheckScope::All
-                },
+                scope,
                 directory: action.directory,
                 all: operation.clone(),
-                files: Some(operation),
-                cases,
+                files: Some(operation.clone()),
+                cases: Some(operation),
                 depends_on: action.after,
             });
         }
@@ -197,18 +153,11 @@ impl From<CheckConfig> for BTreeMap<String, Check> {
             .definitions
             .into_iter()
             .map(|definition| {
-                let operation = if definition.scope == CheckScope::ChangedFiles {
-                    definition.files.as_ref().unwrap_or(&definition.all)
-                } else {
-                    &definition.all
-                };
+                let operation = &definition.all;
                 let command = match &operation.args {
                     Some(args) => Command::Arguments(
                         std::iter::once(operation.command.clone())
-                            .chain(args.iter().map(|arg| {
-                                arg.replace("{file.path}", "{path}")
-                                    .replace("{package.name}", "{package}")
-                            }))
+                            .chain(args.iter().cloned())
                             .collect(),
                     ),
                     None => Command::Shell(operation.command.clone()),
@@ -228,7 +177,7 @@ impl From<CheckConfig> for BTreeMap<String, Check> {
                         },
                         action: Action {
                             command,
-                            package_manager: operation.package_manager,
+                            inputs: operation.inputs.clone(),
                             directory: definition.directory,
                             label: (definition.name != definition.id).then_some(definition.name),
                             category: Some(definition.category),
@@ -249,76 +198,44 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn mixed_actions_keep_independent_package_managers_and_default_to_manual() -> Result<()> {
-        let config: CheckConfig = serde_json::from_value(json!({
-            "rust": {"trigger":{"paths":["rust/**/*.rs"]},"action":{"directory":"rust","package_manager":"cargo","command":["cargo","test","--package","{package}"]}},
-            "web": {"trigger":{"auto":true,"paths":["web/**/*.ts"]},"action":{"directory":"web","package_manager":"npm","command":["npm","test","--workspace","{package}"]}}
-        }))?;
-        assert!(!config.definitions[0].auto);
-        assert!(config.definitions[1].auto);
-        assert_eq!(
-            config.definitions[0]
-                .files
-                .as_ref()
-                .unwrap()
-                .package_manager,
-            Some(PackageManager::Cargo)
-        );
-        assert_eq!(
-            config.definitions[1]
-                .files
-                .as_ref()
-                .unwrap()
-                .package_manager,
-            Some(PackageManager::Npm)
-        );
-        let saved = serde_json::to_value(&config)?;
-        assert_eq!(saved["rust"]["action"]["command"][3], "{package}");
-        assert!(saved.get("definitions").is_none());
+    fn commands_do_not_infer_categories_or_rewrite_arguments() -> Result<()> {
+        for program in ["cargo", "npm", "rustfmt", "custom"] {
+            let value = json!({"check":{"action":{"command":[program,"test","--lib"]}}});
+            let config: CheckConfig = serde_json::from_value(value)?;
+            let definition = &config.definitions[0];
+            assert_eq!(definition.category, CheckCategory::Check);
+            assert!(!definition.auto);
+            assert_eq!(definition.all.command, program);
+            assert_eq!(definition.all.args.as_ref().unwrap(), &["test", "--lib"]);
+            assert_eq!(definition.cases.as_ref(), Some(&definition.all));
+        }
         Ok(())
     }
 
     #[test]
-    fn package_bindings_reject_missing_mismatched_and_unknown_managers() {
-        for action in [
-            json!({"command":["cargo","test","--package","{package}"]}),
-            json!({"command":["cargo","test","--package","{package}"],"package_manager":"npm"}),
-            json!({"command":["cargo","test","--package","{package}"],"package_manager":"unknown"}),
-            json!({"command":["cargo","test","{packge}"],"package_manager":"cargo"}),
-        ] {
-            assert!(
-                serde_json::from_value::<CheckConfig>(json!({"tests":{"action":action}})).is_err()
-            );
-        }
+    fn input_contract_roundtrips_and_rejects_undeclared_bindings() -> Result<()> {
+        let value = json!({"unit":{"action":{
+            "command":["runner","{package}","{test}"],
+            "inputs":{
+                "package":{"type":"string","description":"Package","required":true},
+                "test":{"type":"string","description":"Test","required":true}
+            },
+            "category":"test"
+        }}});
+        let config: CheckConfig = serde_json::from_value(value)?;
+        let reopened: CheckConfig = serde_json::from_value(serde_json::to_value(&config)?)?;
+        assert_eq!(config, reopened);
         assert!(
-            serde_json::from_value::<CheckConfig>(json!({"version":2,"definitions":[]})).is_err()
+            serde_json::from_value::<CheckConfig>(json!({
+                "unit":{"action":{"command":["runner","{undeclared}"]}}
+            }))
+            .is_err()
         );
-    }
-
-    #[test]
-    fn check_requests_accept_one_explicit_selector_without_kind() -> Result<()> {
-        for selector in [
-            json!({"files":["src/lib.rs"]}),
-            json!({"packages":["engine"]}),
-            json!({"tests":["tests::works"]}),
-            json!({"all":true}),
-        ] {
-            let mut request = json!({"check":"tests"});
-            request
-                .as_object_mut()
-                .unwrap()
-                .extend(selector.as_object().unwrap().clone());
-            let request: super::super::CheckRunRequest = serde_json::from_value(request)?;
-            let selected = super::super::RunRequest::try_from(request)?;
-            assert!(selected.selections.contains_key("tests"));
-        }
-        let conflicting = serde_json::from_value::<super::super::CheckRunRequest>(
-            json!({"check":"tests","files":["src/lib.rs"],"packages":["engine"]}),
-        )?;
-        assert!(super::super::RunRequest::try_from(conflicting).is_err());
         assert!(
-            serde_json::from_value::<super::super::CheckRunRequest>(json!({"ids":["tests"]}))
-                .is_err()
+            serde_json::from_value::<CheckConfig>(json!({
+                "unit":{"action":{"command":["cargo","test"],"package_manager":"cargo"}}
+            }))
+            .is_err()
         );
         Ok(())
     }

@@ -152,7 +152,7 @@ impl CheckRun {
 /// Retains configured identity, requested coverage, and the handler's resolved coverage.
 pub struct CheckCommand {
     #[serde(default)]
-    /// Configured direct operation before package bindings resolve.
+    /// Configured operation before named inputs resolve.
     pub operation: Option<super::CheckOperation>,
     #[serde(default)]
     /// Frozen direct invocation executed without shell interpolation.
@@ -189,9 +189,6 @@ impl CheckCommand {
                 super::CheckSelection::Cases { cases } if cases.len() == 1 => {
                     vec![cases[0].name.as_str()]
                 }
-                super::CheckSelection::Tests { tests } if tests.len() == 1 => {
-                    vec![tests[0].as_str()]
-                }
                 super::CheckSelection::Files { files } if files.len() == 1 => {
                     vec![files[0].as_str()]
                 }
@@ -218,6 +215,9 @@ pub struct CheckRunContext {
     pub overrides: BTreeMap<String, bool>,
     /// Complete task-relative path changes used to evaluate all check triggers.
     pub changed_files: Vec<String>,
+    #[serde(default)]
+    /// Accepted plan cases available independently of explicit input overrides.
+    pub planned_cases: Vec<super::CheckCase>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize)]

@@ -8,8 +8,16 @@ for _, name in ipairs({ "first", "second" }) do
   vim.fn.writefile({ vim.json.encode({ name = name }) }, workspace .. "/packages/" .. name .. "/package.json")
 end
 vim.fn.writefile({ vim.json.encode({ name = "root", private = true, workspaces = { "packages/*" } }) }, workspace .. "/package.json")
+vim.fn.writefile({ "def main [package: string, test: string] { print ($package + ':' + $test) }" }, workspace .. "/check.nu")
 vim.fn.writefile({ vim.json.encode({ checks = {
-  ["package-tests"] = { trigger = { auto = true, paths = { "packages/**" } }, action = { command = { "nu",  "--no-config-file", "-c", "print '{package}'"  }, label = "Package tests", directory = ".", category = "test", package_manager = "npm", after = {} } }
+  ["package-tests"] = { trigger = { auto = true, paths = { "packages/**" } }, action = {
+    command = { "nu", "--no-config-file", "check.nu", "{package}", "{test}" },
+    inputs = {
+      package = { type = "string", description = "Explicit fixture package", required = true },
+      test = { type = "string", description = "Explicit fixture case", required = true },
+    },
+    label = "Package tests", directory = ".", category = "test", after = {},
+  } }
 } }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
@@ -45,8 +53,8 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
   assert(request("checks.list").configured)
-  local id = request("checks.run", { check = "package-tests", files = {
-      "packages/first/src/one.ts", "packages/first/src/two.ts", "packages/second/src/one.ts",
+  local id = request("checks.run", { check = "package-tests", inputs = {
+      package = "first", test = "selected",
   } }).run_id
   local run
   assert(vim.wait(10000, function()
@@ -54,11 +62,10 @@ local succeeded, failure = xpcall(function()
     return run.state ~= "running"
   end, 20), "package checks did not settle")
   assert(run.state == "passed", vim.inspect(run))
-  assert(#run.commands == 2, "expected one invocation per package: " .. vim.inspect(run))
-  assert(#run.commands[1].context.matched_files == 2)
-  assert(run.commands[1].context.invocation.package.name == "first")
-  assert(run.commands[2].context.invocation.package.name == "second")
-  assert(table.concat(vim.fn.readfile(run.commands[1].stdout), "\n") == "first")
+  assert(#run.commands == 1, "expected one configured invocation: " .. vim.inspect(run))
+  assert(run.commands[1].context.invocation.inputs.package == "first")
+  assert(run.commands[1].context.invocation.inputs.test == "selected")
+  assert(table.concat(vim.fn.readfile(run.commands[1].stdout), "\n") == "first:selected")
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)

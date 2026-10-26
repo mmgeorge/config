@@ -54,9 +54,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu benchmarks --all --timeout 120sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "benchmarks",
+          "--full",
+          "--timeout",
+          "120sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Benchmarks and resources",
         "category": "test",
+        "input": true,
         "after": [
           "forge-build"
         ]
@@ -93,9 +111,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu buffer --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "buffer",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Buffers and folds",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-composer": {
@@ -131,9 +167,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu composer --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "composer",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Composer and queue",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-controls": {
@@ -177,9 +231,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu controls --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "controls",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Controls",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-editing": {
@@ -212,9 +284,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu editing --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "editing",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Editing",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-extended": {
@@ -230,9 +320,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu extended --all --timeout 120sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "extended",
+          "--full",
+          "--timeout",
+          "120sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Extended integration",
         "category": "test",
+        "input": true,
         "after": [
           "forge-build"
         ]
@@ -255,7 +363,6 @@
           "nvim/lua/forge/git/write.lua",
           "nvim/lua/github/pr_creation.lua",
           "nvim/lua/github/mutation.lua",
-          "nvim/lua/github/issue_snapshot.lua",
           "nvim/lua/plugins/github.lua",
           "nvim/lua/forge/builder.lua",
           "nvim/lua/github/repo_users.lua",
@@ -276,9 +383,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu github --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "github",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "GitHub",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-lsp": {
@@ -308,9 +433,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu lsp --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "lsp",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "LSP",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-permissions": {
@@ -342,9 +485,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu permissions --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "permissions",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Permissions and questions",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-plan-editor": {
@@ -392,9 +553,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu plan-editor --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "plan-editor",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Plan editor",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-plan-workflow": {
@@ -415,9 +594,10 @@
           "nvim/lua/forge/views/plan_review/uml_style.lua",
           "nvim/lua/forge/infra/highlights.lua",
           "nvim/lua/forge/draft_comments.lua",
-          "nvim/lua/forge/views/plan_review/entity_info.lua",
           "nvim/lua/forge/infra/popup_window.lua",
-          "nvim/lua/forge/views/picker/layout.lua",
+          "nvim/lua/forge/views/plan_review/entity_info.lua",
+          "nvim/lua/forge/render/task_tree.lua",
+          "nvim/lua/forge/views/plan_review/document.lua",
           "nvim/lua/forge/types.lua",
           "nvim/lua/forge/protocol_contract.json",
           "nvim/lua/forge/shared/**",
@@ -430,9 +610,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu plan-workflow --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "plan-workflow",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Plan workflow",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-providers": {
@@ -478,9 +676,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu providers --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "providers",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Providers and settings",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-rendering": {
@@ -529,9 +745,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu rendering --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "rendering",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Rendering",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-review-documents": {
@@ -579,9 +813,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu review-documents --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "review-documents",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Review documents",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-sessions": {
@@ -604,15 +856,31 @@
           "nvim/lua/forge/session.lua",
           "nvim/lua/forge/views/harness/layout.lua",
           "nvim/lua/forge/views/harness/approval.lua",
-          "nvim/lua/forge/views/harness/question_presentation.lua",
+          "nvim/lua/forge/views/harness/health.lua",
+          "nvim/lua/forge/buffer.lua",
+          "nvim/lua/forge/shared/keymaps.lua",
+          "nvim/lua/forge/views/harness/subagent_profiles.lua",
+          "nvim/lua/forge/views/harness/plan_question/init.lua",
+          "nvim/lua/forge/render/harness/command.lua",
+          "nvim/lua/forge/render/harness/tool.lua",
+          "nvim/lua/forge/views/harness/completion/command_source.lua",
           "nvim/lua/forge/infra/notifications.lua",
-          "nvim/lua/forge/views/harness/task_transition.lua",
-          "nvim/lua/forge/render/harness/interaction_tree.lua",
-          "nvim/lua/forge/views/harness/session_transition.lua",
-          "nvim/lua/forge/views/harness/session_navigation.lua",
-          "nvim/lua/forge/infra/config.lua",
+          "nvim/lua/forge/views/harness/prompt_history.lua",
+          "nvim/lua/forge/builder.lua",
+          "nvim/lua/forge/protocol.lua",
           "nvim/lua/forge/infra/highlights.lua",
-          "nvim/lua/forge/session.lua",
+          "nvim/lua/forge/views/harness/presentation.lua",
+          "nvim/lua/forge/views/harness/terminals.lua",
+          "nvim/lua/forge/render/task_tree.lua",
+          "nvim/lua/forge/render/task_tree_style.lua",
+          "nvim/lua/forge/render/harness/interaction_tree.lua",
+          "nvim/lua/forge/infra/config.lua",
+          "nvim/lua/forge/views/harness/session_navigation.lua",
+          "nvim/lua/forge/source_document.lua",
+          "nvim/lua/forge/views/harness/session_picker.lua",
+          "nvim/lua/forge/integrations/datetime.lua",
+          "nvim/lua/forge/shared/form.lua",
+          "nvim/lua/forge/views/picker/layout.lua",
           "nvim/lua/forge/types.lua",
           "nvim/lua/forge/protocol_contract.json",
           "nvim/lua/forge/shared/**",
@@ -624,9 +892,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu sessions --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "sessions",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Sessions",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-shared": {
@@ -650,26 +936,9 @@
           "nvim/lua/forge/completion.lua",
           "nvim/lua/forge/document_commands.lua",
           "nvim/lua/forge/editable.lua",
-          "nvim/lua/forge/shared/input_gutter.lua",
-          "nvim/lua/forge/shared/view_controller.lua",
-          "nvim/lua/forge/render/helpers.lua",
-          "nvim/lua/forge/shared/diff_context.lua",
-          "nvim/lua/forge/shared/diff_highlights.lua",
-          "nvim/lua/forge/shared/helpers.lua",
-          "nvim/lua/forge/shared/hunk.lua",
-          "nvim/lua/forge/shared/path.lua",
-          "nvim/lua/forge/shared/source_position.lua",
-          "nvim/lua/forge/shared/virtual_text.lua",
-          "nvim/lua/forge/shared/keymaps.lua",
-          "nvim/lua/forge/permissions.lua",
-          "nvim/lua/forge/render/diff.lua",
-          "nvim/lua/forge/render/diff_intraline.lua",
-          "nvim/lua/forge/render/diff_folds.lua",
-          "nvim/lua/forge/render/diff_file_folds.lua",
-          "nvim/lua/forge/render/diff_file.lua",
+          "nvim/lua/forge/views/permissions.lua",
+          "nvim/lua/forge/render/diff_parse.lua",
           "nvim/lua/forge/infra/perf.lua",
-          "nvim/lua/forge/infra/highlights.lua",
-          "nvim/lua/forge/infra/popup_window.lua",
           "nvim/lua/forge/notifications.lua",
           "nvim/lua/github/notifications.lua",
           "nvim/lua/forge/input.lua",
@@ -691,9 +960,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu shared --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "shared",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Shared components",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-status-git": {
@@ -745,9 +1032,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu status-git --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "status-git",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Status and Git",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-timeline-layout": {
@@ -772,9 +1077,9 @@
           "nvim/lua/forge/gutter.lua",
           "nvim/lua/forge/views/harness/status_hint.lua",
           "nvim/lua/forge/shared/view_command_set.lua",
-          "nvim/lua/forge/infra/highlights.lua",
-          "nvim/lua/forge/shared/helpers.lua",
-          "nvim/lua/forge/width.lua",
+          "nvim/lua/forge/views/harness/health.lua",
+          "nvim/lua/forge/render/harness/timeline_status.lua",
+          "nvim/lua/forge/init.lua",
           "nvim/lua/forge/types.lua",
           "nvim/lua/forge/protocol_contract.json",
           "nvim/lua/forge/shared/**",
@@ -786,9 +1091,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu timeline-layout --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "timeline-layout",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Timeline layout",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-timeline-stream": {
@@ -802,21 +1125,19 @@
           "nvim/lua/forge/views/harness/controller.lua",
           "nvim/lua/forge/views/harness/snapshot.lua",
           "nvim/lua/forge/client.lua",
-          "nvim/lua/forge/session.lua",
           "nvim/lua/forge/views/harness/prompt_submission.lua",
           "nvim/lua/forge/init.lua",
           "nvim/lua/forge/render/harness/interaction_tree.lua",
           "nvim/lua/forge/buffer.lua",
           "nvim/lua/forge/shared/view_command_set.lua",
           "nvim/lua/forge/infra/config.lua",
+          "nvim/lua/forge/session.lua",
           "nvim/lua/forge/infra/highlights.lua",
+          "nvim/lua/forge/views/harness/health.lua",
+          "nvim/lua/forge/views/harness/layout.lua",
           "nvim/lua/forge/infra/notifications.lua",
           "nvim/lua/forge/infra/perf.lua",
-          "nvim/lua/forge/views/harness/layout.lua",
-          "nvim/lua/forge/views/harness/focus.lua",
-          "nvim/lua/forge/shared/keymaps.lua",
-          "nvim/lua/forge/views/harness/health.lua",
-          "nvim/lua/forge/session.lua",
+          "nvim/lua/forge/render/harness/tool.lua",
           "nvim/lua/forge/types.lua",
           "nvim/lua/forge/protocol_contract.json",
           "nvim/lua/forge/shared/**",
@@ -828,9 +1149,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu timeline-stream --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "timeline-stream",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Timeline streaming",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-transport": {
@@ -863,9 +1202,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu transport --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "transport",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Transport",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-lua-walkthrough": {
@@ -890,9 +1247,27 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file .forge/checks/lua-tests.nu walkthrough --all --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "walkthrough",
+          "--full",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Walkthrough",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-rust-clippy": {
@@ -907,22 +1282,47 @@
       },
       "action": {
         "command": [
-          "cargo",
-          "clippy",
-          "--profile",
-          "dev",
-          "--locked",
-          "--package",
-          "{package}",
-          "--all-targets",
-          "--",
-          "-D",
-          "warnings"
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/rust.nu",
+          "clippy"
         ],
-        "package_manager": "cargo",
-        "directory": "nvim/rust/forge",
+        "inputs": {
+          "executable": {
+            "type": "string",
+            "description": "lib, test:<name>, or bin:<name>",
+            "required": false,
+            "default": "lib"
+          },
+          "files": {
+            "type": "array",
+            "description": "Changed repository paths",
+            "required": false,
+            "source": "changed_files"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Run the workspace explicitly",
+            "required": false,
+            "default": false
+          },
+          "package": {
+            "type": "string",
+            "description": "Explicit Cargo package",
+            "required": false,
+            "default": ""
+          },
+          "test": {
+            "type": "string",
+            "description": "Exact Rust test name",
+            "required": false,
+            "default": ""
+          }
+        },
         "label": "Forge Clippy",
-        "category": "lint"
+        "category": "lint",
+        "input": true
       }
     },
     "forge-rust-format-fix": {
@@ -942,16 +1342,48 @@
       },
       "action": {
         "command": [
-          "cargo",
-          "fmt",
-          "--package",
-          "{package}"
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/rust.nu",
+          "format"
         ],
-        "package_manager": "cargo",
-        "directory": "nvim/rust/forge",
+        "inputs": {
+          "executable": {
+            "type": "string",
+            "description": "lib, test:<name>, or bin:<name>",
+            "required": false,
+            "default": "lib"
+          },
+          "files": {
+            "type": "array",
+            "description": "Changed repository paths",
+            "required": false,
+            "source": "changed_files"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Run the workspace explicitly",
+            "required": false,
+            "default": false
+          },
+          "package": {
+            "type": "string",
+            "description": "Explicit Cargo package",
+            "required": false,
+            "default": ""
+          },
+          "test": {
+            "type": "string",
+            "description": "Exact Rust test name",
+            "required": false,
+            "default": ""
+          }
+        },
         "label": "Affected Rust package formatting fix",
         "category": "format",
-        "prepare": true
+        "prepare": true,
+        "input": true
       }
     },
     "forge-rust-tests": {
@@ -969,56 +1401,47 @@
       },
       "action": {
         "command": [
-          "cargo",
-          "test",
-          "--profile",
-          "dev",
-          "--locked",
-          "--package",
-          "{package}",
-          "--tests"
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/rust.nu",
+          "test"
         ],
-        "package_manager": "cargo",
-        "directory": "nvim/rust/forge",
+        "inputs": {
+          "executable": {
+            "type": "string",
+            "description": "lib, test:<name>, or bin:<name>",
+            "required": false,
+            "default": "lib"
+          },
+          "files": {
+            "type": "array",
+            "description": "Changed repository paths",
+            "required": false,
+            "source": "changed_files"
+          },
+          "full": {
+            "type": "boolean",
+            "description": "Run the workspace explicitly",
+            "required": false,
+            "default": false
+          },
+          "package": {
+            "type": "string",
+            "description": "Explicit Cargo package",
+            "required": false,
+            "default": ""
+          },
+          "test": {
+            "type": "string",
+            "description": "Exact Rust test name",
+            "required": false,
+            "default": ""
+          }
+        },
         "label": "Affected Forge Rust package tests",
-        "category": "test"
-      }
-    },
-    "forge-rust-timings": {
-      "trigger": {
-        "paths": [
-          "nvim/rust/forge/**"
-        ],
-        "exclude": [
-          "**/target/**",
-          "**/node_modules/**"
-        ]
-      },
-      "action": {
-        "command": [
-          "cargo",
-          "nextest",
-          "run",
-          "--cargo-profile",
-          "dev",
-          "--profile",
-          "default",
-          "--locked",
-          "--package",
-          "{package}",
-          "--tests",
-          "--retries",
-          "0",
-          "--no-fail-fast",
-          "--status-level",
-          "all",
-          "--final-status-level",
-          "all"
-        ],
-        "package_manager": "cargo",
-        "directory": "nvim/rust/forge",
-        "label": "Rust per-test timings and two-second deadlines",
-        "category": "test"
+        "category": "test",
+        "input": true
       }
     },
     "forge-rust-workspace-format-fix": {
@@ -1143,6 +1566,8 @@
           "nvim/tests/forge/plan_checks_host.lua",
           "nvim/tests/forge/receive_initialize_host.lua",
           "nvim/tests/forge/pr_context_host.lua",
+          "nvim/tests/forge/source_host.lua",
+          "nvim/tests/forge/source_document_presentation.lua",
           "nvim/tests/forge/semantic_execution_host.lua",
           "nvim/tests/forge/status_recent_commits_host.lua",
           "nvim/tests/forge/status_push_host.lua",
@@ -1177,7 +1602,23 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file --stdin .forge/checks/lua-tests.nu affected --timeout 30sec",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/lua.nu",
+          "affected",
+          "--timeout",
+          "30sec"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Affected Lua feature suites",
         "category": "test",
         "input": true
@@ -1195,7 +1636,20 @@
         ]
       },
       "action": {
-        "command": "nu --no-config-file --stdin .forge/checks/nushell-syntax.nu",
+        "command": [
+          "nu",
+          "--no-config-file",
+          "--stdin",
+          "nvim/tools/checks/nushell.nu"
+        ],
+        "inputs": {
+          "files": {
+            "type": "array",
+            "description": "Selected repository paths",
+            "required": false,
+            "source": "changed_files"
+          }
+        },
         "label": "Nushell syntax",
         "category": "check",
         "input": true
@@ -1219,8 +1673,8 @@
           "--dry-run",
           "--config",
           "rulesync-global/rulesync.jsonc",
-          "--input-root",
-          "rulesync-global",
+          "--input-roots",
+          "rulesync-global/.rulesync",
           "--global"
         ],
         "label": "Global Rulesync dry run",

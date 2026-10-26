@@ -1,99 +1,117 @@
 ---
 name: harness-checks
 description: >-
-  Configure Forge Harness project checks, automatic triggers, package-aware commands,
-  and scoped test helpers through checks_configure. Use when adding, editing, or
-  repairing .forge.json checks or .forge/checks/*.nu helpers. Do not use for merely
-  running existing checks or changing task-specific check selection.
+  Configure Forge Harness project checks, automatic triggers, typed command inputs,
+  and repository-owned callbacks through checks_configure. Use when adding, editing,
+  or repairing .forge.json checks or managed .forge/checks/ helpers. Do not use for
+  merely running existing checks or changing task-specific check selection.
 targets:
   - '*'
 ---
 
 # Harness Checks
 
-Configure checks only through the Harness check tools. Check-editing permission
-must be enabled in the current interaction. If disabled, ask the user to enable
-it with `/checks setup on`. Skill selection does not grant editing permission.
+Configure checks only through `checks_configure` when check editing is enabled.
+Read `checks_list` for the current revision, definitions, and live automatic-check
+policy. Preserve unrelated configuration. Every submission requires review outside
+YOLO. Configuration does not execute checks or validate helper-language syntax.
 
-Inspect project manifests, scripts, CI, test runners, and repository instructions.
-For an empty directory, use the user's request to establish tooling. During a
-planning prerequisite, limit discovery to checks and retain the original feature
-request for Harness to resume after publication.
+Inspect repository scripts and manifests before choosing commands. The check
+executor treats all commands as opaque. It never detects Cargo, npm, a language,
+or a runner, never performs test discovery, and never adds runner flags.
 
-Infer functional areas, automatic suites, and coverage cost from repository evidence
-and the user's request. Preserve explicit choices already made. Ask questions only
-when a material decision remains unresolved, not as a prerequisite to saving.
-Read `checks_list` for the current revision, definitions, helper identities, and
-live automatic-check settings. Preserve unrelated definitions and settings.
-Submit through `checks_configure`. Every call presents the configuration and helper
-changes for approval before saving in Read and Write modes, even with saved allow
-rules. YOLO approves automatically. Rejection leaves the existing files unchanged.
-Do not run checks during configuration or write `.forge.json` or helpers through
-shell tools. A saved configuration and its command previews do not prove execution.
+## Declared inputs and templates
 
-The checks configuration is a map of names to trigger and action:
+Checks map names to `trigger` and `action`. A command array starts with a fixed
+executable. A string runs through the configured shell.
 
 ```json
 {
-  "rust-tests": {
-    "trigger": {"auto": true, "paths": ["rust/**/*.rs", "rust/**/Cargo.toml"], "exclude": ["**/target/**"]},
-    "action": {"directory": "rust", "package_manager": "cargo", "command": ["cargo", "test", "--locked", "--package", "{package}", "--tests"]}
-  },
-  "web-tests": {
-    "trigger": {"paths": ["web/**"], "exclude": ["**/node_modules/**"]},
-    "action": {"directory": "web", "package_manager": "npm", "command": ["npm", "test", "--workspace", "{package}"]}
+  "unit": {
+    "trigger": {"auto": false},
+    "action": {
+      "command": ["cargo", "test", "--package", "{package}", "--lib", "--", "{test}", "--exact"],
+      "category": "test",
+      "inputs": {
+        "package": {"type": "string", "description": "Package containing the test", "required": true},
+        "test": {"type": "string", "description": "Exact library test name", "required": true}
+      }
+    }
   }
 }
 ```
 
-An empty map is valid without automated checks. Do not add dummy commands.
-There is no version, definitions array, kind, scope, or separate all/files/cases
-configuration. trigger.auto defaults to false. Empty paths match any changed file.
-Paths are project-relative and case-sensitive. `*` and `?` match within a component,
-and a whole-component `**` matches zero or more components. Exclude removes matching
-paths. Include manifests, lockfiles, generators, and shared inputs when relevant.
+Call this check with `{"check":"unit","inputs":{"package":"engine","test":"tests::example"}}`.
+`package` and `test` are ordinary names declared by this check. No package manager
+field or reserved runner-specific selectors exist.
 
-An action.command array starts with the executable. A string instead runs in the
-configured shell. Only arrays support bindings. `{path}` expands once per selected
-file. `{package}` expands to its owning package name. Identical invocations are
-merged. A full request expands all discovered packages or existing matching files.
+Each input declares `type` and `description`. Types are string, integer, number,
+boolean, array, and object. `required` defaults to false. An optional `default`
+must match the type. Optional automatic `source` bindings are `changed_files`
+(array), `planned_cases` (array), and `workspace` (string). Explicit values override
+context sources and defaults. Missing required values and unknown inputs fail.
 
-action.package_manager supports cargo, npm, and pnpm and is required for
-`{package}`. Declare it per action, including in mixed-language repositories.
-Cargo uses workspace metadata, npm uses package.json membership, and pnpm uses
-its workspace manifest. action.directory selects the discovery and execution root.
-Cargo's leading +toolchain is preserved. Reject unknown or ambiguous packages.
-Workspace root manifests and lockfiles may affect all members and need separate
-full actions. Package discovery does not infer dependent-package impact.
+A complete argv element `{name}` substitutes a scalar or splices an array of
+scalars. Other text stays literal, including `prefix-{name}` and JSON arguments.
+No shell interpolation or implicit per-element fan-out occurs. Use a callback
+for conditionals, multiple commands, object inputs, or source-to-package mapping.
+Shell-string commands receive declared inputs through stdin, not interpolation.
 
-Optional action fields are label, category, prepare, input, and after. Categories
-are format, lint, check, test, and build. Standard Cargo commands infer a category.
-Use prepare:true for source-mutating formatters. Successful preparation establishes
-the source baseline. action.after names required successful checks. Use it for
-actual dependencies such as integration tests consuming a build. After dependencies
-and preparation, category priority is format, lint/check, test, then build. Names
-break priority ties.
+## Repository callbacks
 
-Manual execution names a saved check: `{"check":"rust-tests"}`. Its trigger
-selects current task changes. Outside a task, supply an explicit selector. Exactly
-one optional override is supported: files, packages, tests, or all:true. Examples
-are `{"check":"rust-tests","packages":["engine"]}` and
-`{"check":"rust-tests","tests":["tests::example"]}`. Commands cannot be replaced.
-Native named tests require Cargo and an unambiguous standard test target. Forge
-lists the target and requires the exact test to execute. Unknown, ignored,
-ambiguous, and zero-match tests do not count as passing coverage.
+Set `input: true` to send JSON on stdin. The callback uses the same declared input
+contract as a template. Example action:
 
-For other scoped runners, use input:true and a Nushell helper under .forge/checks/.
-Helpers receive version 1 JSON on stdin with check_id, workspace, selection, and
-receipt_path. Internal selections use `{kind:"files",files:[...]}`,
-`{kind:"packages",packages:[...]}`, `{kind:"tests",tests:[...]}`, or `{kind:"all"}`.
-Accepted plans may provide `{kind:"cases",cases:[{file,name,target}]}`. Write a
-version 1 receipt with the actual selection. Missing, empty, and broader receipts
-fail. Forward runner output and status. Use `def main []` and read `$in` inside
-main. Launch as `["nu","--no-config-file","--stdin",".forge/checks/example.nu"]`.
-Pass source and expected_digest to checks_configure, null for new helpers.
+```json
+{
+  "command": ["nu", "--no-config-file", "--stdin", ".forge/checks/test.nu"],
+  "input": true,
+  "category": "test",
+  "inputs": {
+    "files": {"type": "array", "description": "Changed repository paths", "source": "changed_files"},
+    "package": {"type": "string", "description": "Explicit package", "default": ""},
+    "test": {"type": "string", "description": "Explicit test", "default": ""}
+  }
+}
+```
 
-Keep the project's selected toolchain, profile, features, compiler flags, and
-target directory. Prefer development artifacts unless release is required. Avoid
-redundant builds, cargo clean, duplicate tests, and silent coverage expansion.
-Concrete previews are proposed commands, never execution evidence.
+The request contains `version: 1`, `check_id`, `workspace`, resolved `inputs`,
+`changed_files`, `selection`, `receipt_path`, and `report_path`.
+`selection` records full, changed-file, planned-case, or explicit-input context.
+The callback owns runner arguments, any manifest lookup, test filtering,
+zero-match detection, and failure interpretation. It must propagate nonzero exits
+and preserve full diagnostics rather than returning success-shaped fallbacks.
+
+On success write `{"version":1,"selection":<request.selection>}` to `receipt_path`.
+Explicit-input receipts must match the requested input map exactly.
+An optional report at `report_path` contains `version: 1` and a `result` array.
+Each result has repository-relative `file`, terminal `state`, optional
+`duration_ms`, `command`, and complete `output`. Translate runner output in the
+callback, not in Harness. Malformed reports and reported failures cannot count
+as success. Plain commands use their exit status without implicit coverage parsing.
+
+Use Nushell for cross-platform callbacks in this dotfiles repository. Managed
+helper files under `.forge/checks/` are published through `checks_configure` with
+their inspected `expected_digest`, or null for a new file. Harness does not select
+an interpreter from an extension or secretly run syntax validation. Configure
+language-specific validation explicitly as another check.
+
+## Triggers and execution
+
+`trigger.auto` defaults to false. Paths are repository-relative globs, with `*`,
+`?`, and `**`. Exclusions remove matching paths. Automatic triggers select checks,
+not package names or runner arguments. Empty check maps are valid.
+
+`action.directory` is repository-relative. Optional `label`, `category`, `prepare`,
+and `after` control display, ordering, mutation, and prerequisites. Every command
+defaults to category `check` unless explicitly configured. Use `prepare: true` for
+source-changing commands. Dependencies express required success, not category order.
+
+`checks_run` accepts a check name or list, plus optional `inputs` or `all: true`.
+These two options cannot be combined. Full context does not synthesize a broader
+command or supply missing required inputs. Define full behavior in a callback or
+separate saved check. Omitted inputs use configured defaults and automatic sources.
+
+Preserve the selected compiler, profile, flags, and artifact directory in the
+repository command. Follow the global smallest-sufficient-coverage policy.
+Never silently broaden a failed or empty targeted request.

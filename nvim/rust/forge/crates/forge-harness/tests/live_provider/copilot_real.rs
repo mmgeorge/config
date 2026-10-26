@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::Duration;
 
 #[tokio::test]
+#[ignore = "requires authenticated Copilot and performs a real model request"]
 async fn isolated_commit_generation_uses_existing_login_without_starting_shared_client() {
     let temporary = tempfile::tempdir().unwrap();
     let backend = CopilotBackend::new(Vec::new()).unwrap();
@@ -39,6 +40,7 @@ async fn isolated_commit_generation_uses_existing_login_without_starting_shared_
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated pinned Copilot and docs-mcp on PATH"]
 async fn starts_shared_copilot_mcp_server_without_arguments() {
     let temporary = tempfile::tempdir().unwrap();
     let config = temporary.path().join("config");
@@ -142,6 +144,7 @@ async fn starts_shared_copilot_mcp_server_without_arguments() {
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated Copilot CLI"]
 async fn lists_native_copilot_skills_and_mcp_rows() {
     let temporary = tempfile::tempdir().unwrap();
     let backend = CopilotBackend::new(Vec::new()).unwrap();
@@ -173,6 +176,7 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated Copilot and performs a real model request"]
 async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");

@@ -1,140 +1,103 @@
 # Extending project checks
 
-A check must preserve the requested coverage from selection through execution.
-Package discovery identifies workspace membership, the invocation resolver expands
-commands, and the runner records execution evidence. A new package manager or test
-runner must use those boundaries so plan previews and Checking resolve the same
-commands without silently widening coverage.
+Project checks execute configured commands without recognizing runners. Package
+ownership, test filtering, test discovery, and runner-output interpretation belong
+in repository callbacks, never in Harness. Adding a runner requires configuration
+and repository code, not another branch in the host.
 
-Automatic selection is independent of availability. `enabled` permits execution,
-while `auto` selects matching checks for plans and completion gates. Explicit plan
-IDs and explicit runs can select enabled nonautomatic checks. Keep the shared
-agent instructions synchronized with these contracts: validation must use the
-checks interface rather than unrecorded terminal commands.
+Read [Project checks](../../docs/forge/checks.md) for the input schema, argv
+substitution, JSON callback request, receipts, and optional result reports.
+[Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate)
+describes admission, persistence, and completion gates.
 
-Read [Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate)
-for lifecycle ownership and [Project checks](../../docs/forge/checks.md) for
-configuration examples. Parser and LSP integration is separate and follows
-[Adding a language](adding-language.md).
+## Prerequisites
 
-## Current contracts
+Use the repository's selected runtime and
+[development toolchain](building-and-testing.md). Enable check editing before
+publishing through `checks_configure`. Configuration publication does not execute
+the configured command. Changes to callback code require their own targeted
+coverage.
 
-Categories describe purpose and supply default execution priority, not success
-dependencies. The shared ordering policy runs selected preparation and its
-prerequisites before unrelated verification, then chooses runnable checks by
-format, lint/check, test, and build. Preserve definition order within a priority.
-Use explicit dependencies for required successful artifacts, including a build
-consumed by an integration test. Keep that consumer categorized as a test.
-Preview and execution must use the same selected set when ordering preparation.
+## Define a repository check
 
-Triggers determine whether a definition applies. `files_changed` and `paths`
-match changed paths, while the definition's scope chooses all, changed-file,
-changed-case, or new-case coverage. Package membership is an operation capability
-selected by `package_manager`, not another trigger or an LLM-supplied mapping.
+Keep selection and execution in the same repository-owned boundary.
 
-| Capability | Current behavior |
-| --- | --- |
-| Cargo ownership | `cargo metadata --format-version 1 --no-deps --offline --locked` supplies workspace members and target identities |
-| npm ownership | `package.json` supplies workspace patterns, including the `workspaces.packages` form |
-| pnpm ownership | `pnpm-workspace.yaml` supplies workspace patterns |
-| Single-package projects | The root package is available without workspace member patterns |
-| Changed files | The deepest discovered package owns the path, including a deleted file's path |
-| Planned cases | `changed_cases` selects new and modified entries, while `new_cases` selects only new entries from the accepted plan |
-| Native exact cases | Cargo standard-harness targets validate runtime names and prove the selected tests executed |
-| Other case runners | Scoped shell helpers consume the versioned selection and return a validated receipt |
+1. Declare named inputs with types, descriptions, defaults, required flags, and
+   explicit context sources. Names such as `package` and `test` have no built-in
+   meaning. Automatic runs obtain context sources from task changes and the plan
+   inventory. Explicit `checks_run.inputs` values override those sources.
+2. Choose a fixed argv command for direct scalar substitution or scalar-array
+   expansion. Only a complete `{name}` argument substitutes a value. Substitution
+   never produces shell source.
+3. Configure `input:true` when the repository needs a callback. Read the versioned
+   JSON request on stdin, validate repository-specific selection, and invoke the
+   appropriate runner. Package mapping and optional discovery remain explicit
+   callback behavior. An explicit package and test should not require searching
+   unrelated executables.
+4. Write a matching selection receipt after the requested work completes. Reject
+   missing tests, ignored tests, or zero matches in the callback when that check
+   promises exact-case coverage. Plain commands use their exit status.
+5. Write an optional versioned report to `report_path` for file-level results.
+   Keep stdout and stderr as diagnostics. Harness never infers a report by matching
+   the executable, helper filename, or output text.
+6. Publish the exact definition and any managed `.forge/checks/` helper captures
+   through `checks_configure`. Preserve unrelated configuration. Managed helper
+   ownership does not imply a language or trigger an implicit syntax command.
 
-Cargo discovery preserves an operation's leading `+toolchain` selector. Its
-request-local package cache includes that selector, so checks using different
-toolchains cannot share metadata resolved under another toolchain.
-
-Ownership does not establish dependent-package impact or map arbitrary changed
-source files to individual unit tests. Root workspace manifests and lockfiles in
-multi-package projects require explicit workspace-wide rules. Excluded or
-independent nested packages cannot fall back to their parent's ownership.
+Categories determine default priority, not dependencies. Selected preparation
+and its prerequisites run before unrelated verification. Other runnable checks
+follow format, lint/check, test, and build priority. Declare `after` only when a
+consumer requires a successful prerequisite, such as a built host executable.
 
 ## Source ownership
 
-Rust paths in this table are relative to
-`nvim/rust/forge/crates/forge-harness/src/`.
+Host paths are relative to `nvim/rust/forge/crates/forge-harness/src/`.
 
 | Boundary | Source |
 | --- | --- |
-| Definition schema, operation validation, and scopes | `checks/config.rs`, `checks/selection.rs` |
-| Trigger matching | `checks/applicability.rs` |
-| Package inventories, manifests, and ownership | `checks/packages.rs` |
-| Binding expansion and invocation deduplication | `checks/invocation.rs` |
-| Preparation, dependencies, execution, and evidence | `checks/supervisor.rs` |
-| Record persistence and coalesced UI delivery | `checks/publication.rs` |
-| Current coverage and repair delivery | `checks/evidence.rs`, `checks/automatic.rs` |
-| Shared catalog and plan previews | `checks/preview.rs`, `checks/tools.rs` |
-| Accepted-plan case inventory | `broker/checks.rs`, `plan/design_tests.rs` |
-| Preview invalidation and plan rendering | `plan/design.rs`, `plan/design_review.rs` |
-| Setup guidance | `rulesync-global/.rulesync/skills/harness-checks/SKILL.md`, relative to the repository root |
-| Editor presentation | `nvim/lua/forge/views/harness/checks.lua`, relative to the repository root |
+| Public check schema and operation validation | `checks/spec.rs`, `checks/config.rs` |
+| Typed named values and context sources | `checks/inputs.rs` |
+| Trigger matching and generic selection | `checks/applicability.rs`, `checks/selection.rs` |
+| Literal argv substitution without subprocesses | `checks/invocation.rs` |
+| Admission, execution, dependencies, and receipts | `checks/supervisor.rs` |
+| Explicit result reports | `checks/report.rs` |
+| Evidence identity and automatic reuse | `checks/evidence.rs`, `checks/automatic.rs` |
+| History persistence and UI delivery | `checks/publication.rs` |
+| Catalog, previews, and authorized configuration | `checks/tools.rs`, `checks/preview.rs` |
 
-## Integration sequence
+This dotfiles repository keeps runner-specific callbacks under
+`nvim/tools/checks/`. The Rust callback maps changed files through Cargo metadata
+only when no package is supplied. The Lua and Nushell callbacks adapt existing
+repository helpers to the generic protocol.
 
-Use the pinned Rust toolchain and development target described in
-[Building and testing](building-and-testing.md). Discovery fixtures must be local
-and must not install project dependencies.
+## Host cutover
 
-1. **Define the capability.** Specify the manifest format, authoritative workspace
-   membership, package identity, deleted-path behavior, and whether exact test
-   identities are available. Package-level execution alone does not require a
-   native case-runner adapter.
-2. **Extend discovery.** Add the manager to `PackageManager` and discovery to
-   `PackageCatalog`. Retain normalized workspace-relative identities, reject
-   outside-workspace members, and capture every metadata input needed to detect
-   changed manifests or lockfiles before execution.
-3. **Extend resolution.** Reuse `InvocationResolver` for direct argument expansion
-   and deduplication. Keep arguments separate from shell source. Merge identical
-   program, argument, and working-directory tuples only within one definition,
-   retaining all contributing files and cases.
-4. **Integrate exact-case evidence when supported.** Validate the runtime case name
-   and target, then require proof that execution ran the selected case. Preserve
-   rejection of missing, ignored, ambiguous, or zero-match cases. Use the existing
-   helper receipt contract when the runner cannot supply native evidence.
-5. **Integrate previews.** Route catalog and plan presentation through the shared
-   resolver. Extend plan preview invalidation for any new metadata filenames.
-   Keep unresolved metadata pending and never record a preview as a completed run.
-6. **Update configuration guidance.** Update setup prompts, schema coverage,
-   user-facing configuration examples, and the affected architecture contracts.
-   Preserve shell operations and existing scoped helpers.
-7. **Verify the boundaries.** Add targeted Rust cases and a fresh-host fixture
-   where the public service behavior changes. Follow the project-check commands
-   in [Building and testing](building-and-testing.md#verify-project-checks).
+The generic-input host rejects the removed `package_manager` property. Rebuild
+the development executable before restarting the host. A restart alone does not
+compile source changes.
 
-## Required failure and resource boundaries
+After restarting, `nu --no-config-file nvim/tools/checks/propose-config.nu`
+prints the proposed checks object without modifying `.forge.json`. Publish that
+object with the new `checks_configure` interface and the current revision from
+`checks_list`. The proposal preserves unrelated checks, triggers, and settings.
+Regenerate Rulesync guidance through its normal publication workflow.
 
-Discovery must reject unsupported membership syntax rather than guess. Node
-workspace patterns currently support `*`, `?`, `**`, and leading `!` exclusions.
-The scanner skips `node_modules`, `.git`, `target`, and `.forge`, and does not
-traverse directory symlinks. It limits traversal to 32 levels, 8,192 directories,
-1,024 manifest candidates, and 512 discovered packages. Individual metadata files
-are limited to 1 MiB.
+The cutover procedure and new callbacks have not been executed during this change
+because the user deferred execution until after the host restart.
 
-Owned discovery processes use no stdin, a 30-second metadata timeout, an 8 MiB
-stdout limit, and a 1 MiB stderr limit. Cargo test discovery has a 120-second
-timeout. One operation resolves to at most 4,096 invocations. A new adapter must preserve
-bounded execution, process cleanup, and cancellation.
+## Verify the boundaries
 
-| Failure | Required behavior |
-| --- | --- |
-| Missing or changed metadata | Report pending preview validation or an execution configuration error and resolve again after correction |
-| Ambiguous or missing package name | Reject name-based substitution and use a valid directory-based operation where supported |
-| File outside discovered membership | Reject ownership instead of assigning an unrelated ancestor package |
-| Missing plan inventory | Report unavailable case coverage, distinct from an accepted plan containing zero matching cases |
-| Expanded prerequisite fails | Skip dependents until every invocation of the prerequisite passes |
-| Native case does not execute | Reject successful process exit as insufficient evidence |
+Use the recorded check interface and the targeted commands in
+[Building and testing](building-and-testing.md#verify-project-checks).
+Host coverage must distinguish configuration and previews from actual execution.
 
-Fixtures must cover single-package and multi-package discovery, exclusions,
-deleted paths, deduplication, metadata changes, exact-case failures, and
-cancellation where applicable. Report the executed commands and observed results
-without treating a preview or configuration save as a test run.
+Cover missing, unknown, and mistyped inputs, explicit source overrides, scalar
+argument boundaries, array expansion, and literal embedded braces. Previewing a
+command must never start discovery. Exercise callbacks through a fresh host with
+valid and missing receipts, malformed reports, cancellation, prerequisite
+failures, and identical versus changed input evidence.
 
-Completion-gate fixtures must distinguish provider-turn completion from actual
-idleness. Include intermediate goals, pending questions, cancelled work, explicit
-tool runs reused by automatic checks, and a repair ending without progress.
-Coverage belongs to the original task or exchange across repair turns. Persist
-failure delivery independently of the provider response to avoid repeated repair
-requests after recovery.
+Repository tests cover runner-specific ownership, exact-case guarantees, and
+zero-match rejection. Completion-gate coverage separately exercises task
+baselines, pending questions, cancelled work, explicit runs reused by automatic
+checks, and failure delivery across repair turns.

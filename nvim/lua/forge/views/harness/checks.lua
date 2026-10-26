@@ -14,7 +14,7 @@ local owner = "forge-harness-checks"
 ---@field area string
 ---@field trigger {auto?: boolean, paths?: string[], exclude?: string[]}
 ---@field directory string
----@field action {command: string|string[], package_manager?: string, directory?: string, after?: string[]}
+---@field action {command: string|string[], inputs?: table<string, {type: string, description: string, required?: boolean, default?: any, source?: string}>, input?: boolean, directory?: string, after?: string[]}
 ---@field depends_on string[]
 
 ---@class ForgeCheckCatalog
@@ -111,10 +111,13 @@ function Checks.open(state, host)
           if type(argument) ~= "string" then return nil, "Invalid check " .. id .. ": expected string command arguments" end
         end
       end
-      for _, property in ipairs({ "label", "category", "directory", "package_manager" }) do
+      for _, property in ipairs({ "label", "category", "directory" }) do
         if action[property] ~= nil and type(action[property]) ~= "string" then
           return nil, "Invalid check " .. id .. ": expected string " .. property
         end
+      end
+      if action.inputs ~= nil and type(action.inputs) ~= "table" then
+        return nil, "Invalid check " .. id .. ": expected declared inputs"
       end
       if action.after ~= nil and type(action.after) ~= "table" then
         return nil, "Invalid check " .. id .. ": expected prerequisite names"
@@ -203,7 +206,7 @@ function Checks.open(state, host)
     result[#result + 1] = "Trigger: " .. vim.json.encode(check.trigger)
     result[#result + 1] = "Area: " .. check.area
     result[#result + 1] = applicability(check)
-    if check.action.package_manager then result[#result + 1] = "Packages: " .. check.action.package_manager end
+    if check.action.inputs then result[#result + 1] = "Inputs: " .. vim.json.encode(check.action.inputs) end
     for _, preview in ipairs(catalog.preview or {}) do
       if preview.id == check.id then
         result[#result + 1] = (preview.pending and "Pending: " or preview.selected and "Will run: " or "Not selected: ") .. preview.command

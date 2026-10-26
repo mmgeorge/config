@@ -80,7 +80,7 @@ When adding stdio **MCP servers** that require inherited credentials, declare th
 Use this dry run before applying global changes:
 
 ```sh
-rulesync generate --dry-run --config rulesync-global/rulesync.jsonc --input-root rulesync-global --global
+rulesync generate --dry-run --config rulesync-global/rulesync.jsonc --input-roots rulesync-global/.rulesync --global
 ```
 
 ## Feature Placement Rule

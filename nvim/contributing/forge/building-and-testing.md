@@ -111,37 +111,27 @@ workspace suite after targeted checks pass when shared interfaces or behavior
 require it. Keep Cargo-heavy jobs serial within the workspace. Record the command,
 deadline, exit status, and failing assertion or compiler diagnostic.
 
-## Measure individual Rust tests
+## Rust test execution
 
-The explicit `forge-rust-timings` check accepts file or package selection and runs
-Cargo nextest with the same development artifacts. Install
-[cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/) 0.9.143 or
-newer on macOS or Windows. Version 0.9.150 is recommended.
+The package and workspace checks use `cargo test` without an explicit test-thread
+limit. Rust runs tests in parallel using available hardware concurrency by default.
+After the generic-check cutover, `forge-rust-tests` uses the repository callback
+`nvim/tools/checks/rust.nu` with declared `package`, `test`, `executable`, `files`,
+and `full` inputs. Explicit package and test inputs bypass package lookup and test
+listing. Automatic changed-file mapping belongs to that callback. Standard stable Rust's
+test runner does not enforce a hard per-test timeout.
 
-From the Rust workspace, the equivalent command for Harness is:
+Tests that require installed or authenticated provider CLIs belong to the single
+`tests/live_provider.rs` integration target, with its provider modules under
+`tests/live_provider/`. Each case has `#[ignore = "..."]` because it depends on
+machine-local tools, credentials, remote services, or billable model requests.
+Normal runs compile and discover these cases without executing them. No Cargo
+feature is required, and mock-provider tests remain in the default suite.
 
-```nu
-cargo nextest run --cargo-profile dev --profile default --locked --package forge-harness --tests --retries 0 --no-fail-fast --status-level all --final-status-level all
-```
-
-`nvim/rust/forge/.config/nextest.toml` gives each test a two-second execution
-deadline with no termination grace period. Nextest defaults to one concurrent case
-per logical CPU. The package and workspace Cargo checks also omit an explicit
-test-thread limit and use Rust's available hardware concurrency.
-Timeouts fail, retries are disabled, and failures do not stop the remaining cases.
-Compilation is outside the per-test deadline. Nextest prints each case's duration
-and writes the complete report to `target/nextest/default/junit.xml`, including
-ignored cases as skipped. Ignored tests remain unexecuted.
-
-This timing check is explicit, not an additional automatic suite. Existing checks
-and their exact-name selectors retain their current behavior.
-
-Tests that require installed and authenticated provider CLIs belong to the
-`live-provider-tests` feature. The default suite excludes those targets rather
-than reporting them as ignored. Enable this feature only for deliberate live
-provider verification. Such runs can make model requests and require the named
-providers, models, and local MCP dependencies. Mock-provider tests remain in the
-default suite.
+After authorizing external requests and checking a case's documented prerequisites,
+run only that case with `--test live_provider <module::test_name> -- --ignored --exact`.
+The integration target's module documentation gives a complete example. Do not
+enable ignored cases in routine project checks.
 
 Test fixtures must use the current public check configuration. Task-specific
 enablement belongs in admission overrides, and scoped shell helpers must declare
@@ -200,20 +190,20 @@ use the direct commands above and record the actual exit status and deadline.
 
 ## Verify project checks
 
-Check resolution changes affect package ownership, concrete commands, and evidence
+Check resolution changes affect declared inputs, concrete commands, and evidence
 accepted by the automatic gate. Run the targeted Rust tests from the Rust workspace
 with the same default target directory:
 
 ```nu
-cargo test --profile dev --locked -p forge-harness --lib checks:: -- --test-threads=1
+cargo test --profile dev --locked -p forge-harness --lib checks::
 cargo test --profile dev --locked -p forge-harness --lib plan::design_review::tests
 cargo test --profile dev --locked -p forge-harness --lib automatic_checks_repair_after_permission_resume_on_worker
 cargo test --profile dev --locked -p forge-harness --lib selected_plan_checks_are_versioned
 ```
 
-The check tests cover package discovery, argument expansion, deduplication,
-new-case selection, exact Cargo test evidence, metadata changes, and prerequisite
-failures. The review tests cover the rendered projection. These provide different
+The check tests cover typed inputs, literal argv substitution, generic callback
+receipts, evidence identity, cancellation, and prerequisite failures without
+runner-specific discovery. The review tests cover the rendered projection. These provide different
 evidence from running the service through a real host.
 
 Rebuild `forge` after compiled changes. Then run the package-check fixture from
@@ -226,13 +216,13 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_chec
 nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_check_lifecycle_host.lua
 ```
 
-The fixture creates a temporary npm workspace and invokes the actual host through
-`checks.list`, `checks.run`, and `checks.status`. Three changed paths must produce
-two passing package invocations, retain both paths for the first package, and
-capture command output. It uses Nushell for the fixture command and does not
-install or run an npm test framework. Success requires exit status zero and host
+The fixture creates a temporary workspace and invokes the actual host through
+`checks.list`, `checks.run`, and `checks.status`. Declared package and test inputs
+must produce one configured invocation, preserve both values, and capture command
+output. It uses Nushell without installing a test framework.
+Success requires exit status zero and host
 cleanup. Use [Extending project checks](extending-project-checks.md) to choose
-additional cases when changing supported package managers or case runners.
+additional cases when changing input binding or repository callbacks.
 
 The automatic-check fixture exercises the completion gate through a fresh host.
 The queue fixture verifies both timing choices, persistence, the first change

@@ -19,7 +19,7 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-const CHECK_HISTORY_VERSION: u32 = 4;
+const CHECK_HISTORY_VERSION: u32 = 5;
 
 /// Owns project check admission, durable run history, and process cancellation for one session.
 pub struct CheckSupervisor {
@@ -417,6 +417,7 @@ impl CheckSupervisor {
                 snapshot,
                 overrides,
                 changed_files: files.clone().unwrap_or_default(),
+                planned_cases: cases.clone().unwrap_or_default(),
             }),
             lifecycle: Vec::new(),
             completed_plan: None,
@@ -493,7 +494,8 @@ impl CheckSupervisor {
                 (
                     CheckState::ConfigurationError,
                     Some(
-                        "Explicit check selection is empty. Supply concrete files or cases.".into(),
+                        "Explicit check selection is empty. Supply concrete declared inputs."
+                            .into(),
                     ),
                 )
             } else if selection.empty()
@@ -504,9 +506,9 @@ impl CheckSupervisor {
                     cases.is_none()
                 })
             {
-                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Request file or full-suite coverage through the harness-checks skill, or supply explicit cases.".into()))
+                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Supply declared inputs or explicitly select full context.".into()))
             } else if selection.empty() && files.is_none() && has_scope {
-                (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Select full coverage explicitly or provide concrete files or cases.".into()))
+                (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Supply declared inputs or explicitly select full context.".into()))
             } else if selection.empty() {
                 (
                     CheckState::Skipped,
@@ -535,9 +537,7 @@ impl CheckSupervisor {
                 id: format!("{id}:{position}"),
                 command: operation.unwrap_or(&definition.all).display(),
                 context: Some(CheckCommand {
-                    operation: operation
-                        .filter(|operation| operation.args.is_some())
-                        .cloned(),
+                    operation: operation.cloned(),
                     invocation: None,
                     definition_id: definition.id.clone(),
                     name: definition.name.clone(),
@@ -572,11 +572,14 @@ impl CheckSupervisor {
         Ok(run)
     }
 
-    /// Freezes package bindings before review, authorization, or process admission.
+    /// Freezes declared inputs before review, authorization, or process admission.
     pub(crate) async fn resolve(&self, mut run: CheckRun) -> Result<CheckRun> {
-        let mut resolver = super::invocation::InvocationResolver::default();
         let mut commands = Vec::new();
-        let mut failures = Vec::new();
+        let planned_cases = run
+            .context
+            .as_ref()
+            .map(|context| context.planned_cases.clone())
+            .unwrap_or_default();
         for mut check in std::mem::take(&mut run.commands) {
             let context = check.context.as_ref().context("check context is missing")?;
             if check.state != CheckState::Pending
@@ -586,26 +589,14 @@ impl CheckSupervisor {
                 commands.push(check);
                 continue;
             }
-            let definition = run
-                .context
-                .as_ref()
-                .context("check run context is missing")?
-                .snapshot
-                .config
-                .definitions
-                .iter()
-                .find(|definition| definition.id == context.definition_id)
-                .context("configured check is missing")?;
-            match resolver
-                .resolve_check(
-                    &self.workspace,
-                    &context.directory,
-                    context.operation.as_ref().unwrap(),
-                    &context.selection,
-                    &definition.trigger,
-                )
-                .await
-            {
+            match super::invocation::resolve(
+                &self.workspace,
+                &context.directory,
+                context.operation.as_ref().unwrap(),
+                &context.selection,
+                &context.matched_files,
+                &planned_cases,
+            ) {
                 Ok(invocations) => {
                     ensure!(
                         !invocations.is_empty(),
@@ -613,16 +604,17 @@ impl CheckSupervisor {
                     );
                     for invocation in invocations {
                         let mut expanded = check.clone();
-                        expanded.command = invocation.display();
-                        let context = expanded.context.as_mut().unwrap();
-                        if let Some(package) = &invocation.package {
-                            context.name = format!(
-                                "{} · {}",
-                                context.name,
-                                package.name.as_deref().unwrap_or(&package.directory)
-                            );
+                        if context
+                            .operation
+                            .as_ref()
+                            .is_some_and(|operation| operation.args.is_some())
+                        {
+                            expanded.command = invocation.display();
                         }
-                        if !invocation.files.is_empty() {
+                        let context = expanded.context.as_mut().unwrap();
+                        if !invocation.files.is_empty()
+                            && matches!(context.selection, CheckSelection::Files { .. })
+                        {
                             context.matched_files = invocation.files.clone();
                             context.reason = format!("Changed: {}", invocation.files.join(", "));
                         }
@@ -644,7 +636,6 @@ impl CheckSupervisor {
                 Err(error) => {
                     check.state = super::failure::classify(&error, CheckState::ConfigurationError);
                     check.error = Some(format!("{error:#}"));
-                    failures.push((commands.len(), error));
                     commands.push(check);
                 }
             }
@@ -659,12 +650,6 @@ impl CheckSupervisor {
                 directory.join(format!("{position}.selection.json"));
         }
         run.commands = commands;
-        for (position, error) in failures {
-            if let Some(discovery) = error.downcast_ref::<super::invocation::DiscoveryFailure>() {
-                std::fs::create_dir_all(self.root.join(&run.id))?;
-                discovery.record(&mut run.commands[position])?;
-            }
-        }
         Ok(run)
     }
 
@@ -711,7 +696,7 @@ impl CheckSupervisor {
                     continue;
                 }
                 if let Some(evidence) = &command.evidence {
-                    if evidence.covers(command, run, check, checkpoint)? {
+                    if evidence.covers(run, check, checkpoint)? {
                         return Ok(Some((previous.id.clone(), command.clone())));
                     }
                 }
@@ -788,7 +773,7 @@ impl CheckSupervisor {
                 if matches!(command.state, CheckState::Passed | CheckState::Failed)
                     && let Some(evidence) = &command.evidence
                     && let Some(checkpoint) = checkpoint
-                    && evidence.covers(command, run, check, checkpoint)?
+                    && evidence.covers(run, check, checkpoint)?
                 {
                     return Ok(None);
                 }
@@ -802,7 +787,7 @@ impl CheckSupervisor {
                             command,
                             cancelled.clone(),
                             cancelled,
-                        )? && evidence.covers(command, run, check, checkpoint)?
+                        )? && evidence.covers(run, check, checkpoint)?
                         {
                             return Ok(Some(previous.id.clone()));
                         }
@@ -1030,10 +1015,6 @@ impl CheckSupervisor {
                 } else {
                     super::failure::classify(&error, CheckState::ExecutionError)
                 };
-                if let Some(discovery) = error.downcast_ref::<super::invocation::DiscoveryFailure>()
-                {
-                    discovery.record(&mut run.commands[index])?;
-                }
                 run.commands[index].error = Some(format!("{error:#}"));
             }
             run.commands[index].completed_at_ms = Some(now_ms());
@@ -1100,7 +1081,7 @@ impl CheckSupervisor {
                 let command = &run.commands[index];
                 if command.state == CheckState::Passed
                     && let Some(evidence) = &command.evidence
-                    && !evidence.covers(command, run, command, &checkpoint)?
+                    && !evidence.covers(run, command, &checkpoint)?
                 {
                     run.commands[index].state = CheckState::Stale;
                     run.commands[index].error = Some("Later source changes superseded this check's evidence. Verify current inputs again.".into());
@@ -1184,53 +1165,12 @@ impl CheckSupervisor {
             directory.starts_with(self.workspace.canonicalize()?),
             "check directory escapes the project"
         );
-        let native = context.invocation.as_ref();
-        if let Some(invocation) = native {
-            for (path, expected) in &invocation.inputs {
-                let actual =
-                    std::fs::read(self.workspace.join(super::config::relative_path(path)?))?;
-                if &crate::plan::digest(&actual) != expected {
-                    return Err(super::failure::CheckFailure::classified(
-                        CheckState::Stale,
-                        anyhow::anyhow!(
-                            "Package configuration changed after check resolution: {path}. Refresh and rerun checks."
-                        ),
-                    ));
-                }
-            }
-        }
-        if let Some(invocation) = native
-            && let Some(discovery) = &invocation.discovery
-        {
-            let output = super::invocation::capture(
-                &invocation.program,
-                discovery,
-                &directory,
-                Some(&cancelled.requested),
-                external_cancelled.map(AsRef::as_ref),
-                120,
-            )
-            .await?;
-            let output = String::from_utf8(output).context("Cargo test inventory is not UTF-8")?;
-            let names: std::collections::BTreeSet<_> = output
-                .lines()
-                .filter_map(|line| line.strip_suffix(": test"))
-                .collect();
-            for case in &invocation.cases {
-                if !names.contains(case.name.as_str()) {
-                    return Err(super::failure::CheckFailure::classified(
-                        CheckState::ConfigurationError,
-                        anyhow::anyhow!(
-                            "Declared test was not discovered in the selected Cargo target: {}",
-                            case.name
-                        ),
-                    ));
-                }
-            }
-            run.commands[index].context.as_mut().unwrap().resolved = Some(CheckSelection::Cases {
-                cases: invocation.cases.clone(),
-            });
-        }
+        let direct = context.invocation.as_ref().filter(|_| {
+            context
+                .operation
+                .as_ref()
+                .is_some_and(|operation| operation.args.is_some())
+        });
         let input = super::supervisor::operation(
             run.context
                 .as_ref()
@@ -1244,14 +1184,13 @@ impl CheckSupervisor {
             &context.selection,
         )
         .is_some_and(|operation| operation.input);
-        let scoped =
-            input || (native.is_none() && !matches!(context.selection, CheckSelection::All));
+        let scoped = input;
         let source = if scoped && run.shell == crate::session::CheckShell::Nushell {
             format!("$in | {}", run.commands[index].command)
         } else {
             run.commands[index].command.clone()
         };
-        let mut command = if let Some(invocation) = native {
+        let mut command = if let Some(invocation) = direct {
             let mut command = crate::process::command(&invocation.program, &invocation.args);
             command.stdin(if scoped {
                 std::process::Stdio::piped()
@@ -1285,9 +1224,16 @@ impl CheckSupervisor {
         } else {
             None
         };
-        let request = serde_json::to_vec(
-            &serde_json::json!({"version":1,"check_id":context.definition_id,"workspace":self.workspace,"selection":context.selection,"receipt_path":context.receipt}),
-        )?;
+        let request = serde_json::to_vec(&serde_json::json!({
+            "version":1,
+            "check_id":context.definition_id,
+            "workspace":self.workspace,
+            "inputs":context.invocation.as_ref().map(|invocation| &invocation.inputs),
+            "selection":context.selection,
+            "changed_files":context.matched_files,
+            "receipt_path":context.receipt,
+            "report_path":context.receipt.with_extension("report.json")
+        }))?;
         let input_delivery = async move {
             if let Some(mut input) = input {
                 input.write_all(&request).await?;
@@ -1366,17 +1312,6 @@ impl CheckSupervisor {
         stdout_file.flush().await?;
         stderr_file.flush().await?;
         let status = status.context("check process status missing")?;
-        if let Some(invocation) = native && !invocation.cases.is_empty() && !killed && status.success() {
-            let output = std::fs::read(&run.commands[index].stdout)?;
-            let output = strip_ansi_escapes::strip(&output);
-            let output = String::from_utf8_lossy(&output);
-            for case in &invocation.cases {
-                if !output.lines().any(|line| line.trim() == format!("test {} ... ok", case.name)) {
-                    return Err(super::failure::CheckFailure::classified(CheckState::ConfigurationError,
-                        anyhow::anyhow!("Declared test did not execute successfully: {}. Zero matches, ignored tests, and nonstandard output cannot prove coverage.", case.name)));
-                }
-            }
-        }
         run.commands[index].exit_code = status.code();
         run.commands[index].state = if killed {
             CheckState::Interrupted
@@ -1385,7 +1320,7 @@ impl CheckSupervisor {
         } else {
             CheckState::Failed
         };
-        if scoped && !killed {
+        if scoped && !killed && status.success() {
             let receipt = (|| -> Result<CheckReceipt> {
                 let source = std::fs::read(&context.receipt)
                     .context("scoped check did not produce a selection receipt; fix its definition")?;
@@ -1394,10 +1329,26 @@ impl CheckSupervisor {
                 Ok(receipt)
             })().map_err(|error| super::failure::CheckFailure::classified(CheckState::ConfigurationError, error))?;
             run.commands[index].context.as_mut().unwrap().resolved = Some(receipt.selection);
+        } else if !scoped && !killed && status.success() {
+            run.commands[index].context.as_mut().unwrap().resolved = Some(context.selection.clone());
         }
         let command = run.commands[index].clone();
         run.commands[index].report = tokio::task::spawn_blocking(move || super::report::collect(&command))
             .await.context("collect check result report")?;
+        if let Some(report) = &run.commands[index].report {
+            if let Some(error) = &report.error {
+                return Err(super::failure::CheckFailure::classified(
+                    CheckState::ConfigurationError, anyhow::anyhow!("{error}")
+                ));
+            }
+            if run.commands[index].state == CheckState::Passed
+                && report.result.iter().any(|result| !matches!(result.state, CheckState::Passed | CheckState::Skipped))
+            {
+                return Err(super::failure::CheckFailure::classified(
+                    CheckState::Failed, anyhow::anyhow!("callback reported a failed result")
+                ));
+            }
+        }
         Ok(())
         }.await;
         if result.is_err() {
@@ -1570,9 +1521,8 @@ pub(super) fn operation<'definition>(
 ) -> Option<&'definition super::CheckOperation> {
     match selection {
         CheckSelection::All => Some(&definition.all),
+        CheckSelection::Inputs { .. } => Some(&definition.all),
         CheckSelection::Files { .. } => definition.files.as_ref(),
-        CheckSelection::Packages { .. } => definition.files.as_ref(),
-        CheckSelection::Tests { .. } => definition.cases.as_ref(),
         CheckSelection::Cases { .. } => definition.cases.as_ref(),
     }
 }

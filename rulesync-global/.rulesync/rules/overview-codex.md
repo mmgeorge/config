@@ -137,9 +137,16 @@ globs:
   affected checks.
 - Use unit tests with mocks to isolate module logic and integration tests with
   real modules to cover end-to-end boundaries.
-- Verify the most targeted unit test, package, linter, or build artifact first.
-  Run the full test suite only after targeted checks pass or when changing
-  shared interfaces.
+- Select the smallest sufficient test coverage: individual tests first, then
+  affected packages, and the full workspace only when necessary. Use supported
+  filters or selectors and batch related tests in one invocation.
+- Escalate to package coverage only when individual tests cannot cover the affected
+  behavior. Run the full workspace only when demonstrated cross-package impact
+  cannot be covered by selected tests or packages, or when the user explicitly
+  requests exhaustive testing. State the reason before broadening coverage.
+- Passing targeted tests does not justify a broader run by itself. Do not run
+  broad suites to discover test names or diagnose compilation failures. Keep
+  required build and lint checks separate from test-coverage selection.
 - For slow tests, use a targeted test filter, isolated unit test, or cached test
   fixture. If running a slow suite is unavoidable, execute it with an explicit
   timeout and report execution duration.

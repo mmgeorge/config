@@ -309,13 +309,13 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "checks_configure",
-                description: "Submit project checks and managed Nushell helpers when check editing is enabled. Every call reviews the exact changes before saving in Read and Write modes, regardless of saved approval rules. YOLO approves automatically. Setup questions are optional. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
+                description: "Submit project checks and managed helper files when check editing is enabled. Checks declare typed named action.inputs and either a fixed argv template or a command receiving JSON on stdin with input:true. Commands are opaque: Harness never infers a runner, category, package membership, or test discovery. Every call reviews the exact changes before saving in Read and Write modes, regardless of saved approval rules. YOLO approves automatically. Preserve unrelated settings and use the revision from checks_list. Does not execute commands or validate helper-language syntax.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))
                     .expect("check configuration schema is serializable"),
             },
             ControlToolDefinition {
                 name: "checks_run",
-                description: "Run a saved check by name. By default its trigger selects current changed files. Optionally supply exactly one of files, packages, tests, or all to override coverage. Package and test selectors require a configured package manager. Never accepts replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
+                description: "Run saved opaque commands by check name. Supply inputs as an object matching each check's declared action.inputs, for example inputs:{package:\"engine\",test:\"tests::example\"} when those names are declared. Input names have no built-in runner semantics. Exact {name} argv elements substitute declared scalar values or splice arrays of scalar values. input:true commands receive resolved inputs and changed-file context as JSON on stdin and own repository-specific selection and coverage validation. Omit inputs to use declared defaults/context sources. all:true explicitly selects full context and cannot be combined with inputs. Harness does not discover tests, inspect package managers, rewrite runner arguments, or parse runner stdout. Never accepts replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::CheckRunRequest))
                     .expect("check run schema is serializable"),
             },
@@ -813,7 +813,7 @@ mod test {
             ),
             (
                 "checks_run",
-                json!({"check":"unit","tests":["tests::example"]}),
+                json!({"check":"unit","inputs":{"package":"engine","test":"tests::example"}}),
             ),
             (
                 "checks_status",

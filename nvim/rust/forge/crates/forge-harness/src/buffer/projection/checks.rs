@@ -49,15 +49,6 @@ fn check_scope(check: &CommandCheck) -> (String, Option<String>) {
             name.or_else(|| Some(case.name.clone())),
         );
     }
-    if let Some(package) = invocation.and_then(|invocation| invocation.package.as_ref()) {
-        return (
-            package
-                .name
-                .clone()
-                .unwrap_or_else(|| package.directory.clone()),
-            name,
-        );
-    }
     if let Some(invocation) = invocation
         && invocation.files.len() == 1
     {
@@ -67,11 +58,6 @@ fn check_scope(check: &CommandCheck) -> (String, Option<String>) {
         && files.len() == 1
     {
         return (files[0].replace('\\', "/"), name);
-    }
-    if let CheckSelection::Packages { packages } = &context.selection
-        && packages.len() == 1
-    {
-        return (packages[0].clone(), name);
     }
     (context.name.clone(), name)
 }

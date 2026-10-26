@@ -106,21 +106,20 @@ local succeeded, failure = xpcall(function()
   vim.fn.mkdir(workspace .. "/.forge/checks", "p")
   vim.fn.writefile({ "def main [] {", "  let request = ($in | from json)", "  {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path", "}" }, workspace .. "/.forge/checks/receipt.nu")
   assert(vim.fn.filereadable(workspace .. "/.forge/checks/receipt.nu") == 1)
-  local validation = vim.system({ "nu", "--no-config-file", "--stdin", "-c", "nu-check ($in | str trim)" }, { text = true, cwd = workspace, stdin = workspace .. "/.forge/checks/receipt.nu" }):wait(10000)
-  assert(validation.code == 0 and validation.stdout:find("true", 1, true), validation.stderr)
   scoped.action.command = "nu --no-config-file --stdin .forge/checks/receipt.nu"
   scoped.action.input = true
+  scoped.action.inputs = { files = { type = "array", description = "Selected fixture paths", required = true } }
   save({ scoped })
   request("session.configure", { shell = "system" })
-  local scoped_id = request("checks.run", { check = "scoped", files = { "src/name $value.rs" } }).run_id
+  local scoped_id = request("checks.run", { check = "scoped", inputs = { files = { "src/name $value.rs" } } }).run_id
   assert(vim.wait(10000, function() return request("checks.status", { run_id = scoped_id }).state ~= "running" end, 20))
   local resolved = request("checks.status", { run_id = scoped_id })
   assert(resolved.state == "passed", table.concat(vim.fn.readfile(resolved.commands[1].output), "\n") .. "\n" .. vim.inspect(resolved))
-  assert(resolved.commands[1].context.resolved.files[1] == "src/name $value.rs", "system shell changed scoped selectors")
+  assert(resolved.commands[1].context.resolved.inputs.files[1] == "src/name $value.rs", "system shell changed declared inputs")
   request("session.configure", { shell = "nushell" })
   scoped.action.command = "print 'missing receipt'"
   save({ scoped })
-  local bad_id = request("checks.run", { check = "scoped", files = { "src/example.rs" } }).run_id
+  local bad_id = request("checks.run", { check = "scoped", inputs = { files = { "src/example.rs" } } }).run_id
   assert(vim.wait(10000, function() return request("checks.status", { run_id = bad_id }).state ~= "running" end, 20))
   assert(request("checks.status", { run_id = bad_id }).state == "configuration_error")
   assert(vim.wait(3000, function() return #errors > 0 end, 10), "configuration errors must notify the user")

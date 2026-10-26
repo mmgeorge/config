@@ -262,7 +262,7 @@ Rendering and validation traverse nested branches iteratively without flow-count
 or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, and `┄▶`
 for effects. Branch rails retain their conditions and nesting. Text exports
 retain fences while PlanReview renders the same diagram rows as native buffer text.
-Section reads, review, and revision diffs use the same canonical projection. Plan schema 14
+Section reads, review, and revision diffs use the same canonical projection. Plan schema 15
 stores named trigger/action check snapshots and excludes older persisted plan formats.
 Retired step input lists are discarded when loading saved flows and are absent from the schema,
 serialized steps, and diagrams. Other unknown step fields remain errors.
@@ -563,26 +563,23 @@ named `test` definitions. No language detector generates commands. An absent che
 blocks plan submission. An explicitly empty checks object is valid. Each named check contains
 its automatic `trigger` and executable `action`.
 
-Check history version 4 stores the same named check snapshots. The supervisor checks the
+Check history version 5 stores named checks with their declared and resolved inputs. The supervisor checks the
 record envelope version before decoding its run. Older records remain on disk but are excluded
 from reopening, previews, and forks. Invalid current records report their file path and decoding
-error. Plan schema 14 applies the corresponding boundary to saved plan check snapshots.
+error. Plan schema 15 applies the corresponding boundary to saved plan check snapshots.
 
-Each definition owns its identity, name, area, trigger, enabled default, scope, directory, commands,
-and prerequisite identities. Every definition implements `all`; `files` and `cases` are
-optional contracts. Shell-based scoped handlers receive versioned JSON on stdin and write
-the actual resolved selection to a Harness-provided receipt path. Unsupported scopes, empty results
-for nonempty requests, malformed receipts, and missing receipts are configuration errors.
-Harness notifies the user and never silently broadens a selection. Managed Nushell helpers
-live under `.forge/checks/`, and setup validates their syntax without running the checks.
+Each definition owns its identity, trigger, explicit category, directory, opaque command,
+typed named inputs, and prerequisites. Callbacks receive resolved inputs and generic change
+context as JSON on stdin. Successful callbacks write a matching selection receipt, and can
+publish a generic result report separately from stdout. Missing or malformed receipts fail.
+Managed helper files live under `.forge/checks/`. Setup validates paths and captured identities,
+not language syntax, and never starts helper-specific validation commands.
 
-Direct operations retain an executable and argument vector. `checks::invocation::InvocationResolver`
-discovers Cargo, npm, or pnpm workspace members and expands file/package bindings before
-authorization and execution. Identical invocations within a definition share one run and retain
-all contributing files. Workspace-wide inputs require explicit full-workspace definitions.
-Nested excluded packages cannot become accidental members of their parent package. Native
-invocations retain manifest fingerprints and reject changed configuration before execution.
-Every expanded prerequisite must pass before a dependent definition runs.
+Direct operations retain an executable and argument vector. `checks::invocation::resolve` substitutes
+declared values into complete argv elements without executing anything. It has no package
+manager or test-runner branches. A definition produces one command. Repository callbacks own
+any package lookup, test filtering, batching, or runner-specific output interpretation.
+Prerequisites must pass before dependent definitions run.
 
 `enabled` permits execution and `auto` controls trigger-driven selection. Omitted
 `auto` defaults to true. The plan's `checks` list explicitly selects enabled
@@ -601,10 +598,9 @@ patch lifecycle. Both previews and execution include required prerequisites.
 
 `CheckEvidence` retains the source checkpoint and execution contract certified by
 an attempt. Automatic gates reuse current evidence within the owning task,
-including evidence from explicit tool runs. Package ownership bounds reuse to
-that package and its metadata. Helpers without declared input boundaries use the
-whole workspace. Partial selections cannot satisfy wider coverage, and changed
-inputs or execution configuration invalidate reuse. Explicit runs always execute.
+including evidence from explicit tool runs. Reuse requires identical context and resolved
+inputs, the same execution contract and helper content, and an unchanged workspace.
+No package ownership is inferred for evidence. Explicit runs always execute.
 
 Ordinary completion and successful goal completion enter the Rust-owned automatic
 gate. Intermediate goal turns, waiting questions, approvals, cancellation, and
@@ -613,16 +609,14 @@ saved failures to a repair exchange retaining the original check owner.
 `AutomaticChecks` persists pending validation and failure delivery. Repeated
 failures without changed inputs stop repair with unresolved diagnostics.
 
-`CheckPreview` uses the same resolver for the check catalog and submitted-plan review. A preview
-is a proposal, not execution evidence. Plans changing package metadata retain pending validation
-instead of resolving against stale manifests. Direct Cargo case operations validate the exact
-case against the selected target's discovered inventory and require execution evidence, including
-rejecting ignored cases and successful commands that ran zero matching tests. Other runners keep
-the scoped-helper receipt contract. Argument vectors never pass through shell interpolation.
+`CheckPreview` resolves the same typed inputs as execution without running subprocesses.
+A missing required value remains an unresolved preview. Runner-specific coverage guarantees,
+including rejecting zero matching tests, belong in configured callbacks. Plain commands use
+their exit status. Argument values never pass through shell interpolation.
 
 Changed-case defaults consume an accepted plan's added/modified case inventory. `new_cases`
-consumes only new entries. Optional case target identities disambiguate Cargo libraries, binaries,
-and integration targets without inferring test impact from production source files. An explicitly
+consumes only new entries. Case executable identities are opaque data for callbacks,
+not instructions for Harness to construct a runner command. An explicitly
 empty inventory can select no cases. Standalone runs have no such inventory and report a
 configuration error when an applicable case-scoped check cannot resolve coverage. Explicit
 empty file or case selections also fail configuration. File mappings and explicit nonempty
@@ -646,7 +640,7 @@ changes rather than an empty change set. Its automatic triggers require verifica
 full-scope checks running normally and unresolved file or case scopes blocking completion.
 The runner never infers a complete change set from declaration files alone or silently broadens
 scoped coverage. Explicit IDs or the separate run-all action bypass triggers.
-Package-manager and case-runner extensions follow
+Repository callback implementations follow
 [Extending project checks](../extending-project-checks.md), with targeted verification in
 [Building and testing](../building-and-testing.md#verify-project-checks).
 Nushell receives `--stdin` before `-c` when scoped selectors are piped into a check. Shell

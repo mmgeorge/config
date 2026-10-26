@@ -334,7 +334,7 @@ and restores the clarification text for retry.
 Request configuration changes in chat after enabling editing. The `harness-checks`
 skill supplies setup guidance. Bare `/checks setup` is not a command.
 The Harness winbar shows enabled editing. See [Project checks](checks.md) for
-publication approval, package-aware commands, and new-test selection.
+publication approval, declared inputs, and repository callbacks.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method

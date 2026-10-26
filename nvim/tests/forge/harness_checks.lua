@@ -167,6 +167,7 @@ picker.close(false)
 for _, malformed in ipairs({
   { unit = { trigger = {} } },
   { unit = { action = { command = {} } } },
+  { unit = { action = { command = "exit 0", inputs = "invalid" } } },
   { unit = { action = { command = "exit 0", after = { "missing" } } } },
 }) do
   catalog.snapshot.config = malformed

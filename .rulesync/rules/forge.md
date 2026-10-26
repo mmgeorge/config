@@ -67,12 +67,12 @@ selected source preparation and its prerequisites before unrelated verification.
 Explicit dependencies take precedence. Reserve dependencies for checks that
 require a successful prerequisite, not merely to reproduce category ordering.
 Do not make formatters or unit tests depend on the final executable build.
-For focused Rust repairs, use `forge-rust-tests` with an exact, fully qualified
-test name and target. Its file selection runs the whole affected package and is
-not a single-test request. The shared Cargo executor already supports exact tests.
-Run one targeted test until compilation succeeds, then select additional relevant
-tests. Apply the repository's high bar for package-wide or project-wide suites.
-Do not use a broad suite to diagnose compilation or discover relevant tests.
+Rust coverage uses `forge-rust-tests` for individual tests or affected packages
+and `forge-rust-workspace-tests` for workspace coverage. The global testing policy
+governs coverage selection. After the generic-input host cutover, use declared
+`inputs` such as `{"package":"forge-harness","test":"checks::tests::case"}`.
+The host never discovers tests or rewrites Cargo commands. Repository callbacks
+own runner arguments, file ownership, and exact-case coverage validation.
 Package formatting uses `forge-rust-format-fix`, while shared configuration uses
 `forge-rust-workspace-format-fix`. Supply explicit formatter files when there are
 no task-relative Rust changes. Category ordering does not select additional checks.
@@ -558,16 +558,18 @@ Run the Rust broker suite:
 cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked --workspace
 ```
 
-Run the opt-in real Codex integration only in its temporary Git repository:
+Live-provider tests are isolated in `tests/live_provider.rs` and ignored by default
+because they require local credentials or external services. Run a specific case
+only after authorizing its external requests:
 
 ```text
-cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked -p forge-harness --test codex_cli -- --ignored --nocapture
+cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --profile dev --locked -p forge-harness --test live_provider codex_cli::lists_backend_owned_codex_model_metadata -- --ignored --exact --nocapture
 ```
 
-Run the opt-in real ACP prompt integration through Copilot CLI:
+The same target owns the real Copilot cases:
 
 ```text
-cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked -p forge-harness --test copilot_real -- --ignored --nocapture
+cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --profile dev --locked -p forge-harness --test live_provider copilot_real::streams_one_native_copilot_sdk_turn_through_the_broker -- --ignored --exact --nocapture
 ```
 
 After automated verification, use Terminal MCP at 160x48 and 100x30 to inspect

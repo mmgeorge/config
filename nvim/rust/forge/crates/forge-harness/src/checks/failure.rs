@@ -37,9 +37,7 @@ impl std::fmt::Display for CheckFailure {
 impl std::error::Error for CheckFailure {}
 
 pub(super) fn classify(error: &anyhow::Error, fallback: CheckState) -> CheckState {
-    if error.is::<super::invocation::DiscoveryFailure>() {
-        CheckState::Failed
-    } else if let Some(failure) = error.downcast_ref::<CheckFailure>() {
+    if let Some(failure) = error.downcast_ref::<CheckFailure>() {
         failure.state
     } else if error.is::<std::io::Error>() {
         CheckState::ExecutionError

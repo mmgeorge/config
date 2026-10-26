@@ -12197,7 +12197,7 @@ mod test {
                     all: crate::checks::CheckOperation {
                         input: false,
                         args: None,
-                        package_manager: None,
+                        inputs: None,
                         command,
                     },
                     files: None,

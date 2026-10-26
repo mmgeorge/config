@@ -13,7 +13,7 @@ documents for the work at hand. Do not read every subsystem chapter for a local 
 | Task | Procedure | Architecture |
 | --- | --- | --- |
 | Add language support | [Adding a language](adding-language.md) | [Languages](architecture/languages.md), [Planning](architecture/planning.md) |
-| Extend package discovery or project checks | [Extending project checks](extending-project-checks.md) | [Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate), [Languages](architecture/languages.md) |
+| Configure check inputs or repository callbacks | [Extending project checks](extending-project-checks.md) | [Planning](architecture/planning.md#project-checks-and-the-harness-checking-gate), [Languages](architecture/languages.md) |
 | Update a parser or query | [Updating Tree-sitter](updating-tree-sitter.md) | [Languages](architecture/languages.md), [Buffers and rendering](architecture/buffers-and-rendering.md) |
 | Build or verify a change | [Building and testing](building-and-testing.md) | [Host and protocol](architecture/host-and-protocol.md) |
 | Change generated buffers, folds, or editing | [Building and testing](building-and-testing.md) | [Buffers and rendering](architecture/buffers-and-rendering.md) |
@@ -25,7 +25,7 @@ documents for the work at hand. Do not read every subsystem chapter for a local 
 | Change GitHub synchronization or review editing | [Building and testing](building-and-testing.md) | [GitHub and review](architecture/github-and-review.md) |
 
 User-facing commands are documented separately in [Forge commands](../../docs/forge/commands.md)
-and package-aware configuration in [Project checks](../../docs/forge/checks.md).
+and typed check configuration in [Project checks](../../docs/forge/checks.md).
 Read [Agent LSP tools](../../docs/forge/lsp-tools.md) for semantic query operations
 and the independent `/config` toggle.
 

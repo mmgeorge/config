@@ -5,9 +5,9 @@ mod changes;
 mod config;
 mod evidence;
 mod failure;
+mod inputs;
 mod invocation;
 mod model;
-mod packages;
 mod preview;
 mod publication;
 mod queue;
@@ -28,8 +28,8 @@ pub use config::{
     CheckCategory, CheckConfig, CheckDefinition, CheckOperation, CheckPurpose, CheckScope,
     ConfigSnapshot,
 };
+pub use inputs::{CheckInput, CheckInputMap, CheckInputSource, CheckInputType, CheckInputValues};
 pub use model::{CheckEvent, CheckEventKind, CheckRun, CheckSetupState, CheckState, CommandCheck};
-pub use packages::PackageManager;
 pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;
 pub use queue::CheckTiming;

@@ -41,8 +41,8 @@ leaves explicit check runs and plan Checking available.
 While a check run is active, the status area shows executing checks and their latest
 nonempty output line. The line updates as output arrives, and complete logs remain
 available in the saved result.
-For an exact test run, the check label includes the fully qualified test name,
-including while its executable is compiling. Other queued tests are not shown as running.
+For planned-case context, the check label includes the selected test name.
+Explicit inputs appear in the frozen invocation and expanded details.
 Single-file checks show the selected path alongside the configured check name in
 live progress and completed history.
 Check status and history omit requester labels and show execution progress and results.
@@ -50,8 +50,8 @@ The completion counter includes only selected checks and their required prerequi
 Unselected catalog entries do not count as finished work or increase the total.
 Selected checks that finish with a skip, failure, or configuration error still count
 toward progress.
-A check expanded across several packages counts once and finishes when all its
-commands have settled.
+A callback can run several packages, but Harness records its configured invocation
+once and waits for that process to settle.
 Submitting a new message during checks stops the previous execution and collects
 its running checks before starting the message. The composer retains newer drafts
 while that interruption finishes.
@@ -59,9 +59,9 @@ Completed runs retain the full details. Result summaries omit not-run counts whi
 preserving passed, failed, interrupted, stale, and other error counts.
 
 The transcript groups completed results under **Checks**, then by category and
-source file or package/application target. Repeated executions appear as separate
-Run rows in their original order. Named Rust tests retain their test names. Lua
-runner results describe whole test files, not individual assertions. The Checks
+source file or configured definition. Repeated executions appear as separate
+Run rows in their original order. Repository callbacks can report individual
+files through the generic result protocol. The Checks
 summary counts command executions even when one command reports several files.
 Expand an execution to inspect its diagnostics. Its output action opens the full
 command log. Invalid file reports keep the command result and show the report error.
@@ -96,10 +96,10 @@ Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
 without changing repository settings or executing commands. Repeated IDs do not
 create repeated plan entries, and adding only already-selected checks leaves the
 plan version unchanged. The tool is available during plan authoring and Resolve.
-`checks_run` accepts `check` as a name or a list of names. Omit coverage overrides
-to use each check's trigger and current changes. Supply exactly one of `files`,
-`packages`, `tests`, or `all: true` to override coverage. Explicit runs execute
-even when earlier evidence remains current.
+`checks_run` accepts `check` as a name or a list of names. Supply `inputs` as an
+object matching each check's declared input contract, or omit it to use defaults
+and automatic context bindings. `all: true` requests full context and cannot be
+combined with `inputs`. Explicit runs execute even when earlier evidence remains current.
 Configured checks run without executable approval prompts, whether started by an
 agent, the checks picker, or an automatic gate. Agents select saved check IDs and
 coverage rather than supplying commands. Editing check definitions still requires
@@ -161,9 +161,9 @@ does. Questions, pending approvals, cancellation, and paused work do not start
 automatic checks.
 
 Harness retains the inputs and coverage of completed runs. A current recorded
-result is reused instead of executing the same check again. Package A's result
-does not satisfy package B, and partial selections do not satisfy wider coverage.
-Relevant edits, changed commands, or changed configuration require new evidence.
+result is reused instead of executing the same check again. Different input maps
+and selections require different evidence. Any workspace edit, changed command,
+or changed configuration requires new evidence.
 
 A check run attaches to the exchange whose work it validates. Its saved results
 remain with that exchange on reload. A failed result starts a repair turn within
@@ -183,8 +183,8 @@ automatic checking verifies the current inputs again without asking the model
 to repair a successful command. Later preparation also invalidates earlier
 verification when it changes those inputs.
 
-Compiler failures during test discovery remain failed checks with their full
-compiler output. Invalid definitions and selectors remain configuration errors.
+Nonzero command exits remain failed checks with their complete output.
+Invalid definitions and input values remain configuration errors.
 Unavailable executables block execution, and storage or internal failures appear
 as execution errors. Explicit cancellation suppresses automatic retries of
 unchanged inputs with `Stopped`. An explicit run or relevant source changes
@@ -200,49 +200,62 @@ separate scope, or `all`/`files`/`cases` command templates are required.
   "checks": {
     "rust-tests": {
       "trigger": {
-        "auto": true,
+        "auto": false,
         "paths": ["rust/**/*.rs"],
         "exclude": ["rust/**/target/**"]
       },
       "action": {
         "directory": "rust",
-        "package_manager": "cargo",
-        "command": ["cargo", "test", "--package", "{package}", "--tests"]
+        "category": "test",
+        "command": ["cargo", "test", "--package", "{package}", "--lib", "--", "{test}", "--exact"],
+        "inputs": {
+          "package": {"type": "string", "description": "Package name", "required": true},
+          "test": {"type": "string", "description": "Exact test name", "required": true}
+        }
       }
     },
     "web-tests": {
       "trigger": {"paths": ["web/**/*.ts"]},
       "action": {
         "directory": "web",
-        "package_manager": "npm",
-        "command": ["npm", "test", "--workspace={package}"]
+        "category": "test",
+        "command": ["npm", "test", "--workspace", "{package}"],
+        "inputs": {
+          "package": {"type": "string", "description": "Workspace package", "required": true}
+        }
       }
     }
   }
 }
 ```
 
-`{path}` runs the action for each selected file. `{package}` runs it once per
-owning package. Repeated files and packages are deduplicated. Without either
-placeholder, the action runs once. Substitutions remain individual process
-arguments rather than executable shell text. A command string is available for
-commands that deliberately require the configured shell.
+Each action runs once. An argv element equal to `{name}` substitutes a declared
+scalar input or expands an array into separate scalar arguments. Embedded text
+such as `prefix-{name}` is literal. Object inputs are available to callbacks,
+not argv templates. Input names have no reserved language or runner meaning.
+The executable remains fixed, and input values never become interpolated shell
+source. Shell-string actions with declared inputs must use `input: true`.
 
-`action.package_manager` is required for package substitution or package
-selection. Supported managers are Cargo, npm, and pnpm. Each check discovers
-membership within its own action directory, so different package managers and
-nested workspaces can coexist. Unknown managers, missing package context, unknown
-package names, and ambiguous names are errors. Workspace-wide manifests and
-lockfiles need a separate workspace action.
+Input declarations require `type` and `description`. Supported types are `string`,
+`integer`, `number`, `boolean`, `array`, and `object`. `required` defaults to false.
+Optional `default` values must match the declared type. Optional `source` binds
+automatic context through `changed_files`, `planned_cases`, or `workspace`.
+Explicit values override context bindings and defaults. Missing required inputs,
+unknown names, and incompatible types fail before starting the command.
+
+Harness treats every command as opaque. It does not recognize package managers,
+discover tests, infer arguments, or interpret runner stdout. Repository callbacks
+own file-to-package mapping, executable selection, and zero-match detection.
 
 Triggers use repository-relative paths. The action directory is also relative
-to the repository. File substitutions resolve correctly from that directory.
+to the repository. Substitution preserves input values unchanged. The configured
+command or callback resolves repository-relative paths from its working directory.
 An omitted `trigger.auto` is false. An omitted path list imposes no path filter.
 
 Optional action fields are `label` for display, `category` for custom command
-ordering, `prepare` for source mutation, and `after` for prerequisites. Standard
-Cargo commands infer their category. `input: true` sends a selection request to
-stdin for a custom helper, which must return a matching selection receipt.
+ordering, `prepare` for source mutation, and `after` for prerequisites. The default
+category is `check` for every executable. `input: true` sends a JSON request to
+stdin for a callback, which must return a matching selection receipt on success.
 
 ## Explicit coverage
 
@@ -252,27 +265,37 @@ A check name alone uses current changes:
 {"check": "rust-tests"}
 ```
 
-Exactly one override can replace that selection:
+Named values can be supplied together according to the check's declaration:
 
 ```json
-{"check": "rust-tests", "files": ["rust/src/lib.rs"]}
-{"check": "rust-tests", "packages": ["engine"]}
-{"check": "rust-tests", "tests": ["tests::updates_scene"]}
+{"check": "rust-tests", "inputs": {"package": "engine", "test": "tests::updates_scene"}}
 {"check": "rust-tests", "all": true}
 ```
 
-Cargo test actions derive the package, executable target, exact filter, and
-inventory command internally. Missing or ambiguous test names fail before
-execution. A passing exit with zero matching tests or an ignored test does not
-prove coverage. The configured toolchain, profile, features, and other build
-flags remain in effect. npm and pnpm package checks run their configured command.
-Named individual tests currently require Cargo's standard test harness.
+The example template still needs its required values when `all` is selected.
+Full coverage is not an alternative command synthesized by Harness. Use a
+callback or a separate configured action when full and targeted commands differ.
+
+## Callback request and result
+
+Callbacks receive `version: 1`, `check_id`, `workspace`, resolved `inputs`,
+`changed_files`, `selection`, `receipt_path`, and `report_path` on stdin.
+`selection` records full, changed-file, planned-case, or explicit-input context.
+On success, write `{"version":1,"selection":<request.selection>}` to `receipt_path`.
+Helpers may narrow changed-file coverage to planned cases under the existing
+receipt contract, but cannot claim broader coverage or change explicit inputs.
+
+An optional generic report at `report_path` has `version: 1` and a `result` array.
+Each result contains `file` (repository-relative), terminal `state`, optional
+`duration_ms`, `command`, and complete `output`. Harness reads this explicit report,
+not stdout. Malformed reports fail, and a callback cannot report failures while
+claiming an overall successful result. Ordinary command output remains preserved.
 
 ## Preview and execution
 
 Plan review and `/checks` show resolved commands and why they were selected.
-Plans that change package manifests show pending validation until their metadata
-exists on disk. Editing selection inputs invalidates an earlier plan preview.
+Missing required inputs show unresolved previews. Previewing never starts the
+configured command or a discovery subprocess. Editing inputs invalidates a prior preview.
 Previews never count as execution evidence.
 
 Agents can call `checks_status` with `wait_for_completion: true` to wait through
@@ -281,10 +304,10 @@ optional `wait_ms` shortens that deadline, and a run still in progress at the
 deadline returns its current state. Omitting this option preserves immediate
 status reads or waits for the next update.
 
-Execution checks the captured manifests again. A changed manifest requires a new
-resolution. A dependent check runs only after every expanded prerequisite passes.
-History records each concrete command, its output, and its selected package or
-cases. Interruption retains completed output and stops owned processes.
+Evidence includes the definition, resolved input values, context, helper content,
+and workspace snapshot. Different inputs cannot reuse each other's evidence.
+A dependent check runs only after its prerequisites pass. History records the
+concrete command and complete output. Interruption stops owned processes.
 
 Running checks appear below the main status, alongside ongoing work. The status area
 shows the current check names, completion count, and elapsed time. It does not replace

@@ -78,14 +78,12 @@ test target. It shows passed results over the total and the largest attempt coun
 those identities. Earlier failures remain in Run rows but do not count as current failures
 after a successful retry. The root duration retains the time spent across all attempts.
 
-The check supervisor validates the Lua runner's existing JSON-line fixture report
-after collecting the process and preserves file outcomes, durations, commands, and
-diagnostics separately from the complete raw logs. It derives missing reports from
-retained current-format logs when reading saved history. Malformed or incomplete
-reports remain visible as report diagnostics and fall back to the command result.
-The transcript consumes these structured outcomes without parsing logs during
-rendering. Expanding a file execution shows its captured diagnostics. Opening its
-output action retains access to the original command log.
+The check supervisor reads an optional generic JSON report at the explicit path
+provided to callbacks. Repository adapters translate runner-specific formats into
+that report. Harness does not detect command names or parse runner stdout.
+Malformed reports fail explicitly, while complete raw logs remain available.
+The transcript consumes reported file outcomes, durations, commands, and diagnostics
+without parsing logs during rendering.
 
 Timeline ownership has no event-count or history-length limit. Recursive agent
 rendering grows stack segments instead of rejecting a fixed nesting depth, and

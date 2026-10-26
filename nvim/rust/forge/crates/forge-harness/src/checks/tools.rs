@@ -14,7 +14,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
-use tokio::io::AsyncWriteExt;
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -377,11 +376,8 @@ impl ConfigureChecks {
         for helper in &self.helpers {
             let relative = super::config::relative_path(&helper.path)?;
             ensure!(
-                helper.path.starts_with(".forge/checks/")
-                    && relative
-                        .extension()
-                        .is_some_and(|extension| extension == "nu"),
-                "helpers must be Nushell files under .forge/checks/"
+                helper.path.starts_with(".forge/checks/") && relative.file_name().is_some(),
+                "helpers must be files under .forge/checks/"
             );
             let destination = workspace.join(relative);
             super::config::reject_links(workspace, &destination)?;
@@ -487,16 +483,8 @@ impl CheckSupervisor {
             }
             if let Some(files) = self.changes.files()? {
                 catalog["preview"] = serde_json::to_value(
-                    super::preview::resolve(
-                        &self.workspace,
-                        &config,
-                        &files,
-                        None,
-                        None,
-                        false,
-                        &[],
-                    )
-                    .await?,
+                    super::preview::resolve(&self.workspace, &config, &files, None, None, &[])
+                        .await?,
                 )?;
                 if let Some(checkpoint) = self.changes.snapshot().await? {
                     let run = self
@@ -703,7 +691,7 @@ impl CheckSupervisor {
         self.set_overrides(task_id, Default::default())
     }
 
-    /// Validates setup captures and helper syntax before saving settings without running checks.
+    /// Validates captured identities before saving settings and opaque helper sources.
     pub(crate) async fn configure(
         &self,
         owner: crate::timeline::TimelineOwner,
@@ -765,47 +753,6 @@ impl CheckSupervisor {
                 "helper changed since setup began: {}",
                 helper.path
             );
-            let temporary = self
-                .root
-                .join(format!("validate-{}.nu", uuid::Uuid::new_v4()));
-            std::fs::write(&temporary, &helper.source)?;
-            let result = tokio::process::Command::new("nu")
-                .kill_on_drop(true)
-                .args([
-                    "--no-config-file",
-                    "--no-history",
-                    "--stdin",
-                    "-c",
-                    "let script = ($in | str trim); if not (nu-check $script) { exit 1 }",
-                ])
-                .stdin(std::process::Stdio::piped())
-                .stdout(std::process::Stdio::piped())
-                .stderr(std::process::Stdio::piped())
-                .spawn();
-            let validation = async {
-                let mut child = result.context("start Nushell helper validation")?;
-                child
-                    .stdin
-                    .take()
-                    .context("helper validator stdin unavailable")?
-                    .write_all(temporary.to_string_lossy().as_bytes())
-                    .await?;
-                let output = tokio::time::timeout(
-                    std::time::Duration::from_secs(30),
-                    child.wait_with_output(),
-                )
-                .await
-                .context("helper validation timed out")??;
-                ensure!(
-                    output.status.success(),
-                    "helper syntax validation failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
-                Ok::<_, anyhow::Error>(())
-            }
-            .await;
-            std::fs::remove_file(temporary)?;
-            validation?;
             helpers.push((destination, previous, helper.source.as_bytes().to_vec()));
         }
         let mut document = original.clone();

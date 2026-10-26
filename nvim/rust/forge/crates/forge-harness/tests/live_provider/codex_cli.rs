@@ -45,6 +45,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
 }
 
 #[tokio::test]
+#[ignore = "requires an installed and authenticated Codex CLI"]
 async fn lists_backend_owned_codex_model_metadata() {
     let repository = tempfile::tempdir().unwrap();
     let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
@@ -69,6 +70,7 @@ async fn lists_backend_owned_codex_model_metadata() {
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated Codex and configured skills and MCP servers"]
 async fn lists_provider_skills_and_complete_mcp_rows() {
     let repository = tempfile::tempdir().unwrap();
     let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
@@ -128,6 +130,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated Codex and performs real planning, editing, and fork requests"]
 async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
@@ -337,6 +340,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated Codex with subagents and performs real model requests"]
 async fn streams_structured_child_agent_lifecycle() {
     let repository = tempfile::tempdir().unwrap();
     git(repository.path(), &["init", "-q"]);
@@ -438,6 +442,7 @@ async fn streams_structured_child_agent_lifecycle() {
 }
 
 #[tokio::test]
+#[ignore = "requires authenticated Codex and the configured local-code-explorer profile"]
 async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     let repository = tempfile::tempdir().unwrap();
     let data_root = tempfile::tempdir().unwrap();
