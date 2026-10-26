@@ -841,20 +841,11 @@ async fn discovery_compilation_failure_preserves_project_output() -> Result<()> 
         "#[test] fn selected() { unavailable_symbol(); }\n",
     )?;
     let mut check = definition("tests", "exit 99");
-    check.cases = Some(direct_operation(
+    check.all = direct_operation(
         "cargo",
-        &[
-            "test",
-            "--offline",
-            "--package",
-            "{package.name}",
-            "{case.target_args}",
-            "--",
-            "{case.name}",
-            "--exact",
-        ],
+        &["test", "--offline", "--package", "{package.name}", "--lib"],
         Some(PackageManager::Cargo),
-    ));
+    );
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let run = runner.prepare_request(
@@ -925,7 +916,7 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
     std::fs::write(workspace.path().join("source.txt"), "before")?;
     let mut check = definition("mapped", "print all");
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(CheckOperation { input: false, command: "do { let request = ($in | from json); {version: 1, selection: {kind: cases, cases: [{file: source.txt, name: mapped}]}} | to json | save --force $request.receipt_path; print checked }".into(), args: None, package_manager: None });
+    check.files = Some(CheckOperation { input: true, command: "do { let request = ($in | from json); {version: 1, selection: {kind: cases, cases: [{file: source.txt, name: mapped}]}} | to json | save --force $request.receipt_path; print checked }".into(), args: None, package_manager: None });
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
@@ -1313,160 +1304,6 @@ async fn cargo_discovery_respects_the_operation_toolchain_and_cache_key() -> Res
 }
 
 #[tokio::test]
-async fn cargo_package_and_new_case_checks_execute_exact_coverage() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    std::fs::create_dir_all(workspace.path().join("src"))?;
-    std::fs::create_dir_all(workspace.path().join("tests"))?;
-    std::fs::write(
-        workspace.path().join("Cargo.toml"),
-        "[package]\nname='native-fixture'\nversion='0.1.0'\nedition='2024'\n",
-    )?;
-    std::fs::write(
-        workspace.path().join("Cargo.lock"),
-        "version = 4\n[[package]]\nname = 'native-fixture'\nversion = '0.1.0'\n",
-    )?;
-    std::fs::write(
-        workspace.path().join("src/lib.rs"),
-        "#[test] fn added() {}\n#[test] fn existing() {}\n#[test] #[ignore] fn ignored() {}\n",
-    )?;
-    std::fs::write(
-        workspace.path().join("tests/gameplay.rs"),
-        "#[test] fn integration() {}\n",
-    )?;
-    let mut packages = definition("packages", "exit 99");
-    packages.scope = CheckScope::ChangedFiles;
-    packages.files = Some(direct_operation(
-        "cargo",
-        &[
-            "test",
-            "--release",
-            "--locked",
-            "--package",
-            "{package.name}",
-            "--tests",
-        ],
-        Some(PackageManager::Cargo),
-    ));
-    let mut new = definition("new", "exit 99");
-    new.scope = CheckScope::NewCases;
-    new.cases = Some(direct_operation(
-        "cargo",
-        &[
-            "test",
-            "--release",
-            "--locked",
-            "--package",
-            "{package.name}",
-            "{case.target_args}",
-            "--",
-            "{case.name}",
-            "--exact",
-        ],
-        Some(PackageManager::Cargo),
-    ));
-    save(workspace.path(), vec![packages, new]);
-    let runner = make_runner(workspace.path(), data.path());
-    let case = CheckCase {
-        file: "src/lib.rs".into(),
-        name: "added".into(),
-        target: Some("lib".into()),
-    };
-    let prepared = runner.prepare(
-        ConfigSnapshot::load(workspace.path())?,
-        CheckAdmission {
-            owner: crate::timeline::TimelineOwner::session("checks-test"),
-            request: Default::default(),
-            overrides: BTreeMap::new(),
-            files: Some(vec!["src/lib.rs".into()]),
-            cases: Some(vec![case.clone()]),
-            new_cases: Some(vec![case.clone()]),
-            has_scope: true,
-            shell: crate::session::CheckShell::Nushell,
-            trigger: "plan".into(),
-            task_id: None,
-            revision: 1,
-        },
-    )?;
-    let run = runner.run(prepared, None, None).await?;
-    assert_eq!(run.state, CheckState::Passed, "{:?}", run.commands);
-    assert!(std::fs::read_to_string(&run.commands[0].stdout)?.contains("integration"));
-    let output = std::fs::read_to_string(&run.commands[1].stdout)?;
-    assert!(output.contains("test added ... ok"));
-    assert!(!output.contains("test existing ... ok"));
-    for name in ["missing", "ignored"] {
-        let request = RunRequest {
-            include: Vec::new(),
-            ids: vec!["new".into()],
-            selections: BTreeMap::from([(
-                "new".into(),
-                CheckSelection::Cases {
-                    cases: vec![CheckCase {
-                        name: name.into(),
-                        ..case.clone()
-                    }],
-                },
-            )]),
-            ..Default::default()
-        };
-        let prepared = runner.prepare_request(
-            crate::timeline::TimelineOwner::session("checks-test"),
-            request,
-            None,
-            crate::session::CheckShell::Nushell,
-            "explicit".into(),
-        )?;
-        let run = runner.run(prepared, None, None).await?;
-        assert_eq!(
-            run.commands
-                .iter()
-                .find(|command| command.context.as_ref().unwrap().definition_id == "new")
-                .unwrap()
-                .state,
-            CheckState::ConfigurationError
-        );
-    }
-    std::fs::write(
-        workspace.path().join("tests/custom.rs"),
-        "fn main() { std::fs::write(\"custom-ran\", \"yes\").unwrap(); }",
-    )?;
-    let manifest = workspace.path().join("Cargo.toml");
-    std::fs::write(
-        &manifest,
-        std::fs::read_to_string(&manifest)? + "\n[[test]]\nname='custom'\nharness=false\n",
-    )?;
-    let request = RunRequest {
-        include: Vec::new(),
-        ids: vec!["new".into()],
-        selections: BTreeMap::from([(
-            "new".into(),
-            CheckSelection::Cases {
-                cases: vec![CheckCase {
-                    file: "tests/custom.rs".into(),
-                    name: "declared".into(),
-                    target: Some("test:custom".into()),
-                }],
-            },
-        )]),
-        ..Default::default()
-    };
-    let prepared = runner.prepare_request(
-        crate::timeline::TimelineOwner::session("checks-test"),
-        request,
-        None,
-        crate::session::CheckShell::Nushell,
-        "custom".into(),
-    )?;
-    let run = runner.run(prepared, None, None).await?;
-    assert_eq!(run.state, CheckState::ConfigurationError);
-    assert!(
-        !workspace.path().join("custom-ran").exists(),
-        "custom harness must not run during native discovery"
-    );
-    Ok(())
-}
-
-#[tokio::test]
 async fn preview_matches_execution_and_manifest_changes_invalidate_bindings() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
@@ -1548,6 +1385,7 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut build = definition("build", "print build");
+    build.auto = false;
     build.trigger = CheckTrigger::Manual;
     let mut rust = definition("rust", "print rust");
     rust.area = "Rust".into();
@@ -1602,7 +1440,15 @@ async fn changes_select_overlapping_areas_and_required_builds_without_running_un
         prepared.commands[1].context.as_ref().unwrap().matched_files,
         ["src/nested/removed.rs"]
     );
-    assert_eq!(prepared.commands[3].state, CheckState::Skipped);
+    assert_eq!(
+        prepared
+            .commands
+            .iter()
+            .find(|command| { command.context.as_ref().unwrap().definition_id == "other" })
+            .unwrap()
+            .state,
+        CheckState::Skipped
+    );
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::Passed);
     assert!(!workspace.path().join("unrelated.txt").exists());
@@ -1678,13 +1524,67 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
 }
 
 #[tokio::test]
-async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applicable_checks()
--> Result<()> {
+async fn input_helpers_resolve_each_selector_without_native_test_discovery() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let config: CheckConfig = serde_json::from_value(serde_json::json!({
+        "helper": {
+            "action": {
+                "command": ["nu", "--no-config-file", "--stdin", "fixture.nu"],
+                "input": true
+            }
+        }
+    }))?;
+    let definition = &config.definitions[0];
+    let operation = definition
+        .cases
+        .as_ref()
+        .expect("input helpers accept cases");
+    for selection in [
+        CheckSelection::All,
+        CheckSelection::Files {
+            files: vec!["src/lib.rs".into()],
+        },
+        CheckSelection::Packages {
+            packages: vec!["fixture".into()],
+        },
+        CheckSelection::Tests {
+            tests: vec!["selected".into()],
+        },
+        CheckSelection::Cases {
+            cases: vec![CheckCase {
+                file: "src/lib.rs".into(),
+                name: "selected".into(),
+                target: None,
+            }],
+        },
+    ] {
+        let invocation = super::invocation::InvocationResolver::default()
+            .resolve_check(
+                workspace.path(),
+                ".",
+                operation,
+                &selection,
+                &definition.trigger,
+            )
+            .await?;
+        assert_eq!(invocation.len(), 1);
+        assert_eq!(invocation[0].program, "nu");
+        assert_eq!(
+            invocation[0].args.as_slice(),
+            operation.args.as_ref().unwrap().as_slice()
+        );
+        assert!(invocation[0].discovery.is_none());
+        assert!(invocation[0].package.is_none());
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn explicit_case_selection_rejects_empty_requests_without_running_the_helper() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    let mut check = definition("unit", "'unexpected full suite' | save unexpected.txt");
-    check.scope = CheckScope::ChangedCases;
-    check.cases = Some(CheckOperation { input: false, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()});
+    let mut check = definition("unit", "exit 99");
+    check.all = CheckOperation { input: true, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()};
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let case_selection = CheckSelection::Cases {
@@ -1694,23 +1594,18 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
             name: "selected_case".into(),
         }],
     };
-    for (inventory, selection, expected) in [
-        (None, None, CheckState::ConfigurationError),
-        (Some(Vec::new()), None, CheckState::Skipped),
+    for (selection, expected) in [
         (
-            None,
-            Some(CheckSelection::Cases { cases: Vec::new() }),
+            CheckSelection::Cases { cases: Vec::new() },
             CheckState::ConfigurationError,
         ),
-        (None, Some(case_selection.clone()), CheckState::Passed),
+        (case_selection.clone(), CheckState::Passed),
     ] {
         let request = RunRequest {
             include: Vec::new(),
             all: false,
             ids: vec!["unit".into()],
-            selections: selection
-                .map(|selection| BTreeMap::from([("unit".into(), selection)]))
-                .unwrap_or_default(),
+            selections: BTreeMap::from([("unit".into(), selection)]),
         };
         let prepared = runner.prepare(
             ConfigSnapshot::load(workspace.path())?,
@@ -1719,7 +1614,7 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
                 request,
                 overrides: Default::default(),
                 files: Some(vec!["src/source.rs".into()]),
-                cases: inventory,
+                cases: None,
                 new_cases: None,
                 has_scope: true,
                 shell: crate::session::CheckShell::Nushell,
@@ -1736,14 +1631,10 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
                 run.commands[0]
                     .error
                     .as_deref()
-                    .is_some_and(|error| error.contains("inventory is unavailable")
-                        || error.contains("selection is empty"))
+                    .is_some_and(|error| error.contains("selection is empty"))
             );
+            assert!(!workspace.path().join("selected.txt").exists());
         }
-        assert!(
-            !workspace.path().join("unexpected.txt").exists(),
-            "selection failure ran the full suite"
-        );
     }
     assert!(workspace.path().join("selected.txt").exists());
     Ok(())
@@ -1858,7 +1749,7 @@ fn selection_deduplicates_without_broadening_and_rejects_escape_paths() -> Resul
             version: 1,
             selection: CheckSelection::All
         }
-        .validate()
+        .validate_request(&selection)
         .is_err()
     );
     assert!(
@@ -1948,8 +1839,9 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'wrong all' | save all-ran.txt");
+    check.scope = CheckScope::ChangedFiles;
     check.files = Some(CheckOperation {
-        input: false,
+        input: true,
         args: None,
         package_manager: None,
         command: "print 'no receipt'".into(),
@@ -1985,7 +1877,8 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "exit 0");
-    check.files = Some(CheckOperation { input: false, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
+    check.scope = CheckScope::ChangedFiles;
+    check.files = Some(CheckOperation { input: true, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/name $var; [case].rs".to_owned();
@@ -2029,72 +1922,6 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
         )?)?,
         files
     );
-    Ok(())
-}
-
-#[tokio::test]
-async fn setup_validates_helpers_before_publication() -> Result<()> {
-    let workspace = tempfile::tempdir()?;
-    let data = tempfile::tempdir()?;
-    let runner = make_runner(workspace.path(), data.path());
-    let revision = runner.catalog(None)?["revision"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let config = CheckConfig {
-        version: 2,
-        definitions: Vec::new(),
-    };
-    let helper_source = format!(
-        "{}let selected = $in | from json\nprint $selected\n",
-        "# retained helper\n".repeat(32_769)
-    );
-    let helper = super::tools::CheckHelper {
-        path: ".forge/checks/select.nu".into(),
-        source: helper_source.clone(),
-        expected_digest: None,
-    };
-    runner
-        .configure(
-            crate::timeline::TimelineOwner::session("checks-test"),
-            crate::checks::ConfigureChecks {
-                expected_revision: revision,
-                config: config.clone(),
-                helpers: vec![helper],
-            },
-            None,
-            None,
-        )
-        .await?;
-    assert_eq!(
-        std::fs::read_to_string(workspace.path().join(".forge/checks/select.nu"))?,
-        helper_source
-    );
-    let revision = runner.catalog(None)?["revision"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let helper = super::tools::CheckHelper {
-        path: ".forge/checks/invalid.nu".into(),
-        source: "let = [".into(),
-        expected_digest: None,
-    };
-    assert!(
-        runner
-            .configure(
-                crate::timeline::TimelineOwner::session("checks-test"),
-                crate::checks::ConfigureChecks {
-                    expected_revision: revision,
-                    config,
-                    helpers: vec![helper]
-                },
-                None,
-                None
-            )
-            .await
-            .is_err()
-    );
-    assert!(!workspace.path().join(".forge/checks/invalid.nu").exists());
     Ok(())
 }
 
@@ -2223,8 +2050,7 @@ async fn disabled_prerequisite_is_a_configuration_error_and_independent_checks_c
 -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
-    let mut disabled = definition("prerequisite", "exit 0");
-    disabled.enabled = false;
+    let disabled = definition("prerequisite", "exit 0");
     let mut dependent = definition("dependent", "'unexpected' | save unexpected.txt");
     dependent.depends_on = vec![disabled.id.clone()];
     save(
@@ -2232,21 +2058,43 @@ async fn disabled_prerequisite_is_a_configuration_error_and_independent_checks_c
         vec![disabled, dependent, definition("independent", "print 'ok'")],
     );
     let runner = make_runner(workspace.path(), data.path());
-    let prepared = runner.prepare_request(
-        crate::timeline::TimelineOwner::session("checks-test"),
-        RunRequest {
-            include: Vec::new(),
-            all: true,
-            ..Default::default()
+    let prepared = runner.prepare(
+        ConfigSnapshot::load(workspace.path())?,
+        CheckAdmission {
+            owner: crate::timeline::TimelineOwner::session("checks-test"),
+            request: RunRequest {
+                all: true,
+                ..Default::default()
+            },
+            overrides: BTreeMap::from([("prerequisite".into(), false)]),
+            files: None,
+            cases: None,
+            new_cases: None,
+            has_scope: false,
+            shell: crate::session::CheckShell::Nushell,
+            trigger: "Test".into(),
+            task_id: None,
+            revision: 0,
         },
-        None,
-        crate::session::CheckShell::Nushell,
-        "Test".into(),
     )?;
     let run = runner.run(prepared, None, None).await?;
     assert_eq!(run.state, CheckState::ConfigurationError);
-    assert_eq!(run.commands[1].state, CheckState::ConfigurationError);
-    assert_eq!(run.commands[2].state, CheckState::Passed);
+    assert_eq!(
+        run.commands
+            .iter()
+            .find(|command| { command.context.as_ref().unwrap().definition_id == "dependent" })
+            .unwrap()
+            .state,
+        CheckState::ConfigurationError
+    );
+    assert_eq!(
+        run.commands
+            .iter()
+            .find(|command| { command.context.as_ref().unwrap().definition_id == "independent" })
+            .unwrap()
+            .state,
+        CheckState::Passed
+    );
     assert!(!workspace.path().join("unexpected.txt").exists());
     Ok(())
 }

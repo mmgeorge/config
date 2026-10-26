@@ -66,7 +66,7 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let (temporary, mut broker) = broker_fixture();
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
-        PermissionMode::Read
+        PermissionMode::Write
     );
 
     let opened = broker

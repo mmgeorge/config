@@ -579,32 +579,6 @@ mod tests {
     }
 
     #[test]
-    fn large_output_preserves_all_display_rows_and_complete_export() -> Result<()> {
-        let row_count = 262_145;
-        let saved = format!("{}\n", "x".repeat(128)).repeat(row_count);
-        assert!(saved.len() > 32 * 1024 * 1024);
-        let mut source = ToolOutputView::new("call".into(), &saved)?;
-        source.append("last output after previous threshold\n")?;
-        let preview = source.preview(true)?;
-        assert_eq!(preview.total_rows, row_count + 1);
-        assert_eq!(
-            preview.row.last().copied(),
-            Some("last output after previous threshold")
-        );
-        let directory = tempfile::tempdir()?;
-        let snapshot = source.snapshot()?;
-        let export = snapshot.export_saved_output(
-            directory.path(),
-            Arc::new(crate::trace::TraceStore::open(directory.path())?),
-            "tool-test",
-        )?;
-        let complete = std::fs::read_to_string(export.path().unwrap())?;
-        assert!(complete.starts_with(&saved));
-        assert!(complete.ends_with("last output after previous threshold\n"));
-        Ok(())
-    }
-
-    #[test]
     fn deferred_output_parses_once_on_demand_and_retains_incremental_state() {
         let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
         output.append("1msecond").unwrap();

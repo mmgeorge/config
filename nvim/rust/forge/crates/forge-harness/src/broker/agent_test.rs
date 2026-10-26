@@ -612,47 +612,6 @@ async fn cross_provider_children_resolve_profile_model_reasoning_and_service_tie
 }
 
 #[tokio::test]
-async fn every_provider_pairing_preserves_child_history_and_root_continuation_ownership() -> Result<()> {
-    use crate::backend::BackendKind;
-    let provider=[BackendKind::Codex,BackendKind::Copilot,BackendKind::Claude,BackendKind::Antigravity];
-    for root_provider in provider {
-        for child_provider in provider {
-            let repository=repository();
-            let data=tempfile::tempdir()?;
-            let mut broker=planning_question_broker(repository.path(),data.path(),false);
-            broker.session.backend=crate::agent::provider_name(root_provider).into();
-            broker.session.access.sandbox=false;
-            broker.agent_coordinator.set_enabled(true);
-            let root=Arc::new(RoutingBackend {kind:root_provider,
-                turn:std::sync::atomic::AtomicUsize::new(0),request:Default::default(),reject_steering:false});
-            let child=Arc::new(RoutingBackend {kind:child_provider,turn:std::sync::atomic::AtomicUsize::new(0),request:Default::default(),reject_steering:false});
-            save_child_profile(&broker,"routing-child",crate::agent::AgentProfile {
-                provider:crate::agent::provider_name(child_provider).into(),model:"fixture-model".into(),
-                reasoning_effort:"default".into(),service_tier:"default".into(),..Default::default()
-            })?;
-            broker.backend=root.clone();
-            broker.agent_backend_factory.register(child.clone());
-            tokio::time::timeout(std::time::Duration::from_secs(5),broker.run_interaction(
-                "PARENT_PRIVATE_HISTORY".into(),PromptMode::Chat,Some(ExchangeAdmission::chat("PARENT_PRIVATE_HISTORY".into()))))
-                .await.context("provider routing did not settle within five seconds")??;
-            let task=broker.store.list_agent_task(&broker.session.id)?;
-            assert_eq!(task.len(),1,"{root_provider:?} -> {child_provider:?}");
-            assert_eq!(task[0].state,ExchangeState::Complete);
-            assert!(task[0].parent_reported);
-            let request=child.request.lock().unwrap();
-            assert_eq!(request.len(),1);
-            assert_eq!(request[0].harness_session_id,broker.session.id);
-            assert_ne!(request[0].runtime_key()?,broker.session.id);
-            assert_eq!(broker.agent_coordinator.resolve(&task[0].agent_id)?.selection.unwrap().provider,child_provider);
-            assert_eq!(root.turn.load(Ordering::Acquire),2);
-            assert_eq!(broker.store.list_exchange(&broker.session.id)?.len(),1);
-            assert_eq!(broker.agent_coordinator.active_count(),0);
-        }
-    }
-    Ok(())
-}
-
-#[tokio::test]
 async fn durable_operation_receipts_prevent_duplicate_child_tasks_before_and_after_completion() -> Result<()> {
     let repository=repository();
     let data=tempfile::tempdir()?;

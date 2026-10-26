@@ -2424,7 +2424,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore = "requires the locally fetched pinned Copilot CLI, without authentication or prompts"]
+    #[cfg(feature = "live-provider-tests")]
     async fn default_cli_resolution_starts_and_collects_without_a_session() {
         let workspace = tempfile::tempdir().unwrap();
         let backend = CopilotBackend::new(Vec::new()).unwrap();

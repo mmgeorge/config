@@ -506,8 +506,14 @@ impl CodexBackend {
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let resources = self.resources(&request).await?;
-        Self::load_terminal_thread(&mut process, &mut output, &request, resources.as_deref())
-            .await?;
+        Self::load_terminal_thread(
+            &mut process,
+            &mut output,
+            &request,
+            resources.as_deref(),
+            std::time::Duration::from_millis(500),
+        )
+        .await?;
         Ok(Some((process, output, thread_id)))
     }
 
@@ -516,6 +522,7 @@ impl CodexBackend {
         output: &mut BackendOutput,
         request: &BackendCatalogRequest,
         resources: Option<&CodexResources>,
+        retry_delay: std::time::Duration,
     ) -> Result<()> {
         let thread_id = request
             .backend_session_id
@@ -568,7 +575,7 @@ impl CodexBackend {
                 return Ok(());
             }
             retries_remaining -= 1;
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            tokio::time::sleep(retry_delay).await;
         }
     }
 
@@ -2377,6 +2384,7 @@ mod test {
             &mut BackendOutput::default(),
             &request,
             None,
+            std::time::Duration::ZERO,
         )
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
@@ -2457,10 +2465,22 @@ mod test {
         )
         .await?;
         let mut output = BackendOutput::default();
-        CodexBackend::load_terminal_thread(&mut process, &mut output, &request, Some(&resources))
-            .await?;
-        CodexBackend::load_terminal_thread(&mut process, &mut output, &request, Some(&resources))
-            .await?;
+        CodexBackend::load_terminal_thread(
+            &mut process,
+            &mut output,
+            &request,
+            Some(&resources),
+            std::time::Duration::ZERO,
+        )
+        .await?;
+        CodexBackend::load_terminal_thread(
+            &mut process,
+            &mut output,
+            &request,
+            Some(&resources),
+            std::time::Duration::ZERO,
+        )
+        .await?;
         process
             .request(
                 "thread/backgroundTerminals/list",
@@ -2549,7 +2569,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore = "requires the installed authenticated Codex CLI and configured MCP servers"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_mcp_catalog() {
         let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
         let result = tokio::time::timeout(
@@ -2572,7 +2592,7 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore = "requires authenticated Codex CLI and Neovim, makes one minimal model request"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_terminal_polling_preserves_mcp_inventory() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let definitions = fixture.path().join("rulesync-global/.rulesync");

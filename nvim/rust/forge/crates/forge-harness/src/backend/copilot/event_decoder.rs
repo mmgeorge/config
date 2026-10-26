@@ -1116,8 +1116,26 @@ mod test {
         assert!(text.contains("lib.rs"));
         assert!(!text.contains("Ran 1 tool"));
         assert!(rendered.tool.is_empty());
-        assert!(rendered.action.values().any(|action| matches!(action,
-            crate::buffer::projection::TranscriptAction::Diff { text, .. } if text.contains("@@ -40 +40 @@\n-old\n+new"))));
+        let displayed = rendered
+            .action
+            .values()
+            .find_map(|action| match action {
+                crate::buffer::projection::TranscriptAction::Diff { text, .. } => Some(text),
+                _ => None,
+            })
+            .expect("changed files must retain a diff action");
+        let patch = forge_diff::patch::UnifiedPatch::parse(displayed)?;
+        assert_eq!(patch.file.len(), 1);
+        assert_eq!(patch.file[0].new_path.as_deref(), Some("src/lib.rs"));
+        assert_eq!(patch.file[0].hunk.len(), 1);
+        let hunk = &patch.file[0].hunk[0];
+        assert_eq!(hunk.old_lines, 39..40);
+        assert_eq!(hunk.new_lines, 39..40);
+        assert_eq!(hunk.row.len(), 2);
+        assert_eq!(hunk.row[0].kind, forge_diff::display::RowKind::Removed);
+        assert_eq!(hunk.row[0].text, "old");
+        assert_eq!(hunk.row[1].kind, forge_diff::display::RowKind::Added);
+        assert_eq!(hunk.row[1].text, "new");
         Ok(())
     }
 

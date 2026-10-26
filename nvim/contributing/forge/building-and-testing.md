@@ -111,6 +111,45 @@ workspace suite after targeted checks pass when shared interfaces or behavior
 require it. Keep Cargo-heavy jobs serial within the workspace. Record the command,
 deadline, exit status, and failing assertion or compiler diagnostic.
 
+## Measure individual Rust tests
+
+The explicit `forge-rust-timings` check accepts file or package selection and runs
+Cargo nextest with the same development artifacts. Install
+[cargo-nextest](https://nexte.st/docs/installation/pre-built-binaries/) 0.9.143 or
+newer on macOS or Windows. Version 0.9.150 is recommended.
+
+From the Rust workspace, the equivalent command for Harness is:
+
+```nu
+cargo nextest run --cargo-profile dev --profile default --locked --package forge-harness --tests --retries 0 --no-fail-fast --status-level all --final-status-level all
+```
+
+`nvim/rust/forge/.config/nextest.toml` gives each test a two-second execution
+deadline with no termination grace period. Nextest defaults to one concurrent case
+per logical CPU. The package and workspace Cargo checks also omit an explicit
+test-thread limit and use Rust's available hardware concurrency.
+Timeouts fail, retries are disabled, and failures do not stop the remaining cases.
+Compilation is outside the per-test deadline. Nextest prints each case's duration
+and writes the complete report to `target/nextest/default/junit.xml`, including
+ignored cases as skipped. Ignored tests remain unexecuted.
+
+This timing check is explicit, not an additional automatic suite. Existing checks
+and their exact-name selectors retain their current behavior.
+
+Tests that require installed and authenticated provider CLIs belong to the
+`live-provider-tests` feature. The default suite excludes those targets rather
+than reporting them as ignored. Enable this feature only for deliberate live
+provider verification. Such runs can make model requests and require the named
+providers, models, and local MCP dependencies. Mock-provider tests remain in the
+default suite.
+
+Test fixtures must use the current public check configuration. Task-specific
+enablement belongs in admission overrides, and scoped shell helpers must declare
+`input: true`. Deadline tests that do not require real process time use Tokio's
+paused clock instead of waiting for wall-clock deadlines.
+
+## Run isolated editor tests
+
 From the repository root, run an isolated editor test directly in a fresh Neovim:
 
 ```nu
@@ -168,7 +207,7 @@ with the same default target directory:
 ```nu
 cargo test --profile dev --locked -p forge-harness --lib checks:: -- --test-threads=1
 cargo test --profile dev --locked -p forge-harness --lib plan::design_review::tests
-cargo test --profile dev --locked -p forge-harness --lib automatic_checks_repair_once
+cargo test --profile dev --locked -p forge-harness --lib automatic_checks_repair_after_permission_resume_on_worker
 cargo test --profile dev --locked -p forge-harness --lib selected_plan_checks_are_versioned
 ```
 

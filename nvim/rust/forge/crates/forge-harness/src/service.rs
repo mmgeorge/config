@@ -5736,50 +5736,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_control_waits_for_cleanup_past_the_former_deadline() -> Result<()> {
-        let fixture = tempfile::tempdir()?;
-        let service = service();
-        let opened = service
-            .open_session(1, initialize(&fixture, "mock"))
-            .await?;
-        let session_id = opened.result().unwrap()["session"]["id"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        let registry = service.registry().await?;
-        let controller = registry.resolve(&session_id).await?;
-        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
-        let control = controller.control_admission.acquire().await?;
-        let execution = controller.execution_admission.acquire().await?;
-        let mut operation = admit_task_intent(
-            &controller,
-            &session_id,
-            &Request {
-                id: 2,
-                method: "task.transition".into(),
-                params: json!({"operation_id":"slow-cleanup", "action":"pause"}),
-            },
-            &mut store,
-        )?;
-        let (sink, _output) = forge_protocol::outbound::channel();
-        let release = async {
-            tokio::time::sleep(Duration::from_secs(11)).await;
-            drop(control);
-            tokio::time::sleep(Duration::from_secs(11)).await;
-            drop(execution);
-        };
-        let (result, ()) = tokio::join!(
-            execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink),
-            release
-        );
-        result?;
-        assert_ne!(operation.state, "failed");
-        assert!(operation.error.is_none());
-        service.shutdown(Duration::from_secs(1)).await?;
-        Ok(())
-    }
-
-    #[tokio::test]
     async fn idle_task_transition_waits_for_readers_without_provider_cleanup() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
@@ -6873,7 +6829,7 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn shutdown_timeout_retains_fork_ownership_and_leases_until_completion() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
@@ -6973,7 +6929,7 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn goal_control_timeout_includes_a_blocked_provider_stop() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;

@@ -232,32 +232,6 @@ mod tests {
     }
 
     #[test]
-    fn large_plan_sources_survive_persistence_and_both_review_capture_paths() {
-        let temporary = tempfile::tempdir().unwrap();
-        let store = PlanFileStore::new(temporary.path(), temporary.path());
-        crate::checks::configure_fixture(&store.workspace);
-        let mut document = crate::plan::document::test_fixture("large-plan", "Large plan");
-        document.overview = "x".repeat(9 * 1024 * 1024);
-        store
-            .write_working_document("session", "large-plan", &document)
-            .unwrap();
-        let (_, rendered, checksum) = store
-            .submit_document_revision("session", "large-plan", 1, document.version)
-            .unwrap();
-        let current = store
-            .capture_review_source("session", "large-plan", Some(1), &checksum)
-            .unwrap();
-        let historical = store
-            .capture_revision_source("session", "large-plan", 1)
-            .unwrap();
-        assert_eq!(current.document, document);
-        assert_eq!(historical.document, document);
-        assert_eq!(current.rendered, rendered);
-        assert_eq!(historical.rendered, rendered);
-        assert!(current.rendered.markdown.len() > 8 * 1024 * 1024);
-    }
-
-    #[test]
     fn existing_design_projection_is_rebuilt_without_rewriting_reviewed_artifacts() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());

@@ -166,6 +166,7 @@ pub(crate) fn validate(text: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "live-provider-tests")]
     use crate::backend::{Backend, BackendCatalogRequest};
 
     #[test]
@@ -226,7 +227,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires authenticated Codex and makes one isolated naming request"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_codex_session_name() {
         let backend =
             crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
@@ -239,7 +240,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires authenticated Copilot and makes one isolated naming request"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_copilot_session_name() {
         let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
         let result = backend.generate_text(request(), TextGeneration::SessionName, "gpt-5.6-sol", None,
@@ -287,7 +288,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires authenticated Codex and makes one isolated recap request"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_codex_recap() {
         let backend =
             crate::backend::codex::CodexBackend::new(vec!["codex".into(), "app-server".into()])
@@ -298,7 +299,7 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "requires authenticated Copilot and makes one isolated recap request"]
+    #[cfg(feature = "live-provider-tests")]
     async fn live_copilot_recap() {
         let backend = crate::backend::copilot::CopilotBackend::new(vec!["copilot".into()]).unwrap();
         let result = backend.generate_text(request(), TextGeneration::Recap, "gpt-5.6-sol", None, "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
@@ -306,6 +307,7 @@ mod tests {
         assert!(!result.unwrap().is_empty());
     }
 
+    #[cfg(feature = "live-provider-tests")]
     fn request() -> BackendCatalogRequest {
         BackendCatalogRequest {
             execution_owner: None,

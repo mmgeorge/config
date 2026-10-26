@@ -42,7 +42,7 @@ readline.createInterface({input:process.stdin}).on('line', line => {
     fs.writeFileSync(process.argv[3], request.method);
     const mode = fs.readFileSync(process.argv[2], 'utf8');
     if (mode === 'wait') return;
-    if (mode === 'disconnect') { process.exit(0); return; }
+    if (mode === 'disconnect') { fs.closeSync(1); return; }
     if (mode === 'error') { write({id:request.id,error:{code:-32603,message:'native submission failure'}}); return; }
     if (mode === 'invalid') result = {};
     else if (request.method === 'session/prompt') result = {stopReason:'end_turn'};
@@ -196,7 +196,10 @@ async fn acp_prompt_response_controls_acceptance_for_both_providers() -> Result<
                         .is_err()
                 );
             }
-            fixture.close().await?;
+            fixture
+                .close()
+                .await
+                .with_context(|| format!("{kind:?} cleanup after {response}"))?;
         }
     }
     Ok(())

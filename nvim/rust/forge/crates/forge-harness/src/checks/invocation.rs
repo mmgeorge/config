@@ -123,6 +123,12 @@ impl InvocationResolver {
         selection: &CheckSelection,
         trigger: &super::CheckTrigger,
     ) -> Result<Vec<CheckInvocation>> {
+        if operation.input {
+            validate(operation)?;
+            return Ok(vec![expand(
+                workspace, directory, operation, None, None, None,
+            )?]);
+        }
         let paths = operation.args.as_ref().is_some_and(|arguments| {
             arguments
                 .iter()

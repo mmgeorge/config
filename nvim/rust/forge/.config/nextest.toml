@@ -1,0 +1,12 @@
+nextest-version = { required = "0.9.143", recommended = "0.9.150" }
+
+[profile.default]
+retries = 0
+fail-fast = false
+slow-timeout = { period = "2s", terminate-after = 1, grace-period = "0s" }
+status-level = "all"
+final-status-level = "all"
+
+[profile.default.junit]
+path = "junit.xml"
+report-skipped = "ignored"

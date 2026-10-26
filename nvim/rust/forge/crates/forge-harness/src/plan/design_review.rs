@@ -990,11 +990,14 @@ fn configured_checks(
             CheckScope::ChangedCases => "Changed cases",
             CheckScope::NewCases => "New cases",
         };
-        let trigger = match &check.trigger {
-            CheckTrigger::Paths { include, .. } | CheckTrigger::FilesChanged { include, .. } => {
-                include.join(", ")
+        let trigger = if !check.auto {
+            "Explicit runs only".into()
+        } else {
+            match &check.trigger {
+                CheckTrigger::Paths { include, .. }
+                | CheckTrigger::FilesChanged { include, .. } => include.join(", "),
+                _ => check.trigger.description(),
             }
-            _ => check.trigger.description(),
         };
         let requires = check
             .depends_on
@@ -1998,10 +2001,11 @@ mod tests {
             vec![
                 vec!["Stage", "Command", "Scope", "Triggers", "Requires"],
                 vec!["Format", "format-all", "All", "src/**", "—"],
+                vec!["Test", "optional-all", "All", "Explicit runs only", "—"],
                 vec![
                     "Test",
-                    "unit-cases",
-                    "Changed cases",
+                    "unit-all",
+                    "Changed files",
                     "Any changed file",
                     "format-all"
                 ],
@@ -2010,14 +2014,7 @@ mod tests {
                     "integration-files",
                     "Changed files",
                     "Explicit runs only",
-                    "unit-cases"
-                ],
-                vec![
-                    "Test (disabled)",
-                    "optional-all",
-                    "All",
-                    "Explicit runs only",
-                    "—"
+                    "unit-all"
                 ],
             ]
         );
@@ -2044,7 +2041,7 @@ mod tests {
             .iter()
             .find(|block| block.id == header.metadata.fold[0].end.block)
             .unwrap();
-        assert!(ending.text.row(0).unwrap().contains("optional-all"));
+        assert!(ending.text.row(0).unwrap().contains("integration-files"));
         for columns in [60, 100, 160] {
             let profile = WidthProfile {
                 columns,

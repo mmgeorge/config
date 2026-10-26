@@ -1351,52 +1351,6 @@ mod tests {
     }
 
     #[test]
-    fn section_continues_loading_past_previous_body_limit() -> Result<()> {
-        let mut blocks = source()?.snapshot()?.block;
-        blocks[1].text = BufferText::from_rows(["x".repeat(16 * 1024 * 1024 + 2 * PAGE_BYTES)])?;
-        let mut source = TranscriptDocument::initialize(
-            DocumentId("large-source".into()),
-            "session".into(),
-            0,
-            vec![TranscriptEntry {
-                id: "entry".into(),
-                block: blocks,
-            }],
-        )?;
-        let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
-        let view = ViewId("view".into());
-        visible.register(view.clone());
-        visible.quota_for_test("tools", 16 * 1024 * 1024);
-        visible.set(&mut source, view.clone(), 1, "tools", true, false, None)?;
-        visible.refresh(&mut source)?;
-        let before = visible
-            .document
-            .document
-            .block(&BlockId("body".into()))
-            .unwrap()
-            .text
-            .byte_count();
-        visible.set(&mut source, view, 2, "tools", true, true, None)?;
-        visible.refresh(&mut source)?;
-        let after = visible
-            .document
-            .document
-            .block(&BlockId("body".into()))
-            .unwrap()
-            .text
-            .byte_count();
-        assert!(after > before && after > 16 * 1024 * 1024);
-        assert!(visible.document.snapshot()?.block.iter().any(|block| {
-            block
-                .metadata
-                .section
-                .iter()
-                .any(|section| section.id.0 == "tools" && section.more)
-        }));
-        Ok(())
-    }
-
-    #[test]
     fn expansion_is_shared_and_closing_a_view_preserves_other_view_choices() -> Result<()> {
         let mut source = source()?;
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;

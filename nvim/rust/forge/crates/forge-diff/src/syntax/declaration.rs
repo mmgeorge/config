@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::OnceLock;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
@@ -224,26 +225,43 @@ impl DeclarationOverview {
         Self::project_tree(source, formatted, language, &tree)
     }
 
+    fn query(language: SyntaxLanguage) -> Result<&'static Query, SyntaxError> {
+        static RUST: OnceLock<Result<Query, SyntaxError>> = OnceLock::new();
+        static TYPESCRIPT: OnceLock<Result<Query, SyntaxError>> = OnceLock::new();
+        static TSX: OnceLock<Result<Query, SyntaxError>> = OnceLock::new();
+        static LUA: OnceLock<Result<Query, SyntaxError>> = OnceLock::new();
+        let (cache, source) = match language {
+            SyntaxLanguage::Rust => (&RUST, include_str!("../../query/forge/rust/design.scm")),
+            SyntaxLanguage::Typescript => (
+                &TYPESCRIPT,
+                include_str!("../../query/forge/typescript/design.scm"),
+            ),
+            SyntaxLanguage::Tsx => (
+                &TSX,
+                include_str!("../../query/forge/typescript/design.scm"),
+            ),
+            SyntaxLanguage::Lua => (&LUA, include_str!("../../query/forge/lua/design.scm")),
+            _ => return Err(SyntaxError::Language(language.name().into())),
+        };
+        cache
+            .get_or_init(|| {
+                Query::new(&language.grammar(), source)
+                    .map_err(|error| SyntaxError::Query(error.to_string()))
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+
     fn project_tree(
         source: &str,
         formatted: bool,
         language: SyntaxLanguage,
         tree: &tree_sitter::Tree,
     ) -> Result<String, SyntaxError> {
-        let grammar = language.grammar();
-        let query_text = match language {
-            SyntaxLanguage::Rust => include_str!("../../query/forge/rust/design.scm"),
-            SyntaxLanguage::Typescript | SyntaxLanguage::Tsx => {
-                include_str!("../../query/forge/typescript/design.scm")
-            }
-            SyntaxLanguage::Lua => include_str!("../../query/forge/lua/design.scm"),
-            _ => unreachable!(),
-        };
-        let query = Query::new(&grammar, query_text)
-            .map_err(|error| SyntaxError::Query(error.to_string()))?;
+        let query = Self::query(language)?;
         let mut cursor = QueryCursor::new();
         let mut roles = HashMap::new();
-        let mut matches = cursor.matches(&query, tree.root_node(), source.as_bytes());
+        let mut matches = cursor.matches(query, tree.root_node(), source.as_bytes());
         while let Some(matched) = matches.next() {
             for capture in matched.captures() {
                 roles.insert(
@@ -1326,6 +1344,42 @@ fn normalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_queries_reuse_compilation_without_sharing_capture_state() {
+        for language in [
+            SyntaxLanguage::Rust,
+            SyntaxLanguage::Typescript,
+            SyntaxLanguage::Tsx,
+            SyntaxLanguage::Lua,
+        ] {
+            let query = DeclarationOverview::query(language).unwrap();
+            std::thread::scope(|scope| {
+                let concurrent = scope.spawn(|| DeclarationOverview::query(language).unwrap());
+                assert!(std::ptr::eq(query, concurrent.join().unwrap()));
+            });
+        }
+        assert!(!std::ptr::eq(
+            DeclarationOverview::query(SyntaxLanguage::Typescript).unwrap(),
+            DeclarationOverview::query(SyntaxLanguage::Tsx).unwrap(),
+        ));
+        std::thread::scope(|scope| {
+            let first = scope.spawn(|| {
+                DeclarationOverview::extract("first.rs", "pub fn first() { let value = 1; }")
+                    .unwrap()
+            });
+            let second = scope.spawn(|| {
+                DeclarationOverview::extract("second.rs", "pub struct Second { pub value: u32 }")
+                    .unwrap()
+            });
+            let first = first.join().unwrap();
+            let second = second.join().unwrap();
+            assert!(first.contains("pub fn first()"));
+            assert!(!first.contains("value") && !first.contains("Second"));
+            assert!(second.contains("pub struct Second") && second.contains("pub value: u32"));
+            assert!(!second.contains("first"));
+        });
+    }
 
     #[test]
     fn comments_preserve_saved_coordinates_and_exclude_literal_markers() {

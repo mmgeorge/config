@@ -133,7 +133,6 @@ async fn initialize_real_codex_broker(
 }
 
 #[tokio::test]
-#[ignore = "requires an authenticated Codex CLI and performs a real model turn"]
 async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");
@@ -324,7 +323,6 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
 }
 
 #[tokio::test]
-#[ignore = "requires an authenticated Codex CLI and performs real GeoParquet planning turns"]
 async fn geoparquet_prompt_reaches_plan_review_after_scope_feedback() {
     let temporary = tempfile::tempdir().unwrap();
     let workspace = temporary.path().join("workspace");

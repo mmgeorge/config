@@ -133,10 +133,14 @@ impl TryFrom<BTreeMap<String, Check>> for CheckConfig {
                     _ => CheckCategory::Check,
                 }
             });
-            let cases = (manager == Some(PackageManager::Cargo)
-                && package_manager(&operation.command) == Some(PackageManager::Cargo)
-                && arguments.iter().any(|arg| arg == "test"))
-            .then(|| super::invocation::case_operation(&operation));
+            let cases = if operation.input {
+                Some(operation.clone())
+            } else {
+                (manager == Some(PackageManager::Cargo)
+                    && package_manager(&operation.command) == Some(PackageManager::Cargo)
+                    && arguments.iter().any(|arg| arg == "test"))
+                .then(|| super::invocation::case_operation(&operation))
+            };
             let trigger = if check.trigger.paths.is_empty() && check.trigger.exclude.is_empty() {
                 CheckTrigger::AnyChange
             } else {

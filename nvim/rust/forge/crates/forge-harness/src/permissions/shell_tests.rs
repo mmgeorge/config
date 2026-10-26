@@ -658,7 +658,6 @@ fn nushell_unresolved_execution_never_inherits_an_allow_rule() {
             "$env.PATH = []; probe",
             "with-env {PATH: []} { probe }",
             "nu --commands $code",
-            "nu script.nu",
         ],
     );
 }

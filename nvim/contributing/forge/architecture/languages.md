@@ -164,6 +164,11 @@ languages must match the selected grammar.
 
 ## Declarations and source coordinates
 
+`DeclarationOverview` compiles each immutable declaration query once per grammar.
+Rust, TypeScript, TSX, and Lua retain separate query slots, including separate slots
+for TypeScript and TSX despite their shared query text. Parsers, syntax trees,
+query cursors, and capture maps remain local to each source operation.
+
 Declaration extraction preserves interfaces and source identity without pretending
 that an overview file is a compilable implementation. Formatting and presentation
 can move rows, so source-token maps remain distinct from displayed coordinates.
