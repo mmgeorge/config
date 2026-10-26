@@ -13,7 +13,7 @@ noremap k g
 
 noremap x u
 noremap c r
-noremap m c 
+noremap m c<Space>
 noremap p v
 noremap v b
 
@@ -37,7 +37,7 @@ exmap back obcommand app:go-back
 nmap , :back
 exmap forward obcommand app:go-forward
 nmap . :forward
- 
+
 "Open commands"
 unmap <Space>
 
