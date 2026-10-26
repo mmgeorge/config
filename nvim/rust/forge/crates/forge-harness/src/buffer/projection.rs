@@ -142,58 +142,6 @@ pub fn project<'source>(
     )
 }
 
-fn reported_changes(exchange: &Exchange, agents: &HashMap<&str, &TimelineEntry>) -> Option<String> {
-    fn record(
-        builder: &mut crate::exchange::ProviderDiffBuilder,
-        exchange: &Exchange,
-        agents: &HashMap<&str, &TimelineEntry>,
-        visited: &mut std::collections::HashSet<String>,
-    ) {
-        if !visited.insert(exchange.id.clone()) {
-            return;
-        }
-        builder.record(exchange);
-        for node in &exchange.node_list {
-            let ExchangeNode::AgentReference { agent } = node else {
-                continue;
-            };
-            let Some(TimelineEntry::AgentLifecycle {
-                exchange,
-                agent: children,
-                ..
-            }) = agents
-                .get(agent.id.as_str())
-                .or_else(|| agents.get(agent.child_agent_id.as_str()))
-                .copied()
-            else {
-                continue;
-            };
-            let Some(exchange) = exchange
-                .iter()
-                .find(|exchange| exchange.id == agent.child_exchange_id)
-            else {
-                continue;
-            };
-            let children = children
-                .iter()
-                .filter_map(|entry| match entry {
-                    TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
-                    _ => None,
-                })
-                .collect();
-            record(builder, exchange, &children, visited);
-        }
-    }
-    let mut builder = crate::exchange::ProviderDiffBuilder::default();
-    record(
-        &mut builder,
-        exchange,
-        agents,
-        &mut std::collections::HashSet::new(),
-    );
-    builder.finish()
-}
-
 fn tool_group_label<'tool>(
     calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
     lifecycle: NodeLifecycle,
@@ -1233,46 +1181,6 @@ impl TimelineRenderer<'_> {
             MarkdownRole::Response,
         )?;
         self.verification_result(interaction)?;
-        let reported = if interaction.completed_at_ms.is_some()
-            && interaction.checkpoint_after.is_none()
-            && interaction.attributed_diff_text.is_none()
-        {
-            reported_changes(interaction, agents)
-        } else {
-            None
-        };
-        if let Some(diff) = interaction
-            .attributed_diff_text
-            .as_ref()
-            .or(reported.as_ref())
-        {
-            self.diff(
-                &format!("{}:changes", interaction.id),
-                "Changed",
-                diff,
-                if interaction.checkpoint_after.is_none() {
-                    " · reported edits"
-                } else if interaction.attributed_matches_checkpoint {
-                    " · checkpoint matched"
-                } else {
-                    ""
-                },
-                None,
-                None,
-            )?;
-        }
-        if !interaction.attributed_matches_checkpoint {
-            if let Some(diff) = &interaction.checkpoint_diff_text {
-                self.diff(
-                    &format!("{}:checkpoint", interaction.id),
-                    "Checkpoint total:",
-                    diff,
-                    "",
-                    None,
-                    None,
-                )?;
-            }
-        }
         self.content(
             interaction,
             agents,
@@ -5067,8 +4975,8 @@ mod tests {
     }
 
     #[test]
-    fn alternating_tools_and_writes_share_groups_and_restore_non_git_summary() -> anyhow::Result<()>
-    {
+    fn alternating_tools_and_writes_restore_activity_without_exchange_summaries()
+    -> anyhow::Result<()> {
         use crate::backend::{
             BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
             ProviderFileChange, ToolActivity, ToolActivityKind, TurnBoundary,
@@ -5181,7 +5089,7 @@ mod tests {
         });
         exchange.observe_turn(&event, 70)?;
         exchange.finish(crate::exchange::ExchangeState::Complete, 70)?;
-        let restored = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
         let projected = project_at(
             &TimelineEntry::Exchange {
                 id: "edits".into(),
@@ -5204,10 +5112,9 @@ mod tests {
             .filter(|block| block.id.0.ends_with(":changes"))
             .map(|block| block.text.wire_rows().join(""))
             .collect();
-        assert_eq!(headings.len(), 3);
+        assert_eq!(headings.len(), 2);
         assert!(headings[0].contains("Changed 1 file"));
         assert!(headings[1].contains("File changes failed"));
-        assert!(headings[2].contains("Changed 1 file") && headings[2].contains("reported edits"));
         assert_eq!(
             projected.tool.len(),
             3,
@@ -5218,48 +5125,47 @@ mod tests {
                 .iter()
                 .any(|block| block.text.wire_rows().join("").contains("file changes"))
         );
-        let summary = blocks
-            .iter()
-            .position(|block| block.id.0 == "edits:changes")
-            .unwrap();
-        let activity = blocks
-            .iter()
-            .find(|block| {
-                block
-                    .metadata
-                    .fold
-                    .iter()
-                    .any(|fold| fold.id.0 == "edits:exchange")
-            })
-            .unwrap();
-        let endpoint = &activity
-            .metadata
-            .fold
-            .iter()
-            .find(|fold| fold.id.0 == "edits:exchange")
-            .unwrap()
-            .end
-            .block;
+        assert!(!blocks.iter().any(|block| block.id.0 == "edits:changes"));
         assert!(
-            blocks
-                .iter()
-                .position(|block| &block.id == endpoint)
-                .unwrap()
-                < summary
+            !projected
+                .action
+                .contains_key(&super::TargetId("edits:changes".into()))
         );
-        let aggregate = match projected
-            .action
-            .get(&super::TargetId("edits:changes".into()))
-            .unwrap()
-        {
-            super::TranscriptAction::Diff { text, .. } => text,
-            _ => panic!("aggregate must expose its reported patch"),
-        };
-        assert!(
-            aggregate.contains("+first")
-                && aggregate.contains("+second")
-                && !aggregate.contains("+wrong")
-        );
+        let reported = "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -0,0 +1 @@\n+second\n";
+        let checkpoint = "--- a/generated.rs\n+++ b/generated.rs\n@@ -0,0 +1 @@\n+generated\n";
+        for (checkpoint_after, attributed, total, matches) in [
+            (None, Some(reported), None, false),
+            (Some("checkpoint"), Some(reported), Some(reported), true),
+            (Some("checkpoint"), Some(reported), Some(checkpoint), false),
+            (Some("checkpoint"), None, Some(checkpoint), false),
+        ] {
+            exchange.checkpoint_after = checkpoint_after.map(str::to_owned);
+            exchange.attributed_diff_text = attributed.map(str::to_owned);
+            exchange.checkpoint_diff_text = total.map(str::to_owned);
+            exchange.attributed_matches_checkpoint = matches;
+            let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+            let with_checkpoint = project_at(
+                &TimelineEntry::Exchange {
+                    id: "edits".into(),
+                    created_at_ms: 0,
+                    exchange: restored,
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                100,
+            )?;
+            assert_eq!(with_checkpoint.entry.block, *blocks);
+            assert!(
+                !with_checkpoint
+                    .action
+                    .contains_key(&super::TargetId("edits:changes".into()))
+            );
+            assert!(
+                !with_checkpoint
+                    .action
+                    .contains_key(&super::TargetId("edits:checkpoint".into()))
+            );
+        }
         Ok(())
     }
 

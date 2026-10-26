@@ -76,7 +76,7 @@ pub(super) fn prepare(block: &mut BufferBlock, width: &WidthProfile) -> Result<(
     Ok(())
 }
 
-/// Collapses a response only after a later exchange has begun.
+/// Collapses a response after it leaves the retained recent-response window.
 pub(super) fn settle(block: &mut BufferBlock) {
     if let Some(node) = &mut block.metadata.node
         && node.kind == NodeKind::Message

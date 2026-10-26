@@ -106,7 +106,8 @@ nvim --headless -u NONE --cmd 'set rtp^=./nvim' -l nvim/tests/forge/harness_prom
 ```
 
 The message-fold fixture checks three-line previews, caret rendering, prompt submission,
-automatic response folding on the next exchange, and retained manual expansion in a fresh host.
+retention of the latest prior response, folding of the second-to-last response on submission,
+and retained manual expansion in a fresh host.
 Both fold fixtures load the installed Markdown renderer and parsers. The Markdown fixture
 checks repeated list folding beside a status row and cursor refreshes for stale bullet decorations.
 The configuration fixture applies thinking changes while idle, while a blocking provider owns

@@ -154,8 +154,9 @@ heading updates preserve the current loaded ranges at application time. They can
 fold metadata captured before the splice.
 
 Prompts and final responses longer than three display rows support message folds. Prompts
-start folded when submitted. The latest response stays expanded until the next exchange
-begins, which folds that response even after an explicit expansion. Older explicit choices
+start folded when submitted. The latest preceding response stays expanded throughout the next
+exchange. Starting another exchange folds the now second-to-last response, even after an explicit
+expansion. Exchanges without a final response do not displace the retained response. Older explicit choices
 remain stable. Folded messages show their first three display rows with a right-pointing
 caret, while expanded messages retain their complete Markdown, links, and text. The canonical
 block keeps the full message and the preview boundary. Resize recomputes that boundary without

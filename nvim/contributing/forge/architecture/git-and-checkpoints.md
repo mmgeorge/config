@@ -395,22 +395,21 @@ file changes in the main timeline and every referenced child-agent turn. The che
 then produces an attributed diff restricted to those paths and a checkpoint diff across every
 path. Because both use the same baseline-to-terminal content comparison, repeated edits,
 overlapping thoughts, and reversions resolve to one final canonical patch instead of summed
-provider hunks. Equal patches render one interaction-level `Changed … · checkpoint matched`
-node. Divergent patches render independent `Changed …` and `Checkpoint total: …` nodes. The
-per-operation provider trees remain available at their original timeline positions.
+provider hunks. These aggregate diffs remain internal exchange data and do not create transcript
+nodes or checkpoint annotations. The per-operation provider trees remain available at their
+original timeline positions.
 
 Saved patch presentation compares LF and CRLF lines by their text and reports line-ending
 conversions separately. Display counts and compact hunks therefore describe textual edits,
-including when reopening older checkpoints. The raw patch action, stored checkpoint bytes,
+including when reopening saved tool and artifact changes. The raw patch action, stored checkpoint bytes,
 and restore behavior retain the original line endings. Missing final newlines and bare CR
 characters remain content changes.
 
 Non-Git exchanges retain an aggregate of successful provider-reported edits at finalization,
-including edits from referenced child exchanges. That summary appears outside the activity node
-and is labeled `reported edits`. It groups repeated paths but preserves individual edit hunks,
-so its counts describe reported operations rather than a net workspace comparison. Reopened
-history without a saved aggregate derives the same summary from its retained edit records.
-No repository is initialized, and no checkpoint or rollback capability is implied.
+including edits from referenced child exchanges. The aggregate remains internal and does not
+create an additional transcript summary. The transcript presents the retained per-operation
+edits within their original activity sections. No repository is initialized, and no checkpoint
+or rollback capability is implied.
 
 The checkpoint total remains the rollback and cancellation-divergence authority. It intentionally
 includes command, formatter, and external-process effects that do not belong to a structured

@@ -12,7 +12,7 @@ use forge_diff::patch::UnifiedPatch;
 use super::projection::TranscriptAction;
 use super::transcript::TranscriptRenderer;
 
-/// Owns the folded presentation of one saved exchange, checkpoint, or tool patch.
+/// Owns the folded presentation of one artifact or tool patch.
 pub(super) struct ChangeTree {
     pub block: Vec<BufferBlock>,
     pub action: HashMap<TargetId, TranscriptAction>,
@@ -526,16 +526,13 @@ mod tests {
             &renderer,
             "exchange:changes",
             "Changed",
-            " · checkpoint matched",
+            "",
             diff,
             None,
             None,
         )
         .unwrap();
-        assert_eq!(
-            tree.block[0].text.row(0),
-            Some("▸ Changed 2 files +1 -2 · checkpoint matched")
-        );
+        assert_eq!(tree.block[0].text.row(0), Some("▸ Changed 2 files +1 -2"));
         let snapshot = BufferSnapshot {
             document: DocumentId("changes".into()),
             revision: DocumentRevision(0),

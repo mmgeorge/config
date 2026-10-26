@@ -29,6 +29,22 @@ local ok, failure = pcall(function()
     error("exchange summary is missing")
   end
   assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps")
+  local baseline = renderer.build({ { kind = "exchange", exchange = exchange } }, { expanded = {} })
+  local reported = "--- a/lib.rs\n+++ b/lib.rs\n@@ -0,0 +1 @@\n+reported\n"
+  local checkpoint = "--- a/generated.rs\n+++ b/generated.rs\n@@ -0,0 +1 @@\n+generated\n"
+  for _, state in ipairs({
+    { attributed_diff_text = reported },
+    { checkpoint_after = "checkpoint", attributed_diff_text = reported, checkpoint_diff_text = reported, attributed_matches_checkpoint = true },
+    { checkpoint_after = "checkpoint", attributed_diff_text = reported, checkpoint_diff_text = checkpoint },
+    { checkpoint_after = "checkpoint", checkpoint_diff_text = checkpoint },
+  }) do
+    local saved = vim.tbl_extend("force", vim.deepcopy(exchange), state)
+    local rendered = renderer.build({ { kind = "exchange", exchange = saved } }, { expanded = {} })
+    assert(vim.deep_equal(rendered.lines, baseline.lines), "checkpoint metadata must not add transcript rows")
+    for _, row in pairs(rendered.rows) do
+      assert(row.kind ~= "checkpoint_changes" and row.kind ~= "attributed_changes", "aggregate change actions must stay out of the transcript")
+    end
+  end
   exchange.metrics.tool_duration_ms = 439
   exchange.metrics.reported_response_ms = 5561
   assert_equals(summary(), "▸ Thought 6s │ 0/1 tools · 439 ms │ 76.0k (90%) -> 4.2k · 755 tps")

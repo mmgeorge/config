@@ -175,7 +175,9 @@ explicitly expanded. Groups that finish before their exchange retain this compac
 After exchange completion, expanding the group shows every tool. Expanding an individual tool
 loads its complete output through the existing paging path. A settled group defaults to collapsed
 tools without previews. Exchange completion also
-collapses the activity node and leaves its aggregate changes and final response outside it.
+collapses the activity node and leaves its final response outside it. Tool changes remain
+inside their activity sections. Checkpoint and exchange-level aggregate diffs do not create
+additional transcript nodes.
 Hidden tools retain their output caches, including late parallel output, without changing visible
 rows. Explicit group expansion persists while new calls arrive, but its live body remains limited
 to the latest tool until exchange completion.

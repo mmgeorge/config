@@ -819,45 +819,6 @@ local function append_interaction(result, interaction, options, agent_by_id)
     end
   end
   if complete then
-    local attributed_key = ("interaction:%s:attributed"):format(interaction.id or interaction.ordinal)
-    local attributed = diff_tree.build(interaction.attributed_diff_text, {
-      indent = 2,
-      key_prefix = attributed_key,
-      interaction = interaction,
-      cwd = options.cwd,
-      on_update = options.on_diff_update,
-      expanded = result.expanded,
-    })
-    if attributed.file_count > 0 then
-      append_change_summary(result, attributed, {
-        indent = "",
-        label = "Changed",
-        suffix = interaction.attributed_matches_checkpoint and " · checkpoint matched" or nil,
-        kind = "attributed_changes",
-        interaction = interaction,
-        expand_key = attributed_key,
-      })
-    end
-    if not interaction.attributed_matches_checkpoint then
-      local checkpoint_key = ("interaction:%s:checkpoint"):format(interaction.id or interaction.ordinal)
-      local checkpoint = diff_tree.build(interaction.checkpoint_diff_text, {
-        indent = 2,
-        key_prefix = checkpoint_key,
-        interaction = interaction,
-        cwd = options.cwd,
-        on_update = options.on_diff_update,
-        expanded = result.expanded,
-      })
-      if checkpoint.file_count > 0 then
-        append_change_summary(result, checkpoint, {
-          indent = "",
-          label = "Checkpoint total:",
-          kind = "checkpoint_changes",
-          interaction = interaction,
-          expand_key = checkpoint_key,
-        })
-      end
-    end
     if #deferred_response > 0 then
       local response_line = #result.lines + 1
       result.rows[response_line] = {

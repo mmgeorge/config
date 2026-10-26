@@ -133,7 +133,9 @@ Switching resumes the task under the configured directory limits and permission 
 Staying in Read mode rejects that request.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
-previous response folds when a new exchange starts. Use the normal expansion command on
+latest prior response stays open during the next exchange. Submitting another prompt folds
+the second-to-last response. Thinking and tool sections keep their usual folding behavior.
+Use the normal expansion command on
 the caret or message body to show or hide the complete text.
 
 `Running` tool groups show only the latest call and its four-row output preview.
@@ -151,6 +153,9 @@ to the same file count once and show the original-to-final diff. A pending write
 Owned events stay inside the thought, including compaction. Late results stay with their
 original operation. Failed writes retain their diagnostics inside the changes group.
 Inconsistent edit reports retain their reported hunks with a diagnostic.
+Completing an exchange keeps these changes in their activity sections without adding a
+checkpoint total or another exchange-level change summary. File checkpoints remain available
+through `/undo`.
 
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do

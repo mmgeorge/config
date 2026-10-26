@@ -28,7 +28,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
-    latest_exchange: Option<String>,
+    unsettled_exchange: Vec<String>,
     syntax_done: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
@@ -526,7 +526,12 @@ impl SessionPresentation {
             });
         }
         let mut projected = Vec::new();
-        let latest = latest_exchange(self.timeline.entry_list());
+        let unsettled = unsettled_exchanges(
+            self.timeline
+                .entry_list()
+                .iter()
+                .map(ProjectionSource::Entry),
+        );
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
             let mut entry = project(
                 ProjectionSource::Entry(entry),
@@ -535,7 +540,7 @@ impl SessionPresentation {
                 &HashMap::new(),
                 &HashMap::new(),
             )?;
-            if Some(entry.entry.id.as_str()) != latest {
+            if !unsettled.contains(&entry.entry.id) {
                 settle_responses(&mut entry);
             }
             projected.push(entry);
@@ -574,7 +579,7 @@ impl SessionPresentation {
             transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
-            latest_exchange: latest.map(str::to_owned),
+            unsettled_exchange: unsettled,
             syntax_done: HashSet::new(),
             syntax,
             agent_scope: None,
@@ -1028,17 +1033,29 @@ impl SessionPresentation {
         if patch.is_empty() {
             return;
         }
-        let latest = latest_exchange(self.timeline.entry_list());
         let Some(open) = self.open.as_mut() else {
             return;
         };
         if open.failure.is_some() {
             return;
         }
-        let latest = if open.agent_scope.is_some() {
-            open.latest_exchange.clone()
+        let unsettled = if let Some(run_id) = open.agent_scope.as_deref() {
+            unsettled_exchanges(
+                find_agent(self.timeline.entry_list(), run_id, 0)
+                    .into_iter()
+                    .flat_map(|entry| match entry {
+                        TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
+                        _ => unreachable!("agent lookup returns an agent lifecycle"),
+                    })
+                    .map(ProjectionSource::Exchange),
+            )
         } else {
-            latest.map(str::to_owned)
+            unsettled_exchanges(
+                self.timeline
+                    .entry_list()
+                    .iter()
+                    .map(ProjectionSource::Entry),
+            )
         };
         let applied = if open.agent_scope.is_some() {
             if patch.operation.iter().all(|operation| {
@@ -1068,7 +1085,7 @@ impl SessionPresentation {
                         _ => false,
                     })
                     .collect();
-                apply_projection(open, patch, filtered.iter().copied(), latest.as_deref())
+                apply_projection(open, patch, filtered.iter().copied(), &unsettled)
             } else {
                 reflow(open, self.timeline.entry_list(), self.timeline.revision())
             }
@@ -1085,7 +1102,7 @@ impl SessionPresentation {
         }) {
             reflow(open, self.timeline.entry_list(), self.timeline.revision())
         } else {
-            apply_projection(open, patch, patch.operation.iter(), latest.as_deref())
+            apply_projection(open, patch, patch.operation.iter(), &unsettled)
         };
         if let Err(error) = applied {
             open.failure = Some(format!("{error:#}"));
@@ -1127,11 +1144,32 @@ fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
     }
 }
 
-fn latest_exchange(source: &[TimelineEntry]) -> Option<&str> {
-    source.iter().rev().find_map(|entry| match entry {
-        TimelineEntry::Exchange { id, .. } => Some(id.as_str()),
+/// Keeps the current exchange and the most recent preceding response outside automatic folding.
+fn unsettled_exchanges<'source>(
+    source: impl DoubleEndedIterator<Item = ProjectionSource<'source>>,
+) -> Vec<String> {
+    let mut exchanges = source.filter_map(|entry| match entry {
+        ProjectionSource::Entry(TimelineEntry::Exchange { id, exchange, .. }) => {
+            Some((id, exchange))
+        }
+        ProjectionSource::Exchange(exchange) => Some((&exchange.id, exchange)),
         _ => None,
-    })
+    });
+    let mut unsettled = Vec::new();
+    if let Some((id, _)) = exchanges.next_back() {
+        unsettled.push(id.clone());
+    }
+    if let Some((id, _)) = exchanges.rfind(|(_, exchange)| {
+        exchange.turn.iter().any(|turn| {
+            turn.messages().iter().any(|message| {
+                message.kind() == crate::turn::MessageKind::Assistant
+                    && message.delivery() == crate::turn::MessageDelivery::Final
+            })
+        })
+    }) {
+        unsettled.push(id.clone());
+    }
+    unsettled
 }
 
 fn settle_responses(projected: &mut ProjectedEntry) {
@@ -1424,11 +1462,7 @@ fn reflow(
         .unwrap_or(&open.last_width)
         .clone();
     let mut projected = Vec::new();
-    let latest = source.iter().rev().find_map(|entry| match entry {
-        ProjectionSource::Entry(TimelineEntry::Exchange { id, .. }) => Some(id.clone()),
-        ProjectionSource::Exchange(exchange) => Some(exchange.id.clone()),
-        _ => None,
-    });
+    let unsettled = unsettled_exchanges(source.iter().copied());
     for (index, entry) in source.into_iter().enumerate() {
         let mut entry = project(
             entry,
@@ -1437,7 +1471,7 @@ fn reflow(
             &open.sections.nodes.choice,
             &open.sections.nodes.tool_limit,
         )?;
-        if Some(entry.entry.id.as_str()) != latest.as_deref() {
+        if !unsettled.contains(&entry.entry.id) {
             settle_responses(&mut entry);
         }
         projected.push(entry);
@@ -1471,7 +1505,7 @@ fn reflow(
     open.syntax = syntax;
     open.sections.nodes.tool = tool;
     open.last_width = width;
-    open.latest_exchange = latest;
+    open.unsettled_exchange = unsettled;
     retain_patches(open, patch)
 }
 
@@ -1479,17 +1513,20 @@ fn apply_projection<'operation>(
     open: &mut OpenPresentation,
     patch: &TimelinePatch,
     operations: impl Iterator<Item = &'operation TimelineOperation> + Clone,
-    latest: Option<&str>,
+    unsettled: &[String],
 ) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
     let mut changed = Vec::new();
-    if open.latest_exchange.as_deref() != latest {
-        if let Some(entry) = open
-            .latest_exchange
-            .as_ref()
-            .and_then(|id| open.entry.get_mut(id))
+    if open.unsettled_exchange != unsettled {
+        for id in open
+            .unsettled_exchange
+            .iter()
+            .filter(|id| !unsettled.contains(id))
         {
+            let Some(entry) = open.entry.get_mut(id) else {
+                continue;
+            };
             for response in entry.response.drain(..) {
                 if let Some(previous) = open.transcript.document.block(&response) {
                     let mut block = previous.clone();
@@ -1498,7 +1535,7 @@ fn apply_projection<'operation>(
                 }
             }
         }
-        open.latest_exchange = latest.map(str::to_owned);
+        open.unsettled_exchange = unsettled.to_vec();
     }
     for operation in operations.clone() {
         match operation {
@@ -1519,7 +1556,12 @@ fn apply_projection<'operation>(
                     .block(&block_id)
                     .context("streamed message block is missing")?;
                 let mut replacement = super::projection::message_block(previous, message, width)?;
-                if Some(entry_id.as_str()) != latest {
+                let owner = if open.agent_scope.is_some() {
+                    exchange_id
+                } else {
+                    entry_id
+                };
+                if !unsettled.contains(owner) {
                     settle_responses(&mut replacement);
                 }
                 let previous_targets = previous
@@ -1535,11 +1577,6 @@ fn apply_projection<'operation>(
                 let syntax_target = TargetId(format!("{}:markdown-syntax", block_id.0));
                 open.syntax.remove(&syntax_target);
                 open.syntax_done.remove(&syntax_target);
-                let owner = if open.agent_scope.is_some() {
-                    exchange_id
-                } else {
-                    entry_id
-                };
                 if let Some(entry) = open.entry.get_mut(owner) {
                     entry
                         .target
@@ -1722,7 +1759,7 @@ fn apply_projection<'operation>(
                     &open.sections.nodes.choice,
                     &open.sections.nodes.tool_limit,
                 )?;
-                if Some(entry.entry.id.as_str()) != latest {
+                if !unsettled.contains(&entry.entry.id) {
                     settle_responses(&mut entry);
                 }
                 let info = entry_presentation(&entry);
@@ -1933,7 +1970,7 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
     #[test]
-    fn long_messages_fold_on_submission_and_the_next_exchange_and_reopen_after_resize()
+    fn long_messages_keep_the_previous_response_until_another_prompt_and_reopen_after_resize()
     -> anyhow::Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
@@ -2024,7 +2061,83 @@ mod tests {
             };
         expand(&mut owner, "first:prompt", 10)?;
         expand(&mut owner, &response.0, 11)?;
-        owner.reconcile(vec![entry.clone(), interaction_entry("second")])?;
+        let mut second = interaction_entry("second");
+        owner.reconcile(vec![entry.clone(), second.clone()])?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        owner.dispatch(super::PresentationRequest::Resize {
+            document: document.clone(),
+            view: view.clone(),
+            width: forge_buffer::width::WidthProfile {
+                columns: 70,
+                ..Default::default()
+            },
+        })?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let without_response = vec![entry.clone(), second.clone(), interaction_entry("empty")];
+        owner.reconcile(without_response)?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let TimelineEntry::Exchange { exchange, .. } = &mut second else {
+            unreachable!()
+        };
+        exchange.state = crate::exchange::ExchangeState::Running;
+        exchange.completed_at_ms = None;
+        event.address.as_mut().unwrap().turn_id = "second-reply".into();
+        event.turn_boundary = Some(TurnBoundary::Started);
+        event.kind = "turn_started".into();
+        event.text = None;
+        event.data = serde_json::Value::Null;
+        exchange.observe_turn(&event, 4)?;
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("next one\nnext two\nnext three\nnext four\nnext five".into());
+        event.data =
+            serde_json::json!({"phase":"final_answer", "provider_message_id":"second-reply"});
+        exchange.observe_turn(&event, 5)?;
+        owner.reconcile(vec![entry.clone(), second.clone()])?;
+        let second_response = owner.open.as_ref().unwrap().entry["second"].response[0].clone();
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let history = vec![entry.clone(), second, interaction_entry("third")];
+        owner.reconcile(history.clone())?;
         let snapshot = owner.snapshot(&document)?;
         let collapsed = snapshot
             .block
@@ -2041,6 +2154,40 @@ mod tests {
             NodeLifecycle::Settled
         );
         assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .find(|block| block.id == second_response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let mut reopened = super::SessionPresentation::new("session".into());
+        reopened.initialize(history.clone())?;
+        reopened.open(document.clone(), view.clone(), Default::default())?;
+        let restored = reopened.snapshot(&document)?;
+        assert_eq!(
+            restored
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            3
+        );
+        assert_eq!(
+            restored
+                .block
+                .iter()
+                .find(|block| block.id == second_response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        assert_eq!(
             owner
                 .open
                 .as_ref()
@@ -2054,6 +2201,9 @@ mod tests {
             5
         );
         expand(&mut owner, &response.0, 12)?;
+        let mut later = history;
+        later.push(interaction_entry("fourth"));
+        owner.reconcile(later)?;
         owner.dispatch(super::PresentationRequest::Resize {
             document: document.clone(),
             view: view.clone(),
@@ -2531,10 +2681,15 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else {
             unreachable!()
         };
-        exchange.attributed_diff_text = Some(
-            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n"
-                .into(),
-        );
+        exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
+            change: crate::exchange::ArtifactChange {
+                id: "saved-diff".into(),
+                path: "test.mjs".into(),
+                diff_text: "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n".into(),
+                created_at_ms: 1,
+                declaration: None,
+            },
+        });
         assert!(output.len() * entries.len() > 64 * 1024 * 1024);
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(entries.clone())?;
@@ -3890,7 +4045,17 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
             unreachable!()
         };
-        exchange.attributed_diff_text = Some(source.into());
+        exchange
+            .node_list
+            .push(crate::exchange::ExchangeNode::ArtifactChange {
+                change: crate::exchange::ArtifactChange {
+                    id: "saved-diff".into(),
+                    path: "test.rs".into(),
+                    diff_text: source.into(),
+                    created_at_ms: 1,
+                    declaration: None,
+                },
+            });
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![entry.clone()])?;
         let document = DocumentId("transcript:invalid-diff".into());
@@ -3926,7 +4091,12 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
             unreachable!()
         };
-        exchange.attributed_diff_text = Some(source.replace("+outside\n", ""));
+        let Some(crate::exchange::ExchangeNode::ArtifactChange { change }) =
+            exchange.node_list.last_mut()
+        else {
+            unreachable!()
+        };
+        change.diff_text = source.replace("+outside\n", "");
         owner.reconcile(vec![entry])?;
         assert!(owner.capture_syntax(&document)?.is_some());
         Ok(())
@@ -3946,10 +4116,15 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
             unreachable!()
         };
-        exchange.attributed_diff_text = Some(
-            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n"
-                .into(),
-        );
+        exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
+            change: crate::exchange::ArtifactChange {
+                id: "saved-diff".into(),
+                path: "test.mjs".into(),
+                diff_text: "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n".into(),
+                created_at_ms: 1,
+                declaration: None,
+            },
+        });
         exchange.completed_at_ms = None;
         exchange.execution_started_at_ms = Some(1);
         let mut owner = SessionPresentation::new("session".into());
@@ -3994,7 +4169,12 @@ mod tests {
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
             unreachable!()
         };
-        exchange.attributed_diff_text.as_mut().unwrap().push('\n');
+        let Some(crate::exchange::ExchangeNode::ArtifactChange { change }) =
+            exchange.node_list.last_mut()
+        else {
+            unreachable!()
+        };
+        change.diff_text.push('\n');
         owner.reconcile(vec![entry])?;
         let before = owner.snapshot(&document)?;
         owner.apply_syntax(&document, &job, blocks.clone())?;
