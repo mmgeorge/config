@@ -53,6 +53,15 @@ local success, failure = xpcall(function()
   local handoff = health.notice(state)
   assert(handoff.text == "Working" and handoff.animated and handoff.hint == "working",
     "a ready queued message must keep Working visible during handoff")
+  state.queue_paused = true
+  assert(health.notice(state) == nil, "locally paused input must not imply a queued handoff")
+  state.session.current_task_id, state.task = nil, {}
+  queued.task_id = nil
+  assert(health.notice(state) == nil, "taskless chat cancellation must not retain a Working spinner")
+  state.queue_paused = false
+  assert(health.notice(state).text == "Working", "resuming taskless queued work lost its handoff status")
+  state.session.current_task_id, state.task = "task", {{id = "task", status = "running"}}
+  queued.task_id = "task"
   state.queue_edit = {barrier = queued}
   assert(health.notice(state) == nil, "editing the next message must not imply a handoff")
   state.queue_edit = nil

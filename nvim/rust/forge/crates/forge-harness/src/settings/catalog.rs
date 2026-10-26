@@ -438,6 +438,29 @@ mod test {
     use super::*;
 
     #[test]
+    fn harness_check_skill_is_discoverable_for_every_provider() {
+        let fixture = tempfile::tempdir().unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../../rulesync-global/.rulesync/skills/harness-checks/SKILL.md");
+        let directory = fixture
+            .path()
+            .join("rulesync-global/.rulesync/skills/harness-checks");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::copy(source, directory.join("SKILL.md")).unwrap();
+        let skill =
+            ResourceCatalog::skills(Some(fixture.path()), &fixture.path().join("workspace"))
+                .unwrap();
+        assert_eq!(skill.len(), 1);
+        assert_eq!(skill[0].name, "harness-checks");
+        assert_eq!(skill[0].scope, Some(crate::backend::ResourceScope::Global));
+        assert!(skill[0].user_invocable);
+        assert!(skill[0].description.contains("checks_configure"));
+        for target in ["codexcli", "copilotcli", "claudecode", "antigravity-cli"] {
+            assert!(ResourceCatalog::supports_target(&skill[0].targets, target));
+        }
+    }
+
+    #[test]
     fn source_identity_survives_definition_change_and_does_not_merge_same_names() {
         let fixture = tempfile::tempdir().unwrap();
         let global = fixture.path().join("global");

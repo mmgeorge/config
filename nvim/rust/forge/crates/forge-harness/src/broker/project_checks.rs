@@ -66,8 +66,8 @@ impl HarnessBroker {
         self.observer.set_check_editing(true)?;
         self.check_setup = true;
         let result = self.run_interaction(format!(
-            "The user requested a plan. Project checks are missing or invalid, so configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{}\n\n{}",
-            plan.request, include_str!("../checks/setup.md")), PromptMode::Chat, Some(admission)).await;
+            "The user requested a plan. Project checks are missing or invalid, so use the harness-checks skill to configure them before beginning that plan. Do not design or implement the requested feature yet. Use the original request only to identify the intended tooling. Harness will resume the original planning request after successful configuration publication.\n\nOriginal planning request:\n{}",
+            plan.request), PromptMode::Chat, Some(admission)).await;
         self.check_setup = false;
         result
     }
@@ -274,55 +274,6 @@ impl HarnessBroker {
             _ => anyhow::bail!("unknown checks operation"),
         };
         Ok((result, Vec::new()))
-    }
-
-    pub(super) async fn setup_checks(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        if self.agent_coordinator.active_count() != 0 || self.check_runner.active()?.is_some() {
-            return Err(
-                RequestNotAdmitted("wait for active checks and agents before setup").into(),
-            );
-        }
-        if self.active_plan_awaits_input()?
-            || self.active_plan_has_acceptance()?
-            || self.find_active_interaction_elicitation()?.is_some()
-        {
-            return Err(RequestNotAdmitted(
-                "answer the active plan questions before starting separate check setup",
-            )
-            .into());
-        }
-        let prompt = include_str!("../checks/setup.md");
-        let selected = params
-            .get("check_id")
-            .and_then(Value::as_str)
-            .unwrap_or("all definitions");
-        let admission =
-            ExchangeAdmission::chat(params.get("check_id").and_then(Value::as_str).map_or_else(
-                || "/checks setup".into(),
-                |id| format!("/checks setup {id}"),
-            ));
-        let plan = self
-            .current_plan_id()?
-            .as_ref()
-            .map(|id| self.plan_file.read_working_document(&self.session.id, id))
-            .transpose()?
-            .map(|document| serde_json::to_string(&document))
-            .transpose()?
-            .unwrap_or_else(|| "No active plan.".into());
-        self.observer.set_check_editing(true)?;
-        self.check_setup = true;
-        let result = self.run_interaction(format!("Configure project checks through checks_configure. Focus: {selected}.\n\nActive proposed plan (read-only context):\n{plan}\n\n{prompt}"), PromptMode::Chat, Some(admission)).await;
-        self.check_setup = false;
-        if result.is_ok()
-            && crate::checks::ConfigSnapshot::load(Path::new(&self.session.workspace)).is_ok()
-            && let Some(plan_id) = self.current_plan_id()?
-        {
-            self.refresh_check_review(&plan_id)?;
-        }
-        result
     }
 
     pub(super) async fn check_task_files(

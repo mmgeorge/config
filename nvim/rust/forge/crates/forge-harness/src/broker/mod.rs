@@ -883,6 +883,7 @@ impl HarnessBroker {
             Arc::clone(&presentation),
             store.objects.clone(),
             Arc::clone(&runtime.repositories),
+            trace.clone(),
         )?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
@@ -1454,7 +1455,6 @@ impl HarnessBroker {
         Box<dyn std::future::Future<Output = Result<(Value, Vec<SessionEvent>)>> + Send + '_>,
     > {
         match method {
-            HarnessMethod::ChecksSetup => Box::pin(self.setup_checks(params)),
             HarnessMethod::ChecksComplete => Box::pin(async move {
                 let result = (serde_json::to_value(self.snapshot()?)?, Vec::new());
                 self.settle_automatic_checks(result, PromptMode::Chat).await
@@ -6005,8 +6005,6 @@ Planning continuation: turn {} of {}.",
                 authorization_sink: backend_event_sink.clone(),
                 editing: Arc::clone(&self.observer.check_editing),
                 setup: interaction.check_setup.is_some(),
-                setup_reviewed: interaction.check_setup
-                    == Some(crate::checks::CheckSetupState::Reviewed),
                 can_run: interaction.check_setup.is_none()
                     && self.agent_coordinator.active_count() == 0
                     && execution.is_none(),
@@ -11360,7 +11358,6 @@ mod test {
             BackendInput::from_text("Plan a fixture"),
         ));
         let bytes = std::mem::size_of_val(future.as_ref().get_ref());
-        eprintln!("interaction inline bytes: {bytes}");
         assert!(
             bytes <= 16 * 1024,
             "interaction retains {bytes} inline bytes"
@@ -18154,7 +18151,6 @@ mod test {
                 authorization_sink: sink,
                 editing: Arc::clone(&broker.observer.check_editing),
                 setup: false,
-                setup_reviewed: false,
                 can_run: true,
                 agent: Arc::clone(&broker.agent_coordinator),
                 cancelled: Arc::new(AtomicBool::new(false)),
@@ -18211,6 +18207,139 @@ mod test {
     }
 
     #[tokio::test]
+    async fn check_configuration_reviews_each_submission_except_yolo() -> Result<()> {
+        use crate::backend::approval::{ApprovalAnswer, ApprovalRequestView};
+        use crate::permissions::document::{CATEGORY_EDIT, PermissionDecision};
+
+        for permission in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
+            for scenario in ["approve", "reject", "cancel", "stale", "revoke"] {
+                let repository = repository();
+                let data = tempfile::tempdir()?;
+                let mut broker = planning_question_broker(repository.path(), data.path(), false);
+                save_check_exchange(&mut broker, "review-checks", false)?;
+                broker.observer.set_check_editing(true)?;
+                broker
+                    .permission_coordinator
+                    .store()
+                    .write()
+                    .unwrap()
+                    .set_rule_list(&[(
+                        CATEGORY_EDIT.into(),
+                        "*".into(),
+                        PermissionDecision::Allow,
+                    )])?;
+                let original = json!({"branch_prefix":"preserved","checks":{}});
+                std::fs::write(
+                    repository.path().join(".forge.json"),
+                    serde_json::to_vec(&original)?,
+                )?;
+                let (sink, mut events) = crate::backend::events::channel();
+                let (scope, _lease) = crate::checks::CheckToolScope::open(
+                    Arc::clone(&broker.check_runner),
+                    crate::checks::CheckAuthority {
+                        data_root: broker.data_root.clone(),
+                        backend: broker.session.backend.clone(),
+                        task_id: None,
+                        shell: broker.session.shell,
+                        mode: PromptMode::Chat,
+                        permission,
+                        permissions: Arc::clone(&broker.permission_coordinator),
+                        address: crate::backend::ProviderAddress {
+                            owner: None,
+                            thread_id: broker.session.id.clone(),
+                            turn_id: "review-checks".into(),
+                        },
+                        authorization_sink: sink,
+                        editing: Arc::clone(&broker.observer.check_editing),
+                        setup: true,
+                        can_run: false,
+                        agent: Arc::clone(&broker.agent_coordinator),
+                        cancelled: Arc::new(AtomicBool::new(false)),
+                        sink: None,
+                    },
+                );
+                let request = json!({
+                    "expected_revision": broker.check_runner.catalog(None)?["revision"],
+                    "config": {"unit":{"trigger":{"auto":true},"action":{"command":["cargo","test"]}}}
+                });
+                let publication = scope.invoke("checks_configure", request);
+                tokio::pin!(publication);
+                if permission != PermissionMode::Yolo {
+                    let event = tokio::select! {
+                        result = &mut publication => panic!("published without review: {result:?}"),
+                        event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv()) =>
+                            event??.context("review event missing")?,
+                    };
+                    assert_eq!(event.kind, "approval_requested");
+                    let approval: ApprovalRequestView = serde_json::from_value(event.data)?;
+                    assert_eq!(approval.item_list.len(), 1);
+                    let item = &approval.item_list[0];
+                    assert_eq!(item.title, "Update project checks");
+                    assert!(item.detail.contains("+"));
+                    assert!(item.detail.contains("cargo"));
+                    assert!(
+                        item.choice_list
+                            .iter()
+                            .all(|choice| choice.rule_list.is_empty())
+                    );
+                    assert_eq!(
+                        serde_json::from_slice::<Value>(&std::fs::read(
+                            repository.path().join(".forge.json"),
+                        )?)?,
+                        original,
+                        "configuration changed before approval"
+                    );
+                    if scenario == "stale" {
+                        std::fs::write(
+                            repository.path().join(".forge.json"),
+                            b"{\"branch_prefix\":\"newer\",\"checks\":{}}",
+                        )?;
+                    } else if scenario == "revoke" {
+                        broker.observer.set_check_editing(false)?;
+                    }
+                    broker
+                        .permission_coordinator
+                        .resolve(
+                            &approval.id,
+                            &[ApprovalAnswer {
+                                item_id: item.id.clone(),
+                                choice_id: match scenario {
+                                    "reject" => "deny_once",
+                                    "cancel" => "cancel",
+                                    _ => "allow_once",
+                                }
+                                .into(),
+                            }],
+                            None,
+                        )
+                        .await?;
+                }
+                let result =
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut publication)
+                        .await?;
+                let document: Value =
+                    serde_json::from_slice(&std::fs::read(repository.path().join(".forge.json"))?)?;
+                if permission == PermissionMode::Yolo || scenario == "approve" {
+                    result?;
+                    assert!(document["checks"]["unit"].is_object());
+                    assert_eq!(document["branch_prefix"], "preserved");
+                } else {
+                    assert!(result.is_err(), "{scenario} unexpectedly published");
+                    assert_eq!(document["checks"], json!({}));
+                }
+                if permission == PermissionMode::Yolo {
+                    assert!(events.try_recv().is_err(), "YOLO opened review");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn configured_check_tools_run_without_command_approval() -> Result<()> {
         let repository = repository();
         let data = tempfile::tempdir()?;
@@ -18246,7 +18375,6 @@ mod test {
                     authorization_sink: sink,
                     editing: Arc::clone(&broker.observer.check_editing),
                     setup: false,
-                    setup_reviewed: false,
                     can_run: true,
                     agent: Arc::clone(&broker.agent_coordinator),
                     cancelled: Arc::new(AtomicBool::new(false)),

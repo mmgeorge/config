@@ -13,8 +13,6 @@ pub enum HarnessMethod {
     LspAnalyze,
     #[serde(rename = "checks.list")]
     ChecksList,
-    #[serde(rename = "checks.setup")]
-    ChecksSetup,
     #[serde(rename = "checks.editing")]
     ChecksEditing,
     #[serde(rename = "checks.override")]
@@ -248,7 +246,6 @@ impl HarnessMethod {
             self,
             Self::PromptSubmit
                 | Self::ChecksComplete
-                | Self::ChecksSetup
                 | Self::AgentStart
                 | Self::ExchangeResume
                 | Self::PlanAccept
@@ -267,6 +264,15 @@ impl HarnessMethod {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn check_editing_has_no_guided_setup_operation() {
+        assert_eq!(
+            super::HarnessMethod::decode("checks.editing").unwrap(),
+            super::HarnessMethod::ChecksEditing
+        );
+        assert!(super::HarnessMethod::decode("checks.setup").is_err());
+    }
+
     #[test]
     fn exchange_methods_replace_interaction_names_without_aliases() {
         for suffix in [

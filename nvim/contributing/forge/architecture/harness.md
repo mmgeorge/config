@@ -259,8 +259,11 @@ Closed output views and replaced hosts cannot adopt late responses.
 
 Harness Markdown resolves visible message owners through the weighted sequence. Collapsed
 descendants have no buffer rows and never enter Markdown parsing. The parser includes complete visible messages across all attached windows, retaining
-delimiter context without scanning off-screen history. Per-block versions suppress renders after
-unrelated tool and timer patches. Parsing uses a completion callback guarded by the render lifetime.
+delimiter context without scanning off-screen history. The presentation caches message versions,
+window identities, and the buffer changedtick. Text publications restore the intended parser
+boundaries even when no Markdown owner changed, because Tree-sitter can extend a message's
+included region into rows appended at its end. Metadata-only and timer updates retain the
+cached presentation. Parsing uses a completion callback guarded by the render lifetime.
 Leaving all Markdown regions stops their highlighter. Cursor reveal checks use the cursor range,
 and display and inline math share asynchronous conversion with at most four active processes.
 Conversion failures retain source text and report the underlying error. A converter has a
@@ -280,8 +283,11 @@ from tool execution time.
 ### Harness timeline ownership
 
 The transcript presentation owns a shared gutter selection controller. `W` enters linewise
-Visual mode and highlights selected source rows together with their virtual gutters.
-`<Space>l` copies those rows with gutters in display order without changing buffer text.
+Visual mode and highlights complete display rows, including the left status column,
+timeline markers, indentation, and inline diff gutters. `<Space>l` copies those rows
+with their displayed markers and gutters without changing buffer text. Copying resolves
+expansion markers from the same layout owner as rendering and removes concealed source
+markers so they do not appear twice.
 Selection exit, buffer leave, rejected startup, and presentation close release selection
 ownership and restore the prior clipboard mapping. Ordinary timeline cursor movement retains
 its existing behavior. Harness keymap configuration and help expose this command only in the
@@ -725,9 +731,15 @@ same-repository session. Preview requests never acquire or alter a durable sessi
 
 Check setup uses ordinary provider execution admission, not the installation/authentication cleanup
 lock. Its model turn therefore remains steerable and interruptible while preserving exclusive execution
-and finalization. Ctrl-C with composer text follows immediate prompt delivery, including Copilot's native
-immediate steering. An empty composer submits a pause intent with output-free prompt retraction
-enabled. Explicit pause actions retain their existing pause-only behavior.
+and finalization. Ctrl-C submits a pause intent with output-free prompt retraction enabled,
+regardless of composer content. It never submits or steers the draft, commits a queued edit,
+or releases queued follow-ups. The composer and pending input retain their existing ownership.
+When a child timeline is selected, Ctrl-C interrupts that child without sending the composer.
+Explicit pause actions retain their existing pause-only behavior.
+The presentation state retains `queue_paused` independently of host task records, so
+taskless chat cancellation cannot release queued input when the pause acknowledgement settles.
+A replacement prompt waiting for check cancellation moves into the queue before its callback
+can deliver it. An explicit new prompt or execution task action releases the local pause.
 
 ## Exchange and restart ownership
 
@@ -1372,8 +1384,11 @@ so unresolved paths and malformed commands reach the editor's notification bound
 
 The existing permission popup includes “Allow and add to global readable directories” or
 the writable equivalent for reported file targets. The server mints the canonical directory
-in each choice. A file grants its existing parent, and a new nested path grants its nearest
-existing directory, with that exact directory displayed before approval. Directory choices
+in each choice. Read grants use the file's existing parent or the nearest existing directory
+for a new nested path. Write grants discover the containing Git worktree from that directory
+and use its root, including linked worktrees and nested repositories. Non-Git writes retain
+the nearest existing directory. Discovery failures reach the permission-error boundary
+instead of producing a broader grant. The popup displays the exact directory before approval. Directory choices
 carry no client-selected path. `SettingsStore::grant_directories` merges accepted choices
 into global settings in one immediate SQLite transaction, retaining unrelated preferences
 and concurrent grants. Persistence completes before the provider receives approval. A
@@ -1381,8 +1396,13 @@ successful grant refreshes the active session's displayed access lists through t
 execution-state event, without interrupting the execution waiting for that approval.
 Subsequent authorization reads current stored lists, including global grants alongside
 workspace/session lists, so grants survive restarts and configured removals take effect.
-Exact and broad permission-file choices remain available. Outside the workspace, broad
-choices name the displayed canonical directory instead of granting an unrelated workspace rule.
+Exact and broad permission-file choices remain available. Write-directory choices and
+external read-directory choices name the displayed canonical directory. Write targets inside
+the execution workspace also offer "Always allow writes in this workspace", which persists
+an absolute workspace edit rule without enabling filesystem-wide writes or changing approval
+mode. When the directory and workspace coincide, this choice replaces the duplicate broad
+allow choice. External targets do not offer an unrelated workspace grant. Explicit denials,
+protected targets, and the Read-mode transition remain authoritative.
 
 These scopes authorize reported file operations, not every filesystem access performed by
 a provider, shell command, or MCP server. Copilot and ACP do not acquire an OS filesystem
@@ -1852,9 +1872,17 @@ default to off. The broker snapshot supplies the permission for the Harness winb
 `/checks setup on` and `/checks setup off` send this control request without creating
 an exchange, interrupting active work, or issuing a model prompt.
 
-Guided `/checks setup` enables the same permission after setup admission. Its exchange
-still requires a recorded answer before publication. Outside guided setup, explicit
-permission allows `checks_configure` without a setup exchange. Check tools read the
+Configuration requests use ordinary chat, not a dedicated setup operation.
+The global Rulesync `harness-checks` skill owns discovery, configuration schema,
+and scoped-helper instructions. `ResourceCatalog` discovers its canonical source
+and provider resource profiles bind it like other selected skills. The per-turn
+contract references the skill without repeating its body. Automatic planning
+prerequisites also reference it and retain the original plan request.
+Questions are optional and never authorize publication. Every `checks_configure` invocation
+reviews the exact configuration and managed helper changes through the shared
+approval coordinator in Read and Write modes, regardless of saved allow rules.
+YOLO skips this review. Review choices apply only to that submission and do not
+create permission rules. Check tools read the
 shared permission at invocation and before publication, so revocation also applies to
 already-open tool scopes. Configuration still validates revisions, managed helpers,
 write approval, and active-agent exclusion. The permission does not enable check runs

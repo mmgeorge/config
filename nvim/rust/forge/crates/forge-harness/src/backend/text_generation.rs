@@ -235,7 +235,6 @@ mod tests {
             "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         let name = result.unwrap();
-        eprintln!("Generated Codex session name: {name}");
         assert!(TextGeneration::SessionName.validate(&name).is_ok());
     }
 
@@ -247,7 +246,6 @@ mod tests {
             "User: Fix terminal counts.\nAssistant: The counts are fixed and tests pass. Next validate the picker.").await;
         backend.shutdown().await.unwrap();
         let name = result.unwrap();
-        eprintln!("Generated Copilot session name: {name}");
         assert!(TextGeneration::SessionName.validate(&name).is_ok());
     }
 

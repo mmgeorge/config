@@ -556,7 +556,8 @@ with a newer report.
 ## Project checks and the Harness checking gate
 
 Project check definitions live in the `checks` section of `.forge.json`. The LLM configures
-them through `/checks setup`, preserving other repository settings. The categories are
+them through `checks_configure` with check-editing permission, using the
+`harness-checks` skill and preserving other repository settings. The categories are
 `format`, `lint`, `check`, `test`, and `build`. Unit, integration, and screenshot suites are
 named `test` definitions. No language detector generates commands. An absent checks section
 blocks plan submission. An explicitly empty checks object is valid. Each named check contains

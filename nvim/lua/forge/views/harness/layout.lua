@@ -99,6 +99,7 @@ function M.open(timeline_key)
   vim.api.nvim_buf_set_lines(composer_buf, 0, -1, false, { "" })
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
+  vim.wo[composer_win].smoothscroll = true
   vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)
   keep_composer_normal_on_entry(composer_buf)
@@ -117,26 +118,32 @@ function M.attach_auto_height(composer_buf, composer_win)
     buffer = composer_buf,
     callback = resize,
   })
+  vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
+    group = group,
+    callback = resize,
+  })
 end
 
 ---@param composer_buf integer
 ---@param composer_win integer
 function M.resize_composer(composer_buf, composer_win)
   if not (vim.api.nvim_buf_is_valid(composer_buf) and vim.api.nvim_win_is_valid(composer_win)) then return end
+  if vim.api.nvim_win_get_buf(composer_win) ~= composer_buf then return end
   local options = config.options.harness
-  local count = vim.api.nvim_buf_line_count(composer_buf)
-  local height = math.max(options.composer_min_height, math.min(options.composer_max_height, count + 1))
+  local measured = vim.api.nvim_win_text_height(composer_win, {
+    start_row = 0, max_height = options.composer_max_height + 1,
+  })
+  local winbar_height = vim.wo[composer_win].winbar ~= "" and 1 or 0
+  local height = math.max(options.composer_min_height,
+    math.min(options.composer_max_height, measured.all + 1 + winbar_height))
   local view = vim.api.nvim_win_call(composer_win, vim.fn.winsaveview)
   local restore = vim.api.nvim_win_get_height(composer_win) ~= height
   if restore then vim.api.nvim_win_set_height(composer_win, height) end
-  local text_rows = vim.api.nvim_win_get_height(composer_win) - (vim.wo[composer_win].winbar ~= "" and 1 or 0)
-  if count <= text_rows then
-    local measured = vim.api.nvim_win_text_height(composer_win, { start_row = 0, max_height = text_rows + 1 })
-    -- Insert-mode scrolling can precede window growth and leave the first row hidden.
-    if measured.all <= text_rows and (view.topline > 1 or view.skipcol > 0 or view.topfill > 0) then
-      view.topline, view.skipcol, view.topfill = 1, 0, 0
-      restore = true
-    end
+  local text_rows = vim.api.nvim_win_get_height(composer_win) - winbar_height
+  -- Insert-mode scrolling can precede window growth and leave the first row hidden.
+  if measured.all <= text_rows and (view.topline > 1 or view.skipcol > 0 or view.topfill > 0) then
+    view.topline, view.skipcol, view.topfill = 1, 0, 0
+    restore = true
   end
   if restore then
     vim.api.nvim_win_call(composer_win, function() vim.fn.winrestview(view) end)

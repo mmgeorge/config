@@ -1926,40 +1926,28 @@ impl Backend for CopilotBackend {
 }
 
 fn model_descriptor(model: Model) -> BackendModel {
-    let output_limit = model
-        .capabilities
-        .limits
-        .as_ref()
-        .and_then(|limit| limit.max_output_tokens)
-        .unwrap_or(0);
-    let token_price = model
-        .billing
-        .as_ref()
-        .and_then(|billing| billing.token_prices.as_ref());
-    let mut context_window = Vec::new();
-    if let Some(default_limit) = token_price.and_then(|price| price.max_prompt_tokens) {
-        context_window.push(BackendContextWindow {
-            id: "default".into(),
-            token_limit: u64::try_from(default_limit.saturating_add(output_limit)).ok(),
-        });
-    } else if let Some(default_limit) = model
+    let context_limit = model
         .capabilities
         .limits
         .as_ref()
         .and_then(|limit| limit.max_context_window_tokens)
-    {
-        context_window.push(BackendContextWindow {
-            id: "default".into(),
-            token_limit: u64::try_from(default_limit).ok(),
-        });
-    }
-    if let Some(long_limit) = token_price
+        .and_then(|limit| u64::try_from(limit).ok())
+        .filter(|limit| *limit > 0);
+    let token_price = model
+        .billing
+        .as_ref()
+        .and_then(|billing| billing.token_prices.as_ref());
+    let mut context_window = vec![BackendContextWindow {
+        id: "default".into(),
+        token_limit: context_limit,
+    }];
+    if token_price
         .and_then(|price| price.long_context.as_ref())
-        .and_then(|long_context| long_context.max_prompt_tokens)
+        .is_some()
     {
         context_window.push(BackendContextWindow {
             id: "long_context".into(),
-            token_limit: u64::try_from(long_limit.saturating_add(output_limit)).ok(),
+            token_limit: None,
         });
     }
     let vision = model
@@ -2696,7 +2684,10 @@ mod test {
             "defaultReasoningEffort": "low",
             "supportedReasoningEfforts": ["low", "high"],
             "capabilities": {
-                "limits": { "max_output_tokens": 28000 },
+                "limits": {
+                    "max_context_window_tokens": 272000,
+                    "max_output_tokens": 128000
+                },
                 "supports": { "reasoningEffort": true, "vision": true }
             },
             "billing": {
@@ -2713,9 +2704,69 @@ mod test {
         assert_eq!(descriptor.id, "gpt-test");
         assert_eq!(descriptor.reasoning, ["low", "high"]);
         assert_eq!(descriptor.default_reasoning.as_deref(), Some("low"));
-        assert_eq!(descriptor.context_window[0].token_limit, Some(328_000));
-        assert_eq!(descriptor.context_window[1].token_limit, Some(1_100_000));
+        assert_eq!(descriptor.context_window[0].id, "default");
+        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
+        assert_eq!(descriptor.context_window[1].id, "long_context");
+        assert_eq!(descriptor.context_window[1].token_limit, None);
         assert!(descriptor.vision);
+    }
+
+    #[test]
+    fn maps_explicit_context_without_billing_metadata() {
+        let model: Model = serde_json::from_value(serde_json::json!({
+            "id": "gpt-test",
+            "name": "Test model",
+            "capabilities": {
+                "limits": { "max_context_window_tokens": 272000 }
+            }
+        }))
+        .unwrap();
+
+        let descriptor = model_descriptor(model);
+
+        assert_eq!(descriptor.context_window.len(), 1);
+        assert_eq!(descriptor.context_window[0].token_limit, Some(272_000));
+    }
+
+    #[test]
+    fn does_not_infer_missing_context_limits_from_billing_or_output() {
+        for context_limit in [
+            serde_json::Value::Null,
+            serde_json::json!(0),
+            serde_json::json!(-1),
+        ] {
+            let model: Model = serde_json::from_value(serde_json::json!({
+                "id": "gpt-test",
+                "name": "Test model",
+                "capabilities": {
+                    "limits": {
+                        "max_context_window_tokens": context_limit,
+                        "max_output_tokens": 128000
+                    }
+                },
+                "billing": {
+                    "tokenPrices": {
+                        "maxPromptTokens": 272000,
+                        "longContext": { "maxPromptTokens": 1000000 }
+                    }
+                }
+            }))
+            .unwrap();
+
+            let descriptor = model_descriptor(model);
+
+            assert_eq!(descriptor.context_window.len(), 2);
+            assert!(
+                descriptor
+                    .context_window
+                    .iter()
+                    .all(|context| context.token_limit.is_none())
+            );
+            assert_eq!(
+                descriptor.default_context_window.as_deref(),
+                Some("default")
+            );
+        }
     }
 
     #[test]

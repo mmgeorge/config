@@ -74,15 +74,14 @@ assert(#calls == 4 and state.queue[1].text == "queue during unsupported active g
 state.queue, state.pending_steer = {}, {}
 state.capability.native_steer = true
 transition = nil
-draft("steer checks setup immediately")
+draft("retain this unsent draft")
 controller.cancel_turn()
-assert(#calls == 5 and calls[5].method == "turn.steer", "Ctrl-C did not send the composer immediately")
-assert(calls[5].params.text == "steer checks setup immediately" and #state.queue == 0)
-assert(text() == "" and transition == nil, "Ctrl-C paused instead of delivering the steering message")
-reply({})
+assert(#calls == 4 and transition.action == "pause" and transition.restore_prompt_if_no_output == true,
+  "Ctrl-C submitted or steered the composer instead of pausing")
+assert(text() == "retain this unsent draft" and #state.queue == 0, "Ctrl-C changed the unsent draft")
 draft("")
 controller.cancel_turn()
-assert(transition.action == "pause" and transition.restore_prompt_if_no_output == true and #calls == 5,
+assert(transition.action == "pause" and transition.restore_prompt_if_no_output == true and #calls == 4,
   "empty Ctrl-C must retract an output-free submission instead of only pausing")
 local task_operation = { state = "accepted", id = "transition-in-progress" }
 local queued_prompt_list = { { text = "first queued prompt" }, { text = "second queued prompt" } }
@@ -90,13 +89,57 @@ state.task_operation = task_operation
 state.queue = vim.deepcopy(queued_prompt_list)
 draft("steer while task transition is being admitted")
 controller.steer_submit()
-assert(#calls == 6 and calls[6].method == "turn.steer", "explicit steering was blocked by cached task operation state")
-assert(calls[6].params.text == "steer while task transition is being admitted")
+assert(#calls == 5 and calls[5].method == "turn.steer", "explicit steering was blocked by cached task operation state")
+assert(calls[5].params.text == "steer while task transition is being admitted")
 assert(state.task_operation == task_operation, "steering cleared the task operation")
 assert(vim.deep_equal(state.queue, queued_prompt_list), "steering changed queued prompts or their FIFO order")
 reply({})
 draft("plain submit during task transition")
 controller.submit()
-assert(#calls == 6 and state.task_operation == task_operation and vim.deep_equal(state.queue, queued_prompt_list),
+assert(#calls == 5 and state.task_operation == task_operation and vim.deep_equal(state.queue, queued_prompt_list),
   "plain submit bypassed task transition admission")
+
+local pending_steer = { { text = "already pending steering" } }
+state.task_operation = nil
+state.pending_steer = pending_steer
+local queued = state.queue
+draft("do not submit this while cancelling")
+transition = nil
+controller.cancel_turn()
+assert(transition.action == "pause" and #calls == 5 and text() == "do not submit this while cancelling",
+  "cancellation delivered a draft while other input was pending")
+assert(state.queue == queued and vim.deep_equal(state.queue, queued_prompt_list)
+    and state.pending_steer == pending_steer,
+  "cancellation consumed, changed, or reordered pending input")
+
+state.checks_running = true
+transition = nil
+controller.cancel_turn()
+assert(transition.action == "pause" and #calls == 5 and not state.check_interrupt_pending,
+  "Ctrl-C during checks started a replacement prompt")
+assert(text() == "do not submit this while cancelling")
+state.checks_running = false
+state.task_operation = { action = "pause", state = "accepted" }
+transition = nil
+controller.cancel_turn()
+assert(transition == nil and #calls == 5, "repeated Ctrl-C submitted or replaced a pending pause")
+state.task_operation = nil
+
+local queued_draft = require("forge.views.harness.queue_editor").move(state, text(), -1)
+draft(queued_draft)
+local queue_edit = state.queue_edit
+draft("unfinished queued edit")
+controller.cancel_turn()
+assert(transition.action == "pause" and #calls == 5 and state.queue_edit == queue_edit
+    and text() == "unfinished queued edit" and vim.deep_equal(state.queue, queued_prompt_list),
+  "Ctrl-C committed or submitted a queued edit")
+
+local child_action
+controller.agent_action = function(action, child_id) child_action = { action = action, id = child_id } end
+state.selected_agent_run_id = "selected-child"
+transition = nil
+controller.cancel_turn()
+assert(child_action.action == "interrupt" and child_action.id == "selected-child"
+    and transition == nil and #calls == 5 and text() == "unfinished queued edit",
+  "Ctrl-C sent the draft to the selected child instead of interrupting it")
 print("harness_submit_steering: passed")

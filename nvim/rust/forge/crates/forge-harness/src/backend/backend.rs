@@ -1070,7 +1070,7 @@ impl Backend for MockBackend {
             && context
                 .checks
                 .as_ref()
-                .is_some_and(|scope| scope.setup_reviewed().is_some())
+                .is_some_and(|scope| scope.is_setup())
         {
             let advertised = crate::control_tools::ControlToolRegistry
                 .definition_list_for_context(Some(context), true);
@@ -1086,30 +1086,7 @@ impl Backend for MockBackend {
             .control_context
             .as_ref()
             .and_then(|context| context.checks.as_ref())
-            && scope.setup_reviewed() == Some(false)
-        {
-            let catalog: Value =
-                serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
-            let rejected = scope
-                .invoke(
-                    "checks_configure",
-                    serde_json::json!({
-                        "expected_revision": catalog["revision"], "config": {}
-                    }),
-                )
-                .await;
-            anyhow::ensure!(
-                rejected.is_err(),
-                "setup published before the user answered"
-            );
-            return Ok(BackendOutput { plan_question: Some(crate::plan::PlanQuestionSet::freeform(
-                "Which functional areas and suites should run automatically, and should routine coverage be targeted or full?".into())), ..Default::default() });
-        }
-        if let Some(scope) = request
-            .control_context
-            .as_ref()
-            .and_then(|context| context.checks.as_ref())
-            && scope.setup_reviewed() == Some(true)
+            && scope.is_setup()
         {
             let catalog: Value =
                 serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
@@ -1575,6 +1552,14 @@ impl Backend for MockBackend {
         {
             let _ = event_sink.send_wait(event.clone()).await;
         }
+        let plan_question: Option<PlanQuestionSet> =
+            if request.input.text() == "Ask a fixture question." {
+                Some(PlanQuestionSet::freeform(
+                    "Which fixture should the operation use?".into(),
+                ))
+            } else {
+                None
+            };
         Ok(BackendOutput {
             backend_session_id: request
                 .backend_session_id
@@ -1587,7 +1572,7 @@ impl Backend for MockBackend {
             plan_read: None,
             plan_deviation: Vec::new(),
             plan_task_report: plan_task_report.into_iter().collect(),
-            plan_question: None,
+            plan_question,
             question_answer: None,
             question_withdrawal: None,
             control_error: None,

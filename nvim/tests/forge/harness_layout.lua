@@ -47,6 +47,66 @@ vim.api.nvim_exec_autocmds("TextChanged", { buffer = composer_buffer })
 assert(vim.api.nvim_win_get_height(composer_window) == prompt_height,
   "clearing the draft did not restore compact prompt height")
 
+assert(vim.wo[composer_window].smoothscroll, "composer did not enable visual-row scrolling")
+local function assert_wrapped_height()
+  local rows = vim.api.nvim_win_text_height(composer_window, { start_row = 0 }).all
+  local winbar = vim.wo[composer_window].winbar ~= "" and 1 or 0
+  local expected = math.max(config.options.harness.composer_min_height,
+    math.min(config.options.harness.composer_max_height, rows + 1 + winbar))
+  assert(vim.api.nvim_win_get_height(composer_window) == expected,
+    ("wrapped draft used height %d instead of %d for %d visual rows"):format(
+      vim.api.nvim_win_get_height(composer_window), expected, rows))
+end
+for _, text in ipairs({ string.rep("wrapped prompt ", 25), string.rep("界🙂\t", 30) }) do
+  vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { text })
+  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = composer_buffer })
+  assert_wrapped_height()
+  assert(vim.api.nvim_win_get_height(composer_window) > prompt_height,
+    "a single wrapped line retained the minimum height")
+  assert(vim.api.nvim_buf_line_count(composer_buffer) == 1
+    and vim.api.nvim_buf_get_lines(composer_buffer, 0, -1, false)[1] == text,
+    "sizing inserted physical newlines into the draft")
+end
+vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { string.rep("width-sensitive prompt ", 16) })
+vim.cmd("vsplit")
+local width_peer = vim.api.nvim_get_current_win()
+vim.api.nvim_set_current_win(composer_window)
+vim.api.nvim_win_set_width(composer_window, 30)
+vim.api.nvim_exec_autocmds("VimResized", {})
+assert_wrapped_height()
+local narrow_height = vim.api.nvim_win_get_height(composer_window)
+vim.api.nvim_win_set_width(composer_window, 60)
+vim.api.nvim_exec_autocmds("WinResized", {})
+assert_wrapped_height()
+assert(vim.api.nvim_win_get_height(composer_window) < narrow_height,
+  "widening the composer did not shrink the wrapped draft")
+vim.api.nvim_win_close(width_peer, true)
+vim.api.nvim_exec_autocmds("VimResized", {})
+vim.wo[composer_window].winbar = "Draft"
+layout.resize_composer(composer_buffer, composer_window)
+assert_wrapped_height()
+vim.wo[composer_window].winbar = ""
+
+local long_line = string.rep("overflowing prompt ", 200)
+vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { long_line })
+layout.resize_composer(composer_buffer, composer_window)
+assert(vim.api.nvim_win_get_height(composer_window) == config.options.harness.composer_max_height,
+  "overflowing wrapped draft did not stop at the maximum pane height")
+vim.api.nvim_win_call(composer_window, function()
+  vim.fn.winrestview({ topline = 1, skipcol = vim.api.nvim_win_get_width(composer_window) * 2 })
+end)
+local scrolled_view = vim.api.nvim_win_call(composer_window, vim.fn.winsaveview)
+assert(scrolled_view.skipcol > 0, "fixture did not scroll within the wrapped line")
+layout.resize_composer(composer_buffer, composer_window)
+assert(vim.api.nvim_win_call(composer_window, vim.fn.winsaveview).skipcol == scrolled_view.skipcol,
+  "resizing reset scrolling within a wrapped physical line")
+vim.api.nvim_buf_set_lines(composer_buffer, 0, -1, false, { "short again" })
+layout.resize_composer(composer_buffer, composer_window)
+local compact_view = vim.api.nvim_win_call(composer_window, vim.fn.winsaveview)
+assert(vim.api.nvim_win_get_height(composer_window) == prompt_height
+  and compact_view.topline == 1 and compact_view.skipcol == 0,
+  "shortening a wrapped draft did not restore the compact viewport")
+
 vim.api.nvim_set_current_win(composer_window)
 local second_transcript, second_timeline, second_composer, second_prompt = layout.open("layout-test-second")
 assert(not vim.wo[second_timeline].winfixheight and vim.wo[second_prompt].winfixheight,

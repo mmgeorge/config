@@ -131,6 +131,15 @@ impl DirectoryPolicy {
                 .parent()
                 .context("file target has no existing parent directory")?;
         }
+        let repository = if operation == DirectoryOperation::Write {
+            forge_git::discover_identity(directory)?
+        } else {
+            None
+        };
+        let directory = repository
+            .as_ref()
+            .and_then(|identity| identity.worktree_root.as_deref())
+            .unwrap_or(directory);
         Ok(Some(DirectoryGrant {
             operation,
             path: directory.to_string_lossy().into_owned(),
@@ -405,6 +414,169 @@ mod test {
                 .evaluate(&compiled, PermissionMode::Write, &mut request)?
                 .decision,
             PermissionDecision::Allow
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_write_grants_use_git_roots_and_preserve_non_git_and_read_scope() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let repository = root.path().join("repository");
+        let nested = repository.join("source/nested");
+        let external = root.path().join("external/nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::create_dir_all(&external)?;
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .output()?;
+        ensure!(
+            initialized.status.success(),
+            "initialize grant fixture: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        let policy = DirectoryPolicy {
+            access: AccessPolicy::default(),
+            workspace: dunce::canonicalize(root.path())?,
+            session_id: "fixture".into(),
+            settings_root: None,
+        };
+        std::fs::write(nested.join("existing.txt"), "")?;
+        for path in [
+            nested.clone(),
+            nested.join("existing.txt"),
+            nested.join("new/deep/file.txt"),
+        ] {
+            let grant = policy
+                .grant(&PermissionTarget::Write {
+                    path: path.display().to_string(),
+                })?
+                .unwrap();
+            assert_eq!(grant.operation, DirectoryOperation::Write);
+            assert_eq!(Path::new(&grant.path), dunce::canonicalize(&repository)?);
+        }
+        let grant = policy
+            .grant(&PermissionTarget::Read {
+                path: nested.join("new/file.txt").display().to_string(),
+            })?
+            .unwrap();
+        assert_eq!(Path::new(&grant.path), dunce::canonicalize(&nested)?);
+        let grant = policy
+            .grant(&PermissionTarget::Write {
+                path: external.join("new/file.txt").display().to_string(),
+            })?
+            .unwrap();
+        assert_eq!(Path::new(&grant.path), dunce::canonicalize(&external)?);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_write_grants_use_the_nearest_nested_repository() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested)?;
+        for repository in [root.path(), nested.as_path()] {
+            let initialized = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .arg(repository)
+                .output()?;
+            ensure!(
+                initialized.status.success(),
+                "initialize nested grant fixture: {}",
+                String::from_utf8_lossy(&initialized.stderr)
+            );
+        }
+        let policy = DirectoryPolicy {
+            access: AccessPolicy::default(),
+            workspace: dunce::canonicalize(root.path())?,
+            session_id: "fixture".into(),
+            settings_root: None,
+        };
+        let grant = policy
+            .grant(&PermissionTarget::Write {
+                path: nested.join("new/file.txt").display().to_string(),
+            })?
+            .unwrap();
+        assert_eq!(Path::new(&grant.path), dunce::canonicalize(&nested)?);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_write_grants_keep_linked_worktrees_separate() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let repository = root.path().join("repository");
+        let linked = root.path().join("linked");
+        std::fs::create_dir(&repository)?;
+        let linked_argument = linked.to_str().context("fixture path must be UTF-8")?;
+        for arguments in [
+            vec!["init", "-q"],
+            vec![
+                "-c",
+                "user.name=Fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "fixture",
+            ],
+            vec!["worktree", "add", "-q", "-b", "linked", linked_argument],
+        ] {
+            let output = std::process::Command::new("git")
+                .current_dir(&repository)
+                .args(arguments)
+                .output()?;
+            ensure!(
+                output.status.success(),
+                "initialize linked worktree fixture: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let nested = linked.join("source/nested");
+        std::fs::create_dir_all(&nested)?;
+        let policy = DirectoryPolicy {
+            access: AccessPolicy::default(),
+            workspace: dunce::canonicalize(&repository)?,
+            session_id: "fixture".into(),
+            settings_root: None,
+        };
+        let grant = policy
+            .grant(&PermissionTarget::Write {
+                path: nested.join("new/file.txt").display().to_string(),
+            })?
+            .unwrap();
+        assert_eq!(Path::new(&grant.path), dunce::canonicalize(&linked)?);
+        assert_ne!(Path::new(&grant.path), dunce::canonicalize(&repository)?);
+        Ok(())
+    }
+
+    #[test]
+    fn directory_write_grants_report_invalid_git_metadata() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(root.path())
+            .output()?;
+        ensure!(
+            initialized.status.success(),
+            "initialize invalid metadata fixture: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
+        std::fs::write(root.path().join(".git/config"), "[invalid\n")?;
+        let policy = DirectoryPolicy {
+            access: AccessPolicy::default(),
+            workspace: dunce::canonicalize(root.path())?,
+            session_id: "fixture".into(),
+            settings_root: None,
+        };
+        assert!(
+            policy
+                .grant(&PermissionTarget::Write {
+                    path: root.path().join("new/file.txt").display().to_string(),
+                })
+                .is_err()
         );
         Ok(())
     }

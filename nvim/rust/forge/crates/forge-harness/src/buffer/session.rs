@@ -1007,6 +1007,8 @@ impl SessionPresentation {
         &mut self,
         document: &DocumentId,
         directory: &std::path::Path,
+        trace: std::sync::Arc<crate::trace::TraceStore>,
+        session_id: &str,
     ) -> Result<std::path::PathBuf> {
         self.open
             .as_mut()
@@ -1014,7 +1016,7 @@ impl SessionPresentation {
             .output
             .get_mut(document)
             .context("unknown tool output document")?
-            .export(directory)
+            .export(directory, trace, session_id)
     }
 
     fn document(&self, document: &DocumentId) -> Result<&OpenPresentation> {

@@ -1,34 +1,12 @@
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{ExitStatus, Output};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::mutation::OperationId;
 use crate::repository::RepositoryState;
-
-struct ConfigTemporary {
-    path: PathBuf,
-    file: Option<File>,
-    published: bool,
-}
-
-impl Drop for ConfigTemporary {
-    fn drop(&mut self) {
-        drop(self.file.take());
-        if !self.published {
-            if let Err(error) = std::fs::remove_file(&self.path) {
-                if error.kind() != std::io::ErrorKind::NotFound {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "Forge repository config temporary cleanup failed: {error}"
-                    );
-                }
-            }
-        }
-    }
-}
 
 pub(super) fn validate(
     repository: &RepositoryState,
@@ -62,46 +40,40 @@ pub(super) fn replace(
         .as_ref()
         .context("repository config requires a worktree")?;
     let destination = root.join(".forge.json");
-    let temporary_path = root.join(format!(
-        ".forge.json.{}-{}.tmp",
-        std::process::id(),
-        operation.value()
-    ));
-    let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let output = options
-        .open(&temporary_path)
+    let prefix = format!(".forge.json.{}-{}.", std::process::id(), operation.value());
+    let mut temporary = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".tmp")
+        .tempfile_in(root)
         .context("create repository config temporary")?;
-    let mut temporary = ConfigTemporary {
-        path: temporary_path,
-        file: Some(output),
-        published: false,
-    };
-    let output = temporary.file.as_mut().expect("created config temporary");
-    for chunk in replacement.chunks(65536) {
-        check()?;
-        output.write_all(chunk)?;
-    }
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(&destination) {
+    let prepared = (|| -> Result<()> {
+        let output = temporary.as_file_mut();
+        for chunk in replacement.chunks(65536) {
+            check()?;
+            output.write_all(chunk)?;
+        }
+        #[cfg(unix)]
+        if let Ok(metadata) = std::fs::metadata(&destination) {
+            output
+                .set_permissions(metadata.permissions())
+                .context("preserve repository config permissions")?;
+        }
+        output.flush()?;
         output
-            .set_permissions(metadata.permissions())
-            .context("preserve repository config permissions")?;
+            .sync_all()
+            .context("persist repository config temporary")?;
+        validate(repository, expected, check)
+    })();
+    if let Err(error) = prepared {
+        return Err(cleanup_failure(temporary, error));
     }
-    output.flush()?;
-    output
-        .sync_all()
-        .context("persist repository config temporary")?;
-    drop(temporary.file.take());
-    validate(repository, expected, check)?;
-    std::fs::rename(&temporary.path, &destination)
-        .context("publish repository config replacement")?;
-    temporary.published = true;
+    let published = temporary.persist(&destination).map_err(|failure| {
+        cleanup_failure(
+            failure.file,
+            anyhow::Error::new(failure.error).context("publish repository config replacement"),
+        )
+    })?;
+    drop(published);
     #[cfg(unix)]
     File::open(root)?
         .sync_all()
@@ -121,6 +93,15 @@ pub(super) fn replace(
         stdout: Vec::new(),
         stderr: Vec::new(),
     })
+}
+
+fn cleanup_failure(temporary: tempfile::NamedTempFile, error: anyhow::Error) -> anyhow::Error {
+    match temporary.close() {
+        Ok(()) => error,
+        Err(cleanup) => error.context(format!(
+            "repository config temporary cleanup failed: {cleanup}"
+        )),
+    }
 }
 
 fn read(path: &Path) -> Result<Option<Vec<u8>>> {
@@ -158,6 +139,21 @@ fn read(path: &Path) -> Result<Option<Vec<u8>>> {
 mod tests {
     use super::*;
     use crate::store::RepositoryStore;
+
+    #[test]
+    fn cleanup_failure_preserves_the_operation_and_cleanup_errors() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let temporary = tempfile::NamedTempFile::new_in(directory.path())?;
+        let path = temporary.path().to_owned();
+        std::fs::remove_file(&path)?;
+        std::fs::create_dir(&path)?;
+        let error = cleanup_failure(temporary, anyhow::anyhow!("original write failure"));
+        let message = format!("{error:#}");
+        assert!(message.contains("original write failure"));
+        assert!(message.contains("repository config temporary cleanup failed"));
+        std::fs::remove_dir(path)?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn replacement_preserves_original_on_conflict_and_cancel() -> Result<()> {
@@ -198,12 +194,9 @@ mod tests {
         );
         assert!(cancelled.is_err());
         assert_eq!(std::fs::read(&destination)?, b"original");
-        assert!(
-            !directory
-                .path()
-                .join(format!(".forge.json.{}-2.tmp", std::process::id()))
-                .exists()
-        );
+        for entry in std::fs::read_dir(directory.path())? {
+            assert!(!entry?.file_name().to_string_lossy().ends_with(".tmp"));
+        }
         let output = replace(
             &repository,
             &expected,
@@ -213,12 +206,9 @@ mod tests {
         )?;
         assert!(output.status.success());
         assert_eq!(std::fs::read(&destination)?, b"replacement");
-        assert!(
-            !directory
-                .path()
-                .join(format!(".forge.json.{}-3.tmp", std::process::id()))
-                .exists()
-        );
+        for entry in std::fs::read_dir(directory.path())? {
+            assert!(!entry?.file_name().to_string_lossy().ends_with(".tmp"));
+        }
         Ok(())
     }
 }

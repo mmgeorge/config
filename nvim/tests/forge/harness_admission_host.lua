@@ -36,7 +36,7 @@ local success, failure = xpcall(function()
     harness = { backend = "mock", backends = { mock = { command = { "session-blocking" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timeout")
-  request("checks.setup")
+  request("prompt.submit", { text = "Ask a fixture question." })
   local before = request("state.get")
   local elicitation = assert(before.active_elicitation).elicitation
   local question_id = elicitation.question_set.questions[1].id

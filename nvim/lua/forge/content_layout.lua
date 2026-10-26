@@ -136,6 +136,21 @@ function M.leading_width(entry, row)
   return width
 end
 
+---Resolve the displayed marker from the current expansion state.
+---@param entry ForgeLayoutEntry
+---@return {text: string, capture: string}?
+function M.marker(entry)
+  local layout = entry.metadata.layout
+  local marker = layout and layout.marker
+  if not marker or marker == vim.NIL then return nil end
+  if marker.text ~= "▸" then return marker end
+  local display = require("forge.nodes").display(entry)
+  return {
+    text = (display.display == "heading" or display.kind == "message" and display.display == "preview") and "▸" or "▾",
+    capture = marker.capture,
+  }
+end
+
 ---@param buffer integer
 ---@param namespace integer
 ---@param start_row integer

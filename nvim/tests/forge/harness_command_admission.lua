@@ -6,6 +6,11 @@ assert(not source.accepts_prompt("/"))
 assert(source.accepts_prompt("/sessions anything /unrecognized"))
 assert(source.accepts_prompt("/plan arbitrary prompt"))
 assert(source.accepts_prompt("/plan"))
+assert(source.accepts_prompt("/checks setup on"))
+assert(source.accepts_prompt("/checks setup off"))
+assert(not source.accepts_prompt("/checks setup"))
+assert(not source.accepts_prompt("/checks setup unit"))
+assert(not source.accepts_prompt("/checks setup on extra"))
 assert(source.accepts_prompt("Explain /sess"))
 assert(not source.queues_execution("/plan inspect screenshot.png"),
   "filename arguments must not override supported command routing")
@@ -19,7 +24,8 @@ notifications.warn = function(message) warnings[#warnings + 1] = message end
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.queue = {}
 for _, prompt in ipairs({ "/sess", "/spawn", "/unrecognized extra text", "/workspace/example",
-  "/workspace/", "/workspace.name/README", "/sessions-extra" }) do
+  "/workspace/", "/workspace.name/README", "/sessions-extra", "/checks setup",
+  "/checks setup unit", "/checks setup on extra" }) do
   for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
     local warning_count = #warnings
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { prompt })

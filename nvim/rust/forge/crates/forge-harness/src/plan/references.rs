@@ -1254,15 +1254,11 @@ mod tests {
             }
         }
         source.push_str("}\n");
-        let started = std::time::Instant::now();
         let capture = super::super::calls::extract("lib.rs", &source).unwrap();
-        let extraction = started.elapsed();
         assert_eq!(capture[0].call.as_ref().unwrap().len(), 10000);
         design.proposed_calls.insert("lib.rs".into(), capture);
         document.design = Some(design);
-        let started = std::time::Instant::now();
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
-        let indexing = started.elapsed();
         assert_eq!(index.call.len(), 1000);
         assert_eq!(
             index
@@ -1273,9 +1269,6 @@ mod tests {
             1000
         );
         assert!(index.unresolved.is_empty());
-        eprintln!(
-            "property scale: 10000 occurrences, 1000 unique targets, capture={extraction:?}, index={indexing:?}"
-        );
     }
 
     #[test]

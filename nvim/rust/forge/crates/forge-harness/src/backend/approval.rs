@@ -511,7 +511,6 @@ impl PermissionCoordinator {
         if let Some(owner) = &execution_owner {
             request.id = format!("{}:{}:{}", owner.session_id, owner.agent_id, request.id);
         }
-        let id = request.id.clone();
         let mut view = approval_view(&request, &evaluation);
         if let Some(policy) = &directory_policy {
             for (item, target) in view
@@ -520,10 +519,13 @@ impl PermissionCoordinator {
                 .zip(&evaluation.pending_target_list)
             {
                 if let Some(grant) = policy.grant(target)? {
-                    if !crate::permissions::matcher::path_starts_with(
-                        Path::new(&grant.path),
-                        &dunce::canonicalize(&policy.workspace)?,
-                    ) {
+                    let workspace = dunce::canonicalize(&policy.workspace)?;
+                    if grant.operation == DirectoryOperation::Write
+                        || !crate::permissions::matcher::path_starts_with(
+                            Path::new(&grant.path),
+                            &workspace,
+                        )
+                    {
                         for choice in &mut item.choice_list {
                             if matches!(
                                 choice.resolution,
@@ -541,6 +543,32 @@ impl PermissionCoordinator {
                                 choice.label = format!("Always {action} directory: {}", grant.path);
                             }
                         }
+                    }
+                    if let PermissionTarget::Write { path } = target
+                        && crate::permissions::matcher::path_starts_with(
+                            Path::new(path),
+                            &workspace,
+                        )
+                    {
+                        if Path::new(&grant.path) == workspace {
+                            item.choice_list.retain(|choice| choice.id != "allow_broad");
+                        }
+                        item.choice_list.insert(
+                            1,
+                            ApprovalChoice {
+                                id: "allow_workspace_write".into(),
+                                label: format!(
+                                    "Always allow writes in this workspace: {}",
+                                    workspace.display()
+                                ),
+                                resolution: ApprovalResolution::AllowBroad,
+                                rule_list: vec![(
+                                    CATEGORY_EDIT.into(),
+                                    workspace.to_string_lossy().into_owned(),
+                                )],
+                                directory: None,
+                            },
+                        );
                     }
                     if policy.settings_root.is_none() {
                         continue;
@@ -590,6 +618,70 @@ impl PermissionCoordinator {
             }
         }
         view.execution_owner = execution_owner;
+        self.wait_for_approval(view, address, event_sink, directory_policy)
+            .await
+    }
+
+    /// Reviews one exact proposal without creating reusable permission grants.
+    pub(crate) async fn review(
+        &self,
+        title: String,
+        detail: String,
+        address: crate::backend::ProviderAddress,
+        event_sink: &BackendEventSink,
+    ) -> Result<ApprovalResolution> {
+        let view = ApprovalRequestView {
+            id: Uuid::new_v4().to_string(),
+            execution_owner: address.owner.clone(),
+            exchange_id: Some(address.turn_id.clone()),
+            turn_id: None,
+            provider: "Harness".into(),
+            reason: None,
+            required_mode: None,
+            deadline: None,
+            resolution_source: ResolutionSource::User,
+            item_list: vec![ApprovalItem {
+                id: "proposal".into(),
+                title,
+                detail,
+                command_list: Vec::new(),
+                choice_list: vec![
+                    ApprovalChoice {
+                        id: "allow_once".into(),
+                        label: "Approve update".into(),
+                        resolution: ApprovalResolution::AllowOnce,
+                        rule_list: Vec::new(),
+                        directory: None,
+                    },
+                    ApprovalChoice {
+                        id: "deny_once".into(),
+                        label: "Reject update".into(),
+                        resolution: ApprovalResolution::DenyOnce,
+                        rule_list: Vec::new(),
+                        directory: None,
+                    },
+                    ApprovalChoice {
+                        id: "cancel".into(),
+                        label: "Cancel update".into(),
+                        resolution: ApprovalResolution::Cancel,
+                        rule_list: Vec::new(),
+                        directory: None,
+                    },
+                ],
+            }],
+        };
+        self.wait_for_approval(view, Some(address), Some(event_sink), None)
+            .await
+    }
+
+    async fn wait_for_approval(
+        &self,
+        mut view: ApprovalRequestView,
+        address: Option<crate::backend::ProviderAddress>,
+        event_sink: Option<&BackendEventSink>,
+        directory_policy: Option<Arc<DirectoryPolicy>>,
+    ) -> Result<ApprovalResolution> {
+        let id = view.id.clone();
         let timeout = self
             .timeout_by_session
             .lock()
@@ -1657,9 +1749,23 @@ mod test {
         let workspace = root.path().join("workspace");
         let external = root.path().join("external");
         std::fs::create_dir(&workspace)?;
-        std::fs::create_dir(&external)?;
+        std::fs::create_dir_all(external.join("nested"))?;
+        let initialized = std::process::Command::new("git")
+            .args(["init", "-q"])
+            .arg(&external)
+            .output()?;
+        anyhow::ensure!(
+            initialized.status.success(),
+            "initialize approval fixture: {}",
+            String::from_utf8_lossy(&initialized.stderr)
+        );
         let settings_root = root.path().join("settings");
         let coordinator = PermissionCoordinator::transient(&workspace)?;
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            CATEGORY_EDIT.into(),
+            ".".into(),
+            PermissionDecision::Ask,
+        )])?;
         let request = crate::backend::BackendRequest {
             execution_owner: None,
             harness_session_id: "directory-session".into(),
@@ -1702,7 +1808,14 @@ mod test {
         let write = permission_from_copilot(
             "write".into(),
             "write",
-            json!({"path":external.join("new/deep/write.txt")}),
+            json!({"path":external.join("nested/new/deep/write.txt")}),
+            &request.workspace,
+        );
+        permission.target_list.extend(write.target_list);
+        let write = permission_from_copilot(
+            "workspace-write".into(),
+            "write",
+            json!({"path":workspace.join("new/deep/write.txt")}),
             &request.workspace,
         );
         permission.target_list.extend(write.target_list);
@@ -1726,11 +1839,44 @@ mod test {
             .unwrap();
         assert_eq!(event.kind, "approval_requested");
         let approval: ApprovalRequestView = serde_json::from_value(event.data)?;
-        assert_eq!(approval.item_list.len(), 2);
+        assert_eq!(approval.item_list.len(), 3);
         let answers = approval
             .item_list
             .iter()
             .map(|item| {
+                if item.detail.starts_with(
+                    &dunce::canonicalize(&workspace)
+                        .unwrap()
+                        .display()
+                        .to_string(),
+                ) {
+                    let choice = item
+                        .choice_list
+                        .iter()
+                        .find(|choice| choice.id == "allow_workspace_write")
+                        .unwrap();
+                    assert_eq!(
+                        choice.rule_list,
+                        vec![(
+                            CATEGORY_EDIT.into(),
+                            dunce::canonicalize(&workspace)
+                                .unwrap()
+                                .display()
+                                .to_string()
+                        )]
+                    );
+                    assert!(choice.directory.is_none());
+                    assert!(choice.label.contains("this workspace"));
+                    return ApprovalAnswer {
+                        item_id: item.id.clone(),
+                        choice_id: choice.id.clone(),
+                    };
+                }
+                assert!(
+                    item.choice_list
+                        .iter()
+                        .all(|choice| choice.id != "allow_workspace_write")
+                );
                 let choice = item
                     .choice_list
                     .iter()
@@ -1743,6 +1889,20 @@ mod test {
                         .display()
                         .to_string()
                 );
+                if item.title == "Write path" {
+                    let broad = item
+                        .choice_list
+                        .iter()
+                        .find(|choice| choice.id == "allow_broad")
+                        .unwrap();
+                    assert_eq!(
+                        broad.rule_list,
+                        vec![(
+                            CATEGORY_EDIT.into(),
+                            choice.directory.as_ref().unwrap().path.clone()
+                        )]
+                    );
+                }
                 ApprovalAnswer {
                     item_id: item.id.clone(),
                     choice_id: choice.id.clone(),
@@ -1773,6 +1933,84 @@ mod test {
                 )
                 .await?,
             ApprovalResolution::AllowOnce
+        );
+        let workspace_rule = dunce::canonicalize(&workspace)?.display().to_string();
+        assert_eq!(
+            coordinator
+                .store()
+                .read()
+                .unwrap()
+                .compiled()
+                .document
+                .permission[CATEGORY_EDIT][&workspace_rule],
+            PermissionDecision::Allow
+        );
+        let (read_sink, mut read_stream) = crate::backend::events::channel();
+        let read_coordinator = coordinator.clone();
+        let read_address = address.clone();
+        let read_workspace = request.workspace.clone();
+        let read_waiter = tokio::spawn(async move {
+            read_coordinator
+                .authorize(
+                    PermissionMode::Read,
+                    permission_from_copilot(
+                        "read-mode-write".into(),
+                        "write",
+                        json!({"path":workspace.join("another/file.txt")}),
+                        &read_workspace,
+                    ),
+                    read_address,
+                    Some(&read_sink),
+                )
+                .await
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), read_stream.recv())
+            .await?
+            .unwrap()
+            .unwrap();
+        let read_approval: ApprovalRequestView = serde_json::from_value(event.data)?;
+        assert_eq!(read_approval.required_mode, Some(PermissionMode::Write));
+        assert!(
+            read_approval.item_list[0]
+                .choice_list
+                .iter()
+                .all(|choice| { choice.rule_list.is_empty() && choice.directory.is_none() })
+        );
+        coordinator
+            .resolve(
+                &read_approval.id,
+                &[ApprovalAnswer {
+                    item_id: "0".into(),
+                    choice_id: "deny_once".into(),
+                }],
+                None,
+            )
+            .await?;
+        assert_eq!(read_waiter.await??, ApprovalResolution::DenyOnce);
+        let protected = Path::new(&request.workspace)
+            .join("protected.txt")
+            .display()
+            .to_string();
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            CATEGORY_EDIT.into(),
+            protected.clone(),
+            PermissionDecision::Deny,
+        )])?;
+        assert_eq!(
+            coordinator
+                .authorize(
+                    PermissionMode::Write,
+                    permission_from_copilot(
+                        "protected".into(),
+                        "write",
+                        json!({"path":protected}),
+                        &request.workspace,
+                    ),
+                    address.clone(),
+                    None,
+                )
+                .await?,
+            ApprovalResolution::DenyOnce
         );
         drop(directories);
         assert!(coordinator.directory_by_owner.lock().unwrap().is_empty());

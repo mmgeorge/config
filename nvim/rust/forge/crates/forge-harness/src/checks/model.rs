@@ -4,11 +4,11 @@ use std::{collections::BTreeMap, path::PathBuf};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
-/// Retains setup's user-decision boundary across question continuations and host recovery.
+/// Retains check discovery context across follow-ups and host recovery.
 pub enum CheckSetupState {
-    /// Configuration discovery has not received the user's setup choices.
+    /// Configuration discovery is active.
     Discovery,
-    /// The user answered setup questions and configuration may be published.
+    /// The user supplied clarification, independently of publication approval.
     Reviewed,
 }
 
@@ -61,31 +61,6 @@ pub struct CommandCheck {
 }
 
 impl CommandCheck {
-    /// Formats the accepted command and its recorded lifecycle for both initial and timer renders.
-    pub(crate) fn heading(&self) -> String {
-        if let Some(context) = &self.context {
-            let scope = match &context.selection {
-                super::CheckSelection::All => "All".into(),
-                super::CheckSelection::Files { files } => format!("{} files", files.len()),
-                super::CheckSelection::Cases { cases } => format!("{} cases", cases.len()),
-                super::CheckSelection::Packages { packages } => {
-                    format!("{} packages", packages.len())
-                }
-                super::CheckSelection::Tests { tests } => format!("{} tests", tests.len()),
-            };
-            return format!("{} · {} · {:?}", context.label(), scope, self.state);
-        }
-        format!(
-            "{} · {:?}",
-            crate::permissions::command::display_command(
-                &self.command,
-                crate::permissions::shell::CommandShell::default()
-            )
-            .source,
-            self.state
-        )
-    }
-
     /// Advances only running commands and retains recorded completion timestamps.
     pub(crate) fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
         let started_at_ms = self.started_at_ms?;

@@ -282,7 +282,7 @@ impl ConfigSnapshot {
         let document = read_document(workspace)?;
         let checks = document
             .get("checks")
-            .context("checks_not_configured: use /checks setup, then retry submission")?;
+            .context("checks_not_configured: enable /checks setup on and request configuration in chat, then retry submission")?;
         let config: CheckConfig =
             serde_json::from_value(checks.clone()).context("invalid checks configuration")?;
         config.validate()?;

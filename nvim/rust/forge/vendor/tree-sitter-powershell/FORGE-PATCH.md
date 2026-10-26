@@ -22,6 +22,8 @@ and build remain included.
 - Parse parenthesized expressions after variable arguments independently from method
   argument lists. Actual method calls retain their original invocation nodes.
 - Give expandable-string content priority over comment tokens after interpolation.
+- Explicitly discard unused state and serialization parameters in the stateless
+  external scanner. Preserve its ABI and keep compiler warnings enabled.
 
 The related upstream reports include
 [command parameters](https://github.com/airbus-cert/tree-sitter-powershell/issues/59),

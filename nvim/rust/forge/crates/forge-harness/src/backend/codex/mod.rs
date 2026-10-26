@@ -2568,8 +2568,7 @@ mod test {
         )
         .await;
         backend.shutdown().await.unwrap();
-        let inventory = result.expect("MCP inventory exceeded 30 seconds").unwrap();
-        eprintln!("MCP inventory: {} servers", inventory.len());
+        let _inventory = result.expect("MCP inventory exceeded 30 seconds").unwrap();
     }
 
     #[tokio::test]

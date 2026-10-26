@@ -14,18 +14,58 @@ local function selected_rows(session)
   local rows = vim.api.nvim_buf_get_lines(session.buffer, first - 1, last, true)
   for index, text in ipairs(rows) do
     local location = session.decoration_location and session.decoration_location(first + index - 2)
+      or session.sequence and buffer.locate(session, first + index - 2, 0)
     text = text:sub((location and location.display_indent or 0) + 1)
     rows[index] = text
+    local node = location and session.sequence.node[location.block]
+    local concealed = {}
+    if node and vim.wo.conceallevel > 0 and vim.wo.concealcursor:find("v", 1, true) then
+      for _, conceal in ipairs(node.entry.metadata.conceal or {}) do
+        if conceal.range.start.row == location.position.row and conceal.range["end"].row == location.position.row then
+          concealed[#concealed + 1] = conceal
+        end
+      end
+    end
+    table.sort(concealed, function(left, right) return left.range.start.column < right.range.start.column end)
+    local function visible_text(start_column, end_column)
+      local fragment, column = {}, start_column
+      for _, conceal in ipairs(concealed) do
+        local start = math.max(column, conceal.range.start.column)
+        local finish = math.min(end_column, conceal.range["end"].column)
+        if start < finish then
+          fragment[#fragment + 1] = text:sub(column + 1, start)
+          if start == conceal.range.start.column then fragment[#fragment + 1] = conceal.replacement end
+          column = finish
+        end
+      end
+      fragment[#fragment + 1] = text:sub(column + 1, end_column)
+      return table.concat(fragment)
+    end
     local layout = gutter.bounds(session, first + index - 1)
     if layout then
       local fragment, column = {}, 0
       for _, entry in ipairs(layout.insertion) do
-        fragment[#fragment + 1] = text:sub(column + 1, entry.position.column)
+        fragment[#fragment + 1] = visible_text(column, entry.position.column)
         for _, chunk in ipairs(entry.chunk) do fragment[#fragment + 1] = chunk.text end
         column = entry.position.column
       end
-      fragment[#fragment + 1] = text:sub(column + 1)
+      fragment[#fragment + 1] = visible_text(column, #text)
       rows[index] = table.concat(fragment)
+    else
+      rows[index] = visible_text(0, #text)
+    end
+    local content = node and location.position.row == 0 and node.entry.metadata.layout
+    local marker = content and require("forge.content_layout").marker(node.entry)
+    if marker and marker ~= vim.NIL and content.indent > 2 then
+      local column = content.indent - 4
+      rows[index] = rows[index]:sub(1, column) .. marker.text
+        .. rows[index]:sub(column + vim.fn.strdisplaywidth(marker.text) + 1)
+    end
+    if vim.wo.statuscolumn ~= "" then
+      local column = vim.api.nvim_eval_statusline(vim.wo.statuscolumn, {
+        winid = vim.api.nvim_get_current_win(), use_statuscol_lnum = first + index - 1,
+      }).str
+      rows[index] = column .. rows[index]
     end
   end
   return rows

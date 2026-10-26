@@ -34,6 +34,7 @@ pub(crate) struct FileCapture {
     /// Content override, absent when the bytes match the Git baseline.
     pub object_id: Option<String>,
     /// Whether an existing content acquisition supplied the result.
+    #[cfg(test)]
     pub reused: bool,
     /// Source version for caching, absent when the file changed during its read.
     pub stamp: Option<FileStamp>,
@@ -109,6 +110,7 @@ impl ObjectStore {
         {
             return Ok(FileCapture {
                 object_id: (!unchanged).then(|| identity.clone()),
+                #[cfg(test)]
                 reused: true,
                 stamp: Some(stamp),
             });
@@ -154,6 +156,7 @@ impl ObjectStore {
         }
         Ok(FileCapture {
             object_id: (!unchanged).then_some(identity),
+            #[cfg(test)]
             reused: false,
             stamp: reusable.then_some(stamp),
         })

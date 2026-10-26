@@ -1586,11 +1586,9 @@ mod test {
             .unwrap();
         let index = references::PlanReferenceIndex::planned(&document, temporary.path()).unwrap();
         let identity = &index.definition[&("src/part_0.rs".into(), 1, 11)].0;
-        let started = std::time::Instant::now();
         let (_, renamed, _, checksum) = store
             .rename_symbol("session", "fast-review", 1, identity, "RenamedState", None)
             .unwrap();
-        let rename_elapsed = started.elapsed();
         renamed.validate_for_submission().unwrap();
         assert_eq!(
             renamed.design.as_ref().unwrap().proposed["src/part_0.rs"],
@@ -1601,7 +1599,6 @@ mod test {
             renamed.design.as_ref().unwrap().proposed["src/part_12.rs"],
             document.design.as_ref().unwrap().proposed["src/part_12.rs"]
         );
-        let started = std::time::Instant::now();
         let (deleted, rendered, _) = store
             .remove_tests(
                 "session",
@@ -1615,7 +1612,6 @@ mod test {
                 None,
             )
             .unwrap();
-        let delete_elapsed = started.elapsed();
         deleted.validate_for_submission().unwrap();
         assert_eq!(
             rendered,
@@ -1658,7 +1654,6 @@ mod test {
                 .capture_review_source("session", "fast-review", None, &checksum)
                 .is_err()
         );
-        eprintln!("warm 13-file review: rename={rename_elapsed:?}, delete={delete_elapsed:?}");
     }
 
     #[test]

@@ -31,6 +31,7 @@ pub struct CheckSupervisor {
     presentation: Arc<Mutex<SessionPresentation>>,
     state: Mutex<CheckStateStore>,
     notification: OnceLock<CheckNotification>,
+    trace: Arc<crate::trace::TraceStore>,
     changed: tokio::sync::Notify,
 }
 
@@ -180,6 +181,7 @@ impl CheckSupervisor {
         presentation: Arc<Mutex<SessionPresentation>>,
         objects: crate::storage::objects::ObjectStore,
         repositories: Arc<forge_git::store::RepositoryStore>,
+        trace: Arc<crate::trace::TraceStore>,
     ) -> Result<Arc<Self>> {
         std::fs::create_dir_all(&root)?;
         let changes = super::changes::CheckChanges::open(&workspace, &root, objects, repositories)?;
@@ -221,6 +223,7 @@ impl CheckSupervisor {
                 notified: Default::default(),
             }),
             notification: OnceLock::new(),
+            trace,
             changed: Default::default(),
         }))
     }
@@ -501,7 +504,7 @@ impl CheckSupervisor {
                     cases.is_none()
                 })
             {
-                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Use changed_files or all in /checks setup, or supply explicit cases.".into()))
+                (CheckState::ConfigurationError, Some("Plan case inventory is unavailable outside plan execution. Request file or full-suite coverage through the harness-checks skill, or supply explicit cases.".into()))
             } else if selection.empty() && files.is_none() && has_scope {
                 (CheckState::ConfigurationError, Some("Task change inventory is unavailable. Select full coverage explicitly or provide concrete files or cases.".into()))
             } else if selection.empty() {
@@ -519,7 +522,7 @@ impl CheckSupervisor {
             } else if operation.is_none() {
                 (
                     CheckState::ConfigurationError,
-                    Some("Requested scope is unsupported. Fix this check in /checks setup.".into()),
+                    Some("Requested scope is unsupported. Enable /checks setup on and request a correction in chat.".into()),
                 )
             } else {
                 (CheckState::Pending, None)
@@ -1471,24 +1474,26 @@ impl CheckSupervisor {
             && let Some(sink) = sink
         {
             self.notification
-                .get_or_init(CheckNotification::new)
+                .get_or_init(|| CheckNotification::new(self.trace.clone(), self.session_id.clone()))
                 .publish(sink, patch.notification());
         }
         if let (Some(error), Some(sink)) = (error, sink) {
-            self.notification.get_or_init(CheckNotification::new).error(
-                sink,
-                BackendEvent {
-                    received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "checks_configuration_error".into(),
-                    text: None,
-                    data: serde_json::json!({"run_id":run.id,"error":error.text}),
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                },
-            );
+            self.notification
+                .get_or_init(|| CheckNotification::new(self.trace.clone(), self.session_id.clone()))
+                .error(
+                    sink,
+                    BackendEvent {
+                        received_at_ms: None,
+                        address: None,
+                        turn_boundary: None,
+                        kind: "checks_configuration_error".into(),
+                        text: None,
+                        data: serde_json::json!({"run_id":run.id,"error":error.text}),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    },
+                );
         }
         Ok(())
     }
@@ -1543,7 +1548,11 @@ impl CheckSupervisor {
                 .await
                 .map_err(|error| format!("{error:#}"));
             if let Err(error) = &result {
-                eprintln!("check execution failed: {error}");
+                supervisor.trace.record(
+                    &supervisor.session_id,
+                    "checks.execution_failed",
+                    serde_json::json!({"run_id":task_id,"error":error}),
+                );
             }
             let _ = completed.send(result);
             if let Ok(mut state) = supervisor.state.lock() {

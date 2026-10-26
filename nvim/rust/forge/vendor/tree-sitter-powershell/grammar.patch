@@ -60,3 +60,24 @@
  
      verbatim_command_argument: ($) =>
        seq('--%', $._verbatim_command_argument_chars),
+--- upstream/src/scanner.c
++++ forge/src/scanner.c
+@@ -28,2 +28,3 @@ static bool scan_statement_terminator(void *payload, TSLexer *lexer, const bool *valid_symbols)
+ {
++    (void)payload;
+     if (valid_symbols[STATEMENT_TERMINATOR]) {
+@@ -61,2 +62,3 @@ void tree_sitter_powershell_external_scanner_destroy(void *p)
+ {
++    (void)p;
+ }
+@@ -65,2 +67,4 @@ unsigned tree_sitter_powershell_external_scanner_serialize(void *payload, char *buffer)
+ {
++    (void)payload;
++    (void)buffer;
+     return 0;
+@@ -70,2 +74,5 @@ void tree_sitter_powershell_external_scanner_deserialize(void *payload, const char *buffer, unsigned length)
+ {
++    (void)payload;
++    (void)buffer;
++    (void)length;
+ }

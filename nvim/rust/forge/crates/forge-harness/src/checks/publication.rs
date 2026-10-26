@@ -47,6 +47,8 @@ pub(super) struct CheckNotification {
     pending: Arc<std::sync::Mutex<PendingNotice>>,
     wake: tokio::sync::mpsc::Sender<()>,
     _worker: JoinHandle<()>,
+    trace: Arc<crate::trace::TraceStore>,
+    session_id: String,
 }
 
 #[derive(Default)]
@@ -57,10 +59,12 @@ struct PendingNotice {
 
 impl CheckNotification {
     /// Starts a delivery worker with one pending progress slot.
-    pub(super) fn new() -> Self {
+    pub(super) fn new(trace: Arc<crate::trace::TraceStore>, session_id: String) -> Self {
         let pending = Arc::new(std::sync::Mutex::new(PendingNotice::default()));
         let (wake, mut receiver) = tokio::sync::mpsc::channel(1);
         let queue = Arc::clone(&pending);
+        let worker_trace = trace.clone();
+        let worker_session = session_id.clone();
         let worker = tokio::spawn(async move {
             while receiver.recv().await.is_some() {
                 let (latest, errors) = {
@@ -69,7 +73,11 @@ impl CheckNotification {
                 };
                 for (sink, event) in errors {
                     if let Err(error) = sink.send_wait(event).await {
-                        eprintln!("check error delivery failed: {error}");
+                        worker_trace.record(
+                            &worker_session,
+                            "checks.error_delivery_failed",
+                            serde_json::json!({"error":error.to_string()}),
+                        );
                     }
                 }
                 if let Some((sink, data)) = latest {
@@ -86,7 +94,11 @@ impl CheckNotification {
                     };
                     // Finish an admitted multipart transfer before replacing pending progress.
                     if let Err(error) = sink.send_wait(event).await {
-                        eprintln!("check presentation delivery failed: {error}");
+                        worker_trace.record(
+                            &worker_session,
+                            "checks.presentation_delivery_failed",
+                            serde_json::json!({"error":error.to_string()}),
+                        );
                     }
                 }
             }
@@ -95,6 +107,8 @@ impl CheckNotification {
             pending,
             wake,
             _worker: worker,
+            trace,
+            session_id,
         }
     }
 
@@ -122,7 +136,46 @@ impl CheckNotification {
             self.wake.try_send(()),
             Err(tokio::sync::mpsc::error::TrySendError::Closed(()))
         ) {
-            eprintln!("check notification worker closed");
+            self.trace.record(
+                &self.session_id,
+                "checks.notification_worker_closed",
+                serde_json::json!({}),
+            );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::CheckNotification;
+    use crate::trace::TraceStore;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn notification_diagnostics_follow_live_logging_configuration() {
+        let directory = tempfile::tempdir().unwrap();
+        let trace = Arc::new(TraceStore::open(directory.path()).unwrap());
+        trace.configure(false).unwrap();
+        let mut notification = CheckNotification::new(trace.clone(), "checks-test".into());
+        notification._worker.abort();
+        assert!(
+            (&mut notification._worker)
+                .await
+                .unwrap_err()
+                .is_cancelled()
+        );
+
+        notification.signal();
+        let path = std::path::PathBuf::from(trace.session_status("checks-test").path);
+        assert!(!path.exists());
+
+        trace.configure(true).unwrap();
+        notification.signal();
+        let logged = std::fs::read_to_string(&path).unwrap();
+        assert!(logged.contains("checks.notification_worker_closed"));
+
+        trace.configure(false).unwrap();
+        notification.signal();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), logged);
     }
 }

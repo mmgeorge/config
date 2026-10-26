@@ -269,7 +269,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     execute.execution_mode = PermissionMode::Yolo;
     execute.backend_session_id = planned.backend_session_id.clone();
     let (event_sink, mut event_stream) = forge_harness::backend::events::channel();
-    eprintln!("codex_cli stage: execute prompt started");
     let executed = tokio::time::timeout(
         Duration::from_secs(90),
         backend.prompt_stream(execute.clone(), Some(event_sink)),
@@ -277,7 +276,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex execution prompt timed out after provider-side completion")
     .unwrap();
-    eprintln!("codex_cli stage: execute prompt returned");
     let streamed_event_list: Vec<_> = std::iter::from_fn(|| event_stream.try_recv().ok()).collect();
     assert!(!streamed_event_list.is_empty());
     assert!(
@@ -304,7 +302,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     );
 
     execute.backend_session_id = executed.backend_session_id;
-    eprintln!("codex_cli stage: goal pause started");
     tokio::time::timeout(
         Duration::from_secs(10),
         backend.goal_status(execute.clone(), Some("Complete the plan".into()), "paused"),
@@ -312,7 +309,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex goal pause timed out")
     .unwrap();
-    eprintln!("codex_cli stage: goal resume started");
     tokio::time::timeout(
         Duration::from_secs(10),
         backend.goal_status(execute.clone(), Some("Complete the plan".into()), "active"),
@@ -320,7 +316,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex goal resume timed out")
     .unwrap();
-    eprintln!("codex_cli stage: goal clear started");
     tokio::time::timeout(
         Duration::from_secs(10),
         backend.goal_status(execute.clone(), None, "cleared"),
@@ -328,7 +323,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex goal clear timed out")
     .unwrap();
-    eprintln!("codex_cli stage: fork started");
     let forked = tokio::time::timeout(
         Duration::from_secs(30),
         backend.fork(BackendForkRequest {
@@ -340,7 +334,6 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     .await
     .expect("Codex fork timed out")
     .unwrap();
-    eprintln!("codex_cli stage: fork returned");
     assert!(!forked.backend_session_id.trim().is_empty());
     assert_eq!(backend.app_server_process_id().await, Some(process_id));
     assert_eq!(backend.app_server_start_count(), 1);

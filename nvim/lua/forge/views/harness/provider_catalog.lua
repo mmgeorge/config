@@ -72,12 +72,30 @@ function M.models(force, callback)
   local function deliver(value, failure)
     if failure then callback(nil, failure) return end
     local models = vim.deepcopy(value or {})
+    local active = state.session or {}
+    local active_model = active.model == "default" and active.resolved_model or active.model
+    local context_size = active.context_usage and tonumber(active.context_usage.size)
     local selected = vim.tbl_extend("force", state.session or {}, state.configuring_config or {},
       state.pending_config or {}, state.task_config or {})
     for _, model in ipairs(models) do
       if model.id == selected.model or (selected.model == "default" and model.is_default) then
         if selected.effort and selected.effort ~= "default" then model.selected_reasoning = selected.effort end
         if selected.context_window ~= nil then model.selected_context_window = selected.context_window end
+      end
+      if context_size and context_size > 0
+        and (model.id == active_model or (active_model == "default" and model.is_default)) then
+        local context_id = active.context_window or model.default_context_window or "default"
+        model.context_window = model.context_window or {}
+        ---@type {id: string, token_limit: integer?}?
+        local active_context
+        for _, context in ipairs(model.context_window) do
+          if context.id == context_id then active_context = context break end
+        end
+        if not active_context then
+          active_context = { id = context_id }
+          model.context_window[#model.context_window + 1] = active_context
+        end
+        active_context.token_limit = context_size
       end
     end
     callback(models, nil)

@@ -54,11 +54,10 @@ or alternate subprocesses. During plan execution, finish the active phase and
 let Harness Checking execute validation. Delegated agents without check tools
 rely on their parent's automatic completion gate after child work settles. Missing coverage
 requires the authorized check-configuration workflow rather than an unrecorded
-command. Check-editing permission is shown in the Harness winbar. `/checks setup`
-enables it and starts guided setup. `/checks setup on` or `/checks setup off`
-toggles it without sending a prompt. With permission enabled outside guided setup,
-use `checks_configure` for requested changes. Guided setup still requires answers
-before saving. Read-only source and package-metadata discovery are unaffected.
+command. Check-editing permission is shown in the Harness winbar. `/checks setup on`
+or `/checks setup off` toggles it without sending a prompt. Use the `harness-checks`
+skill to configure checks through `checks_configure`. Each submission requires
+approval outside YOLO. Read-only source and package-metadata discovery are unaffected.
 
 The build commands below define the required artifact and flags. Harness agents
 must execute them as configured checks when working inside Harness.

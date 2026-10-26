@@ -61,7 +61,6 @@ pub(crate) struct CheckToolScope {
     address: crate::backend::ProviderAddress,
     editing: Arc<AtomicBool>,
     setup: bool,
-    setup_reviewed: bool,
     can_run: bool,
     agent: Arc<crate::agent::AgentCoordinator>,
     cancelled: Arc<AtomicBool>,
@@ -87,8 +86,6 @@ pub(crate) struct CheckAuthority {
     pub authorization_sink: BackendEventSink,
     pub editing: Arc<AtomicBool>,
     pub setup: bool,
-    /// Whether this setup exchange consumed an explicit user answer.
-    pub setup_reviewed: bool,
     pub can_run: bool,
     pub agent: Arc<crate::agent::AgentCoordinator>,
     pub cancelled: Arc<AtomicBool>,
@@ -113,9 +110,8 @@ impl CheckToolScope {
         self.editing.load(Ordering::Acquire)
     }
 
-    /// Reports the guided setup decision state to the deterministic fixture provider.
-    pub(crate) fn setup_reviewed(&self) -> Option<bool> {
-        self.setup.then_some(self.setup_reviewed)
+    pub(crate) fn is_setup(&self) -> bool {
+        self.setup
     }
 
     pub(crate) fn open(
@@ -134,7 +130,6 @@ impl CheckToolScope {
             authorization_sink,
             editing,
             setup,
-            setup_reviewed,
             can_run,
             agent,
             cancelled,
@@ -152,7 +147,6 @@ impl CheckToolScope {
             address,
             editing,
             setup,
-            setup_reviewed,
             can_run,
             agent,
             cancelled,
@@ -194,17 +188,14 @@ impl CheckToolScope {
             "checks_configure" => {
                 ensure!(
                     self.editing_enabled(),
-                    "Check editing is disabled. The user can enable it with /checks setup on or start guided /checks setup."
-                );
-                ensure!(
-                    !self.setup || self.setup_reviewed,
-                    "Check setup must ask the user about functional areas, automatic suites, and coverage cost with question_ask before saving. Continue /checks setup after the user answers."
+                    "Check editing is disabled. The user can enable it with /checks setup on, then request changes using the harness-checks skill."
                 );
                 ensure!(
                     self.agent.active_count() == 0,
                     "check setup cannot race active agents"
                 );
                 let request: ConfigureChecks = serde_json::from_value(arguments)?;
+                let review = request.review(&self.runner.workspace)?;
                 let target_list = std::iter::once(".forge.json")
                     .chain(request.helpers.iter().map(|helper| helper.path.as_str()))
                     .map(
@@ -228,6 +219,30 @@ impl CheckToolScope {
                     &delivery.authorization,
                 )
                 .await?;
+                if self.permission != PermissionMode::Yolo {
+                    let resolution = self
+                        .permissions
+                        .review(
+                            "Update project checks".into(),
+                            review,
+                            self.address.clone(),
+                            &delivery.authorization,
+                        )
+                        .await?;
+                    ensure!(
+                        resolution == crate::backend::approval::ApprovalResolution::AllowOnce,
+                        "check configuration update was not approved"
+                    );
+                }
+                ensure!(
+                    !self.cancelled.load(Ordering::Acquire)
+                        && self
+                            .delivery
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("check delivery lock poisoned"))?
+                            .is_some(),
+                    "check configuration was interrupted during review"
+                );
                 ensure!(
                     self.agent.active_count() == 0,
                     "an agent started during check configuration authorization"
@@ -329,6 +344,117 @@ impl CheckToolScope {
                 .is_some()
                 && !self.cancelled.load(Ordering::Acquire),
             "check operation was interrupted during authorization"
+        );
+        Ok(())
+    }
+}
+
+impl ConfigureChecks {
+    fn review(&self, workspace: &std::path::Path) -> Result<String> {
+        self.config.validate()?;
+        let document = super::config::read_document(workspace)?;
+        ensure!(
+            crate::plan::digest(&serde_json::to_vec(&document)?) == self.expected_revision,
+            ".forge.json changed since setup began"
+        );
+        let before = serde_json::to_string_pretty(&document["checks"])?;
+        let after = serde_json::to_string_pretty(&self.config)?;
+        let mut detail = String::from(
+            "Approve these project check changes and managed helper updates. No checks will run.\n\n",
+        );
+        detail.push_str(
+            &similar::TextDiff::from_lines(&before, &after)
+                .unified_diff()
+                .header(
+                    ".forge.json checks (current)",
+                    ".forge.json checks (proposed)",
+                )
+                .to_string(),
+        );
+        if before == after {
+            detail.push_str("Check definitions are unchanged.\n");
+        }
+        for helper in &self.helpers {
+            let relative = super::config::relative_path(&helper.path)?;
+            ensure!(
+                helper.path.starts_with(".forge/checks/")
+                    && relative
+                        .extension()
+                        .is_some_and(|extension| extension == "nu"),
+                "helpers must be Nushell files under .forge/checks/"
+            );
+            let destination = workspace.join(relative);
+            super::config::reject_links(workspace, &destination)?;
+            let previous = match std::fs::read(&destination) {
+                Ok(source) => Some(source),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            ensure!(
+                previous.as_ref().map(|source| crate::plan::digest(source))
+                    == helper.expected_digest,
+                "helper changed since setup began: {}",
+                helper.path
+            );
+            let before = previous
+                .as_deref()
+                .map(std::str::from_utf8)
+                .transpose()?
+                .unwrap_or("");
+            detail.push_str(&format!("\nManaged helper: {}\n", helper.path));
+            detail.push_str(
+                &similar::TextDiff::from_lines(before, &helper.source)
+                    .unified_diff()
+                    .header(
+                        &format!("{} (current)", helper.path),
+                        &format!("{} (proposed)", helper.path),
+                    )
+                    .to_string(),
+            );
+        }
+        Ok(detail)
+    }
+}
+
+#[cfg(test)]
+mod review_tests {
+    use super::*;
+
+    #[test]
+    fn check_configuration_review_includes_helper_changes_and_rejects_stale_captures() -> Result<()>
+    {
+        let workspace = tempfile::tempdir()?;
+        let document = json!({"branch_prefix":"keep","checks":{}});
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            serde_json::to_vec(&document)?,
+        )?;
+        std::fs::create_dir_all(workspace.path().join(".forge/checks"))?;
+        let destination = workspace.path().join(".forge/checks/example.nu");
+        let before = "def main [] { print 'before' }\n";
+        std::fs::write(&destination, before)?;
+        let request = ConfigureChecks {
+            expected_revision: crate::plan::digest(&serde_json::to_vec(&document)?),
+            config: serde_json::from_value(json!({}))?,
+            helpers: vec![CheckHelper {
+                path: ".forge/checks/example.nu".into(),
+                source: "def main [] { print 'after' }\n".into(),
+                expected_digest: Some(crate::plan::digest(before.as_bytes())),
+            }],
+        };
+        let detail = request.review(workspace.path())?;
+        assert!(detail.contains("Check definitions are unchanged."));
+        assert!(detail.contains("Managed helper: .forge/checks/example.nu"));
+        assert!(detail.contains("-def main [] { print 'before' }"));
+        assert!(detail.contains("+def main [] { print 'after' }"));
+        assert_eq!(std::fs::read_to_string(&destination)?, before);
+        std::fs::write(&destination, "newer helper")?;
+        assert!(
+            request
+                .review(workspace.path())
+                .unwrap_err()
+                .to_string()
+                .contains("helper changed since setup began")
         );
         Ok(())
     }

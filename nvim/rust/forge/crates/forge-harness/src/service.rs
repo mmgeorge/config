@@ -369,7 +369,7 @@ impl HarnessService {
                 .presentation
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .export_tool(&document, &directory)?;
+                .export_tool(&document, &directory, controller.trace.clone(), &session_id)?;
             return Ok(json!({"path":path}));
         }
         controller
@@ -5897,7 +5897,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checks_setup_can_be_interrupted_while_provider_startup_is_pending() -> Result<()> {
+    async fn check_configuration_chat_startup_can_be_interrupted() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let service = service();
         let opened = service
@@ -5910,7 +5910,7 @@ mod tests {
         let registry = service.registry().await?;
         let controller = registry.resolve(&session_id).await?;
         let execution = service
-            .prepare(Some(&session_id), HarnessMethod::ChecksSetup)
+            .prepare(Some(&session_id), HarnessMethod::PromptSubmit)
             .await?
             .unwrap();
         let maintenance = controller.broker.lock().await;
@@ -5922,8 +5922,8 @@ mod tests {
                     Some(session_id.clone()),
                     Request {
                         id: 2,
-                        method: "checks.setup".into(),
-                        params: json!({}),
+                        method: "prompt.submit".into(),
+                        params: json!({"text":"Configure project checks."}),
                     },
                     &sink,
                 )
@@ -6445,8 +6445,8 @@ mod tests {
             .unwrap()
             .unwrap();
         drop(resumed);
-        let setup = service
-            .prepare(None, HarnessMethod::ChecksSetup)
+        let prompt = service
+            .prepare(None, HarnessMethod::PromptSubmit)
             .await
             .unwrap()
             .unwrap();
@@ -6458,13 +6458,21 @@ mod tests {
         );
         assert!(
             service
-                .prepare(None, HarnessMethod::ChecksSetup)
+                .prepare(None, HarnessMethod::ExchangeResume)
                 .await
                 .is_err()
         );
         let cleanup = Arc::clone(&controller.control_admission)
             .try_acquire_owned()
-            .expect("check setup must not retain cleanup admission while its model runs");
+            .expect("chat must not retain cleanup admission while its model runs");
+        assert!(
+            service
+                .prepare(None, HarnessMethod::ChecksEditing)
+                .await
+                .unwrap()
+                .is_none(),
+            "check-editing toggles must not need provider execution admission"
+        );
         assert!(
             service
                 .prepare(None, HarnessMethod::TurnCancel)
@@ -6473,7 +6481,7 @@ mod tests {
                 .is_none()
         );
         drop(cleanup);
-        drop(setup);
+        drop(prompt);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 

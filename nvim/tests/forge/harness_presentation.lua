@@ -2,6 +2,8 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local original_request = client.request_for
 local original_accepting = client.host_accepting
+local markdown = require("forge.render.harness.markdown")
+local original_markdown_render = markdown.render
 client.host_accepting = function() return true end
 local requests = {}
 client.request_for = function(session, method, params, callback)
@@ -241,7 +243,94 @@ local ok, failure = xpcall(function()
     and expansion.action == "set_expansion" and expansion.expanded,
     "deferred thought did not request its owned activity")
   assert(owner.close())
+
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(window, transcript)
+  local markdown_publication = {}
+  markdown.render = function(buffer, rendered_window, ranges)
+    markdown_publication[#markdown_publication + 1] = {
+      buffer = buffer, window = rendered_window, ranges = vim.deepcopy(ranges),
+    }
+  end
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) error(message) end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  local markdown_opening = requests[#requests]
+  local markdown_history = snapshot(markdown_opening.params.document, "**retained response**")
+  markdown_history.block[1].metadata.markdown = true
+  markdown_history.block[2] = { id = "tail", text = { "" },
+    metadata = { target = {}, decoration = {}, editable_region = {} } }
+  markdown_opening.callback({ transcript = markdown_history })
+  local rendered_ranges = vim.deepcopy(owner.markdown_ranges)
+  local render_count = #markdown_publication
+  assert(render_count > 0 and rendered_ranges[1].id == "body", "initial response Markdown was not published")
+  refresh().callback({ patch = { {
+    document = owner.document, base = 0, next = 1, base_rows = 2, next_rows = 4,
+    base_blocks = 2, next_blocks = 2,
+    text_edit = { { start_row = 1, removed_rows = 1, text = { "", "new prompt", "Working" } } },
+    block_edit = {}, removed_block = {},
+    metadata_edit = { { block = "tail", row_count = 3, metadata = markdown_history.block[2].metadata } },
+  } } })
+  assert(vim.wait(500, function() return owner.transcript.revision == 1 end, 1),
+    "prompt insertion did not publish")
+  assert(vim.deep_equal(owner.markdown_ranges, rendered_ranges),
+    "appending a prompt changed the retained response's Markdown ownership: "
+      .. vim.inspect({ before = rendered_ranges, after = owner.markdown_ranges }))
+  assert(#markdown_publication > render_count,
+    "appending non-Markdown text did not restore retained response parser boundaries")
+  render_count = #markdown_publication
+  refresh().callback({ patch = {} })
+  assert(#markdown_publication == render_count, "unchanged publication rerendered Markdown")
+  refresh().callback({ patch = { {
+    document = owner.document, base = 1, next = 2, base_rows = 4, next_rows = 4,
+    base_blocks = 2, next_blocks = 2, text_edit = {}, block_edit = {}, removed_block = {},
+    metadata_edit = { { block = "tail", row_count = 3, metadata = markdown_history.block[2].metadata } },
+  } } })
+  assert(vim.wait(500, function() return owner.transcript.revision == 2 end, 1),
+    "metadata-only publication did not settle")
+  assert(#markdown_publication == render_count, "non-Markdown metadata-only publication rerendered Markdown")
+  assert(owner.close())
+  markdown.render = original_markdown_render
+
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(window, transcript)
+  vim.cmd("belowright 3split")
+  local composer_window = vim.api.nvim_get_current_win()
+  vim.api.nvim_win_set_buf(composer_window, composer)
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) error(message) end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  opening = requests[#requests]
+  local idle = snapshot(opening.params.document, "")
+  idle.block[1].text = { "", "Idle" }
+  idle.block[1].metadata.status = { row = 1, animated = false }
+  opening.callback({ transcript = idle })
+  local status_revision = owner.transcript.revision
+  local status_cursor = vim.api.nvim_win_get_cursor(window)
+  for _, resize in ipairs({
+    { height = 7, event = "WinResized" },
+    { height = 3, event = "VimResized" },
+    { height = 5, event = "WinResized" },
+  }) do
+    vim.api.nvim_win_set_height(composer_window, resize.height)
+    vim.api.nvim_exec_autocmds(resize.event, {})
+    local height = vim.api.nvim_win_get_height(window) - (vim.wo[window].winbar ~= "" and 1 or 0)
+    local measured = vim.api.nvim_win_text_height(window, { start_row = 0 }).all
+    assert(measured == height,
+      ("resize left idle status using %d rows in a %d-row pane"):format(measured, height))
+    assert(owner.transcript.revision == status_revision, "resize required a new transcript revision")
+    assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), { "", "Idle" }),
+      "resize inserted spacing into transcript text")
+    assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), status_cursor), "resize moved the transcript cursor")
+    assert(vim.api.nvim_get_current_win() == composer_window, "resize stole composer focus")
+  end
+  assert(owner.close())
 end, debug.traceback)
 client.request_for = original_request
 client.host_accepting = original_accepting
+markdown.render = original_markdown_render
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else print("harness_presentation OK") vim.cmd("qa!") end

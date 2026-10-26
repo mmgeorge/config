@@ -309,7 +309,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "checks_configure",
-                description: "Save project checks and managed Nushell helpers when check editing is enabled by /checks setup on or guided /checks setup. Guided setup requires answers to its setup questions. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
+                description: "Submit project checks and managed Nushell helpers when check editing is enabled. Every call reviews the exact changes before saving in Read and Write modes, regardless of saved approval rules. YOLO approves automatically. Setup questions are optional. Preserve unrelated settings and use the revision from checks_list. Does not run checks.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))
                     .expect("check configuration schema is serializable"),
             },

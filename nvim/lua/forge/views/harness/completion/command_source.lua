@@ -15,7 +15,6 @@ local session = require("forge.session")
 
 local command_list = {
   { label = "/checks", detail = "Manage project checks, scopes, and run history" },
-  { label = "/checks setup", detail = "Enable check editing and start guided setup" },
   { label = "/checks setup on", detail = "Enable check editing without sending a prompt" },
   { label = "/checks setup off", detail = "Disable check editing without sending a prompt" },
   { label = "/config", detail = "Configure Harness settings" },
@@ -84,6 +83,12 @@ end
 ---@return boolean accepted
 ---@return string? failure
 function CommandSource.accepts_prompt(text)
+  if text:match("^%s*/checks%s+setup%s*$") or text:match("^%s*/checks%s+setup%s+") then
+    local setting = vim.trim(text):match("^/checks%s+setup%s+(%S+)$")
+    if setting ~= "on" and setting ~= "off" then
+      return false, "Use /checks setup on or /checks setup off, then request check changes in chat."
+    end
+  end
   local token = command_token(text)
   if not token then return true end
   for _, command in ipairs(command_list) do

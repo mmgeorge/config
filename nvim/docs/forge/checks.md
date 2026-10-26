@@ -1,10 +1,10 @@
 # Project checks
 
-`/checks setup` configures the commands that Harness runs during Checking.
-`/checks` lists configured checks and their task-specific settings. Expand a check
+`/checks` lists the commands Harness runs during Checking and their task-specific settings. Expand a check
 with `i` to inspect selection reasons, proposed commands, and saved results.
 Definitions live in the `checks` section of `.forge.json`. Setup preserves other
-repository settings and asks for your choices before saving.
+repository settings and presents the proposed configuration and helper changes
+for approval before saving.
 
 Saved results from an older check-history format remain on disk but are excluded from
 the current session history. Plans containing the older check configuration must be recreated.
@@ -12,16 +12,24 @@ the current session history. Plans containing the older check configuration must
 `/checks setup on` enables check-editing permission without sending a prompt.
 `/checks setup off` disables it without sending a prompt, including during active work.
 The permission starts off, applies to this Harness conversation, and survives reopening.
-The winbar shows `check editing on` or `check editing off`. The same permission is
-available in `/config` under **Checks → Setup**, toggled with Space. Guided `/checks setup`
-also enables permission, but still asks for your choices before saving. Enabling
-permission does not run checks or change which checks are enabled.
+The winbar shows `check editing on` while enabled. The same permission is
+available in `/config` under **Checks → Setup**, toggled with Space. Enabling
+permission does not run checks, send a prompt, or change which checks are enabled.
+Request configuration changes in ordinary chat, such as "Configure targeted checks
+for this repository." The `harness-checks` skill supplies discovery, schema, and
+scoped-runner guidance through the shared Rulesync skill catalog. Bare
+`/checks setup` and `/checks setup <check-id>` are not commands.
 
-Follow-up messages and interrupted setup retain your recorded choices. Setup still
-requires a user answer before saving. After configuration is saved, subsequent
-messages return to ordinary chat. Cancellation, rollback, or starting another task
-does not transfer the earlier setup's recorded answers to that task. Check-editing
-permission remains a separate conversation-level setting until you disable it.
+Every `checks_configure` submission opens an approval popup in Read and Write modes,
+even when saved rules allow the files. The popup shows the configuration and managed
+helper changes. Approve publishes that exact update, while rejection, cancellation,
+or timeout leaves the existing files unchanged. YOLO approves without a popup.
+Setup questions are optional and do not authorize publication.
+
+Planning still configures missing or invalid checks before generating the plan.
+That prerequisite uses the same skill and publication approval, then resumes the
+original planning request. Check-editing permission remains a separate
+conversation-level setting until you disable it.
 
 ## Automatic and explicit checks
 
@@ -64,8 +72,8 @@ run when required by a selected check, including checks with automatic selection
 
 In `/checks`, `●` marks an enabled check and `○` marks a disabled check. Space
 toggles the selected check. The Auto field controls automatic selection with the left/right arrows. These changes affect task overrides. Enter does not run
-checks. The History page retains previous runs. Use `/checks setup`
-to edit project defaults. Plan review shows automatic selection reasons and checks
+checks. The History page retains previous runs. Enable check editing and request
+changes in chat to edit project defaults. Plan review shows automatic selection reasons and checks
 explicitly requested by the plan.
 
 If the host returns an incompatible or malformed checks configuration, the picker
@@ -287,7 +295,8 @@ Submitting a prompt while checks run interrupts those checks and starts the prom
 after their processes stop. Explicitly queueing a prompt leaves checks running and
 waits for completion. A directly submitted prompt takes precedence over queued
 prompts, and edits made to the composer during cancellation remain unsent.
-`Ctrl-C` with an empty composer stops running checks and pauses work. `Ctrl-S`
+`Ctrl-C` stops running checks and pauses work without submitting the composer or
+queued messages. `Ctrl-S`
 submits the composer even while that pause is pending, after cleanup finishes.
 Closing the runtime during checks retains interrupted results when the session reopens.
 Checks do not restart automatically. If checkpoint saving was interrupted, the next prompt

@@ -28,7 +28,7 @@ end
 local function complete_snapshot()
   local request = requests[#requests]
   assert(request.method == "state.get")
-  request.callback({ session = state.session, capability = state.capability, status = { kind = "idle" } })
+  request.callback({ session = state.session, capability = state.capability, status = { kind = "idle" }, task = state.task })
 end
 
 local path_prompt = "/workspace/Screen shot.png\n[Image #1]\n\n"
@@ -205,6 +205,93 @@ complete_snapshot()
 assert(#state.queue == 1 and state.queue[1] == following, "accepted work was queued for duplicate execution")
 state.execution_notice = nil
 state.queue = {}
+for _, has_task in ipairs({ false, true }) do
+  state.session.current_task_id = has_task and "cancel-task" or nil
+  state.task = has_task and { { id = "cancel-task", kind = "chat", status = "running" } } or {}
+  compose("active prompt to cancel")
+  controller.submit()
+  local active_prompt = requests[#requests]
+  compose("steering awaiting acknowledgement")
+  controller.steer_submit()
+  local steering = requests[#requests]
+  assert(steering.method == "turn.steer")
+  local cancel_queue = {
+    { text = "first retained follow-up", task_id = state.session.current_task_id },
+    { text = "second retained follow-up", task_id = state.session.current_task_id },
+  }
+  state.queue = cancel_queue
+  compose("unsent draft while cancelling")
+  controller.cancel_turn()
+  local pause = requests[#requests]
+  assert(pause.method == "task.transition" and pause.params.action == "pause"
+      and pause.params.text == nil and pause.params.attachments == nil,
+    "Ctrl-C submitted composer content instead of a pause-only operation")
+  steering.callback(nil, "steering missed the cancelled turn")
+  active_prompt.callback(nil, "cancelled", { code = "turn_cancelled" })
+  if has_task then state.task[1].status = "paused" end
+  pause.callback({ state = "completed" })
+  complete_snapshot()
+  local settled_count = #requests
+  vim.wait(20, function() return false end, 1)
+  controller.drain()
+  assert(#requests == settled_count and not state.busy and state.queue_suspended,
+    "late steering or cancellation completion automatically submitted pending input")
+  assert(state.queue == cancel_queue and #state.queue == 3
+      and state.queue[1].text == "first retained follow-up"
+      and state.queue[2].text == "second retained follow-up"
+      and state.queue[3].text == "steering awaiting acknowledgement",
+    "cancellation lost or reordered queued input and unaccepted steering")
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "unsent draft while cancelling",
+    "cancellation erased the unsent draft")
+  compose("explicitly start another prompt")
+  controller.submit()
+  local explicit_prompt = requests[#requests]
+  assert(explicit_prompt.method == "prompt.submit" and explicit_prompt.params.text == "explicitly start another prompt"
+      and not state.queue_paused, "an explicit prompt did not release the local queue pause")
+  state.queue = {}
+  explicit_prompt.callback({})
+  complete_snapshot()
+end
+state.session.current_task_id, state.task = nil, {}
+state.queue = {}
+state.checks_running, state.active_check_run = true, "cancel-replacement"
+compose("replacement pending check cancellation")
+controller.submit()
+local check_cancel = requests[#requests]
+assert(check_cancel.method == "checks.cancel")
+compose("newer unsent draft")
+controller.cancel_turn()
+local replacement_pause = requests[#requests]
+assert(replacement_pause.method == "task.transition" and state.check_interrupt_pending == nil
+    and state.queue[1].text == "replacement pending check cancellation",
+  "Ctrl-C did not retain the pending check replacement as queued input")
+check_cancel.callback({})
+state.checks_running, state.active_check_run = false, nil
+replacement_pause.callback({ state = "completed" })
+complete_snapshot()
+local paused_count = #requests
+controller.drain()
+assert(#requests == paused_count and state.queue_paused and #state.queue == 1
+    and vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "newer unsent draft",
+  "late check cancellation delivered the replacement or changed the newer draft")
+state.queue = {}
+controller.task_transition({ action = "resume" })
+local resumed = requests[#requests]
+assert(resumed.method == "task.transition" and resumed.params.action == "resume" and not state.queue_paused,
+  "explicit resume did not release the local queue pause")
+resumed.callback({ state = "completed" })
+complete_snapshot()
+state.session.current_task_id = "already-running"
+state.task = {{ id = "already-running", kind = "chat", status = "running" }}
+state.queue_paused = true
+state.queue = {{ text = "resume locally paused queue", task_id = "already-running" }}
+controller.task_transition({ action = "resume" })
+local resumed_prompt = requests[#requests]
+assert(resumed_prompt.method == "prompt.submit" and resumed_prompt.params.text == "resume locally paused queue",
+  "explicit resume stranded the local queue when the host task was already running")
+state.queue = {}
+resumed_prompt.callback({})
+complete_snapshot()
 client.request_for = function() error("transport admission failed") end
 local admission_failure
 state.queue = { retained }

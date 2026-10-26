@@ -20,7 +20,7 @@ function M.notice(state)
     or diagnostic.get(state, "sync_error", "info")
     or state.presentation and diagnostic.get(state.presentation, "sync_failure", "info")
   if notice then return notice end
-  if not state.status or state.status.kind ~= "idle" or state.checks_running
+  if not state.status or state.status.kind ~= "idle" or state.checks_running or state.queue_paused
     or state.task_operation or state.active_elicitation or state.aborting_plan then return end
   local submission = state.busy and state.prompt_submission
   local entry = submission and submission.queue_entry or (state.queue or {})[1]

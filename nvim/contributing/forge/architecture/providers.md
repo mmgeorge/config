@@ -317,6 +317,14 @@ stale after a configuration change. `views/harness/model_picker.lua` owns only p
 state, field cycling, and presentation order. Copilot maps the selected context tier into native
 session creation and `set_model`, while Codex exposes only the controls returned by app-server.
 
+Copilot takes its default numeric context limit from `capabilities.limits.max_context_window_tokens`.
+Billing thresholds and output allowances never define context capacity. A billing `longContext`
+entry advertises the selectable tier but not its capacity, so that tier retains its identifier
+until live usage supplies a limit. When delivering a catalog, `provider_catalog.lua` overlays
+the active model and context tier with the session's provider-reported `ContextUsage.size`,
+the same value the winbar displays. The overlay resolves the default model through its runtime
+identity and leaves other models, inactive tiers, and cached catalog metadata unchanged.
+
 Codex resolves the `default` selection through its model catalog before admitting a turn.
 The resolved model is sent explicitly on thread creation, thread resume, and turn start,
 and the same value supplies the runtime model shown in Harness. Omitting the model after

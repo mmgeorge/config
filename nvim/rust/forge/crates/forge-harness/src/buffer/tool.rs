@@ -401,18 +401,30 @@ impl ToolOutputSnapshot {
         Ok(())
     }
 
-    pub fn export_saved_output(&self, directory: &Path) -> Result<OwnedToolExport> {
-        OwnedToolExport::create(directory, &self.saved)
+    pub fn export_saved_output(
+        &self,
+        directory: &Path,
+        trace: Arc<crate::trace::TraceStore>,
+        session_id: &str,
+    ) -> Result<OwnedToolExport> {
+        OwnedToolExport::create(directory, &self.saved, trace, session_id)
     }
 }
 
 pub struct OwnedToolExport {
     file: Option<File>,
     path: Option<PathBuf>,
+    trace: Arc<crate::trace::TraceStore>,
+    session_id: String,
 }
 
 impl OwnedToolExport {
-    pub fn create(directory: &Path, saved: &str) -> Result<Self> {
+    pub fn create(
+        directory: &Path,
+        saved: &str,
+        trace: Arc<crate::trace::TraceStore>,
+        session_id: &str,
+    ) -> Result<Self> {
         std::fs::create_dir_all(directory).context("create tool export directory")?;
         let directory = directory
             .canonicalize()
@@ -431,6 +443,8 @@ impl OwnedToolExport {
         let mut export = Self {
             file: Some(file),
             path: Some(path),
+            trace,
+            session_id: session_id.into(),
         };
         let output = export.file.as_mut().expect("created export");
         for chunk in saved.as_bytes().chunks(65536) {
@@ -463,9 +477,10 @@ impl OwnedToolExport {
 impl Drop for OwnedToolExport {
     fn drop(&mut self) {
         if let Err(error) = self.close() {
-            let _ = writeln!(
-                std::io::stderr(),
-                "Forge tool export cleanup failed: {error:#}"
+            self.trace.record(
+                &self.session_id,
+                "tool.export_cleanup_failed",
+                serde_json::json!({"error":format!("{error:#}")}),
             );
         }
     }
@@ -474,6 +489,34 @@ impl Drop for OwnedToolExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_cleanup_reports_errors_and_logs_only_while_enabled() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let trace = Arc::new(crate::trace::TraceStore::open(directory.path())?);
+        for (session_id, enabled) in [
+            ("disabled", false),
+            ("enabled", true),
+            ("disabled-again", false),
+        ] {
+            trace.configure(enabled)?;
+            let mut export =
+                OwnedToolExport::create(directory.path(), "saved", trace.clone(), session_id)?;
+            let path = export.path().unwrap().to_owned();
+            drop(export.file.take());
+            std::fs::remove_file(&path)?;
+            std::fs::create_dir(&path)?;
+            assert!(export.close().is_err());
+            drop(export);
+            let log = PathBuf::from(trace.session_status(session_id).path);
+            assert_eq!(log.exists(), enabled);
+            if enabled {
+                assert!(std::fs::read_to_string(log)?.contains("tool.export_cleanup_failed"));
+            }
+            std::fs::remove_dir(path)?;
+        }
+        Ok(())
+    }
 
     #[test]
     fn complete_check_snapshot_retains_all_output_without_expanding_inline() -> Result<()> {
@@ -526,7 +569,11 @@ mod tests {
         output.accept_batch(&last)?;
         assert!(output.next_batch(256, 65536)?.is_none());
         let directory = tempfile::tempdir()?;
-        let export = output.export_saved_output(directory.path())?;
+        let export = output.export_saved_output(
+            directory.path(),
+            Arc::new(crate::trace::TraceStore::open(directory.path())?),
+            "tool-test",
+        )?;
         assert_eq!(std::fs::read_to_string(export.path().unwrap())?, saved);
         Ok(())
     }
@@ -546,7 +593,11 @@ mod tests {
         );
         let directory = tempfile::tempdir()?;
         let snapshot = source.snapshot()?;
-        let export = snapshot.export_saved_output(directory.path())?;
+        let export = snapshot.export_saved_output(
+            directory.path(),
+            Arc::new(crate::trace::TraceStore::open(directory.path())?),
+            "tool-test",
+        )?;
         let complete = std::fs::read_to_string(export.path().unwrap())?;
         assert!(complete.starts_with(&saved));
         assert!(complete.ends_with("last output after previous threshold\n"));
@@ -684,7 +735,11 @@ mod tests {
         let mut export = view
             .snapshot()
             .unwrap()
-            .export_saved_output(directory.path())
+            .export_saved_output(
+                directory.path(),
+                Arc::new(crate::trace::TraceStore::open(directory.path()).unwrap()),
+                "tool-test",
+            )
             .unwrap();
         let path = export.path().unwrap().to_owned();
         assert_eq!(std::fs::read(&path).unwrap(), saved.as_bytes());

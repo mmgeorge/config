@@ -1014,6 +1014,7 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
+  if from_composer then state.queue_paused = false end
   local request_owner = set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
@@ -1079,10 +1080,6 @@ end
 function M.cancel_turn()
   local state = harness_state()
   if state.host_error then M.render() return end
-  if composer_text(state.composer_buf) ~= "" then
-    M.submit()
-    return
-  end
   if state.selected_agent_run_id then
     M.agent_action("interrupt", state.selected_agent_run_id)
     return
@@ -1102,6 +1099,7 @@ end
 function M.drain()
   local state = harness_state()
   if not state.host_error and check_queue.publish(state, function() vim.schedule(M.drain) end) then return end
+  if state.queue_paused then state.queue_suspended = true return end
   if state.check_interrupt_pending then
     resume_check_interrupted_prompt(state, state.check_interrupt_pending)
     return
@@ -1156,6 +1154,7 @@ function M.drain()
       if type(entry) == "table" then next_config = vim.tbl_extend("force", next_config, entry.config or {}) end
       M.configure(next_config, true, function(applied)
         if not applied then return end
+        if state.queue_paused then return end
         if state.queue[1] ~= entry then return end
         if state.queue_edit and state.queue_edit.barrier == entry then return end
         if prompt ~= "" then begin_request(prompt, false, entry.attachments or {}, nil, entry)
@@ -1830,17 +1829,6 @@ function M.submit()
     end)
     return
   end
-  if text == "/checks setup" or text:match("^/checks setup%s+") then
-    if state.busy then notifications.error("Finish or pause active work before check setup", "Harness checks") return end
-    set_composer_text(state.composer_buf, "")
-    state.busy = true
-    client.request_for(state.session.id, "checks.setup", { check_id = text:match("^/checks setup%s+(.+)$") }, function(_, failure)
-      state.busy = false
-      if failure then notifications.error(failure, "Harness checks") end
-      synchronize_state()
-    end)
-    return
-  end
   if text == "/skills" then
     set_composer_text(state.composer_buf, "")
     M.open_skill_picker()
@@ -2481,6 +2469,17 @@ function M.task_transition(action, submitted_text, completed, method)
   if submitted_text then action.attachments = attachment.capture(state.composer_buf).attachments end
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
+  if action.action == "pause" then
+    state.queue_paused = true
+    local interrupted = state.check_interrupt_pending
+    if interrupted then
+      state.check_interrupt_pending = nil
+      table.insert(state.queue, 1, { text = interrupted.text, attachments = interrupted.attachments,
+        task_id = state.session.current_task_id })
+    end
+  elseif vim.tbl_contains({ "resume", "clear", "chat", "plan", "goal", "execute" }, action.action) then
+    state.queue_paused = false
+  end
   if action.action ~= "configure" then
     state.task_config = nil
     if state.configuration_completion then
@@ -2492,6 +2491,7 @@ function M.task_transition(action, submitted_text, completed, method)
   if action.action == "resume" and current and current.status == "running"
     and (not action.task_id or action.task_id == current.id) then
     M.render()
+    M.drain()
     return
   end
   set_busy(true)
@@ -2754,7 +2754,7 @@ function M.activate_snapshot(result)
   require("forge.views.harness.health").watch(state, function()
     if harness_state() == state then M.render() end
   end)
-  if previous_session ~= state.session.id then state.queue, state.queue_edit = {}, nil end
+  if previous_session ~= state.session.id then state.queue, state.queue_edit, state.queue_paused = {}, nil, false end
   M.render()
   M.resolve_runtime_model()
   if state.active_elicitation and state.active_elicitation.elicitation then

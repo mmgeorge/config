@@ -102,7 +102,7 @@ M.view_specs = {
         queue_edit = function(state) if state.queue_edit then return "unqueue" end end } },
     { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if state.busy and state.capability and state.capability.native_steer then return "steer" end end } },
-    { id = "cancel", label = "cancel", desc = "Send text immediately, or interrupt (restore prompt if output-free)", modes = { "n", "i" }, pinned = false,
+    { id = "cancel", label = "cancel", desc = "Interrupt without sending the composer (restore prompt if output-free)", modes = { "n", "i" }, pinned = false,
       hints = { composer = function(state) if state.busy then return "cancel" end end,
         working_status = function() return "interrupt" end,
         permission_status = function() return "interrupt" end } },

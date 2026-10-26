@@ -81,6 +81,7 @@ M.empty_diff_rows = {}
 ---@field render_initialized boolean
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
+---@field queue_paused boolean
 ---@field check_queue? ForgeCheckQueuePublication
 ---@field status_thoughts? boolean
 ---@field subagent_tools? boolean
@@ -162,6 +163,7 @@ local function new_harness_state()
   render_initialized = false,
   render_fold_signature = nil,
   queue = {},
+  queue_paused = false,
   pending_steer = {},
   transcript_buf = nil,
   transcript_win = nil,

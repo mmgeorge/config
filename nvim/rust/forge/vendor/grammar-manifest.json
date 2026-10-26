@@ -25,7 +25,7 @@
         },
         {
           "path": "FORGE-PATCH.md",
-          "sha256": "9d26e1cfbd7a5fa8e530c73a531210cdf46a60073497d4ba8607395f81ceda89"
+          "sha256": "b080964f714cc769277c76ade080a280570a95b22097ba2c2f64357a49bd0bce"
         },
         {
           "path": "grammar.js",
@@ -33,7 +33,7 @@
         },
         {
           "path": "grammar.patch",
-          "sha256": "05c5559777ca7a790c83dc3514ae0fed21a1acb9cbe4bde965f9fd1b17eb62ac"
+          "sha256": "ae3f46e676a5871794313f0f19642fd83224e678436e0df9d3a1736818e4167d"
         },
         {
           "path": "LICENSE",
@@ -57,7 +57,7 @@
         },
         {
           "path": "src/scanner.c",
-          "sha256": "cf366b70e258a0ac1eb264ac0f4165c8f0c1b943d1a6e9db9d291c6cf178221f"
+          "sha256": "0ed9bd369917808a62c934db10c061a6c95f82e80b9f19ec5416ab3860b93af9"
         },
         {
           "path": "src/tree_sitter/alloc.h",

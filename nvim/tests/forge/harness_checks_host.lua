@@ -16,6 +16,7 @@ client._set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 local answered = {}
+local configuration_reviews = 0
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
 end
@@ -26,6 +27,12 @@ local function request(method, params)
     for _, approval in ipairs(state.approval or {}) do
       if not answered[approval.id] then
         answered[approval.id] = true
+        for _, item in ipairs(approval.item_list) do
+          if item.title == "Update project checks" then
+            configuration_reviews = configuration_reviews + 1
+            assert(item.detail:find(".forge.json", 1, true), "configuration review omitted changes")
+          end
+        end
         local answers = {}
         for _, item in ipairs(approval.item_list) do answers[#answers + 1] = {item_id = item.id, choice_id = "allow_once"} end
         client.request("approval.resolve", {approval_id = approval.id, answer_list = answers}, function(_, error)
@@ -50,26 +57,6 @@ end
 local function definition(id, command, dependency)
   return { id = id, trigger = {auto = true}, action = { command = command, category = "test", after = dependency or {} } }
 end
-local function setup(params)
-  local admitted = request("checks.setup", params)
-  assert(vim.wait(1000, function()
-    return state.active_elicitation and state.active_elicitation.elicitation
-      and state.status.kind == "awaiting_input"
-  end, 10), "setup completed without publishing its question to the UI: " .. vim.inspect({
-    question = state.active_elicitation, status = state.status, busy = state.busy,
-  }))
-  local question = state.active_elicitation.elicitation.question_set.questions[1]
-  local controller = require("forge.views.harness.controller")
-  require("forge.views.harness.plan_question").close()
-  state.plan_question_open = false
-  controller.reopen_question()
-  assert(state.plan_question_open, "oe did not reopen the pending setup question")
-  require("forge.views.harness.plan_question").close()
-  state.plan_question_open = false
-  request("question.answer", { question_id = question.id, response = { kind = "other", text = "Use targeted checks for this fixture." } })
-  request("question.continue")
-  return admitted
-end
 local succeeded, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
@@ -91,11 +78,10 @@ local succeeded, failure = xpcall(function()
   toggle_editing(true)
   toggle_editing(false)
   assert(#request("exchange.list") == 0, "permission toggles sent a provider prompt")
-  local first_setup = setup()
-  assert(state.check_editing == true, "guided setup must enable editing")
-  assert(request("checks.list").configured, "setup did not publish after the user answered")
-  local repeated_setup = setup({ check_id = "unit" })
-  assert(first_setup.exchange.id ~= repeated_setup.exchange.id, "each setup request must own a new exchange")
+  assert(not pcall(request, "checks.setup"), "removed guided setup operation must be rejected")
+  assert(state.check_editing == false, "removed setup operation changed permission")
+  assert(#request("exchange.list") == 0, "removed setup operation created an exchange")
+  toggle_editing(true)
   request("session.configure", { shell = "nushell" })
   save({ definition("failure", "exit 7"), definition("dependent", "'unexpected' | save unexpected.txt", { "failure" }), definition("independent", "sleep 200ms; print 'independent output'") })
   assert(not pcall(request, "checks.run"), "manual runs must name their checks")
@@ -163,25 +149,15 @@ local succeeded, failure = xpcall(function()
   assert(vim.fn.filereadable(workspace .. "/shutdown-orphan.txt") == 0, "shutdown left a check process running")
   vim.fn.delete(workspace .. "/.forge.json")
   request("prompt.submit", { text = "/plan add test coverage" })
-  local bootstrap_state = request("state.get")
-  local bootstrap = bootstrap_state.active_elicitation
-  assert(type(bootstrap) == "table", "planning bootstrap did not ask about missing checks")
-  assert(not pcall(request, "checks.setup"), "separate setup must not take ownership of pending plan questions")
-  local rejected_setup = request("state.get")
-  assert(rejected_setup.active_elicitation.elicitation.question_set.id == bootstrap.elicitation.question_set.id,
-    "rejected setup changed the pending plan questions")
-  assert(vim.deep_equal(rejected_setup.task, bootstrap_state.task),
-    "rejected setup changed the waiting plan task: " .. vim.inspect(rejected_setup.task))
-  request("question.answer", {question_id = bootstrap.elicitation.question_set.questions[1].id,
-    response = {kind = "other", text = "Use targeted checks for the proposed project."}})
-  request("question.continue")
-  assert(request("checks.list").configured, "planning bootstrap did not save after the user's answer")
+  assert(request("state.get").active_elicitation == nil, "planning bootstrap required setup questions")
+  assert(request("checks.list").configured, "planning bootstrap did not save after approval")
+  assert(configuration_reviews == 1, "planning bootstrap omitted configuration approval")
   local planned = request("state.get").active_plan
   assert(type(planned) == "table", "plan fixture did not create a review")
-  local configured = setup()
+  request("checks.editing", { enabled = false })
+  request("checks.editing", { enabled = true })
   local after_setup = request("state.get").active_plan
-  assert(after_setup.id == planned.id and after_setup.state == planned.state, "check setup changed the active plan lifecycle")
-  assert(type(configured.exchange.id) == "string", "check setup did not create an exchange during plan review")
+  assert(after_setup.id == planned.id and after_setup.state == planned.state, "check-editing toggles changed the active plan lifecycle")
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
 if state.presentation then state.presentation.close() end

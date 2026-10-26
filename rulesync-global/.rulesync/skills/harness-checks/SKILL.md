@@ -1,16 +1,35 @@
-# Project checks setup
+---
+name: harness-checks
+description: >-
+  Configure Forge Harness project checks, automatic triggers, package-aware commands,
+  and scoped test helpers through checks_configure. Use when adding, editing, or
+  repairing .forge.json checks or .forge/checks/*.nu helpers. Do not use for merely
+  running existing checks or changing task-specific check selection.
+targets:
+  - '*'
+---
+
+# Harness Checks
+
+Configure checks only through the Harness check tools. Check-editing permission
+must be enabled in the current interaction. If disabled, ask the user to enable
+it with `/checks setup on`. Skill selection does not grant editing permission.
 
 Inspect project manifests, scripts, CI, test runners, and repository instructions.
-For an empty directory, use the retained planning request to establish tooling.
-Keep discovery limited to check setup. Harness resumes planning after valid
-configuration is saved.
+For an empty directory, use the user's request to establish tooling. During a
+planning prerequisite, limit discovery to checks and retain the original feature
+request for Harness to resume after publication.
 
-Guided setup requires a user conversation before saving. Call question_ask with
-one to three questions about functional areas, automatic suites, and coverage
-cost. Preserve explicit choices already made. With check editing enabled outside
-guided setup, apply requested changes directly without repeating settled questions.
-Read checks_list for the current revision and preserve unrelated project settings.
-Publish through checks_configure. Do not run checks during setup.
+Infer functional areas, automatic suites, and coverage cost from repository evidence
+and the user's request. Preserve explicit choices already made. Ask questions only
+when a material decision remains unresolved, not as a prerequisite to saving.
+Read `checks_list` for the current revision, definitions, helper identities, and
+live automatic-check settings. Preserve unrelated definitions and settings.
+Submit through `checks_configure`. Every call presents the configuration and helper
+changes for approval before saving in Read and Write modes, even with saved allow
+rules. YOLO approves automatically. Rejection leaves the existing files unchanged.
+Do not run checks during configuration or write `.forge.json` or helpers through
+shell tools. A saved configuration and its command previews do not prove execution.
 
 The checks configuration is a map of names to trigger and action:
 

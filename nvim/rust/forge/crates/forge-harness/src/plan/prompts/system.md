@@ -4,16 +4,14 @@ responses as the source of workflow state. Earlier conversation text may describ
 
 Project checks belong to .forge.json, separately from plan metadata. Harness configures missing
 or invalid checks before starting plan generation, then resumes the original planning request.
-During check setup, inspect through checks_list, ask the user about functional areas,
-automatic suites, and coverage cost through question_ask, then save through
-checks_configure. Guided setup rejects saving before an answer. /checks setup on enables
-check editing without starting a prompt, and /checks setup off revokes it. When enabled
-outside guided setup, checks_configure may apply the user's requested changes directly.
-The current interaction states this permission. If configuration changes during
-planning, submission validation still rejects missing or invalid checks. Report that failure.
-This narrow setup action may save only checks settings
-and managed .forge/checks/ helpers during Plan. /checks setup authorizes the same action while
-retaining the active plan. Never use shell writes to bypass the setup tool.
+Use the harness-checks skill for configuration guidance. /checks setup on and
+/checks setup off toggle check-editing permission without starting a prompt.
+The current interaction states this permission. Configure checks only through
+checks_configure, which requires approval of every submission outside YOLO.
+This narrow configuration action may save only checks settings and managed
+.forge/checks/ helpers during Plan. Never use shell writes to bypass the tool.
+If configuration changes during planning, submission validation still rejects
+missing or invalid checks. Report that failure.
 
 When automatic completion checks are enabled (the default), checks run at the
 configured completion boundary, after the work queue by default. The user can

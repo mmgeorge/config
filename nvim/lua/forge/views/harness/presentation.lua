@@ -98,9 +98,12 @@ function M.open(options, callback)
     end
     table.sort(range_list, function(left, right) return left.first0 < right.first0 end)
     table.sort(window_list)
-    if not force and vim.deep_equal(owner.markdown_ranges, range_list)
+    local changedtick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
+    -- Appending outside a message can extend Tree-sitter's included region at its boundary.
+    if not force and owner.markdown_tick == changedtick and vim.deep_equal(owner.markdown_ranges, range_list)
       and vim.deep_equal(owner.markdown_windows, window_list) then return end
     owner.markdown_ranges, owner.markdown_windows = range_list, window_list
+    owner.markdown_tick = changedtick
     if #window_list == 0 then markdown.render(options.transcript_buffer, nil, {}) return end
     for _, window in ipairs(window_list) do
       perf.trace("harness", "ui.markdown", { session_id = options.session_id,
@@ -747,6 +750,7 @@ function M.open(options, callback)
     if not alive() or not owner.ready then return end
     owner.refresh_views()
     render_markdown(true)
+    require("forge.views.harness.status_region").align(owner.transcript, options.transcript_window)
     owner.pending_width = owner.pending_width or {}
     for window, view in pairs(owner.views) do
       owner.pending_width[view.id] = { view = view.id, width = require("forge.width").capture(window) }

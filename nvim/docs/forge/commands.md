@@ -137,11 +137,20 @@ A file-write request in Read mode offers **Switch to Write mode** or **Stay in R
 Switching resumes the task under the configured directory limits and permission rules.
 Staying in Read mode rejects that request.
 
+File-write permission popups offer **Always allow writes in this workspace** for
+paths inside the current workspace. The choice persists a workspace-specific rule,
+not filesystem-wide access. Explicit denials and protected files remain restricted.
+Directory grants for writes use the containing Git worktree root when available,
+including linked worktrees and nested repositories. Non-Git paths use the nearest
+existing directory. The popup shows the selected root before approval.
+
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
 two latest prior responses stay open during the current exchange. Submitting another prompt folds
 the third-to-last response. Thinking and tool sections keep their usual folding behavior.
 Use the normal expansion command on
 the caret or message body to show or hide the complete text.
+Submitting another prompt preserves Markdown formatting in earlier responses while the new
+exchange starts.
 
 `Running` tool groups show only the latest call and its four-row output preview.
 When a group changes to `Ran`, it folds automatically. Expanding that completed group
@@ -181,7 +190,11 @@ in the child. Inherited question and plan controls are inactive.
 | `:ForgeHarnessLog` | Optional `on`, `off`, or `open` | Control or open the active session's protocol trace |
 | `:ForgePermissions` | None | Edit the Harness permissions document |
 
-`ForgeHarnessLog` requires an open Harness session. Inside Harness, `/sessions`
+`ForgeHarnessLog` requires an open Harness session. Check-worker and tool-export
+cleanup diagnostics follow the same `/log` setting instead of printing to process
+streams. Operation failures remain visible when logging is off.
+
+Inside Harness, `/sessions`
 opens durable session search and `/undo` opens the interaction list directly.
 After selecting an interaction, choose **Conversation only** to keep current files,
 or **Conversation and files** to restore its checkpoint too. Conversation-only
@@ -199,6 +212,9 @@ Each entry previews only its first line on one display row, with an ellipsis whe
 that line exceeds the available width. Editing opens the complete message in the
 prompt and keeps the status and queue visible at the bottom of the transcript.
 Live tool output occupies four rows, including blank padding.
+Shell-backed tool headings show the underlying command rather than the shell tool
+wrapper, both while running and after completion. Expanding the call retains its
+full arguments. Native tools such as `rg` keep their structured call headings.
 The live status line shows the current phase, elapsed time, and interrupt key.
 Thought headers retain tool totals and append failed-tool and changed-file counts
 when nonzero. Repeated successful edits to one file count once.
@@ -218,8 +234,14 @@ Assistant commentary marked with an open circle is separate from the reasoning-s
 Explicit steering sends the current composer text to the active response while
 preserving queued follow-ups. If the active turn cannot accept it, the text joins
 the follow-up queue and Harness shows a warning.
+`Ctrl-C` only interrupts active work. It never submits or steers the composer,
+including while editing a queued message. Drafts and queued follow-ups remain
+unsent while the task is paused. With a child timeline selected, it interrupts
+that child without sending the draft.
 Queued prompts and pending steering appear below the status in the upper timeline
 pane. The lower prompt buffer contains only the draft being edited.
+The prompt grows with visual wrapped rows up to its configured maximum height.
+Longer drafts scroll through wrapped rows without inserting newlines into the text.
 Queued prompts remain visible until accepted. If submission fails before acceptance,
 the message and its attachments stay queued for inspection or resubmission. Messages
 waiting for execution capacity do not interrupt the active response or checks.
@@ -233,6 +255,10 @@ Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` an
 draft and attachments. Inside a multiline draft, the arrows move between lines.
 `Alt-Up` and `Alt-Down` also browse history. Timeline row activation, folding,
 and gutter selection remain in the upper pane.
+
+In the timeline, press `W` to select whole lines from the left gutter, including
+markers and indentation. Extend the selection, then press `<Space>l` to copy the
+displayed lines and their gutters to the clipboard for pasting into a prompt.
 
 Unknown or unfinished slash commands keep the draft and show a warning. A leading
 path with a filename extension, such as `/workspace/screenshot.png`, submits and
@@ -291,17 +317,24 @@ Check-editing permission is also available under **Checks → Setup** without
 sending a prompt. Unsupported controls explain their restriction, and provider
 setup and Windows sandbox options appear only where applicable.
 
+The model picker's **Context** value uses the provider's explicit context limit.
+For the active model and tier, it uses the live session limit shown in the winbar.
+Copilot tiers without an explicit numeric limit display their identifier, such as
+`long_context`, until the provider reports their active capacity. Billing thresholds
+and output allowances do not increase the displayed context size.
+
 Input timeouts run independently of the picker. An idle session has no periodic
 timeout check. Changing a timeout affects future questions and approvals without
 extending an existing deadline. If another execution prevents a clarification
 from being submitted, Harness shows **Not submitted**, keeps the question open,
 and restores the clarification text for retry.
 
-`/checks` opens project checks, and `/checks setup` configures their commands and
-selection policies through a guided conversation. `/checks setup on` and
+`/checks` opens project checks. `/checks setup on` and
 `/checks setup off` toggle check-editing permission without sending a prompt.
-The Harness winbar shows the current permission. See [Project checks](checks.md) for package-aware commands and
-new-test selection.
+Request configuration changes in chat after enabling editing. The `harness-checks`
+skill supplies setup guidance. Bare `/checks setup` is not a command.
+The Harness winbar shows enabled editing. See [Project checks](checks.md) for
+publication approval, package-aware commands, and new-test selection.
 
 PlanReview shows declaration changes with nearby context lines and enclosing
 declaration boundaries, using the regular diff grouping rules. Nearby method

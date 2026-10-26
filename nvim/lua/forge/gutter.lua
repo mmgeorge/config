@@ -48,10 +48,13 @@ end
 function M.highlight(session, window, row, namespace)
   local selection = session.gutter_selection
   if not selection or selection.window ~= window or row + 1 < selection.first or row + 1 > selection.last then return end
+  vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, 0, {
+    end_row = row + 1, end_col = 0, hl_group = "Visual", line_hl_group = "Visual",
+    hl_eol = true, priority = 65535, ephemeral = true,
+  })
   local bounds = M.bounds(session, row + 1)
-  if not bounds then return end
   local origin = vim.api.nvim_win_get_position(window)[2] + 1
-  for _, entry in ipairs(bounds.insertion) do
+  for _, entry in ipairs(bounds and bounds.insertion or {}) do
     local chunks = {}
     for _, chunk in ipairs(entry.chunk) do
       chunks[#chunks + 1] = { chunk.text, "Visual" }
@@ -67,6 +70,17 @@ function M.highlight(session, window, row, namespace)
         virt_text = chunks, virt_text_win_col = column, priority = 65535, hl_mode = "replace", ephemeral = true,
       })
     end
+  end
+  local location = session.decoration_location and session.decoration_location(row)
+    or require("forge.buffer").locate(session, row, 0)
+  local node = location and session.sequence.node[location.block]
+  local layout = node and location.position.row == 0 and node.entry.metadata.layout
+  local marker = layout and require("forge.content_layout").marker(node.entry)
+  if marker and layout.indent > 2 then
+    vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, 0, {
+      virt_text = { { marker.text, "Visual" } }, virt_text_win_col = layout.indent - 4,
+      priority = 65535, hl_mode = "replace", ephemeral = true,
+    })
   end
 end
 

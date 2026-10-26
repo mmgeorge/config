@@ -69,7 +69,7 @@ Rust paths in this table are relative to
 | Shared catalog and plan previews | `checks/preview.rs`, `checks/tools.rs` |
 | Accepted-plan case inventory | `broker/checks.rs`, `plan/design_tests.rs` |
 | Preview invalidation and plan rendering | `plan/design.rs`, `plan/design_review.rs` |
-| Setup guidance | `checks/setup.md`, `plan/prompts/planning.md` |
+| Setup guidance | `rulesync-global/.rulesync/skills/harness-checks/SKILL.md`, relative to the repository root |
 | Editor presentation | `nvim/lua/forge/views/harness/checks.lua`, relative to the repository root |
 
 ## Integration sequence

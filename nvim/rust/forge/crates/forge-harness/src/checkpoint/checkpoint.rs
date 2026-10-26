@@ -392,7 +392,6 @@ impl GitCheckpoint {
         mut check: impl FnMut() -> Result<()>,
     ) -> Result<CheckpointRecord> {
         check()?;
-        let started = std::time::Instant::now();
         let signature = forge_git::checkpoint::signature(&self.workspace, &mut check)?;
         if let Some(previous) = self
             .cache
@@ -404,18 +403,11 @@ impl GitCheckpoint {
             && previous.unchanged()
         {
             check()?;
-            let _ = writeln!(
-                std::io::stderr(),
-                "checkpoint.reuse duration_ms={}",
-                started.elapsed().as_millis()
-            );
             return Ok(previous.record.clone());
         }
         let inventory = forge_git::checkpoint::inventory(&self.workspace, &signature, &mut check)?;
         let mut file = Vec::new();
         let mut deleted = inventory.missing.into_iter().collect::<Vec<_>>();
-        let mut hits = 0usize;
-        let mut bytes = 0u64;
         let mut source = Vec::new();
         let mut reusable = true;
         for relative in &inventory.candidate {
@@ -463,7 +455,7 @@ impl GitCheckpoint {
                 .base
                 .get(relative)
                 .filter(|base| base.mode == mode && base.checkout.unsupported.is_none());
-            let (identity, reused) = if metadata.is_symlink() {
+            let identity = if metadata.is_symlink() {
                 let target = fs::read_link(&path)?;
                 let content = target.as_os_str().as_encoded_bytes();
                 let digest = crate::plan::digest(content);
@@ -471,14 +463,11 @@ impl GitCheckpoint {
                     .map(|base| objects.matches_baseline(&self.workspace, base, &digest))
                     .transpose()?
                     .unwrap_or(false);
-                (
-                    if unchanged {
-                        None
-                    } else {
-                        Some(objects.put(content)?)
-                    },
-                    false,
-                )
+                if unchanged {
+                    None
+                } else {
+                    Some(objects.put(content)?)
+                }
             } else {
                 let captured =
                     match objects.capture_file(&path, &self.workspace, base, &mut check) {
@@ -507,13 +496,8 @@ impl GitCheckpoint {
                 } else {
                     reusable = false;
                 }
-                (captured.object_id, captured.reused)
+                captured.object_id
             };
-            if reused {
-                hits += 1;
-            } else {
-                bytes += metadata.len();
-            }
             let Some(identity) = identity else {
                 continue;
             };
@@ -540,15 +524,6 @@ impl GitCheckpoint {
             &checkout,
             &inventory.excluded,
         ))?;
-        let _ = writeln!(
-            std::io::stderr(),
-            "checkpoint.capture candidates={} overrides={} cache_hits={} bytes_read={} duration_ms={}",
-            inventory.candidate.len(),
-            file.len(),
-            hits,
-            bytes,
-            started.elapsed().as_millis()
-        );
         let record = CheckpointRecord {
             id: crate::plan::digest(&manifest),
             session_id: session_id.into(),

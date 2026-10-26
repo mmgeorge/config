@@ -69,7 +69,6 @@ pub fn signature(
     root: &Path,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<CheckpointSignature> {
-    let started = std::time::Instant::now();
     let repository = gix::open(root)?;
     let index = match std::fs::metadata(repository.index_path()) {
         Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
@@ -158,7 +157,6 @@ pub fn signature(
     let identity = crate::discover_identity(root)?
         .ok_or_else(|| anyhow::anyhow!("checkpoint repository disappeared"))?;
     config.extend(crate::content::conversion::read_info(&identity, check)?.unwrap_or_default());
-    let command_elapsed = started.elapsed();
     let checkout = checkout_attributes(
         root,
         &names
@@ -180,14 +178,6 @@ pub fn signature(
         .iter()
         .map(|entry| (path_key(entry.path(&refreshed)), entry.stat.size))
         .collect();
-    let _ = writeln!(
-        std::io::stderr(),
-        "checkpoint.signature commands_ms={} attributes_ms={} names={} attributes={}",
-        command_elapsed.as_millis(),
-        (started.elapsed() - command_elapsed).as_millis(),
-        names.stdout.len(),
-        checkout.len()
-    );
     Ok(CheckpointSignature {
         status: output.stdout,
         index,

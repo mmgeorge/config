@@ -41,6 +41,10 @@ composer buffer. Shared document commands resolve configured bindings,
 help, selections, and gutters from native metadata. Physical source rows contain source
 text, while decorations provide gutters and selection presentation without changing text.
 
+Composer height follows visual wrapped rows, with one spare row and winbar space, within
+the configured minimum and maximum heights. Text changes and window or editor resize events
+remeasure wrapping at the current width. The composer enables window-local `smoothscroll`
+so drafts taller than the pane can scroll through portions of one physical line.
 Composer resizing captures the current cursor and viewport immediately before changing
 window height. If the complete draft fits after accounting for wrapping and the winbar,
 the viewport starts at the first line. Otherwise it retains the current
@@ -91,6 +95,9 @@ Harness Markdown handlers retain only decorations inside the current projected m
 ranges and clip spans at their ends before render-markdown caches them. Incremental parser
 trees can retain deleted list items at a collapsed boundary. Filtering before caching prevents
 cursor refreshes from restoring their bullets on a separator or another transcript entry.
+Transcript text changes also invalidate Markdown presentation when message ranges remain
+unchanged. Restoring parser boundaries after adjacent prompt or status rows change prevents
+those rows from entering the previous response's Markdown tree.
 
 Expanding an unloaded node keeps its heading visible while the existing asynchronous content request
 runs. A successful response inserts content. Closing during loading cancels expansion
@@ -147,7 +154,9 @@ The replica's `before_commit` callback runs at that same boundary. Timeline swit
 to save the outgoing view after backend requests and local preparation finish. Its optional
 `after_commit` callback runs after viewport restoration in the same atomic patch or snapshot commit.
 Harness uses these callbacks to save outgoing timeline views and align status spacing without
-overriding the shared cursor and viewport restoration. Declaration
+overriding the shared cursor and viewport restoration. Window and editor resize events also
+realign status spacing immediately, before asynchronous width requests settle. Idle timelines
+therefore keep status at the bottom without requiring a new document revision. Declaration
 expansion captures its viewport after the response, immediately before publication. Rejected
 editable-text changes capture cursors inside the scheduled rollback, not when queuing it.
 Action-target snapshots remain separate and only validate whether a response still applies.
@@ -194,6 +203,12 @@ outside this aggregation.
 Hidden tools retain their output caches, including late parallel output, without changing visible
 rows. Explicit group expansion persists while new calls arrive, but its live body remains limited
 to the latest tool until exchange completion.
+
+`TranscriptRenderer` resolves shell-tool arguments into command headings through the
+shared command display parser. Live previews, timer refreshes, and completed rows
+use the same heading and command decorations. Expanded bodies retain the original
+structured call, and native tools retain their structured headings. Missing or
+malformed shell arguments preserve the original title rather than inventing a command.
 
 The status entry persists through idle, running, and waiting phases under one identity. It renders
 an initial separator and the phase label, followed by current check activity and optional thought

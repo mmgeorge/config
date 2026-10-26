@@ -348,9 +348,6 @@ mod tests {
     #[tokio::test]
     async fn syntax_acceptance_reports_deterministic_resource_usage_for_all_configured_languages() {
         let engine = engine();
-        let started = std::time::Instant::now();
-        let mut source_bytes = 0usize;
-        let mut capture_count = 0usize;
         for (name, text) in [
             ("rust", "fn main() {}"),
             ("typescript", "const value: number = 1;"),
@@ -385,22 +382,15 @@ mod tests {
             ("cue", "value: 1"),
             ("algorithm", "value ← 1\nif value ≥ 1\n  return value"),
         ] {
-            let handle = engine
+            engine
                 .analyze(request(SyntaxLanguage::from_name(name).unwrap(), text))
                 .await
                 .unwrap_or_else(|error| panic!("{name}: {error:?}"));
-            source_bytes += handle.source().retained_bytes();
-            capture_count += handle.captures().len();
         }
         let usage = engine.usage();
         assert_eq!(SyntaxLanguage::ALL.len(), 26);
         assert_eq!(usage.active_jobs, 0);
         assert!(usage.cached_entries > 0 && usage.cached_entries <= 26);
-        eprintln!(
-            "syntax_acceptance={{\"languages\":26,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
-            usage.cached_entries,
-            started.elapsed().as_micros(),
-        );
     }
 
     #[test]

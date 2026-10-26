@@ -74,13 +74,21 @@ impl OutputDocument {
         })
     }
 
-    pub fn export(&mut self, directory: &Path) -> Result<PathBuf> {
+    pub fn export(
+        &mut self,
+        directory: &Path,
+        trace: std::sync::Arc<crate::trace::TraceStore>,
+        session_id: &str,
+    ) -> Result<PathBuf> {
         ensure!(
             directory.is_absolute(),
             "tool export directory must be absolute"
         );
         if self.export.is_none() {
-            self.export = Some(self.output.export_saved_output(directory)?);
+            self.export = Some(
+                self.output
+                    .export_saved_output(directory, trace, session_id)?,
+            );
         }
         Ok(self
             .export
@@ -150,7 +158,11 @@ mod tests {
             1001
         );
         let directory = tempfile::tempdir()?;
-        let path = document.export(directory.path())?;
+        let path = document.export(
+            directory.path(),
+            std::sync::Arc::new(crate::trace::TraceStore::open(directory.path())?),
+            "output-test",
+        )?;
         assert_eq!(std::fs::read_to_string(&path)?, source);
         document.close()?;
         assert!(!path.exists());

@@ -12,7 +12,7 @@ impl HarnessBroker {
         if let Err(error) = &result {
             if let Some(sink) = &self.event_sink {
                 let _ = sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
-                    kind:"checks_configuration_error".into(),text:None,data:json!({"run_id":"automatic-gate","error":format!("Checking could not finish: {error:#}. Fix project checks through /checks setup.")}),
+                    kind:"checks_configuration_error".into(),text:None,data:json!({"run_id":"automatic-gate","error":format!("Checking could not finish: {error:#}. Enable /checks setup on and request a correction in chat.")}),
                     activity:None,summary:None,task_update:None}).await;
             }
             let mut goal = self.active_goal()?;

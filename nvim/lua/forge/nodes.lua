@@ -161,23 +161,26 @@ function M.display(entry)
 end
 
 function M.sign()
-  if vim.v.virtnum ~= 0 then return "  " end
   local window = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
   local session = sessions[vim.api.nvim_win_get_buf(window)]
   if not session or session.status ~= "Applied" or session.applying then return "  " end
+  local selection = session.gutter_selection
+  local selected = selection and selection.window == window
+    and vim.v.lnum >= selection.first and vim.v.lnum <= selection.last
+  local blank = selected and "%#Visual#  %*" or "  "
+  if vim.v.virtnum ~= 0 then return blank end
   local location = require("forge.buffer").locate(session, vim.v.lnum - 1, 0)
   local node = location and session.sequence.node[location.block]
   local status = node and node.entry.metadata.status
-  if status and status ~= vim.NIL and location.position.row == status.row then return "%s" end
-  local layout = node and location.position.row == 0 and node.entry.metadata.layout
-  local marker = layout and layout.marker
-  if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end
-  local icon = marker.text
-  if icon == "▸" then
-    local display = M.display(node.entry)
-    icon = (display.display == "heading" or display.kind == "message" and display.display == "preview") and "▸" or "▾"
+  if status and status ~= vim.NIL and location.position.row == status.row then
+    if not selected then return "%s" end
+    local sign = vim.api.nvim_eval_statusline("%s", { winid = window, use_statuscol_lnum = vim.v.lnum }).str
+    return "%#Visual#" .. sign:gsub("%%", "%%%%") .. "%*"
   end
-  return "%#" .. marker.capture .. "#" .. icon .. " %*"
+  local layout = node and location.position.row == 0 and node.entry.metadata.layout
+  local marker = layout and require("forge.content_layout").marker(node.entry)
+  if not marker or marker == vim.NIL or layout.indent ~= 2 then return blank end
+  return "%#" .. (selected and "Visual" or marker.capture) .. "#" .. marker.text .. " %*"
 end
 
 

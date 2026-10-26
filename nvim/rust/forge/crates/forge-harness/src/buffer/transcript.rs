@@ -401,7 +401,12 @@ impl<'profile> TranscriptRenderer<'profile> {
                 ..BlockMetadata::default()
             },
         };
-        decorate_tool_heading(&mut block, title_rows, kind, failed);
+        let heading_kind = if kind == "tool_call" && shell_tool_display(title).is_some() {
+            "command"
+        } else {
+            kind
+        };
+        decorate_tool_heading(&mut block, title_rows, heading_kind, failed);
         Self::heading_marker(&mut block, "Normal");
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
@@ -513,14 +518,47 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
         .collect())
 }
 
+fn shell_tool_display(title: &str) -> Option<crate::permissions::command::CommandDisplay> {
+    use crate::permissions::shell::CommandShell;
+
+    let (name, arguments) = title.split_once('(')?;
+    let name = name.rsplit('.').next()?;
+    let shell = match name {
+        "bash" => CommandShell::Bash,
+        "powershell" => CommandShell::PowerShell,
+        "shell" | "exec_command" | "run_shell_command" => CommandShell::default(),
+        _ => return None,
+    };
+    let arguments: serde_json::Value = serde_json::from_str(arguments.strip_suffix(')')?).ok()?;
+    let command = arguments
+        .get("command")
+        .or_else(|| arguments.get("cmd"))?
+        .as_str()
+        .filter(|command| !command.trim().is_empty())?;
+    let shell = arguments
+        .get("shell")
+        .and_then(serde_json::Value::as_str)
+        .map_or(shell, CommandShell::from_executable);
+    Some(crate::permissions::command::display_command(command, shell))
+}
+
 /// Formats a bounded display title without changing the retained provider call.
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
-    let display = matches!(kind, "command" | "check").then(|| {
-        crate::permissions::command::display_command(
-            title,
-            crate::permissions::shell::CommandShell::default(),
-        )
-    });
+    let display = if kind == "tool_call" {
+        shell_tool_display(title)
+    } else {
+        matches!(kind, "command" | "check").then(|| {
+            crate::permissions::command::display_command(
+                title,
+                crate::permissions::shell::CommandShell::default(),
+            )
+        })
+    };
+    let kind = if kind == "tool_call" && display.is_some() {
+        "command"
+    } else {
+        kind
+    };
     let summary = if kind == "command" {
         display.as_ref().and_then(|display| display.summary())
     } else {
@@ -1076,6 +1114,10 @@ mod test {
                     "tool_call",
                     r#"sem.context({"path":"src/game.rs","query":"a long query with 界 characters"})"#,
                 ),
+                (
+                    "tool_call",
+                    r#"bash({"command":"rg -n 'a long pattern with 界 characters' src/game.rs"})"#,
+                ),
             ] {
                 let collapsed = renderer.tool_header(
                     BlockId("tool".into()),
@@ -1157,6 +1199,107 @@ mod test {
             tool_heading(&profile, "command", "rg -n TODO src", "1s")?,
             "• 1s rg -n TODO src"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn shell_tool_headings_show_commands_during_execution_and_after_completion() -> Result<()> {
+        let profile = WidthProfile {
+            columns: 160,
+            ..WidthProfile::default()
+        };
+        let renderer = TranscriptRenderer::new(&profile)?;
+        for (source, expected) in [
+            (
+                r#"bash({"command":"rg -n 'TODO|FIXME' src","description":"Search source","initial_wait":30})"#,
+                "rg -n 'TODO|FIXME' src",
+            ),
+            (
+                r#"functions.bash({"command":"bash -lc 'rg -n TODO src'"})"#,
+                "rg -n TODO src",
+            ),
+            (
+                r#"powershell({"command":"Get-Content src/main.rs -TotalCount 40"})"#,
+                "Read · src/main.rs · first 40 lines",
+            ),
+            (
+                r#"shell({"command":"rg -n TODO src && git status --short"})"#,
+                "rg -n TODO src && git status --short",
+            ),
+            (
+                r#"functions.exec_command({"cmd":"rg -n TODO src"})"#,
+                "rg -n TODO src",
+            ),
+            (
+                r#"run_shell_command({"command":"nu -c 'open --raw src/main.rs'"})"#,
+                "Read · src/main.rs · raw",
+            ),
+        ] {
+            let running = renderer.tool_header(
+                BlockId("shell".into()),
+                TargetId("shell".into()),
+                "tool_call",
+                Some(100),
+                false,
+                source,
+                false,
+            )?;
+            assert_eq!(
+                running.text.row(0),
+                Some(format!("• {} {expected}", tool_duration(Some(100))).as_str())
+            );
+            assert!(
+                running
+                    .metadata
+                    .decoration
+                    .iter()
+                    .any(|decoration| { decoration.capture == "ForgeHarnessCommand" })
+            );
+            assert!(
+                running
+                    .metadata
+                    .decoration
+                    .iter()
+                    .all(|decoration| { decoration.capture != "ForgeHarnessMcpName" })
+            );
+            let completed = renderer.refresh_tool_heading(
+                &running,
+                "tool_call",
+                Some(100),
+                false,
+                source,
+                false,
+            )?;
+            assert_eq!(completed.text, running.text);
+            let expanded_source = tool_source_rows(&profile, "tool_call", source)?.join("\n");
+            assert!(expanded_source.contains(source));
+            running.validate()?;
+            completed.validate()?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_shell_and_incomplete_calls_keep_their_structured_titles() -> Result<()> {
+        let profile = WidthProfile {
+            columns: 160,
+            ..WidthProfile::default()
+        };
+        for source in [
+            r#"rg({"glob":"*.lua","paths":["nvim/lua"],"pattern":"TODO"})"#,
+            r#"fixture.inspect({"command":"rg -n TODO src"})"#,
+            r#"read_bash({"shellId":"42"})"#,
+            r#"bash({"command":["rg","TODO","src"]})"#,
+            r#"bash({"command":""})"#,
+            r#"bash({"command":"rg"#,
+            "bash",
+        ] {
+            assert!(shell_tool_display(source).is_none(), "{source}");
+            assert_eq!(
+                tool_heading(&profile, "tool_call", source, "0.1s")?,
+                format!("• 0.1s {source}")
+            );
+        }
         Ok(())
     }
 

@@ -116,6 +116,12 @@ local success, failure = xpcall(function()
     assert(prior_copy_count == 1)
     start(3)
     move(6)
+    local selected_column = {}
+    for row = 3, 6 do
+      selected_column[row] = vim.api.nvim_eval_statusline(vim.wo.statuscolumn, {
+        winid = state.transcript_win, use_statuscol_lnum = row,
+      }).str
+    end
     vim.fn.maparg("<Space>l", "x", false, true).callback()
     assert(clipboard.kind == "V")
     for index = 1, 4 do
@@ -124,7 +130,11 @@ local success, failure = xpcall(function()
       for _, insertion in ipairs(layout.insertion) do
         for _, chunk in ipairs(insertion.chunk) do prefix[#prefix + 1] = chunk.text end
       end
-      assert(clipboard.lines[index] == table.concat(prefix) .. source[index + 2], "copied gutter differs from display")
+      local column = selected_column[index + 2]
+      assert(clipboard.lines[index] == column .. table.concat(prefix) .. source[index + 2],
+        "copied gutter differs from display: " .. vim.inspect({
+          actual = clipboard.lines[index], expected = column .. table.concat(prefix) .. source[index + 2],
+        }))
     end
     assert(presentation.transcript.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n")
     assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, true), source))
@@ -186,16 +196,19 @@ local success, failure = xpcall(function()
     state.presentation = pending
     vim.fn.maparg("W", "n", false, true).callback()
     assert(vim.api.nvim_get_mode().mode == "n", "pending presentation admitted selection")
-    open_response.callback(nil, "fixture rejection")
+    open_response.callback(nil, "fixture rejection", { code = "invalid_state" })
     assert(rejected and pending.selection.closed, "rejected startup retained selection owner")
     assert(vim.fn.exists("#ForgeGutterSelection" .. state.transcript_buf) == 0,
       "rejected startup retained selection callbacks")
+    assert(vim.wait(1000, function() return pending.closed end, 1), "rejected presentation did not close")
     local replica = require("forge.buffer")
     local input = require("forge.input")
     for _, indent in ipairs({ 2, 4, 6 }) do
+      vim.cmd("tabnew")
+      local prompt_window = vim.api.nvim_get_current_win()
       local prompt = replica.open("prompt-alignment-" .. indent)
-      vim.api.nvim_set_current_win(state.transcript_win)
-      vim.api.nvim_win_set_buf(state.transcript_win, prompt.buffer)
+      vim.api.nvim_set_current_win(prompt_window)
+      vim.api.nvim_win_set_buf(prompt_window, prompt.buffer)
       assert(replica.apply_snapshot(prompt, { document = prompt.document, revision = 0, block = {
         { id = "prompt", text = { "● first prompt line", "second prompt line", "third prompt line" },
           metadata = { target = {}, decoration = {}, editable_region = {},
@@ -203,19 +216,63 @@ local success, failure = xpcall(function()
             conceal = { { range = { start = { row = 0, column = 0 },
               ["end"] = { row = 0, column = #"● " } }, replacement = "", line = false, priority = 100 } },
           } },
+        { id = "activity", text = { "▸ Thinking" },
+          metadata = { target = {}, decoration = {}, editable_region = {},
+            layout = { indent = indent, marker = { text = "▸", capture = "Normal" } },
+            conceal = { { range = { start = { row = 0, column = 0 },
+              ["end"] = { row = 0, column = #"▸ " } }, replacement = "", line = false, priority = 100 } },
+          } },
+        { id = "status", text = { "Idle" }, metadata = {
+          target = {}, decoration = {}, editable_region = {}, status = { row = 0, animated = false },
+        } },
       } }).kind == "Applied")
-      local view = input.open(prompt, state.transcript_win, { margin = 0,
+      vim.api.nvim_buf_set_extmark(prompt.buffer, vim.api.nvim_create_namespace("GutterSelectionStatusMarker"), 4, 0, {
+        sign_text = "◇", sign_hl_group = "Normal",
+      })
+      local view = input.open(prompt, prompt_window, { margin = 0,
         columns = { signcolumn = "yes:1", statuscolumn = "%s" },
+        fold_markers = true,
         conceal = { level = 3, cursor = "nvic" },
       })
       vim.cmd("normal! ggzt")
       vim.cmd("redraw!")
-      local first = vim.fn.screenpos(state.transcript_win, 1, #"● " + 1)
+      local first = vim.fn.screenpos(prompt_window, 1, 1)
+      local text_column = vim.api.nvim_win_get_position(prompt_window)[2] + indent
+      assert(vim.api.nvim__inspect_cell(1, first.row - 1, text_column)[1] == "f",
+        "prompt text does not follow its displayed marker at indent " .. indent)
       for row = 2, 3 do
-        local continuation = vim.fn.screenpos(state.transcript_win, row, 1)
-        assert(first.col > 0 and continuation.col == first.col,
+        local continuation = vim.fn.screenpos(prompt_window, row, 1)
+        local expected = row == 2 and "s" or "t"
+        assert(vim.api.nvim__inspect_cell(1, continuation.row - 1, text_column)[1] == expected,
           "prompt continuation does not align with first-line text at indent " .. indent)
       end
+      local selection = require("forge.document_commands").attach_selection(prompt, { normalize = false })
+      vim.api.nvim_win_set_cursor(prompt_window, { 1, 0 })
+      selection.start()
+      vim.api.nvim_win_set_cursor(prompt_window, { 5, 0 })
+      vim.api.nvim_exec_autocmds("CursorMoved", { buffer = prompt.buffer })
+      vim.cmd("redraw!")
+      for row = 1, 5 do
+        local position = vim.fn.screenpos(prompt_window, row, 1)
+        local left = vim.api.nvim_win_get_position(prompt_window)[2]
+        for column = left, left + indent - 1 do
+          assert(vim.api.nvim__inspect_cell(1, position.row - 1, column)[2].background == 0x123456,
+            "timeline gutter lost Visual at indent " .. indent .. " row " .. row .. " column " .. column)
+        end
+        local right = left + vim.api.nvim_win_get_width(prompt_window) - 1
+        assert(vim.api.nvim__inspect_cell(1, position.row - 1, right)[2].background == 0x123456,
+          "whole-line selection stopped before the right edge")
+      end
+      vim.fn.maparg("<Space>l", "x", false, true).callback()
+      local marker_indent = string.rep(" ", math.max(0, indent - 2))
+      assert(clipboard.lines[1] == marker_indent .. "● first prompt line",
+        "copied prompt lost its displayed marker: " .. vim.inspect(clipboard.lines))
+      assert(clipboard.lines[2] == string.rep(" ", indent) .. "second prompt line",
+        "copied continuation lost its indentation")
+      assert(clipboard.lines[4] == marker_indent .. "▾ Thinking",
+        "copied activity did not use its displayed expansion marker: " .. vim.inspect(clipboard.lines))
+      assert(clipboard.lines[5] == "◇ Idle", "copy lost the displayed status sign: " .. vim.inspect(clipboard.lines))
+      selection.close()
       input.close(view)
       replica.close(prompt)
     end

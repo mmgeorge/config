@@ -203,6 +203,7 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
         Arc::new(Mutex::new(presentation)),
         crate::storage::objects::ObjectStore::open(data).unwrap(),
         Arc::new(forge_git::store::RepositoryStore::default()),
+        Arc::new(crate::trace::TraceStore::open(data).unwrap()),
     )
     .unwrap()
 }
@@ -328,9 +329,6 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
         discovery: None,
     });
     running.preview = "Compiling test executable".into();
-    let label = running.heading();
-    assert!(label.contains("tests::current"));
-    assert!(!label.contains("tests::queued"));
     let activity = CheckActivity::from_run(&run).unwrap();
     assert!(activity.command_list[0].title.contains("tests::current"));
     assert!(!activity.command_list[0].title.contains("tests::queued"));
@@ -348,11 +346,6 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     context.selection = CheckSelection::Files {
         files: vec!["nvim/tests/forge/harness_health.lua".into()],
     };
-    assert!(
-        running
-            .heading()
-            .contains("nvim/tests/forge/harness_health.lua")
-    );
     let activity = CheckActivity::from_run(&run).unwrap();
     assert!(
         activity.command_list[0]
