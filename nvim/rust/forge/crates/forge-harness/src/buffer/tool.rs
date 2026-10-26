@@ -185,6 +185,20 @@ impl ToolOutputView {
             expanded: false,
         })
     }
+
+    /// Captures complete file output for an explicitly opened output document.
+    pub(super) fn complete_snapshot(&self) -> Result<ToolOutputSnapshot> {
+        let Some((path, total, _)) = &self.file else {
+            return self.snapshot();
+        };
+        let mut complete = Self::file(self.call_id.clone(), path.clone(), *total)?;
+        complete.load_prefix(usize::MAX)?;
+        ensure!(
+            !complete.has_unloaded_output(),
+            "saved check output ended before its recorded length"
+        );
+        complete.snapshot()
+    }
     /// Retains source heading fields without copying the saved output or change tree.
     pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
         self.heading = Some(crate::turn::ToolCall {
@@ -460,6 +474,22 @@ impl Drop for OwnedToolExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_check_snapshot_retains_all_output_without_expanding_inline() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let path = directory.path().join("check.output");
+        let saved = format!("{}last diagnostic λ\n", "output\n".repeat(30_000));
+        std::fs::write(&path, &saved)?;
+        let source = ToolOutputView::file("check".into(), path.clone(), saved.len() as u64)?;
+        let snapshot = source.complete_snapshot()?;
+        assert_eq!(snapshot.saved.as_str(), saved);
+        assert!(source.saved.is_empty());
+        assert!(source.has_unloaded_output());
+        std::fs::write(&path, "shortened")?;
+        assert!(source.complete_snapshot().is_err());
+        Ok(())
+    }
 
     #[test]
     fn check_output_loads_only_requested_prefix_and_retains_unicode_boundaries() -> Result<()> {

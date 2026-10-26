@@ -192,8 +192,13 @@ Idle uses the same static icon as a question wait. At the live transcript tail, 
 aligns with the bottom of the pane. Check activity, queued messages, and other current details
 add rows below the phase label only while present. Scrolling through history remains available.
 Queued follow-up inputs have a blank line above their heading, including when no steering inputs are present.
+Each entry previews only its first line on one display row, with an ellipsis when
+that line exceeds the available width. Editing opens the complete message in the
+prompt and keeps the status and queue visible at the bottom of the transcript.
 Live tool output occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
+Thought headers retain tool totals and append failed-tool and changed-file counts
+when nonzero. Repeated successful edits to one file count once.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
 italics, aligned with the phase label on one line, with `...` when it exceeds the available width. The option
 defaults to Off, persists across sessions, and applies without interrupting an

@@ -358,7 +358,7 @@ impl SessionPresentation {
                     .tool
                     .get(&call_id)
                     .context("saved tool output is unavailable")?;
-                let source = tool.snapshot()?;
+                let source = tool.complete_snapshot()?;
                 let output = OutputDocument::new(document.clone(), source)?;
                 let snapshot = output.snapshot();
                 open.output.insert(document, output);
@@ -1862,8 +1862,20 @@ fn update_staging_block(open: &mut OpenPresentation) -> Result<()> {
     if let Some(staging) = &open.staging {
         let width = open.transcript.views.profile().unwrap_or(&open.last_width);
         let mut rows = Vec::new();
-        append_staging_section(&mut rows, "Steering active turn", &staging.steering, width)?;
-        append_staging_section(&mut rows, "Queued follow-up inputs", &staging.queue, width)?;
+        append_staging_section(
+            &mut rows,
+            "Steering active turn",
+            &staging.steering,
+            width,
+            false,
+        )?;
+        append_staging_section(
+            &mut rows,
+            "Queued follow-up inputs",
+            &staging.queue,
+            width,
+            true,
+        )?;
         let mut block = forge_buffer::block::BufferBlock {
             id: block_id.clone(),
             text: forge_buffer::text::BufferText::from_rows(rows)?,
@@ -1925,6 +1937,7 @@ fn append_staging_section(
     label: &str,
     values: &[String],
     width: &WidthProfile,
+    preview: bool,
 ) -> Result<()> {
     if values.is_empty() {
         return Ok(());
@@ -1932,6 +1945,11 @@ fn append_staging_section(
     rows.push(String::new());
     rows.extend(width.wrap_plain(label, 0)?);
     for value in values {
+        if preview {
+            let first = value.split(['\r', '\n']).next().unwrap_or_default();
+            rows.push(width.clip_plain(&format!("• {first}"))?);
+            continue;
+        }
         rows.extend(width.wrap_plain(
             &format!("• {value}"),
             2.min(width.columns.saturating_sub(1)),
@@ -2444,16 +2462,15 @@ mod tests {
                     assert!(row.starts_with("  "), "unaligned continuation: {row:?}");
                 }
             }
-            assert!(
-                snapshot
-                    .block
-                    .last()
-                    .unwrap()
-                    .text
-                    .wire_rows()
-                    .iter()
-                    .any(|row| row.starts_with("      never"))
-            );
+            let preview = snapshot.block.last().unwrap().text.wire_rows();
+            let heading = preview
+                .iter()
+                .position(|row| *row == "Queued follow-up inputs")
+                .unwrap();
+            assert_eq!(preview.len(), heading + 2);
+            assert!(preview[heading + 1].starts_with("• a Harness"));
+            assert!(preview[heading + 1].ends_with('…'));
+            assert!(!preview.iter().any(|row| row.contains("never lose")));
         }
         assert_eq!(
             owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue,
@@ -2477,7 +2494,7 @@ mod tests {
         owner.dispatch(PresentationRequest::Staging {
             sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),
-            queue,
+            queue: queue.clone(),
             steering: vec![steering.clone()],
         })?;
         let rows = owner
@@ -2491,9 +2508,19 @@ mod tests {
             .join("\n");
         assert!(rows.contains("queue-0-"));
         let unwrapped = rows.lines().map(str::trim_start).collect::<String>();
-        assert!(unwrapped.contains(&last));
-        assert!(unwrapped.find("queue-0-").unwrap() < unwrapped.find(&last).unwrap());
+        assert!(unwrapped.contains("queue-1199-"));
+        assert!(unwrapped.find("queue-0-").unwrap() < unwrapped.find("queue-1199-").unwrap());
         assert!(unwrapped.contains(&steering));
+        assert_eq!(
+            owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue,
+            queue
+        );
+        assert_eq!(
+            rows.lines()
+                .filter(|row| row.starts_with("• queue-"))
+                .count(),
+            1200
+        );
         owner.reconcile(vec![
             interaction_entry("main"),
             interaction_entry("followup"),
@@ -2545,9 +2572,7 @@ mod tests {
             .join("\n");
         assert!(
             rows.lines()
-                .map(str::trim_start)
-                .collect::<String>()
-                .contains(&last)
+                .any(|row| row.starts_with("• queue-1199-") && row.ends_with('…'))
         );
         assert_eq!(
             owner
@@ -2560,6 +2585,10 @@ mod tests {
                 .queue
                 .len(),
             1
+        );
+        assert_eq!(
+            owner.open.as_ref().unwrap().staging.as_ref().unwrap().queue[0],
+            last
         );
         Ok(())
     }

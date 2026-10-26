@@ -1686,10 +1686,12 @@ local function finish_queue_edit(state, text, unqueue)
   if unqueue then original, attachments = text, selected_attachments
   elseif text ~= "" then prompt_history.record(text) end
   set_composer_text(state.composer_buf, original, attachments)
-  if unqueue and state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-    vim.api.nvim_set_current_win(state.composer_win)
+  if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+    layout.resize_composer(state.composer_buf, state.composer_win)
+    if unqueue then vim.api.nvim_set_current_win(state.composer_win) end
   end
   M.refresh_winbar()
+  if state.presentation then state.presentation.follow_tail() end
   if not unqueue then M.drain() end
 end
 
@@ -2176,9 +2178,11 @@ function M.edit_queued(direction)
   vim.cmd.stopinsert()
   set_composer_text(state.composer_buf, text, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+    layout.resize_composer(state.composer_buf, state.composer_win)
     vim.api.nvim_set_current_win(state.composer_win)
   end
   M.refresh_winbar()
+  if state.presentation then state.presentation.follow_tail() end
 end
 
 ---@param delta integer

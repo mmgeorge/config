@@ -873,6 +873,11 @@ unfinished edit remains reserved. While editing, submit,
 queue, and steering bindings save the reserved message instead of sending it out of order.
 The timeline marks the active reservation with `[editing]`. Same-session snapshots and
 composer recreation retain the edit. Changing sessions clears it with the queue.
+The native staging projection limits each queued preview to the first logical line
+and one display row while retaining the complete draft in staging state. Steering
+entries retain their full text. Explicit queue navigation resizes the composer
+before positioning the transcript tail, so the status and queue use the resulting
+pane height. Passive staging refreshes preserve the reader's position.
 
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Explicit steering
 preserves queued follow-ups and delegates active-turn admission to the backend even while a task
@@ -1101,6 +1106,10 @@ Tool time uses milliseconds below one second and rounded tenths of a second ther
 omitting a zero fractional digit. The outer duration remains whole seconds. The pass numerator
 counts successful completed calls only. Running, failed, interrupted, and cancelled calls remain
 in the denominator without counting as passed.
+Headers append nonzero failed-tool and distinct changed-file totals after usage.
+Failure counts include explicit provider failure flags and failed tool states.
+Changed-file counts use successful provider file changes, normalize paths, and
+deduplicate repeated edits. Failed and unfinished edits do not increase the file total.
 
 Each distinct admitted usage report refreshes cumulative input, cache percentage, reasoning,
 non-reasoning output, and request count immediately. Turns that have not reported usage do not

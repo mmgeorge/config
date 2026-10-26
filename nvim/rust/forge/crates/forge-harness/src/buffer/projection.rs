@@ -3081,6 +3081,28 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
     if !tokens.is_empty() {
         sections.push(tokens.join(" · "));
     }
+    let failed = interaction
+        .turn
+        .iter()
+        .flat_map(|turn| turn.tools())
+        .filter(|tool| tool.failed || tool.state() == crate::turn::ToolState::Failed)
+        .count();
+    let mut changes = crate::exchange::ProviderChangeIndex::default();
+    changes.record(interaction);
+    let mut outcomes = Vec::new();
+    if failed > 0 {
+        outcomes.push(format!("{failed} failed"));
+    }
+    if !changes.is_empty() {
+        let files = changes.paths().len();
+        outcomes.push(format!(
+            "{files} file{} changed",
+            if files == 1 { "" } else { "s" }
+        ));
+    }
+    if !outcomes.is_empty() {
+        sections.push(outcomes.join(" · "));
+    }
     let mut summary = sections.join(" │ ");
     if let Some(error) = &interaction.finalization_error {
         summary.push_str(&format!(" — {}", error.replace(['\n', '\r'], " ")));
@@ -8132,6 +8154,65 @@ mod tests {
     }
 
     #[test]
+    fn activity_header_retains_failures_and_distinct_files_during_refresh_and_reload()
+    -> anyhow::Result<()> {
+        let mut calls = serde_json::Map::new();
+        let mut order = Vec::new();
+        for (id, status, failed, path) in [
+            ("first", "completed", false, "src\\main.rs"),
+            ("repeat", "completed", false, "src/main.rs"),
+            ("other", "completed", false, "src/other.rs"),
+            ("error", "failed", false, "failed.rs"),
+            ("reported", "completed", true, "also-failed.rs"),
+            ("pending", "running", false, "pending.rs"),
+        ] {
+            order.push(id);
+            calls.insert(
+                id.into(),
+                json!({"id":id,"kind":"file_change","title":"Edit",
+                "status":status,"failed":failed,"output":"","started_at_ms":1000,
+                "change":{"file":[{"path":path,"kind":"update","diff":""}]}}),
+            );
+        }
+        let mut source = json!({"id":"summary", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
+            "execution_started_at_ms":1000,"attributed_matches_checkpoint":false,"node_list":[],
+            "turn":[{"id":"turn","provider":{"thread_id":"thread","turn_id":"turn"},
+                "state":{"kind":"running"},"started_at_ms":1000,"tool":{"order":order,"item":calls},
+                "message":[],"item":[],"current_message":null}]});
+        let exchange: Exchange = serde_json::from_value(source.clone())?;
+        let live = super::exchange_activity_summary(&exchange, 2000);
+        assert!(live.contains("3/6 tools"));
+        assert!(live.ends_with("│ 2 failed · 2 files changed"));
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+        assert_eq!(super::exchange_activity_summary(&restored, 2000), live);
+        source["turn"][0]["tool"]["item"]["pending"]["status"] = json!("completed");
+        let exchange: Exchange = serde_json::from_value(source)?;
+        let entry = TimelineEntry::Exchange {
+            id: exchange.id.clone(),
+            created_at_ms: 1000,
+            exchange,
+            agent_by_id: HashMap::new(),
+        };
+        let width = WidthProfile::default();
+        let projected = project_at(&entry, &width, 2000)?;
+        let document = forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("summary-document".into()),
+            projected.entry.block.clone(),
+        )?;
+        let refreshed =
+            super::timing_blocks(&entry, &width, &document, &HashMap::new(), &projected.tool)?;
+        let heading = refreshed
+            .iter()
+            .find(|block| block.id.0 == "summary:summary")
+            .unwrap();
+        let text = heading.text.wire_rows().join(" ");
+        assert!(text.contains("4/6 tools"));
+        assert!(text.ends_with("│ 2 failed · 3 files changed"));
+        Ok(())
+    }
+
+    #[test]
     fn compact_header_reports_successful_tools_and_inclusive_output_tokens() {
         let mut calls = serde_json::Map::new();
         let order = (1..=20).map(|index| index.to_string()).collect::<Vec<_>>();
@@ -8157,7 +8238,7 @@ mod tests {
         let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 44000),
-            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps"
+            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps │ 1 failed"
         );
         for status in ["running", "cancelled", "interrupted"] {
             value["turn"][0]["tool"]["item"]["1"]["status"] = json!(status);
@@ -8308,7 +8389,7 @@ mod tests {
         exchange.observe_turn(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps"
+            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps │ 1 failed"
         );
         event.address.as_mut().unwrap().thread_id = "unowned-child".into();
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
@@ -8318,7 +8399,7 @@ mod tests {
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
                 format!(
-                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps",
+                    "● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps │ 1 failed",
                     duration_ms / 1000
                 )
             );
@@ -8326,7 +8407,7 @@ mod tests {
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k"
+            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k │ 1 failed"
         );
     }
 

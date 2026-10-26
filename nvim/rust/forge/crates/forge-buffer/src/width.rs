@@ -44,6 +44,34 @@ impl Default for WidthProfile {
 }
 
 impl WidthProfile {
+    /// Fits a literal line to the viewport, marking omitted text with an ellipsis.
+    /// Grapheme clusters and tab widths follow this profile. The caller retains the full source.
+    pub fn clip_plain(&self, text: &str) -> Result<String, ContractError> {
+        self.validate()?;
+        if text.contains(['\r', '\n', '\0']) {
+            return Err(ContractError("clipped preview requires one text row"));
+        }
+        let suffix = "…";
+        let suffix_cells = self.cells(suffix, 0)?;
+        let mut column = 0;
+        let mut suffix_offset = 0;
+        for (offset, cluster) in text.grapheme_indices(true) {
+            let cells = self.cells(cluster, column)?;
+            if column + cells > self.columns {
+                return Ok(if suffix_cells <= self.columns {
+                    format!("{}{suffix}", text[..suffix_offset].trim_end())
+                } else {
+                    String::new()
+                });
+            }
+            column += cells;
+            if column + suffix_cells <= self.columns {
+                suffix_offset = offset + cluster.len();
+            }
+        }
+        Ok(text.to_owned())
+    }
+
     /// Returns the retained byte count and display rows for a word-wrapped single-line preview.
     /// The limit bounds only the preview, leaving the complete source available to its owner.
     pub fn wrapped_prefix(
@@ -235,6 +263,28 @@ impl WidthProfile {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn clipped_previews_preserve_graphemes_tabs_and_unbroken_prefixes() {
+        let mut profile = super::WidthProfile {
+            columns: 12,
+            ..Default::default()
+        };
+        assert_eq!(
+            profile.clip_plain("• abcdefghijklmnop").unwrap(),
+            "• abcdefghi…"
+        );
+        assert_eq!(profile.clip_plain("• short").unwrap(), "• short");
+        assert_eq!(profile.clip_plain("a\tb").unwrap(), "a\tb");
+        profile.columns = 5;
+        assert_eq!(profile.clip_plain("• 🇺🇸🇯🇵").unwrap(), "• 🇺🇸…");
+        assert_eq!(profile.clip_plain("• éééé").unwrap(), "• éé…");
+        assert_eq!(profile.clip_plain("a\tb").unwrap(), "a…");
+        profile.columns = 1;
+        assert_eq!(profile.clip_plain("界").unwrap(), "…");
+        assert_eq!(profile.clip_plain("").unwrap(), "");
+        assert!(profile.clip_plain("first\nsecond").is_err());
+    }
+
     #[test]
     fn large_plain_text_preserves_rows_without_size_admission() {
         let line = "x".repeat(257);
