@@ -285,17 +285,24 @@ impl CheckRun {
 
     /// Summarizes actual recorded results without labeling excluded checks as passed.
     pub fn summary(&self) -> String {
-        Self::summarize_states(self.commands.iter().map(|check| check.state))
+        Self::summarize_states(self.commands.iter().map(|check| check.state), None)
     }
 
-    pub(crate) fn summarize_states(states: impl Iterator<Item = CheckState> + Clone) -> String {
+    pub(crate) fn summarize_states(
+        states: impl Iterator<Item = CheckState> + Clone,
+        total: Option<usize>,
+    ) -> String {
         let count = |state| {
             states
                 .clone()
                 .filter(|candidate| *candidate == state)
                 .count()
         };
-        let mut summary = vec![format!("{} passed", count(CheckState::Passed))];
+        let passed = count(CheckState::Passed);
+        let mut summary = vec![match total {
+            Some(total) => format!("{passed}/{total} passed"),
+            None => format!("{passed} passed"),
+        }];
         let failed = count(CheckState::Failed);
         if failed > 0 {
             summary.push(format!("{failed} failed"));

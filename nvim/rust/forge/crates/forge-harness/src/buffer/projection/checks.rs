@@ -154,6 +154,59 @@ fn category_label(category: CheckCategory) -> &'static str {
     }
 }
 
+pub(super) fn check_summary(run: &CheckRun) -> String {
+    let leaves = [
+        CheckCategory::Format,
+        CheckCategory::Lint,
+        CheckCategory::Check,
+        CheckCategory::Test,
+        CheckCategory::Build,
+    ]
+    .into_iter()
+    .flat_map(|category| check_leaves(run, category))
+    .collect::<Vec<_>>();
+    summarize_check_leaves(&leaves)
+}
+
+fn summarize_check_leaves(leaves: &[CheckLeaf<'_>]) -> String {
+    let mut latest = BTreeMap::new();
+    for leaf in leaves {
+        let state = leaf.state();
+        let category = leaf
+            .check
+            .context
+            .as_ref()
+            .map_or(CheckCategory::Check, |context| context.category);
+        let definition = leaf
+            .check
+            .context
+            .as_ref()
+            .map_or(leaf.check.command.as_str(), |context| {
+                context.definition_id.as_str()
+            });
+        let key = (
+            category_key(category),
+            definition,
+            leaf.scope.as_str(),
+            leaf.name.as_deref(),
+        );
+        let result = latest.entry(key).or_insert((state, 0_usize));
+        result.0 = state;
+        result.1 += 1;
+    }
+    let attempts = latest
+        .values()
+        .map(|(_, attempts)| *attempts)
+        .max()
+        .unwrap_or(0);
+    let summary =
+        CheckRun::summarize_states(latest.values().map(|(state, _)| *state), Some(latest.len()));
+    format!(
+        "{summary} · {attempts} {}",
+        if attempts == 1 { "attempt" } else { "attempts" }
+    )
+}
+
 impl TimelineRenderer<'_> {
     pub(super) fn checks(
         &mut self,
@@ -189,14 +242,14 @@ impl TimelineRenderer<'_> {
                     } else {
                         "finished"
                     },
-                    run.summary(),
+                    check_summary(run),
                     run.duration_ms() as f64 / 1000.0
                 )
             }
         } else {
             format!(
                 "Checks finished · {} · {:.1}s",
-                run.summary(),
+                check_summary(run),
                 run.duration_ms() as f64 / 1000.0
             )
         };
@@ -248,7 +301,28 @@ impl TimelineRenderer<'_> {
                 continue;
             }
             let category_id = format!("{}:category:{}", run.id, category_key(category));
-            self.literal(&category_id, category_label(category), None)?;
+            let duration = run
+                .commands
+                .iter()
+                .filter(|check| {
+                    check
+                        .context
+                        .as_ref()
+                        .map_or(CheckCategory::Check, |context| context.category)
+                        == category
+                })
+                .filter_map(|check| check.elapsed_ms(self.now_ms))
+                .fold(0, u64::saturating_add);
+            self.literal(
+                &category_id,
+                &format!(
+                    "{} · {} · {:.1}s",
+                    category_label(category),
+                    summarize_check_leaves(&leaves),
+                    duration as f64 / 1000.0
+                ),
+                None,
+            )?;
             let section = self.begin_section(2);
             let mut scopes = BTreeMap::<String, Vec<CheckLeaf<'_>>>::new();
             for leaf in leaves {
@@ -260,7 +334,8 @@ impl TimelineRenderer<'_> {
                     self.check_leaf(&leaves[0], &scope)?;
                     continue;
                 }
-                let outcomes = CheckRun::summarize_states(leaves.iter().map(CheckLeaf::state));
+                let outcomes =
+                    CheckRun::summarize_states(leaves.iter().map(CheckLeaf::state), None);
                 let elapsed = leaves.iter().try_fold(0_u64, |total, leaf| {
                     Some(total.saturating_add(leaf.elapsed_ms(self.now_ms)?))
                 });
@@ -307,7 +382,7 @@ impl TimelineRenderer<'_> {
                 }
                 self.finish_section(scope_section, &scope_id, false);
             }
-            self.finish_section(section, &category_id, false);
+            self.finish_section(section, &category_id, true);
         }
         self.finish_section(checks, &format!("{}:checks", run.id), true);
         if let Some(title) = &run.completed_plan {
@@ -517,7 +592,10 @@ mod tests {
             .flat_map(|block| block.text.wire_rows())
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(text.contains("4 passed · 1 failed"));
+        assert!(
+            text.contains("3/4 passed · 1 failed · 2 attempts"),
+            "{text}"
+        );
         for category in ["Formatting", "Lint", "Tests", "Builds"] {
             assert!(text.contains(category));
         }
@@ -528,6 +606,14 @@ mod tests {
         );
         assert!(text.contains("Run 1 · Passed · 0.1s"), "{text}");
         assert!(text.contains("Run 2 · Failed · 0.2s"), "{text}");
+        assert!(
+            text.contains("Formatting · 0/1 passed · 1 failed · 2 attempts · 0.3s"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Tests · 1/1 passed · 1 attempt · 0.3s"),
+            "{text}"
+        );
         assert!(!text.contains("format check"), "{text}");
         assert!(text.contains("Failed"));
         for category in ["format", "lint", "test", "build"] {
@@ -535,6 +621,14 @@ mod tests {
                 .iter()
                 .find(|block| block.id.0 == format!("run:category:{category}"))
                 .unwrap();
+            assert_eq!(
+                block.metadata.node.as_ref().unwrap().default_display,
+                NodeDisplay::Heading
+            );
+            assert_eq!(
+                block.metadata.node.as_ref().unwrap().display,
+                NodeDisplay::Heading
+            );
             assert_eq!(
                 block
                     .metadata
@@ -548,6 +642,56 @@ mod tests {
                 "run:checks"
             );
         }
+        let mut retried = run.clone();
+        for attempt in 2..5 {
+            let mut command = run.commands[1].clone();
+            command.id = format!("retry-{attempt}");
+            command.state = if attempt == 4 {
+                CheckState::Passed
+            } else {
+                CheckState::Failed
+            };
+            retried.commands.push(command);
+        }
+        let mut independent = run.commands[0].clone();
+        independent.id = "independent".into();
+        independent.context.as_mut().unwrap().definition_id = "other-format".into();
+        retried.commands.push(independent);
+        assert_eq!(check_summary(&retried), "5/5 passed · 5 attempts");
+        let mut regression = run.commands[1].clone();
+        regression.id = "regression".into();
+        retried.commands.push(regression.clone());
+        assert_eq!(
+            check_summary(&retried),
+            "4/5 passed · 1 failed · 6 attempts"
+        );
+        regression.id = "excluded".into();
+        regression.state = CheckState::Skipped;
+        retried.commands.push(regression);
+        assert_eq!(
+            check_summary(&retried),
+            "4/5 passed · 1 failed · 6 attempts"
+        );
+
+        let mut reported = run.clone();
+        reported.commands.truncate(1);
+        reported.commands[0].context.as_mut().unwrap().category = CheckCategory::Test;
+        reported.commands[0].state = CheckState::Failed;
+        reported.commands[0].report = Some(serde_json::from_value(json!({
+            "result":[
+                {"file":"one.lua","state":"passed","duration_ms":10,"command":"lua","output":""},
+                {"file":"two.lua","state":"failed","duration_ms":20,"command":"lua","output":"failed"}
+            ],"error":null
+        }))?);
+        let mut repaired = reported.commands[0].clone();
+        repaired.id = "reported-retry".into();
+        repaired.state = CheckState::Passed;
+        let results = &mut repaired.report.as_mut().unwrap().result;
+        results[1].state = CheckState::Passed;
+        results.reverse();
+        reported.commands.push(repaired);
+        assert_eq!(check_summary(&reported), "2/2 passed · 2 attempts");
+
         let mut failed_run = run;
         failed_run.commands[0].state = CheckState::Failed;
         failed_run.commands[1].completed_at_ms = None;

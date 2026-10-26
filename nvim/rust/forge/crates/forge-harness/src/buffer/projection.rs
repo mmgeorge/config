@@ -1289,7 +1289,7 @@ impl TimelineRenderer<'_> {
             .collect();
         let heading = format!(
             "Checks finished · {} · {:.1}s",
-            combined.summary(),
+            checks::check_summary(&combined),
             combined.duration_ms() as f64 / 1000.0
         );
         self.checks(&combined, false, Some(&heading))
@@ -7730,9 +7730,9 @@ mod tests {
                 .find(|block| block.id.0 == "combined:results:checks")
                 .unwrap();
             assert!(summary.text.wire_rows().join("").contains(if index == 0 {
-                "0 passed · 1 failed"
+                "0/1 passed · 1 failed · 1 attempt"
             } else {
-                "1 passed · 1 failed"
+                "1/1 passed · 2 attempts"
             }));
             for (thought_index, thought_id) in thought_ids.iter().enumerate() {
                 let run = blocks

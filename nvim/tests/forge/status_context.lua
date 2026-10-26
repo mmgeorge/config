@@ -5,8 +5,11 @@ local gh = require("forge.integrations.gh")
 local config = require("forge.infra.config")
 local notifications = require("forge.infra.notifications")
 local original_error = notifications.error
+local original_notify = vim.notify
 local errors = {}
+local notices = {}
 notifications.error = function(message) errors[#errors + 1] = message end
+vim.notify = function(message) notices[#notices + 1] = message end
 local original_auto = config.options.about_auto_generate
 local original_lookup, original_lookup_delay = config.options.pr_lookup_mode, config.options.pr_mock_delay_ms
 assert(config.options.about_auto_generate ~= false, "automatic About must be enabled by default")
@@ -84,8 +87,19 @@ local ok, failure = xpcall(function()
   assert(#pull_request == lookup_count and owner.pr_timer, "mock PR lookup contacted GitHub")
   owner.generate_about(true)
   assert(owner.pr_timer, "About generation cancelled the independent mock PR timer")
+  generation[#generation]({ state = "generating" })
+  local pending_generation_count = #generation
+  current = true
+  owner.activate("status:context:about")
+  table.remove(updates).callback({ kind = "about" })
+  assert(#notices == 0 and #generation == pending_generation_count,
+    "opening pending About notified or restarted generation")
   generation[#generation]({ state = "error", error = "provider authentication failed" })
-  assert(#errors == 1 and errors[1]:find("authentication failed", 1, true), "current generation failure was hidden")
+  assert(owner.about.state == "error" and owner.about.error:find("authentication failed", 1, true),
+    "current generation failure was lost")
+  owner.activate("status:context:about")
+  table.remove(updates).callback({ kind = "about" })
+  assert(#errors == 1 and errors[1]:find("authentication failed", 1, true), "opening failed About hid its error")
   local closed_about = owner.about
   owner.close()
   assert(not owner.pr_timer, "closed Status retained its mock PR timer")
@@ -94,6 +108,7 @@ local ok, failure = xpcall(function()
 end, debug.traceback)
 client.request_host, ai.ensure, ai.clear, gh.current_pr_async = original_request, original_ai, original_clear, original_pr
 notifications.error = original_error
+vim.notify = original_notify
 config.options.about_auto_generate = original_auto
 config.options.pr_lookup_mode, config.options.pr_mock_delay_ms = original_lookup, original_lookup_delay
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

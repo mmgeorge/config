@@ -41,6 +41,9 @@ The default is `status_open_target = "tab"`.
 Automatic About drafts and commit-message regeneration send a compact diff to the
 selected model without progress, waiting, or completion popups. Generation failures
 produce error notifications and preserve the existing draft, including edits made while waiting.
+For a new commit, the editor copies the existing About draft or waits for its in-progress
+generation. It does not start another generation. `Ctrl-A` explicitly regenerates from
+staged changes, or from the latest commit when amending.
 
 Git LFS files are excluded from both the changed-file inventory and compact diff before
 Forge reads their content. This applies to automatic drafts, staged regeneration, amend

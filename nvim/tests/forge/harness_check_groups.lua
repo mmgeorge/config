@@ -3,10 +3,19 @@ local scene = dofile("nvim/tests/forge/support/check_groups_scene.lua").open()
 local success, failure = xpcall(function()
   scene.toggle("scene:checks")
   local text = table.concat(scene.lines(), "\n")
-  assert(text:find("5 passed · 2 failed · 1 blocked", 1, true), text)
+  assert(text:find("5/7 passed · 1 failed · 1 blocked · 2 attempts", 1, true), text)
   for _, category in ipairs({ "Formatting", "Lint", "Validation", "Tests", "Builds" }) do
     assert(text:find(category, 1, true), "missing category " .. category)
   end
+  assert(text:find("Formatting · 1/1 passed · 2 attempts · 0.1s", 1, true), text)
+  assert(text:find("Tests · 3/3 passed · 2 attempts · 0.1s", 1, true), text)
+  assert(text:find("Builds · 1/1 passed · 1 attempt · 0.1s", 1, true), text)
+  assert(not text:find("Run 1", 1, true) and not text:find("nvim/tests/forge/first.lua", 1, true),
+    "opening Checks expanded category contents")
+  for _, category in ipairs({ "format", "lint", "check", "test", "build" }) do
+    scene.toggle("scene:category:" .. category)
+  end
+  text = table.concat(scene.lines(), "\n")
   assert(text:find("Run 1", 1, true) and text:find("Run 2", 1, true), "repeated runs were lost")
   assert(text:find("nvim/tests/forge/first.lua · 2 passed · 2.4s", 1, true), text)
   assert(text:find("nvim/tests/forge/second.lua · 1 passed · 1 failed · 0.2s", 1, true), text)

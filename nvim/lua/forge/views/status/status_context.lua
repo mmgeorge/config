@@ -229,7 +229,7 @@ function M.attach(options)
 
   local function open_about(_, _, captured)
     if not owner.about or owner.about.state == "none" then owner.generate_about(true) return end
-    if owner.about.state == "generating" then vim.notify("Commit message is still generating", vim.log.levels.INFO, { title = "Forge" }) return end
+    if owner.about.state == "generating" then return end
     if owner.about.state == "error" then notifications.error(owner.about.error or "Commit message generation failed") return end
     require("forge.source_document").open_about({ workspace = options.workspace, status_document = options.document_id, message = owner.about.message, window = options.input_window(captured),
       is_current = function() return alive() and options.is_input_current(captured) end })

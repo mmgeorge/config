@@ -66,12 +66,17 @@ without creating transcript rows or output nodes.
 Completed results retain one Checks root. Its children group executions by
 Formatting, Lint, Validation, Tests, and Builds, then by a known source file or
 package/application target. Exact test names nest below their known source or
-target. Repeated executions retain independent command identities and chronological
+target. Categories start collapsed and show their latest passing ratio, maximum attempt
+count, and total command duration across all attempts. Explicit category expansion persists
+when the Checks root is closed and reopened.
+Repeated executions retain independent command identities and chronological
 Run rows, including earlier failures. Grouped file and target headings summarize their
 leaf outcomes and sum their recorded durations. They omit the total duration if any leaf
 has no recorded duration. Run rows show only their number, outcome, and duration.
-The root totals count check commands, not
-assertions or files reported within one command.
+The root summary counts the latest outcome for each check definition and known file or
+test target. It shows passed results over the total and the largest attempt count across
+those identities. Earlier failures remain in Run rows but do not count as current failures
+after a successful retry. The root duration retains the time spent across all attempts.
 
 The check supervisor validates the Lua runner's existing JSON-line fixture report
 after collecting the process and preserves file outcomes, durations, commands, and
