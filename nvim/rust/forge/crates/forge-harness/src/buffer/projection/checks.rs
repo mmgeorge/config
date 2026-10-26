@@ -10,6 +10,19 @@ struct CheckLeaf<'run> {
     name: Option<String>,
 }
 
+impl CheckLeaf<'_> {
+    fn state(&self) -> CheckState {
+        self.result.map_or(self.check.state, |result| result.state)
+    }
+
+    fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
+        self.result.map_or_else(
+            || self.check.elapsed_ms(now_ms),
+            |result| result.duration_ms,
+        )
+    }
+}
+
 /// Selects known file or target identities without assigning package-wide results to guessed files.
 fn check_scope(check: &CommandCheck) -> (String, Option<String>) {
     use crate::checks::CheckSelection;
@@ -247,7 +260,14 @@ impl TimelineRenderer<'_> {
                     self.check_leaf(&leaves[0], &scope)?;
                     continue;
                 }
-                self.literal(&scope_id, &scope, None)?;
+                let outcomes = CheckRun::summarize_states(leaves.iter().map(CheckLeaf::state));
+                let elapsed = leaves.iter().try_fold(0_u64, |total, leaf| {
+                    Some(total.saturating_add(leaf.elapsed_ms(self.now_ms)?))
+                });
+                let duration = elapsed
+                    .map(|elapsed| format!(" · {:.1}s", elapsed as f64 / 1000.0))
+                    .unwrap_or_default();
+                self.literal(&scope_id, &format!("{scope} · {outcomes}{duration}"), None)?;
                 let scope_section = self.begin_section(2);
                 let mut names = BTreeMap::<String, Vec<&CheckLeaf<'_>>>::new();
                 for leaf in &leaves {
@@ -277,14 +297,7 @@ impl TimelineRenderer<'_> {
                             Some((self.begin_section(2), id))
                         };
                         for (index, leaf) in attempts.iter().enumerate() {
-                            let label = format!(
-                                "Run {} · {}",
-                                index + 1,
-                                leaf.check
-                                    .context
-                                    .as_ref()
-                                    .map_or("Check", |context| context.name.as_str())
-                            );
+                            let label = format!("Run {}", index + 1);
                             self.check_leaf(leaf, &label)?;
                         }
                         if let Some((section, id)) = named_section {
@@ -311,11 +324,8 @@ impl TimelineRenderer<'_> {
     fn check_leaf(&mut self, leaf: &CheckLeaf<'_>, label: &str) -> Result<()> {
         let check = leaf.check;
         let call_id = &leaf.call_id;
-        let state = leaf.result.map_or(check.state, |result| result.state);
-        let elapsed = leaf.result.map_or_else(
-            || check.elapsed_ms(self.now_ms),
-            |result| result.duration_ms,
-        );
+        let state = leaf.state();
+        let elapsed = leaf.elapsed_ms(self.now_ms);
         let failed = matches!(
             state,
             CheckState::Failed
@@ -476,7 +486,7 @@ mod tests {
         ] {
             commands.push(json!({
                 "id":format!("run:{index}"), "command":"echo checked", "state":state,
-                "started_at_ms":1,"completed_at_ms":11,"exit_code":if state == "failed" {1} else {0},
+                "started_at_ms":1,"completed_at_ms":1 + (index + 1) * 100,"exit_code":if state == "failed" {1} else {0},
                 "error":null,"stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,"preview":"",
                 "context":{"definition_id":category,"name":format!("{category} check"),"area":".","reason":"selected",
                     "matched_files":[file],"category":category,"directory":".","selection":{"kind":"files","files":[file]},
@@ -494,7 +504,7 @@ mod tests {
             &TimelineEntry::Checks {
                 id: "run".into(),
                 created_at_ms: 1,
-                run,
+                run: run.clone(),
             },
             &WidthProfile::default(),
             false,
@@ -512,6 +522,13 @@ mod tests {
             assert!(text.contains(category));
         }
         assert!(text.contains("Run 1") && text.contains("Run 2"));
+        assert!(
+            text.contains("src/main.rs · 1 passed · 1 failed · 0.3s"),
+            "{text}"
+        );
+        assert!(text.contains("Run 1 · Passed · 0.1s"), "{text}");
+        assert!(text.contains("Run 2 · Failed · 0.2s"), "{text}");
+        assert!(!text.contains("format check"), "{text}");
         assert!(text.contains("Failed"));
         for category in ["format", "lint", "test", "build"] {
             let block = blocks
@@ -531,6 +548,28 @@ mod tests {
                 "run:checks"
             );
         }
+        let mut failed_run = run;
+        failed_run.commands[0].state = CheckState::Failed;
+        failed_run.commands[1].completed_at_ms = None;
+        let failed_projection = project(
+            &TimelineEntry::Checks {
+                id: "run".into(),
+                created_at_ms: 1,
+                run: failed_run,
+            },
+            &WidthProfile::default(),
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+        )?;
+        let heading = failed_projection
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .find(|row| row.contains("src/main.rs · 0 passed · 2 failed"))
+            .expect("failed file group omitted its outcome counts");
+        assert_eq!(heading.trim(), "src/main.rs · 0 passed · 2 failed");
         Ok(())
     }
 }

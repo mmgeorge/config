@@ -201,6 +201,7 @@ local success, failure = xpcall(function()
   }).kind == "Applied")
   vim.api.nvim_set_current_win(state.composer_win)
   state.presentation.follow_tail()
+  local staging_cursor = vim.api.nvim_win_get_cursor(state.transcript_win)
   state.queue = { { text = "queued follow-up" } }
   for index = 1, vim.api.nvim_win_get_height(state.transcript_win) + 5 do
     state.queue[#state.queue + 1] = { text = "queued extra " .. index }
@@ -229,16 +230,25 @@ local success, failure = xpcall(function()
   assert(staged_request.queue[1] == "queued follow-up" and staged_request.steering[1] == "steering update",
     "staging request lost its messages")
   assert(staging_count == 2, "selection failure did not flush the latest staged messages")
-  local timeline_view = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
-  local visible_height = vim.api.nvim_win_get_height(state.transcript_win)
-    - (vim.wo[state.transcript_win].winbar ~= "" and 1 or 0)
-  assert(vim.api.nvim_win_text_height(state.transcript_win, { start_row = timeline_view.topline - 1 }).all <= visible_height,
-    "queue-only refresh left staging below the viewport")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(state.transcript_win), staging_cursor),
+    "passive queue refresh moved the transcript cursor")
+  assert(vim.api.nvim_get_current_win() == state.composer_win,
+    "passive queue refresh moved focus from the composer")
   vim.api.nvim_set_current_win(state.transcript_win)
-  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 0 })
+  vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 2 })
+  vim.api.nvim_win_call(state.transcript_win, function() vim.cmd("normal! zt") end)
+  local reading_view = vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)
+  state.queue[#state.queue].text = "queue update while reading history"
   controller.refresh_winbar()
-  assert(vim.api.nvim_win_get_cursor(state.transcript_win)[1] == 1,
+  assert(vim.wait(1000, function()
+    return vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == state.queue[#state.queue].text
+  end), "queue refresh did not publish while reading history")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(state.transcript_win), { 1, 2 }),
     "staging refresh displaced intentional transcript browsing")
+  assert(vim.deep_equal(vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview), reading_view),
+    "staging refresh scrolled a history reader")
+  assert(vim.api.nvim_get_current_win() == state.transcript_win,
+    "staging refresh moved focus from the history reader")
   state.queue, state.pending_steer = {}, {}
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
   controller.refresh_winbar()
@@ -353,7 +363,10 @@ local success, failure = xpcall(function()
   assert(state.execution_notice, "provider failure lost its persistent notice")
   state.execution_notice = nil
   controller.drain()
-  assert(#state.queue == 0 and submitted ~= nil, "idle status did not resume queued input")
+  assert(#state.queue == 1 and submitted ~= nil, "idle status did not submit retained queued input")
+  receive("backend_event", { kind = "prompt_submission", data = { document = state.presentation.document,
+    token = submitted.submission.token, state = "accepted" } }, "native-controller")
+  assert(#state.queue == 0, "accepted queued input remained in the queue")
   local original_plain_request = client.request
   local child_request_for = client.request_for
   client.request_for = function(session_id, method, params, callback)

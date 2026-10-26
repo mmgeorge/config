@@ -610,12 +610,6 @@ function M.open(options, callback)
     opening = opening or {}
     loading[window] = opening
     opening[id] = { view = view.id, ready = false }
-    local header = owner.transcript.node_owner[id]
-    local _, row = owner.transcript.sequence:position(header)
-    if row then
-      loading_mark[id] = vim.api.nvim_buf_set_extmark(options.transcript_buffer, loading_namespace, row, 0,
-        { virt_text = { { " Loading…", "Comment" } }, virt_text_pos = "eol" })
-    end
     owner.set_section(id, true, false, view)
     return true
   end

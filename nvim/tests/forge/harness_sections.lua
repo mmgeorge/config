@@ -64,15 +64,22 @@ local ok, failure = xpcall(function()
   assert(vim.wait(1000, function() return owner.ready end, 1))
   assert(owner.transcript.block.heading.metadata.node.display == "heading")
   assert(not table.concat(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), "\n"):find("loaded only", 1, true))
+  local loading_namespace = vim.api.nvim_get_namespaces()["ForgeHarnessLoading" .. transcript]
+  local collapsed_lines = vim.api.nvim_buf_get_lines(transcript, 0, -1, false)
   deferred = true
   assert(owner.toggle_heading(window))
   assert(owner.transcript.block.heading.metadata.node.display == "heading", "unloaded fold opened before delivery")
   assert(owner.transcript.fold_loading[window].tools, "opening did not publish loading state")
-  assert(#vim.api.nvim_buf_get_extmarks(transcript, vim.api.nvim_get_namespaces()["ForgeHarnessLoading" .. transcript], 0, -1, {}) > 0, "heading omitted loading state")
+  assert(#vim.api.nvim_buf_get_extmarks(transcript, loading_namespace, 0, -1, {}) == 0,
+    "pending expansion displayed a loading marker")
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(transcript, 0, -1, false), collapsed_lines),
+    "pending expansion replaced the collapsed heading")
   assert(not body_loaded())
   assert(respond() == "node")
   assert(vim.wait(1000, function() return #held > 0 end, 1))
   assert(owner.transcript.block.heading.metadata.node.display == "heading", "fold opened on acknowledgement before content")
+  assert(#vim.api.nvim_buf_get_extmarks(transcript, loading_namespace, 0, -1, {}) == 0,
+    "acknowledged expansion displayed a loading marker before content arrived")
   assert(not body_loaded())
   assert(respond() == "sync")
   assert(vim.wait(1000, function()
@@ -102,6 +109,9 @@ local ok, failure = xpcall(function()
   respond("fixture delivery failure")
   assert(owner.transcript.block.heading.metadata.node.display == "heading" and not body_loaded())
   assert(not owner.transcript.fold_loading[window], "failed request retained loading state")
+  local failure_marks = vim.api.nvim_buf_get_extmarks(transcript, loading_namespace, 0, -1, { details = true })
+  assert(#failure_marks == 1 and failure_marks[1][4].virt_text[1][1]:find("Section unavailable", 1, true),
+    "failed expansion lost its retry feedback")
   assert(#notices == 0 and owner.section_failure.tools:find("fixture delivery failure", 1, true))
   assert(not require("forge.views.harness.health").notice({ presentation = owner }), "section failure escaped its local scope")
   deferred = false

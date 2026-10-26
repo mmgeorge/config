@@ -67,7 +67,10 @@ Completed results retain one Checks root. Its children group executions by
 Formatting, Lint, Validation, Tests, and Builds, then by a known source file or
 package/application target. Exact test names nest below their known source or
 target. Repeated executions retain independent command identities and chronological
-Run rows, including earlier failures. The root totals count check commands, not
+Run rows, including earlier failures. Grouped file and target headings summarize their
+leaf outcomes and sum their recorded durations. They omit the total duration if any leaf
+has no recorded duration. Run rows show only their number, outcome, and duration.
+The root totals count check commands, not
 assertions or files reported within one command.
 
 The check supervisor validates the Lua runner's existing JSON-line fixture report
@@ -513,8 +516,8 @@ announces the current source revision without duplicating transcript content in 
 
 The session presentation owns a separate loaded document. Closed folds retain their heading and
 an empty body anchor. A section request records expansion intent per view and publishes the union
-needed by attached windows. An unloaded fold stays closed with a loading label until its first
-page is installed. The same publication opens it, and a second toggle cancels that pending open.
+needed by attached windows. An unloaded fold keeps its existing collapsed heading without a loading
+label until its first page is installed. The same publication opens it, and a second toggle cancels that pending open.
 Failed requests leave the fold closed and retryable. Closing the last requesting view releases its body. Nested closed
 sections remain deferred. Expanded change files own their hunk bodies and start with two
 window heights of display rows. Each continuation adds two current window heights when its
