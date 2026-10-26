@@ -38,12 +38,20 @@ local ok, failure = xpcall(function()
   assert(opened.initial == nil and opened.composer == nil, "opening transmitted an unsent draft")
   local history = snapshot(opened.document, "native transcript")
   history.block[1].text = { "native transcript", "previous exchange", "previous answer" }
+  history.block[1].metadata.node = {
+    id = "body", kind = "thought", order = 0, lifecycle = "live", more = false,
+    default_display = "full", display = "full", generation = 1, content_revision = 1,
+    loaded_rows = 3, loaded_bytes = #table.concat(history.block[1].text, "\n"),
+  }
   requests[1].callback({ transcript = history })
   assert(attached == owner and owner.ready)
   assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "native transcript")
   assert(vim.bo[composer].modifiable and not vim.bo[transcript].modifiable)
   owner.activate(function() error("plain transcript text was activated") end)
   assert(#requests == 1, "plain transcript text dispatched an action without a target")
+  vim.api.nvim_win_set_cursor(window, { 1, 0 })
+  assert(not owner.toggle_heading(window), "a thought without activity offered a fold")
+  assert(#requests == 1, "a thought without activity dispatched an expansion")
   owner.sync()
   owner.sync()
   assert(#requests == 1, "refresh bypassed the publication interval")
@@ -212,6 +220,26 @@ local ok, failure = xpcall(function()
   assert(owner.failure and owner.failure:find("Reopen Harness to retry", 1, true))
   assert(#notices == 1, "refresh failure flooded notifications: " .. vim.inspect(notices))
   assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
+  assert(owner.close())
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(window, transcript)
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) error(message) end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  local opening = requests[#requests]
+  local collapsed = snapshot(opening.params.document, "Thought with deferred tools")
+  collapsed.block[1].metadata.node = vim.deepcopy(history.block[1].metadata.node)
+  collapsed.block[1].metadata.node.default_display = "heading"
+  collapsed.block[1].metadata.node.display = "heading"
+  opening.callback({ transcript = collapsed })
+  vim.api.nvim_win_set_cursor(window, { 1, 0 })
+  assert(owner.toggle_heading(window), "collapsed thought without materialized fold ranges did not open")
+  local expansion = requests[#requests].params
+  assert(expansion.operation == "node" and expansion.node == "body"
+    and expansion.action == "set_expansion" and expansion.expanded,
+    "deferred thought did not request its owned activity")
   assert(owner.close())
 end, debug.traceback)
 client.request_for = original_request

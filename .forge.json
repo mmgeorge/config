@@ -222,6 +222,7 @@
           "nvim/tests/forge/harness_control_responsiveness.lua",
           "nvim/tests/forge/harness_completion.lua",
           "nvim/tests/forge/harness_checks_host.lua",
+          "nvim/tests/forge/harness_admission_host.lua",
           "nvim/tests/forge/harness_checks.lua",
           "nvim/tests/forge/harness_checkpoint_host.lua",
           "nvim/tests/forge/harness_automatic_checks.lua",

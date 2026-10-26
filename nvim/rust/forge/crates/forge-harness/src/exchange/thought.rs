@@ -5,24 +5,15 @@ use anyhow::{Context, Result};
 use super::{Exchange, ExchangeNode};
 use crate::turn::{Message, MessageKind, ToolCall, ToolState, Turn, TurnItem};
 
-/// Classifies the two activity groups owned by one thought.
-#[derive(Clone, Copy)]
-pub(crate) enum ThoughtGroupKind {
-    Tools,
-    Writes,
-}
-
 /// Borrows an activity and its original provider-turn identity.
 pub(crate) struct ThoughtCall<'source> {
     pub id: &'source str,
-    pub node: &'source ExchangeNode,
     pub turn: &'source Turn,
     pub tool: &'source ToolCall,
 }
 
 /// Owns ordered activity references while the exchange owns their streamed content.
 pub(crate) struct ThoughtGroup<'source> {
-    pub kind: ThoughtGroupKind,
     pub call: Vec<ThoughtCall<'source>>,
     pub live: bool,
 }
@@ -42,11 +33,6 @@ impl ExchangeThought<'_> {
     pub fn has_activity(&self) -> bool {
         !self.events.is_empty() || !self.tools.call.is_empty() || !self.writes.call.is_empty()
     }
-
-    /// Count successful logical files without counting repeat edits or failed attempts.
-    pub fn changed_files(&self) -> usize {
-        super::ProviderDiffBuilder::file_count(self.writes.call.iter().map(|call| call.tool))
-    }
 }
 
 /// Preserves user-input boundaries between owned thought sections.
@@ -60,8 +46,6 @@ pub(crate) enum ThoughtPart<'source> {
 pub(crate) struct ThoughtContent<'source> {
     pub thought: Vec<ExchangeThought<'source>>,
     pub part: Vec<ThoughtPart<'source>>,
-    thought_index: HashMap<&'source str, usize>,
-    group_index: HashMap<&'source str, (usize, ThoughtGroupKind)>,
 }
 
 impl<'source> ThoughtContent<'source> {
@@ -73,21 +57,6 @@ impl<'source> ThoughtContent<'source> {
         }
     }
 
-    /// Get the section that begins at this message or initial activity node.
-    pub fn thought(&self, id: &str) -> Option<&ExchangeThought<'source>> {
-        self.thought_index
-            .get(id)
-            .map(|index| &self.thought[*index])
-    }
-
-    /// Get a group only at its first activity, keeping its identity stable as calls arrive.
-    pub fn group(&self, id: &str) -> Option<&ThoughtGroup<'source>> {
-        self.group_index.get(id).map(|(index, kind)| match kind {
-            ThoughtGroupKind::Tools => &self.thought[*index].tools,
-            ThoughtGroupKind::Writes => &self.thought[*index].writes,
-        })
-    }
-
     fn begin(&mut self, id: &'source str, message: Option<&'source Message>) -> usize {
         let index = self.thought.len();
         self.thought.push(ExchangeThought {
@@ -95,18 +64,15 @@ impl<'source> ThoughtContent<'source> {
             message,
             events: Vec::new(),
             tools: ThoughtGroup {
-                kind: ThoughtGroupKind::Tools,
                 call: Vec::new(),
                 live: true,
             },
             writes: ThoughtGroup {
-                kind: ThoughtGroupKind::Writes,
                 call: Vec::new(),
                 live: true,
             },
         });
         self.part.push(ThoughtPart::Thought(index));
-        self.thought_index.insert(self.thought[index].id, index);
         index
     }
 
@@ -151,8 +117,6 @@ impl Exchange {
         let mut content = ThoughtContent {
             thought: Vec::new(),
             part: Vec::new(),
-            thought_index: HashMap::new(),
-            group_index: HashMap::new(),
         };
         let mut question_turn = std::collections::HashSet::new();
         let mut preceding_turn = None;
@@ -236,15 +200,7 @@ impl Exchange {
                     } else {
                         &mut content.thought[index].tools
                     };
-                    if group.call.is_empty() {
-                        content.group_index.insert(id, (index, group.kind));
-                    }
-                    group.call.push(ThoughtCall {
-                        id,
-                        node,
-                        turn,
-                        tool,
-                    });
+                    group.call.push(ThoughtCall { id, turn, tool });
                 }
                 ExchangeNode::Compaction { compaction, .. }
                     if compaction.state == crate::backend::CompactionState::Running => {}

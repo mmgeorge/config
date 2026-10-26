@@ -827,7 +827,10 @@ fn index(
     let mut sections = Vec::new();
     for (start, block) in entry.block.iter().enumerate() {
         if let Some(node) = &block.metadata.node
-            && node.kind != forge_buffer::node::NodeKind::Message
+            && !matches!(
+                node.kind,
+                forge_buffer::node::NodeKind::Message | forge_buffer::node::NodeKind::Thought
+            )
             && !block.metadata.fold.iter().any(|fold| fold.id == node.id)
         {
             owner.insert(node.id.0.clone(), entry.id.to_owned());

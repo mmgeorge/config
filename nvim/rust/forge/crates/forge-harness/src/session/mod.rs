@@ -8,6 +8,7 @@ mod shell;
 mod timeout;
 pub use access::{AccessPolicy, DirectoryScope, WindowsSandbox};
 pub use shell::CheckShell;
+pub(crate) use timeout::InputSchedule;
 pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
 pub mod continuation;
 pub mod state_machine;

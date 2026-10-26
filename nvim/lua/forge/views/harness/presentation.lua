@@ -685,7 +685,10 @@ function M.open(options, callback)
       node = section_state(block.metadata.content_node)
     end
     if not node or node == vim.NIL then return false end
-    if node.kind == "message" and #(block.metadata.fold or {}) == 0 then return false end
+    if #(block.metadata.fold or {}) == 0
+      and (node.kind == "message" or node.kind == "thought" and node.default_display == "full") then
+      return false
+    end
     local view = view_for(window)
     if not view then return false end
     local desired = node.display ~= "full"

@@ -24,6 +24,7 @@ local hold = vim.g.forge_check_activity_hold or 0
 vim.fn.writefile({ vim.json.encode({ checks = {
   ["activity"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c",
       ("sleep %dms; print 'retained check output'"):format(hold + 1200)  }, label = "Activity fixture", directory = ".", category = "test", after = {} } },
+  ["empty"] = { trigger = { auto = false }, action = { command = { "nu", "--no-config-file", "-c", "exit 0" }, label = "Empty fixture", directory = ".", category = "test", after = {} } },
   ["unused"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c", "exit 9"  }, label = "Unused fixture", directory = ".", category = "test", after = {} } }
 } }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
@@ -90,7 +91,7 @@ local succeeded, failure = xpcall(function()
     "provider did not start: " .. tostring(prompt_failure) .. "\n" .. transcript() .. "\n" .. table.concat(errors, "\n"))
   request("turn.cancel")
   assert(vim.wait(3000, function() return transcript():find("Idle", 1, true) ~= nil end, 10))
-  local run_id = request("checks.run", { check = { "activity" } }).run_id
+  local run_id = request("checks.run", { check = { "activity", "empty" } }).run_id
   assert(vim.wait(3000, function()
     answer_permissions()
     return transcript():find("Activity fixture", 1, true) ~= nil
@@ -132,6 +133,30 @@ local succeeded, failure = xpcall(function()
     return transcript():find("Activity fixture", 1, true) ~= nil
   end, 10), "executed check is missing from expanded results")
   assert(not transcript():find("Unused fixture", 1, true), "skipped check appeared in expanded results")
+  local empty_command
+  for _, command in ipairs(result.commands) do
+    if command.context.definition_id == "empty" then empty_command = command.id end
+  end
+  assert(empty_command, "empty check result is missing")
+  local _, empty_heading_row = state.presentation.transcript.sequence:position(empty_command .. ":tool")
+  assert(empty_heading_row, "empty check heading is missing")
+  vim.api.nvim_win_set_cursor(state.transcript_win, { empty_heading_row + 1, 0 })
+  assert(state.presentation.toggle_heading(state.transcript_win), "empty check did not expand")
+  assert(vim.wait(3000, function() return transcript():find("no output", 1, true) ~= nil end, 10))
+  local _, output_row = state.presentation.transcript.sequence:position(empty_command .. ":preview")
+  assert(output_row, "empty output row is missing")
+  vim.api.nvim_win_set_cursor(state.transcript_win, { output_row + 1, 0 })
+  vim.cmd("normal! zz")
+  vim.cmd("redraw!")
+  local output_position = vim.fn.screenpos(state.transcript_win, output_row + 1, 1)
+  local rendered_output = ""
+  for column = 1, 120 do rendered_output = rendered_output .. vim.fn.screenstring(output_position.row, column) end
+  assert(rendered_output:find("└  no output", 1, true), "output branch or indentation is wrong: " .. rendered_output)
+  assert(not rendered_output:find("▸", 1, true) and not rendered_output:find("▾", 1, true),
+    "output row inherited a heading triangle: " .. rendered_output)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { empty_heading_row + 1, 0 })
+  assert(state.presentation.toggle_heading(state.transcript_win), "empty check did not collapse")
+  assert(vim.wait(3000, function() return transcript():find("no output", 1, true) == nil end, 10))
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, -2, -1, false)[1] == "Idle",
     "idle retained unused rows below the phase")
   assert_status_region()

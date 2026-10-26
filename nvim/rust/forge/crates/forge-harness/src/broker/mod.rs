@@ -357,6 +357,7 @@ pub struct TurnCancellation {
     cleanup: tokio::sync::watch::Sender<ExecutionCleanup>,
     retraction_allowed: AtomicBool,
     notify: Notify,
+    state: tokio::sync::watch::Sender<bool>,
 }
 
 impl TurnCancellation {
@@ -370,6 +371,7 @@ impl TurnCancellation {
             cleanup: tokio::sync::watch::channel(ExecutionCleanup::Idle).0,
             retraction_allowed: AtomicBool::new(false),
             notify: Notify::new(),
+            state: tokio::sync::watch::channel(false).0,
         }
     }
 
@@ -382,6 +384,7 @@ impl TurnCancellation {
         self.cleanup.send_replace(ExecutionCleanup::Idle);
         self.retraction_allowed
             .store(retraction_allowed, Ordering::Release);
+        self.state.send_replace(false);
     }
 
     /// Request cancellation without waiting for the broker's serialized request lane.
@@ -390,6 +393,7 @@ impl TurnCancellation {
         self.submission_cancelled.store(true, Ordering::Release);
         self.restore_prompt.store(restore_prompt, Ordering::Release);
         self.requested.store(true, Ordering::Release);
+        self.state.send_replace(true);
         self.notify.notify_waiters();
     }
 
@@ -433,6 +437,11 @@ impl TurnCancellation {
             notified.await;
         }
     }
+
+    /// Observe cancellation and rearming without acquiring execution ownership.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.state.subscribe()
+    }
 }
 
 #[derive(Debug)]
@@ -448,7 +457,11 @@ impl std::fmt::Display for TurnCancelled {
 impl std::error::Error for TurnCancelled {}
 
 #[derive(Debug)]
-struct RequestNotAdmitted(&'static str);
+/// Rejects a request before it owns or mutates the active execution.
+pub struct RequestNotAdmitted(
+    /// Describes the unavailable execution or cleanup owner.
+    pub &'static str,
+);
 
 impl std::fmt::Display for RequestNotAdmitted {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -873,6 +886,7 @@ impl HarnessBroker {
         )?;
         let plan_file = Arc::new(PlanFileStore::new(&data_root, &session.workspace));
         let observer = Arc::new(observation::BrokerObserver {
+            input_schedule: tokio::sync::watch::channel(Default::default()).0,
             lsp: runtime.lsp.clone(),
             status_thoughts: AtomicBool::new(shared.desired.status_thoughts.unwrap_or(false)),
             check_editing: Arc::new(AtomicBool::new(
@@ -944,6 +958,7 @@ impl HarnessBroker {
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
         };
+        broker.refresh_input_schedule()?;
         let initial_timeline = broker.snapshot()?.timeline;
         broker
             .presentation
@@ -1294,6 +1309,9 @@ impl HarnessBroker {
         }
         if let Some(stage) = settle_stage {
             stage.complete(json!({"status":if outcome.is_ok() { "completed" } else { "failed" }}));
+        }
+        if let Err(error) = self.refresh_input_schedule() {
+            outcome = Err(error.context("publish input deadline"));
         }
         match outcome {
             Ok((value, mut event)) => {
@@ -4696,6 +4714,48 @@ impl HarnessBroker {
         }
     }
 
+    /// Publish canonical input ownership after a durable state transition.
+    pub(crate) fn refresh_input_schedule(&self) -> Result<()> {
+        let plan = if self.active_plan_awaits_input()? {
+            Some(self.active_elicitation_plan()?)
+        } else {
+            None
+        };
+        let interaction = if plan.is_none() {
+            self.find_active_interaction_elicitation()?
+        } else {
+            None
+        };
+        let input = plan
+            .as_ref()
+            .and_then(|plan| {
+                plan.elicitation
+                    .as_ref()
+                    .map(|input| (format!("plan:{}", plan.id), input))
+            })
+            .or_else(|| {
+                interaction.as_ref().and_then(|exchange| {
+                    exchange
+                        .elicitation
+                        .as_ref()
+                        .map(|input| (format!("exchange:{}", exchange.id), input))
+                })
+            });
+        let next = crate::session::InputSchedule {
+            identity: input
+                .as_ref()
+                .map(|(owner, input)| format!("{owner}:{}", input.question_set.id)),
+            deadline: input.as_ref().and_then(|(_, input)| input.deadline.clone()),
+            question_revision: input.as_ref().map(|(_, input)| input.revision),
+            approval_allowed: input.is_none() && !self.active_plan_has_acceptance()?,
+            ..Default::default()
+        };
+        self.observer
+            .input_schedule
+            .send_if_modified(|current| current.update(next, self.clock.now_ms()));
+        Ok(())
+    }
+
     /// Resolve expired input only while holding the owning session's execution admission.
     pub(crate) fn expire_input(
         &mut self,
@@ -4714,6 +4774,14 @@ impl HarnessBroker {
         } else {
             None
         };
+        let owner = plan
+            .as_ref()
+            .map(|plan| format!("plan:{}", plan.id))
+            .or_else(|| {
+                interaction
+                    .as_ref()
+                    .map(|exchange| format!("exchange:{}", exchange.id))
+            });
         let elicitation = plan
             .as_mut()
             .and_then(|plan| plan.elicitation.as_mut())
@@ -4724,8 +4792,11 @@ impl HarnessBroker {
             });
         if let Some(elicitation) = elicitation {
             if let Some(deadline) = &elicitation.deadline {
-                let identity =
-                    format!("{}:{}", elicitation.question_set.id, deadline.expires_at_ms);
+                let owner = owner.as_deref().expect("active input owner");
+                let identity = format!(
+                    "{owner}:{}:{}",
+                    elicitation.question_set.id, deadline.expires_at_ms
+                );
                 if active_deadline
                     .as_ref()
                     .is_none_or(|(current, _)| current != &identity)

@@ -1308,6 +1308,10 @@ fn toggle_inline_output(
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
     heading.metadata.node = previous_heading.metadata.node.clone();
+    let body_layout = layout.map(|mut layout| {
+        layout.marker = None;
+        layout
+    });
     let chunks = if expanded {
         source.inline_prefix_chunks(limit)?
     } else {
@@ -1372,7 +1376,7 @@ fn toggle_inline_output(
         } else {
             renderer.tool_body(call_id, source, expanded, chunk)?
         };
-        block.metadata.layout = layout.clone();
+        block.metadata.layout = body_layout.clone();
         body.push(block);
     }
     let mut hidden = if !expanded && call.kind == "check" {
@@ -1384,7 +1388,7 @@ fn toggle_inline_output(
     } else {
         renderer.tool_hidden(call_id, source, expanded)?
     };
-    hidden.metadata.layout = layout;
+    hidden.metadata.layout = body_layout;
     let target = body
         .iter()
         .chain(std::iter::once(&hidden))
@@ -1642,7 +1646,10 @@ fn apply_projection<'operation>(
                     .document
                     .block(&block_id)
                     .context("streamed tool block is missing")?;
-                let layout = previous.metadata.layout.clone();
+                let layout = previous.metadata.layout.clone().map(|mut layout| {
+                    layout.marker = None;
+                    layout
+                });
                 let mut content_width = width.clone();
                 content_width.columns = content_width
                     .columns
@@ -2558,6 +2565,91 @@ mod tests {
     }
 
     #[test]
+    fn expanded_empty_check_has_only_a_heading_marker() -> Result<()> {
+        use forge_buffer::identity::BlockId;
+
+        let directory = tempfile::tempdir()?;
+        let output = directory.path().join("command.output");
+        std::fs::write(&output, "")?;
+        let run = serde_json::from_value(serde_json::json!({
+            "id":"gate","owner":{"kind":"session","session_id":"session"},
+            "revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
+            "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"gate:0","command":"accepted command","state":"passed","started_at_ms":1,
+                "completed_at_ms":2,"exit_code":0,"error":null,"stdout":output,"stderr":output,
+                "output":output,"output_bytes":0,"preview":""
+            }]
+        }))?;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(crate::timeline::TimelineProjector::with_checks(
+            Vec::new(),
+            vec![run],
+        )?)?;
+        let document = DocumentId("empty-check-output".into());
+        owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        expand_sections(&mut owner, "view")?;
+        owner
+            .open
+            .as_mut()
+            .unwrap()
+            .sections
+            .nodes
+            .choice
+            .insert("gate:0:tool".into(), true);
+        toggle_inline_output(
+            owner.open.as_mut().unwrap(),
+            "gate:0",
+            true,
+            super::super::tool::INITIAL_INLINE_BYTES,
+        )?;
+        expand_sections(&mut owner, "view")?;
+        let open = owner.open.as_ref().unwrap();
+        let heading = open
+            .transcript
+            .document
+            .block(&BlockId("gate:0:tool".into()))
+            .unwrap();
+        assert_eq!(
+            heading
+                .metadata
+                .layout
+                .as_ref()
+                .unwrap()
+                .marker
+                .as_ref()
+                .unwrap()
+                .text,
+            "▸"
+        );
+        for identity in ["gate:0:preview", "gate:0:hidden"] {
+            let block = open
+                .transcript
+                .document
+                .block(&BlockId(identity.into()))
+                .unwrap();
+            assert!(block.metadata.layout.as_ref().unwrap().marker.is_none());
+        }
+        let body = open
+            .transcript
+            .document
+            .block(&BlockId("gate:0:preview".into()))
+            .unwrap();
+        assert!(
+            body.text
+                .wire_rows()
+                .iter()
+                .any(|row| row.trim_start() == "└  no output")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn attached_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let output = directory.path().join("command.output");
@@ -3133,6 +3225,186 @@ mod tests {
     }
 
     #[test]
+    fn streamed_thought_retains_owned_tools_and_expansion() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        use forge_buffer::node::NodeKind;
+        let mut active = serde_json::to_value(interaction_entry("active"))?;
+        active["exchange"]["state"] = serde_json::json!("running");
+        active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+        active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: Some(ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "active".into(),
+            }),
+            turn_boundary: None,
+            kind: "assistant_message".into(),
+            text: Some("First [link](https://example.com)".into()),
+            data: serde_json::json!({"provider_message_id":"message","phase":"commentary"}),
+            summary: None,
+            task_update: None,
+            activity: None,
+        };
+        exchange.observe_turn(&event, 2)?;
+        let thought_id = exchange.node_list.last().unwrap().id().to_owned();
+        let mut tool_event = event.clone();
+        tool_event.kind = "tool".into();
+        tool_event.text = None;
+        tool_event.data = serde_json::Value::Null;
+        tool_event.activity = Some(ToolActivity {
+            id: "owned-tool".into(),
+            kind: ToolActivityKind::Command,
+            title: "Read owned output".into(),
+            output: Some("Thought-owned output".into()),
+            output_delta: false,
+            status: Some("running".into()),
+            change: Default::default(),
+        });
+        exchange.observe_turn(&tool_event, 2)?;
+        let entry = TimelineEntry::Exchange {
+            id: "active".into(),
+            created_at_ms: 0,
+            exchange: exchange.clone(),
+            agent_by_id: HashMap::new(),
+        };
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("settled"), entry])?;
+        let document = DocumentId("streamed-message".into());
+        owner.open(
+            document.clone(),
+            ViewId("view".into()),
+            WidthProfile::default(),
+        )?;
+        let snapshot = owner.snapshot(&document)?;
+        let thought = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == thought_id)
+            .unwrap();
+        let node = thought.metadata.node.as_ref().unwrap();
+        assert_eq!(node.kind, NodeKind::Thought);
+        owner.dispatch(PresentationRequest::Node {
+            request: NodeRequest {
+                document: document.clone(),
+                view: ViewId("view".into()),
+                sequence: 1,
+                node: node.id.0.clone(),
+                generation: node.generation,
+                action: NodeAction::SetExpansion { expanded: true },
+                rows: 40,
+                width: WidthProfile::default(),
+            },
+        })?;
+        let snapshot = owner.snapshot(&document)?;
+        let thought_fold = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == thought_id)
+            .unwrap()
+            .metadata
+            .fold
+            .clone();
+        assert!(!thought_fold.is_empty());
+        let revision = snapshot.revision;
+        let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
+        let tool = owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"]
+            .preview(true)?
+            .row
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        event.text = Some("\n\nMore **text** with λ.".into());
+        exchange.observe_turn(&event, 3)?;
+        let patch = owner
+            .update_message(&exchange, &event)?
+            .expect("owned message");
+        assert!(matches!(
+            &patch.operation[..],
+            [TimelineOperation::Message { index: 1, .. }]
+        ));
+        let sync = owner.sync(&document, revision)?;
+        assert!(sync.snapshot.is_none() && !sync.patch.is_empty());
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.projected_entries,
+            projected_entries
+        );
+        assert!(sync.patch.iter().all(|patch| {
+            patch.block_edit.is_empty()
+                && patch.metadata_edit.iter().all(|edit| {
+                    !edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool")
+                })
+        }));
+        assert_eq!(
+            owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"]
+                .preview(true)?
+                .row,
+            tool
+        );
+        assert!(owner.snapshot(&document)?.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .iter()
+                .any(|row| row.contains("More **text**"))
+        }));
+        let snapshot = owner.snapshot(&document)?;
+        let thought = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == thought_id)
+            .unwrap();
+        assert_eq!(thought.metadata.fold, thought_fold);
+        let group = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0.contains("owned-tool") && block.id.0.ends_with(":tools"))
+            .unwrap();
+        assert_eq!(
+            group
+                .metadata
+                .node
+                .as_ref()
+                .unwrap()
+                .parent
+                .as_ref()
+                .unwrap()
+                .0,
+            thought_id
+        );
+        tool_event.activity.as_mut().unwrap().status = Some("completed".into());
+        exchange.observe_turn(&tool_event, 4)?;
+        owner.reconcile(vec![
+            interaction_entry("settled"),
+            TimelineEntry::Exchange {
+                id: "active".into(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+        ])?;
+        let snapshot = owner.snapshot(&document)?;
+        let thought = snapshot
+            .block
+            .iter()
+            .find(|block| block.id.0 == thought_id)
+            .unwrap();
+        assert_eq!(
+            thought.metadata.node.as_ref().unwrap().kind,
+            NodeKind::Thought
+        );
+        assert_eq!(
+            thought.metadata.node.as_ref().unwrap().display,
+            forge_buffer::node::NodeDisplay::Full
+        );
+        Ok(())
+    }
+
+    #[test]
     fn streamed_thoughts_appear_only_in_status_when_enabled() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress};
         for status_thoughts in [false, true] {
@@ -3531,11 +3803,13 @@ mod tests {
                     snapshot
                         .block
                         .iter()
-                        .filter(|block| block
-                            .metadata
-                            .node
-                            .as_ref()
-                            .is_some_and(|node| node.kind == NodeKind::Changes))
+                        .filter(
+                            |block| block.metadata.node.as_ref().is_some_and(|node| node.kind
+                                == NodeKind::Changes
+                                && node.parent.as_ref().is_some_and(|parent| thought_id
+                                    .as_ref()
+                                    .is_some_and(|thought| parent.0 == thought.0)))
+                        )
                         .count(),
                     1
                 );
@@ -3588,12 +3862,15 @@ mod tests {
                 .iter()
                 .find(|block| Some(&block.id) == thought_id.as_ref())
                 .unwrap();
-            assert!(
+            assert_eq!(
                 thought
                     .text
-                    .row(0)
-                    .unwrap()
-                    .contains(&format!("{count} files changed"))
+                    .wire_rows()
+                    .iter()
+                    .map(|row| row.trim_start())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                "Write the requested files.\nPreserve their content."
             );
             let thought_node = thought.metadata.node.as_ref().unwrap();
             assert_eq!(
@@ -3624,14 +3901,30 @@ mod tests {
                 .iter()
                 .enumerate()
                 .filter(|(_, block)| {
-                    block
-                        .metadata
-                        .node
-                        .as_ref()
-                        .is_some_and(|node| node.kind == NodeKind::Changes)
+                    block.metadata.node.as_ref().is_some_and(|node| {
+                        node.kind == NodeKind::Changes
+                            && node.parent.as_ref().is_some_and(|parent| {
+                                thought_id
+                                    .as_ref()
+                                    .is_some_and(|thought| parent.0 == thought.0)
+                            })
+                    })
                 })
                 .collect();
             assert_eq!(groups.len(), 1);
+            let summary = snapshot
+                .block
+                .iter()
+                .find(|block| block.id.0 == "writes:results:changes")
+                .unwrap();
+            assert!(summary.metadata.node.as_ref().unwrap().parent.is_none());
+            assert!(
+                summary
+                    .text
+                    .wire_rows()
+                    .join("")
+                    .contains(&format!("Changed {count} files"))
+            );
             let (position, group) = groups[0];
             assert!(
                 group

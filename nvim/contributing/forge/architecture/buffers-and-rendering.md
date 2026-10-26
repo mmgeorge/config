@@ -157,11 +157,15 @@ Action-target snapshots remain separate and only validate whether a response sti
 The timeline projects ordered exchange items into separate message, tool-group, and change
 nodes. `Exchange::thoughts` derives `ExchangeThought` sections from canonical ordered events,
 with events and separate tool and write groups borrowing their current streamed content.
-The model owns visible-call filtering, unique-file totals, activity presence, and group identity.
-Each thought with activity is collapsed by default and shows tool and file counts in its heading.
+The model owns visible-call filtering, activity presence, and group identity. The renderer consumes
+each thought's owned groups directly without rediscovering ownership from raw provider events.
+Thought nodes retain the same kind before and after activity arrives. Each thought with activity
+is collapsed by default. Its heading preserves commentary text without appended activity counts.
 Expanding it shows events in arrival order, then one tool group, then one change group, indented
 two spaces below the thought. Empty thoughts keep their open-circle marker without a container
-fold. Explicit thought expansion survives new activity and completion.
+fold. Explicit thought expansion survives new activity and completion. Streamed text replacement
+preserves the thought node, content ownership, and fold endpoints. Counts belong to child activity
+headings and the exchange summaries.
 Ordinary tools share a group across interleaved writes and events. New commentary, user input,
 and question interactions end that section. Compaction and other owned events remain inside
 the current thought. Question interactions keep their clarification history outside collapsed thoughts.

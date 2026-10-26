@@ -25,11 +25,17 @@ local function option_list(question, elicitation, allow_ask)
   return result, selected_index, entries
 end
 
-local function question_page_list(elicitation, allow_ask)
+local function question_page_list(elicitation, host)
   local question_set = elicitation.question_set or {}
   local page_list = {}
   for index, question in ipairs(question_set.questions or {}) do
-    local options, selected_index, entries = option_list(question, elicitation, allow_ask)
+    local options, selected_index, entries = option_list(question, elicitation, host.allow_ask)
+    local draft = host.clarification_draft
+    if draft and draft.question_id == question.id then
+      for entry_index, entry in ipairs(entries) do
+        if entry.kind == "ask" then selected_index = entry_index break end
+      end
+    end
     local answer = model.answer_for(elicitation, question.id)
     local selected_entry = entries[selected_index]
     page_list[#page_list + 1] = {
@@ -41,7 +47,8 @@ local function question_page_list(elicitation, allow_ask)
       wrap_column = 2,
       option_list = options,
       selected_index = selected_index,
-      initial_draft = selected_entry and model.input_text(selected_entry, answer) or "",
+      initial_draft = draft and draft.question_id == question.id and draft.text
+        or selected_entry and model.input_text(selected_entry, answer) or "",
       allow_input = true,
       input_height = config.options.picker.input_height,
       footer = "←→ page  ↑↓ select  Enter confirm  Tab feedback",
@@ -77,8 +84,13 @@ end
 
 local function build_spec(elicitation, host)
   local question = model.current_question(elicitation)
-  local pages = question and question_page_list(elicitation, host.allow_ask) or { review_page(elicitation) }
+  local pages = question and question_page_list(elicitation, host) or { review_page(elicitation) }
   local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1
+  if host.clarification_draft then
+    for index, page in ipairs(pages) do
+      if page.id == host.clarification_draft.question_id then initial_page = index break end
+    end
+  end
   return {
     owner = "plan_question",
     deadline = elicitation.deadline,
@@ -88,6 +100,7 @@ local function build_spec(elicitation, host)
     },
     page_list = pages,
     initial_page = initial_page,
+    initial_input_kind = host.clarification_draft and "ask" or nil,
     on_confirm = function(result)
       if not active_elicitation then return false end
       if result.page.id == "review" then

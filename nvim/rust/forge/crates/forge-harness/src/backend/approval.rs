@@ -131,6 +131,8 @@ pub struct PermissionCoordinator {
     store: Arc<RwLock<PermissionStore>>,
     timeout_by_session: Mutex<BTreeMap<String, (InputTimeout, InputTimeout)>>,
     feedback_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, String>>,
+    feedback_watch:
+        Mutex<HashMap<crate::backend::ExecutionOwner, tokio::sync::watch::Sender<bool>>>,
     skill_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, Arc<crate::skill::SkillAccess>>>,
     directory_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, Arc<DirectoryPolicy>>>,
 }
@@ -142,6 +144,7 @@ impl PermissionCoordinator {
             store,
             timeout_by_session: Mutex::new(BTreeMap::new()),
             feedback_by_owner: Mutex::new(HashMap::new()),
+            feedback_watch: Mutex::new(HashMap::new()),
             skill_by_owner: Mutex::new(HashMap::new()),
             directory_by_owner: Mutex::new(HashMap::new()),
         }
@@ -290,11 +293,57 @@ impl PermissionCoordinator {
         &self,
         owner: &crate::backend::ExecutionOwner,
     ) -> Result<Option<String>> {
-        Ok(self
+        let feedback = self
             .feedback_by_owner
             .lock()
             .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
-            .remove(owner))
+            .remove(owner);
+        self.publish_timeout_feedback(owner)?;
+        Ok(feedback)
+    }
+
+    /// Subscribe to one owner's retained feedback without losing changes during registration.
+    pub(crate) fn subscribe_timeout_feedback(
+        &self,
+        owner: &crate::backend::ExecutionOwner,
+    ) -> Result<tokio::sync::watch::Receiver<bool>> {
+        let feedback = self
+            .feedback_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?;
+        let mut watch = self
+            .feedback_watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback subscription lock poisoned"))?;
+        watch.retain(|_, sender| sender.receiver_count() > 0);
+        Ok(watch
+            .entry(owner.clone())
+            .or_insert_with(|| tokio::sync::watch::channel(feedback.contains_key(owner)).0)
+            .subscribe())
+    }
+
+    fn publish_timeout_feedback(&self, owner: &crate::backend::ExecutionOwner) -> Result<()> {
+        let feedback = self
+            .feedback_by_owner
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?;
+        let mut watch = self
+            .feedback_watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback subscription lock poisoned"))?;
+        watch.retain(|_, sender| sender.receiver_count() > 0);
+        if let Some(sender) = watch.get(owner) {
+            sender.send_if_modified(|pending| {
+                let next = feedback.contains_key(owner);
+                if *pending == next {
+                    false
+                } else {
+                    *pending = next;
+                    true
+                }
+            });
+        }
+        Ok(())
     }
 
     /// Check whether one owner needs a serialized continuation after denial.
@@ -618,6 +667,7 @@ impl PermissionCoordinator {
                     if let Some(owner) = &pending.view.execution_owner {
                         self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
                             .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. The user may be unavailable. Continue conservatively within existing permissions, avoid repeating the denied request, and request additional permissions only when essential.", pending.view.id));
+                        self.publish_timeout_feedback(owner)?;
                     }
                     Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
                     Ok(ApprovalResolution::TimedOut)
@@ -834,6 +884,21 @@ impl PermissionCoordinator {
             .lock()
             .map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
             .clear();
+        for sender in self
+            .feedback_watch
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval feedback subscription lock poisoned"))?
+            .values()
+        {
+            sender.send_if_modified(|pending| {
+                if *pending {
+                    *pending = false;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
         let pending_list = {
             let mut pending_map = self
                 .pending_map
@@ -2085,6 +2150,13 @@ mod test {
         ));
         let before = std::fs::read(directory.path().join("permissions.json")).unwrap();
         let coordinator = Arc::new(PermissionCoordinator::new(store));
+        let expired_owner = crate::backend::ExecutionOwner::root("expired");
+        let mut expired_feedback = coordinator
+            .subscribe_timeout_feedback(&expired_owner)
+            .unwrap();
+        let waiting_feedback = coordinator
+            .subscribe_timeout_feedback(&crate::backend::ExecutionOwner::root("waiting"))
+            .unwrap();
         coordinator
             .configure_timeout(
                 "expired",
@@ -2173,6 +2245,9 @@ mod test {
             .unwrap()
             .unwrap();
         assert_eq!(expired.data["resolution_source"], "timeout");
+        assert!(expired_feedback.has_changed().unwrap());
+        assert!(*expired_feedback.borrow_and_update());
+        assert!(!waiting_feedback.has_changed().unwrap());
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::TimedOut);
         assert_eq!(
             codex_response(
@@ -2205,6 +2280,19 @@ mod test {
         assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::Cancel);
         assert!(coordinator.pending_list().unwrap().is_empty());
         assert!(coordinator.resolve(&original.id, &[], None).await.is_err());
+        let late_feedback = coordinator
+            .subscribe_timeout_feedback(&expired_owner)
+            .unwrap();
+        assert!(*late_feedback.borrow());
+        assert!(
+            coordinator
+                .take_timeout_feedback(&expired_owner)
+                .unwrap()
+                .is_some()
+        );
+        assert!(expired_feedback.has_changed().unwrap());
+        assert!(!*expired_feedback.borrow_and_update());
+        assert!(!*late_feedback.borrow());
     }
 
     #[tokio::test]

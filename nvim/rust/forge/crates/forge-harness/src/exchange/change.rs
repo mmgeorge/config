@@ -59,13 +59,6 @@ pub struct ProviderDiffBuilder {
 }
 
 impl ProviderDiffBuilder {
-    /// Count logical files across successful writes, following move destinations.
-    pub fn file_count<'tool>(tools: impl Iterator<Item = &'tool ToolCall>) -> usize {
-        let mut builder = Self::default();
-        builder.record_tools(tools);
-        builder.projection.len()
-    }
-
     /// Build a unified operation diff from successful provider file-change tools.
     pub fn build(tool_list: &[ToolCall]) -> Option<String> {
         let mut builder = Self::default();

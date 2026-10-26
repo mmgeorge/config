@@ -104,7 +104,7 @@ failure boundary. Explicit shutdown remains a neutral lifecycle notice.
 
 
 `NodeMap` owns the shared expansion choices, node incarnations, and tool output sources for
-one open Harness presentation. Emitted nodes identify exchanges, messages, tool groups,
+one open Harness presentation. Emitted nodes identify exchanges, messages, thoughts, tool groups,
 tools, changes, files, and hunks. Each node separates its source lifecycle, automatic display,
 explicit expansion override, and loaded extent. `NodeState` travels inside block metadata,
 so the same atomic publication changes the text, node state, and visible source ranges.
@@ -1256,8 +1256,14 @@ denial response. Other adapters receive it at their next serialized continuation
 Child continuations retain their original execution owner and cancellation channel.
 
 Question sets retain one deadline across navigation, confirmed answers, and clarification.
-The session controller checks deadlines outside the provider request lane and resumes expired
-sets through the existing streamed dispatch and execution admission. It preserves confirmed
+The broker publishes input ownership and deadlines through a watched schedule after durable
+transitions. One session worker sleeps until the captured monotonic deadline or a schedule,
+approval-feedback, or cancellation change. Idle sessions perform no periodic timeout checks
+and acquire no execution permit. An expired deadline waits asynchronously for execution and
+cleanup admission, then revalidates its schedule revision before resuming through streamed
+dispatch. Replaced or cancelled waits release admission without resolving stale questions.
+Approval feedback wakes only its owning session and remains pending while a question or plan
+acceptance blocks continuation. The worker preserves confirmed
 answers, selects each unanswered question's first recommended option or first supplied option,
 and skips questions without options. Structured recommendation metadata and the existing
 `(Recommended)` label convention normalize to the same choice. Automatic answers retain their

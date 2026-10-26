@@ -499,6 +499,23 @@ pub(super) fn message_block(
     }
     super::layout::materialize(block)?;
     block.metadata.node = previous.metadata.node.clone();
+    block.metadata.content_node = previous.metadata.content_node.clone();
+    if previous
+        .metadata
+        .node
+        .as_ref()
+        .is_some_and(|node| node.kind == NodeKind::Thought)
+    {
+        block.metadata.fold = previous.metadata.fold.clone();
+        for fold in &mut block.metadata.fold {
+            if fold.end.block == previous.id {
+                fold.end.position = TextPosition {
+                    row: block.text.row_count(),
+                    column: 0,
+                };
+            }
+        }
+    }
     if message.delivery() == crate::turn::MessageDelivery::Final
         && previous
             .metadata
@@ -1545,87 +1562,134 @@ impl TimelineRenderer<'_> {
         for part in &content.part {
             match part {
                 crate::exchange::ThoughtPart::Boundary(nodes) => {
-                    self.content_nodes(
-                        interaction,
-                        agents,
-                        depth,
-                        &content,
-                        nodes,
-                        questions,
-                        response_role,
-                    )?;
+                    self.content_nodes(interaction, agents, depth, nodes, questions)?;
                 }
                 crate::exchange::ThoughtPart::Thought(index) => {
-                    let thought = &content.thought[*index];
-                    let message = thought.message.filter(|message| {
-                        message.delivery() != crate::turn::MessageDelivery::Final
-                    });
-                    let section = if let Some(message) = message {
-                        self.markdown(thought.id, message.text(), MarkdownRole::Commentary)?;
-                        thought.has_activity().then(|| self.begin_section(2))
-                    } else {
-                        if let Some(message) = thought.message {
-                            self.markdown(thought.id, message.text(), response_role)?;
-                        }
-                        None
-                    };
-                    self.content_nodes(
+                    self.thought(
                         interaction,
                         agents,
                         depth,
-                        &content,
-                        &thought.events,
+                        &content.thought[*index],
                         questions,
                         response_role,
                     )?;
-                    let mut nodes = thought
-                        .tools
-                        .call
-                        .iter()
-                        .map(|call| call.node)
-                        .collect::<Vec<_>>();
-                    nodes.extend(thought.writes.call.iter().map(|call| call.node));
-                    self.content_nodes(
-                        interaction,
-                        agents,
-                        depth,
-                        &content,
-                        &nodes,
-                        questions,
-                        response_role,
-                    )?;
-                    if let Some(section) = section {
-                        let tools = thought.tools.call.len();
-                        let files = thought.changed_files();
-                        let mut suffix = String::new();
-                        if tools > 0 {
-                            suffix.push_str(&format!(
-                                " · {tools} {}",
-                                if tools == 1 { "tool" } else { "tools" }
-                            ));
-                        }
-                        if files > 0 {
-                            suffix.push_str(&format!(
-                                " · {files} {} changed",
-                                if files == 1 { "file" } else { "files" }
-                            ));
-                        }
-                        let heading = &mut self.block[section.start];
-                        let mut rows = heading
-                            .text
-                            .wire_rows()
-                            .into_iter()
-                            .map(str::to_owned)
-                            .collect::<Vec<_>>();
-                        if let Some(first) = rows.first_mut() {
-                            first.push_str(&suffix);
-                        }
-                        heading.text = forge_buffer::text::BufferText::from_rows(rows)?;
-                        self.finish_section(section, thought.id, true);
-                    }
                 }
             }
         }
+        Ok(())
+    }
+
+    fn thought<'exchange>(
+        &mut self,
+        interaction: &'exchange Exchange,
+        agents: &HashMap<&str, &TimelineEntry>,
+        depth: usize,
+        thought: &crate::exchange::ExchangeThought<'exchange>,
+        questions: Option<&super::question::QuestionHistory<'exchange>>,
+        response_role: MarkdownRole,
+    ) -> Result<()> {
+        let section = if let Some(message) = thought.message {
+            if message.delivery() == crate::turn::MessageDelivery::Final {
+                self.markdown(thought.id, message.text(), response_role)?;
+                None
+            } else {
+                self.markdown(thought.id, message.text(), MarkdownRole::Commentary)?;
+                thought.has_activity().then(|| self.begin_section(2))
+            }
+        } else {
+            None
+        };
+        self.content_nodes(interaction, agents, depth, &thought.events, questions)?;
+        self.tool_group(&thought.tools)?;
+        if let Some(first) = thought.writes.call.first() {
+            let calls = thought
+                .writes
+                .call
+                .iter()
+                .map(|call| call.tool)
+                .collect::<Vec<_>>();
+            self.file_change_group(first.id, &calls)?;
+        }
+        if let Some(section) = section {
+            let start = section.start;
+            self.finish_section(section, thought.id, true);
+            self.block[start]
+                .metadata
+                .node
+                .as_mut()
+                .expect("thought node")
+                .kind = NodeKind::Thought;
+        }
+        Ok(())
+    }
+
+    fn tool_group(&mut self, group: &crate::exchange::ThoughtGroup<'_>) -> Result<()> {
+        let Some(first) = group.call.first() else {
+            return Ok(());
+        };
+        let start = self.block.len();
+        let settled = !group.live;
+        let lifecycle = if settled {
+            NodeLifecycle::Settled
+        } else {
+            NodeLifecycle::Live
+        };
+        let group_id = format!("{}:tools", first.id);
+        let label = tool_group_label(
+            group.call.iter().map(|call| call.tool),
+            lifecycle,
+            self.now_ms,
+        );
+        self.literal(&group_id, &label, None)?;
+        for (index, call) in group.call.iter().enumerate() {
+            let tool_start = self.block.len();
+            self.tool(
+                call.turn.id(),
+                call.tool,
+                &group_id,
+                !settled && index + 1 == group.call.len(),
+            )?;
+            let node_id = format!("{}:{}:tool", call.turn.id(), call.tool.id);
+            self.fold(
+                tool_start,
+                &node_id,
+                settled || index + 1 < group.call.len(),
+                NodeKind::Tool,
+            );
+            if let Some(node) = &mut self.block[tool_start].metadata.node {
+                node.lifecycle = if call.tool.state() == crate::turn::ToolState::Running {
+                    NodeLifecycle::Live
+                } else {
+                    NodeLifecycle::Settled
+                };
+                if !settled && index + 1 == group.call.len() {
+                    node.default_display = NodeDisplay::Preview;
+                }
+                if self.expansion.get(&node_id) == Some(&true) {
+                    let output = &self.tool[&format!("{}:{}", call.turn.id(), call.tool.id)];
+                    let limit = self
+                        .tool_limit
+                        .get(&node_id)
+                        .copied()
+                        .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+                    node.more = output.inline_prefix_chunks(limit)? < output.inline_chunks()?;
+                }
+                node.resolve(self.expansion.get(&node_id).copied());
+            }
+        }
+        self.fold(start, &group_id, settled, NodeKind::ToolGroup);
+        let node = self.block[start]
+            .metadata
+            .node
+            .as_mut()
+            .expect("tool group node");
+        node.lifecycle = lifecycle;
+        node.default_display = if settled {
+            NodeDisplay::Heading
+        } else {
+            NodeDisplay::Preview
+        };
+        node.resolve(self.expansion.get(&group_id).copied());
         Ok(())
     }
 
@@ -1634,10 +1698,8 @@ impl TimelineRenderer<'_> {
         interaction: &'exchange Exchange,
         agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
-        content: &crate::exchange::ThoughtContent<'exchange>,
         visible: &[&'exchange ExchangeNode],
         questions: Option<&super::question::QuestionHistory<'exchange>>,
-        response_role: MarkdownRole,
     ) -> Result<()> {
         for (position, node) in visible.iter().enumerate() {
             if let Some(group) = questions.and_then(|history| history.group.get(node.id())) {
@@ -1664,116 +1726,8 @@ impl TimelineRenderer<'_> {
                     )?;
                 }
                 ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
-                ExchangeNode::TurnContent { id, item, .. } => {
-                    match item {
-                        crate::turn::TurnItem::Message { .. } => {
-                            let message =
-                                content
-                                    .thought(id)
-                                    .and_then(|thought| thought.message)
-                                    .context("timeline content references a missing message")?;
-                            let final_message =
-                                message.delivery() == crate::turn::MessageDelivery::Final;
-                            if final_message {
-                                self.markdown(id, message.text(), response_role)?;
-                            } else {
-                                self.markdown(id, message.text(), MarkdownRole::Commentary)?;
-                            }
-                        }
-                        crate::turn::TurnItem::Tool { .. } => {
-                            let Some(group) = content.group(id) else {
-                                continue;
-                            };
-                            let file_change =
-                                matches!(group.kind, crate::exchange::ThoughtGroupKind::Writes);
-                            let calls = group
-                                .call
-                                .iter()
-                                .map(|call| (call.id, call.turn, call.tool))
-                                .collect::<Vec<_>>();
-                            if calls.is_empty() {
-                                continue;
-                            }
-                            if file_change {
-                                self.file_change_group(
-                                    id,
-                                    &calls.iter().map(|(_, _, tool)| *tool).collect::<Vec<_>>(),
-                                )?;
-                                continue;
-                            }
-                            let start = self.block.len();
-                            let count = calls.len();
-                            // Alternating tools and writes share an activity section across turns.
-                            // Only a section boundary or exchange completion closes its tool group.
-                            let settled = !group.live;
-                            let lifecycle = if settled {
-                                NodeLifecycle::Settled
-                            } else {
-                                NodeLifecycle::Live
-                            };
-                            let group_id = format!("{id}:tools");
-                            let label = tool_group_label(
-                                calls.iter().map(|(_, _, tool)| *tool),
-                                lifecycle,
-                                self.now_ms,
-                            );
-                            self.literal(&group_id, &label, None)?;
-                            for (index, (_, turn, tool)) in calls.into_iter().enumerate() {
-                                let tool_start = self.block.len();
-                                self.tool(
-                                    turn.id(),
-                                    tool,
-                                    &group_id,
-                                    !settled && index + 1 == count,
-                                )?;
-                                let node = format!("{}:{}:tool", turn.id(), tool.id);
-                                self.fold(
-                                    tool_start,
-                                    &node,
-                                    settled || index + 1 < count,
-                                    NodeKind::Tool,
-                                );
-                                if let Some(node) = &mut self.block[tool_start].metadata.node {
-                                    node.lifecycle =
-                                        if tool.state() == crate::turn::ToolState::Running {
-                                            NodeLifecycle::Live
-                                        } else {
-                                            NodeLifecycle::Settled
-                                        };
-                                    if !settled && index + 1 == count {
-                                        node.default_display = NodeDisplay::Preview;
-                                    }
-                                    if self.expansion.get(&node.id.0) == Some(&true) {
-                                        let output =
-                                            &self.tool[&format!("{}:{}", turn.id(), tool.id)];
-                                        let limit = self
-                                            .tool_limit
-                                            .get(&node.id.0)
-                                            .copied()
-                                            .unwrap_or(super::tool::INITIAL_INLINE_BYTES);
-                                        node.more = output.inline_prefix_chunks(limit)?
-                                            < output.inline_chunks()?;
-                                    }
-                                    node.resolve(self.expansion.get(&node.id.0).copied());
-                                }
-                            }
-                            self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
-                            {
-                                let node = self.block[start]
-                                    .metadata
-                                    .node
-                                    .as_mut()
-                                    .expect("tool group node");
-                                node.lifecycle = lifecycle;
-                                node.default_display = if settled {
-                                    NodeDisplay::Heading
-                                } else {
-                                    NodeDisplay::Preview
-                                };
-                                node.resolve(self.expansion.get(&group_id).copied());
-                            }
-                        }
-                    }
+                ExchangeNode::TurnContent { .. } => {
+                    anyhow::bail!("provider content must be rendered through its thought owner");
                 }
                 ExchangeNode::PlanEvent { event } => {
                     self.plan_event(event)?;
@@ -2896,7 +2850,11 @@ impl TimelineRenderer<'_> {
         }
         rendered.block.metadata.node = Some(NodeState::new(
             FoldId(id.into()),
-            NodeKind::Message,
+            if matches!(role, MarkdownRole::Commentary) {
+                NodeKind::Thought
+            } else {
+                NodeKind::Message
+            },
             NodeDisplay::Full,
         ));
         if matches!(role, MarkdownRole::Response) {
@@ -6701,7 +6659,7 @@ mod tests {
                 block
                     .text
                     .row(0)
-                    .is_some_and(|text| text.starts_with("  Inspecting ownership · 1 file changed"))
+                    .is_some_and(|text| text == "  Inspecting ownership")
             })
             .unwrap();
         assert_eq!(
@@ -7584,6 +7542,126 @@ mod tests {
                         .contains(activity.completed_label())
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn thought_activity_preserves_text_ownership_and_streamed_fold() -> anyhow::Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"thought-layout", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Run exact Rust tests", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 0)?;
+        let text = "I’ll run the two Rust regression tests individually.\nThe next line retains its own source position.";
+        let mut event = BackendEvent {
+            received_at_ms: None,
+            address: Some(address),
+            turn_boundary: None,
+            kind: "assistant_message".into(),
+            text: Some(text.into()),
+            data: json!({"provider_message_id":"initial", "phase":"commentary"}),
+            summary: None,
+            task_update: None,
+            activity: None,
+        };
+        exchange.observe_turn(&event, 1)?;
+        let thought_id = exchange.node_list.last().unwrap().id().to_owned();
+        for index in 0..3 {
+            event.kind = "tool".into();
+            event.text = None;
+            event.data = serde_json::Value::Null;
+            event.activity = Some(ToolActivity {
+                id: format!("exact-{index}"),
+                kind: ToolActivityKind::Command,
+                title: format!("checks_run exact test {index}"),
+                output: Some("retained test output".into()),
+                output_delta: false,
+                status: Some(if index == 2 { "running" } else { "completed" }.into()),
+                change: Default::default(),
+            });
+            exchange.observe_turn(&event, index + 2)?;
+        }
+        for columns in [40, 124, 180] {
+            let width = WidthProfile {
+                columns,
+                ..Default::default()
+            };
+            let projected = project_at(
+                &TimelineEntry::Exchange {
+                    id: exchange.id.clone(),
+                    created_at_ms: 0,
+                    exchange: exchange.clone(),
+                    agent_by_id: HashMap::new(),
+                },
+                &width,
+                10,
+            )?;
+            let heading = projected
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == thought_id)
+                .unwrap();
+            assert_eq!(
+                heading
+                    .text
+                    .wire_rows()
+                    .iter()
+                    .map(|row| row.trim_start())
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                text,
+                "activity counts must not be appended to commentary source"
+            );
+            let group =
+                projected
+                    .entry
+                    .block
+                    .iter()
+                    .find(|block| {
+                        block.metadata.node.as_ref().is_some_and(|node| {
+                            node.kind == forge_buffer::node::NodeKind::ToolGroup
+                        })
+                    })
+                    .unwrap();
+            assert_eq!(
+                group
+                    .metadata
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .parent
+                    .as_ref()
+                    .unwrap()
+                    .0,
+                thought_id
+            );
+            assert!(
+                group.metadata.layout.as_ref().unwrap().indent
+                    > heading.metadata.layout.as_ref().unwrap().indent
+            );
+            let message = exchange.turn[0]
+                .messages()
+                .iter()
+                .find(|message| message.kind() == crate::turn::MessageKind::Assistant)
+                .unwrap();
+            let streamed = super::message_block(heading, message, &width)?;
+            let replacement = &streamed.entry.block[0];
+            assert_eq!(
+                replacement.metadata.fold, heading.metadata.fold,
+                "a streamed thought update must retain its activity fold endpoints"
+            );
+            assert_eq!(replacement.metadata.node, heading.metadata.node);
         }
         Ok(())
     }

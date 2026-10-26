@@ -17,6 +17,6 @@ pub use node::{
     PlanCommentResolution, QuestionInput,
 };
 pub use task::{TaskItem, TaskSnapshot, TaskTracker};
-pub(crate) use thought::{ThoughtContent, ThoughtGroupKind, ThoughtPart};
+pub(crate) use thought::{ExchangeThought, ThoughtGroup, ThoughtPart};
 
 pub use crate::turn::ToolCall;

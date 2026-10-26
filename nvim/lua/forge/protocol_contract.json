@@ -1,9 +1,10 @@
 {
-  "version": 22,
+  "version": 23,
   "node": {
     "kind": [
       "exchange",
       "message",
+      "thought",
       "tool_group",
       "tool",
       "changes",

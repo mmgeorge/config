@@ -2,6 +2,7 @@ use super::*;
 
 /// Shares durable queries and published transient state without acquiring the execution owner.
 pub(crate) struct BrokerObserver {
+    pub(crate) input_schedule: tokio::sync::watch::Sender<crate::session::InputSchedule>,
     pub(super) lsp: Arc<crate::control_tools::lsp::LspService>,
     pub(crate) status_thoughts: AtomicBool,
     pub(crate) check_editing: Arc<AtomicBool>,

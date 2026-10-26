@@ -10,7 +10,9 @@ pub enum NodeKind {
     Exchange,
     /// Prompt or assistant text, optionally retaining a folded preview.
     Message,
-    /// Consecutive tool calls in one provider turn.
+    /// Assistant commentary and its owned activity across provider turns.
+    Thought,
+    /// Ordinary tool calls owned by one thought.
     ToolGroup,
     /// One tool heading and its output source.
     Tool,

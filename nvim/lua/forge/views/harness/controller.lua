@@ -409,13 +409,15 @@ local function schedule_render()
 end
 
 ---@param busy boolean
+---@return table? owner
 local function set_busy(busy)
   local state = harness_state()
   state.busy = busy
+  state.execution_request_owner = busy and {} or nil
   if busy then
     state.execution_notice = nil
     state.execution_notice_operation = nil
-    if state.working_started_ns then return end
+    if state.working_started_ns then return state.execution_request_owner end
     state.working_started_ns = vim.uv.hrtime()
     state.working_timer = vim.uv.new_timer()
     state.working_timer:start(1000, 1000, function()
@@ -436,6 +438,7 @@ local function set_busy(busy)
     end
   end
   schedule_render()
+  return state.execution_request_owner
 end
 
 ---@param state table
@@ -865,6 +868,13 @@ function M.present_plan_question(force)
   local elicitation = state.active_elicitation and state.active_elicitation.elicitation
   if state.busy or state.plan_question_open or not elicitation then return end
   local owner = state.active_elicitation.owner
+  local owner_id = state.active_elicitation.exchange_id or state.active_elicitation.plan_id
+  local draft = state.question_draft
+  if draft and (draft.owner_id ~= owner_id or draft.question_set_id ~= elicitation.question_set.id
+    or not vim.iter(elicitation.question_set.questions or {}):any(function(item) return item.id == draft.question_id end)) then
+    state.question_draft = nil
+    draft = nil
+  end
   if not force and not question_presentation.should_present(state) then return end
   question_presentation.mark_presented(state)
   state.plan_question_open = true
@@ -875,6 +885,7 @@ function M.present_plan_question(force)
     window_list = host.window_list,
     control_win = host.control_win,
     allow_ask = owner ~= "plan_acceptance",
+    clarification_draft = draft,
     answer = function(params, callback)
       client.request("question.answer", params, function(result, request_error)
         if request_error then
@@ -900,12 +911,16 @@ function M.present_plan_question(force)
     ask = function(params)
       state.plan_question_open = false
       prompt_history.record(params.text)
-      set_busy(true)
+      local request_owner = set_busy(true)
       client.request("question.ask", params, function(_, request_error, error_detail)
-        if finish_execution(request_error, error_detail) then return end
+        if finish_execution(request_error, error_detail, request_owner) then return end
+        state.question_draft = request_error and error_detail and error_detail.code == "not_admitted"
+          and { owner_id = owner_id, question_set_id = elicitation.question_set.id, question_id = params.question_id, text = params.text } or nil
         question_presentation.reset(state)
         if request_error then
-          notifications.error(request_error, "Planning clarification")
+          if not error_detail or error_detail.code ~= "not_admitted" then
+            notifications.error(request_error, "Planning clarification")
+          end
           synchronize_state()
           return
         end
@@ -914,11 +929,13 @@ function M.present_plan_question(force)
     end,
     continue = function()
       state.plan_question_open = false
-      set_busy(true)
+      local request_owner = set_busy(true)
       client.request("question.continue", {}, function(_, request_error, error_detail)
-        if finish_execution(request_error, error_detail) then return end
+        if finish_execution(request_error, error_detail, request_owner) then return end
         if request_error then
-          notifications.error(request_error, "Planning continuation")
+          if not error_detail or error_detail.code ~= "not_admitted" then
+            notifications.error(request_error, "Planning continuation")
+          end
           synchronize_state()
           return
         end
@@ -961,9 +978,11 @@ end
 
 ---@param request_error string?
 ---@param error_detail {code: string}?
+---@param request_owner table?
 ---@return boolean
-finish_execution = function(request_error, error_detail)
+finish_execution = function(request_error, error_detail, request_owner)
   local state = harness_state()
+  if request_owner and state.execution_request_owner ~= request_owner then return true end
   if state.host_error then set_busy(false) return true end
   if state.task_operation then return true end
   if request_error and error_detail and error_detail.code == "turn_cancelled" then
@@ -1001,7 +1020,7 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
   recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
-  set_busy(true)
+  local request_owner = set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
   if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
     state.goal = { objective = goal_objective, state = "active" }
@@ -1020,7 +1039,7 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
       resume_check_interrupted_prompt(state, interrupted)
       return
     end
-    if finish_execution(request_error, error_detail) then return end
+    if finish_execution(request_error, error_detail, request_owner) then return end
     state.cancel_requested = false
     if request_error then
       if error_detail and error_detail.code == "turn_retracted" then
@@ -1159,10 +1178,10 @@ function M.drain()
   end
   if not text and state.checks_deferred then
     local session_id, epoch = state.session.id, state.runtime_epoch
-    set_busy(true)
+    local request_owner = set_busy(true)
     client.request_for(session_id, "checks.complete", {}, function(_, failure, detail)
       if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
-      if finish_execution(failure, detail) then return end
+      if finish_execution(failure, detail, request_owner) then return end
       if failure then notifications.error(failure, "Harness checks") end
       synchronize_state(M.drain)
     end)

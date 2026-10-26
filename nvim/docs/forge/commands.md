@@ -144,8 +144,8 @@ the caret or message body to show or hide the complete text.
 When a group changes to `Ran`, it folds automatically. Expanding that completed group
 shows every call in the group, with individual output available on expansion.
 
-Thoughts with activity start collapsed and show live tool and changed-file counts in their
-heading. Expanding a thought shows its events first, then its tool summary, then its file changes,
+Thoughts with activity start collapsed and preserve the assistant's text in their heading.
+Expanding a thought shows its events first, then its tool summary, then its file changes,
 one indentation level deeper. Thoughts without activity keep the `○` marker. Your explicit
 expansion choice survives incoming activity. Tools and file writes accumulate into two entries,
 even when they alternate. Each tool updates the tool group, and each completed write updates `Changed N files`.
@@ -282,6 +282,12 @@ check shell and timing, access scope and extra directories, and both timeouts.
 Check-editing permission is also available under **Checks → Setup** without
 sending a prompt. Unsupported controls explain their restriction, and provider
 setup and Windows sandbox options appear only where applicable.
+
+Input timeouts run independently of the picker. An idle session has no periodic
+timeout check. Changing a timeout affects future questions and approvals without
+extending an existing deadline. If another execution prevents a clarification
+from being submitted, Harness shows **Not submitted**, keeps the question open,
+and restores the clarification text for retry.
 
 `/checks` opens project checks, and `/checks setup` configures their commands and
 selection policies through a guided conversation. `/checks setup on` and

@@ -428,7 +428,7 @@ fn preview_rows(
     output: &ToolOutputPreview<'_>,
 ) -> Result<(Vec<String>, usize)> {
     let mut content_profile = profile.clone();
-    let margin = 4.min(content_profile.columns - 1);
+    let margin = 3.min(content_profile.columns - 1);
     content_profile.columns -= margin;
     let mut row = Vec::new();
     let mut hidden_rows = output.hidden_rows;
@@ -457,20 +457,11 @@ fn preview_rows(
     if row.is_empty() {
         row.push("no output".into());
     }
-    Ok((
-        row.into_iter()
-            .enumerate()
-            .map(|(index, text)| {
-                let prefix = if index == 0 && margin == 4 {
-                    "  └ ".into()
-                } else {
-                    " ".repeat(margin)
-                };
-                format!("{prefix}{text}")
-            })
-            .collect(),
-        hidden_rows,
-    ))
+    let mut formatted = Vec::new();
+    for (index, text) in row.into_iter().enumerate() {
+        formatted.extend(tool_body_rows(profile, &text, index == 0)?);
+    }
+    Ok((formatted, hidden_rows))
 }
 
 fn tool_output_rows(
@@ -505,15 +496,15 @@ fn tool_output_rows(
 /// Wraps body content before adding its marker so long tokens cannot strand the marker.
 fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Vec<String>> {
     let mut content_profile = profile.clone();
-    let margin = 4.min(content_profile.columns - 1);
+    let margin = 3.min(content_profile.columns - 1);
     content_profile.columns -= margin;
     Ok(content_profile
         .wrap_plain(text, 0)?
         .into_iter()
         .enumerate()
         .map(|(index, text)| {
-            let prefix = if branch && index == 0 && margin == 4 {
-                "  └ ".into()
+            let prefix = if branch && index == 0 && margin == 3 {
+                "└  ".into()
             } else {
                 " ".repeat(margin)
             };
@@ -878,7 +869,7 @@ mod test {
         assert!(rows[0].starts_with("•    2s sem.sem_context({"));
         assert!(rows[0].contains('…'));
         assert!(rows.len() > 2);
-        assert_eq!(*rows.last().unwrap(), "  └ response");
+        assert_eq!(*rows.last().unwrap(), "└  response");
         let call = rows[1..rows.len() - 1]
             .iter()
             .map(|row| row.trim().trim_start_matches('└').trim())
@@ -919,7 +910,7 @@ mod test {
                     expanded,
                 )?;
                 let rows = block.text.wire_rows();
-                assert!(rows[1].starts_with("  └ "));
+                assert!(rows[1].starts_with("└  "));
                 let truncated = rows
                     .last()
                     .is_some_and(|row| row.contains("…(1 earlier line)"));
@@ -929,9 +920,9 @@ mod test {
                     .enumerate()
                     .map(|(index, row)| {
                         if index == 0 {
-                            row.strip_prefix("  └ ").unwrap()
+                            row.strip_prefix("└  ").unwrap()
                         } else {
-                            row.strip_prefix("    ").unwrap()
+                            row.strip_prefix("   ").unwrap()
                         }
                     })
                     .collect::<String>();
@@ -1275,11 +1266,11 @@ mod test {
             block.text.wire_rows(),
             vec![
                 "•    2s cargo test --lib parser",
-                "  └ first",
-                "    second",
-                "    third",
-                "    fourth",
-                "    …(96 earlier lines)"
+                "└  first",
+                "   second",
+                "   third",
+                "   fourth",
+                "   …(96 earlier lines)"
             ]
         );
         assert_eq!(
@@ -1321,7 +1312,7 @@ mod test {
 
         assert_eq!(
             block.text.wire_rows(),
-            vec!["•    2s cargo check", "  └ no output"]
+            vec!["•    2s cargo check", "└  no output"]
         );
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessOutput" && decoration.range.start.row == 1
@@ -1352,11 +1343,11 @@ mod test {
             block.text.wire_rows(),
             vec![
                 "•    2s docs_lookup(crate, Item)",
-                "  └ two",
-                "    three",
-                "    four",
-                "    five",
-                "    …(1 earlier line)"
+                "└  two",
+                "   three",
+                "   four",
+                "   five",
+                "   …(1 earlier line)"
             ]
         );
         assert!(
@@ -1411,7 +1402,7 @@ mod test {
             6,
             "preview must contain a heading, four output rows, and a hidden-count row"
         );
-        assert_eq!(rows[5], "    …(1 earlier line)");
+        assert_eq!(rows[5], "   …(1 earlier line)");
         assert!(rows.iter().any(|row| row.contains("second")));
         assert!(rows.iter().any(|row| row.contains("third")));
         let expanded = render(true)?;
@@ -1421,8 +1412,8 @@ mod test {
             .iter()
             .skip(1)
             .map(|row| {
-                row.strip_prefix("  └ ")
-                    .or_else(|| row.strip_prefix("    "))
+                row.strip_prefix("└  ")
+                    .or_else(|| row.strip_prefix("   "))
                     .unwrap()
             })
             .collect::<String>();

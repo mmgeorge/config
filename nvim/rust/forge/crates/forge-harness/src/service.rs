@@ -429,7 +429,9 @@ impl HarnessService {
             let controller = registry.resolve(session_id).await?;
             let _control = Arc::clone(&controller.control_admission)
                 .try_acquire_owned()
-                .context("Harness cleanup is still running")?;
+                .map_err(|_| {
+                    crate::broker::RequestNotAdmitted("Harness cleanup is still running")
+                })?;
             let interrupted_checks = if method == HarnessMethod::PromptSubmit {
                 if let Some(run_id) = controller.checks.active()? {
                     controller.interrupt_checks(session_id, &run_id).await?;
@@ -450,7 +452,11 @@ impl HarnessService {
             } else {
                 Arc::clone(&controller.execution_admission)
                     .try_acquire_owned()
-                    .context("a Harness execution request is already running")?
+                    .map_err(|_| {
+                        crate::broker::RequestNotAdmitted(
+                            "a Harness execution request is already running",
+                        )
+                    })?
             };
             controller
                 .cancellation
@@ -1053,7 +1059,7 @@ impl SessionController {
     }
 
     async fn attach_compaction(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
-        self.attach_timeout(message_sink).await;
+        self.attach_timeout(message_sink).await?;
         self.attach_agents(message_sink).await?;
         let mut task = self.compaction_task.lock().await;
         if task.is_some() {
@@ -1093,28 +1099,86 @@ impl SessionController {
         Ok(())
     }
 
-    async fn attach_timeout(self: &Arc<Self>, message_sink: &MessageSender) {
+    async fn attach_timeout(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
         let mut task = self.timeout_task.lock().await;
         if task.is_some() {
-            return;
+            return Ok(());
         }
+        let mut schedule = self.observer.input_schedule.subscribe();
+        let owner = crate::backend::ExecutionOwner::root(
+            self.catalog_request.read().await.harness_session_id.clone(),
+        );
+        let mut feedback = self.permission.subscribe_timeout_feedback(&owner)?;
+        let mut cancellation = self.cancellation.subscribe();
         let controller = Arc::downgrade(self);
         let message_sink = message_sink.clone();
         *task = Some(tokio::spawn(async move {
-            let mut active_deadline = None;
-            let mut interval = tokio::time::interval(Duration::from_millis(250));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut attempted = None;
             loop {
-                interval.tick().await;
+                let mut current = schedule.borrow_and_update().clone();
+                let pending_feedback = *feedback.borrow_and_update();
+                let cancelled = *cancellation.borrow_and_update();
+                let identity = (current.revision, pending_feedback);
+                let ready = async {
+                    if cancelled || attempted == Some(identity) {
+                        return std::future::pending::<()>().await;
+                    }
+                    if current.approval_allowed && pending_feedback {
+                        return;
+                    }
+                    if let Some(deadline) = &mut current.deadline {
+                        tokio::time::sleep_until(deadline.instant(0)).await;
+                    } else {
+                        std::future::pending::<()>().await;
+                    }
+                };
+                tokio::select! {
+                    biased;
+                    changed = schedule.changed() => { if changed.is_err() { return; } continue; }
+                    changed = feedback.changed() => { if changed.is_err() { return; } attempted = None; continue; }
+                    changed = cancellation.changed() => { if changed.is_err() { return; } attempted = None; continue; }
+                    () = ready => {}
+                }
                 let Some(controller) = controller.upgrade() else {
                     return;
                 };
-                let Ok(_admission) = controller.execution_admission.try_acquire() else {
-                    continue;
+                let admission = async {
+                    loop {
+                        let execution = Arc::clone(&controller.execution_admission)
+                            .acquire_owned()
+                            .await?;
+                        if let Ok(_control) = controller.control_admission.try_acquire() {
+                            return Ok::<_, anyhow::Error>(execution);
+                        }
+                        drop(execution);
+                        drop(controller.control_admission.acquire().await?);
+                    }
                 };
-                let Ok(mut broker) = controller.broker.try_lock() else {
-                    continue;
+                let _admission = tokio::select! {
+                    biased;
+                    _ = schedule.changed() => continue,
+                    _ = feedback.changed() => { attempted = None; continue; },
+                    _ = cancellation.changed() => { attempted = None; continue; }
+                    result = admission => match result { Ok(permit) => permit, Err(_) => return },
                 };
+                let mut broker = tokio::select! {
+                    biased;
+                    _ = schedule.changed() => continue,
+                    _ = feedback.changed() => { attempted = None; continue; },
+                    _ = cancellation.changed() => { attempted = None; continue; }
+                    broker = controller.broker.lock() => broker,
+                };
+                attempted = Some(identity);
+                let mut active_deadline = current.deadline.clone().map(|deadline| {
+                    (
+                        format!(
+                            "{}:{}",
+                            current.identity.as_deref().unwrap_or_default(),
+                            deadline.expires_at_ms
+                        ),
+                        deadline,
+                    )
+                });
                 let session_id = controller
                     .catalog_request
                     .read()
@@ -1122,6 +1186,10 @@ impl SessionController {
                     .harness_session_id
                     .clone();
                 let result = async {
+                    broker.refresh_input_schedule()?;
+                    if schedule.borrow().revision != current.revision || *cancellation.borrow() {
+                        return Ok(());
+                    }
                     if let Some(request) = broker.expire_input(&mut active_deadline)? {
                         if request.method == "question.continue" {
                             message_sink
@@ -1169,6 +1237,8 @@ impl SessionController {
                     Ok::<(), anyhow::Error>(())
                 }
                 .await;
+                let publication = broker.refresh_input_schedule();
+                let result = result.and(publication);
                 drop(broker);
                 match result {
                     Ok(()) => {}
@@ -1180,6 +1250,7 @@ impl SessionController {
                 }
             }
         }));
+        Ok(())
     }
 
     async fn attach_agents(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
@@ -3333,8 +3404,8 @@ async fn acquire_request_broker(
         match Arc::clone(&controller.execution_admission).try_acquire_owned() {
             Ok(admission) => Some(admission),
             Err(_) if matches!(method, HarnessMethod::GoalPause | HarnessMethod::GoalClear) => None,
-            Err(error) => return Err(error).context(
-                "This operation requires a settled session. Use a task transition while execution is active"),
+            Err(_) => return Err(crate::broker::RequestNotAdmitted(
+                "This operation requires a settled session. Use a task transition while execution is active").into()),
         }
     };
     if admitted || admission.is_some() {
@@ -6178,6 +6249,141 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn input_timeout_waits_without_admission_and_releases_stale_waits() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        controller.attach_timeout(&sink).await?;
+        let broker = controller.broker.lock().await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+
+        let schedule = crate::session::InputSchedule {
+            revision: 1,
+            identity: Some("exchange:question".into()),
+            question_revision: Some(1),
+            deadline: crate::session::InputTimeout {
+                amount: 1,
+                unit: crate::session::TimeoutUnit::S,
+            }
+            .deadline(0)?,
+            approval_allowed: false,
+        };
+        controller
+            .observer
+            .input_schedule
+            .send_replace(schedule.clone());
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(controller.execution_admission.available_permits(), 0);
+        controller
+            .observer
+            .input_schedule
+            .send_replace(crate::session::InputSchedule {
+                revision: 2,
+                ..Default::default()
+            });
+        tokio::task::yield_now().await;
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+
+        let execution = controller.execution_admission.acquire().await?;
+        controller
+            .observer
+            .input_schedule
+            .send_replace(crate::session::InputSchedule {
+                revision: 3,
+                ..schedule
+            });
+        tokio::task::yield_now().await;
+        controller.cancellation.request(false);
+        tokio::task::yield_now().await;
+        drop(execution);
+        tokio::task::yield_now().await;
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn input_timeout_resumes_restored_questions_once_without_a_view() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let mut store = SqliteStore::open(&controller.data_root)?;
+        let mut exchange = crate::exchange::Exchange::agent_admission(
+            &registry.initial_session_id,
+            1,
+            "Await an answer".into(),
+            0,
+        );
+        exchange.awaiting_input = true;
+        exchange.pause(0);
+        let mut elicitation = crate::plan::PlanElicitation::new(
+            crate::plan::PlanQuestionSet::freeform("Which option?".into()).normalize()?,
+        );
+        elicitation.deadline = Some(serde_json::from_value(json!({"expires_at_ms":-1}))?);
+        exchange.elicitation = Some(elicitation);
+        store.save_exchange(&exchange)?;
+        controller.broker.lock().await.refresh_input_schedule()?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        controller.attach_timeout(&sink).await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let frame = output
+                    .recv()
+                    .await?
+                    .context("timeout worker output closed")?;
+                let message: Value = serde_json::from_slice(frame.bytes())?;
+                ensure!(
+                    message["event"] != "backend_event" || message["payload"]["kind"] != "error",
+                    "{message}"
+                );
+                if message["event"] == "question_answered"
+                    && message["payload"]["resolution_source"] == "timeout"
+                {
+                    break;
+                }
+            }
+            loop {
+                tokio::task::yield_now().await;
+                if controller.execution_admission.available_permits() == 1 {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        let resolved = store.list_exchange(&registry.initial_session_id)?;
+        assert!(resolved.iter().all(|exchange| !exchange.awaiting_input));
+        let count = resolved.len();
+        controller.broker.lock().await.refresh_input_schedule()?;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            store.list_exchange(&registry.initial_session_id)?.len(),
+            count
+        );
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+        service.shutdown(Duration::from_secs(1)).await?;
+        Ok(())
+    }
+
     #[tokio::test]
     async fn execution_admission_excludes_overlapping_work_and_pending_cleanup() {
         let fixture = tempfile::tempdir().unwrap();
@@ -6199,7 +6405,8 @@ mod tests {
             service
                 .prepare(None, HarnessMethod::GoalResume)
                 .await
-                .is_err()
+                .unwrap_err()
+                .is::<crate::broker::RequestNotAdmitted>()
         );
         assert!(
             service
@@ -6228,7 +6435,8 @@ mod tests {
             service
                 .prepare(None, HarnessMethod::ExchangeResume)
                 .await
-                .is_err()
+                .unwrap_err()
+                .is::<crate::broker::RequestNotAdmitted>()
         );
         drop(cleanup);
         let resumed = service

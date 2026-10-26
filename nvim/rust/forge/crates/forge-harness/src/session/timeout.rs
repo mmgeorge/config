@@ -1,6 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+use tokio::time::Instant;
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +93,11 @@ pub struct InputDeadline {
 }
 
 impl InputDeadline {
+    /// Return the captured monotonic deadline after restoring durable timing once.
+    pub(crate) fn instant(&mut self, now_ms: i64) -> Instant {
+        self.restore(now_ms);
+        self.instant.expect("validated input deadline")
+    }
     /// Restore monotonic timing once after loading durable state.
     pub fn restore(&mut self, now_ms: i64) {
         if self.instant.is_none() {
@@ -117,9 +123,69 @@ impl PartialEq for InputDeadline {
 }
 impl Eq for InputDeadline {}
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// Publishes the current input owner independently of execution admission.
+pub(crate) struct InputSchedule {
+    /// Changes whenever input ownership, timing, or continuation eligibility changes.
+    pub revision: u64,
+    /// Identifies the owning plan or exchange and its question set.
+    pub identity: Option<String>,
+    /// Invalidates pending expiry work when answers or question content change.
+    pub question_revision: Option<u32>,
+    /// Retains one monotonic timer for the current durable deadline.
+    pub deadline: Option<InputDeadline>,
+    /// Allows approval feedback to continue only outside question and acceptance waits.
+    pub approval_allowed: bool,
+}
+
+impl InputSchedule {
+    /// Adopt durable input state without extending an unchanged live deadline.
+    pub fn update(&mut self, mut next: Self, now_ms: i64) -> bool {
+        next.revision = self.revision;
+        if *self == next {
+            return false;
+        }
+        if self.identity == next.identity && self.deadline == next.deadline {
+            next.deadline = self.deadline.clone();
+        } else if let Some(deadline) = &mut next.deadline {
+            deadline.restore(now_ms);
+        }
+        next.revision += 1;
+        *self = next;
+        true
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn input_schedule_keeps_monotonic_deadlines_and_invalidates_replaced_owners() {
+        let mut schedule = InputSchedule::default();
+        let durable = || InputSchedule {
+            identity: Some("exchange:first:question".into()),
+            deadline: Some(
+                serde_json::from_value(serde_json::json!({"expires_at_ms": 11_000})).unwrap(),
+            ),
+            ..Default::default()
+        };
+        assert!(schedule.update(durable(), 10_000));
+        let revision = schedule.revision;
+        tokio::time::advance(Duration::from_millis(999)).await;
+        assert!(!schedule.update(durable(), 0));
+        assert_eq!(schedule.revision, revision);
+        let mut revised = durable();
+        revised.question_revision = Some(2);
+        assert!(schedule.update(revised, 0));
+        assert!(!schedule.deadline.as_ref().unwrap().expired(i64::MAX));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        assert!(schedule.deadline.as_ref().unwrap().expired(0));
+        assert!(schedule.update(InputSchedule::default(), 11_000));
+        assert!(schedule.update(durable(), 11_000));
+        assert!(schedule.revision > revision);
+        assert!(schedule.deadline.as_ref().unwrap().expired(0));
+    }
 
     #[test]
     fn input_timeout_recovery_and_clock_changes_do_not_extend_live_deadlines() {

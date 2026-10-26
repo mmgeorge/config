@@ -393,9 +393,14 @@ impl ConnectionHost {
             let method = match self.router.prepare(&mut envelope).await {
                 Ok(method) => method,
                 Err(error) => {
+                    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
+                        "not_admitted"
+                    } else {
+                        "request_failed"
+                    };
                     sink.send(Message::Response(Response::failure(
                         envelope.request.id,
-                        "request_failed",
+                        code,
                         format!("{error:#}"),
                     )))?;
                     continue;
@@ -410,9 +415,14 @@ impl ConnectionHost {
                 let _permit = permit;
                 let request_id = envelope.request.id;
                 if let Err(error) = router.route(envelope, method, &sink).await {
+                    let code = if error.is::<forge_harness::broker::RequestNotAdmitted>() {
+                        "not_admitted"
+                    } else {
+                        "request_failed"
+                    };
                     sink.send(Message::Response(Response::failure(
                         request_id,
-                        "request_failed",
+                        code,
                         format!("{error:#}"),
                     )))?;
                 }

@@ -102,6 +102,15 @@ local ok, failure = pcall(function()
   assert_equals(ask_params.text, "Why does storage matter?", "Ask should submit clarification text")
   assert_true(not view.is_open(), "Ask should close while clarification runs")
 
+  host.clarification_draft = { question_id = "storage", text = "Why does storage matter?" }
+  view.open(elicitation, host)
+  active = view._state_for_test()
+  assert_equals(active.input_kind, "ask", "rejected clarification should reopen its editor")
+  assert_equals(table.concat(vim.api.nvim_buf_get_lines(active.input_buf, 0, -1, false), "\n"),
+    "Why does storage matter?", "rejected clarification text should survive")
+  view.close()
+  host.clarification_draft = nil
+
   view.open(elicitation, host)
   active = view._state_for_test()
   invoke("n")

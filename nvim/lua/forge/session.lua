@@ -99,6 +99,8 @@ M.empty_diff_rows = {}
 ---@field pending_steer table[]
 ---@field prompt_submission? ForgePromptSubmission
 ---@field prompt_sequence? integer
+---@field execution_request_owner? table Opaque owner of the current execution callback.
+---@field question_draft? {owner_id?:string, question_set_id:string, question_id:string, text:string} Rejected clarification retained for retry.
 ---@field transcript_buf integer?
 ---@field transcript_win integer?
 ---@field composer_buf integer?
