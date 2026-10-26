@@ -1,0 +1,536 @@
+use super::*;
+use crate::checks::{CheckCategory, CheckResult, CheckRun, CheckState, CommandCheck};
+
+struct CheckLeaf<'run> {
+    check: &'run CommandCheck,
+    result: Option<&'run CheckResult>,
+    call_id: String,
+    group: String,
+    scope: String,
+    name: Option<String>,
+}
+
+/// Selects known file or target identities without assigning package-wide results to guessed files.
+fn check_scope(check: &CommandCheck) -> (String, Option<String>) {
+    use crate::checks::CheckSelection;
+    let Some(context) = &check.context else {
+        return (check.command.clone(), None);
+    };
+    let invocation = context.invocation.as_ref();
+    let cases = invocation
+        .map(|invocation| invocation.cases.as_slice())
+        .unwrap_or_default();
+    let name = (!cases.is_empty()).then(|| {
+        cases
+            .iter()
+            .map(|case| case.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    });
+    if let CheckSelection::Cases { cases } = &context.selection
+        && let Some(case) = cases.first()
+        && cases.iter().all(|candidate| candidate.file == case.file)
+    {
+        return (
+            case.file.replace('\\', "/"),
+            name.or_else(|| Some(case.name.clone())),
+        );
+    }
+    if let Some(package) = invocation.and_then(|invocation| invocation.package.as_ref()) {
+        return (
+            package
+                .name
+                .clone()
+                .unwrap_or_else(|| package.directory.clone()),
+            name,
+        );
+    }
+    if let Some(invocation) = invocation
+        && invocation.files.len() == 1
+    {
+        return (invocation.files[0].replace('\\', "/"), name);
+    }
+    if let CheckSelection::Files { files } = &context.selection
+        && files.len() == 1
+    {
+        return (files[0].replace('\\', "/"), name);
+    }
+    if let CheckSelection::Packages { packages } = &context.selection
+        && packages.len() == 1
+    {
+        return (packages[0].clone(), name);
+    }
+    (context.name.clone(), name)
+}
+
+/// Keeps independent execution identities even when the same check and source repeat.
+fn check_leaves(run: &CheckRun, category: CheckCategory) -> Vec<CheckLeaf<'_>> {
+    let mut result = Vec::new();
+    for check in &run.commands {
+        if check
+            .context
+            .as_ref()
+            .map_or(CheckCategory::Check, |context| context.category)
+            != category
+            || matches!(check.state, CheckState::Pending | CheckState::Skipped)
+        {
+            continue;
+        }
+        if let Some(report) = &check.report
+            && !report.result.is_empty()
+        {
+            for (index, fixture) in report.result.iter().enumerate() {
+                result.push(CheckLeaf {
+                    check,
+                    result: Some(fixture),
+                    call_id: format!("{}:result:{index}", check.id),
+                    group: format!("{}:checks", run.id),
+                    scope: fixture.file.clone(),
+                    name: None,
+                });
+            }
+            if !matches!(check.state, CheckState::Passed | CheckState::Failed)
+                || check.state == CheckState::Failed
+                    && report
+                        .result
+                        .iter()
+                        .all(|result| result.state != CheckState::Failed)
+            {
+                let (scope, _) = check_scope(check);
+                result.push(CheckLeaf {
+                    check,
+                    result: None,
+                    call_id: check.id.clone(),
+                    group: format!("{}:checks", run.id),
+                    scope,
+                    name: Some("Runner result".into()),
+                });
+            }
+        } else {
+            let (scope, name) = check_scope(check);
+            result.push(CheckLeaf {
+                check,
+                result: None,
+                call_id: check.id.clone(),
+                group: format!("{}:checks", run.id),
+                scope,
+                name,
+            });
+        }
+    }
+    result
+}
+
+fn category_key(category: CheckCategory) -> &'static str {
+    match category {
+        CheckCategory::Format => "format",
+        CheckCategory::Lint => "lint",
+        CheckCategory::Check => "check",
+        CheckCategory::Test => "test",
+        CheckCategory::Build => "build",
+    }
+}
+
+fn category_label(category: CheckCategory) -> &'static str {
+    match category {
+        CheckCategory::Format => "Formatting",
+        CheckCategory::Lint => "Lint",
+        CheckCategory::Check => "Validation",
+        CheckCategory::Test => "Tests",
+        CheckCategory::Build => "Builds",
+    }
+}
+
+impl TimelineRenderer<'_> {
+    pub(super) fn checks(
+        &mut self,
+        run: &crate::checks::CheckRun,
+        separate: bool,
+        summary: Option<&str>,
+    ) -> Result<()> {
+        ensure!(
+            run.state != crate::checks::CheckState::Running,
+            "active checks belong to session status"
+        );
+        if separate && self.leading_separator {
+            self.literal(&format!("{}:separator", run.id), "", None)?;
+        }
+        let heading = if let Some(summary) = summary {
+            summary.to_owned()
+        } else if run.context.is_some() {
+            if run.lifecycle.iter().any(|event| {
+                matches!(
+                    event.kind,
+                    crate::checks::CheckEventKind::ConfigurationSaved
+                )
+            }) {
+                run.lifecycle
+                    .last()
+                    .map(|event| event.text.clone())
+                    .unwrap_or_else(|| "Check configuration saved".into())
+            } else {
+                format!(
+                    "Checks {} · {} · {:.1}s",
+                    if run.state == crate::checks::CheckState::Interrupted {
+                        "interrupted"
+                    } else {
+                        "finished"
+                    },
+                    run.summary(),
+                    run.duration_ms() as f64 / 1000.0
+                )
+            }
+        } else {
+            format!(
+                "Checks finished · {} · {:.1}s",
+                run.summary(),
+                run.duration_ms() as f64 / 1000.0
+            )
+        };
+        self.literal(&format!("{}:checks", run.id), &heading, None)?;
+        let checks = self.begin_section(2);
+        if summary.is_none()
+            && run
+                .context
+                .as_ref()
+                .is_none_or(|context| context.trigger == "Plan execution")
+        {
+            self.literal(
+                &format!("{}:declarations", run.id),
+                &format!(
+                    "Declarations · {}",
+                    if run.progress.conforms() {
+                        "match"
+                    } else {
+                        "differ"
+                    }
+                ),
+                None,
+            )?;
+            let declarations = self.begin_section(2);
+            for (index, finding) in run.progress.findings().iter().enumerate() {
+                self.literal(&format!("{}:finding:{index}", run.id), finding, None)?;
+            }
+            for (index, change) in run.progress.declaration_changes.iter().enumerate() {
+                self.diff(
+                    &format!("{}:declaration:{index}", run.id),
+                    &change.name,
+                    &change.diff,
+                    "",
+                    Some((&change.path, &change.name)),
+                    None,
+                )?;
+            }
+            self.finish_section(declarations, &format!("{}:declarations", run.id), true);
+        }
+        for category in [
+            CheckCategory::Format,
+            CheckCategory::Lint,
+            CheckCategory::Check,
+            CheckCategory::Test,
+            CheckCategory::Build,
+        ] {
+            let leaves = check_leaves(run, category);
+            if leaves.is_empty() {
+                continue;
+            }
+            let category_id = format!("{}:category:{}", run.id, category_key(category));
+            self.literal(&category_id, category_label(category), None)?;
+            let section = self.begin_section(2);
+            let mut scopes = BTreeMap::<String, Vec<CheckLeaf<'_>>>::new();
+            for leaf in leaves {
+                scopes.entry(leaf.scope.clone()).or_default().push(leaf);
+            }
+            for (scope, leaves) in scopes {
+                let scope_id = format!("{category_id}:{}", crate::plan::digest(scope.as_bytes()));
+                if leaves.len() == 1 && leaves[0].name.is_none() {
+                    self.check_leaf(&leaves[0], &scope)?;
+                    continue;
+                }
+                self.literal(&scope_id, &scope, None)?;
+                let scope_section = self.begin_section(2);
+                let mut names = BTreeMap::<String, Vec<&CheckLeaf<'_>>>::new();
+                for leaf in &leaves {
+                    names
+                        .entry(leaf.name.clone().unwrap_or_default())
+                        .or_default()
+                        .push(leaf);
+                }
+                for (name, attempts) in names {
+                    if attempts.len() == 1 {
+                        let label = if name.is_empty() {
+                            attempts[0]
+                                .check
+                                .context
+                                .as_ref()
+                                .map_or("Check", |context| context.name.as_str())
+                        } else {
+                            &name
+                        };
+                        self.check_leaf(attempts[0], label)?;
+                    } else {
+                        let named_section = if name.is_empty() {
+                            None
+                        } else {
+                            let id = format!("{scope_id}:{}", crate::plan::digest(name.as_bytes()));
+                            self.literal(&id, &name, None)?;
+                            Some((self.begin_section(2), id))
+                        };
+                        for (index, leaf) in attempts.iter().enumerate() {
+                            let label = format!(
+                                "Run {} · {}",
+                                index + 1,
+                                leaf.check
+                                    .context
+                                    .as_ref()
+                                    .map_or("Check", |context| context.name.as_str())
+                            );
+                            self.check_leaf(leaf, &label)?;
+                        }
+                        if let Some((section, id)) = named_section {
+                            self.finish_section(section, &id, false);
+                        }
+                    }
+                }
+                self.finish_section(scope_section, &scope_id, false);
+            }
+            self.finish_section(section, &category_id, false);
+        }
+        self.finish_section(checks, &format!("{}:checks", run.id), true);
+        if let Some(title) = &run.completed_plan {
+            self.literal(
+                &format!("{}:complete", run.id),
+                &format!("◇ Plan complete: {title}"),
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Renders one execution with compact status and lazily expanded diagnostics.
+    fn check_leaf(&mut self, leaf: &CheckLeaf<'_>, label: &str) -> Result<()> {
+        let check = leaf.check;
+        let call_id = &leaf.call_id;
+        let state = leaf.result.map_or(check.state, |result| result.state);
+        let elapsed = leaf.result.map_or_else(
+            || check.elapsed_ms(self.now_ms),
+            |result| result.duration_ms,
+        );
+        let failed = matches!(
+            state,
+            CheckState::Failed
+                | CheckState::Blocked
+                | CheckState::ConfigurationError
+                | CheckState::ExecutionError
+        );
+        let title = format!(
+            "{} · {state:?}{}",
+            label.replace(['\r', '\n'], " "),
+            if check
+                .report
+                .as_ref()
+                .is_some_and(|report| report.error.is_some())
+            {
+                " · result report unavailable"
+            } else {
+                ""
+            }
+        );
+        let heading = crate::turn::ToolCall {
+            id: call_id.clone(),
+            kind: "check".into(),
+            title: title.clone(),
+            started_at_ms: elapsed.map(|_| 0),
+            completed_at_ms: elapsed.map(|value| value.min(i64::MAX as u64) as i64),
+            task_id: None,
+            output: String::new(),
+            status: String::new(),
+            failed,
+            change: Default::default(),
+        };
+        let mut output = if let Some(result) = leaf.result {
+            let details = format!("Command: {}\n{}", result.command, result.output);
+            let raw =
+                ToolOutputView::file(check.id.clone(), check.output.clone(), check.output_bytes)?;
+            self.tool.insert(check.id.clone(), raw);
+            ToolOutputView::new(call_id.clone(), &details)?
+        } else {
+            ToolOutputView::file(call_id.clone(), check.output.clone(), check.output_bytes)?
+        };
+        output.heading(&heading);
+        output.group = leaf.group.clone();
+        let expanded = self.expansion.get(&format!("{call_id}:tool")).copied() == Some(true);
+        let limit = self
+            .tool_limit
+            .get(&format!("{call_id}:tool"))
+            .copied()
+            .unwrap_or(super::super::tool::INITIAL_INLINE_BYTES);
+        if expanded {
+            output.load_prefix(limit)?;
+        }
+        let width = self.content_width();
+        let renderer = TranscriptRenderer::new(&width)?;
+        let start = self.block.len();
+        self.push(renderer.tool_header(
+            BlockId(format!("{call_id}:tool")),
+            TargetId(format!("{call_id}:tool")),
+            "check",
+            elapsed,
+            failed,
+            &title,
+            expanded,
+        )?)?;
+        self.action.insert(
+            TargetId(format!("{call_id}:tool")),
+            TranscriptAction::Tool {
+                call_id: check.id.clone(),
+            },
+        );
+        if expanded {
+            for chunk in 0..output.inline_prefix_chunks(limit)? {
+                self.push(renderer.tool_body(call_id, &output, true, chunk)?)?;
+            }
+            self.push(renderer.tool_hidden(call_id, &output, true)?)?;
+        } else {
+            for suffix in ["preview", "hidden"] {
+                self.push(BufferBlock {
+                    id: BlockId(format!("{call_id}:{suffix}")),
+                    text: Default::default(),
+                    metadata: Default::default(),
+                })?;
+            }
+        }
+        if let Some(error) = &check.error {
+            self.literal(&format!("{call_id}:error"), error, None)?;
+        }
+        if let Some(error) = check
+            .report
+            .as_ref()
+            .and_then(|report| report.error.as_ref())
+        {
+            self.literal(
+                &format!("{call_id}:report-error"),
+                &format!("Result details unavailable: {error}"),
+                None,
+            )?;
+        }
+        self.fold(start, &format!("{call_id}:tool"), true, NodeKind::Tool);
+        if let Some(node) = &mut self.block[start].metadata.node {
+            node.more = expanded && output.has_unloaded_output();
+        }
+        self.tool.insert(call_id.clone(), output);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn concrete_file_scopes_do_not_override_package_ownership_or_hide_runner_failures() -> Result<()>
+    {
+        let mut source = json!({
+            "id":"command", "command":"runner", "state":"failed", "started_at_ms":1,
+            "completed_at_ms":2,"exit_code":1,"error":null,"stdout":"unused","stderr":"unused",
+            "output":"unused","output_bytes":0,"preview":"",
+            "report":{"result":[{"file":"tests/pass.lua","state":"passed","duration_ms":1,
+                "command":"nvim","output":""}],"error":null},
+            "context":{"definition_id":"test","name":"Runner","area":".","reason":"selected",
+                "matched_files":["src/one.rs","src/two.rs"],"category":"test","directory":".",
+                "selection":{"kind":"files","files":["src/one.rs","src/two.rs"]},
+                "resolved":null,"depends_on":[],"receipt":"unused",
+                "invocation":{"inputs":{},"program":"runner","args":[],"directory":".",
+                    "package":null,"files":["src/one.rs"],"cases":[],"discovery":null}}
+        });
+        let command: CommandCheck = serde_json::from_value(source.clone())?;
+        assert_eq!(check_scope(&command).0, "src/one.rs");
+        source["context"]["invocation"]["package"] =
+            json!({"name":"core","directory":"core","manifest":"core/Cargo.toml"});
+        let command: CommandCheck = serde_json::from_value(source)?;
+        assert_eq!(check_scope(&command).0, "core");
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":1,"completed_at_ms":2,"state":"failed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[command]
+        }))?;
+        let leaves = check_leaves(&run, CheckCategory::Test);
+        assert_eq!(leaves.len(), 2);
+        assert!(leaves[0].result.is_some() && leaves[1].result.is_none());
+        assert_eq!(leaves[1].name.as_deref(), Some("Runner result"));
+        Ok(())
+    }
+
+    #[test]
+    fn categories_preserve_file_groups_repeated_runs_and_original_outcomes() -> Result<()> {
+        let mut commands = Vec::new();
+        for (index, category, file, state) in [
+            (0, "format", "src/main.rs", "passed"),
+            (1, "format", "src/main.rs", "failed"),
+            (2, "test", "tests/ui.lua", "passed"),
+            (3, "lint", "src/main.rs", "passed"),
+            (4, "build", "game", "passed"),
+        ] {
+            commands.push(json!({
+                "id":format!("run:{index}"), "command":"echo checked", "state":state,
+                "started_at_ms":1,"completed_at_ms":11,"exit_code":if state == "failed" {1} else {0},
+                "error":null,"stdout":"unused","stderr":"unused","output":"unused","output_bytes":0,"preview":"",
+                "context":{"definition_id":category,"name":format!("{category} check"),"area":".","reason":"selected",
+                    "matched_files":[file],"category":category,"directory":".","selection":{"kind":"files","files":[file]},
+                    "resolved":null,"depends_on":[],"receipt":"unused"}
+            }));
+        }
+        let run: CheckRun = serde_json::from_value(json!({
+            "id":"run","owner":{"kind":"session","session_id":"session"},"revision":0,
+            "shell":"system","executable":null,"workspace":".","environment_digest":"test",
+            "started_at_ms":1,"completed_at_ms":11,"state":"failed",
+            "progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":commands
+        }))?;
+        let projected = project(
+            &TimelineEntry::Checks {
+                id: "run".into(),
+                created_at_ms: 1,
+                run,
+            },
+            &WidthProfile::default(),
+            false,
+            &HashMap::new(),
+            &HashMap::new(),
+        )?;
+        let blocks = &projected.entry.block;
+        let text = blocks
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("4 passed · 1 failed"));
+        for category in ["Formatting", "Lint", "Tests", "Builds"] {
+            assert!(text.contains(category));
+        }
+        assert!(text.contains("Run 1") && text.contains("Run 2"));
+        assert!(text.contains("Failed"));
+        for category in ["format", "lint", "test", "build"] {
+            let block = blocks
+                .iter()
+                .find(|block| block.id.0 == format!("run:category:{category}"))
+                .unwrap();
+            assert_eq!(
+                block
+                    .metadata
+                    .node
+                    .as_ref()
+                    .unwrap()
+                    .parent
+                    .as_ref()
+                    .unwrap()
+                    .0,
+                "run:checks"
+            );
+        }
+        Ok(())
+    }
+}

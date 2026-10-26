@@ -262,12 +262,17 @@ impl CheckSupervisor {
             if value["version"] != CHECK_HISTORY_VERSION {
                 continue;
             }
-            let run: CheckRun = crate::codec::from_value(value["run"].clone())
+            let mut run: CheckRun = crate::codec::from_value(value["run"].clone())
                 .with_context(|| format!("decode current check history {}", path.display()))?;
             ensure!(
                 directory.file_name().to_string_lossy() == run.id,
                 "check history identity differs from its directory"
             );
+            for command in &mut run.commands {
+                if command.report.is_none() {
+                    command.report = super::report::collect(command);
+                }
+            }
             records.push(run);
         }
         records.sort_by_key(|run| run.started_at_ms);
@@ -553,6 +558,7 @@ impl CheckSupervisor {
                 output: directory.join(format!("{position}.output")),
                 output_bytes: 0,
                 preview: String::new(),
+                report: None,
             });
         }
         run.record(
@@ -989,6 +995,7 @@ impl CheckSupervisor {
                 command.output = previous.output;
                 command.output_bytes = previous.output_bytes;
                 command.preview = previous.preview;
+                command.report = previous.report;
                 command.context.as_mut().unwrap().resolved =
                     previous.context.and_then(|context| context.resolved);
                 run.record(
@@ -1385,6 +1392,9 @@ impl CheckSupervisor {
             })().map_err(|error| super::failure::CheckFailure::classified(CheckState::ConfigurationError, error))?;
             run.commands[index].context.as_mut().unwrap().resolved = Some(receipt.selection);
         }
+        let command = run.commands[index].clone();
+        run.commands[index].report = tokio::task::spawn_blocking(move || super::report::collect(&command))
+            .await.context("collect check result report")?;
         Ok(())
         }.await;
         if result.is_err() {

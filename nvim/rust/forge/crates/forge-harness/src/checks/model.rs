@@ -55,6 +55,9 @@ pub struct CommandCheck {
     pub output: PathBuf,
     pub output_bytes: u64,
     pub preview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Validated file-level outcomes from a structured runner, separate from this command's status.
+    pub report: Option<super::CheckReport>,
 }
 
 impl CommandCheck {

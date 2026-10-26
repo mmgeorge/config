@@ -2724,11 +2724,16 @@ mod tests {
                     .as_ref()
                     .unwrap()
                     .0,
-                "gate:checks"
+                if identity == "gate:0:tool" {
+                    "gate:category:check"
+                } else {
+                    "gate:checks"
+                }
             );
             assert_eq!(
                 child.metadata.layout.as_ref().unwrap().indent,
-                checks.metadata.layout.as_ref().unwrap().indent + 2
+                checks.metadata.layout.as_ref().unwrap().indent
+                    + if identity == "gate:0:tool" { 4 } else { 2 }
             );
         }
         {

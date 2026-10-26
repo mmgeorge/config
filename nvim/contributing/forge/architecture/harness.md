@@ -63,6 +63,22 @@ Expanded check groups contain attempted commands and failures, including failure
 before process startup. Skipped and pending selections remain in check records
 without creating transcript rows or output nodes.
 
+Completed results retain one Checks root. Its children group executions by
+Formatting, Lint, Validation, Tests, and Builds, then by a known source file or
+package/application target. Exact test names nest below their known source or
+target. Repeated executions retain independent command identities and chronological
+Run rows, including earlier failures. The root totals count check commands, not
+assertions or files reported within one command.
+
+The check supervisor validates the Lua runner's existing JSON-line fixture report
+after collecting the process and preserves file outcomes, durations, commands, and
+diagnostics separately from the complete raw logs. It derives missing reports from
+retained current-format logs when reading saved history. Malformed or incomplete
+reports remain visible as report diagnostics and fall back to the command result.
+The transcript consumes these structured outcomes without parsing logs during
+rendering. Expanding a file execution shows its captured diagnostics. Opening its
+output action retains access to the original command log.
+
 Timeline ownership has no event-count or history-length limit. Recursive agent
 rendering grows stack segments instead of rejecting a fixed nesting depth, and
 persisted JSON uses the shared stack-growing codec. Output paging controls the

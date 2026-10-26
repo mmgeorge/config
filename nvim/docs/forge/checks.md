@@ -50,6 +50,14 @@ while that interruption finishes.
 Completed runs retain the full details. Result summaries omit not-run counts while
 preserving passed, failed, interrupted, stale, and other error counts.
 
+The transcript groups completed results under **Checks**, then by category and
+source file or package/application target. Repeated executions appear as separate
+Run rows in their original order. Named Rust tests retain their test names. Lua
+runner results describe whole test files, not individual assertions. The Checks
+summary counts command executions even when one command reports several files.
+Expand an execution to inspect its diagnostics. Its output action opens the full
+command log. Invalid file reports keep the command result and show the report error.
+
 `trigger.auto` controls automatic selection and defaults to `false`. Every configured
 check remains available for explicit runs and explicit plan selection. Prerequisites
 run when required by a selected check, including checks with automatic selection off.
