@@ -512,11 +512,7 @@ fn planning_task_reports_provider_start_failure_without_stopping_host() {
 fn streams_plan_document_changes_before_the_jsonl_response() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
-    std::fs::write(
-        repository.path().join(".forge.json"),
-        br#"{"checks":{"version":2,"definitions":[]}}"#,
-    )
-    .unwrap();
+    std::fs::write(repository.path().join(".forge.json"), br#"{"checks":{}}"#).unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),
@@ -1039,11 +1035,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
 fn retracts_an_output_free_planning_turn_and_restores_control_state() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
-    std::fs::write(
-        repository.path().join(".forge.json"),
-        br#"{"checks":{"version":2,"definitions":[]}}"#,
-    )
-    .unwrap();
+    std::fs::write(repository.path().join(".forge.json"), br#"{"checks":{}}"#).unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),
@@ -1299,11 +1291,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
 fn persists_acknowledged_steering_on_the_active_interaction() {
     let _serial_guard = serial_test();
     let repository = tempfile::tempdir().unwrap();
-    std::fs::write(
-        repository.path().join(".forge.json"),
-        br#"{"checks":{"version":2,"definitions":[]}}"#,
-    )
-    .unwrap();
+    std::fs::write(repository.path().join(".forge.json"), br#"{"checks":{}}"#).unwrap();
     git(repository.path(), &["init", "-q"]);
     git(
         repository.path(),

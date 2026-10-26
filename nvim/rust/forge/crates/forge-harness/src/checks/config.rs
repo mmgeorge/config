@@ -44,6 +44,8 @@ pub enum CheckScope {
 #[serde(deny_unknown_fields)]
 /// Supplies shell source or a direct executable with resolved argument bindings.
 pub struct CheckOperation {
+    #[serde(default)]
+    pub input: bool,
     /// Shell source when args is absent, otherwise an executable name or path.
     pub command: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -104,7 +106,10 @@ fn automatic_default() -> bool {
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
+#[serde(
+    try_from = "BTreeMap<String, super::spec::Check>",
+    into = "BTreeMap<String, super::spec::Check>"
+)]
 /// Owns explicit project configuration, including an intentionally empty definition list.
 pub struct CheckConfig {
     pub version: u32,
@@ -140,7 +145,6 @@ impl CheckConfig {
             definition.trigger.validate()?;
             ensure!(
                 !definition.id.is_empty()
-                    && definition.id.len() <= 128
                     && definition
                         .id
                         .bytes()
@@ -392,7 +396,7 @@ pub(crate) fn reject_links(workspace: &Path, destination: &Path) -> Result<()> {
 pub(crate) fn configure_fixture(workspace: &Path) {
     let mut document = read_document(workspace).unwrap();
     if document.get("checks").is_none() {
-        document["checks"] = serde_json::json!({"version":2,"definitions":[]});
+        document["checks"] = serde_json::json!({});
         std::fs::write(
             workspace.join(".forge.json"),
             serde_json::to_vec(&document).unwrap(),

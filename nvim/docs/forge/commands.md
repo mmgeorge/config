@@ -133,8 +133,8 @@ Switching resumes the task under the configured directory limits and permission 
 Staying in Read mode rejects that request.
 
 Long prompts and responses fold to a three-line preview. Prompts fold when sent, and the
-latest prior response stays open during the next exchange. Submitting another prompt folds
-the second-to-last response. Thinking and tool sections keep their usual folding behavior.
+two latest prior responses stay open during the current exchange. Submitting another prompt folds
+the third-to-last response. Thinking and tool sections keep their usual folding behavior.
 Use the normal expansion command on
 the caret or message body to show or hide the complete text.
 
@@ -178,9 +178,11 @@ active execution before changing history and leaves the task paused. An unfinish
 restore requires recovery first.
 
 The status area stays present between responses and shows **Idle** when no work is running.
+It keeps **Working** visible while handing off to the next queued message.
 Idle uses the same static icon as a question wait. At the live transcript tail, the status area
 aligns with the bottom of the pane. Check activity, queued messages, and other current details
 add rows below the phase label only while present. Scrolling through history remains available.
+Queued follow-up inputs have a blank line above their heading, including when no steering inputs are present.
 Live tool output occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
@@ -217,7 +219,8 @@ queues as ordinary text. Extension detection also accepts spaces in a path on th
 first line and attachments on later lines. Supported commands still take priority,
 so `/plan inspect screenshot.png` starts planning rather than sending an ordinary prompt.
 
-`M-s` edits the newest queued prompt in place. Repeating it moves backward through
+`M-s` edits the newest queued prompt in place and leaves the composer in Normal mode.
+Repeating it moves backward through
 the queue, and `M-t` moves forward while editing. Navigation preserves message order
 and saved drafts. Earlier messages may execute, but the
 message being edited and all later messages wait. `Ctrl-S` saves the edit in its

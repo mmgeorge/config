@@ -2289,10 +2289,7 @@ mod test {
         let workspace = fixture.path().to_string_lossy().into_owned();
         std::fs::write(
             fixture.path().join(".forge.json"),
-            json!({"checks":{"version":2,"definitions":[{
-                "id":"manual", "name":"Manual", "area":"Tests", "category":"test", "enabled":true,
-                "auto":false, "trigger":{"kind":"manual"}, "all":{"command":"print selected"}
-            }]}})
+            json!({"checks":{"manual":{"trigger":{"auto":false},"action":{"command":"print selected","label":"Manual","category":"test"}}}})
             .to_string(),
         )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;

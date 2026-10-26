@@ -32,31 +32,27 @@ local function preview()
   assert(vim.wait(25000, function() return vim.g.forge_check_preview_continue end, 10), "preview timed out")
 end
 local succeeded, failure = xpcall(function()
-  local definitions = {
-    { id = "slow", name = "Streaming check", category = "test", area = "Fixture", enabled = true,
-      trigger = { kind = "manual" }, all = { command = "print 'Check output is streaming'; sleep 30sec" } },
-    { id = "failure", name = "One failing check", category = "test", area = "Fixture", enabled = true,
-      trigger = { kind = "manual" }, all = { command = "exit 7" } },
+  local checks = {
+    slow = { trigger = {}, action = { label = "Streaming check", category = "test", command = "print 'Check output is streaming'; sleep 30sec" } },
+    failure = { trigger = {}, action = { label = "One failing check", category = "test", command = "exit 7" } },
   }
   for index = 1, 31 do
-    definitions[#definitions + 1] = { id = "quick-" .. index, name = "Quick check " .. index,
-      category = "test", area = "Fixture", enabled = true,
-      trigger = { kind = "manual" }, all = { command = "print done" } }
+    checks["quick-" .. index] = { trigger = {}, action = { label = "Quick check " .. index, category = "test", command = "print done" } }
   end
-  vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = definitions } }) }, workspace .. "/.forge.json")
+  vim.fn.writefile({ vim.json.encode({ checks = checks }) }, workspace .. "/.forge.json")
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
     harness = { backend = "mock", backends = { mock = { command = { "mock" }, selectable = true } } } })
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), "startup timed out")
   request("session.configure", { shell = "nushell" })
-  local id = request("checks.run", { ids = { "slow", "quick-1", "quick-2", "quick-3" } }).run_id
+  local id = request("checks.run", { check = { "slow", "quick-1", "quick-2", "quick-3" } }).run_id
   assert(vim.wait(5000, function()
     return state.checks_running and state.active_check_run == id
       and rows():find("Check output is streaming", 1, true)
   end, 10), "running check did not reach the visible transcript")
-  assert(rows():find("Checking", 1, true) and rows():find("User requested", 1, true), rows())
-  assert(rows():find("0/4 finished", 1, true) and not rows():find("/33 finished", 1, true), rows())
+  assert(rows():find("Checking", 1, true) and not rows():find("User requested", 1, true), rows())
+  assert(rows():find("3/4 finished", 1, true) and not rows():find("/33 finished", 1, true), rows())
   preview()
   request("checks.cancel", { run_id = id })
   assert(vim.wait(3000, function()
@@ -66,7 +62,7 @@ local succeeded, failure = xpcall(function()
   assert(cancelled.state == "interrupted" and type(cancelled.completed_at_ms) == "number", vim.inspect(cancelled))
   assert(rows():find("Checks interrupted", 1, true), rows())
   preview()
-  local failed = request("checks.run", { ids = { "failure" } }).run_id
+  local failed = request("checks.run", { check = { "failure" } }).run_id
   assert(request("checks.status", { run_id = failed, wait_for_completion = true, wait_ms = 3000 }).state == "failed")
   request("state.get")
   assert(vim.wait(3000, function() return rows():find("1 failed", 1, true) ~= nil end, 10), rows())

@@ -114,6 +114,67 @@ pub(super) struct InvocationResolver {
 }
 
 impl InvocationResolver {
+    /// Resolves full path actions against existing files matching the saved trigger.
+    pub(super) async fn resolve_check(
+        &mut self,
+        workspace: &Path,
+        directory: &str,
+        operation: &CheckOperation,
+        selection: &CheckSelection,
+        trigger: &super::CheckTrigger,
+    ) -> Result<Vec<CheckInvocation>> {
+        let paths = operation.args.as_ref().is_some_and(|arguments| {
+            arguments
+                .iter()
+                .any(|argument| argument.contains("{file.path}"))
+        });
+        if !matches!(selection, CheckSelection::All) || !paths {
+            return self
+                .resolve(workspace, directory, operation, selection)
+                .await;
+        }
+        let mut pending = vec![workspace.to_path_buf()];
+        let mut files = Vec::new();
+        while let Some(directory) = pending.pop() {
+            let mut entries = tokio::fs::read_dir(&directory).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_symlink() {
+                    continue;
+                }
+                if file_type.is_dir() {
+                    if !matches!(
+                        entry.file_name().to_str(),
+                        Some(".git" | "target" | "node_modules" | ".forge")
+                    ) {
+                        pending.push(entry.path());
+                    }
+                } else if file_type.is_file() {
+                    let path = entry
+                        .path()
+                        .strip_prefix(workspace)?
+                        .to_str()
+                        .context("check path is not UTF-8")?
+                        .replace('\\', "/");
+                    if trigger.matches_path(&path) {
+                        files.push(path);
+                    }
+                }
+            }
+        }
+        files.sort();
+        ensure!(
+            !files.is_empty(),
+            "full path selection contains no matching files"
+        );
+        self.resolve(
+            workspace,
+            directory,
+            operation,
+            &CheckSelection::Files { files },
+        )
+        .await
+    }
     /// Expands input changes to concrete commands and merges identical invocations.
     pub(super) async fn resolve(
         &mut self,
@@ -218,6 +279,112 @@ impl InvocationResolver {
         }
         let mut result = Vec::new();
         match selection {
+            CheckSelection::Packages { packages } => {
+                let catalog =
+                    catalog.context("package selection requires action.package_manager")?;
+                for name in packages {
+                    let matches: Vec<_> = catalog
+                        .packages
+                        .iter()
+                        .filter(|package| package.identity.name.as_deref() == Some(name))
+                        .collect();
+                    ensure!(
+                        matches.len() == 1,
+                        "package {name} is unknown or ambiguous in {directory}"
+                    );
+                    ensure!(
+                        needs_package,
+                        "package selection requires {{package}} in the configured action"
+                    );
+                    result.push(expand(
+                        workspace,
+                        directory,
+                        operation,
+                        Some(matches[0]),
+                        None,
+                        None,
+                    )?);
+                }
+            }
+            CheckSelection::Tests { tests } => {
+                ensure!(
+                    operation.package_manager == Some(PackageManager::Cargo),
+                    "named test selection currently requires the Cargo package manager"
+                );
+                let catalog = catalog.context("test selection requires action.package_manager")?;
+                for name in tests {
+                    let mut matches = Vec::new();
+                    for package in &catalog.packages {
+                        for target in &package.targets {
+                            if !target.test || !target.harness {
+                                continue;
+                            }
+                            let kind = if target
+                                .kind
+                                .iter()
+                                .any(|kind| matches!(kind.as_str(), "lib" | "proc-macro"))
+                            {
+                                "lib"
+                            } else if target.kind.iter().any(|kind| kind == "bin") {
+                                "bin"
+                            } else if target.kind.iter().any(|kind| kind == "test") {
+                                "test"
+                            } else {
+                                continue;
+                            };
+                            if args.iter().any(|argument| argument == "--lib") && kind != "lib" {
+                                continue;
+                            }
+                            if args.windows(2).any(|pair| {
+                                (pair[0] == "--bin" && (kind != "bin" || pair[1] != target.name))
+                                    || (pair[0] == "--test"
+                                        && (kind != "test" || pair[1] != target.name))
+                            }) {
+                                continue;
+                            }
+                            let case = CheckCase {
+                                file: target.src_path.clone(),
+                                name: name.clone(),
+                                target: Some(if kind == "lib" {
+                                    kind.into()
+                                } else {
+                                    format!("{kind}:{}", target.name)
+                                }),
+                            };
+                            let invocation = expand(
+                                workspace,
+                                directory,
+                                operation,
+                                Some(package),
+                                Some(&case.file),
+                                Some(&case),
+                            )?;
+                            let output = capture(
+                                &invocation.program,
+                                invocation.discovery.as_ref().unwrap(),
+                                &workspace.join(directory),
+                                None,
+                                None,
+                                300,
+                            )
+                            .await?;
+                            let output = String::from_utf8(output)
+                                .context("Cargo test inventory is not UTF-8")?;
+                            if output
+                                .lines()
+                                .any(|line| line.strip_suffix(": test") == Some(name.as_str()))
+                            {
+                                matches.push(invocation);
+                            }
+                        }
+                    }
+                    ensure!(
+                        matches.len() == 1,
+                        "test {name} is unknown or ambiguous in {directory}"
+                    );
+                    result.extend(matches);
+                }
+            }
             CheckSelection::All if needs_file || needs_case => {
                 bail!("file or case bindings require an explicit scoped operation")
             }
@@ -310,6 +477,61 @@ impl InvocationResolver {
     }
 }
 
+/// Derives exact Cargo selection while preserving the action's build flags and test arguments.
+pub(super) fn case_operation(operation: &CheckOperation) -> CheckOperation {
+    let mut result = operation.clone();
+    let original = operation.args.as_deref().unwrap_or_default();
+    let separator = original
+        .iter()
+        .position(|argument| argument == "--")
+        .unwrap_or(original.len());
+    let mut arguments = Vec::new();
+    let mut skip = false;
+    let mut fixed_target = false;
+    for argument in &original[..separator] {
+        if skip {
+            skip = false;
+            continue;
+        }
+        if matches!(argument.as_str(), "--package" | "-p" | "--exclude") {
+            skip = true;
+            continue;
+        }
+        if matches!(
+            argument.as_str(),
+            "--workspace"
+                | "--all"
+                | "--tests"
+                | "--bins"
+                | "--all-targets"
+                | "--examples"
+                | "--doc"
+        ) || argument.starts_with("--package=")
+        {
+            continue;
+        }
+        if matches!(argument.as_str(), "--lib" | "--bin" | "--test") {
+            fixed_target = true;
+        }
+        arguments.push(argument.clone());
+    }
+    arguments.extend(["--package".into(), "{package.name}".into()]);
+    if !fixed_target {
+        arguments.push("{case.target_args}".into());
+    }
+    arguments.extend(["--".into(), "{case.name}".into(), "--exact".into()]);
+    if separator < original.len() {
+        arguments.extend(
+            original[separator + 1..]
+                .iter()
+                .filter(|argument| argument.as_str() != "--exact")
+                .cloned(),
+        );
+    }
+    result.args = Some(arguments);
+    result
+}
+
 fn expand(
     workspace: &Path,
     directory: &str,
@@ -358,7 +580,14 @@ fn expand(
         );
     }
     if let Some(file) = file {
-        bindings.insert("{file.path}", file.into());
+        bindings.insert(
+            "{file.path}",
+            if directory == "." {
+                file.into()
+            } else {
+                workspace.join(file).to_string_lossy().into_owned()
+            },
+        );
     }
     if let Some(case) = case {
         bindings.insert("{case.file}", case.file.clone());

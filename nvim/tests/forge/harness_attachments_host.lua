@@ -23,7 +23,7 @@ local workspace, data = temporary .. "/workspace", temporary .. "/data"
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local owned_root = vim.uv.fs_realpath(temporary)
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local image_path = workspace .. "/screen shot.png"
 local image_file = assert(io.open(image_path, "wb"))
 assert(image_file:write(vim.base64.decode("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+j5V8AAAAASUVORK5CYII=")))

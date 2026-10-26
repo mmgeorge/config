@@ -19,7 +19,7 @@ local definition_only = vim.g.forge_plan_definition_only == true
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-vim.fn.writefile({vim.json.encode({checks={version=2,definitions={}}})},workspace .. "/.forge.json")
+vim.fn.writefile({vim.json.encode({checks=vim.empty_dict()})},workspace .. "/.forge.json")
 local source = { "pub fn leaf() {}", "pub fn run() { leaf(); leaf(); }", "pub struct Client { pub count: usize }", "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; }", "/// Describes the following declaration.", "pub struct Following;" }
 if definition_only then
   source[3] = "pub struct Client { pub count: usize, secret: usize }"

@@ -1982,22 +1982,7 @@ mod tests {
         design.check_configuration = Some(serde_json::from_value(serde_json::json!({
             "digest": "checks",
             "helper_digest": {},
-            "config": { "version": 2, "definitions": [
-                { "id": "format-internal", "name": "Format", "area": "format", "category": "format",
-                  "enabled": true, "scope": "all", "all": { "command": "format-all" },
-                  "trigger": { "kind": "paths", "include": ["src/**"], "exclude": ["private/**"] } },
-                { "id": "unit-internal", "name": "Unit", "area": "unit", "category": "test",
-                  "enabled": true, "scope": "changed_cases", "all": { "command": "unit-all" },
-                  "cases": { "command": "unit-cases" }, "depends_on": ["format-internal"],
-                  "trigger": { "kind": "any_change" } },
-                { "id": "integration-internal", "name": "Integration", "area": "integration", "category": "test",
-                  "enabled": true, "scope": "changed_files", "all": { "command": "integration-all" },
-                  "files": { "command": "integration-files" }, "depends_on": ["unit-internal"],
-                  "trigger": { "kind": "manual" } },
-                { "id": "optional-internal", "name": "Optional", "area": "optional", "category": "test",
-                  "enabled": false, "scope": "all", "all": { "command": "optional-all" },
-                  "trigger": { "kind": "manual" } }
-            ] }
+            "config": {"format-internal":{"trigger":{"auto":true,"paths":["src/**"],"exclude":["private/**"]},"action":{"command":"format-all","label":"Format","category":"format"}},"unit-internal":{"trigger":{"auto":true},"action":{"command":"unit-all","label":"Unit","category":"test","after":["format-internal"],"input":true}},"integration-internal":{"trigger":{"auto":false},"action":{"command":"integration-files","label":"Integration","category":"test","after":["unit-internal"],"input":true}},"optional-internal":{"trigger":{"auto":false},"action":{"command":"optional-all","label":"Optional","category":"test"}}}
         })).unwrap());
         document.design = Some(design);
         let original = serde_json::to_vec(&document).unwrap();

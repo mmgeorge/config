@@ -2287,7 +2287,11 @@ async fn route_request(
                     .context("finish active source work before checks")?;
                 let run = controller.checks.prepare_request(
                     controller.checks.session_owner(),
-                    serde_json::from_value(request.params.clone())?,
+                    crate::checks::RunRequest::try_from(serde_json::from_value::<
+                        crate::checks::CheckRunRequest,
+                    >(
+                        request.params.clone()
+                    )?)?,
                     task_id.map(str::to_owned),
                     session.shell,
                     "User requested".into(),
@@ -4139,11 +4143,7 @@ mod tests {
     #[tokio::test]
     async fn plan_check_edits_retain_review_annotations_and_project_defaults() -> Result<()> {
         let fixture = tempfile::tempdir()?;
-        let config = json!({"checks":{"version":2,"definitions":[{
-            "id":"format", "name":"Rust formatting", "category":"format", "area":"Rust", "enabled":true,
-            "trigger":{"kind":"any_change"}, "scope":"all", "directory":".", "depends_on":[],
-            "all":{"command":"nu", "args":["-c","print checked"]}
-        }]}});
+        let config = json!({"checks":{"format":{"trigger":{"auto":true},"action":{"command":["nu", "-c","print checked"],"label":"Rust formatting","category":"format","directory":".","after":[]}}}});
         std::fs::write(
             fixture.path().join(".forge.json"),
             serde_json::to_vec(&config)?,
@@ -6318,11 +6318,7 @@ mod tests {
             std::fs::write(
                 fixture.path().join(".forge.json"),
                 serde_json::to_vec(&json!({
-                    "checks":{"version":2,"definitions":[{
-                        "id":"waiting", "name":"Waiting check", "category":"test", "area":"Fixture",
-                        "enabled":true, "auto":false, "trigger":{"kind":"manual"}, "scope":"all",
-                        "all":{"command":"nu", "args":["--no-config-file","-c","sleep 30sec"]}
-                    }]}
+                    "checks":{"waiting":{"trigger":{"auto":false},"action":{"command":["nu", "--no-config-file","-c","sleep 30sec"],"label":"Waiting check","category":"test"}}}
                 }))?,
             )?;
             let service = service();
@@ -6360,7 +6356,7 @@ mod tests {
                     Request {
                         id: 2,
                         method: "checks.run".into(),
-                        params: json!({"ids":["waiting"]}),
+                        params: json!({"check":"waiting"}),
                     },
                     &sink,
                 )

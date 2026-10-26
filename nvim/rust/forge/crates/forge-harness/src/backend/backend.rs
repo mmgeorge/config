@@ -1090,9 +1090,14 @@ impl Backend for MockBackend {
         {
             let catalog: Value =
                 serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
-            let rejected = scope.invoke("checks_configure", serde_json::json!({
-                "expected_revision": catalog["revision"], "config": {"version":2,"definitions":[]}
-            })).await;
+            let rejected = scope
+                .invoke(
+                    "checks_configure",
+                    serde_json::json!({
+                        "expected_revision": catalog["revision"], "config": {}
+                    }),
+                )
+                .await;
             anyhow::ensure!(
                 rejected.is_err(),
                 "setup published before the user answered"
@@ -1111,7 +1116,7 @@ impl Backend for MockBackend {
             let config = if catalog["snapshot"]["config"].is_object() {
                 catalog["snapshot"]["config"].clone()
             } else {
-                serde_json::json!({"version":2,"definitions":[]})
+                serde_json::json!({})
             };
             scope
                 .invoke(

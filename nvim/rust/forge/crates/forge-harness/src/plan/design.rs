@@ -1074,7 +1074,7 @@ mod tests {
     #[test]
     fn project_checks_are_snapshotted_without_running_commands() {
         let workspace = tempfile::tempdir().unwrap();
-        let config = serde_json::json!({"checks":{"version":2,"definitions":[{"id":"score","name":"Score tests","area":"Game","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"echo test > should-not-exist.txt"}}]}});
+        let config = serde_json::json!({"checks":{"score":{"trigger":{"auto":true},"action":{"command":"echo test > should-not-exist.txt","label":"Score tests","category":"test"}}}});
         std::fs::write(
             workspace.path().join(".forge.json"),
             serde_json::to_vec(&config).unwrap(),

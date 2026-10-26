@@ -68,16 +68,28 @@ selected source preparation and its prerequisites before unrelated verification.
 Explicit dependencies take precedence. Reserve dependencies for checks that
 require a successful prerequisite, not merely to reproduce category ordering.
 Do not make formatters or unit tests depend on the final executable build.
-For explicit targeted Rust runs, select the matching formatter, `forge-rust-tests`,
-and `forge-build` together, retaining the case or file selection on
-`forge-rust-tests`. Package changes use `forge-rust-format-fix`, while shared
-configuration changes use `forge-rust-workspace-format-fix`. Category ordering
-does not select additional checks. Without task-relative Rust changes, supply
-concrete formatter files or explicitly select its `all` operation if formatting
-is required. An empty formatter selection does not skip independent tests or
-builds. Host-based editor integration tests depend on `forge-build` because they
-consume its executable. Do not edit source after the final build without
-repeating the affected sequence.
+For focused Rust repairs, use `forge-rust-tests` with an exact, fully qualified
+test name and target. Its file selection runs the whole affected package and is
+not a single-test request. The shared Cargo executor already supports exact tests.
+Run one targeted test until compilation succeeds, then select additional relevant
+tests. Apply the repository's high bar for package-wide or project-wide suites.
+Do not use a broad suite to diagnose compilation or discover relevant tests.
+Package formatting uses `forge-rust-format-fix`, while shared configuration uses
+`forge-rust-workspace-format-fix`. Supply explicit formatter files when there are
+no task-relative Rust changes. Category ordering does not select additional checks.
+Run `forge-build` after the source changes stabilize and before runtime verification.
+Do not rebuild the executable after every unit-test attempt.
+Host-based editor integration tests depend on `forge-build` because they consume
+its executable. After later compiled-source edits, rebuild before using host-test
+results as verification of those edits.
+
+Finish every Forge code-change task, including Lua-only changes, by running the
+configured `forge-build` check after the final edits and targeted tests. Wait for
+its recorded passing result before reporting completion. A pending, failed, or
+interrupted build does not establish that the executable is current. Run the check
+again if any Forge code changes afterward. Use the checks interface rather than a
+terminal build, and do not substitute `cargo test`, `cargo check`, or the presence
+of an existing executable for this final build.
 
 ## Manual Rust Builds
 

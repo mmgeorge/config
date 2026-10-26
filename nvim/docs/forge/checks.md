@@ -6,6 +6,9 @@ with `i` to inspect selection reasons, proposed commands, and saved results.
 Definitions live in the `checks` section of `.forge.json`. Setup preserves other
 repository settings and asks for your choices before saving.
 
+Saved results from an older check-history format remain on disk but are excluded from
+the current session history. Plans containing the older check configuration must be recreated.
+
 `/checks setup on` enables check-editing permission without sending a prompt.
 `/checks setup off` disables it without sending a prompt, including during active work.
 The permission starts off, applies to this Harness conversation, and survives reopening.
@@ -30,6 +33,11 @@ leaves explicit check runs and plan Checking available.
 While a check run is active, the status area shows executing checks and their latest
 nonempty output line. The line updates as output arrives, and complete logs remain
 available in the saved result.
+For an exact test run, the check label includes the fully qualified test name,
+including while its executable is compiling. Other queued tests are not shown as running.
+Single-file checks show the selected path alongside the configured check name in
+live progress and completed history.
+Check status and history omit requester labels and show execution progress and results.
 The completion counter includes only selected checks and their required prerequisites.
 Unselected catalog entries do not count as finished work or increase the total.
 Selected checks that finish with a skip, failure, or configuration error still count
@@ -42,17 +50,20 @@ while that interruption finishes.
 Completed runs retain the full details. Result summaries omit not-run counts while
 preserving passed, failed, interrupted, stale, and other error counts.
 
-`enabled` controls whether a check can run. `auto` controls automatic selection
-and defaults to `true` when omitted. An enabled check with `auto: false` remains
-available for explicit runs and explicit plan selection. Prerequisites run when
-required by a selected check, including prerequisites with `auto: false`.
+`trigger.auto` controls automatic selection and defaults to `false`. Every configured
+check remains available for explicit runs and explicit plan selection. Prerequisites
+run when required by a selected check, including checks with automatic selection off.
 
 In `/checks`, `●` marks an enabled check and `○` marks a disabled check. Space
-toggles the selected check. Tab moves between Scope and Auto, and the left/right
-arrows change the focused field. These changes affect task overrides. Enter runs
-the selected check, and the History page retains previous runs. Use `/checks setup`
+toggles the selected check. The Auto field controls automatic selection with the left/right arrows. These changes affect task overrides. Enter does not run
+checks. The History page retains previous runs. Use `/checks setup`
 to edit project defaults. Plan review shows automatic selection reasons and checks
 explicitly requested by the plan.
+
+If the host returns an incompatible or malformed checks configuration, the picker
+shows the error and retains its last valid rows with editing disabled. A schema
+mismatch requires the current Forge executable and configuration. Rebuild and
+restart Forge after changing the checks schema, then update `.forge.json`.
 
 While viewing a plan, press `oc` to open its checks picker. `●` marks an enabled
 check and `○` marks a disabled check. Press Space or Enter to toggle the selected
@@ -69,9 +80,10 @@ Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
 without changing repository settings or executing commands. Repeated IDs do not
 create repeated plan entries, and adding only already-selected checks leaves the
 plan version unchanged. The tool is available during plan authoring and Resolve.
-`checks_run` accepts multiple `ids`, or
-`all: true` for every enabled check. Explicit runs execute even when earlier
-evidence remains current.
+`checks_run` accepts `check` as a name or a list of names. Omit coverage overrides
+to use each check's trigger and current changes. Supply exactly one of `files`,
+`packages`, `tests`, or `all: true` to override coverage. Explicit runs execute
+even when earlier evidence remains current.
 Configured checks run without executable approval prompts, whether started by an
 agent, the checks picker, or an automatic gate. Agents select saved check IDs and
 coverage rather than supplying commands. Editing check definitions still requires
@@ -98,14 +110,14 @@ unrelated verification. Among checks whose prerequisites have been ordered, the
 default priority is **format → lint/check → test → build**. Lint and check share
 one priority. Definition order breaks ties.
 
-Explicit `depends_on` prerequisites take precedence over category priority.
+Explicit `action.after` prerequisites take precedence over category priority.
 A host integration test remains a `test` check and depends on the `build` check
 whose executable it launches. Independent unit tests run before that build.
 Categories do not create success dependencies or select additional checks.
 A failed independent test therefore does not suppress a build unless the build
 explicitly depends on it.
 
-Use `purpose: "prepare"` for source-changing commands and reserve `depends_on`
+Use `action.prepare: true` for source-changing commands and reserve `action.after`
 for checks that require a successful prerequisite. Unselected preparation does
 not promote its prerequisites ahead of selected verification. Preparation that
 requires verification can still invalidate that prerequisite's evidence when it
@@ -147,7 +159,7 @@ repeating the unchanged command. If repair ends with the same failures and no
 relevant changes, automatic repair stops with the failure unresolved.
 Configuration errors require correction through the authorized setup workflow.
 
-Definitions default to `purpose: "verify"`. Use `purpose: "prepare"` for commands
+Actions verify their inputs by default. Use `action.prepare: true` for commands
 that intentionally change source, such as a formatter in fix mode. A successful
 preparation records its resulting source as the baseline. Dependent checks run
 against that source. Source changes during verification produce `Stale`, and
@@ -162,80 +174,83 @@ as execution errors. Explicit cancellation suppresses automatic retries of
 unchanged inputs with `Stopped`. An explicit run or relevant source changes
 permit another attempt.
 
-## Tests for changed packages
+## Trigger and action configuration
 
-One definition can run every affected package without naming packages in advance.
-This Cargo definition selects each package containing a changed Rust file and runs
-its unit and integration test targets:
+The `checks` object maps check names to one trigger and one action. No version,
+separate scope, or `all`/`files`/`cases` command templates are required.
 
 ```json
 {
-  "id": "package-tests",
-  "name": "Package tests",
-  "category": "test",
-  "area": "Tests",
-  "enabled": true,
-  "trigger": { "kind": "files_changed", "include": ["**/*.rs"] },
-  "scope": "changed_files",
-  "all": { "command": "cargo test --workspace --tests" },
-  "files": {
-    "command": "cargo",
-    "args": ["test", "--package", "{package.name}", "--tests"],
-    "package_manager": "cargo"
+  "checks": {
+    "rust-tests": {
+      "trigger": {
+        "auto": true,
+        "paths": ["rust/**/*.rs"],
+        "exclude": ["rust/**/target/**"]
+      },
+      "action": {
+        "directory": "rust",
+        "package_manager": "cargo",
+        "command": ["cargo", "test", "--package", "{package}", "--tests"]
+      }
+    },
+    "web-tests": {
+      "trigger": {"paths": ["web/**/*.ts"]},
+      "action": {
+        "directory": "web",
+        "package_manager": "npm",
+        "command": ["npm", "test", "--workspace={package}"]
+      }
+    }
   }
 }
 ```
 
-Add the toolchain, profile, feature, and lockfile flags required by your project.
-Five changed files in one package produce one invocation. Changes in two packages
-produce two invocations. The details retain every triggering file. Root lockfiles
-and workspace manifests require a separate workspace-wide rule instead of being
-silently attributed to one package.
+`{path}` runs the action for each selected file. `{package}` runs it once per
+owning package. Repeated files and packages are deduplicated. Without either
+placeholder, the action runs once. Substitutions remain individual process
+arguments rather than executable shell text. A command string is available for
+commands that deliberately require the configured shell.
 
-The direct form keeps arguments separate from shell source. Available bindings are
-`{file.path}`, `{package.name}`, `{package.directory}`, `{package.manifest}`, and
-`{workspace.directory}`. File paths are workspace-relative. Directory and manifest
-bindings are absolute. The operation's `package_manager` chooses Cargo, npm, or pnpm
-workspace membership. Excluded or independent nested packages are not included in
-their parent's checks.
+`action.package_manager` is required for package substitution or package
+selection. Supported managers are Cargo, npm, and pnpm. Each check discovers
+membership within its own action directory, so different package managers and
+nested workspaces can coexist. Unknown managers, missing package context, unknown
+package names, and ambiguous names are errors. Workspace-wide manifests and
+lockfiles need a separate workspace action.
 
-For npm workspaces, use `npm run test --workspace={package.name}`. For pnpm
-workspaces, use `pnpm --filter {package.name} test`. Directory-based commands also
-work for single-package projects: `npm --prefix {package.directory} run test` and
-`pnpm --dir {package.directory} test`. These command examples must be represented as
-separate `command` and `args` values in direct operations.
+Triggers use repository-relative paths. The action directory is also relative
+to the repository. File substitutions resolve correctly from that directory.
+An omitted `trigger.auto` is false. An omitted path list imposes no path filter.
 
-## New tests from the plan
+Optional action fields are `label` for display, `category` for custom command
+ordering, `prepare` for source mutation, and `after` for prerequisites. Standard
+Cargo commands infer their category. `input: true` sends a selection request to
+stdin for a custom helper, which must return a matching selection receipt.
 
-The `new_cases` scope selects only test entries marked `new` in the accepted plan.
-The `changed_cases` scope selects both new and modified entries. These scopes use
-the definition's `cases` operation. They include tests added to existing files.
+## Explicit coverage
 
-A native Cargo cases operation selects exact runtime names:
+A check name alone uses current changes:
 
 ```json
-{
-  "command": "cargo",
-  "package_manager": "cargo",
-  "args": [
-    "test", "--package", "{package.name}", "{case.target_args}",
-    "--", "{case.name}", "--exact"
-  ]
-}
+{"check": "rust-tests"}
 ```
 
-The plan supplies the test file and full runtime name. It may also supply `target`
-as `lib`, `bin:<name>`, or `test:<name>` when the file's target is ambiguous. Harness
-confirms the name in the target's test inventory before running it. Missing tests,
-ignored tests, and successful commands with no executed matching test do not pass.
+Exactly one override can replace that selection:
 
-An accepted plan with no new tests reports that no tests were selected. Outside
-plan execution, provide explicit cases or choose a file/package check. Missing
-plan inventory is different from an empty inventory.
+```json
+{"check": "rust-tests", "files": ["rust/src/lib.rs"]}
+{"check": "rust-tests", "packages": ["engine"]}
+{"check": "rust-tests", "tests": ["tests::updates_scene"]}
+{"check": "rust-tests", "all": true}
+```
 
-npm and pnpm do not define individual test identities. Their case-scoped checks
-continue to use a configured runner-specific helper and a selection receipt.
-Existing Nushell helper checks remain supported.
+Cargo test actions derive the package, executable target, exact filter, and
+inventory command internally. Missing or ambiguous test names fail before
+execution. A passing exit with zero matching tests or an ignored test does not
+prove coverage. The configured toolchain, profile, features, and other build
+flags remain in effect. npm and pnpm package checks run their configured command.
+Named individual tests currently require Cargo's standard test harness.
 
 ## Preview and execution
 

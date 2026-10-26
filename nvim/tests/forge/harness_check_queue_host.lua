@@ -5,10 +5,9 @@ vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 assert(vim.system({ "git", "init", "--quiet", workspace }, { text = true }):wait(10000).code == 0)
 vim.fn.writefile({ "before" }, workspace .. "/source.txt")
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-  { id = "verify", name = "Queue verification", category = "test", area = "Fixture", enabled = true,
-    trigger = { kind = "files_changed", include = { "source.txt" } }, all = { command = "print queue-verified" } },
-} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = {
+  ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "print queue-verified", label = "Queue verification", category = "test" } }
+} }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
 local original_stdpath = vim.fn.stdpath
@@ -132,7 +131,7 @@ local success, failure = xpcall(function()
   vim.fn.writefile({ "edit with completion checking disabled" }, workspace .. "/source.txt")
   await(completed, "disabled-check work did not complete")
   assert(executed() == 3 and state.check_timing == "after_queue", "disabled gate ran or lost its timing")
-  local explicit = request("checks.run", { ids = { "verify" } })
+  local explicit = request("checks.run", { check = { "verify" } })
   local checked = request("checks.status", { run_id = explicit.run_id, wait_for_completion = true })
   assert(checked.state == "passed" and executed() == 4, "disabling automatic checks disabled explicit runs")
   applied = nil

@@ -22,7 +22,7 @@ else
   vim.fn.writefile({ "[package]", 'name = "mock-plan-bootstrap"', 'version = "0.1.0"', 'edition = "2021"',
     "[lib]", 'path = "src/change.rs"', "[workspace]" }, workspace .. "/Cargo.toml")
 end
-vim.fn.writefile({vim.json.encode({ checks = { version = 2, definitions = {} } })}, workspace .. "/.forge.json")
+vim.fn.writefile({vim.json.encode({ checks = vim.empty_dict() })}, workspace .. "/.forge.json")
 local function command(arguments, cwd)
   local result = vim.system(arguments, { cwd = cwd, text = true }):wait(30000)
   assert(result.code == 0, (result.stderr or "") .. (result.stdout or ""))

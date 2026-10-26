@@ -35,8 +35,8 @@ workflow rather than inventing an unrecorded validation command. Delegated agent
 without check-tool access report verification needs to their parent, which follows
 the live automatic_checks policy after the children settle.
 
-Enabled checks may be selected explicitly. auto controls automatic plan inclusion
-and completion checks, and defaults to true. Use plan_checks_add to select
+Enabled checks may be selected explicitly. trigger.auto controls automatic plan inclusion
+and completion checks, and defaults to false. Use plan_checks_add to select
 additional configured check IDs in a draft plan without changing project settings.
 Automatic completion checks reuse current recorded coverage, including explicit
 tool runs. A recorded failure remains unresolved until corrected and verified.

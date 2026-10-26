@@ -10,6 +10,27 @@ This repository stores the user's **dotfiles** and personal developer environmen
 
 Treat this repository as operational infrastructure rather than a single application. A change here alters the runtime behavior of Neovim, Nushell, WezTerm, Git, Codex, Claude Code, Copilot CLI, and Antigravity CLI across unrelated projects.
 
+# Targeted Verification
+
+- Start with the smallest existing test that exercises the changed behavior. Use
+  an exact test name or an individual fixture when available. A changed source
+  file selects its package, not a single test, so do not substitute file selection
+  for exact-test selection when only one regression needs verification.
+- After a compilation failure, fix the compiler error and retry one targeted
+  test. Do not queue other tests that compile the same failing target.
+- Broaden to related tests after the targeted test passes. Package-wide and
+  project-wide suites are exceptional. Run them only for an explicit user request,
+  a mandatory repository gate, or an identified cross-module risk that narrower
+  tests cannot cover. State the specific risk and why targeted coverage is
+  insufficient before running a broad suite. A changed source file, compilation
+  failure, or uncertainty about test selection does not meet this bar. Investigate
+  the affected behavior and existing tests before expanding coverage.
+- Reuse recorded passing results while their inputs remain unchanged. Repeat
+  checks only for relevant edits, observed failures, or unresolved coverage.
+- Inspect the existing check configuration and executor before changing them.
+  Do not add a runner, redesign checks, or disable automatic coverage to compensate
+  for selecting an unnecessarily broad test run.
+
 # Cross-Platform Scripting
 
 This repository supports **Windows and macOS**, and every supported environment provides **Nushell**. Treat every shared workflow as cross-platform unless its owning directory or integration explicitly targets Windows.

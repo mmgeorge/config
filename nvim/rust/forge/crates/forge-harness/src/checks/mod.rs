@@ -12,6 +12,7 @@ mod preview;
 mod publication;
 mod queue;
 mod selection;
+mod spec;
 mod supervisor;
 #[cfg(test)]
 mod tests;
@@ -32,7 +33,7 @@ pub use preview::CheckPreview;
 pub(crate) use preview::plan as preview_plan;
 pub use queue::CheckTiming;
 pub(crate) use queue::CompletionQueue;
-pub use selection::{CheckCase, CheckReceipt, CheckSelection, RunRequest};
+pub use selection::{CheckCase, CheckReceipt, CheckRunRequest, CheckSelection, RunRequest};
 pub(crate) use supervisor::CheckAdmission;
 pub use supervisor::CheckSupervisor;
 pub(crate) use tools::CheckAuthority;

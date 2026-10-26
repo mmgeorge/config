@@ -251,8 +251,7 @@ fn append_checks(
     now_ms: i64,
 ) -> Result<()> {
     let mut lines = vec![format!(
-        "Checks running · {} · {}/{} finished · {}s",
-        checks.trigger,
+        "Checks running · {}/{} finished · {}s",
         checks.completed_count,
         checks.total_count,
         checks.elapsed_ms(now_ms) / 1000

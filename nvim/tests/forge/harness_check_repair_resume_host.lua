@@ -6,10 +6,9 @@ vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 assert(vim.system({ "git", "init", "--quiet", workspace }, { text = true }):wait(10000).code == 0)
 vim.fn.writefile({ "before" }, workspace .. "/source.txt")
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-  { id = "verify", name = "Verify", category = "test", area = "Fixture", enabled = true,
-    trigger = { kind = "files_changed", include = { "source.txt" } }, all = { command = "exit 7" } },
-} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = {
+  ["verify"] = { trigger = { auto = true, paths = { "source.txt" } }, action = { command = "exit 7", label = "Verify", category = "test" } }
+} }) }, workspace .. "/.forge.json")
 local executable = require("forge.builder").binary_path()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind)

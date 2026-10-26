@@ -32,10 +32,9 @@ local function open(session_id)
   return result
 end
 local success, failure = xpcall(function()
-  vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-    { id = "slow", name = "Recovery check", category = "test", area = "Fixture", enabled = true, auto = false,
-      trigger = { kind = "manual" }, all = { command = "print running; sleep 30sec" } },
-  } } }) }, workspace .. "/.forge.json")
+  vim.fn.writefile({ vim.json.encode({ checks = {
+  ["slow"] = { trigger = { auto = false }, action = { command = "print running; sleep 30sec", label = "Recovery check", category = "test" } }
+} }) }, workspace .. "/.forge.json")
   vim.fn.chdir(workspace)
   require("forge").setup({ harness = { backend = "mock", backends = { mock = { command = { "mock" } } } } })
   local snapshot = open()
@@ -43,7 +42,7 @@ local success, failure = xpcall(function()
   request(session_id, "session.configure", { shell = "nushell" })
   request(session_id, "prompt.submit", { text = "Before closing" })
   for _, pause_first in ipairs({ true, false }) do
-    local run_id = request(session_id, "checks.run", { ids = { "slow" } }).run_id
+    local run_id = request(session_id, "checks.run", { check = { "slow" } }).run_id
     assert(vim.wait(5000, function()
       local run = request(session_id, "checks.status", { run_id = run_id })
       return run.commands[1] and run.commands[1].state == "running"

@@ -65,8 +65,12 @@ impl CommandCheck {
                 super::CheckSelection::All => "All".into(),
                 super::CheckSelection::Files { files } => format!("{} files", files.len()),
                 super::CheckSelection::Cases { cases } => format!("{} cases", cases.len()),
+                super::CheckSelection::Packages { packages } => {
+                    format!("{} packages", packages.len())
+                }
+                super::CheckSelection::Tests { tests } => format!("{} tests", tests.len()),
             };
-            return format!("{} · {} · {:?}", context.name, scope, self.state);
+            return format!("{} · {} · {:?}", context.label(), scope, self.state);
         }
         format!(
             "{} · {:?}",
@@ -189,6 +193,39 @@ pub struct CheckCommand {
     pub resolved: Option<super::CheckSelection>,
     pub depends_on: Vec<String>,
     pub receipt: PathBuf,
+}
+
+impl CheckCommand {
+    /// Includes this invocation's exact tests or its single selected file.
+    pub(crate) fn label(&self) -> String {
+        let names: Vec<&str> = if let Some(invocation) = &self.invocation
+            && !invocation.cases.is_empty()
+        {
+            invocation
+                .cases
+                .iter()
+                .map(|case| case.name.as_str())
+                .collect()
+        } else {
+            match &self.selection {
+                super::CheckSelection::Cases { cases } if cases.len() == 1 => {
+                    vec![cases[0].name.as_str()]
+                }
+                super::CheckSelection::Tests { tests } if tests.len() == 1 => {
+                    vec![tests[0].as_str()]
+                }
+                super::CheckSelection::Files { files } if files.len() == 1 => {
+                    vec![files[0].as_str()]
+                }
+                _ => Vec::new(),
+            }
+        };
+        if names.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} · {}", self.name, names.join(", "))
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]

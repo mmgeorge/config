@@ -6,8 +6,6 @@ use serde::Serialize;
 pub struct CheckActivity {
     /// Durable run whose progress is currently visible.
     pub run_id: String,
-    /// Explains whether the run was requested explicitly or scheduled at completion.
-    pub trigger: String,
     /// Execution time accumulated by completed commands.
     pub duration_ms: u64,
     /// Current execution interval, absent while an interrupted run is suspended.
@@ -83,7 +81,7 @@ impl CheckActivity {
                         )
                         .source
                     },
-                    |context| context.name.clone(),
+                    |context| context.label(),
                 ),
                 started_at_ms: command.started_at_ms,
                 output_line: String::from_utf8_lossy(&strip_ansi_escapes::strip(
@@ -97,10 +95,6 @@ impl CheckActivity {
             .collect();
         Some(Self {
             run_id: run.id.clone(),
-            trigger: run.context.as_ref().map_or_else(
-                || "Plan verification".into(),
-                |context| context.trigger.clone(),
-            ),
             duration_ms,
             started_at_ms,
             completed_count: selected.values().filter(|completed| **completed).count(),
@@ -121,7 +115,7 @@ impl CheckActivity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 /// One live command within the current check run.
 pub struct CheckCommandActivity {
-    /// Complete configured check name or normalized command text.
+    /// Configured check name and exact test identity, or normalized command text.
     pub title: String,
     /// Command execution interval used by the status timer.
     pub started_at_ms: Option<i64>,

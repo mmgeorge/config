@@ -714,7 +714,7 @@ mod test {
     async fn selected_plan_checks_are_versioned_and_replayed_without_changing_configuration() {
         let mut context = planning_context();
         let workspace = context.workspace_root.clone().unwrap();
-        let settings = json!({"checks":{"version":2,"definitions":[{"id":"manual","name":"Manual","area":"Tests","category":"test","enabled":true,"auto":false,"trigger":{"kind":"manual"},"all":{"command":"print selected"}}]}});
+        let settings = json!({"checks":{"manual":{"trigger":{"auto":false},"action":{"command":"print selected","label":"Manual","category":"test"}}}});
         std::fs::write(workspace.join(".forge.json"), settings.to_string()).unwrap();
         context.plan_document.as_mut().unwrap().design =
             Some(crate::plan::DeclarationDesign::default());

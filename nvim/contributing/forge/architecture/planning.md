@@ -262,8 +262,8 @@ Rendering and validation traverse nested branches iteratively without flow-count
 or depth caps. The renderer uses `→` for the first action, `↓` for subsequent steps, and `┄▶`
 for effects. Branch rails retain their conditions and nesting. Text exports
 retain fences while PlanReview renders the same diagram rows as native buffer text.
-Section reads, review, and revision diffs use the same canonical projection. Plan schema 13
-replaces the generic node tree without converting older persisted plan formats.
+Section reads, review, and revision diffs use the same canonical projection. Plan schema 14
+stores named trigger/action check snapshots and excludes older persisted plan formats.
 Retired step input lists are discarded when loading saved flows and are absent from the schema,
 serialized steps, and diagrams. Other unknown step fields remain errors.
 Native diagram rows keep literal punctuation and receive neutral prose styling, with exact
@@ -559,8 +559,13 @@ Project check definitions live in the `checks` section of `.forge.json`. The LLM
 them through `/checks setup`, preserving other repository settings. The categories are
 `format`, `lint`, `check`, `test`, and `build`. Unit, integration, and screenshot suites are
 named `test` definitions. No language detector generates commands. An absent checks section
-blocks plan submission. An explicitly empty definition list is valid. Configuration version 2
-requires each check to name its functional area and define its automatic trigger.
+blocks plan submission. An explicitly empty checks object is valid. Each named check contains
+its automatic `trigger` and executable `action`.
+
+Check history version 4 stores the same named check snapshots. The supervisor checks the
+record envelope version before decoding its run. Older records remain on disk but are excluded
+from reopening, previews, and forks. Invalid current records report their file path and decoding
+error. Plan schema 14 applies the corresponding boundary to saved plan check snapshots.
 
 Each definition owns its identity, name, area, trigger, enabled default, scope, directory, commands,
 and prerequisite identities. Every definition implements `all`; `files` and `cases` are

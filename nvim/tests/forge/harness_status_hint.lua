@@ -292,6 +292,16 @@ assert(#vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 2, {}) == 
 vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(idle_mark, vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 1, { details = true })),
   "idle icon animated")
+resting.status_notice = {text = "Working", animated = true, hint = "working"}
+hint.render(resting, command_set, 120)
+local handoff_mark = vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 1, { details = true })
+assert(vim.trim(handoff_mark[3].virt_text[1][1]) == "Working" and handoff_mark[3].sign_text,
+  "queue handoff must replace visible Idle with animated Working")
+resting.status_notice = nil
+hint.render(resting, command_set, 120)
+local settled_mark = vim.api.nvim_buf_get_extmark_by_id(resting.buffer, namespace, 1, { details = true })
+assert(settled_mark[3].virt_text == nil and vim.trim(settled_mark[3].sign_text) == "◷",
+  "settled handoff must restore the native idle presentation")
 hint.clear(resting.buffer)
 buffer.close(resting)
 local details = buffer.open("implementation-details-hint", {})

@@ -150,7 +150,13 @@ pub(super) async fn resolve(
                         .into();
             } else {
                 match resolver
-                    .resolve(workspace, &definition.directory, operation, &scope)
+                    .resolve_check(
+                        workspace,
+                        &definition.directory,
+                        operation,
+                        &scope,
+                        &definition.trigger,
+                    )
                     .await
                 {
                     Ok(invocations) => {

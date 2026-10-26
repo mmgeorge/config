@@ -39,10 +39,16 @@ local function request(method, params)
   return value
 end
 local function save(definitions)
-  vim.fn.writefile({ vim.json.encode({ branch_prefix = "fixture", checks = { version = 2, definitions = definitions } }) }, workspace .. "/.forge.json")
+  local checks = {}
+  for _, definition in ipairs(definitions) do
+    local value = vim.deepcopy(definition)
+    value.id = nil
+    checks[definition.id] = value
+  end
+  vim.fn.writefile({ vim.json.encode({ branch_prefix = "fixture", checks = checks }) }, workspace .. "/.forge.json")
 end
 local function definition(id, command, dependency)
-  return { id = id, name = id, category = "test", enabled = true, area = "Fixture", trigger = {kind = "any_change"}, all = { command = command }, depends_on = dependency or {} }
+  return { id = id, trigger = {auto = true}, action = { command = command, category = "test", after = dependency or {} } }
 end
 local function setup(params)
   local admitted = request("checks.setup", params)
@@ -92,10 +98,8 @@ local succeeded, failure = xpcall(function()
   assert(first_setup.exchange.id ~= repeated_setup.exchange.id, "each setup request must own a new exchange")
   request("session.configure", { shell = "nushell" })
   save({ definition("failure", "exit 7"), definition("dependent", "'unexpected' | save unexpected.txt", { "failure" }), definition("independent", "sleep 200ms; print 'independent output'") })
-  local excluded = request("checks.run").run_id
-  assert(vim.wait(5000, function() return request("checks.status", {run_id = excluded}).state ~= "running" end, 10))
-  assert(request("checks.status", {run_id = excluded}).state == "skipped", "unknown task changes must not run every enabled check")
-  local id = request("checks.run", { all = true }).run_id
+  assert(not pcall(request, "checks.run"), "manual runs must name their checks")
+  local id = request("checks.run", { check = {"failure", "dependent", "independent"}, all = true }).run_id
   local run
   assert(vim.wait(10000, function()
     run = request("checks.status", { run_id = id })
@@ -118,25 +122,26 @@ local succeeded, failure = xpcall(function()
   assert(vim.fn.filereadable(workspace .. "/.forge/checks/receipt.nu") == 1)
   local validation = vim.system({ "nu", "--no-config-file", "--stdin", "-c", "nu-check ($in | str trim)" }, { text = true, cwd = workspace, stdin = workspace .. "/.forge/checks/receipt.nu" }):wait(10000)
   assert(validation.code == 0 and validation.stdout:find("true", 1, true), validation.stderr)
-  scoped.files = { command = "nu --no-config-file --stdin .forge/checks/receipt.nu" }
+  scoped.action.command = "nu --no-config-file --stdin .forge/checks/receipt.nu"
+  scoped.action.input = true
   save({ scoped })
   request("session.configure", { shell = "system" })
-  local scoped_id = request("checks.run", { ids = { "scoped" }, selections = { scoped = { kind = "files", files = { "src/name $value.rs" } } } }).run_id
+  local scoped_id = request("checks.run", { check = "scoped", files = { "src/name $value.rs" } }).run_id
   assert(vim.wait(10000, function() return request("checks.status", { run_id = scoped_id }).state ~= "running" end, 20))
   local resolved = request("checks.status", { run_id = scoped_id })
   assert(resolved.state == "passed", table.concat(vim.fn.readfile(resolved.commands[1].output), "\n") .. "\n" .. vim.inspect(resolved))
   assert(resolved.commands[1].context.resolved.files[1] == "src/name $value.rs", "system shell changed scoped selectors")
   request("session.configure", { shell = "nushell" })
-  scoped.files = { command = "print 'missing receipt'" }
+  scoped.action.command = "print 'missing receipt'"
   save({ scoped })
-  local bad_id = request("checks.run", { ids = { "scoped" }, selections = { scoped = { kind = "files", files = { "src/example.rs" } } } }).run_id
+  local bad_id = request("checks.run", { check = "scoped", files = { "src/example.rs" } }).run_id
   assert(vim.wait(10000, function() return request("checks.status", { run_id = bad_id }).state ~= "running" end, 20))
   assert(request("checks.status", { run_id = bad_id }).state == "configuration_error")
   assert(vim.wait(3000, function() return #errors > 0 end, 10), "configuration errors must notify the user")
   assert(errors[#errors]:find("receipt", 1, true), table.concat(errors, "\n"))
   errors = {}
   save({ definition("shutdown", "sleep 2sec; 'orphan' | save shutdown-orphan.txt") })
-  local shutdown_id = request("checks.run", { all = true }).run_id
+  local shutdown_id = request("checks.run", { check = "shutdown", all = true }).run_id
   assert(request("checks.status", { run_id = shutdown_id }).state == "running")
   local session_id = state.session.id
   require("forge.views.harness.workspace").release(state)

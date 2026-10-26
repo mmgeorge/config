@@ -41,6 +41,12 @@ impl<'exchange> ExchangeLayout<'exchange> {
             .flat_map(|thought| thought.events.iter().map(|node| node.id()))
             .collect::<std::collections::HashSet<_>>();
         activity.retain(|node| {
+            if matches!(node, ExchangeNode::TimelineEvent { event }
+                if matches!(event.as_ref(), crate::timeline::TimelineEvent::Check { .. }))
+            {
+                results.push(*node);
+                return false;
+            }
             if owned_events.contains(node.id()) {
                 return true;
             }

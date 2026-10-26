@@ -3,7 +3,7 @@ local root = vim.fs.normalize(vim.fn.getcwd())
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
 assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = vim.empty_dict() }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify

@@ -254,7 +254,9 @@ impl CheckToolScope {
                         ),
                     "automated checks are owned by Harness during plan execution and cannot race active writing agents"
                 );
-                let request = serde_json::from_value(arguments)?;
+                let request = RunRequest::try_from(serde_json::from_value::<
+                    super::CheckRunRequest,
+                >(arguments)?)?;
                 let run = self.runner.prepare_request(
                     self.runner.exchange_owner(&self.address.turn_id)?,
                     request,

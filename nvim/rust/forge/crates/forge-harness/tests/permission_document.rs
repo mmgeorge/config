@@ -20,7 +20,7 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
     std::fs::create_dir_all(&workspace).unwrap();
     std::fs::write(
         workspace.join(".forge.json"),
-        json!({"checks":{"version":2,"definitions":[]}}).to_string(),
+        json!({"checks":{}}).to_string(),
     )
     .unwrap();
     assert!(

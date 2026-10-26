@@ -1144,7 +1144,7 @@ fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
     }
 }
 
-/// Keeps the current exchange and the most recent preceding response outside automatic folding.
+/// Keeps the current exchange and the two most recent preceding responses outside automatic folding.
 fn unsettled_exchanges<'source>(
     source: impl DoubleEndedIterator<Item = ProjectionSource<'source>>,
 ) -> Vec<String> {
@@ -1159,16 +1159,20 @@ fn unsettled_exchanges<'source>(
     if let Some((id, _)) = exchanges.next_back() {
         unsettled.push(id.clone());
     }
-    if let Some((id, _)) = exchanges.rfind(|(_, exchange)| {
-        exchange.turn.iter().any(|turn| {
-            turn.messages().iter().any(|message| {
-                message.kind() == crate::turn::MessageKind::Assistant
-                    && message.delivery() == crate::turn::MessageDelivery::Final
+    unsettled.extend(
+        exchanges
+            .rev()
+            .filter(|(_, exchange)| {
+                exchange.turn.iter().any(|turn| {
+                    turn.messages().iter().any(|message| {
+                        message.kind() == crate::turn::MessageKind::Assistant
+                            && message.delivery() == crate::turn::MessageDelivery::Final
+                    })
+                })
             })
-        })
-    }) {
-        unsettled.push(id.clone());
-    }
+            .take(2)
+            .map(|(id, _)| id.clone()),
+    );
     unsettled
 }
 
@@ -1918,9 +1922,7 @@ fn append_staging_section(
     if values.is_empty() {
         return Ok(());
     }
-    if !rows.is_empty() {
-        rows.push(String::new());
-    }
+    rows.push(String::new());
     rows.extend(width.wrap_plain(label, 0)?);
     for value in values {
         rows.extend(width.wrap_plain(
@@ -1970,8 +1972,7 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
     #[test]
-    fn long_messages_keep_the_previous_response_until_another_prompt_and_reopen_after_resize()
-    -> anyhow::Result<()> {
+    fn long_messages_keep_two_previous_responses_and_reopen_after_resize() -> anyhow::Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
         use forge_buffer::node::{NodeDisplay, NodeLifecycle};
@@ -2136,7 +2137,50 @@ mod tests {
                 .row_count(),
             5
         );
-        let history = vec![entry.clone(), second, interaction_entry("third")];
+        let mut third = interaction_entry("third");
+        owner.reconcile(vec![entry.clone(), second.clone(), third.clone()])?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let TimelineEntry::Exchange { exchange, .. } = &mut third else {
+            unreachable!()
+        };
+        exchange.state = crate::exchange::ExchangeState::Running;
+        exchange.completed_at_ms = None;
+        event.address.as_mut().unwrap().turn_id = "third-reply".into();
+        event.turn_boundary = Some(TurnBoundary::Started);
+        event.kind = "turn_started".into();
+        event.text = None;
+        event.data = serde_json::Value::Null;
+        exchange.observe_turn(&event, 6)?;
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("third one\nthird two\nthird three\nthird four\nthird five".into());
+        event.data =
+            serde_json::json!({"phase":"final_answer", "provider_message_id":"third-reply"});
+        exchange.observe_turn(&event, 7)?;
+        owner.reconcile(vec![entry.clone(), second.clone(), third.clone()])?;
+        assert_eq!(
+            owner
+                .snapshot(&document)?
+                .block
+                .iter()
+                .find(|block| block.id == response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        let third_response = owner.open.as_ref().unwrap().entry["third"].response[0].clone();
+        let history = vec![entry.clone(), second, third, interaction_entry("fourth")];
         owner.reconcile(history.clone())?;
         let snapshot = owner.snapshot(&document)?;
         let collapsed = snapshot
@@ -2158,6 +2202,16 @@ mod tests {
                 .block
                 .iter()
                 .find(|block| block.id == second_response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        assert_eq!(
+            snapshot
+                .block
+                .iter()
+                .find(|block| block.id == third_response)
                 .unwrap()
                 .text
                 .row_count(),
@@ -2188,6 +2242,16 @@ mod tests {
             5
         );
         assert_eq!(
+            restored
+                .block
+                .iter()
+                .find(|block| block.id == third_response)
+                .unwrap()
+                .text
+                .row_count(),
+            5
+        );
+        assert_eq!(
             owner
                 .open
                 .as_ref()
@@ -2202,7 +2266,7 @@ mod tests {
         );
         expand(&mut owner, &response.0, 12)?;
         let mut later = history;
-        later.push(interaction_entry("fourth"));
+        later.push(interaction_entry("fifth"));
         owner.reconcile(later)?;
         owner.dispatch(super::PresentationRequest::Resize {
             document: document.clone(),
@@ -2277,7 +2341,8 @@ mod tests {
         let rows = snapshot.block[staging_index].text.wire_rows().join("\n");
         assert!(rows.contains("Steering active turn"));
         assert!(rows.contains("active direction"));
-        assert!(rows.contains("Queued follow-up inputs"));
+        assert!(rows.starts_with("\nSteering active turn\n"));
+        assert!(rows.contains("\n\nQueued follow-up inputs\n"));
         assert!(rows.find("queued first").unwrap() < rows.find("queued second").unwrap());
         assert!(!owner.timeline.entry_list().iter().any(
             |entry| matches!(entry, TimelineEntry::Status { id, .. } if id == "harness:staging")
@@ -2298,6 +2363,19 @@ mod tests {
             "a repeated staging identity replaced newer presentation state"
         );
 
+        owner.dispatch(PresentationRequest::Staging {
+            sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
+            document: document.clone(),
+            queue: vec!["queued only".into()],
+            steering: Vec::new(),
+        })?;
+        assert_eq!(
+            owner.snapshot(&document)?.block[staging_index]
+                .text
+                .wire_rows(),
+            ["", "Queued follow-up inputs", "• queued only"],
+            "the first queued input must be separated from the preceding status"
+        );
         owner.dispatch(PresentationRequest::Staging {
             sequence: owner.open.as_ref().unwrap().staging_sequence + 1,
             document: document.clone(),

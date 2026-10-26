@@ -45,6 +45,34 @@ local success, failure = xpcall(function()
   state.busy = false
   advance(1)
   assert(health.notice(state) == nil)
+  state.status.kind = "idle"
+  state.session.current_task_id = "task"
+  state.task = {{id = "task", status = "running"}}
+  local queued = {text = "Next message", task_id = "task"}
+  state.queue = {queued}
+  local handoff = health.notice(state)
+  assert(handoff.text == "Working" and handoff.animated and handoff.hint == "working",
+    "a ready queued message must keep Working visible during handoff")
+  state.queue_edit = {barrier = queued}
+  assert(health.notice(state) == nil, "editing the next message must not imply a handoff")
+  state.queue_edit = nil
+  state.task[1].status = "paused"
+  assert(health.notice(state) == nil, "a paused task must not imply queued execution")
+  state.task[1].status = "running"
+  queued.task_id = "another-task"
+  assert(health.notice(state) == nil, "queued work for another task must not imply execution")
+  queued.task_id = "task"
+  state.checks_running = true
+  assert(health.notice(state) == nil, "native check progress must remain visible")
+  state.checks_running = false
+  state.queue = {}
+  state.busy = true
+  state.prompt_submission = {queue_entry = queued, accepted = true}
+  assert(health.notice(state).text == "Working", "admission must not flash Idle after removing the queue entry")
+  state.status.kind = "working"
+  assert(health.notice(state) == nil, "native execution status must replace the handoff display")
+  state.prompt_submission, state.busy, state.status.kind = nil, false, "idle"
+  assert(health.notice(state) == nil, "the empty queue must return to native Idle after settlement")
   responsive = false
   advance(6)
   assert(health.notice(state).text == "Connection unresponsive — task status unknown",

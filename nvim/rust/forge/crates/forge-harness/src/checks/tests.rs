@@ -18,6 +18,7 @@ fn definition(id: &str, command: &str) -> CheckDefinition {
         scope: CheckScope::All,
         directory: ".".into(),
         all: CheckOperation {
+            input: false,
             args: None,
             package_manager: None,
             command: command.into(),
@@ -29,7 +30,7 @@ fn definition(id: &str, command: &str) -> CheckDefinition {
 }
 
 fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
-    std::fs::write(workspace.join(".forge.json"),serde_json::to_vec(&serde_json::json!({"branch_prefix":"feature","checks":{"version":2,"definitions":definitions}})).unwrap()).unwrap();
+    std::fs::write(workspace.join(".forge.json"),serde_json::to_vec(&serde_json::json!({"branch_prefix":"feature","checks":CheckConfig { version: 2, definitions }})).unwrap()).unwrap();
 }
 
 #[test]
@@ -159,7 +160,7 @@ fn large_check_configuration_and_helpers_preserve_complete_content() -> Result<(
         .map(|index| definition(&format!("check-{index}"), "print ok"))
         .collect::<Vec<_>>();
     let document = serde_json::json!({
-        "checks":{"version":2,"definitions":definitions},
+        "checks":CheckConfig { version: 2, definitions },
         "unrelated":"λ".repeat(1024 * 1024)
     });
     std::fs::write(
@@ -207,6 +208,51 @@ fn make_runner(workspace: &std::path::Path, data: &std::path::Path) -> Arc<Check
 }
 
 #[test]
+fn reopening_history_excludes_obsolete_check_configuration_without_rewriting_it() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    save(workspace.path(), vec![definition("test", "echo test")]);
+    let runner = make_runner(workspace.path(), data.path());
+    let run = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
+        RunRequest::default(),
+        None,
+        crate::session::CheckShell::System,
+        "User requested".into(),
+    )?;
+    let current_path = data.path().join(&run.id).join("record.json");
+    super::supervisor::write_record(&current_path, &run)?;
+    let mut obsolete = crate::codec::to_value(&run)?;
+    obsolete["id"] = serde_json::json!("obsolete");
+    obsolete["context"]["snapshot"]["config"] =
+        serde_json::json!({"version": 2, "definitions": []});
+    let obsolete = crate::codec::to_vec(&serde_json::json!({"version": 3, "run": obsolete}))?;
+    let obsolete_path = data.path().join("obsolete").join("record.json");
+    std::fs::create_dir_all(obsolete_path.parent().unwrap())?;
+    std::fs::write(&obsolete_path, &obsolete)?;
+    drop(runner);
+
+    let reopened = make_runner(workspace.path(), data.path());
+    let history = reopened.history()?;
+    assert_eq!(history.len(), 1);
+    assert_eq!(history[0].id, run.id);
+    assert_eq!(std::fs::read(obsolete_path)?, obsolete);
+    assert_eq!(
+        history[0].context.as_ref().unwrap().snapshot.config.definitions.len(),
+        1
+    );
+    let mut invalid: serde_json::Value = crate::codec::from_slice(&std::fs::read(&current_path)?)?;
+    invalid["run"]["context"]["snapshot"]["config"] =
+        serde_json::json!({"version": 2, "definitions": []});
+    std::fs::write(&current_path, crate::codec::to_vec(&invalid)?)?;
+    let error = CheckSupervisor::saved_history(data.path()).unwrap_err();
+    let message = format!("{error:#}");
+    assert!(message.contains(current_path.to_str().unwrap()));
+    assert!(message.contains("expected struct Check"));
+    Ok(())
+}
+
+#[test]
 fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
@@ -246,6 +292,52 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
     }
     let activity = CheckActivity::from_run(&run).unwrap();
     assert_eq!((activity.completed_count, activity.total_count), (2, 4));
+    let running = run
+        .commands
+        .iter_mut()
+        .find(|command| command.state == CheckState::Running)
+        .unwrap();
+    let context = running.context.as_mut().unwrap();
+    let current = CheckCase {
+        file: "src/lib.rs".into(),
+        name: "tests::current".into(),
+        target: Some("lib".into()),
+    };
+    let queued = CheckCase {
+        name: "tests::queued".into(),
+        ..current.clone()
+    };
+    context.selection = CheckSelection::Cases {
+        cases: vec![current.clone(), queued],
+    };
+    context.invocation = Some(super::invocation::CheckInvocation {
+        inputs: BTreeMap::new(),
+        program: "cargo".into(),
+        args: Vec::new(),
+        directory: ".".into(),
+        package: None,
+        files: Vec::new(),
+        cases: vec![current],
+        discovery: None,
+    });
+    running.preview = "Compiling test executable".into();
+    let label = running.heading();
+    assert!(label.contains("tests::current"));
+    assert!(!label.contains("tests::queued"));
+    let activity = CheckActivity::from_run(&run).unwrap();
+    assert!(activity.command_list[0].title.contains("tests::current"));
+    assert!(!activity.command_list[0].title.contains("tests::queued"));
+    assert_eq!(
+        activity.command_list[0].output_line.as_deref(),
+        Some("Compiling test executable")
+    );
+    let running = run.commands.iter_mut().find(|command| command.state == CheckState::Running).unwrap();
+    let context = running.context.as_mut().unwrap();
+    context.invocation = None;
+    context.selection = CheckSelection::Files { files: vec!["nvim/tests/forge/harness_health.lua".into()] };
+    assert!(running.heading().contains("nvim/tests/forge/harness_health.lua"));
+    let activity = CheckActivity::from_run(&run).unwrap();
+    assert!(activity.command_list[0].title.contains("nvim/tests/forge/harness_health.lua"));
     let mut package_command = run
         .commands
         .iter()
@@ -275,6 +367,7 @@ fn direct_operation(
     manager: Option<PackageManager>,
 ) -> CheckOperation {
     CheckOperation {
+        input: false,
         command: command.into(),
         args: Some(args.iter().map(|argument| (*argument).into()).collect()),
         package_manager: manager,
@@ -818,7 +911,7 @@ async fn automatic_coverage_reuses_a_helpers_resolved_case_mapping() -> Result<(
     std::fs::write(workspace.path().join("source.txt"), "before")?;
     let mut check = definition("mapped", "print all");
     check.scope = CheckScope::ChangedFiles;
-    check.files = Some(CheckOperation { command: "do { let request = ($in | from json); {version: 1, selection: {kind: cases, cases: [{file: source.txt, name: mapped}]}} | to json | save --force $request.receipt_path; print checked }".into(), args: None, package_manager: None });
+    check.files = Some(CheckOperation { input: false, command: "do { let request = ($in | from json); {version: 1, selection: {kind: cases, cases: [{file: source.txt, name: mapped}]}} | to json | save --force $request.receipt_path; print checked }".into(), args: None, package_manager: None });
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     begin_recorded_task(workspace.path(), data.path(), &runner).await?;
@@ -1098,6 +1191,7 @@ fn new_case_scope_keeps_modified_cases_separate() -> Result<()> {
     let mut check = definition("new", "exit 0");
     check.scope = CheckScope::NewCases;
     check.cases = Some(CheckOperation {
+        input: false,
         command: "handler".into(),
         args: None,
         package_manager: None,
@@ -1139,8 +1233,7 @@ fn advertised_schema_accepts_file_trigger_and_direct_package_arguments() -> Resu
         version: 2,
         definitions: vec![check],
     })?;
-    value["definitions"][0]["trigger"] =
-        serde_json::json!({"kind":"files_changed", "include":["**/*.rs"]});
+    value["packages"]["trigger"] = serde_json::json!({"paths":["**/*.rs"]});
     serde_json::from_value::<CheckConfig>(value.clone())?.validate()?;
     let schema = serde_json::to_value(schemars::schema_for!(CheckConfig))?;
     let validator = jsonschema::validator_for(&schema).unwrap();
@@ -1518,6 +1611,7 @@ fn scoped_selection_receives_only_matching_files_and_cases() -> Result<()> {
     };
     check.scope = CheckScope::ChangedFiles;
     check.files = Some(CheckOperation {
+        input: false,
         args: None,
         package_manager: None,
         command: "files".into(),
@@ -1576,7 +1670,7 @@ async fn missing_case_inventory_and_empty_explicit_selection_cannot_skip_applica
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'unexpected full suite' | save unexpected.txt");
     check.scope = CheckScope::ChangedCases;
-    check.cases = Some(CheckOperation { args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()});
+    check.cases = Some(CheckOperation { input: false, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; 'selected case' | save --force selected.txt }".into()});
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let case_selection = CheckSelection::Cases {
@@ -1841,6 +1935,7 @@ async fn scoped_handlers_need_receipts_and_never_fallback_to_all() -> Result<()>
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "'wrong all' | save all-ran.txt");
     check.files = Some(CheckOperation {
+        input: false,
         args: None,
         package_manager: None,
         command: "print 'no receipt'".into(),
@@ -1876,7 +1971,7 @@ async fn scoped_input_preserves_paths_and_valid_receipts() -> Result<()> {
     let workspace = tempfile::tempdir()?;
     let data = tempfile::tempdir()?;
     let mut check = definition("unit", "exit 0");
-    check.files = Some(CheckOperation { args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
+    check.files = Some(CheckOperation { input: false, args: None, package_manager: None,command:"do { let request = ($in | from json); {version: 1, selection: $request.selection} | to json | save --force $request.receipt_path; $request.selection.files | to json | save --force received.json }".into()});
     save(workspace.path(), vec![check]);
     let runner = make_runner(workspace.path(), data.path());
     let path = "src/name $var; [case].rs".to_owned();

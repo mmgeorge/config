@@ -10879,7 +10879,7 @@ mod test {
                     .unwrap();
                 let started: Value = serde_json::from_str(
                     &scope
-                        .invoke("checks_run", json!({"ids":["verify"]}))
+                        .invoke("checks_run", json!({"check":"verify"}))
                         .await?,
                 )?;
                 loop {
@@ -10952,10 +10952,7 @@ mod test {
                 repair: false,
                 explicit: false,
             });
-            std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
-                "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
-                "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
-            }]}}).to_string())?;
+            std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"print queue-pass","label":"Verify","category":"test"}}}}).to_string())?;
             broker.observer.completion_queue.update(1, true)?;
             broker
                 .run_interaction(
@@ -11033,10 +11030,7 @@ mod test {
             repair: false,
             explicit: false,
         });
-        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
-            "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,
-            "trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"print queue-pass"}
-        }]}}).to_string())?;
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"print queue-pass","label":"Verify","category":"test"}}}}).to_string())?;
         assert_eq!(
             broker.snapshot()?.check_timing,
             crate::checks::CheckTiming::AfterQueue
@@ -11080,11 +11074,7 @@ mod test {
             repair: true,
             explicit: false,
         });
-        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{
-            "id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,
-            "trigger":{"kind":"files_changed","include":["seed.txt"]},
-            "all":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }"}
-        }]}}).to_string())?;
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }","label":"Verify","category":"test"}}}}).to_string())?;
         let (mut exchange, _, _) = broker
             .interaction_for_turn("Resumed edit", true, broker.clock.now_ms())
             .await?;
@@ -11149,7 +11139,7 @@ mod test {
                 repair,
                 explicit: true,
             });
-            std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{"id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"auto":true,"trigger":{"kind":"files_changed","include":["seed.txt"]},"all":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }"}}]}}).to_string())?;
+            std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true,"paths":["seed.txt"]},"action":{"command":"if ((open --raw seed.txt) | str contains fixed) { print ok } else { exit 7 }","label":"Verify","category":"test"}}}}).to_string())?;
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
                 broker.run_interaction(
@@ -11219,7 +11209,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir()?;
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"version":2,"definitions":[{"id":"verify","name":"Verify","area":"Tests","category":"test","enabled":true,"trigger":{"kind":"any_change"},"all":{"command":"print ok"}}]}}).to_string())?;
+        std::fs::write(repository.path().join(".forge.json"), json!({"checks":{"verify":{"trigger":{"auto":true},"action":{"command":"print ok","label":"Verify","category":"test"}}}}).to_string())?;
         let checkpoint = broker
             .checkpoint
             .as_ref()
@@ -12299,6 +12289,7 @@ mod test {
                     scope: Default::default(),
                     directory: ".".into(),
                     all: crate::checks::CheckOperation {
+                        input: false,
                         args: None,
                         package_manager: None,
                         command,
@@ -12633,9 +12624,7 @@ mod test {
             .plan_file
             .read_working_document(&broker.session.id, &plan.id)
             .unwrap();
-        std::fs::write(repository.path().join(".forge.json"),serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
-            "id":"unit","name":"Unit tests","area":"Core","trigger":{"kind":"any_change"},"category":"test","enabled":true,"all":{"command":"exit 0"}
-        }]}})).unwrap()).unwrap();
+        std::fs::write(repository.path().join(".forge.json"),serde_json::to_vec(&json!({"checks":{"unit":{"trigger":{"auto":true},"action":{"command":"exit 0","label":"Unit tests","category":"test"}}}})).unwrap()).unwrap();
         assert!(broker.refresh_check_review(&plan.id).unwrap());
         let after = broker
             .plan_file
@@ -18120,7 +18109,7 @@ mod test {
         let request = || -> Result<Value> {
             Ok(json!({
                 "expected_revision": broker.check_runner.catalog(None)?["revision"],
-                "config": {"version": 2, "definitions": []}
+                "config": {}
             }))
         };
         assert!(
@@ -18153,11 +18142,9 @@ mod test {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         std::fs::write(
             repository.path().join(".forge.json"),
-            serde_json::to_vec(&json!({"checks":{"version":2,"definitions":[{
-                "id":"configured", "name":"Configured check", "category":"test",
-                "enabled":true, "area":"Fixture", "trigger":{"kind":"manual"},
-                "all":{"command":"echo configured-check"}
-            }]}}))?,
+            serde_json::to_vec(
+                &json!({"checks":{"configured":{"trigger":{"auto":false},"action":{"command":"echo configured-check","label":"Configured check","category":"test"}}}}),
+            )?,
         )?;
         for permission in [PermissionMode::Read, PermissionMode::Write] {
             save_check_exchange(
@@ -18194,7 +18181,7 @@ mod test {
             let response: Value = serde_json::from_str(
                 &tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    scope.invoke("checks_run", json!({"ids":["configured"]})),
+                    scope.invoke("checks_run", json!({"check":"configured"})),
                 )
                 .await??,
             )?;
@@ -18211,7 +18198,7 @@ mod test {
                 scope
                     .invoke(
                         "checks_run",
-                        json!({"ids":["configured"],"command":"echo unconfigured"}),
+                        json!({"check":"configured","command":"echo unconfigured"}),
                     )
                     .await
                     .is_err(),
@@ -18221,7 +18208,7 @@ mod test {
                 scope
                     .invoke(
                         "checks_configure",
-                        json!({"expected_revision":"","config":{"version":2,"definitions":[]}}),
+                        json!({"expected_revision":"","config":{}}),
                     )
                     .await
                     .unwrap_err()
@@ -18231,7 +18218,7 @@ mod test {
             drop(lease);
             assert!(
                 scope
-                    .invoke("checks_run", json!({"ids":["configured"]}))
+                    .invoke("checks_run", json!({"check":"configured"}))
                     .await
                     .is_err(),
                 "inactive check scope admitted execution"
@@ -18265,7 +18252,7 @@ mod test {
                 broker.check_runner.session_owner(),
                 serde_json::from_value(json!({
                     "expected_revision": catalog["revision"],
-                    "config": {"version": 2, "definitions": []}
+                    "config": {}
                 }))
                 .unwrap(),
                 None,

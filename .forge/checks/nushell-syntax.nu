@@ -4,7 +4,8 @@ def main [--all] {
   let request_text = $in
   cd $repository_root
   let request = if $all { null } else { $request_text | from json }
-  let selected = if $all {
+  let full = $all or ($request != null and $request.selection.kind == "all")
+  let selected = if $full {
     let tracked = ^git ls-files --cached --others --exclude-standard -z -- '*.nu' | complete
     if $tracked.exit_code != 0 { error make {msg: $tracked.stderr} }
     $tracked.stdout | split row (char nul) | where {|entry| $entry != "" }
@@ -20,10 +21,10 @@ def main [--all] {
   for file in $files {
     if not ($file | str ends-with ".nu") { error make {msg: $"Not a Nushell file: ($file)"} }
     if not ($file | path exists) { print $"Verified removal: ($file)"; continue }
-    let passed = try { nu-check --debug $file } catch {|failure| print --stderr $failure.msg; false }
+    let passed = try { nu-check --debug ($file | path expand) } catch {|failure| print --stderr $failure.msg; false }
     print ({file: $file, passed: $passed} | to json --raw)
     if not $passed { $failures += 1 }
   }
-  if not $all { {version: 1, selection: {kind: "files", files: $files}} | to json --raw | save --force $request.receipt_path }
+  if not $all { {version: 1, selection: (if $full { {kind: "all"} } else { {kind: "files", files: $files} })} | to json --raw | save --force $request.receipt_path }
   if $failures > 0 { exit 1 }
 }

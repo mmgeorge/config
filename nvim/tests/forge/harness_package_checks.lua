@@ -8,12 +8,9 @@ for _, name in ipairs({ "first", "second" }) do
   vim.fn.writefile({ vim.json.encode({ name = name }) }, workspace .. "/packages/" .. name .. "/package.json")
 end
 vim.fn.writefile({ vim.json.encode({ name = "root", private = true, workspaces = { "packages/*" } }) }, workspace .. "/package.json")
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-  { id = "package-tests", name = "Package tests", category = "test", area = "Tests", enabled = true,
-    trigger = { kind = "files_changed", include = { "packages/**" } }, scope = "changed_files", directory = ".",
-    all = { command = "print all" }, files = { command = "nu", package_manager = "npm",
-      args = { "--no-config-file", "-c", "print '{package.name}'" } }, depends_on = {} },
-} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = {
+  ["package-tests"] = { trigger = { auto = true, paths = { "packages/**" } }, action = { command = { "nu",  "--no-config-file", "-c", "print '{package}'"  }, label = "Package tests", directory = ".", category = "test", package_manager = "npm", after = {} } }
+} }) }, workspace .. "/.forge.json")
 local binary = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), binary))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
@@ -48,10 +45,8 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10), table.concat(errors, "\n"))
   assert(request("checks.list").configured)
-  local id = request("checks.run", { ids = { "package-tests" }, selections = {
-    ["package-tests"] = { kind = "files", files = {
+  local id = request("checks.run", { check = "package-tests", files = {
       "packages/first/src/one.ts", "packages/first/src/two.ts", "packages/second/src/one.ts",
-    } },
   } }).run_id
   local run
   assert(vim.wait(10000, function()

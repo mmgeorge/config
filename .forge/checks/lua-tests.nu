@@ -165,16 +165,17 @@ def main [
     {suite: "transport", pattern: '^nvim/lua/forge/client\.lua$|^nvim/lua/forge/receive\.lua$|^nvim/lua/forge/protocol[^/]*\.lua$|^nvim/lua/forge/json_transfer\.lua$|^nvim/lua/rust_sidecar/.*$|^nvim/lua/forge/builder\.lua$|^nvim/lua/forge/infra/notifications\.lua$|^nvim/lua/forge/protocol\.lua$|^nvim/lua/forge/init\.lua$|^nvim/lua/forge/status\.lua$|^nvim/lua/forge/startup_log\.lua$|^nvim/lua/plugins/forge\.lua$|^nvim/lua/forge/integrations/commit\.lua$|^nvim/lua/forge/buffer\.lua$|^nvim/lua/forge/snapshot\.lua$|^nvim/lua/forge/session\.lua$|^nvim/lua/forge/types\.lua$|^nvim/lua/forge/protocol_contract\.json$|^nvim/lua/forge/shared/.*$|^\.forge/checks/lua-tests\.nu$'} 
   ]
   let request = if $all { null } else { $request_text | from json }
-  if not $all and ($request.version != 1 or $request.selection.kind != "files") {
+  let full = $all or ($request != null and $request.selection.kind == "all")
+  if not $full and ($request.version != 1 or $request.selection.kind != "files") {
     error make {msg: "Lua selection requires a version 1 files request"}
   }
-  let input_paths = if $all { [] } else {
+  let input_paths = if $full { [] } else {
     $request.selection.files | each {|entry|
       $entry | path expand | path relative-to $repository_root | str replace --all '\' '/'
     } | uniq
   }
-  let selected = if $all {
-    if $suite == "all" { $automatic | values | flatten | append $unclassified } else if $suite == "shared" {
+  let selected = if $full {
+    if $suite == "all" or $suite == "affected" { $automatic | values | flatten | append $unclassified } else if $suite == "shared" {
       $registry.shared | append $unclassified
     } else { $registry | get $suite }
   } else if $suite == "affected" {
@@ -236,3 +237,4 @@ def main [
   print ({passed: (($test_list | length) - $failure_count), failed: $failure_count} | to json --raw)
   if $failure_count > 0 { exit 1 }
 }
+

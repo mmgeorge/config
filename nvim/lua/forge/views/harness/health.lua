@@ -1,6 +1,7 @@
 local M = {}
 local client = require("forge.client")
 local diagnostic = require("forge.views.harness.diagnostic")
+local task_control = require("forge.views.harness.task")
 
 ---@class HarnessStatusNotice
 ---@field text string
@@ -19,6 +20,15 @@ function M.notice(state)
     or diagnostic.get(state, "sync_error", "info")
     or state.presentation and diagnostic.get(state.presentation, "sync_failure", "info")
   if notice then return notice end
+  if not state.status or state.status.kind ~= "idle" or state.checks_running
+    or state.task_operation or state.active_elicitation or state.aborting_plan then return end
+  local submission = state.busy and state.prompt_submission
+  local entry = submission and submission.queue_entry or (state.queue or {})[1]
+  if not entry or state.queue_edit and state.queue_edit.barrier == entry then return end
+  if type(entry) == "table" and entry.task_id ~= (state.session and state.session.current_task_id) then return end
+  local task = task_control.current(state)
+  if task and vim.tbl_contains({ "paused", "blocked", "failed", "stopping" }, task.status) then return end
+  return { text = "Working", animated = true, hint = "working" }
 end
 
 ---@param state table

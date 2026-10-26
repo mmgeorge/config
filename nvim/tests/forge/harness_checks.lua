@@ -7,12 +7,16 @@ local picker_state = require("forge.views.picker.state")
 local checks = require("forge.views.harness.checks")
 local session = require("forge.session")
 local original = client.request_for
+local notifications = require("forge.infra.notifications")
+local original_error = notifications.error
+local errors = {}
+notifications.error = function(message) errors[#errors + 1] = message end
 local catalog = {
-  configured = true, revision = "fixture", overrides = { enabled = vim.empty_dict(), scopes = vim.empty_dict() }, history = {},
-  snapshot = { config = { definitions = {
-    { id = "unit", name = "Unit tests", area = "Core", trigger = {kind = "paths", include = {"src/**"}, exclude = {}}, category = "test", enabled = true, scope = "all", directory = ".", all = { command = "runner all" }, files = { command = "runner files" }, cases = { command = "runner cases" }, depends_on = {} },
-    { id = "screenshots", name = "Screenshot tests", area = "UI", trigger = {kind = "paths", include = {"ui/**"}, exclude = {}}, category = "test", enabled = false, scope = "all", directory = ".", all = { command = "visual tests" }, depends_on = { "unit" } },
-  } } },
+  configured = true, revision = "fixture", overrides = { enabled = { screenshots = false }, scopes = vim.empty_dict() }, history = {},
+  snapshot = { config = {
+    unit = { trigger = {auto = true, paths = {"src/**"}}, action = {label = "Unit tests", category = "test", directory = "Core", command = "runner all"} },
+    screenshots = { trigger = {paths = {"ui/**"}}, action = {label = "Screenshot tests", category = "test", directory = "UI", command = "visual tests", after = {"unit"}} },
+  } },
   applicability = {
     {id = "unit", selected = true, reason = "Changed: src/core.rs", matched_files = {"src/core.rs"}},
     {id = "screenshots", selected = false, reason = "No matching task changes", matched_files = {}},
@@ -21,7 +25,7 @@ local catalog = {
 local calls = {}
 local load_failure
 local output_path = string.rep("path/", 40) .. "result.log"
-catalog.history = {{ id = "pending-run", state = "running", commands = {{ command = "runner all", context = { definition_id = "unit" }, state = "pending", started_at_ms = vim.NIL, completed_at_ms = vim.NIL, output = output_path }} }}
+catalog.history = {{ id = "pending-run", state = "running", context = {trigger = "Agent requested"}, lifecycle = {{kind = "started", text = "Checks started · Agent requested · 1 selected"}}, commands = {{ command = "runner all", context = { definition_id = "unit" }, state = "pending", started_at_ms = vim.NIL, completed_at_ms = vim.NIL, output = output_path }} }}
 client.request_for = function(_, method, params, callback)
   calls[#calls + 1] = { method = method, params = params }
   if method == "checks.list" and load_failure then callback(nil, load_failure) return end
@@ -71,12 +75,12 @@ local function key(value)
 end
 
 assert(row("screenshots").columns[2] == "test", "screenshot suites must remain dynamic named test checks")
-assert(row("unit").columns[5] == "Core", "functional area must be visible")
+assert(row("unit").columns[4] == "Core", "functional area must be visible")
 assert(row("unit").columns[1] == "● Unit tests", "enabled checks need a filled circle without numbering")
 assert(row("screenshots").columns[1] == "○ Screenshot tests", "disabled checks need an empty circle")
 local current = picker._state_for_test()
 local page = picker_state.page(current.state, current.spec)
-assert(vim.deep_equal(page.column_headers, { "Check", "Category", "Scope", "Auto", "Area" }))
+assert(vim.deep_equal(page.column_headers, { "Check", "Category", "Auto", "Directory" }))
 assert(#page.option_list == 2, "the definitions page must only contain check rows")
 for _, option in ipairs(page.option_list) do
   assert(option.value and option.value.category, "setup, run, reset, and save actions must be absent")
@@ -88,28 +92,25 @@ end
 select("unit")
 current = picker._state_for_test()
 assert(picker_state.page(current.state, current.spec).subtitle == nil, "selection details must not appear above the table")
-current.spec.on_confirm({ option = row("unit") })
-assert(calls[#calls - 1].method == "checks.run"
-  and vim.deep_equal(calls[#calls - 1].params, { ids = { "unit" } }), "Enter must run only the selected check")
+local call_count = #calls
+assert(current.spec.on_confirm({ option = row("unit") }) == false)
+assert(#calls == call_count, "Enter must not run a check")
+assert(not page.footer:find("↵ run", 1, true), "the footer must not advertise Enter to run")
 
 key("<Space>")
 assert(catalog.overrides.enabled.unit == false, "Space must toggle the selected check through the host")
 assert(row("unit").columns[1] == "○ Unit tests")
-assert(catalog.snapshot.config.definitions[1].enabled, "temporary toggles must preserve project defaults")
+assert(catalog.snapshot.config.unit.trigger.auto, "temporary toggles must preserve project defaults")
 key("<Right>")
-assert(catalog.overrides.scopes.unit == "changed_files", "arrows must change the focused scope")
-key("<Tab>")
-key("<Right>")
-assert(catalog.overrides.auto.unit == false, "Tab must focus Auto for arrow-key changes")
+assert(catalog.overrides.auto.unit == false, "arrows must toggle automatic execution")
 key("<Space>")
 assert(catalog.overrides.enabled.unit and catalog.overrides.auto.unit == false,
-  "Space must toggle enabled state independently of the focused field")
-key("<Tab>")
+  "Space must toggle enabled state independently of automatic execution")
 key("<Left>")
-assert(catalog.overrides.scopes.unit == "all", "Tab must cycle back to Scope")
+assert(catalog.overrides.auto.unit == true, "Left must toggle automatic execution")
 
 action("details", { option = row("unit") })
-assert(row("unit").child_line_list[2] == "All: runner all", "expanded rows must show concrete commands")
+assert(row("unit").child_line_list[2] == "Action: runner all", "expanded rows must show concrete commands")
 action("details", { option = row("screenshots") })
 assert(row("screenshots").child_line_list[3] == "Prerequisites: unit", "details must expose dependencies")
 local frame = require("forge.views.picker.layout").build(picker_state.page(picker._state_for_test().state, picker._state_for_test().spec), 1, 80)
@@ -128,6 +129,12 @@ assert(picker_state.selected_option(current.state, current.spec).id == "screensh
 key("]")
 current = picker._state_for_test()
 assert(picker_state.page(current.state, current.spec).id == "history", "history must be reachable while arrows edit values")
+assert(picker_state.page(current.state, current.spec).option_list[1].label == "Checks",
+  "history must not label checks by who requested them")
+action("details", {option = picker_state.page(current.state, current.spec).option_list[1]})
+current = picker._state_for_test()
+assert(not table.concat(picker_state.page(current.state, current.spec).option_list[1].child_line_list, "\n"):find("Agent requested", 1, true),
+  "history details must omit the requester-bearing start event")
 key("R")
 current = picker._state_for_test()
 assert(picker_state.page(current.state, current.spec).id == "history", "refresh must preserve the history page")
@@ -135,7 +142,40 @@ assert(vim.fn.maparg("<Space>", "n") == "", "the history page must not retain th
 key("<Left>")
 current = picker._state_for_test()
 assert(picker_state.page(current.state, current.spec).id == "checks", "history arrows must restore page navigation")
+
+local valid_config = vim.deepcopy(catalog.snapshot.config)
+catalog.snapshot.config = { version = 2, definitions = {} }
+action("refresh")
+current = picker._state_for_test()
+assert(row("error").label:find("schema mismatch", 1, true), "old host schemas must show a repair error")
+assert(row("unit").columns[1] == "● Unit tests", "a failed refresh must retain the last valid rows")
+local failure_count = #errors
+action("refresh")
+assert(#errors == failure_count, "unchanged schema errors must not repeat notifications")
+select("unit")
+call_count = #calls
+action("toggle")
+action("next")
+current.spec.on_confirm({ option = row("unit") })
+assert(#calls == call_count, "retained rows must not mutate an incompatible host")
+catalog.snapshot.config = valid_config
+action("refresh")
+assert(#picker_state.page(picker._state_for_test().state, picker._state_for_test().spec).option_list == 2,
+  "a valid response must remove the error row")
+
 picker.close(false)
+for _, malformed in ipairs({
+  { unit = { trigger = {} } },
+  { unit = { action = { command = {} } } },
+  { unit = { action = { command = "exit 0", after = { "missing" } } } },
+}) do
+  catalog.snapshot.config = malformed
+  checks.open(session.harness, host)
+  assert(row("error").label:find("Invalid check", 1, true), "malformed checks must not crash the callback")
+  assert(#picker_state.page(picker._state_for_test().state, picker._state_for_test().spec).option_list == 1,
+    "an invalid initial response must not publish partial check rows")
+  picker.close(false)
+end
 catalog.configured, catalog.snapshot, catalog.error = false, nil, "checks_not_configured: use /checks setup"
 checks.open(session.harness, host)
 current = picker._state_for_test()
@@ -156,5 +196,6 @@ action("next")
 assert(#calls == call_count, "error rows must not run or change a previously selected check")
 picker.close(false)
 client.request_for = original
+notifications.error = original_error
 io.write("harness_checks OK\n")
 vim.cmd("qa!")

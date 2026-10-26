@@ -315,8 +315,8 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "checks_run",
-                description: "Optionally run enabled configured checks for earlier feedback. Checks run automatically at the configured queue boundary, so manual runs are generally unnecessary. Supports IDs and optional file or exact test-case selections, never replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
-                input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::RunRequest))
+                description: "Run a saved check by name. By default its trigger selects current changed files. Optionally supply exactly one of files, packages, tests, or all to override coverage. Package and test selectors require a configured package manager. Never accepts replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
+                input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::CheckRunRequest))
                     .expect("check run schema is serializable"),
             },
             ControlToolDefinition {
@@ -809,11 +809,11 @@ mod test {
             ("checks_list", json!({})),
             (
                 "checks_configure",
-                json!({"expected_revision":"revision","config":{"version":2,"definitions":[]}}),
+                json!({"expected_revision":"revision","config":{}}),
             ),
             (
                 "checks_run",
-                json!({"ids":["unit"],"selections":{"unit":{"kind":"cases","cases":[{"file":"src/lib.rs","name":"tests::example","target":"lib"}]}}}),
+                json!({"check":"unit","tests":["tests::example"]}),
             ),
             (
                 "checks_status",

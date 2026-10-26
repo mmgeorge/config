@@ -33,7 +33,7 @@ local function press(key)
   mapping.callback()
 end
 local function start_check()
-  local run_id = request("checks.run", { ids = { "slow" } }).run_id
+  local run_id = request("checks.run", { check = { "slow" } }).run_id
   assert(vim.wait(5000, function()
     return state.checks_running and state.active_check_run == run_id and rows():find("Shortcut check is running", 1, true)
   end, 10), "check did not become active")
@@ -47,10 +47,9 @@ local function compose(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
 end
 local succeeded, failure = xpcall(function()
-  vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-    { id = "slow", name = "Shortcut check", category = "test", area = "Fixture", enabled = true, auto = false,
-      trigger = { kind = "manual" }, all = { command = "print 'Shortcut check is running'; sleep 30sec" } },
-  } } }) }, workspace .. "/.forge.json")
+  vim.fn.writefile({ vim.json.encode({ checks = {
+  ["slow"] = { trigger = { auto = false }, action = { command = "print 'Shortcut check is running'; sleep 30sec", label = "Shortcut check", category = "test" } }
+} }) }, workspace .. "/.forge.json")
   vim.api.nvim_set_current_dir(workspace)
   require("forge").setup({ diff_logging = false, harness_logging = false,
     harness = { backend = "mock", backends = { mock = { command = { "mock" }, selectable = true } } } })

@@ -19,6 +19,8 @@ use std::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+const CHECK_HISTORY_VERSION: u32 = 4;
+
 /// Owns project check admission, durable run history, and process cancellation for one session.
 pub struct CheckSupervisor {
     pub(crate) session_id: String,
@@ -255,11 +257,13 @@ impl CheckSupervisor {
             if !path.exists() {
                 continue;
             }
-            let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)?;
-            if value["version"] != 3 {
+            let value: serde_json::Value = crate::codec::from_slice(&std::fs::read(&path)?)
+                .with_context(|| format!("decode check history {}", path.display()))?;
+            if value["version"] != CHECK_HISTORY_VERSION {
                 continue;
             }
-            let run: CheckRun = crate::codec::from_value(value["run"].clone())?;
+            let run: CheckRun = crate::codec::from_value(value["run"].clone())
+                .with_context(|| format!("decode current check history {}", path.display()))?;
             ensure!(
                 directory.file_name().to_string_lossy() == run.id,
                 "check history identity differs from its directory"
@@ -554,11 +558,7 @@ impl CheckSupervisor {
         run.record(
             CheckEventKind::Started,
             None,
-            format!(
-                "Checks started · {} · {} selected",
-                run.context.as_ref().unwrap().trigger,
-                requested.len()
-            ),
+            format!("Checks started · {} selected", requested.len()),
         );
         Ok(run)
     }
@@ -577,12 +577,23 @@ impl CheckSupervisor {
                 commands.push(check);
                 continue;
             }
+            let definition = run
+                .context
+                .as_ref()
+                .context("check run context is missing")?
+                .snapshot
+                .config
+                .definitions
+                .iter()
+                .find(|definition| definition.id == context.definition_id)
+                .context("configured check is missing")?;
             match resolver
-                .resolve(
+                .resolve_check(
                     &self.workspace,
                     &context.directory,
                     context.operation.as_ref().unwrap(),
                     &context.selection,
+                    &definition.trigger,
                 )
                 .await
             {
@@ -1210,7 +1221,21 @@ impl CheckSupervisor {
                 cases: invocation.cases.clone(),
             });
         }
-        let scoped = native.is_none() && !matches!(context.selection, CheckSelection::All);
+        let input = super::supervisor::operation(
+            run.context
+                .as_ref()
+                .context("check context unavailable")?
+                .snapshot
+                .config
+                .definitions
+                .iter()
+                .find(|definition| definition.id == context.definition_id)
+                .context("check definition unavailable")?,
+            &context.selection,
+        )
+        .is_some_and(|operation| operation.input);
+        let scoped =
+            input || (native.is_none() && !matches!(context.selection, CheckSelection::All));
         let source = if scoped && run.shell == crate::session::CheckShell::Nushell {
             format!("$in | {}", run.commands[index].command)
         } else {
@@ -1218,7 +1243,11 @@ impl CheckSupervisor {
         };
         let mut command = if let Some(invocation) = native {
             let mut command = crate::process::command(&invocation.program, &invocation.args);
-            command.stdin(std::process::Stdio::null());
+            command.stdin(if scoped {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            });
             command
         } else {
             let executable = run.executable.as_ref().ok_or_else(|| {
@@ -1523,6 +1552,8 @@ pub(super) fn operation<'definition>(
     match selection {
         CheckSelection::All => Some(&definition.all),
         CheckSelection::Files { .. } => definition.files.as_ref(),
+        CheckSelection::Packages { .. } => definition.files.as_ref(),
+        CheckSelection::Tests { .. } => definition.cases.as_ref(),
         CheckSelection::Cases { .. } => definition.cases.as_ref(),
     }
 }
@@ -1531,7 +1562,7 @@ pub(super) fn operation<'definition>(
 pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
     if path.exists() {
         let existing: serde_json::Value = crate::codec::from_slice(&std::fs::read(path)?)?;
-        if existing["version"] == 3 {
+        if existing["version"] == CHECK_HISTORY_VERSION {
             let previous: CheckRun = crate::codec::from_value(existing["run"].clone())?;
             ensure!(previous.owner == run.owner, "check ownership cannot change");
         }
@@ -1540,7 +1571,7 @@ pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
     let temporary = path.with_extension("tmp");
     std::fs::write(
         &temporary,
-        crate::codec::to_vec(&serde_json::json!({"version":3,"run":crate::codec::to_value(run)?}))?,
+        crate::codec::to_vec(&serde_json::json!({"version":CHECK_HISTORY_VERSION,"run":crate::codec::to_value(run)?}))?,
     )?;
     std::fs::rename(temporary, path)?;
     Ok(())

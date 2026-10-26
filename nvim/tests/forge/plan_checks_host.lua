@@ -21,11 +21,9 @@ local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
-local config = vim.json.encode({ checks = { version = 2, definitions = {{
-  id = "tests", name = "Package tests", category = "test", area = "Project", enabled = true,
-  trigger = { kind = "any_change" }, scope = "all", directory = ".", depends_on = {},
-  all = { command = "cargo", args = { "+nightly-2026-04-01-x86_64-pc-windows-msvc", "fmt", "--all", "--", "--check" } },
-}} } })
+local config = vim.json.encode({ checks = {
+  ["tests"] = { trigger = { auto = true }, action = { command = { "cargo",  "+nightly-2026-04-01-x86_64-pc-windows-msvc", "fmt", "--all", "--", "--check"  }, label = "Package tests", directory = ".", category = "test", after = {} } }
+} })
 vim.fn.writefile({ config }, workspace .. "/.forge.json")
 assert(vim.system({ "git", "init", workspace }, { text = true }):wait(10000).code == 0)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")

@@ -2154,6 +2154,7 @@ function M.edit_queued(direction)
   local draft = composer_text(state.composer_buf)
   local text, failure, attachments = queue_editor.move(state, draft, direction)
   if failure then notifications.warn(failure, "ForgeHarness") return end
+  vim.cmd.stopinsert()
   set_composer_text(state.composer_buf, text, attachments)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)

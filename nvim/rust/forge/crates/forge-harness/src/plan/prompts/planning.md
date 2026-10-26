@@ -392,8 +392,7 @@ Include inline test modules and separate test files consistently. List existing 
 reused, omit unrelated repository tests, and use [] when no tests apply. Keep names unique within
 a file and list each file once. Native Cargo case checks require the full runtime test name.
 Use the optional target field (lib, bin:<name>, or test:<name>) when a file belongs to multiple
-Cargo test targets. new_cases checks select only new entries, while changed_cases checks select
-new and modified entries. Tests is rendered
+Cargo test targets. Tests is rendered
 before Verification and records planned coverage. Verification retains execution commands and manual checks.
 Objective, Background, and Design must be nonempty before submission.
 

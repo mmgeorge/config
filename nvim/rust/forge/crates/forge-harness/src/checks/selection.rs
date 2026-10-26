@@ -24,6 +24,12 @@ pub enum CheckSelection {
     Files {
         files: Vec<String>,
     },
+    Packages {
+        packages: Vec<String>,
+    },
+    Tests {
+        tests: Vec<String>,
+    },
     Cases {
         cases: Vec<CheckCase>,
     },
@@ -41,6 +47,26 @@ impl CheckSelection {
                 files.sort();
                 files.dedup();
             }
+            Self::Packages { packages } => {
+                ensure!(
+                    packages
+                        .iter()
+                        .all(|name| !name.is_empty() && !name.chars().any(char::is_control)),
+                    "invalid package name"
+                );
+                packages.sort();
+                packages.dedup();
+            }
+            Self::Tests { tests } => {
+                ensure!(
+                    tests.iter().all(|name| !name.is_empty()
+                        && !name.starts_with('-')
+                        && !name.chars().any(char::is_control)),
+                    "invalid test name"
+                );
+                tests.sort();
+                tests.dedup();
+            }
             Self::Cases { cases } => {
                 for case in cases.iter() {
                     super::config::relative_path(&case.file)?;
@@ -49,9 +75,10 @@ impl CheckSelection {
                         "invalid test case name"
                     );
                     ensure!(
-                        case.target.as_ref().is_none_or(|target| !target.is_empty()
-                            && target.len() <= 256
-                            && !target.chars().any(char::is_control)),
+                        case.target
+                            .as_ref()
+                            .is_none_or(|target| !target.is_empty()
+                                && !target.chars().any(char::is_control)),
                         "invalid test target"
                     );
                 }
@@ -66,8 +93,81 @@ impl CheckSelection {
         match self {
             Self::All => false,
             Self::Files { files } => files.is_empty(),
+            Self::Packages { packages } => packages.is_empty(),
+            Self::Tests { tests } => tests.is_empty(),
             Self::Cases { cases } => cases.is_empty(),
         }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Runs one saved check, with at most one explicit coverage override.
+pub struct CheckRunRequest {
+    pub check: CheckNames,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub files: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packages: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tests: Option<Vec<String>>,
+    #[serde(default)]
+    pub all: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, JsonSchema, Serialize)]
+#[serde(untagged)]
+pub enum CheckNames {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl TryFrom<CheckRunRequest> for RunRequest {
+    type Error = anyhow::Error;
+
+    fn try_from(request: CheckRunRequest) -> Result<Self> {
+        let names = match request.check {
+            CheckNames::One(name) => vec![name],
+            CheckNames::Many(names) => names,
+        };
+        ensure!(
+            !names.is_empty() && names.iter().all(|name| !name.is_empty()),
+            "check is required"
+        );
+        ensure!(
+            usize::from(request.files.is_some())
+                + usize::from(request.packages.is_some())
+                + usize::from(request.tests.is_some())
+                + usize::from(request.all)
+                <= 1,
+            "choose only one of files, packages, tests, or all"
+        );
+        let selection = if let Some(files) = request.files {
+            Some(CheckSelection::Files { files })
+        } else if let Some(packages) = request.packages {
+            Some(CheckSelection::Packages { packages })
+        } else if let Some(tests) = request.tests {
+            Some(CheckSelection::Tests { tests })
+        } else if request.all {
+            Some(CheckSelection::All)
+        } else {
+            None
+        };
+        let mut result = Self {
+            ids: names.clone(),
+            ..Self::default()
+        };
+        if let Some(mut selection) = selection {
+            selection.normalize()?;
+            ensure!(
+                !selection.empty(),
+                "explicit check selection cannot be empty"
+            );
+            for name in names {
+                result.selections.insert(name, selection.clone());
+            }
+        }
+        Ok(result)
     }
 }
 
@@ -185,7 +285,7 @@ impl CheckReceipt {
         ensure!(self.version == 1, "unsupported selection receipt version");
         self.selection.normalize()?;
         ensure!(
-            !self.selection.empty() && !matches!(self.selection, CheckSelection::All),
+            !self.selection.empty(),
             "requested scope resolved to no tests or a broader suite"
         );
         Ok(())
@@ -195,6 +295,17 @@ impl CheckReceipt {
     pub(crate) fn validate_request(&mut self, requested: &CheckSelection) -> Result<()> {
         self.validate()?;
         let contained = match (requested, &self.selection) {
+            (CheckSelection::All, _) => true,
+            (
+                CheckSelection::Packages {
+                    packages: requested,
+                },
+                CheckSelection::Packages { packages: resolved },
+            ) => resolved.iter().all(|name| requested.contains(name)),
+            (
+                CheckSelection::Tests { tests: requested },
+                CheckSelection::Tests { tests: resolved },
+            ) => resolved.iter().all(|name| requested.contains(name)),
             (
                 CheckSelection::Files { files: requested },
                 CheckSelection::Files { files: resolved },

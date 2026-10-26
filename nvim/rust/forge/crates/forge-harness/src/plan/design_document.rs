@@ -286,16 +286,13 @@ mod tests {
     fn complete_check_selection_preserves_every_configured_choice() {
         let definitions = (0..129)
             .map(|index| {
-                serde_json::json!({
-                    "id": format!("check_{index}"), "name": format!("Check {index}"),
-                    "category": "test", "enabled": true, "area": "Project",
-                    "trigger": {"kind": "manual"}, "all": {"command": "test"},
-                })
+                (format!("check_{index}"), serde_json::json!({
+                    "trigger": {}, "action": {"label": format!("Check {index}"), "category": "test", "command": "test"}
+                }))
             })
-            .collect::<Vec<_>>();
+            .collect::<serde_json::Map<String, serde_json::Value>>();
         let config: crate::checks::CheckConfig =
-            serde_json::from_value(serde_json::json!({"version": 2, "definitions": definitions}))
-                .unwrap();
+            serde_json::from_value(serde_json::Value::Object(definitions)).unwrap();
         let changes = config
             .definitions
             .iter()

@@ -1755,11 +1755,11 @@ mod test {
             .connection
             .execute(
                 "INSERT INTO plan_record(id,session_id,payload) VALUES('old-plan','current',?1)",
-                [r#"{"id":"old-plan","schema_version":4}"#],
+                [r#"{"id":"old-plan","schema_version":13}"#],
             )
             .unwrap();
         store.connection.execute("INSERT INTO plan_execution_record(id,session_id,payload) VALUES('old-execution','current',?1)",
-            [r#"{"id":"old-execution","goal_id":"old-goal","schema_version":4}"#]).unwrap();
+            [r#"{"id":"old-execution","goal_id":"old-goal","schema_version":13}"#]).unwrap();
         store
             .connection
             .execute(

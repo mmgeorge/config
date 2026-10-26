@@ -11,6 +11,12 @@ end
 local history = require("forge.views.harness.prompt_history")
 local notifications = require("forge.infra.notifications")
 local requests, warnings = {}, {}
+local original_stopinsert = vim.cmd.stopinsert
+local normal_mode_requests = 0
+vim.cmd.stopinsert = function()
+  normal_mode_requests = normal_mode_requests + 1
+  original_stopinsert()
+end
 client.request = function(method, params, callback)
   if method == "backend.model_pins" then callback({}) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
@@ -45,6 +51,7 @@ local success, failure = xpcall(function()
   compose("original composer draft")
 
   controller.edit_queued(-1)
+  assert(normal_mode_requests == 1, "entering queue editing must leave Insert mode")
   assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == third_entry
     and #state.queue == 3 and state.queue[1] == prior_entry and state.queue[2] == second_entry
     and state.queue[3] == third_entry, "editing the tail changed queue order or chose the wrong barrier")
@@ -55,6 +62,7 @@ local success, failure = xpcall(function()
     and state.queue_edit.barrier == second_entry, "moving backward did not retain the third-entry draft")
   compose("second edited")
   controller.edit_queued(1)
+  assert(normal_mode_requests == 3, "navigating queued messages must return to Normal mode")
   assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == second_entry
     and composer_text() == "/model rejected impossible prompt", "forward navigation changed the barrier or lost a draft")
   controller.edit_queued(-1)
@@ -134,6 +142,7 @@ local success, failure = xpcall(function()
 end, debug.traceback)
 
 if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
+vim.cmd.stopinsert = original_stopinsert
 if vim.api.nvim_buf_is_valid(state.composer_buf) then vim.api.nvim_buf_delete(state.composer_buf, { force = true }) end
 if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
 print("harness_queue_edit: passed")

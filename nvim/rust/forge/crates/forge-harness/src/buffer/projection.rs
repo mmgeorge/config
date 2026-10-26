@@ -7708,7 +7708,7 @@ mod tests {
                 .text
                 .wire_rows()
                 .iter()
-                .any(|row| row.contains("Plan verification"))
+                .any(|row| row.starts_with("Checks running · 0/0 finished · "))
         );
         let document = forge_buffer::document::BufferDocument::new(
             forge_buffer::identity::DocumentId("check-clock".into()),

@@ -3,7 +3,7 @@ vim.loader.enable(false)
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace, "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-vim.fn.writefile({vim.json.encode({checks={version=2,definitions={}}})},workspace .. "/.forge.json")
+vim.fn.writefile({vim.json.encode({checks=vim.empty_dict()})},workspace .. "/.forge.json")
 local executable = require("forge.builder").binary_path()
 local original_stdpath = vim.fn.stdpath
 vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end

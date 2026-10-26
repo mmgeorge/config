@@ -43,7 +43,7 @@ assert(vim.deep_equal(initial_padding, vim.api.nvim_buf_get_extmark_by_id(docume
   "repeated refresh accumulated spacing")
 
 commit({ "short response" }, { "", "Working · 2s", "Checks running · 0/1 finished", "  Cargo tests · 1s" },
-  { "Queued follow-up inputs", "• Keep the full queue visible", "• " .. string.rep("wrapped follow-up ", 10) })
+  { "", "Queued follow-up inputs", "• Keep the full queue visible", "• " .. string.rep("wrapped follow-up ", 10) })
 assert_bottom()
 local status_row = region.location(document)
 assert(vim.api.nvim_buf_get_lines(document.buffer, status_row, status_row + 1, false)[1] == "Working · 2s")
@@ -58,7 +58,7 @@ vim.wo[window].winbar = ""
 
 local history = {}
 for index = 1, 100 do history[index] = "history " .. index end
-commit(history, { "", "Working · 3s" }, { "Queued follow-up inputs", "• Later" })
+commit(history, { "", "Working · 3s" }, { "", "Queued follow-up inputs", "• Later" })
 assert(#vim.api.nvim_buf_get_extmarks(document.buffer, namespace, 0, -1, {}) == 0,
   "long transcripts retained unnecessary padding")
 vim.api.nvim_win_set_cursor(window, { 12, 3 })

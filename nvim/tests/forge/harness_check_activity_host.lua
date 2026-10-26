@@ -21,15 +21,11 @@ local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 vim.fn.mkdir(workspace, "p")
 vim.fn.mkdir(data, "p")
 local hold = vim.g.forge_check_activity_hold or 0
-vim.fn.writefile({ vim.json.encode({ checks = { version = 2, definitions = {
-  { id = "activity", name = "Activity fixture", category = "test", area = "Fixture", enabled = true,
-    auto = false, trigger = { kind = "manual" }, scope = "all", directory = ".",
-    all = { command = "nu", args = { "--no-config-file", "-c",
-      ("sleep %dms; print 'retained check output'"):format(hold + 1200) } }, depends_on = {} },
-  { id = "unused", name = "Unused fixture", category = "test", area = "Fixture", enabled = true,
-    auto = false, trigger = { kind = "manual" }, scope = "all", directory = ".",
-    all = { command = "nu", args = { "--no-config-file", "-c", "exit 9" } }, depends_on = {} },
-} } }) }, workspace .. "/.forge.json")
+vim.fn.writefile({ vim.json.encode({ checks = {
+  ["activity"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c",
+      ("sleep %dms; print 'retained check output'"):format(hold + 1200)  }, label = "Activity fixture", directory = ".", category = "test", after = {} } },
+  ["unused"] = { trigger = { auto = false }, action = { command = { "nu",  "--no-config-file", "-c", "exit 9"  }, label = "Unused fixture", directory = ".", category = "test", after = {} } }
+} }) }, workspace .. "/.forge.json")
 local executable = data .. "/forge-host" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
@@ -94,7 +90,7 @@ local succeeded, failure = xpcall(function()
     "provider did not start: " .. tostring(prompt_failure) .. "\n" .. transcript() .. "\n" .. table.concat(errors, "\n"))
   request("turn.cancel")
   assert(vim.wait(3000, function() return transcript():find("Idle", 1, true) ~= nil end, 10))
-  local run_id = request("checks.run", { ids = { "activity" } }).run_id
+  local run_id = request("checks.run", { check = { "activity" } }).run_id
   assert(vim.wait(3000, function()
     answer_permissions()
     return transcript():find("Activity fixture", 1, true) ~= nil
@@ -105,6 +101,8 @@ local succeeded, failure = xpcall(function()
   assert(snapshot.status.kind == "idle", "check replaced the primary phase")
   local running = transcript()
   local phase_row, checks_row = running:find("Checking", 1, true), running:find("Checks running", 1, true)
+  assert(not running:find("User requested", 1, true) and not running:find("Agent requested", 1, true),
+    "check progress must not expose requester labels")
   assert(phase_row and checks_row and phase_row < checks_row, running)
   assert(not running:find("retained check output", 1, true), "running status exposed check output")
   assert_status_region()
@@ -162,7 +160,11 @@ local succeeded, failure = xpcall(function()
   })
   state = require("forge.session").harness
   assert(vim.wait(5000, function() return transcript():find("Checks finished", 1, true) ~= nil end, 10),
-    "restored exchange hid its check summary inside collapsed activity: " .. transcript())
+    "restored exchange hid its check summary inside collapsed activity: " .. transcript()
+      .. "\nhistory=" .. vim.inspect(vim.tbl_map(function(entry)
+        return {id = entry.id, state = entry.state, owner = entry.owner}
+      end, request("checks.list").history))
+      .. "\nerrors=" .. vim.inspect(errors))
   local sequence = state.presentation.transcript.sequence
   local function assert_visible_check()
     local _, row = sequence:position(run_id .. ":checks")
