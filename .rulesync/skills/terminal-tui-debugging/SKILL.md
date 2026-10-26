@@ -37,6 +37,18 @@ Use `terminal-mcp` (`terminal-mcp --headless`) to debug interactive terminal app
 
 ## Debugging Workflow
 
+### Neovim Input and Session Ownership
+
+Attaching `nvim --remote-ui --server <socket>` controls that existing editor. A new Terminal MCP session does not isolate the attached Neovim process. Only quit processes created for the current test. Never quit the editor hosting the agent or the user's working session during inspection.
+
+Before sending Neovim keys, inspect the current mode, target buffer, and effective mappings through `nvim --headless --server <socket> --remote-expr`. Use `vim.api.nvim_get_mode()` and `vim.fn.maparg(key, mode, false, true)` in the target buffer. Inspect callback mappings at their source. Repeat after switching buffers or modes. Do not assume default Vim bindings or type prompt text until Insert mode is confirmed.
+
+This configuration maps Normal-mode **Ctrl+W to `:qa!`**, which closes every window without saving. Never send Ctrl+W for navigation. Keys such as `i` and `k` are also remapped. For window navigation, inspect `vim.api.nvim_list_wins()` and select the intended window with `vim.api.nvim_set_current_win(window_id)` over RPC, then verify the rendered result with Terminal MCP. For prompt entry, use `:startinsert`, confirm Insert mode, then type through Terminal MCP and submit with the verified buffer mapping.
+
+If a key's effect is unknown and RPC inspection is unavailable, inspect the configuration before sending it. To finish observing an existing editor, detach only the observing UI with `:detach` rather than sending a quit command or destroying its terminal while attached.
+
+### Execution
+
 1. Spawn the TUI application in an isolated session at specific dimensions.
 2. Wait for the initial stable frame before dispatching inputs.
 3. Send a single key event or input chunk.

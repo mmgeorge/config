@@ -737,7 +737,11 @@ impl HarnessBroker {
                             shell: preference
                                 .as_ref()
                                 .map_or(Default::default(), |preference| preference.shell),
-                            execution_mode: PermissionMode::Read,
+                            execution_mode: if request.background.is_some() {
+                                PermissionMode::Read
+                            } else {
+                                PermissionMode::Write
+                            },
                             current_task_id: None,
                             default_write_permission: preference
                                 .as_ref()
@@ -12013,7 +12017,7 @@ mod test {
             .unwrap();
         assert!(!stored.access.sandbox);
         assert_eq!(stored.access.writable_directory.len(), 1);
-        assert_eq!(stored.execution_mode, PermissionMode::Read);
+        assert_eq!(stored.execution_mode, PermissionMode::Write);
         let preference = broker
             .store
             .load_preference(&stored.workspace, &stored.backend)
@@ -16091,7 +16095,7 @@ mod test {
                     PromptMode::PlanDiscussion
                 }
             );
-            assert_eq!(request.execution_mode, PermissionMode::Read);
+            assert_eq!(request.execution_mode, PermissionMode::Write);
             if turn < 4 {
                 assert!(
                     request
@@ -18894,6 +18898,8 @@ mod test {
         assert_ne!(first.session.id, second.session.id);
         assert_eq!(first.session.name, "first");
         assert_eq!(second.session.name, "second");
+        assert_eq!(first.session.execution_mode, PermissionMode::Write);
+        assert_eq!(second.session.execution_mode, PermissionMode::Write);
         assert_eq!(second.store.list_session(None).unwrap().len(), 2);
     }
 
@@ -18972,6 +18978,7 @@ mod test {
                 .is_none()
         );
         stored.backend = "mock".into();
+        stored.execution_mode = PermissionMode::Read;
         stored.workspace = format!("{}//./", stored.workspace);
         source.store.save_session(&stored).unwrap();
 
@@ -18979,6 +18986,7 @@ mod test {
             HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();
         assert_eq!(resumed.session.id, source.session.id);
         assert_eq!(resumed.session.name, "source");
+        assert_eq!(resumed.session.execution_mode, PermissionMode::Read);
         assert_eq!(resumed.store.list_session(None).unwrap().len(), 2);
     }
 
@@ -19435,7 +19443,7 @@ mod test {
         assert_eq!(session["effort"], "low");
         assert_eq!(session["context_window"], "default");
         assert_eq!(session["service_tier"], "ultrafast");
-        assert_eq!(session["execution_mode"], "read");
+        assert_eq!(session["execution_mode"], "write");
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
@@ -19576,9 +19584,12 @@ mod test {
             goal_max_turns: 20,
             lease_conflict_action: None,
         };
-        let initial =
+        let mut initial =
             HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100)))
                 .unwrap();
+        assert_eq!(initial.session.execution_mode, PermissionMode::Write);
+        initial.session.execution_mode = PermissionMode::Read;
+        initial.save_session().unwrap();
         let original_id = initial.session.id.clone();
         let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
         settings.save_provider(0, "codex", &json!({
@@ -19591,6 +19602,7 @@ mod test {
                 .unwrap();
         assert_eq!(resumed.session.id, original_id);
         assert_eq!(resumed.session.model, "original-model");
+        assert_eq!(resumed.session.execution_mode, PermissionMode::Read);
         let created = resumed
             .dispatch(Request {
                 id: 1,
@@ -19603,7 +19615,7 @@ mod test {
         assert_eq!(child["effort"], "high");
         assert_eq!(child["context_window"], "long_context");
         assert_eq!(child["service_tier"], "fast");
-        assert_eq!(child["execution_mode"], "read");
+        assert_eq!(child["execution_mode"], "write");
 
         let fresh = HarnessBroker::initialize_with_clock(
             InitializeRequest {
@@ -19615,6 +19627,7 @@ mod test {
         )
         .unwrap();
         assert_eq!(fresh.session.model, "preferred-model");
+        assert_eq!(fresh.session.execution_mode, PermissionMode::Write);
         assert_eq!(
             fresh.session.resolved_model.as_deref(),
             Some("preferred-model")
@@ -19686,7 +19699,7 @@ mod test {
             })
             .await;
         assert!(invalid_mode.response.error().is_some());
-        assert_eq!(broker.session.execution_mode, PermissionMode::Read);
+        assert_eq!(broker.session.execution_mode, PermissionMode::Write);
     }
 
     #[tokio::test]

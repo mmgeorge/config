@@ -168,11 +168,12 @@ local ok, failure = xpcall(function()
     return requests[#requests]
   end
   owner.follow_tail()
+  local before_stream = vim.api.nvim_win_get_cursor(window)
   stream.revision = 1
   stream.block[1].text[#stream.block[1].text + 1] = "streamed at bottom"
   refresh().callback({ snapshot = vim.deepcopy(stream) })
-  assert(vim.api.nvim_win_get_cursor(window)[1] == #stream.block[1].text,
-    "snapshot publication did not follow a window already at the bottom")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), before_stream),
+    "snapshot publication moved a window already at the bottom")
   local delayed = refresh()
   vim.api.nvim_win_call(window, function() vim.cmd("normal! ggzt") end)
   local reading_view = vim.api.nvim_win_call(window, vim.fn.winsaveview)

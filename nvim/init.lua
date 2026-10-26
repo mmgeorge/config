@@ -58,3 +58,4 @@ require("vim_options")
 require("keymap");
 require("diagnostics");
 require("autosnippets");
+require("session_log").setup()

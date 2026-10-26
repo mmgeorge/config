@@ -230,9 +230,12 @@ Rust, TypeScript/TSX, JavaScript/JSX/MJS/CJS, and Lua. LSP supplies semantic ide
 and relationships. Missing capabilities, failures, and empty results are distinct.
 
 Opening Harness warms enabled editor LSP configurations against real project
-files. Queries and editor buffers reuse those same clients. Startup discovers at
-most 4,096 entries in 128 directories through depth eight, excluding build and
-dependency directories. Source queries wait up to 60 seconds for initialization and any work-done progress
+files. JavaScript and TypeScript startup requires `package.json`, and Rust startup
+requires `Cargo.toml`. Loose `.js`, `.ts`, and `.rs` files do not trigger automatic
+startup. Nested projects are discovered in scheduled batches, excluding build and
+dependency directories. Queries and editor buffers reuse those same clients.
+A server that declines a project root does not produce an initialization-timeout
+notification. Source queries wait up to 60 seconds for initialization and any work-done progress
 reported by the server, then have a ten-second operation deadline, or 30 seconds for path searches. Status reports
 starting or indexing while those states are visible. Servers can index silently,
 so readiness still cannot guarantee that every workspace result is complete.

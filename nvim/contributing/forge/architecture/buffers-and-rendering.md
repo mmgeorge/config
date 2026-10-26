@@ -119,6 +119,10 @@ writer captures every displayed window's cursor immediately before its synchrono
 It restores surviving block identities afterward, or selects the enclosing heading when
 collapse removes the selected body. No cursor snapshot crosses asynchronous preparation.
 Text, decorations, visible indexes, and cursor restoration publish without yielding.
+For active Visual and Select mode, the writer also captures the live anchor and restores
+both endpoints through the same block and source-position mapping. It preserves selection
+type and direction while clamping removed rows and shortened UTF-8 lines independently.
+Native replacement therefore cannot extend a selection into appended status or queue rows.
 Each changed span replaces its prior rows directly, without clearing the buffer first.
 
 `forge.cooperative` prepares Harness document updates in slices targeting four milliseconds
@@ -142,8 +146,8 @@ asynchronous preparation boundaries.
 The replica's `before_commit` callback runs at that same boundary. Timeline switches use it
 to save the outgoing view after backend requests and local preparation finish. Its optional
 `after_commit` callback runs after viewport restoration in the same atomic patch or snapshot commit.
-Harness uses these callbacks to capture bottom visibility and apply per-window tail following
-without retaining stale scroll decisions across asynchronous preparation. Declaration
+Harness uses these callbacks to save outgoing timeline views and align status spacing without
+overriding the shared cursor and viewport restoration. Declaration
 expansion captures its viewport after the response, immediately before publication. Rejected
 editable-text changes capture cursors inside the scheduled rollback, not when queuing it.
 Action-target snapshots remain separate and only validate whether a response still applies.
@@ -175,9 +179,14 @@ explicitly expanded. Groups that finish before their exchange retain this compac
 After exchange completion, expanding the group shows every tool. Expanding an individual tool
 loads its complete output through the existing paging path. A settled group defaults to collapsed
 tools without previews. Exchange completion also
-collapses the activity node and leaves its final response outside it. Tool changes remain
-inside their activity sections. Checkpoint and exchange-level aggregate diffs do not create
-additional transcript nodes.
+collapses the activity node and leaves its final response outside it. Individual file changes
+and check runs remain inside their owning thought sections. Each interaction also projects one
+Changed files summary and one Checks summary outside the activity fold, before its response.
+The summaries keep stable identities as new writes and completed runs arrive. The file summary
+composes reported edits across thoughts and counts each file once. The check summary totals
+recorded command outcomes and durations across completed runs. Its expanded commands retain
+their original output sources with separate presentation identities. Checkpoint diffs remain
+outside this aggregation.
 Hidden tools retain their output caches, including late parallel output, without changing visible
 rows. Explicit group expansion persists while new calls arrive, but its live body remains limited
 to the latest tool until exchange completion.
@@ -188,6 +197,8 @@ previews. It reserves no empty detail rows. Lua fills unused transcript-window s
 with virtual rows, so the live tail ends at the bottom without changing native text or row identities.
 Queued prompts and other footer details add only their visible rows below status. Idle uses the same
 static icon as waiting states and has no action hint. Complete thoughts remain in the conversation timeline.
+Check handoffs retain the previous progress display until the next command starts. Incremental
+updates and full snapshots apply the same retention rule, without temporary preparation rows.
 
 Tool output deltas update the existing output cache. File edits have no generic tool-output
 cache, so their deltas reconcile the change node instead. Both paths retain the same provider
@@ -240,8 +251,9 @@ through ambiguous edits involving identical omission rows.
 
 ## Refresh cadence and decoration updates
 
-Transcript synchronization coalesces event bursts with a 67-millisecond timer, limiting normal
-refresh requests to 15 per second. Events arriving during an active update retain one trailing
+Transcript synchronization coalesces event bursts with a 60 Hz target interval of 16.67 milliseconds.
+Neovim's whole-millisecond timer rounds this up to 17 milliseconds, allowing about 59 refresh
+requests per second before request and publication time. Events arriving during an active update retain one trailing
 refresh. Each response publishes its ordered batch of at most 64 patches without yielding
 between revisions. Queued document requests wait until publication completes. Closing the view
 cancels its pending refresh timer, and host replacement cancels preparation before publication.

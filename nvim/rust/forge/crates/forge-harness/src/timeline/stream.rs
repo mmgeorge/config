@@ -560,6 +560,7 @@ impl TimelineStream {
                     *checks = None;
                 }
             }
+            self.retain_check_progress(&mut entry);
             let value = crate::codec::to_value(&entry)?;
             self.upsert(entry, value, self.entry_list.len(), &mut operation);
         }
@@ -574,12 +575,35 @@ impl TimelineStream {
         })
     }
 
-    pub fn reconcile(&mut self, next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
+    /// Keep the last visible command through preparation and handoff snapshots.
+    fn retain_check_progress(&self, entry: &mut TimelineEntry) {
+        let TimelineEntry::Status { id, checks, .. } = entry else {
+            return;
+        };
+        if !checks
+            .as_ref()
+            .is_some_and(|activity| activity.command_list.is_empty())
+        {
+            return;
+        }
+        *checks = self
+            .entry_index
+            .get(id)
+            .and_then(|index| match &self.entry_list[*index] {
+                TimelineEntry::Status { checks, .. } => checks.clone(),
+                _ => None,
+            });
+    }
+
+    pub fn reconcile(&mut self, mut next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
         ensure!(
             self.revision < forge_buffer::MAX_COUNTER,
             "timeline revision exhausted"
         );
         let base_revision = self.revision;
+        for entry in &mut next_entry_list {
+            self.retain_check_progress(entry);
+        }
         let next_value_list = serialize_entry_list(&next_entry_list)?;
         for (index, value) in self.value_list.iter_mut().enumerate() {
             if value.is_null() {
@@ -806,6 +830,8 @@ mod test {
         let mut next = run.clone();
         next.id = "next-checks".into();
         next.state = crate::checks::CheckState::Running;
+        next.commands[0].state = crate::checks::CheckState::Running;
+        next.commands[0].completed_at_ms = None;
         stream.update_checks(&next)?;
         stream.update_checks(&run)?;
         assert!(
@@ -825,6 +851,67 @@ mod test {
                 .count(),
             2
         );
+        Ok(())
+    }
+
+    #[test]
+    fn check_handoffs_retain_status_until_the_next_command_starts() -> anyhow::Result<()> {
+        let mut run: crate::checks::CheckRun = serde_json::from_value(serde_json::json!({
+            "id":"handoff","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","owner":{"kind":"session","session_id":"session"},
+            "environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
+            "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"first","selected":true,"command":"first check","state":"pending","started_at_ms":null,
+                "completed_at_ms":null,"exit_code":null,"error":null,"stdout":"","stderr":"",
+                "output":"","output_bytes":0,"preview":""
+            },{
+                "id":"second","selected":true,"command":"second check","state":"pending","started_at_ms":null,
+                "completed_at_ms":null,"exit_code":null,"error":null,"stdout":"","stderr":"",
+                "output":"","output_bytes":0,"preview":""
+            }]
+        }))?;
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![status(SessionPhase::Idle)])?;
+        assert!(
+            stream.update_checks(&run)?.is_empty(),
+            "preparation changed the visible status"
+        );
+        run.commands[0].state = crate::checks::CheckState::Running;
+        run.commands[0].started_at_ms = Some(1);
+        assert!(!stream.update_checks(&run)?.is_empty());
+        let previous = serde_json::to_value(stream.entry_list())?;
+        run.commands[0].state = crate::checks::CheckState::Passed;
+        run.commands[0].completed_at_ms = Some(5);
+        assert!(
+            stream.update_checks(&run)?.is_empty(),
+            "handoff replaced the last command"
+        );
+        assert_eq!(serde_json::to_value(stream.entry_list())?, previous);
+        let mut snapshot = stream.entry_list().to_vec();
+        if let TimelineEntry::Status { checks, .. } = &mut snapshot[0] {
+            *checks = crate::checks::CheckActivity::from_run(&run);
+        }
+        assert!(
+            stream.reconcile(snapshot)?.is_empty(),
+            "snapshot exposed the handoff gap"
+        );
+        run.commands[1].state = crate::checks::CheckState::Running;
+        run.commands[1].started_at_ms = Some(8);
+        assert!(!stream.update_checks(&run)?.is_empty());
+        assert!(
+            matches!(&stream.entry_list()[0], TimelineEntry::Status { checks: Some(activity), .. }
+            if activity.command_list[0].title == "second check" && activity.completed_count == 1)
+        );
+        run.commands[1].state = crate::checks::CheckState::Passed;
+        run.commands[1].completed_at_ms = Some(10);
+        run.completed_at_ms = Some(10);
+        run.state = crate::checks::CheckState::Passed;
+        stream.update_checks(&run)?;
+        assert!(matches!(
+            stream.entry_list().last(),
+            Some(TimelineEntry::Status { checks: None, .. })
+        ));
         Ok(())
     }
 

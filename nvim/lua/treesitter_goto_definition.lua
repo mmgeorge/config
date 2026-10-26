@@ -8,7 +8,7 @@ local api = vim.api
 
 local M = {}
 
-local function index_of(tbl, obj)
+local function find_usage_index(tbl, obj)
   for i, o in ipairs(tbl) do
     if o == obj then
       return i
@@ -162,7 +162,7 @@ function M.goto_adjacent_usage(bufnr, delta)
   local def_node, scope = locals.find_definition(node_at_point, bufnr)
   local usages = locals.find_usages(def_node, scope, bufnr)
 
-  local index = index_of(usages, node_at_point)
+  local index = find_usage_index(usages, node_at_point)
   if not index then
     return
   end

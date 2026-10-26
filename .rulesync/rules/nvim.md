@@ -9,6 +9,33 @@ Use the **neovim-lua-dev** skill for Lua and Neovim plugin work. It covers Neovi
 
 Read the relevant skill reference section before modifying that subsystem.
 
+## Cursor And Viewport Preservation
+
+Treat every programmatic Lua update as cursor-preserving by default. Text replacements,
+streaming output, thought and status refreshes, decorations, folding, resizing, and delayed
+callbacks must preserve the current cursor location and viewport in every affected window,
+including unfocused splits. Preserve the byte column as well as the logical text position.
+Bottom visibility, elapsed time, and composer focus do not authorize moving to the final row
+or the end of a growing line. Only an explicit navigation action may request a new position.
+
+Complete asynchronous preparation first, then capture current positions immediately before
+the synchronous text and layout commit. Restore through the shared document or view owner
+within that same non-yielding commit. Never restore a position captured before a request,
+timer, scheduled callback, or coroutine yield. If content is removed or shortened, retain the
+nearest valid position using the shared anchor resolution and UTF-8-safe column clamping.
+For active Visual or Select mode, preserve both the anchor and cursor endpoints, their
+direction, and the selection type. Resolve each endpoint independently after publication,
+including when selected rows disappear. Cursor-only restoration does not preserve selection.
+Verify updates on the cursor's own line, below it, while another split is focused, and after
+the user moves during pending work. Read the cursor-preservation section in the Neovim Lua
+skill's rendering reference for implementation and regression guidance.
+
+## Live Editor Ownership
+
+Never treat `nvim --remote-ui --server <socket>` as an isolated test editor. It attaches to an existing process and can terminate the Harness session running inside that process. For interactive tests, launch a separate Neovim with a unique socket and isolated session storage, then verify its process ID over RPC before sending input. Only terminate test processes created by the current task. Detach an observing UI with `:detach` rather than quitting the existing editor.
+
+Inspect the target buffer's effective mappings and current mode before driving keys. This configuration remaps standard Vim keys, including Ctrl+W to `:qa!`. Use explicit RPC window selection for navigation instead of assuming default key sequences.
+
 For Forge work, start with `nvim/contributing/forge/README.md` and follow its
 task-specific architecture and procedure links. Keep the affected contributor
 documents and `nvim/docs/forge/` user documentation up to date with behavior and

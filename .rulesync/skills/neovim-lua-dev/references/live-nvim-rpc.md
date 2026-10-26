@@ -2,6 +2,17 @@
 
 This reference establishes procedures for querying live editor state, inspecting buffers, evaluating Lua expressions, reloading modified plugin modules, and verifying runtime behavior via Neovim msgpack-RPC.
 
+## Identify the Target Before Input
+
+A remote UI shares the target editor's process, buffers, mappings, and active tasks. Attaching Terminal MCP to the editor hosting the agent gives that agent control over its own host. Treat a discovered socket as an existing user editor unless the current test created its process.
+
+1. Start a separate Neovim process with a unique `--listen` address and isolated session storage for interactive reproduction.
+2. Record the launched process ID and query `vim.fn.getpid()`, `vim.v.servername`, and `vim.fn.getcwd()` through that socket to verify the target.
+3. Attach Terminal MCP only after confirming the process identity. Inspect mode and buffer-local mappings before sending input.
+4. Capture terminal output and the test process's exit status. Terminate only that test process during cleanup.
+
+For inspection of an existing user editor, prefer read-only RPC. If a remote UI is needed to observe rendering, detach that UI with `:detach` when finished. Do not send quit commands or close its terminal as a substitute for detaching. If process identity cannot be established, do not send input that changes editor state.
+
 ## RPC Socket Detection
 
 When executed inside a Neovim terminal session, `$NVIM` contains the server socket address (a Unix domain socket on Unix platforms or a named pipe such as `\\.\pipe\nvim.*` on Windows).
@@ -62,6 +73,12 @@ nvim --server $env:NVIM --remote-expr 'execute("LspRestart")'
 ```
 
 ## Keystroke Simulation and File Opening
+
+Before sending keys, query `vim.api.nvim_get_mode()` and `vim.fn.maparg(key, mode, false, true)` in the target buffer through `nvim --headless --server <socket> --remote-expr`. Inspect callback mappings at their source. Recheck after changing buffers or modes. In this configuration, Normal-mode Ctrl+W invokes `:qa!`, and `i` and `k` do not have their default Vim meanings. Never send Ctrl+W for window navigation.
+
+Select windows with `vim.api.nvim_list_wins()` and `vim.api.nvim_set_current_win(window_id)` over RPC, then inspect the rendered result through Terminal MCP. Enter prompt text only after `:startinsert` and a confirmed Insert mode. Inspect the target buffer's submission mapping before using it.
+
+`nvim --remote-ui --server <socket>` attaches to the existing process. A separate terminal does not make that editor disposable. Finish observation with `:detach` to detach only the observing UI. Quit only test editors created for the current verification, never the user's editor or the editor hosting the agent.
 
 - **`--remote-send`**: Dispatches raw keystrokes into the active editor buffer. Reserve for workflows that require end-to-end keymap validation.
 - **`--remote` / `--remote-tab`**: Opens specified files in existing or new tabs within the user session.

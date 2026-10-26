@@ -10,6 +10,26 @@ by `nvim/rust/forge/rust-toolchain.toml`, and the platform C compiler. Real lang
 fixtures also need Git and the selected language server. TypeScript fixtures need
 Node/npm and the native TypeScript server, with their dependency installed locally.
 
+## Diagnose an editor closing unexpectedly
+
+The Neovim configuration installs `session_log` after initialization. Each process
+writes a timestamped JSONL file under `stdpath("log")/sessions`. Print the current
+path with `:lua print(require("session_log").path())`. Logs survive restarts and
+concurrent editors write separate files.
+
+The log records Normal-mode input and its effective mapping, command names without
+arguments, error notifications, changes to `v:errmsg`, one-second heartbeats, UI
+attachment events, and `QuitPre`, `ExitPre`, `VimLeavePre`, and `VimLeave`. Heartbeats
+include the current Harness session identity and busy state when available.
+Prompt text and Insert-mode input are not recorded by the input observer.
+
+Reproduce the failure in a fresh editor, then retain that process's file before
+starting another investigation. An exit-event sequence identifies an orderly
+shutdown path. A file ending without exit events identifies an abrupt interruption,
+but cannot distinguish a native crash, forced process termination, or power loss
+by itself. Correlate it with the operating system's crash reports and the shell's
+exit status. The observer does not cancel exits or recover native faults.
+
 ## Validation order
 
 Harness prioritizes runnable checks as format, lint/check, test, and build.

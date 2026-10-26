@@ -73,7 +73,7 @@ pub fn prepare_new_session(
         shell: preference
             .as_ref()
             .map_or(source.shell, |value| value.shell),
-        execution_mode: PermissionMode::Read,
+        execution_mode: PermissionMode::Write,
         current_task_id: None,
         default_write_permission: preference
             .as_ref()

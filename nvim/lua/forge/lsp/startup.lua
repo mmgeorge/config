@@ -4,6 +4,7 @@ local M = {}
 ---@class ForgeLspStartupJob
 ---@field path string
 ---@field filetype string
+---@field filetypes string[]
 ---@field name string
 ---@field started integer
 ---@field client? integer
@@ -26,6 +27,19 @@ local M = {}
 ---@type table<string, ForgeLspStartup>
 local workspaces = {}
 local excluded = { [".git"] = true, node_modules = true, target = true, build = true, dist = true, [".cache"] = true }
+local package_filetypes = {
+  javascript = true, javascriptreact = true, typescript = true, typescriptreact = true,
+  vue = true, svelte = true, astro = true, htmlangular = true,
+}
+
+---@param config vim.lsp.Config
+---@return string?
+local function project_manifest(config)
+  for _, filetype in ipairs(config.filetypes or {}) do
+    if filetype == "rust" then return "Cargo.toml" end
+    if package_filetypes[filetype] then return "package.json" end
+  end
+end
 
 ---@param job ForgeLspStartupJob
 ---@param failure? string
@@ -62,11 +76,12 @@ local function launch(state, config, path, filetype, accept_root, on_settled)
       return
     end
   end
-  local job = { path = path, filetype = filetype, name = config.name, started = vim.uv.now(), on_settled = on_settled }
+  local job = { path = path, filetype = filetype, filetypes = config.filetypes or {}, name = config.name,
+    started = vim.uv.now(), on_settled = on_settled }
   state.jobs[key] = job
   state.timer:again()
   source.read(path, function(contents, failure)
-    if state.closed then return end
+    if state.closed or job.done then return end
     if failure then settle(job, "startup_failed: " .. config.name .. " — " .. failure) return end
     local buffer, owned, open_error = source.open(path, contents, filetype)
     if not buffer then settle(job, open_error) return end
@@ -83,7 +98,9 @@ local function launch(state, config, path, filetype, accept_root, on_settled)
       end
       resolved.root_dir = root
       if not root and resolved.workspace_required then settle(job) return end
-      local ok, identity = pcall(vim.lsp.start, resolved, { bufnr = buffer, reuse_client = resolved.reuse_client })
+      local options = { bufnr = buffer, reuse_client = resolved.reuse_client }
+      if project_manifest(config) == vim.fs.basename(path) then options.attach = false end
+      local ok, identity = pcall(vim.lsp.start, resolved, options)
       if not ok or not identity then
         settle(job, "startup_failed: " .. config.name .. " — " .. tostring(identity or "Server launch failed."))
       else job.client = identity end
@@ -104,7 +121,10 @@ local function poll(state)
       local client = job.client and vim.lsp.get_client_by_id(job.client)
       if client and client.initialized and not client:is_stopped() then settle(job)
       elseif job.client and (not client or client:is_stopped()) then settle(job, "startup_failed: " .. job.name .. " stopped during initialization.")
-      elseif vim.uv.now() - job.started >= 60000 then settle(job, "timeout: " .. job.name .. " initialization exceeded 60 seconds.") end
+      elseif vim.uv.now() - job.started >= 60000 then
+        if job.client then settle(job, "timeout: " .. job.name .. " initialization exceeded 60 seconds.")
+        else settle(job) end
+      end
       pending = pending or not job.done
     end
   end
@@ -152,6 +172,7 @@ local function select_sources(state, candidates)
           return root ~= nil and source.inside(state.workspace, root)
         end, function(job)
           if job.failure or (job.root and source.inside(state.workspace, job.root)) then selected() return end
+          if not job.root then vim.schedule(next_source) return end
           local depth = job.root and #source.canonical(job.root) or math.huge
           if not fallback or depth < fallback_depth then fallback, fallback_depth = candidate, depth end
           if job.root and source.inside(job.root, state.workspace) then nested_roots[#nested_roots + 1] = job.root end
@@ -165,17 +186,17 @@ end
 
 ---@param state ForgeLspStartup
 local function discover(state)
-  local queue, cursor, entries, visited = { { path = state.workspace, depth = 0 } }, 1, 0, 0
+  local queue, cursor = { state.workspace }, 1
   local candidates, candidate_directory = {}, {}
   local function next_directory()
     if state.closed then return end
-    if #state.configs == 0 or cursor > #queue or entries >= 4096 or visited >= 128 then
+    if #state.configs == 0 or cursor > #queue then
       select_sources(state, candidates)
       return
     end
     local directory = queue[cursor]
-    cursor, visited = cursor + 1, visited + 1
-    vim.uv.fs_scandir(directory.path, function(failure, scan)
+    cursor = cursor + 1
+    vim.uv.fs_scandir(directory, function(failure, scan)
       vim.schedule(function()
         if state.closed then return end
         if failure then
@@ -184,26 +205,35 @@ local function discover(state)
           require("forge.infra.notifications").error(state.failure, "Harness LSP startup")
           return
         end
-        while entries < 4096 do
-          local name, kind = vim.uv.fs_scandir_next(scan)
-          if not name then break end
-          entries = entries + 1
-          local path = directory.path .. "/" .. name
-          if kind == "directory" and directory.depth < 8 and not excluded[name] then
-            queue[#queue + 1] = { path = path, depth = directory.depth + 1 }
-          elseif kind == "file" then
-            local filetype = vim.filetype.match({ filename = path })
-            for _, config in ipairs(state.configs) do
-              local key = config.name .. ":" .. directory.path
-              if filetype and not candidate_directory[key] and vim.tbl_contains(config.filetypes or {}, filetype) then
-                candidate_directory[key] = true
-                candidates[config.name] = candidates[config.name] or {}
-                table.insert(candidates[config.name], { path = path, filetype = filetype })
+        local function read_batch()
+          if state.closed then return end
+          for _ = 1, 256 do
+            local name, kind = vim.uv.fs_scandir_next(scan)
+            if not name then next_directory() return end
+            local path = directory .. "/" .. name
+            if kind == "directory" and not excluded[name] then
+              queue[#queue + 1] = path
+            elseif kind == "file" then
+              local filetype
+              for _, config in ipairs(state.configs) do
+                local manifest = project_manifest(config)
+                if not manifest or name == manifest then
+                  filetype = filetype or vim.filetype.match({ filename = path })
+                end
+                local matches = manifest and name == manifest or not manifest
+                  and filetype and vim.tbl_contains(config.filetypes or {}, filetype)
+                local key = config.name .. ":" .. directory
+                if matches and not candidate_directory[key] then
+                  candidate_directory[key] = true
+                  candidates[config.name] = candidates[config.name] or {}
+                  table.insert(candidates[config.name], { path = path, filetype = filetype })
+                end
               end
             end
           end
+          vim.schedule(read_batch)
         end
-        next_directory()
+        read_batch()
       end)
     end)
   end
@@ -271,7 +301,7 @@ function M.wait(workspace, path, receive)
       end
     end
     for _, job in pairs(state.jobs) do
-      if not filetype or job.filetype == filetype then
+      if not filetype or vim.tbl_contains(job.filetypes, filetype) then
         if not job.done then return end
         if not ready or path and source.canonical(job.path) == source.canonical(path) then failure = failure or job.failure end
       end

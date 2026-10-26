@@ -6,6 +6,48 @@ This reference defines buffer management, decoration providers, extmark lifecycl
 
 Asynchronous work must not restore a cursor or viewport captured before the user could move again. Complete loading and preparation first. In one non-yielding commit, capture the current cursor identity and viewport of each affected window, apply text and fold changes, and restore against the resulting document. Do not capture restoration state before requests, scheduled callbacks, timers, or coroutine yields. Keep action targets for stale-response validation separate from restoration state, and record navigation return positions only at actual departure.
 
+Preserve cursor location and viewport for every programmatic update, including streaming
+thoughts, status text, appended output, same-line replacements, decorations, and resizing.
+Retain the byte column and logical text anchor in each window, including unfocused splits.
+Reuse the shared document or view owner for capture and restoration. Do not add a second
+restoration callback that overrides that owner's result.
+
+Never infer navigation intent from bottom visibility, composer focus, or elapsed time.
+Background publication must not run `normal! G`, `$`, or tail-positioning helpers. An explicit
+navigation or submission action may position its target once, but later updates must preserve
+the resulting position. If removal or shortening invalidates an anchor, use the shared
+nearest-surviving-position policy and clamp to a valid UTF-8 byte boundary.
+
+Regression coverage must exercise a growing line beneath the cursor, wrapped text, appended
+rows, focused and unfocused transcript windows, independent split positions, metadata-only
+updates, and cursor movement while a response or preparation step is pending. Assert both
+row and byte column, viewport where content remains valid, and unchanged window focus.
+
+Active Visual and Select ranges have two endpoints. Capture the current anchor with
+`getpos("v")` as well as the cursor, selection type, direction, and virtual-column offsets.
+Resolve both endpoints through the shared position resolver after publication and clamp
+each to surviving rows and UTF-8 boundaries. Restoring only the cursor leaves the anchor
+subject to native text-replacement movement and can select appended status or queue rows.
+Keep the capture and restoration in the same atomic commit. Test forward and reversed
+character, line, and block selections, incremental patches and snapshots, appended queue
+rows, input movement during preparation, shortened multibyte text, and complete removal.
+
+## Stable Asynchronous Status
+
+Retain the last usable progress display while preparing the next operation. Intermediate
+states such as an empty running-command list do not authorize replacing visible content.
+Publish the next command's title, progress, and output together when execution starts, then
+publish the final result when the workflow completes, fails, or is interrupted.
+
+Never insert `Preparing next check` or another temporary loading row during a handoff.
+Keep this policy in the owning state or publication layer so timer refreshes and full
+snapshots cannot reintroduce placeholder text. Preserve the cursor and viewport during the
+eventual commit. Real failures must remain visible through the normal error boundary.
+
+Test initial preparation, the gap between two commands, a snapshot arriving during that gap,
+the next command's start, and terminal completion. Assert that preparation and handoff leave
+the visible state unchanged, while start and completion publish their real state.
+
 ## Concrete Buffer Lines vs Viewport Text Virtualization
 
 Do not virtualize buffer text by paging rows in and out of a small physical buffer. Virtualizing text breaks core editor capabilities:

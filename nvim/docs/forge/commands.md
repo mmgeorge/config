@@ -39,9 +39,8 @@ The default is `status_open_target = "tab"`.
 ## Generated commit messages
 
 Automatic About drafts and commit-message regeneration send a compact diff to the
-selected model. A persistent notification shows an animated spinner, model name,
-and elapsed seconds until generation completes. Readable provider reasoning summaries appear
-when available. Failures preserve the existing draft, including edits made while waiting.
+selected model without progress, waiting, or completion popups. Generation failures
+produce error notifications and preserve the existing draft, including edits made while waiting.
 
 Git LFS files are excluded from both the changed-file inventory and compact diff before
 Forge reads their content. This applies to automatic drafts, staged regeneration, amend
@@ -107,6 +106,9 @@ file list but have no excerpts, including license files with Markdown or text ex
 
 ## Harness and permissions
 
+New interactive sessions start in Write mode. Reopening a session preserves its
+saved permission mode. Use `/read`, `/write`, or `/yolo` to change the current mode.
+
 Copilot can read and write its current session's notes directory without approval,
 including in Read mode. Harness gets that directory from the native CLI, so the
 location can differ across platforms and installations. The exception does not
@@ -153,9 +155,16 @@ to the same file count once and show the original-to-final diff. A pending write
 Owned events stay inside the thought, including compaction. Late results stay with their
 original operation. Failed writes retain their diagnostics inside the changes group.
 Inconsistent edit reports retain their reported hunks with a diagnostic.
-Completing an exchange keeps these changes in their activity sections without adding a
-checkpoint total or another exchange-level change summary. File checkpoints remain available
-through `/undo`.
+Each interaction also shows expandable **Changed files** and **Checks** summaries alongside
+**Thought**. They update in place and remain visible when Thought is collapsed. Changed files
+combines reported edits across thoughts and counts each file once. Checks combines recorded
+command outcomes and elapsed times across completed runs. Individual file modifications and
+check runs remain under their owning subthoughts, with the same expandable detail controls.
+File checkpoints remain available through `/undo`.
+
+A file created and deleted within one changes group does not appear in its net diff.
+If no files remain changed, the summary shows `No net file changes`. Individual writes
+remain available under their original thoughts.
 
 `/fork [name]` opens a child timeline with a snapshot of the source's visible history
 above its fork marker. New child messages append below that marker. Source updates do
@@ -186,10 +195,14 @@ Queued follow-up inputs have a blank line above their heading, including when no
 Live tool output occupies four rows, including blank padding.
 The live status line shows the current phase, elapsed time, and interrupt key.
 Enable **Thoughts** in `/config` under **Display** to show the latest thought below it in
-italics, aligned with the phase label and wrapped into at most two preview rows. The option
+italics, aligned with the phase label on one line, with `...` when it exceeds the available width. The option
 defaults to Off, persists across sessions, and applies without interrupting an
 active response. Thoughts never appear as commentary in the timeline. Only the latest
 readable reasoning summary appears in status when this option is On.
+Timeline updates preserve the current cursor and reading position, including when the thought
+preview changes. Active selections retain both endpoints and their selection type.
+If selected text disappears, each endpoint moves to the nearest surviving position.
+Submitting a prompt positions the transcript at its tail once.
 Codex and Copilot request concise reasoning summaries when the selected model supports them.
 Claude and Antigravity retain provider-defined summary detail through their current ACP integrations.
 Assistant commentary marked with an open circle is separate from the reasoning-summary setting.

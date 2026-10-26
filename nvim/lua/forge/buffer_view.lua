@@ -41,118 +41,170 @@ function M.restore_viewport(session, retained)
   end)
 end
 
----@class ForgeRetainedView
----@field window integer
+---@class ForgeRetainedPosition
 ---@field block? string
 ---@field row integer Offset inside the retained block.
 ---@field original_row integer Zero-based native cursor row before the update.
 ---@field column integer Zero-based byte column.
 ---@field source_column? boolean Column is canonical and requires projection on restore.
 ---@field projection_offset? integer Physical offset within an attached annotation.
+---@field source_row? integer Row in the canonical source before projection.
+---@field column_offset? integer Virtual screen-column offset inside a character.
+
+---@param session table Native buffer replica.
+---@param cursor integer[] One-based row and zero-based byte column.
+---@param retained fun(id: string): boolean Accepts identities present after the update.
+---@return ForgeRetainedPosition
+local function capture_position(session, cursor, retained)
+  local original_row = cursor[1] - 1
+  local source = session.source_projected and session.locate and session.locate(original_row, cursor[2]) or nil
+  local node = source and session.sequence.node[source.block] or session.sequence:locate(original_row)
+  if node then
+    local index, start = session.sequence:position(node.id)
+    local canonical_row = source and start + source.position.row or original_row
+    local block, offset = node.id, canonical_row - start
+    local projection_offset = source and session.physical_row
+      and original_row - session.physical_row(canonical_row) or nil
+    if not retained(block) and session.retain_removed_position then
+      block, offset, projection_offset = nil, 0, nil
+    elseif not retained(block) then
+      projection_offset = nil
+      block, offset = nil, 0
+      local ancestor_size
+      for _, record in pairs(session.fold and session.fold.record or {}) do
+        local _, first = session.sequence:position(record.owner)
+        local _, last = session.sequence:position(record.fold["end"].block)
+        first = first + record.fold.start.row
+        last = last + record.fold["end"].position.row
+        if canonical_row >= first and canonical_row < last and retained(record.owner)
+          and (not ancestor_size or last - first < ancestor_size) then
+          block, offset, ancestor_size = record.owner, record.fold.start.row, last - first
+        end
+      end
+      local distance
+      for _, direction in ipairs(block and {} or { -1, 1 }) do
+        local candidate_index = index + direction
+        while candidate_index >= 0 and candidate_index < session.sequence:count() do
+          local candidate = session.sequence:at(candidate_index)
+          if retained(candidate.id) then
+            local _, candidate_start = session.sequence:position(candidate.id)
+            local candidate_row = math.max(candidate_start,
+              math.min(canonical_row, candidate_start + candidate.entry.row_count - 1))
+            local candidate_distance = math.abs(canonical_row - candidate_row)
+            if not distance or candidate_distance < distance then
+              block, offset, distance = candidate.id, candidate_row - candidate_start, candidate_distance
+            end
+            break
+          end
+          candidate_index = candidate_index + direction
+        end
+      end
+    end
+    return {
+      block = block, row = offset, original_row = original_row,
+      column = source and projection_offset == 0 and source.position.column or cursor[2],
+      source_column = source ~= nil and projection_offset == 0,
+      projection_offset = projection_offset,
+      source_row = block and session.projection and not session.project_source
+        and require("forge.node_projection").source_position(session, block, {row=offset,column=0}).row or nil,
+    }
+  end
+  return { row = 0, original_row = original_row, column = cursor[2] }
+end
+
+---@class ForgeRetainedView: ForgeRetainedPosition
+---@field window integer
 ---@field view table Native winsaveview state.
+---@field selection? {mode: string, anchor: ForgeRetainedPosition}
 
 ---@param session table Native buffer replica.
 ---@param retained fun(id: string): boolean Accepts identities present after the update.
 ---@return ForgeRetainedView[]
 function M.capture(session, retained)
-  if not session.preserve_view or session.row_count == 0 then return {} end
+  if not session.preserve_view then return {} end
   local result = {}
+  local active_window, mode = vim.api.nvim_get_current_win(), vim.fn.mode(1)
+  local selecting = mode == "v" or mode == "V" or mode == "\22"
+    or mode == "s" or mode == "S" or mode == "\19"
   for _, window in ipairs(vim.fn.win_findbuf(session.buffer)) do
-    local cursor = vim.api.nvim_win_get_cursor(window)
-    local original_row = cursor[1] - 1
-    local source = session.source_projected and session.locate and session.locate(original_row, cursor[2]) or nil
-    local node = source and session.sequence.node[source.block] or session.sequence:locate(original_row)
-    if node then
-      local index, start = session.sequence:position(node.id)
-      local canonical_row = source and start + source.position.row or original_row
-      local block, offset = node.id, canonical_row - start
-      local projection_offset = source and session.physical_row
-        and original_row - session.physical_row(canonical_row) or nil
-      if not retained(block) and session.retain_removed_position then
-        block, offset, projection_offset = nil, 0, nil
-      elseif not retained(block) then
-        projection_offset = nil
-        block, offset = nil, 0
-        local ancestor_size
-        for _, record in pairs(session.fold and session.fold.record or {}) do
-          local _, first = session.sequence:position(record.owner)
-          local _, last = session.sequence:position(record.fold["end"].block)
-          first = first + record.fold.start.row
-          last = last + record.fold["end"].position.row
-          if canonical_row >= first and canonical_row < last and retained(record.owner)
-            and (not ancestor_size or last - first < ancestor_size) then
-            block, offset, ancestor_size = record.owner, record.fold.start.row, last - first
-          end
-        end
-        local distance
-        for _, direction in ipairs(block and {} or { -1, 1 }) do
-          local candidate_index = index + direction
-          while candidate_index >= 0 and candidate_index < session.sequence:count() do
-            local candidate = session.sequence:at(candidate_index)
-            if retained(candidate.id) then
-              local _, candidate_start = session.sequence:position(candidate.id)
-              local candidate_row = math.max(candidate_start,
-                math.min(canonical_row, candidate_start + candidate.entry.row_count - 1))
-              local candidate_distance = math.abs(canonical_row - candidate_row)
-              if not distance or candidate_distance < distance then
-                block, offset, distance = candidate.id, candidate_row - candidate_start, candidate_distance
-              end
-              break
-            end
-            candidate_index = candidate_index + direction
-          end
-        end
-      end
-      result[#result + 1] = {
-        window = window, block = block, row = offset, original_row = original_row,
-        column = source and projection_offset == 0 and source.position.column or cursor[2],
-        source_column = source ~= nil and projection_offset == 0,
-        projection_offset = projection_offset,
-        source_row = block and session.projection and not session.project_source
-          and require("forge.node_projection").source_position(session, block, {row=offset,column=0}).row or nil,
-        view = vim.api.nvim_win_call(window, vim.fn.winsaveview),
-      }
+    local saved = capture_position(session, vim.api.nvim_win_get_cursor(window), retained)
+    saved.window = window
+    saved.view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+    if window == active_window and selecting then
+      local position = vim.fn.getpos("v")
+      local anchor = capture_position(session, { position[2], position[3] - 1 }, retained)
+      anchor.column_offset = position[4]
+      saved.selection = { mode = mode, anchor = anchor }
     end
+    result[#result + 1] = saved
   end
   return result
 end
 
 ---@param session table Native buffer replica after publication.
+---@param saved ForgeRetainedPosition
+---@param allow_eol boolean Whether the current mode permits the end-of-line byte boundary.
+---@return integer row
+---@return integer column
+---@return integer row_count
+local function resolve_position(session, saved, allow_eol)
+  local row = math.min(saved.original_row, math.max(0, session.row_count - 1))
+  local node = saved.block and session.sequence.node[saved.block]
+  if node then
+    local _, start = session.sequence:position(saved.block)
+    local offset = saved.row
+    if saved.source_row and session.next_projection_mapping then
+      offset = require("forge.node_projection").visible_position(session.next_projection_mapping, saved.block, saved.source_row) or 0
+    end
+    row = start + math.min(offset, node.entry.row_count - 1)
+  end
+  local row_count = session.row_count
+  local canonical_row = row
+  if session.source_projected and session.physical_row then
+    row_count = vim.api.nvim_buf_line_count(session.buffer)
+    row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
+  end
+  local column = saved.source_column and require("forge.buffer").physical_column(session, canonical_row, saved.column) or saved.column
+  local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
+  column = math.min(column, math.max(0, #line - (allow_eol and 0 or 1)))
+  while column > 0 do
+    local byte = line:byte(column + 1)
+    if not byte or byte < 128 or byte >= 192 then break end
+    column = column - 1
+  end
+  return row, column, row_count
+end
+
+---@param session table Native buffer replica after publication.
 ---@param retained ForgeRetainedView[]
 function M.restore(session, retained)
+  local active_window = vim.api.nvim_get_current_win()
   for _, saved in ipairs(retained) do
     if vim.api.nvim_win_is_valid(saved.window) and vim.api.nvim_win_get_buf(saved.window) == session.buffer then
-      local row = math.min(saved.original_row, math.max(0, session.row_count - 1))
-      local node = saved.block and session.sequence.node[saved.block]
-      if node then
-        local _, start = session.sequence:position(saved.block)
-        local offset = saved.row
-        if saved.source_row and session.next_projection_mapping then
-          offset = require("forge.node_projection").visible_position(session.next_projection_mapping, saved.block, saved.source_row) or 0
-        end
-        row = start + math.min(offset, node.entry.row_count - 1)
-      end
-      local row_count = session.row_count
-      local canonical_row = row
-      if session.source_projected and session.physical_row then
-        row_count = vim.api.nvim_buf_line_count(session.buffer)
-        row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
-      end
       vim.api.nvim_win_call(saved.window, function()
-        local column = saved.source_column and require("forge.buffer").physical_column(session, canonical_row, saved.column) or saved.column
-        local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
-        local insertion = vim.api.nvim_get_current_win() == saved.window and vim.fn.mode(1):match("^[iR]") ~= nil
-        column = math.min(column, math.max(0, #line - (insertion and 0 or 1)))
-        while column > 0 do
-          local byte = line:byte(column + 1)
-          if not byte or byte < 128 or byte >= 192 then break end
-          column = column - 1
+        local mode = vim.fn.mode(1)
+        local selection = saved.selection
+        local selecting = selection and active_window == saved.window and mode == selection.mode
+        local allow_eol = (active_window == saved.window and mode:match("^[iR]") ~= nil)
+          or (selecting and vim.o.selection == "exclusive")
+        local row, column, row_count = resolve_position(session, saved, allow_eol)
+        local select_mode = selecting and (mode == "s" or mode == "S" or mode == "\19")
+        if selecting then
+          local anchor_row, anchor_column = resolve_position(session, selection.anchor, allow_eol)
+          local offset = anchor_column == selection.anchor.column and selection.anchor.column_offset or 0
+          if select_mode then vim.cmd.normal({ args = { "\7" }, bang = true }) end
+          -- Swap endpoints to restore the live Visual anchor without leaving Visual mode.
+          vim.cmd.normal({ args = { "o" }, bang = true })
+          vim.fn.setpos(".", { 0, anchor_row + 1, anchor_column + 1, offset })
+          vim.cmd.normal({ args = { "o" }, bang = true })
         end
         local view = vim.deepcopy(saved.view)
         view.lnum, view.col = row + 1, column
+        if column ~= saved.column then view.coladd = 0 end
         view.topline = math.max(1, math.min(row_count,
           saved.view.topline + row - saved.original_row))
         vim.fn.winrestview(view)
+        if select_mode then vim.cmd.normal({ args = { "\7" }, bang = true }) end
       end)
     end
   end

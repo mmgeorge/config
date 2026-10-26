@@ -639,7 +639,7 @@ impl TimelineRenderer<'_> {
                     .collect();
                 self.interaction(interaction, &agents, depth)?;
             }
-            TimelineEntry::Checks { run, .. } => self.checks(run, true)?,
+            TimelineEntry::Checks { run, .. } => self.checks(run, true, None)?,
             TimelineEntry::SessionEvent { event, .. } => self.session_event(event)?,
             TimelineEntry::Status {
                 id,
@@ -1172,6 +1172,7 @@ impl TimelineRenderer<'_> {
                 NodeLifecycle::Live
             };
         }
+        self.interaction_results(interaction)?;
         self.content(
             interaction,
             agents,
@@ -1215,6 +1216,63 @@ impl TimelineRenderer<'_> {
             continuation = remaining;
         }
         Ok(())
+    }
+
+    /// Project stable interaction summaries while retaining each thought's original activity.
+    fn interaction_results(&mut self, interaction: &Exchange) -> Result<()> {
+        let nodes = interaction.node_list.iter().collect::<Vec<_>>();
+        let content = interaction.thoughts(&nodes)?;
+        let writes = content
+            .thought
+            .iter()
+            .flat_map(|thought| thought.writes.call.iter().map(|call| call.tool))
+            .collect::<Vec<_>>();
+        let identity = format!("{}:results", interaction.id);
+        if !writes.is_empty() {
+            self.file_change_group(&identity, &writes)?;
+        }
+        let runs = interaction
+            .node_list
+            .iter()
+            .filter_map(|node| match node {
+                ExchangeNode::TimelineEvent { event } => match event.as_ref() {
+                    crate::timeline::TimelineEvent::Check { run }
+                        if run.state != crate::checks::CheckState::Running =>
+                    {
+                        Some(run.as_ref())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let Some(latest) = runs.last() else {
+            return Ok(());
+        };
+        let mut combined = (**latest).clone();
+        combined.id = identity;
+        combined.completed_plan = None;
+        combined.commands = runs
+            .iter()
+            .flat_map(|run| run.commands.iter())
+            .filter(|command| {
+                !matches!(
+                    command.state,
+                    crate::checks::CheckState::Pending | crate::checks::CheckState::Skipped
+                )
+            })
+            .map(|command| {
+                let mut command = command.clone();
+                command.id = format!("{}:command:{}", combined.id, command.id);
+                command
+            })
+            .collect();
+        let heading = format!(
+            "Checks finished · {} · {:.1}s",
+            combined.summary(),
+            combined.duration_ms() as f64 / 1000.0
+        );
+        self.checks(&combined, false, Some(&heading))
     }
 
     fn verification_result(&mut self, interaction: &Exchange) -> Result<()> {
@@ -1588,7 +1646,9 @@ impl TimelineRenderer<'_> {
             }
             match node {
                 ExchangeNode::TimelineEvent { event } => match event.as_ref() {
-                    crate::timeline::TimelineEvent::Check { run } => self.checks(run, false)?,
+                    crate::timeline::TimelineEvent::Check { run } => {
+                        self.checks(run, false, None)?
+                    }
                     crate::timeline::TimelineEvent::Session { event } => {
                         self.session_event(event)?
                     }
@@ -2381,6 +2441,8 @@ impl TimelineRenderer<'_> {
                 }
             } else if unsuccessful.len() == calls.len() {
                 "File changes".to_owned()
+            } else if !unavailable && warning.is_none() {
+                "No net file changes".to_owned()
             } else {
                 "Changed files · details unavailable".to_owned()
             };
@@ -2469,7 +2531,12 @@ impl TimelineRenderer<'_> {
         )
     }
 
-    fn checks(&mut self, run: &crate::checks::CheckRun, separate: bool) -> Result<()> {
+    fn checks(
+        &mut self,
+        run: &crate::checks::CheckRun,
+        separate: bool,
+        summary: Option<&str>,
+    ) -> Result<()> {
         ensure!(
             run.state != crate::checks::CheckState::Running,
             "active checks belong to session status"
@@ -2477,7 +2544,9 @@ impl TimelineRenderer<'_> {
         if separate && self.leading_separator {
             self.literal(&format!("{}:separator", run.id), "", None)?;
         }
-        let heading = if run.context.is_some() {
+        let heading = if let Some(summary) = summary {
+            summary.to_owned()
+        } else if run.context.is_some() {
             if run.lifecycle.iter().any(|event| {
                 matches!(
                     event.kind,
@@ -2505,10 +2574,11 @@ impl TimelineRenderer<'_> {
         };
         self.literal(&format!("{}:checks", run.id), &heading, None)?;
         let checks = self.begin_section(2);
-        if run
-            .context
-            .as_ref()
-            .is_none_or(|context| context.trigger == "Plan execution")
+        if summary.is_none()
+            && run
+                .context
+                .as_ref()
+                .is_none_or(|context| context.trigger == "Plan execution")
         {
             self.literal(
                 &format!("{}:declarations", run.id),
@@ -4940,7 +5010,9 @@ mod tests {
                 .entry
                 .block
                 .iter()
-                .filter(|block| block.id.0.ends_with(":changes") && block.id.0 != "edits:changes")
+                .filter(|block| {
+                    block.id.0.ends_with(":changes") && !block.id.0.starts_with("edits:results:")
+                })
                 .map(|block| block.text.wire_rows().join(""))
                 .collect();
             assert_eq!(
@@ -5109,7 +5181,9 @@ mod tests {
         assert!(groups[0].text.wire_rows().join("").contains("Ran 3 tools"));
         let headings: Vec<_> = blocks
             .iter()
-            .filter(|block| block.id.0.ends_with(":changes"))
+            .filter(|block| {
+                block.id.0.ends_with(":changes") && !block.id.0.starts_with("edits:results:")
+            })
             .map(|block| block.text.wire_rows().join(""))
             .collect();
         assert_eq!(headings.len(), 2);
@@ -7134,14 +7208,26 @@ mod tests {
     }
 
     #[test]
-    fn working_status_wraps_reasoning_and_omits_empty_previews() {
-        for summary in [
-            "",
-            " \n\t ",
-            "**Considering new ECS components** with Unicode 界 and enough detail to wrap",
+    fn working_status_ellipsizes_reasoning_and_omits_empty_previews() {
+        for (summary, columns, expected) in [
+            ("", 32, None),
+            (" \n\t ", 32, None),
+            ("short\nthought", 32, Some("short thought")),
+            ("**short**", 5, Some("short")),
+            ("12345678", 8, Some("12345678")),
+            ("123456789", 8, Some("12345...")),
+            ("界界界界界", 8, Some("界界...")),
+            (
+                "e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}",
+                8,
+                Some("e\u{301}e\u{301}e\u{301}e\u{301}e\u{301}..."),
+            ),
+            ("👩‍💻👩‍💻👩‍💻", 5, Some("👩‍💻...")),
+            ("overflow", 1, Some(".")),
+            ("overflow", 2, Some("..")),
         ] {
             let width = WidthProfile {
-                columns: 32,
+                columns,
                 ..Default::default()
             };
             let projection = project_at(
@@ -7163,27 +7249,22 @@ mod tests {
                 0,
             )
             .unwrap();
-            let rows = projection.entry.block[0].text.wire_rows();
-            assert_eq!(rows[1], "Planning · 37s");
-            if summary.trim().is_empty() {
-                assert_eq!(rows, vec!["", "Planning · 37s"]);
+            let block = &projection.entry.block[0];
+            let rows = block.text.wire_rows();
+            let preview_start = block
+                .metadata
+                .decoration
+                .iter()
+                .find(|decoration| decoration.capture == "ForgeHarnessCommentary")
+                .map(|decoration| decoration.range.start.row);
+            if let Some(expected) = expected {
+                let start = preview_start.expect("missing thought preview");
+                assert_eq!(rows.len(), start + 1, "{summary:?} at {columns} columns");
+                assert_eq!(rows[start], expected);
+                assert!(width.cells(rows[start], 0).unwrap() <= columns);
             } else {
-                assert_eq!(rows.len(), 4);
-                assert!(
-                    rows[2..]
-                        .iter()
-                        .all(|row| width.cells(row, 0).unwrap() <= 32)
-                );
-                assert!(
-                    "Considering new ECS components with Unicode 界 and enough detail to wrap"
-                        .starts_with(
-                            &rows[2..]
-                                .iter()
-                                .map(|row| row.trim())
-                                .collect::<Vec<_>>()
-                                .join(" ")
-                        )
-                );
+                assert!(preview_start.is_none());
+                assert_eq!(rows, vec!["", "Planning · 37s"]);
             }
         }
     }
@@ -7503,6 +7584,272 @@ mod tests {
                         .contains(activity.completed_label())
                 );
             }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interaction_results_render_created_then_deleted_files_without_preview_errors()
+    -> anyhow::Result<()> {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
+            ProviderFileChange, ToolActivity, ToolActivityKind,
+        };
+        for persistent in [false, true] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"transient", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Exercise changes", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            exchange.resume(0)?;
+            let address = ProviderAddress {
+                owner: None,
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            };
+            exchange.start_turn(address.clone(), 0)?;
+            for (index, (kind, diff)) in [
+                (ProviderChangeKind::Add, "@@ -0,0 +1 @@\n+first"),
+                (ProviderChangeKind::Update, "@@ -1 +1 @@\n-first\n+second"),
+                (ProviderChangeKind::Update, "@@ -1 +1 @@\n-second\n+third"),
+                (ProviderChangeKind::Delete, "@@ -1 +0,0 @@\n-third"),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut event = BackendEvent {
+                    received_at_ms: None,
+                    address: Some(address.clone()),
+                    turn_boundary: None,
+                    kind: "assistant_message".into(),
+                    text: Some(format!("Step {index}")),
+                    data: json!({"message_id":format!("step-{index}"), "phase":"commentary"}),
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                };
+                exchange.observe_turn(&event, index as i64 * 10 + 1)?;
+                let mut file = vec![ProviderFileChange {
+                    path: "temporary.lua".into(),
+                    move_path: None,
+                    kind,
+                    diff: diff.into(),
+                }];
+                if persistent && index == 3 {
+                    file.push(ProviderFileChange {
+                        path: "existing.lua".into(),
+                        move_path: None,
+                        kind: ProviderChangeKind::Update,
+                        diff: "@@ -1 +1 @@\n-before\n+after".into(),
+                    });
+                }
+                event.kind = "tool".into();
+                event.text = None;
+                event.data = serde_json::Value::Null;
+                event.activity = Some(ToolActivity {
+                    id: format!("write-{index}"),
+                    kind: ToolActivityKind::FileChange,
+                    title: "file changes".into(),
+                    output: None,
+                    output_delta: false,
+                    status: Some("completed".into()),
+                    change: ProviderChangeSet { file },
+                });
+                exchange.observe_turn(&event, index as i64 * 10 + 2)?;
+            }
+            for complete in [false, true] {
+                if complete {
+                    exchange
+                        .turn
+                        .last_mut()
+                        .unwrap()
+                        .finish(crate::turn::TurnOutcome::Completed, 49)?;
+                    exchange.finish(crate::exchange::ExchangeState::Complete, 50)?;
+                }
+                let restored = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+                let projected = project_at(
+                    &TimelineEntry::Exchange {
+                        id: "transient".into(),
+                        created_at_ms: 0,
+                        exchange: restored,
+                        agent_by_id: HashMap::new(),
+                    },
+                    &WidthProfile::default(),
+                    60,
+                )?;
+                let blocks = &projected.entry.block;
+                assert!(!blocks.iter().any(|block| {
+                    block
+                        .text
+                        .wire_rows()
+                        .join("")
+                        .contains("preview unavailable")
+                }));
+                let summary = blocks
+                    .iter()
+                    .find(|block| block.id.0 == "transient:results:changes")
+                    .unwrap();
+                assert!(summary.text.wire_rows().join("").contains(if persistent {
+                    "Changed 1 file"
+                } else {
+                    "No net file changes"
+                }));
+                assert_eq!(
+                    blocks
+                        .iter()
+                        .filter(|block| {
+                            block.id.0.ends_with(":changes")
+                                && block.id.0 != "transient:results:changes"
+                        })
+                        .count(),
+                    4
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn interaction_results_combine_checks_and_files_above_their_thought_details()
+    -> anyhow::Result<()> {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
+            ProviderFileChange, ToolActivity, ToolActivityKind,
+        };
+        use crate::exchange::ExchangeNode;
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"combined", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Implement and check", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = ProviderAddress {
+            owner: None,
+            thread_id: "thread".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 0)?;
+        let mut thought_ids = Vec::new();
+        for index in 0..2 {
+            let mut event = BackendEvent {
+                received_at_ms: None,
+                address: Some(address.clone()),
+                turn_boundary: None,
+                kind: "assistant_message".into(),
+                text: Some(format!("Thought {index}")),
+                data: json!({"message_id":format!("thought-{index}"), "phase":"commentary"}),
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            exchange.observe_turn(&event, index * 10 + 1)?;
+            thought_ids.push(exchange.node_list.last().unwrap().id().to_owned());
+            event.kind = "tool".into();
+            event.text = None;
+            event.data = serde_json::Value::Null;
+            event.activity = Some(ToolActivity {
+                id: format!("write-{index}"),
+                kind: ToolActivityKind::FileChange,
+                title: "file changes".into(),
+                output: None,
+                output_delta: false,
+                status: Some("completed".into()),
+                change: ProviderChangeSet {
+                    file: vec![ProviderFileChange {
+                        path: "result.txt".into(),
+                        move_path: None,
+                        kind: if index == 0 {
+                            ProviderChangeKind::Add
+                        } else {
+                            ProviderChangeKind::Update
+                        },
+                        diff: if index == 0 {
+                            "@@ -0,0 +1 @@\n+first"
+                        } else {
+                            "@@ -1 +1 @@\n-first\n+second"
+                        }
+                        .into(),
+                    }],
+                },
+            });
+            exchange.observe_turn(&event, index * 10 + 2)?;
+            let run: crate::checks::CheckRun = serde_json::from_value(json!({
+                "id":format!("run-{index}"), "owner":{"kind":"exchange","session_id":"session",
+                    "exchange_id":"combined","node_count":exchange.node_list.len()},
+                "revision":1,"completed_plan":null,"shell":"system","executable":null,
+                "workspace":".","environment_digest":"environment", "started_at_ms":index * 10 + 3,
+                "completed_at_ms":index * 10 + 5,"state":if index == 0 { "failed" } else { "passed" },
+                "progress":crate::plan::execution::SemanticProgress::default(),
+                "workspace_identity":null,"workspace_digest":{},"commands":[{
+                    "id":format!("run-{index}:command"),"command":"check result","state":if index == 0 { "failed" } else { "passed" },
+                    "started_at_ms":index * 10 + 3,"completed_at_ms":index * 10 + 5,"exit_code":if index == 0 {1} else {0},
+                    "error":null,"stdout":"","stderr":"","output":"","output_bytes":0,"preview":""
+                }]
+            }))?;
+            exchange.node_list.push(ExchangeNode::TimelineEvent {
+                event: Box::new(crate::timeline::TimelineEvent::Check { run: Box::new(run) }),
+            });
+            let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange)?)?;
+            let projected = project_at(
+                &TimelineEntry::Exchange {
+                    id: "combined".into(),
+                    created_at_ms: 0,
+                    exchange: restored,
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                30,
+            )?;
+            let blocks = &projected.entry.block;
+            let ids = blocks
+                .iter()
+                .map(|block| &block.id)
+                .collect::<std::collections::HashSet<_>>();
+            assert_eq!(
+                ids.len(),
+                blocks.len(),
+                "aggregate and detail blocks reused identities"
+            );
+            for identity in ["combined:results:checks", "combined:results:changes"] {
+                let heading = blocks.iter().find(|block| block.id.0 == identity).unwrap();
+                assert!(
+                    heading.metadata.node.as_ref().unwrap().parent.is_none(),
+                    "interaction summary is hidden inside Thought"
+                );
+                assert_eq!(heading.metadata.layout.as_ref().unwrap().indent, 2);
+            }
+            let summary = blocks
+                .iter()
+                .find(|block| block.id.0 == "combined:results:checks")
+                .unwrap();
+            assert!(summary.text.wire_rows().join("").contains(if index == 0 {
+                "0 passed · 1 failed"
+            } else {
+                "1 passed · 1 failed"
+            }));
+            for (thought_index, thought_id) in thought_ids.iter().enumerate() {
+                let run = blocks
+                    .iter()
+                    .find(|block| block.id.0 == format!("run-{thought_index}:checks"))
+                    .unwrap();
+                assert_eq!(
+                    run.metadata
+                        .node
+                        .as_ref()
+                        .unwrap()
+                        .parent
+                        .as_ref()
+                        .unwrap()
+                        .0,
+                    *thought_id,
+                    "individual check run lost its subthought owner"
+                );
+            }
+            let changes = blocks
+                .iter()
+                .find(|block| block.id.0 == "combined:results:changes")
+                .unwrap();
+            assert!(changes.text.wire_rows().join("").contains("Changed 1 file"));
         }
         Ok(())
     }

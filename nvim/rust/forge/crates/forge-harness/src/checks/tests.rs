@@ -238,7 +238,14 @@ fn reopening_history_excludes_obsolete_check_configuration_without_rewriting_it(
     assert_eq!(history[0].id, run.id);
     assert_eq!(std::fs::read(obsolete_path)?, obsolete);
     assert_eq!(
-        history[0].context.as_ref().unwrap().snapshot.config.definitions.len(),
+        history[0]
+            .context
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .config
+            .definitions
+            .len(),
         1
     );
     let mut invalid: serde_json::Value = crate::codec::from_slice(&std::fs::read(&current_path)?)?;
@@ -331,13 +338,27 @@ fn progress_counts_selected_checks_instead_of_the_configured_catalog() -> Result
         activity.command_list[0].output_line.as_deref(),
         Some("Compiling test executable")
     );
-    let running = run.commands.iter_mut().find(|command| command.state == CheckState::Running).unwrap();
+    let running = run
+        .commands
+        .iter_mut()
+        .find(|command| command.state == CheckState::Running)
+        .unwrap();
     let context = running.context.as_mut().unwrap();
     context.invocation = None;
-    context.selection = CheckSelection::Files { files: vec!["nvim/tests/forge/harness_health.lua".into()] };
-    assert!(running.heading().contains("nvim/tests/forge/harness_health.lua"));
+    context.selection = CheckSelection::Files {
+        files: vec!["nvim/tests/forge/harness_health.lua".into()],
+    };
+    assert!(
+        running
+            .heading()
+            .contains("nvim/tests/forge/harness_health.lua")
+    );
     let activity = CheckActivity::from_run(&run).unwrap();
-    assert!(activity.command_list[0].title.contains("nvim/tests/forge/harness_health.lua"));
+    assert!(
+        activity.command_list[0]
+            .title
+            .contains("nvim/tests/forge/harness_health.lua")
+    );
     let mut package_command = run
         .commands
         .iter()

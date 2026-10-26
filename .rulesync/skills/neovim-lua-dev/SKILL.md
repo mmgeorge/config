@@ -17,6 +17,14 @@ This skill governs authoring and refactoring Neovim plugins in Lua and inspectin
 
 Read the relevant reference file in `references/` before modifying complex subsystems.
 
+## Editor Process Ownership
+
+`nvim --remote-ui --server <socket>` controls the existing editor at that socket. It does not start an isolated editor. A new Terminal MCP session does not isolate that Neovim process. The target may be running the Harness agent making the tool call, so quitting it also terminates the agent's session.
+
+For interactive reproduction, start a separate Neovim process with a unique `--listen` address and isolated session storage. Record its process ID and socket, then verify `vim.fn.getpid()`, `vim.v.servername`, and `vim.fn.getcwd()` over RPC before attaching or sending input. Only terminate the process created for that test. If ownership is uncertain, use read-only RPC inspection until the target is identified.
+
+Never assume default Vim keybindings. Inspect the current mode and effective mappings in the target buffer before sending keys. Use explicit RPC window selection for navigation. When observing an existing editor, finish with `:detach` on the observing UI. Do not use quit commands, close the attached terminal as cleanup, or kill the existing editor.
+
 ---
 
 ## Lua Language Standards
@@ -39,12 +47,16 @@ Read the relevant reference file in `references/` before modifying complex subsy
 - **Tree-sitter Parsing:** Parse syntax trees asynchronously via `LanguageTree:parse(range, on_parse)`. Render initial text before parsing completes and upgrade highlighting in the callback.
 - **Buffer Rendering and Viewports:** Store logical lines as actual buffer text to preserve native search, marks, undo history, and folding. Apply syntax highlighting lazily to the active viewport using `nvim_set_decoration_provider`.
 - **Cursor and Viewport Preservation:** Finish asynchronous loading and preparation first. Capture each affected window's current cursor identity and viewport immediately before applying synchronous text or fold changes, then restore within that same non-yielding commit. Never carry restoration snapshots across requests, scheduled callbacks, timers, or coroutine yields. Capture action targets separately for stale-response validation. Save explicit navigation return positions only when actually leaving the source view.
+- **Stable Status Publication:** Retain the last usable status while asynchronous work prepares its successor. Publish the next operation only when it starts, and publish the final result when the workflow settles. Do not clear progress rows or insert transient placeholders such as `Preparing next check` between operations. Preserve this rule across incremental updates and full snapshots. See `references/rendering-and-highlights.md` for handoff regression coverage.
+- **Selection Preservation:** Capture the active Visual or Select anchor together with the cursor at the commit boundary. Restore both through the shared position resolver, preserving selection type and direction. Clamp removed rows and shortened UTF-8 lines independently so updates cannot expand the selection into newly appended content.
 - **Window Option Scoping:** Target window options explicitly using `vim.wo[win_id]` rather than relying on current window defaults (`vim.wo[0]`).
 - **Cursor Lifecycle in Focused TUIs:** Explicitly capture `vim.o.guicursor` when entering modal buffers, set a hidden cursor during focus, and restore the original cursor state on exit.
 - **Buffer Initialization:** Use `vim.cmd.edit` when editor plugins (such as LSP or gitsigns) must attach, as `nvim_win_set_buf` does not trigger `BufRead` or `FileType` autocmds.
 - **Display Re-entry:** Bind buffer display setup to `BufEnter` or `BufWinEnter` events so configuration re-applies across window switches and session restoration.
 
 ## Live Editor RPC Verification
+
+Before driving a live editor, read `references/live-nvim-rpc.md`. This configuration maps Normal-mode Ctrl+W to `:qa!`. Never assume default Vim navigation or Insert-mode keys. Inspect effective mappings in the target buffer and use explicit RPC window selection for navigation. A remote UI controls the existing editor, including its quit commands.
 
 Verify plugin behavior against running Neovim instances over the `$NVIM` socket:
 

@@ -4,6 +4,7 @@ local replica = require("forge.buffer")
 local input = require("forge.input")
 local perf = require("forge.infra.perf")
 local diagnostic = require("forge.views.harness.diagnostic")
+local refresh_interval_ns = 1e9 / 60
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
@@ -14,7 +15,6 @@ local transcript_options = {
 }
 
 function M.open(options, callback)
-  local tail = require("forge.views.harness.tail_follow").new(options.transcript_buffer)
   local loading_namespace = vim.api.nvim_create_namespace("ForgeHarnessLoading" .. options.transcript_buffer)
   local loading_mark = {}
   local function clear_loading()
@@ -242,9 +242,6 @@ function M.open(options, callback)
   owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
     before_commit = function()
-      if not owner.restore_timeline then
-        for window in pairs(owner.views) do tail.capture(window) end
-      end
       if not owner.save_timeline then return end
       local saved = {}
       for _, window in ipairs(vim.fn.win_findbuf(options.transcript_buffer)) do
@@ -255,10 +252,6 @@ function M.open(options, callback)
     end,
     after_commit = function()
       require("forge.views.harness.status_region").align(owner.transcript, options.transcript_window)
-      for window in pairs(owner.views) do
-        if owner.restore_timeline or not owner.ready then tail.reset(window)
-        else tail.publish(window) end
-      end
     end,
     recover = function() recovery(owner.transcript) end })
   owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
@@ -474,7 +467,7 @@ function M.open(options, callback)
     end
     if not owner.refresh_ready then
       if not owner.refresh_timer then
-        local deadline = vim.uv.hrtime() + 67000000
+        local deadline = vim.uv.hrtime() + refresh_interval_ns
         local function publish()
           owner.refresh_timer = nil
           if not alive() then return end
@@ -488,7 +481,7 @@ function M.open(options, callback)
           owner.sync()
         end
         vim.uv.update_time()
-        owner.refresh_timer = vim.defer_fn(publish, 67)
+        owner.refresh_timer = vim.defer_fn(publish, math.ceil(refresh_interval_ns / 1e6))
       end
       return
     end
@@ -512,7 +505,6 @@ function M.open(options, callback)
           for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
             if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
               vim.api.nvim_win_call(window, function() vim.fn.winrestview(saved) end)
-              tail.reset(window)
             end
           end
           owner.restore_timeline = nil
@@ -696,7 +688,6 @@ function M.open(options, callback)
     if node.kind == "message" and #(block.metadata.fold or {}) == 0 then return false end
     local view = view_for(window)
     if not view then return false end
-    tail.suspend(window)
     local desired = node.display ~= "full"
     if section_pending(node.id) then
       local intent = owner.section_intent and owner.section_intent[view.id]
@@ -741,7 +732,6 @@ function M.open(options, callback)
     for window, view in pairs(owner.views) do
       if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= owner.transcript.buffer then
         input.close(view)
-        tail.remove(window)
         owner.views[window] = nil
         owner.transcript.fold_loading[window] = nil
         if owner.section_intent then owner.section_intent[view.id] = nil end
@@ -848,12 +838,13 @@ function M.open(options, callback)
     end)
   end
 
-  ---Resume transcript tail following for an explicit user action without changing focus.
+  ---Position the transcript at its tail once for an explicit action without changing focus.
   function owner.follow_tail()
     if not alive() or not owner.ready then return end
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
-        tail.follow(window)
+        vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(owner.transcript.buffer), 0 })
+        vim.api.nvim_win_call(window, function() vim.cmd("normal! $zb") end)
       end
     end
   end
@@ -907,7 +898,6 @@ function M.open(options, callback)
   local markdown_scheduled = false
   vim.api.nvim_create_autocmd({ "WinScrolled", "CursorMoved", "CursorMovedI", "BufWinEnter", "WinClosed" }, {
     group = owner.group, callback = function()
-      for window in pairs(owner.views) do tail.observe(window) end
       if markdown_scheduled then return end
       markdown_scheduled = true
       vim.schedule(function() markdown_scheduled = false render_markdown(false) owner.observe_sections() end)

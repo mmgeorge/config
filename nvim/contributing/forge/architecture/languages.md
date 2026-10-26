@@ -88,12 +88,20 @@ servers when Harness closes. Agent queries also prepare explicit project files
 and await initialization and reported work-done progress before selecting a client. No generated project or
 source is required.
 
-Startup considers one source per directory and enabled configuration within its
-bounded scan. It resolves candidates using the original server root callback,
+Startup discovers JavaScript and TypeScript projects from `package.json` and Rust
+projects from `Cargo.toml`. Loose source files do not start these servers during
+discovery. Manifest buffers retain their actual filetype and are not attached as
+language source documents. Other configurations use one matching source per directory.
+Discovery visits nested directories in scheduled batches, excluding dependency and
+build directories without limiting the total entries, directories, or nesting depth.
+It resolves candidates using the original server root callback,
 preferring a root containing the repository before falling back to the closest
 nested workspace. Deeper independent workspaces are skipped once identified.
 Discovery and a concurrent first query share pending startup work. Explicit
 queries into separate workspaces retain separate editor-owned clients.
+Root callbacks may decline startup by not selecting a directory. Those attempts
+settle without an initialization error after the discovery wait, and are not retried
+as nested fallbacks. Initialization timeouts apply to clients that actually started.
 
 Rust owns one interaction scope per root or child turn, the read policy, and the
 setting generation. It admits at most four requests per host, each with a

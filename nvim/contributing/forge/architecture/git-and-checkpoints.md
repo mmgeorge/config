@@ -215,9 +215,9 @@ inventory nor text excerpts across HEAD, staged, amend, and pull-request compari
 The resolver does not open asset contents or execute filters. Other binary and
 unsupported sources retain an inventory entry without a text excerpt.
 
-The Lua generation owner maintains a persistent spinner with the resolved model,
-reasoning effort, elapsed time, and provider-supplied readable reasoning summaries.
-Failures remain visible after the editor buffer closes and never replace an existing draft.
+The Lua generation owner retains model and request state without displaying progress,
+waiting, completion, empty-result, or cancellation notifications. Generation failures
+produce error notifications even if the editor buffer has closed and never replace an existing draft.
 The `repository.generate` route accepts Harness configuration only. Gemini and direct
 HTTP provider selection are absent from this workflow.
 
@@ -398,6 +398,11 @@ overlapping thoughts, and reversions resolve to one final canonical patch instea
 provider hunks. These aggregate diffs remain internal exchange data and do not create transcript
 nodes or checkpoint annotations. The per-operation provider trees remain available at their
 original timeline positions.
+
+Grouped provider changes omit files created and deleted within the group because neither
+endpoint has a file to display. They never encode a patch with two absent paths. A group
+with only these operations displays `No net file changes`, while each operation remains
+in its original thought. Other changed files retain their previews and navigation.
 
 Saved patch presentation compares LF and CRLF lines by their text and reports line-ending
 conversions separately. Display counts and compact hunks therefore describe textual edits,

@@ -266,9 +266,6 @@ fn append_checks(
             lines.push(format!("    {output_line}"));
         }
     }
-    if checks.command_list.is_empty() {
-        lines.push("  Preparing next check".to_owned());
-    }
     let rendered = TranscriptRenderer::new(width)?.literal(
         BlockId(format!("{}:checks", block.id.0)),
         &lines.join("\n"),
@@ -317,9 +314,37 @@ fn append_reasoning_preview(
         &normalized,
         width,
     )?;
+    let first = rendered.block.text.row(0).unwrap_or("");
+    let preview = if rendered.block.text.row_count() > 1 || width.cells(first, 0)? > width.columns {
+        let suffix = ["...", "..", ".", ""]
+            .into_iter()
+            .find(|suffix| {
+                width
+                    .cells(suffix, 0)
+                    .is_ok_and(|cells| cells <= width.columns)
+            })
+            .unwrap_or("");
+        let available = width.columns.saturating_sub(width.cells(suffix, 0)?);
+        let prefix = if available == 0 {
+            ""
+        } else {
+            let mut preview_width = width.clone();
+            preview_width.columns = available;
+            let (end, _) = preview_width.wrapped_prefix(first, 1, 0)?;
+            let prefix = &first[..end];
+            if width.cells(prefix, 0)? <= available {
+                prefix.trim_end()
+            } else {
+                ""
+            }
+        };
+        format!("{prefix}{suffix}")
+    } else {
+        first.to_owned()
+    };
     let start = block.text.row_count();
     let mut rows = block.text.wire_rows();
-    rows.extend(rendered.block.text.wire_rows().into_iter().take(2));
+    rows.push(&preview);
     block.text = forge_buffer::text::BufferText::from_rows(rows)?;
     block.metadata.decoration.push(Decoration {
         range: TextRange {

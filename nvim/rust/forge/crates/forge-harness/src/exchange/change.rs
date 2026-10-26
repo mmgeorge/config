@@ -247,13 +247,15 @@ fn operation_hunk_list(kind: ProviderChangeKind, diff: &str) -> Vec<String> {
 }
 
 fn render_projection(output: &mut String, projection: FileProjection) {
-    let old_path = projection.old_path.as_deref().unwrap_or("/dev/null");
-    let new_path = projection.new_path.as_deref().unwrap_or("/dev/null");
-    let label_path = projection
+    let Some(label_path) = projection
         .new_path
         .as_deref()
         .or(projection.old_path.as_deref())
-        .unwrap_or("unknown");
+    else {
+        return;
+    };
+    let old_path = projection.old_path.as_deref().unwrap_or("/dev/null");
+    let new_path = projection.new_path.as_deref().unwrap_or("/dev/null");
     let git_old = projection.old_path.as_deref().unwrap_or(label_path);
     let git_new = projection.new_path.as_deref().unwrap_or(label_path);
     output.push_str(&format!("diff --git a/{git_old} b/{git_new}\n"));
@@ -412,6 +414,96 @@ mod test {
             index.paths().iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["src/main.rs", "src/new.rs", "src/old.rs"]
         );
+    }
+
+    #[test]
+    fn transient_files_do_not_emit_pathless_patches() {
+        let mut tools = Vec::new();
+        for (id, kind, path, move_path, diff) in [
+            (
+                "create",
+                ProviderChangeKind::Add,
+                "temporary.lua",
+                None,
+                "@@ -0,0 +1 @@\n+first",
+            ),
+            (
+                "edit",
+                ProviderChangeKind::Update,
+                "temporary.lua",
+                None,
+                "@@ -1 +1 @@\n-first\n+second",
+            ),
+            (
+                "move",
+                ProviderChangeKind::Move,
+                "temporary.lua",
+                Some("renamed.lua"),
+                "",
+            ),
+            (
+                "remove",
+                ProviderChangeKind::Delete,
+                "renamed.lua",
+                None,
+                "@@ -1 +0,0 @@\n-second",
+            ),
+        ] {
+            tools.push(file_tool(
+                id,
+                "completed",
+                vec![ProviderFileChange {
+                    path: path.into(),
+                    move_path: move_path.map(str::to_owned),
+                    kind,
+                    diff: diff.into(),
+                }],
+            ));
+        }
+        let (diff, warning) = ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>());
+        assert!(diff.is_none());
+        assert!(warning.is_none());
+        assert!(ProviderDiffBuilder::build(&tools).is_none());
+
+        tools.push(file_tool(
+            "persist",
+            "completed",
+            vec![ProviderFileChange {
+                path: "existing.lua".into(),
+                move_path: None,
+                kind: ProviderChangeKind::Update,
+                diff: "@@ -1 +1 @@\n-before\n+after".into(),
+            }],
+        ));
+        for diff in [
+            ProviderDiffBuilder::build(&tools),
+            ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>()).0,
+        ] {
+            let diff = diff.expect("persistent edit");
+            let patch = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
+            assert_eq!(patch.file.len(), 1);
+            assert_eq!(patch.file[0].new_path.as_deref(), Some("existing.lua"));
+            assert_eq!(patch.file[0].hunk[0].row[1].text, "after");
+        }
+
+        tools.push(file_tool(
+            "recreate",
+            "completed",
+            vec![ProviderFileChange {
+                path: "temporary.lua".into(),
+                move_path: None,
+                kind: ProviderChangeKind::Add,
+                diff: "@@ -0,0 +1 @@\n+third".into(),
+            }],
+        ));
+        let (diff, warning) = ProviderDiffBuilder::build_group(&tools.iter().collect::<Vec<_>>());
+        assert!(warning.is_none());
+        let diff = diff.unwrap();
+        let patch = forge_diff::patch::UnifiedPatch::parse(&diff).unwrap();
+        assert_eq!(patch.file.len(), 2);
+        assert_eq!(patch.file[1].old_path, None);
+        assert_eq!(patch.file[1].new_path.as_deref(), Some("temporary.lua"));
+        assert_eq!(patch.file[1].hunk[0].row[0].text, "third");
     }
 
     #[test]

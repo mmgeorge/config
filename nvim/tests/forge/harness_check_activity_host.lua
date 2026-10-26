@@ -167,9 +167,10 @@ local succeeded, failure = xpcall(function()
       .. "\nerrors=" .. vim.inspect(errors))
   local sequence = state.presentation.transcript.sequence
   local function assert_visible_check()
-    local _, row = sequence:position(run_id .. ":checks")
+    local summary_id = exchange.id .. ":results:checks"
+    local _, row = sequence:position(summary_id)
     assert(row, "check summary disappeared")
-    local block = state.presentation.transcript.block[run_id .. ":checks"]
+    local block = state.presentation.transcript.block[summary_id]
     assert(not block.metadata.node.parent or block.metadata.node.parent == vim.NIL,
       "check summary belongs to the activity fold")
     vim.api.nvim_set_current_win(state.transcript_win)

@@ -38,21 +38,15 @@ local function run()
   local cwd = "D:/ai-commit-fixture"
   ai_commit.ensure(cwd, { ref = "HEAD", ignored_paths = { "excluded.txt" } })
   assert_equal(requests[1].params.ignored_paths[1], "excluded.txt")
-  local first_notice = notices[#notices]
-  assert_equal(first_notice.options.timeout, false, "generation notice must remain visible")
-  assert(vim.wait(1500, function()
-    return notices[#notices].message:find("fixture-model · 1s", 1, true) ~= nil
-  end, 10), "generation notice omitted model or elapsed time")
-  assert_equal(notices[#notices].options.id, first_notice.options.id, "progress created another notification")
-  local animated = {}
-  for _, notice in ipairs(notices) do animated[notice.options.icon] = true end
-  assert(vim.tbl_count(animated) > 1, "generation icon did not animate")
+  assert_equal(#notices, 0, "starting generation displayed a notification")
+  vim.wait(250, function() return false end)
+  assert_equal(#notices, 0, "waiting for generation displayed a notification")
   local finish_draft = take("generate", "head")
   local buffer = vim.api.nvim_create_buf(false, true)
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd)
   assert_equal(#requests, 0, "pending draft performed validation or generation")
   finish_draft({ state = "ready", message = "reused draft" })
-  assert_equal(notices[#notices].options.timeout, 3000, "completed generation retained its spinner")
+  assert_equal(#notices, 0, "completed generation displayed a notification")
   local completed_count = #notices
   vim.wait(250, function() return false end)
   assert_equal(#notices, completed_count, "completed generation timer kept notifying")
@@ -87,9 +81,10 @@ local function run()
   assert_equal(notices[#notices].message, "Commit generation failed: provider failed")
   assert_equal(notices[#notices].level, vim.log.levels.ERROR)
   assert_equal(vim.api.nvim_buf_get_lines(buffer, 0, 1, false)[1], "edited before provider failure")
+  local error_count = #notices
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   take("generate", "staged")({ state = "none" })
-  assert_equal(notices[#notices].message, "No staged changes to describe")
+  assert_equal(#notices, error_count, "empty generation displayed a notification")
   ai_commit.populate_commit_buffer_when_ready(buffer, cwd, true)
   local closed = take("generate", "staged")
   vim.api.nvim_buf_delete(buffer, { force = true })
@@ -117,10 +112,10 @@ local function run()
   local obsolete = take("generate", "head")
   local invalidated
   ai_commit.ensure(cwd, { ref = "HEAD" }, function(state) invalidated = state end)
+  local cancelled_count = #notices
   ai_commit.clear(cwd)
   assert_equal(invalidated.state, "none", "pending About waiter was not released")
-  assert_equal(notices[#notices].message, "Commit generation cancelled")
-  local cancelled_count = #notices
+  assert_equal(#notices, cancelled_count, "cancelled generation displayed a notification")
   vim.wait(150, function() return false end)
   assert_equal(#notices, cancelled_count, "cancelled generation timer kept notifying")
   assert_equal(ai_commit.state(cwd, "HEAD"), nil, "cleared About remained reusable")
@@ -165,12 +160,15 @@ local function run()
   }
   ai_commit.ensure("D:/harness-fallback", { ref = "HEAD" })
   assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").message, "fix: use recent Harness\n\nPreserve the body.")
-  assert(notices[#notices].message:find("selected-model (codex)", 1, true))
+  assert_equal(ai_commit.state("D:/harness-fallback", "HEAD").model, "selected-model (codex)")
   package.loaded["forge.client"].request_generation = function(_, callback)
     callback(nil, "claude commit_message generation failed: Unsupported provider capability: text_generation")
   end
   ai_commit.ensure("D:/unsupported-harness", { ref = "HEAD" })
   assert(ai_commit.state("D:/unsupported-harness", "HEAD").error:find("text_generation", 1, true))
+  for _, notice in ipairs(notices) do
+    assert_equal(notice.level, vim.log.levels.ERROR, "generation displayed a non-error notification")
+  end
 end
 
 local ok, failure = xpcall(run, debug.traceback)

@@ -20,10 +20,18 @@ requests[1].callback({ transcript = { document = owner.document, revision = 0, b
 } } })
 local function burst(expected)
   local started = vim.uv.hrtime()
+  local defer = vim.defer_fn
+  local scheduled_delay
+  vim.defer_fn = function(callback, delay)
+    scheduled_delay = delay
+    return defer(callback, delay)
+  end
   for _ = 1, 100 do owner.sync() end
+  vim.defer_fn = defer
+  assert(scheduled_delay == 17, "refresh did not schedule the 60 Hz target")
   assert(#requests == expected - 1, "burst published immediately")
   assert(vim.wait(1000, function() return #requests == expected end, 1), "burst did not publish")
-  assert((requests[expected].time - started) / 1e6 >= 60, "refresh exceeded the 15 fps cap")
+  assert((requests[expected].time - started) / 1e6 >= 1000 / 60, "refresh exceeded the 60 Hz target")
 end
 burst(2)
 for _ = 1, 100 do owner.sync() end
@@ -48,7 +56,7 @@ requests[2].callback({ patch = patch })
 assert(owner.transcript.revision == 64)
 assert(publications == initial_publications + 1, "batch notified before its final revision")
 assert(vim.wait(1000, function() return #requests == 3 end, 1), "in-flight burst lost its trailing update")
-assert((requests[3].time - completed) / 1e6 >= 60, "trailing publication exceeded the frame cap")
+assert((requests[3].time - completed) / 1e6 >= 1000 / 60, "trailing publication exceeded the 60 Hz target")
 requests[3].callback({ patch = {} })
 timer:stop()
 timer:close()
@@ -74,5 +82,5 @@ assert(owner.close())
 local closed_count = #requests
 vim.wait(100, function() return false end, 1)
 assert(#requests == closed_count, "closed presentation dispatched a pending refresh")
-print("harness_publication: passed, atomic 64-patch batch and 15 fps trailing updates")
+print("harness_publication: passed, atomic 64-patch batch and 60 Hz target with trailing updates")
 vim.cmd("qa!")

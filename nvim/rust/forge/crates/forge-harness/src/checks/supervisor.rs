@@ -1571,7 +1571,9 @@ pub(super) fn write_record(path: &Path, run: &CheckRun) -> Result<()> {
     let temporary = path.with_extension("tmp");
     std::fs::write(
         &temporary,
-        crate::codec::to_vec(&serde_json::json!({"version":CHECK_HISTORY_VERSION,"run":crate::codec::to_value(run)?}))?,
+        crate::codec::to_vec(
+            &serde_json::json!({"version":CHECK_HISTORY_VERSION,"run":crate::codec::to_value(run)?}),
+        )?,
     )?;
     std::fs::rename(temporary, path)?;
     Ok(())

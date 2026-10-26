@@ -301,16 +301,12 @@ Controller renders and
 presentation callbacks share status-hint selection so updates cannot alternate between a
 wait notice and the underlying activity. Connection and execution failures retain precedence.
 
-Transcript presentation follows updates only in windows showing the bottom immediately before
-publication. Native viewport and cursor movement suspend following for 500 milliseconds, independently
-of mouse input or configured navigation keys. Following resumes only when that grace period has elapsed
-and the bottom is visible. Changing focus does not resume following. Each attached window tracks its
-own viewport, including wrapped final lines, and retains historical reading positions through snapshot
-recovery. Explicit prompt submission and agent actions can request tail positioning directly.
-Expanding or collapsing a timeline section suspends following in the initiating
-window, including through delayed content delivery. Native cursor or viewport
-navigation clears that suspension and applies the normal bottom-visibility grace
-period. Explicit tail actions resume following immediately.
+Transcript updates preserve each attached window's cursor and viewport through the shared
+document commit, including when thought text beneath Working grows or wraps. Bottom visibility,
+elapsed time, and composer focus never authorize automatic cursor movement. Explicit prompt
+submission and agent actions can position the transcript at its tail once. Subsequent updates
+preserve that position. Snapshot recovery retains reading positions, and timeline switches
+restore the selected timeline's saved view.
 
 
 `client.lua` owns one persistent Forge JSONL process. Repository requests do not require Harness
@@ -518,7 +514,8 @@ explicitly retries or closes and reopens it.
 A failed request produces a visible notice and remains retryable. Section sequences reject delayed requests, and document identities reject
 requests from a previous presentation lifetime. Neovim's native search covers loaded text.
 
-The existing 67 ms publication interval applies to demand responses and streaming changes. Each
+The 60 Hz publication target uses a 16.67 ms interval rounded up to a 17 ms timer for demand
+responses and streaming changes. Each
 buffer commit installs text and metadata atomically. Internal events retain the 512 KiB frame limit
 and use ordered JSON parts for larger payloads without an aggregate byte limit. Transport shutdown
 or an incomplete multipart event reports an explicit delivery failure.
@@ -1123,6 +1120,10 @@ use compact minutes, hours, or days. Timer updates do not scan peer tools to siz
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
 ## Permissions, sandboxing, and request deadlines
+
+Both initial interactive session creation and `session.new` initialize permissions
+to Write. Explicit and latest-session resumes retain the stored mode. Background
+generation and provider forks keep their existing Read initialization.
 
 The Rust `PermissionStore` loads one validated Rulesync-shaped document from
 `stdpath("config")/forge/permissions.json`, compiles command and resource matchers once, and
