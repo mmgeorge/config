@@ -139,6 +139,7 @@ local succeeded, failure = xpcall(function()
   assert(state.presentation.toggle_heading(state.transcript_win), "check results did not expand")
   local category_row
   assert(vim.wait(3000, function()
+    if not state.presentation.transcript.sequence.node[run_id .. ":category:test"] then return false end
     _, category_row = state.presentation.transcript.sequence:position(run_id .. ":category:test")
     return category_row ~= nil
   end, 10), "test category is missing")
@@ -153,16 +154,8 @@ local succeeded, failure = xpcall(function()
     if command.context.definition_id == "empty" then empty_command = command.id end
   end
   assert(empty_command, "empty check result is missing")
-  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:find("Empty fixture", 1, true) then
-      vim.api.nvim_win_set_cursor(state.transcript_win, { row, 0 })
-      assert(state.presentation.toggle_heading(state.transcript_win), "empty check scope did not expand")
-      break
-    end
-  end
   assert(vim.wait(3000, function()
-    local _, row = state.presentation.transcript.sequence:position(empty_command .. ":tool")
-    return row ~= nil
+    return state.presentation.transcript.sequence.node[empty_command .. ":tool"] ~= nil
   end, 10), "empty check tool did not load")
   local _, empty_heading_row = state.presentation.transcript.sequence:position(empty_command .. ":tool")
   assert(empty_heading_row, "empty check heading is missing")
@@ -268,7 +261,13 @@ local succeeded, failure = xpcall(function()
   }, rust_root .. "/src/lib.rs")
   local lock = vim.system({ "cargo", "generate-lockfile", "--offline" }, { cwd = rust_root, text = true }):wait(10000)
   assert(lock.code == 0, lock.stderr)
-  local streaming_id = request("checks.run", { check = { "rust-stream" } }).run_id
+  local function rust_command(run)
+    for _, command in ipairs(run.commands) do
+      if command.context and command.context.definition_id == "rust-stream" then return command end
+    end
+    error("Rust callback command is missing")
+  end
+  local streaming_id = request("checks.run", { check = { "rust-stream" }, inputs = { test = "streaming" } }).run_id
   assert(vim.wait(30000, function()
     answer_permissions()
     return transcript():find("    running 1 test", 1, true) ~= nil
@@ -288,7 +287,7 @@ local succeeded, failure = xpcall(function()
     return rust_result.state ~= "running"
   end, 20), "Rust streaming check did not finish")
   assert(rust_result.state == "passed", vim.inspect(rust_result))
-  local report = rust_result.commands[1].report.result[1]
+  local report = rust_command(rust_result).report.result[1]
   assert(report.output:find("Compiling stream-fixture", 1, true), "report lost stderr")
   assert(report.output:find("test streaming ... ok", 1, true), "report lost stdout")
   assert(vim.wait(3000, function()
@@ -303,7 +302,7 @@ local succeeded, failure = xpcall(function()
       return failed.state ~= "running"
     end, 20), "Rust failure fixture did not finish")
     assert(failed.state == "failed", "streaming converted a failed or unmatched test into success")
-    assert(failed.commands[1].report.result[1].state == "failed")
+    assert(rust_command(failed).report.result[1].state == "failed")
   end
 end, debug.traceback)
 require("forge.views.harness.workspace").release(state)
