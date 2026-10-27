@@ -4,6 +4,38 @@ Harness owns durable sessions, exchanges, tasks, goals, child agents, approvals,
 
 Provider-specific transport behavior is described in [Providers](providers.md). Plan lifecycle and checking gates are described in [Planning](planning.md).
 
+## Agent inspection and conversation recall
+
+The root interaction exposes `harness_config` and seven `harness_session_*` tools
+through `control_tools/harness`. Configuration inspection remains available when
+Session history is disabled in `/config`. The portable `session_tools` setting
+defaults on, inherits global/workspace/session layers, and removes history tools
+from provider catalogs when off. Existing scopes also reject disabled history
+calls. The `harness-sessions` skill remains independently discoverable.
+
+An inspection scope retains the authenticated turn-start session and caller read
+policy. Other sessions require authorization against their workspace. Their saved
+permissions never authorize the caller. Root scopes retire with the interaction,
+and Background requests have no inspection tools. Reads use SQLite read-only
+connections without schema initialization, migrations, or ownership leases.
+Question/answer pages read exchange metadata without hydrating stored tool output.
+Search streams candidate exchanges and explicit output chunks. Repository filters
+use canonical Git common-directory identity, including linked worktrees.
+
+Each query writes a private temporary result snapshot before publication. Opaque
+continuations bind to that query and interaction, and recheck workspace authority.
+Page byte budgets bound delivery rather than total result size. Oversized records
+continue as UTF-8 fragments of serialized JSON without losing content. Retiring
+the scope removes its temporary files. Failures leave canonical history unchanged.
+
+Exchange details expose ordered conversation, tool identities, approval provenance,
+and check-event identities. Structured tool input is not retained by exchange
+storage and is reported unavailable. Session log inspection includes retained
+rotations but exposes only allowlisted diagnostic metadata, excluding raw provider
+transports, prompts, credentials, and private reasoning. `harness_config` reports
+effective portable settings, approval/access state, permission rules, and configured
+source/settings locations without provider authentication payloads.
+
 Provider polling runs in an owned Tokio task. The broker pins the provider lifecycle,
 event loop, and event-processing futures separately so their state does not accumulate
 inline along a permission-change resume and automatic repair. Compaction processing

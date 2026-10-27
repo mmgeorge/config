@@ -59,6 +59,7 @@ function HarnessSnapshot.apply(state, result)
   state.capability = result.capability or {}
   state.subagent_tools = result.subagent_tools == true
   state.lsp_tools = result.lsp_tools == true
+  state.session_tools = result.session_tools ~= false
   state.status_thoughts = result.status_thoughts == true
   state.check_editing = result.check_editing == true
   state.checks_running = result.checks_running == true

@@ -5,6 +5,17 @@ describes the current local plugin configuration. The source registration define
 argument parsing and completion. Contributor documentation starts at
 [Contributing to Forge](../../contributing/forge/README.md).
 
+## Harness inspection
+
+Harness agents can inspect configuration with `harness_config` and recall previous
+work through `harness_session_list`, `harness_session_search`,
+`harness_session_exchange_list`, `harness_session_exchange`, `harness_session_tool`,
+`harness_session_status`, and `harness_session_log`. These are model tools, not
+editor commands. `/config` → **Tools** → **Session history** toggles all seven
+history tools. Configuration inspection and the `harness-sessions` skill remain
+available when history is off. Session-specific reads default to the current
+session. Unfiltered listing/search considers all accessible sessions.
+
 ## Git review
 
 | Command | Arguments | Behavior |

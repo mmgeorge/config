@@ -92,6 +92,19 @@ impl HarnessBroker {
                 Arc::clone(&self.repositories),
                 Arc::clone(&self.diff),
             )?;
+        let (harness_scope, harness_lease) =
+            crate::control_tools::harness::HarnessInspectionScope::open(
+                self.session.clone(),
+                self.data_root.clone(),
+                self.permission_store
+                    .read()
+                    .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
+                    .open()
+                    .0,
+                policy.clone(),
+                Arc::clone(&self.turn_cancellation.requested),
+                self.trace.clone(),
+            )?;
         let (lsp_scope, lsp_lease) = self.lsp.scope(
             self.session.id.clone(),
             interaction.id.clone(),
@@ -102,6 +115,7 @@ impl HarnessBroker {
         if let Some(context) = &mut backend_request.control_context {
             context.lsp = Some(lsp_scope);
             context.repository = Some(repository_scope);
+            context.harness = Some(harness_scope);
             context.has_active_elicitation |= interaction.elicitation.is_some();
         }
         self.trace.record(
@@ -121,6 +135,7 @@ impl HarnessBroker {
         .await;
         drop(execution);
         drop(repository_lease);
+        drop(harness_lease);
         drop(lsp_lease);
         let output = match output {
             Ok(output) => output,

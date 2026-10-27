@@ -1,3 +1,4 @@
+pub(crate) mod inspection;
 pub(crate) mod model_pin;
 pub mod objects;
 mod ownership;

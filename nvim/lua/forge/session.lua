@@ -86,6 +86,7 @@ M.empty_diff_rows = {}
 ---@field status_thoughts? boolean
 ---@field subagent_tools? boolean
 ---@field lsp_tools? boolean
+---@field session_tools? boolean
 ---@field task_config? table
 ---@field check_editing? boolean
 ---@field check_timing? 'after_queue'|'between_work'

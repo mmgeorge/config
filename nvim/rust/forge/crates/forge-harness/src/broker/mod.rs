@@ -160,6 +160,7 @@ pub struct BrokerSnapshot {
     pub access_abbreviation: String,
     pub subagent_tools: bool,
     pub lsp_tools: bool,
+    pub session_tools: bool,
     pub status_thoughts: bool,
     pub check_editing: bool,
     pub runtime_epoch: String,
@@ -1071,6 +1072,7 @@ impl HarnessBroker {
                 .is_some_and(|goal| goal.state == GoalState::Active),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             repository: None,
+            harness: None,
             lsp: None,
             execution: None,
         })
@@ -10147,13 +10149,18 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
         let lsp_tools = params.get("lsp_tools").and_then(Value::as_bool);
+        let session_tools = params
+            .get("session_tools")
+            .map(|value| serde_json::from_value::<bool>(value.clone()))
+            .transpose()?;
         let status_thoughts = params
             .get("status_thoughts")
             .map(|value| serde_json::from_value::<bool>(value.clone()))
             .transpose()?;
         let delegation_registry_changed = subagent_tools
             .is_some_and(|enabled| enabled != self.agent_coordinator.enabled())
-            || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id));
+            || lsp_tools.is_some_and(|enabled| enabled != self.lsp.enabled(&self.session.id))
+            || session_tools.is_some();
         if let Some(access) = access {
             configured.access = access;
         }
@@ -10260,6 +10267,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
             if let Some(enabled) = lsp_tools {
                 portable.lsp_tools = Some(enabled);
+                changed = true;
+            }
+            if let Some(enabled) = session_tools {
+                portable.session_tools = Some(enabled);
                 changed = true;
             }
             if let Some(enabled) = status_thoughts {

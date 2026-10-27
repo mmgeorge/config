@@ -24,6 +24,7 @@ pub struct ControlTurnContext {
     pub has_active_goal: bool,
     pub workspace_root: Option<PathBuf>,
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
+    pub(crate) harness: Option<Arc<super::harness::HarnessInspectionScope>>,
     pub(crate) lsp: Option<Arc<super::lsp::LspScope>>,
     pub execution: Option<crate::plan::execution::ExecutionControlSender>,
 }
@@ -68,6 +69,7 @@ impl ControlTurnContext {
             has_active_goal: false,
             workspace_root: None,
             repository: None,
+            harness: None,
             lsp: None,
             execution: None,
         }
@@ -219,6 +221,18 @@ impl ControlToolRuntime {
             execution.require_revision_phase()?;
         }
         match invocation.name.as_str() {
+            name if super::harness::is_tool(name) => {
+                let scope = self
+                    .context
+                    .harness
+                    .as_ref()
+                    .context("Harness inspection requires an authenticated root interaction")?;
+                let message = scope.invoke(name, invocation.arguments).await?;
+                Ok(ControlToolResult {
+                    invocation: None,
+                    message,
+                })
+            }
             name if super::lsp::is_tool(name) => {
                 let scope = self
                     .context
@@ -849,6 +863,7 @@ mod test {
             has_active_goal: false,
             workspace_root: Some(workspace),
             repository: None,
+            harness: None,
             lsp: None,
             execution: None,
         }

@@ -309,6 +309,15 @@ impl BrokerObserver {
             access_abbreviation: session.access.abbreviation().into(),
             subagent_tools: self.agent_coordinator.enabled(),
             lsp_tools: self.lsp.enabled(&source_session.id),
+            session_tools: crate::settings::SettingsStore::read_only(&self.data_root)?
+                .get(
+                    &source_session.workspace,
+                    &source_session.id,
+                    &source_session.backend,
+                )?
+                .desired
+                .session_tools
+                .unwrap_or(true),
             status_thoughts,
             check_editing: self.check_editing.load(Ordering::Acquire),
             runtime_epoch: self.runtime_epoch.clone(),

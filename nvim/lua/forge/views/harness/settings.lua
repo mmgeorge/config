@@ -200,6 +200,7 @@ function M.open(state, host)
         active.status_thoughts = state.status_thoughts == true
         active.check_timing = state.check_timing or "after_queue"
         active.automatic_checks = state.automatic_checks ~= false
+        if applied and params.session_tools ~= nil then active.session_tools = params.session_tools end
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -282,6 +283,8 @@ function M.open(state, host)
         configure({ subagent_tools = (active.subagent_tools == nil and state.subagent_tools or active.subagent_tools) ~= true })
       elseif id == "lsp-tools" then
         configure({ lsp_tools = (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) ~= true })
+      elseif id == "session-tools" then
+        configure({ session_tools = not (active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false)) })
       elseif id == "status-thoughts" then
         configure({ status_thoughts = active.status_thoughts ~= true })
       elseif id == "check-timing" then
@@ -476,6 +479,9 @@ function M.open(state, host)
             }, true),
             row("lsp-tools", "Tools", "LSP", {
               field("lsp-tools", "toggle", (active.lsp_tools == nil and state.lsp_tools or active.lsp_tools) == true, "LSP", "Read-only agent queries through editor language servers."),
+            }, true),
+            row("session-tools", "Tools", "Session history", {
+              field("session-tools", "toggle", active.session_tools ~= false and (active.session_tools ~= nil or state.session_tools ~= false), "Sessions", "Read-only Harness history tools. Configuration inspection and the Harness skill remain available when off."),
             }, true),
             row("status-thoughts", "Display", "Thoughts", {
               field("status-thoughts", "toggle", active.status_thoughts == true, "Thoughts", "Show the latest thought under live status without changing timeline messages."),

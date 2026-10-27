@@ -9,6 +9,7 @@ use tokio::io::{AsyncWriteExt, BufReader};
 
 mod executor;
 mod failure;
+pub(crate) mod harness;
 pub(crate) mod lsp;
 pub mod repository;
 mod runtime;
@@ -357,6 +358,7 @@ impl ControlToolRegistry {
             },
         ]);
         definitions.extend(lsp::definitions());
+        definitions.extend(harness::definitions());
         definitions
     }
 
@@ -391,6 +393,14 @@ impl ControlToolRegistry {
         self.definition_list()
             .into_iter()
             .filter(|definition| {
+                if harness::is_tool(definition.name) {
+                    return root
+                        && context
+                            .and_then(|context| context.harness.as_ref())
+                            .is_some_and(|scope| {
+                                definition.name == "harness_config" || scope.enabled()
+                            });
+                }
                 if is_check_tool(definition.name) {
                     return root && context.is_some_and(|context| context.checks.is_some());
                 }
@@ -536,6 +546,7 @@ pub fn apply_invocation(
         | "repository_changed_paths"
         | "repository_diff"
         | "repository_file_diff" => {}
+        name if harness::is_tool(name) => {}
         name => anyhow::bail!("unknown Harness control tool: {name}"),
     }
     Ok(())

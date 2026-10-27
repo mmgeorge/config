@@ -67,7 +67,10 @@ Copilot's native file tools report absent sides as `a/dev/null` and `b/dev/null`
 The Copilot diff adapter recognizes those markers before converting workspace
 paths to relative paths, so additions and deletions cannot become renames to a
 device path. A real workspace file named `dev/null` retains its identity after
-normalization. The shared ordinary-Git patch parser keeps its standard path rules.
+normalization. The adapter also normalizes Copilot's `create file mode` header
+to Git's `new file mode` before parsing a complete multi-file report. Diff-prefixed
+source rows remain unchanged. The shared ordinary-Git patch parser keeps its
+standard path rules.
 
 `MockBackend` implements the same provider boundary with deterministic responses.
 Its `backend/mock_response.rs` control stores session-scoped, one-response holds.

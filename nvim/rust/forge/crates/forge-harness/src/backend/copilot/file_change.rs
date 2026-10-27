@@ -8,6 +8,24 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
     if !source.starts_with("diff --git ") && !source.starts_with("--- ") {
         return Ok(ProviderChangeSet::default());
     }
+    // Copilot uses "create file mode" where Git uses "new file mode".
+    // Hunk rows retain their diff prefix and must not be rewritten.
+    let normalized;
+    let source = if source
+        .lines()
+        .any(|line| line.starts_with("create file mode "))
+    {
+        normalized = source
+            .split_inclusive('\n')
+            .map(|line| {
+                line.strip_prefix("create file mode ")
+                    .map_or_else(|| line.to_owned(), |mode| format!("new file mode {mode}"))
+            })
+            .collect::<String>();
+        normalized.as_str()
+    } else {
+        source
+    };
     let patch = UnifiedPatch::parse(source).context("decode file-tool result diff")?;
     let file = patch
         .file
@@ -96,6 +114,31 @@ fn relative_path(path: &str, workspace: &str) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn copilot_creation_headers_preserve_all_files_and_literal_hunk_text() {
+        let output = "\ndiff --git a/Users/me/project/old.rs b/Users/me/project/old.rs\n\
+            index 0000000..0000000 100644\n--- a/Users/me/project/old.rs\n+++ b/Users/me/project/old.rs\n\
+            @@ -1 +1 @@\n-before\n+after\n\
+            diff --git a/Users/me/project/new.rs b/Users/me/project/new.rs\n\
+            create file mode 100644\nindex 0000000..0000000\n--- a/dev/null\n+++ b/Users/me/project/new.rs\n\
+            @@ -1,0 +1,2 @@\n+create file mode 100644\n+retained\n\
+            diff --git a/Users/me/project/gone.rs b/dev/null\n\
+            --- a/Users/me/project/gone.rs\n+++ b/dev/null\n@@ -1 +0,0 @@\n-gone\n";
+        for source in [output.to_owned(), output.replace('\n', "\r\n")] {
+            let changes = from_output(&source, "/Users/me/project").unwrap();
+            assert_eq!(changes.file.len(), 3);
+            assert_eq!(changes.file[0].kind, ProviderChangeKind::Update);
+            assert_eq!(changes.file[1].kind, ProviderChangeKind::Add);
+            assert_eq!(changes.file[1].path, "new.rs");
+            assert!(changes.file[1].diff.contains("+create file mode 100644"));
+            assert_eq!(changes.file[2].kind, ProviderChangeKind::Delete);
+        }
+        assert!(
+            UnifiedPatch::parse(output.trim_start()).is_err(),
+            "provider dialect normalization must not change ordinary Git parsing"
+        );
+    }
 
     #[test]
     fn prefixed_null_markers_render_as_additions_and_deletions() {

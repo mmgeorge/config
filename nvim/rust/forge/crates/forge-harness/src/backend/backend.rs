@@ -6,7 +6,7 @@ use crate::session::{ApprovalMode, ContextUsage};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::time::Duration;
 
 pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = include_str!("../plan/prompts/system.md");
@@ -886,7 +886,7 @@ pub fn build(
             lsp_probe: launch
                 .command
                 .first()
-                .is_some_and(|value| value == "lsp-tools"),
+                .is_some_and(|value| matches!(value.as_str(), "lsp-tools" | "control-tools")),
             delay: match launch.command.first().map(String::as_str) {
                 Some("blocking" | "visible-blocking" | "writing-blocking") => {
                     Some(Duration::from_secs(60))
@@ -1077,8 +1077,11 @@ impl Backend for MockBackend {
                 .expect("mock control context poisoned")
                 .insert(request.runtime_key()?, context.clone());
         }
-        if self.lsp_probe
-            && let Some(arguments) = request.input.text().strip_prefix("LSP ")
+        let probe_input = self.lsp_probe.then(|| request.input.text());
+        if let Some(input) = probe_input.as_deref()
+            && let Some(arguments) = input
+                .strip_prefix("LSP ")
+                .or_else(|| input.strip_prefix("CONTROL "))
         {
             let context = request
                 .control_context
@@ -1090,22 +1093,125 @@ impl Backend for MockBackend {
                 .and_then(|value| value.remove("tool"))
                 .and_then(|value| value.as_str().map(str::to_owned))
                 .context("LSP fixture requires tool name")?;
-            let invocation = crate::control_tools::ControlToolInvocation { name, arguments };
-            let text = match crate::control_tools::ControlToolExecutor::new(context)
-                .execute(invocation)
-                .await
-                .and_then(|outcome| outcome.result)
-            {
-                Ok(result) => result.message,
-                Err(error) => format!("LSP error: {error:#}"),
+            let control_probe = input.starts_with("CONTROL ");
+            let collect_pages = arguments
+                .as_object_mut()
+                .and_then(|arguments| arguments.remove("__collect_pages"))
+                .map(serde_json::from_value::<bool>)
+                .transpose()?
+                .unwrap_or(false);
+            let tool_id = uuid::Uuid::new_v4().to_string();
+            if control_probe && let Some(sink) = &event_sink {
+                sink.send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(ToolActivity {
+                        id: tool_id.clone(),
+                        kind: ToolActivityKind::ToolCall,
+                        title: name.clone(),
+                        output: None,
+                        status: Some("running".into()),
+                        change: Default::default(),
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            }
+            let text = if control_probe && name == "__catalog" {
+                serde_json::to_string(
+                    &crate::control_tools::ControlToolRegistry
+                        .definition_list_for_context(Some(&context), request.owner()?.is_root())
+                        .into_iter()
+                        .map(|tool| tool.name)
+                        .collect::<Vec<_>>(),
+                )?
+            } else {
+                let invocation = crate::control_tools::ControlToolInvocation {
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                };
+                let executor = crate::control_tools::ControlToolExecutor::new(context);
+                match executor
+                    .execute(invocation)
+                    .await
+                    .and_then(|outcome| outcome.result)
+                {
+                    Ok(result) if collect_pages => {
+                        let mut page: Value = serde_json::from_str(&result.message)?;
+                        let mut cursor_set = std::collections::HashSet::new();
+                        let mut pages = Vec::new();
+                        loop {
+                            let cursor = page["next_cursor"].as_str().map(str::to_owned);
+                            pages.push(page);
+                            let Some(cursor) = cursor else {
+                                break;
+                            };
+                            anyhow::ensure!(
+                                cursor_set.insert(cursor.clone()),
+                                "inspection returned a repeated cursor"
+                            );
+                            arguments["cursor"] = json!(cursor);
+                            let result = executor
+                                .execute(crate::control_tools::ControlToolInvocation {
+                                    name: name.clone(),
+                                    arguments: arguments.clone(),
+                                })
+                                .await?
+                                .result?;
+                            page = serde_json::from_str(&result.message)?;
+                        }
+                        serde_json::to_string(&json!({"pages":pages}))?
+                    }
+                    Ok(result) => result.message,
+                    Err(error) if control_probe => {
+                        serde_json::to_string(&json!({"error":format!("{error:#}")}))?
+                    }
+                    Err(error) => format!("LSP error: {error:#}"),
+                }
             };
+            if control_probe && let Some(sink) = &event_sink {
+                sink.send_wait(BackendEvent {
+                    received_at_ms: None,
+                    address: None,
+                    turn_boundary: None,
+                    kind: "tool".into(),
+                    text: None,
+                    data: Value::Null,
+                    activity: Some(ToolActivity {
+                        id: tool_id,
+                        kind: ToolActivityKind::ToolCall,
+                        title: name,
+                        output: Some(text.clone()),
+                        status: Some("completed".into()),
+                        change: Default::default(),
+                        output_delta: false,
+                    }),
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
+            }
             let event = BackendEvent {
                 received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
-                text: Some(text),
-                data: Value::Null,
+                text: Some(if control_probe {
+                    format!("```json\n{text}\n```")
+                } else {
+                    text
+                }),
+                data: if control_probe {
+                    json!({"phase":"final_answer"})
+                } else {
+                    Value::Null
+                },
                 activity: None,
                 summary: None,
                 task_update: None,

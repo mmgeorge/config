@@ -62,6 +62,7 @@ client.request_for = function(session_id, method, params, callback)
     if params.plan_executor_model then configured_session.plan_executor.model = params.plan_executor_model end
     if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
     callback(vim.deepcopy(configured_session))
+    if params.session_tools ~= nil then state.session_tools = params.session_tools end
     return
   end
   if method == "trace.configure" then enabled = params.enabled end
@@ -115,7 +116,14 @@ local success, failure = xpcall(function()
     assert(mapping.callback, "missing key " .. binding)
     mapping.callback()
   end
-  assert(#instance.spec.page_list[1].option_list == 20, "settings are not grouped into 20 rows")
+  assert(#instance.spec.page_list[1].option_list == 21, "settings are not grouped into 21 rows")
+  assert(find("session-tools").section == "Tools")
+  key("session-tools", "<Space>")
+  assert(state.session_tools == false)
+  assert(find("session-tools").fields[1].value == false, "confirmed history setting kept the stale picker value")
+  key("session-tools", "<Space>")
+  assert(state.session_tools == true)
+  assert(find("session-tools").fields[1].value == true)
   assert(find("check-timing").section == "Checks")
   assert(find("plan-approval").section == "Planning")
   assert(find("plan-revisions").section == "Planning")

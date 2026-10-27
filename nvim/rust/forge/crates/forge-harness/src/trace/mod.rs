@@ -23,41 +23,7 @@ fn metadata_payload(payload: &Value) -> Value {
     };
     let mut metadata = serde_json::Map::new();
     for (key, value) in object.iter().take(32) {
-        if !matches!(
-            key.as_str(),
-            "method"
-                | "operation"
-                | "operation_id"
-                | "request_id"
-                | "session_id"
-                | "agent_id"
-                | "exchange_id"
-                | "thread_id"
-                | "turn_id"
-                | "provider"
-                | "event_type"
-                | "status"
-                | "code"
-                | "enabled"
-                | "cached"
-                | "cancelled"
-                | "generation"
-                | "revision"
-                | "phase"
-                | "elapsed_ms"
-                | "duration_ms"
-                | "count"
-                | "retry_attempt"
-                | "max_retries"
-                | "rows"
-                | "bytes"
-                | "source_bytes"
-                | "result_bytes"
-                | "queue_bytes"
-                | "queue_count"
-                | "active_jobs"
-                | "retained_bytes"
-        ) {
+        if !diagnostic_field(key) {
             continue;
         }
         let value = match value {
@@ -68,6 +34,84 @@ fn metadata_payload(payload: &Value) -> Value {
         metadata.insert(key.clone(), value);
     }
     Value::Object(metadata)
+}
+
+fn diagnostic_field(key: &str) -> bool {
+    matches!(
+        key,
+        "method"
+            | "operation"
+            | "operation_id"
+            | "request_id"
+            | "session_id"
+            | "agent_id"
+            | "exchange_id"
+            | "thread_id"
+            | "turn_id"
+            | "tool_id"
+            | "tool_call_id"
+            | "toolCallId"
+            | "requestId"
+            | "turnId"
+            | "type"
+            | "success"
+            | "provider"
+            | "event_type"
+            | "status"
+            | "code"
+            | "enabled"
+            | "cached"
+            | "cancelled"
+            | "generation"
+            | "revision"
+            | "phase"
+            | "elapsed_ms"
+            | "duration_ms"
+            | "count"
+            | "retry_attempt"
+            | "max_retries"
+            | "rows"
+            | "bytes"
+            | "source_bytes"
+            | "result_bytes"
+            | "queue_bytes"
+            | "queue_count"
+            | "active_jobs"
+            | "retained_bytes"
+    )
+}
+
+pub(crate) fn inspection_record(record: &Value) -> Value {
+    let mut payload = inspection_metadata(&record["payload"]);
+    for (name, pointer) in [
+        ("data", "/payload/data"),
+        ("params", "/payload/params"),
+        ("provider_event", "/payload/params/event"),
+        ("provider_event_data", "/payload/params/event/data"),
+    ] {
+        if let Some(value) = record.pointer(pointer) {
+            let metadata = inspection_metadata(value);
+            if !metadata.is_empty() {
+                payload.insert(name.into(), Value::Object(metadata));
+            }
+        }
+    }
+    json!({
+        "timestamp_ms":record["timestamp_ms"],
+        "session_id":record["session_id"],
+        "event":record["event"],
+        "payload":payload,
+    })
+}
+
+fn inspection_metadata(value: &Value) -> serde_json::Map<String, Value> {
+    value
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(key, value)| diagnostic_field(key) && !value.is_object() && !value.is_array())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }
 
 #[derive(Clone, Debug, Serialize)]

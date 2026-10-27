@@ -338,6 +338,16 @@ impl CapabilityManifest {
             "Off by default. Manual child spawning remains available and children cannot delegate",
         );
         add(
+            "session_tools",
+            "Settings",
+            "Inspect and search Harness sessions",
+            false,
+            "forge",
+            true,
+            "server_restart",
+            "On by default. Disabling hides history tools but retains configuration inspection and the Harness skill",
+        );
+        add(
             "native_agent_suppression",
             "Provider",
             "Disable provider-native agent tools",

@@ -149,11 +149,18 @@ impl AcpBackend {
             },
         )?;
         *state.tool_definition.write().await = tools.unwrap_or_else(|| {
-            crate::control_tools::ControlToolRegistry.definition_list_for_owner(
-                &request.owner().expect("validated runtime owner"),
-                setting.desired.subagent_tools.unwrap_or(false),
-                setting.desired.lsp_tools.unwrap_or(false),
-            )
+            crate::control_tools::ControlToolRegistry
+                .definition_list_for_owner(
+                    &request.owner().expect("validated runtime owner"),
+                    setting.desired.subagent_tools.unwrap_or(false),
+                    setting.desired.lsp_tools.unwrap_or(false),
+                )
+                .into_iter()
+                .filter(|tool| {
+                    !tool.name.starts_with("harness_session_")
+                        || setting.desired.session_tools.unwrap_or(true)
+                })
+                .collect()
         });
         let control = ControlServer::start(state.clone()).await?;
         let target = if self.kind == BackendKind::Claude {

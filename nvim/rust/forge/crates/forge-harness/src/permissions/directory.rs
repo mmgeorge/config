@@ -164,28 +164,33 @@ impl DirectoryPolicy {
     }
 
     fn effective_access(&self) -> Result<AccessPolicy> {
-        let mut access = self.access.clone();
         if let Some(root) = &self.settings_root {
             let settings = SettingsStore::open(root)?;
-            if let Some(current) = settings
-                .get(&self.workspace.to_string_lossy(), &self.session_id, "")?
-                .desired
-                .access
-            {
-                access.readable_directory = current.readable_directory;
-                access.writable_directory = current.writable_directory;
-            }
-            let global = settings.layer_settings(SettingScope::Global, "", "")?;
-            if let Some(global) = global.access {
-                for directory in global.readable_directory {
-                    if !access.readable_directory.contains(&directory) {
-                        access.readable_directory.push(directory);
-                    }
+            return self.access_from(&settings);
+        }
+        Ok(self.access.clone())
+    }
+
+    pub(crate) fn access_from(&self, settings: &SettingsStore) -> Result<AccessPolicy> {
+        let mut access = self.access.clone();
+        if let Some(current) = settings
+            .get(&self.workspace.to_string_lossy(), &self.session_id, "")?
+            .desired
+            .access
+        {
+            access.readable_directory = current.readable_directory;
+            access.writable_directory = current.writable_directory;
+        }
+        let global = settings.layer_settings(SettingScope::Global, "", "")?;
+        if let Some(global) = global.access {
+            for directory in global.readable_directory {
+                if !access.readable_directory.contains(&directory) {
+                    access.readable_directory.push(directory);
                 }
-                for directory in global.writable_directory {
-                    if !access.writable_directory.contains(&directory) {
-                        access.writable_directory.push(directory);
-                    }
+            }
+            for directory in global.writable_directory {
+                if !access.writable_directory.contains(&directory) {
+                    access.writable_directory.push(directory);
                 }
             }
         }

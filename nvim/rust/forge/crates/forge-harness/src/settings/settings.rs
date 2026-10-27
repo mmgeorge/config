@@ -84,6 +84,8 @@ pub struct PortableSettings {
     pub subagent_tools: Option<bool>,
     /// Enables read-only tools backed by the connected editor language servers.
     pub lsp_tools: Option<bool>,
+    /// Exposes read-only session history tools independently of configuration inspection.
+    pub session_tools: Option<bool>,
     /// Shows the latest thought beneath live status without changing timeline messages.
     pub status_thoughts: Option<bool>,
     #[serde(default)]
@@ -131,6 +133,9 @@ impl PortableSettings {
         }
         if overriding.lsp_tools.is_some() {
             self.lsp_tools = overriding.lsp_tools;
+        }
+        if overriding.session_tools.is_some() {
+            self.session_tools = overriding.session_tools;
         }
         if overriding.status_thoughts.is_some() {
             self.status_thoughts = overriding.status_thoughts;
@@ -273,6 +278,15 @@ struct SettingsReceipt {
 }
 
 impl SettingsStore {
+    pub(crate) fn read_only(data_root: &Path) -> Result<Self> {
+        let connection = Connection::open_with_flags(
+            data_root.join("settings.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )?;
+        connection.busy_timeout(std::time::Duration::from_secs(5))?;
+        Ok(Self { connection })
+    }
+
     /// Open the current preference schema with transactional revision checks.
     pub fn open(data_root: &Path) -> Result<Self> {
         std::fs::create_dir_all(data_root)?;
