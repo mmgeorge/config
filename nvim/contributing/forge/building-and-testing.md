@@ -43,9 +43,9 @@ shared-configuration changes rather than every package edit.
 
 Inside Harness, use configured checks rather than executing the commands below
 directly. For a targeted Rust run, select the matching formatter,
-`forge-rust-tests`, and `forge-build` together, retaining the exact case or file
-selection on `forge-rust-tests`. Use `forge-rust-format-fix` for package changes
-or `forge-rust-workspace-format-fix` for shared configuration. Explicit selection
+`rust-test`, and `rust-build` together, retaining the exact case or file
+selection on `rust-test`. Use `rust-format` for package changes
+or `rust-format-workspace` for shared configuration. Explicit selection
 does not add checks through category ordering. If the task has no Rust changes
 and formatting is required, supply concrete formatter files or explicitly select
 its `all` operation. An empty formatter selection does not skip tests or builds.
@@ -115,7 +115,7 @@ deadline, exit status, and failing assertion or compiler diagnostic.
 
 The package and workspace checks use `cargo test` without an explicit test-thread
 limit. Rust runs tests in parallel using available hardware concurrency by default.
-After the generic-check cutover, `forge-rust-tests` uses the repository callback
+After the generic-check cutover, `rust-test` uses the repository callback
 `nvim/tools/checks/rust.nu` with declared `package`, `test`, `executable`, `files`,
 and `full` inputs. Explicit package and test inputs bypass package lookup and test
 listing. Automatic changed-file mapping belongs to that callback. Standard stable Rust's
@@ -139,6 +139,12 @@ enablement belongs in admission overrides, and scoped shell helpers must declare
 paused clock instead of waiting for wall-clock deadlines.
 
 ## Run isolated editor tests
+
+Inside Harness, select an ordinary fixture with
+`check_run({"check":"lua-test","inputs":{"fixture":"nvim/tests/forge/plan_check_selection.lua"}})`.
+Use `inputs:{"suite":"walkthrough"}` only when the whole feature requires coverage.
+Feature names do not need individual saved check definitions. Host integration
+and benchmarks retain their separate build-dependent checks.
 
 From the repository root, run an isolated editor test directly in a fresh Neovim:
 

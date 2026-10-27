@@ -163,6 +163,20 @@ action("refresh")
 assert(#picker_state.page(picker._state_for_test().state, picker._state_for_test().spec).option_list == 2,
   "a valid response must remove the error row")
 
+catalog.snapshot.config = {
+  a_build = { action = { command = "exit 0", category = "build" } },
+  b_test = { action = { command = "exit 0", category = "test" } },
+  c_check = { action = { command = "exit 0", category = "check" } },
+  d_format = { action = { command = "exit 0", category = "format" } },
+}
+action("refresh")
+current = picker._state_for_test()
+local ordered = picker_state.page(current.state, current.spec).option_list
+assert(vim.deep_equal(vim.tbl_map(function(option) return option.id end, ordered),
+  { "d_format", "c_check", "b_test", "a_build" }), "check rows must follow category priority, not names")
+catalog.snapshot.config = valid_config
+action("refresh")
+
 picker.close(false)
 for _, malformed in ipairs({
   { unit = { trigger = {} } },

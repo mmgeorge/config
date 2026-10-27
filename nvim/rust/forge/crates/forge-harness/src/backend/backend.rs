@@ -1075,10 +1075,12 @@ impl Backend for MockBackend {
             let advertised = crate::control_tools::ControlToolRegistry
                 .definition_list_for_context(Some(context), true);
             anyhow::ensure!(
-                advertised.iter().any(|tool| tool.name == "checks_list")
+                advertised
+                    .iter()
+                    .any(|tool| tool.name == "check_definition_list")
                     && advertised
                         .iter()
-                        .any(|tool| tool.name == "checks_configure"),
+                        .any(|tool| tool.name == "check_definition_edit"),
                 "check setup requires advertised list and configuration tools"
             );
         }
@@ -1088,16 +1090,29 @@ impl Backend for MockBackend {
             .and_then(|context| context.checks.as_ref())
             && scope.is_setup()
         {
-            let catalog: Value =
-                serde_json::from_str(&scope.invoke("checks_list", serde_json::json!({})).await?)?;
-            let config = if catalog["snapshot"]["config"].is_object() {
-                catalog["snapshot"]["config"].clone()
-            } else {
-                serde_json::json!({})
-            };
+            let catalog: Value = serde_json::from_str(
+                &scope
+                    .invoke("check_definition_list", serde_json::json!({}))
+                    .await?,
+            )?;
+            let mut config = serde_json::Map::new();
+            for definition in catalog["definitions"].as_array().into_iter().flatten() {
+                let details: Value = serde_json::from_str(
+                    &scope
+                        .invoke(
+                            "check_definition_details",
+                            serde_json::json!({"check_id":definition["check_id"]}),
+                        )
+                        .await?,
+                )?;
+                let id = definition["check_id"]
+                    .as_str()
+                    .context("missing check identity")?;
+                config.insert(id.to_owned(), details["definition"].clone());
+            }
             scope
                 .invoke(
-                    "checks_configure",
+                    "check_definition_edit",
                     serde_json::json!({
                         "expected_revision": catalog["revision"], "config": config,
                     }),

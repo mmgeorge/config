@@ -20,7 +20,7 @@ for this repository." The `harness-checks` skill supplies discovery, schema, and
 scoped-runner guidance through the shared Rulesync skill catalog. Bare
 `/checks setup` and `/checks setup <check-id>` are not commands.
 
-Every `checks_configure` submission opens an approval popup in Read and Write modes,
+Every `check_definition_edit` submission opens an approval popup in Read and Write modes,
 even when saved rules allow the files. The popup shows the configuration and managed
 helper changes. Approve publishes that exact update, while rejection, cancellation,
 or timeout leaves the existing files unchanged. YOLO approves without a popup.
@@ -96,7 +96,7 @@ Agents add existing checks with `plan_checks_add`, supplying `plan_id`,
 without changing repository settings or executing commands. Repeated IDs do not
 create repeated plan entries, and adding only already-selected checks leaves the
 plan version unchanged. The tool is available during plan authoring and Resolve.
-`checks_run` accepts `check` as a name or a list of names. Supply `inputs` as an
+`check_run` accepts `check` as a name or a list of names. Supply `inputs` as an
 object matching each check's declared input contract, or omit it to use defaults
 and automatic context bindings. `all: true` requests full context and cannot be
 combined with `inputs`. Explicit runs execute even when earlier evidence remains current.
@@ -105,14 +105,14 @@ agent, the checks picker, or an automatic gate. Agents select saved check IDs an
 coverage rather than supplying commands. Editing check definitions still requires
 check-editing permission and write authorization.
 
-Agents can stop a running check with `checks_cancel`, supplying its `run_id`
-from `checks_run` or `checks_list`. Cancellation preserves output and check
+Agents can stop a running check with `check_cancel`, supplying its `run_id`
+from `check_run` or `check_list`. Cancellation preserves output and check
 history. It stops that run without disabling future automatic checks.
 
-`checks_list` returns the live `automatic_checks` boolean and `check_timing`
+`check_definition_list` returns the live `automatic_checks` boolean and `check_timing`
 (`after_queue` or `between_work`) alongside the catalog. Agents read these fields
 before deciding whether to run checks manually. When enabled, they normally
-rely on the completion gate and may call `checks_run` for earlier feedback. When
+rely on the completion gate and may call `check_run` for earlier feedback. When
 disabled, they explicitly run applicable checks if their changes need verification.
 Direct
 terminal builds, tests, linters, formatters, and validation scripts do not record
@@ -276,6 +276,36 @@ The example template still needs its required values when `all` is selected.
 Full coverage is not an alternative command synthesized by Harness. Use a
 callback or a separate configured action when full and targeted commands differ.
 
+This repository uses one `lua-test` definition for ordinary Lua coverage.
+Omit inputs for changed-file mapping, supply `files` for explicit paths, select
+a complete feature `suite`, or name one `fixture`:
+
+```json
+{"check":"lua-test","inputs":{"fixture":"nvim/tests/forge/plan_check_selection.lua"}}
+{"check":"lua-test","inputs":{"suite":"walkthrough"}}
+```
+
+`suite` defaults to `affected` and `fixture` defaults to an empty string.
+An exact fixture cannot be combined with a named or full suite. Existing feature
+names remain in the repository runner, not separate saved definitions.
+`lua-test-host` and `lua-benchmark` remain explicit checks with a
+`rust-build` prerequisite. The ordinary callback rejects those suite names and
+build-dependent fixtures rather than bypassing that prerequisite.
+Supply explicit `files` to `lua-test-host` or `lua-benchmark` to select individual
+fixtures while retaining the build prerequisite. Omitting inputs keeps the full
+saved suite.
+
+Check IDs use language/tool-first names, while display labels name the action.
+`rulesync-local-preview` and `rulesync-global-preview` only preview generation.
+Their manual `rulesync-local-update` and `rulesync-global-update` counterparts
+write generated files and declare source preparation. Each update requires its
+matching preview to pass. Updates never run automatically.
+
+Definition lists group format, lint/check, test, and build categories, with IDs
+breaking ties. Execution retains prerequisite ordering and runs selected source
+preparation before unrelated verification. A required build can therefore run
+before its host-integration test.
+
 ## Callback request and result
 
 Callbacks receive `version: 1`, `check_id`, `workspace`, resolved `inputs`,
@@ -298,11 +328,52 @@ Missing required inputs show unresolved previews. Previewing never starts the
 configured command or a discovery subprocess. Editing inputs invalidates a prior preview.
 Previews never count as execution evidence.
 
-Agents can call `checks_status` with `wait_for_completion: true` to wait through
-progress updates until the run finishes. The default wait is 60 seconds. An
-optional `wait_ms` shortens that deadline, and a run still in progress at the
-deadline returns its current state. Omitting this option preserves immediate
-status reads or waits for the next update.
+Agent tools separate saved definitions from execution. The source contracts live
+in `checks/response.rs` and `control_tools/mod.rs` in `forge-harness`.
+
+| Tool | Request and response |
+| --- | --- |
+| `check_definition_list` | No arguments. Get revision, automatic policy, and minimal definitions with input descriptions, without history or previews. |
+| `check_definition_details` | Supply `check_id`. Get one complete saved trigger/action definition and its revision. |
+| `check_definition_edit` | Supply `expected_revision`, complete `config`, and optional managed `helpers`. Get revision, changed check/helper names, and `checks_executed:false`. |
+| `check_run` | Supply `check` and optional `inputs` or `all`. Every admitted run immediately gets only `run_id`, even if execution finishes immediately. |
+| `check_list` | No arguments. Get `runs`, containing compact status for all currently running IDs in this session. Completed history is excluded. |
+| `check_status` | Supply `run_id` and optional `wait_ms` from 0 to 60000, default 0. Get compact status, never logs or saved configuration. |
+| `check_detail` | Supply `run_id`, optional `stream` (`combined`, `stdout`, or `stderr`), and optional `cursor`. Get completed-command metadata and paginated output. |
+| `check_cancel` | Supply `run_id`. Get `cancellation_requested:true`, not a claim that process cleanup has finished. |
+
+Use `check_definition_list` to choose a saved check and
+`check_definition_details` to inspect its caller contract. Normal execution uses
+`check_run` followed by `check_status`. Use `check_list` to recover running IDs,
+`check_cancel` to request cancellation, and `check_detail` for completed logs.
+Definition `check_id` values identify saved configuration. Execution `run_id`
+values identify admitted jobs and are not interchangeable with definition IDs.
+
+`check_status` includes `state`, `completed`, `total`, `elapsed_ms`, `exit_code`,
+`latest_output`, `error`, and `executed`/`reused` counts. `latest_output` is one
+nonempty line with terminal escapes removed, or null before output arrives.
+The aggregate exit code is null for multiple selected commands. Waiting ignores
+progress updates and ends on completion or the original deadline. A deadline
+returns the current summary without cancelling work.
+
+Definition details are available before execution. Execution details remain
+unavailable until the run finishes, including failed, interrupted, and blocked
+runs. A running detail request returns `Still running. Use check_status to wait.`
+without opening log files. Unknown run IDs fail explicitly.
+
+Completed detail pages contain a command's executable and argv, working directory,
+resolved inputs, exit status, duration, and reuse origin. The returned `text` uses
+the requested stream. Pages use a 16 KiB read budget and preserve UTF-8 boundaries.
+Follow `next_cursor` with the same `run_id` and `stream` until null. The cursor's
+`command_index` identifies a selected command in the frozen run, and `offset`
+counts bytes within that command's log. Pagination traverses every selected
+command and preserves the complete log without imposing a total-content limit.
+Missing logs for started commands, invalid cursors, and decoding failures report
+errors. Unstarted commands with no log return empty text.
+
+The editor's internal `checks.list` and `checks.status` service routes retain
+their full catalog and run shapes. The agent tools do not serialize those
+snapshots during polling.
 
 Evidence includes the definition, resolved input values, context, helper content,
 and workspace snapshot. Different inputs cannot reuse each other's evidence.

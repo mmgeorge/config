@@ -7,7 +7,7 @@ or invalid checks before starting plan generation, then resumes the original pla
 Use the harness-checks skill for configuration guidance. /checks setup on and
 /checks setup off toggle check-editing permission without starting a prompt.
 The current interaction states this permission. Configure checks only through
-checks_configure, which requires approval of every submission outside YOLO.
+check_definition_edit, which requires approval of every submission outside YOLO.
 This narrow configuration action may save only checks settings and managed
 .forge/checks/ helpers during Plan. Never use shell writes to bypass the tool.
 If configuration changes during planning, submission validation still rejects
@@ -16,14 +16,14 @@ missing or invalid checks. Report that failure.
 When automatic completion checks are enabled (the default), checks run at the
 configured completion boundary, after the work queue by default. The user can
 disable this completion gate in /config without disabling explicit runs or plan
-Checking. Before deciding whether to run checks manually, call checks_list and
+Checking. Before deciding whether to run checks manually, call check_definition_list and
 read its live automatic_checks and check_timing fields. When automatic_checks is
 true, normally finish your work and let Harness run applicable checks. You may
-optionally call checks_run for earlier feedback. When automatic_checks is false
-and your changes need verification, call checks_run for applicable checks and
+optionally call check_run for earlier feedback. When automatic_checks is false
+and your changes need verification, call check_run for applicable checks and
 inspect their results before reporting verified completion. A disabled completion
 gate does not disable plan Checking, so plan phases still rely on Harness.
-Read recorded results with checks_status. Stop a running check with checks_cancel using
+Read recorded results with check_status. Stop a running check with check_cancel using
 its run_id. Cancellation retains recorded output and does not disable future checks.
 Do not execute builds,
 tests, linters, formatters, or validation scripts directly through terminal tools,
@@ -40,7 +40,7 @@ Automatic completion checks reuse current recorded coverage, including explicit
 tool runs. A recorded failure remains unresolved until corrected and verified.
 Follow repair instructions when Harness resumes a turn after failed checks.
 Correct the defects and finish the repair turn so Harness checks the changed
-inputs again. Recheck checks_list if the user changes automatic-check settings
+inputs again. Recheck check_definition_list if the user changes automatic-check settings
 during the task.
 
 ## Permissions and tasks

@@ -454,7 +454,7 @@ mod test {
         assert_eq!(skill[0].name, "harness-checks");
         assert_eq!(skill[0].scope, Some(crate::backend::ResourceScope::Global));
         assert!(skill[0].user_invocable);
-        assert!(skill[0].description.contains("checks_configure"));
+        assert!(skill[0].description.contains("check_definition_edit"));
         for target in ["codexcli", "copilotcli", "claudecode", "antigravity-cli"] {
             assert!(ResourceCatalog::supports_target(&skill[0].targets, target));
         }

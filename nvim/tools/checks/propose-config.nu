@@ -13,9 +13,9 @@ def main [] {
     files: {type: "array", description: "Selected repository paths", source: "changed_files"}
   }
   let rust_action = {
-    "forge-rust-tests": "test"
-    "forge-rust-format-fix": "format"
-    "forge-rust-clippy": "clippy"
+    "rust-test": "test"
+    "rust-format": "format"
+    "rust-lint": "clippy"
   }
   mut proposed = {}
   for entry in ($checks | transpose id definition) {
@@ -30,15 +30,15 @@ def main [] {
         | upsert input true
         | upsert inputs $rust_inputs
       )
-    } else if $name == "nushell-syntax" {
+    } else if $name == "nushell-check" {
       $definition.action = (
         $action | upsert command ["nu" "--no-config-file" "--stdin" "nvim/tools/checks/nushell.nu"]
         | upsert input true | upsert inputs $file_inputs
       )
-    } else if $name == "lua-affected" {
+    } else if $name == "lua-test" {
       $definition.action = (
         $action | upsert command ["nu" "--no-config-file" "--stdin" "nvim/tools/checks/lua.nu" "affected" "--timeout" "30sec"]
-        | upsert input true | upsert inputs $file_inputs
+        | upsert input true | upsert inputs ($action.inputs? | default $file_inputs)
       )
     } else if ($action.command | describe) == "string" and ($action.command | str contains ".forge/checks/lua-tests.nu") {
       let parsed = $action.command | parse --regex 'lua-tests\.nu (?<suite>[a-z-]+) --all --timeout (?<timeout>[0-9]+sec)'

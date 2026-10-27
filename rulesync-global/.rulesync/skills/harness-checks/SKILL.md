@@ -2,7 +2,7 @@
 name: harness-checks
 description: >-
   Configure Forge Harness project checks, automatic triggers, typed command inputs,
-  and repository-owned callbacks through checks_configure. Use when adding, editing,
+  and repository-owned callbacks through check_definition_edit. Use when adding, editing,
   or repairing .forge.json checks or managed .forge/checks/ helpers. Do not use for
   merely running existing checks or changing task-specific check selection.
 targets:
@@ -11,10 +11,14 @@ targets:
 
 # Harness Checks
 
-Configure checks only through `checks_configure` when check editing is enabled.
-Read `checks_list` for the current revision, definitions, and live automatic-check
+Configure checks only through `check_definition_edit` when check editing is enabled.
+Read `check_definition_list` for the current revision, definitions, and live automatic-check
 policy. Preserve unrelated configuration. Every submission requires review outside
 YOLO. Configuration does not execute checks or validate helper-language syntax.
+The list contains input descriptions but omits full commands, history, and previews.
+Read `check_definition_details` with `check_id` for each existing definition that
+must be preserved or edited. Publish the complete intended definition map, not a
+partial replacement. Successful edits return the new revision and changed names.
 
 Inspect repository scripts and manifests before choosing commands. The check
 executor treats all commands as opaque. It never detects Cargo, npm, a language,
@@ -91,7 +95,7 @@ callback, not in Harness. Malformed reports and reported failures cannot count
 as success. Plain commands use their exit status without implicit coverage parsing.
 
 Use Nushell for cross-platform callbacks in this dotfiles repository. Managed
-helper files under `.forge/checks/` are published through `checks_configure` with
+helper files under `.forge/checks/` are published through `check_definition_edit` with
 their inspected `expected_digest`, or null for a new file. Harness does not select
 an interpreter from an extension or secretly run syntax validation. Configure
 language-specific validation explicitly as another check.
@@ -107,10 +111,19 @@ and `after` control display, ordering, mutation, and prerequisites. Every comman
 defaults to category `check` unless explicitly configured. Use `prepare: true` for
 source-changing commands. Dependencies express required success, not category order.
 
-`checks_run` accepts a check name or list, plus optional `inputs` or `all: true`.
+`check_run` accepts a check name or list, plus optional `inputs` or `all: true`.
 These two options cannot be combined. Full context does not synthesize a broader
 command or supply missing required inputs. Define full behavior in a callback or
 separate saved check. Omitted inputs use configured defaults and automatic sources.
+
+`check_run` immediately returns only `run_id`. Use `check_status` with that ID
+and optional `wait_ms` (0 through 60000) to wait for completion. Status returns
+compact progress and the latest nonempty output line, not full logs. `check_list`
+returns those summaries for currently running IDs. Use `check_detail` only after
+completion for exact invocation metadata and logs. A running detail request directs
+the caller to wait with `check_status`. Follow `next_cursor` using the same ID and
+stream to retrieve the complete log. `check_cancel` requests cancellation without
+claiming process cleanup has finished. Unknown IDs and I/O errors remain failures.
 
 Preserve the selected compiler, profile, flags, and artifact directory in the
 repository command. Follow the global smallest-sufficient-coverage policy.

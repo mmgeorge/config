@@ -14,7 +14,7 @@ describes admission, persistence, and completion gates.
 
 Use the repository's selected runtime and
 [development toolchain](building-and-testing.md). Enable check editing before
-publishing through `checks_configure`. Configuration publication does not execute
+publishing through `check_definition_edit`. Configuration publication does not execute
 the configured command. Changes to callback code require their own targeted
 coverage.
 
@@ -25,7 +25,7 @@ Keep selection and execution in the same repository-owned boundary.
 1. Declare named inputs with types, descriptions, defaults, required flags, and
    explicit context sources. Names such as `package` and `test` have no built-in
    meaning. Automatic runs obtain context sources from task changes and the plan
-   inventory. Explicit `checks_run.inputs` values override those sources.
+   inventory. Explicit `check_run.inputs` values override those sources.
 2. Choose a fixed argv command for direct scalar substitution or scalar-array
    expansion. Only a complete `{name}` argument substitutes a value. Substitution
    never produces shell source.
@@ -41,7 +41,7 @@ Keep selection and execution in the same repository-owned boundary.
    Keep stdout and stderr as diagnostics. Harness never infers a report by matching
    the executable, helper filename, or output text.
 6. Publish the exact definition and any managed `.forge/checks/` helper captures
-   through `checks_configure`. Preserve unrelated configuration. Managed helper
+   through `check_definition_edit`. Preserve unrelated configuration. Managed helper
    ownership does not imply a language or trigger an implicit syntax command.
 
 Categories determine default priority, not dependencies. Selected preparation
@@ -78,12 +78,9 @@ compile source changes.
 
 After restarting, `nu --no-config-file nvim/tools/checks/propose-config.nu`
 prints the proposed checks object without modifying `.forge.json`. Publish that
-object with the new `checks_configure` interface and the current revision from
-`checks_list`. The proposal preserves unrelated checks, triggers, and settings.
+object with the new `check_definition_edit` interface and the current revision from
+`check_definition_list`. The proposal preserves unrelated checks, triggers, and settings.
 Regenerate Rulesync guidance through its normal publication workflow.
-
-The cutover procedure and new callbacks have not been executed during this change
-because the user deferred execution until after the host restart.
 
 ## Verify the boundaries
 

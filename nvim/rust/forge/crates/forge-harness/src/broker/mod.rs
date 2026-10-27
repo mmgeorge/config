@@ -10936,12 +10936,12 @@ mod test {
                 let context = request.control_context.as_ref().unwrap();
                 let advertised = crate::control_tools::ControlToolRegistry
                     .definition_list_for_context(Some(context), true);
-                assert!(advertised.iter().any(|tool| tool.name == "checks_run"));
+                assert!(advertised.iter().any(|tool| tool.name == "check_run"));
                 assert!(
                     !crate::control_tools::ControlToolRegistry
                         .definition_list_for_context(Some(context), false)
                         .iter()
-                        .any(|tool| tool.name.starts_with("checks_"))
+                        .any(|tool| tool.name.starts_with("check_"))
                 );
                 let scope = request
                     .control_context
@@ -10951,15 +10951,13 @@ mod test {
                     .as_ref()
                     .unwrap();
                 let started: Value = serde_json::from_str(
-                    &scope
-                        .invoke("checks_run", json!({"check":"verify"}))
-                        .await?,
+                    &scope.invoke("check_run", json!({"check":"verify"})).await?,
                 )?;
                 loop {
                     let run: Value = serde_json::from_str(
                         &scope
                             .invoke(
-                                "checks_status",
+                                "check_status",
                                 json!({"run_id":started["run_id"],"wait_ms":30000}),
                             )
                             .await?,
@@ -17008,7 +17006,8 @@ mod test {
                 sink: None,
             },
         );
-        let catalog: Value = serde_json::from_str(&scope.invoke("checks_list", json!({})).await?)?;
+        let catalog: Value =
+            serde_json::from_str(&scope.invoke("check_definition_list", json!({})).await?)?;
         assert_eq!(catalog["automatic_checks"], true);
         assert_eq!(catalog["check_timing"], "after_queue");
         let configured = catalog["configured"].clone();
@@ -17022,11 +17021,11 @@ mod test {
                 }))
                 .await?;
             let catalog: Value =
-                serde_json::from_str(&scope.invoke("checks_list", json!({})).await?)?;
+                serde_json::from_str(&scope.invoke("check_definition_list", json!({})).await?)?;
             assert_eq!(catalog["automatic_checks"], json!(automatic_checks));
             assert_eq!(catalog["check_timing"], json!(check_timing));
             assert_eq!(catalog["configured"], configured);
-            assert!(catalog["history"].as_array().unwrap().is_empty());
+            assert!(catalog.get("history").is_none());
         }
         let request = || -> Result<Value> {
             Ok(json!({
@@ -17036,18 +17035,18 @@ mod test {
         };
         assert!(
             scope
-                .invoke("checks_configure", request()?)
+                .invoke("check_definition_edit", request()?)
                 .await
                 .unwrap_err()
                 .to_string()
                 .contains("disabled")
         );
         broker.observer.set_check_editing(true)?;
-        scope.invoke("checks_configure", request()?).await?;
+        scope.invoke("check_definition_edit", request()?).await?;
         broker.observer.set_check_editing(false)?;
         assert!(
             scope
-                .invoke("checks_configure", request()?)
+                .invoke("check_definition_edit", request()?)
                 .await
                 .unwrap_err()
                 .to_string()
@@ -17102,10 +17101,11 @@ mod test {
             let response: Value = serde_json::from_str(
                 &tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    scope.invoke("checks_run", json!({"check":"configured"})),
+                    scope.invoke("check_run", json!({"check":"configured"})),
                 )
                 .await??,
             )?;
+            assert_eq!(response.as_object().unwrap().len(), 1);
             let run = broker
                 .check_runner
                 .status(response["run_id"].as_str().unwrap(), 5000, true)
@@ -17114,11 +17114,39 @@ mod test {
             assert_eq!(run.commands.len(), 1);
             assert_eq!(run.commands[0].command, "echo configured-check");
             assert_eq!(run.commands[0].exit_code, Some(0));
+            let summary: Value = serde_json::from_str(
+                &scope
+                    .invoke(
+                        "check_status",
+                        json!({"run_id":response["run_id"],"wait_ms":10}),
+                    )
+                    .await?,
+            )?;
+            assert_eq!(summary["state"], "passed");
+            assert_eq!(summary["exit_code"], 0);
+            assert_eq!(summary["latest_output"], "configured-check");
+            assert!(summary.get("context").is_none());
+            assert!(summary.get("commands").is_none());
+            let details: Value = serde_json::from_str(
+                &scope
+                    .invoke("check_detail", json!({"run_id":response["run_id"]}))
+                    .await?,
+            )?;
+            assert!(
+                details["text"]
+                    .as_str()
+                    .unwrap()
+                    .contains("configured-check")
+            );
+            assert!(details["command"]["invocation"]["args"].is_array());
+            let running: Value =
+                serde_json::from_str(&scope.invoke("check_list", json!({})).await?)?;
+            assert_eq!(running, json!({"runs":[]}));
             assert!(events.try_recv().is_err(), "check requested approval");
             assert!(
                 scope
                     .invoke(
-                        "checks_run",
+                        "check_run",
                         json!({"check":"configured","command":"echo unconfigured"}),
                     )
                     .await
@@ -17128,7 +17156,7 @@ mod test {
             assert!(
                 scope
                     .invoke(
-                        "checks_configure",
+                        "check_definition_edit",
                         json!({"expected_revision":"","config":{}}),
                     )
                     .await
@@ -17139,7 +17167,7 @@ mod test {
             drop(lease);
             assert!(
                 scope
-                    .invoke("checks_run", json!({"check":"configured"}))
+                    .invoke("check_run", json!({"check":"configured"}))
                     .await
                     .is_err(),
                 "inactive check scope admitted execution"

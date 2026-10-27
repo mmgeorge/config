@@ -2,14 +2,25 @@ def main [suite: string, --full, --timeout: duration = 30sec] {
   let request = $in | from json
   if $request.version != 1 { error make {msg: "Unsupported check request version"} }
   cd $request.workspace
-  let files = $request.inputs.files? | default ($request.changed_files? | default [])
-  let selection = if $full or $request.selection.kind == "all" {
+  let selected_suite = $request.inputs.suite? | default $suite
+  let fixture = $request.inputs.fixture? | default ""
+  if $suite == "affected" and $selected_suite in ["extended" "benchmarks"] {
+    error make {msg: "Use lua-test-host or lua-benchmark for build-dependent coverage"}
+  }
+  if $fixture != "" and ($selected_suite != "affected" or $full or $request.selection.kind == "all") {
+    error make {msg: "Choose an exact fixture or a full suite, not both"}
+  }
+  let files = if $fixture != "" { [$fixture] } else {
+    $request.inputs.files? | default ($request.changed_files? | default [])
+  }
+  let explicit_host_files = $suite != "affected" and $request.selection.kind == "inputs" and not ($request.selection.inputs.files? | default [] | is-empty)
+  let selection = if not $explicit_host_files and ($full or $request.selection.kind == "all" or $selected_suite != "affected") {
     {kind: "all"}
   } else {
     {kind: "files", files: $files}
   }
   let forwarded = $request | upsert selection $selection
-  let arguments = ["--no-config-file" "--stdin" ".forge/checks/lua-tests.nu" $suite "--timeout" ($timeout | into string)]
+  let arguments = ["--no-config-file" "--stdin" ".forge/checks/lua-tests.nu" $selected_suite "--timeout" ($timeout | into string)]
   let result = ($forwarded | to json --raw | ^nu ...$arguments | complete)
   print --no-newline $result.stdout
   print --stderr --no-newline $result.stderr

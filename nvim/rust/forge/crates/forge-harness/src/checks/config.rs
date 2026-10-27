@@ -17,6 +17,17 @@ pub enum CheckCategory {
     Build,
 }
 
+impl CheckCategory {
+    pub(crate) fn priority(self) -> u8 {
+        match self {
+            Self::Format => 0,
+            Self::Lint | Self::Check => 1,
+            Self::Test => 2,
+            Self::Build => 3,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Determines whether successful execution certifies stable inputs or prepares new inputs.
@@ -246,12 +257,7 @@ impl CheckConfig {
                             .all(|id| completed.contains(id.as_str()))
                 })
                 .min_by_key(|(index, definition)| {
-                    let category = match definition.category {
-                        CheckCategory::Format => 0,
-                        CheckCategory::Lint | CheckCategory::Check => 1,
-                        CheckCategory::Test => 2,
-                        CheckCategory::Build => 3,
-                    };
+                    let category = definition.category.priority();
                     (
                         !preparation.contains(definition.id.as_str()),
                         category,

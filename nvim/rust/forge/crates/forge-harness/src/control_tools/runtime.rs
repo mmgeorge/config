@@ -231,8 +231,14 @@ impl ControlToolRuntime {
                     message,
                 })
             }
-            "checks_list" | "checks_configure" | "checks_run" | "checks_status"
-            | "checks_cancel" => {
+            "check_definition_list"
+            | "check_definition_edit"
+            | "check_definition_details"
+            | "check_list"
+            | "check_run"
+            | "check_status"
+            | "check_detail"
+            | "check_cancel" => {
                 let scope = self
                     .context
                     .checks

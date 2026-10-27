@@ -556,7 +556,7 @@ with a newer report.
 ## Project checks and the Harness checking gate
 
 Project check definitions live in the `checks` section of `.forge.json`. The LLM configures
-them through `checks_configure` with check-editing permission, using the
+them through `check_definition_edit` with check-editing permission, using the
 `harness-checks` skill and preserving other repository settings. The categories are
 `format`, `lint`, `check`, `test`, and `build`. Unit, integration, and screenshot suites are
 named `test` definitions. No language detector generates commands. An absent checks section
@@ -697,7 +697,7 @@ batch. If queue editing removes the remaining work, Lua invokes `checks.complete
 under normal execution admission. Failed, paused, or waiting work retains its existing
 admission boundaries. Plan Checking and explicitly requested runs remain independent.
 
-One Rust-owned runner serves the automatic gate and `checks_run`. Its provider-neutral
+One Rust-owned runner serves the automatic gate and `check_run`. Its provider-neutral
 tools list configuration, save authorized setup captures, start runs, read status, and cancel
 owned runs. Model-triggered runs execute enabled saved definitions without command approval,
 just like automatic checks. Requests select check IDs and coverage, never replacement commands.
@@ -705,7 +705,7 @@ Check configuration writes still follow the existing permission coordinator. The
 setup action writes only checks settings and managed helpers while retaining the active plan.
 Disabled checks cannot be selected by the model. Source-writing phases and active children
 exclude on-demand runs. Models normally finish work and leave checking to the gate.
-Manual runs are generally unnecessary, but models may optionally call `checks_run`
+Manual runs are generally unnecessary, but models may optionally call `check_run`
 for earlier feedback where on-demand runs are available.
 Automatic checking does not admit a model exchange or report tokens.
 
@@ -741,10 +741,16 @@ Intermediate lifecycle events remain in the check record rather than producing t
 rows. Reopening reconstructs the same final results and current independent activity.
 `CheckSupervisor` owns publication for both plan gates and on-demand runs. The broker does
 not publish a second check projection or replace the primary phase from a check update.
-`checks_status` supports `wait_for_completion` through both the control tool and
-service route. The runner subscribes before reading state, ignores intermediate
-updates, and retains one deadline across wakeups. Completion waits default to at
-most 60 seconds and return the current state when that deadline expires.
+Agent `check_status` returns only a compact summary and latest output line.
+Its optional `wait_ms` waits for completion under one fixed deadline, defaulting
+to immediate observation and allowing at most 60 seconds. `check_list` applies
+the same summary to currently running IDs without serializing completed history.
+Both paths read current in-memory records without resolving previews or opening logs.
+`check_detail` reads completed logs in UTF-8-safe pages and exposes exact invocation
+metadata. Running detail requests direct the caller to `check_status`.
+`check_definition_list` reads saved definitions and live policy without history,
+while `check_definition_details` provides a full definition on demand.
+The editor's internal service routes retain their catalog and run contracts.
 
 Recorded declaration or command failures enter Resolve. Configuration errors block completion
 and notify the user to fix the definitions. Disabled checks and empty task selections remain

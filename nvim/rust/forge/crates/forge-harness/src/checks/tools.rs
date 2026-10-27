@@ -168,11 +168,11 @@ impl CheckToolScope {
             !self.cancelled.load(Ordering::Acquire),
             "check tools belong to an inactive interaction"
         );
-        if matches!(name, "checks_list" | "checks_run") {
+        if name == "check_run" {
             self.runner.refresh_changes().await?;
         }
         let result = match name {
-            "checks_list" => {
+            "check_definition_list" => {
                 let settings = crate::settings::SettingsStore::open(&self.data_root)?
                     .get(
                         &self.runner.workspace.to_string_lossy(),
@@ -180,11 +180,35 @@ impl CheckToolScope {
                         &self.backend,
                     )?
                     .desired;
-                self.runner
-                    .catalog_preview(self.task_id.as_deref(), self.shell, &settings)
-                    .await?
+                let mut definitions = super::response::definitions(&self.runner.workspace)?;
+                let overrides = self.runner.overrides(self.task_id.as_deref())?;
+                for definition in definitions["definitions"]
+                    .as_array_mut()
+                    .into_iter()
+                    .flatten()
+                {
+                    let id = definition["check_id"]
+                        .as_str()
+                        .context("missing check identity")?
+                        .to_owned();
+                    if let Some(enabled) = overrides.enabled.get(&id) {
+                        definition["enabled"] = json!(enabled);
+                    }
+                    if let Some(auto) = overrides.auto.get(&id) {
+                        definition["auto"] = json!(auto);
+                    }
+                }
+                definitions["automatic_checks"] = json!(settings.automatic_checks.unwrap_or(true));
+                definitions["check_timing"] = json!(settings.check_timing.unwrap_or_default());
+                definitions
             }
-            "checks_configure" => {
+            "check_definition_details" => {
+                let id = arguments["check_id"]
+                    .as_str()
+                    .context("check_id is required")?;
+                super::response::definition(&self.runner.workspace, id)?
+            }
+            "check_definition_edit" => {
                 ensure!(
                     self.editing_enabled(),
                     "Check editing is disabled. The user can enable it with /checks setup on, then request changes using the harness-checks skill."
@@ -195,6 +219,27 @@ impl CheckToolScope {
                 );
                 let request: ConfigureChecks = serde_json::from_value(arguments)?;
                 let review = request.review(&self.runner.workspace)?;
+                let original = super::config::read_document(&self.runner.workspace)?;
+                let proposed = serde_json::to_value(&request.config)?;
+                let before = original["checks"].as_object();
+                let after = proposed
+                    .as_object()
+                    .context("check definitions must be an object")?;
+                let names: std::collections::BTreeSet<_> = before
+                    .into_iter()
+                    .flat_map(|map| map.keys())
+                    .chain(after.keys())
+                    .collect();
+                let changed_checks: Vec<_> = names
+                    .into_iter()
+                    .filter(|name| before.and_then(|map| map.get(*name)) != after.get(*name))
+                    .cloned()
+                    .collect();
+                let changed_helpers: Vec<_> = request
+                    .helpers
+                    .iter()
+                    .map(|helper| helper.path.clone())
+                    .collect();
                 let target_list = std::iter::once(".forge.json")
                     .chain(request.helpers.iter().map(|helper| helper.path.as_str()))
                     .map(
@@ -246,16 +291,21 @@ impl CheckToolScope {
                     self.agent.active_count() == 0,
                     "an agent started during check configuration authorization"
                 );
-                self.runner
+                let published = self
+                    .runner
                     .configure(
                         self.runner.exchange_owner(&self.address.turn_id)?,
                         request,
                         delivery.lifecycle.as_ref(),
                         Some(&self.editing),
                     )
-                    .await?
+                    .await?;
+                json!({
+                    "revision":published["revision"],"changed_checks":changed_checks,
+                    "changed_helpers":changed_helpers,"checks_executed":false
+                })
             }
-            "checks_run" => {
+            "check_run" => {
                 ensure!(
                     self.can_run
                         && self.agent.active_count() == 0
@@ -285,16 +335,20 @@ impl CheckToolScope {
                 );
                 json!({"run_id":self.runner.start(run, delivery.lifecycle,Some(Arc::clone(&self.cancelled)),None).await?})
             }
-            "checks_status" => {
+            "check_status" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
-                let wait_for_completion =
-                    arguments["wait_for_completion"].as_bool().unwrap_or(false);
-                let wait_ms = arguments["wait_ms"]
-                    .as_u64()
-                    .unwrap_or(if wait_for_completion { 60000 } else { 0 });
-                serde_json::to_value(self.runner.status(id, wait_ms, wait_for_completion).await?)?
+                let wait_ms = arguments["wait_ms"].as_u64().unwrap_or(0);
+                self.runner.status_summary(id, wait_ms).await?
             }
-            "checks_cancel" => {
+            "check_list" => self.runner.running_summaries()?,
+            "check_detail" => {
+                let request: super::DetailRequest = serde_json::from_value(arguments)?;
+                let run = self.runner.status(&request.run_id, 0, false).await?;
+                tokio::task::spawn_blocking(move || super::response::detail(&run, &request))
+                    .await
+                    .context("read completed check details")??
+            }
+            "check_cancel" => {
                 let id = arguments["run_id"].as_str().context("run_id is required")?;
                 self.runner.cancel(id)?;
                 json!({"run_id":id,"cancellation_requested":true})

@@ -72,12 +72,12 @@ impl BackendRequest {
             .and_then(|context| context.checks.as_ref())
             .is_some_and(|scope| scope.editing_enabled())
         {
-            "enabled. Use the harness-checks skill when configuring checks. Submit through checks_configure, which requires approval outside YOLO."
+            "enabled. Use the harness-checks skill when configuring checks. Submit through check_definition_edit, which requires approval outside YOLO."
         } else {
             "disabled. The user can enable it with /checks setup on. Configuration guidance is in the harness-checks skill."
         };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call checks_run for earlier feedback. Read recorded results through checks_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nCheck editing permission: {check_editing}\nSaved project checks run in {interpreter}. Setup commands must target that interpreter. Checks run automatically at the configured queue boundary, after the queue by default. Manual runs are generally unnecessary. You may optionally call check_run for earlier feedback. Read recorded results through check_status. During automatic repair, fix the failures and finish the turn so Harness checks again. Never run validation through terminal commands or subprocesses. During plan execution, finish the phase and let Harness Checking run checks. Delegated agents without check tools must leave validation to their parent's completion gate.\n{question}{lsp}",
             self.execution_mode.label(),
             serde_json::to_string(&self.access).expect("access policy serializes")
         )

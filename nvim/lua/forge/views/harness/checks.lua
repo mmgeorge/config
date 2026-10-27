@@ -132,7 +132,13 @@ function Checks.open(state, host)
         trigger = trigger, action = action, depends_on = action.after or {},
       }
     end
-    table.sort(source, function(left, right) return left.id < right.id end)
+    local category_priority = { format = 0, lint = 1, check = 1, test = 2, build = 3 }
+    table.sort(source, function(left, right)
+      local left_priority = category_priority[left.category] or 1
+      local right_priority = category_priority[right.category] or 1
+      if left_priority ~= right_priority then return left_priority < right_priority end
+      return left.id < right.id
+    end)
     local result, completed = {}, {}
     while #result < #source do
       local ready

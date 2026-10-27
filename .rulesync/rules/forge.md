@@ -46,8 +46,8 @@ user's explicit approval before introducing a rejection or truncation policy.
 
 Inside Forge Harness, checks run automatically at the configured queue boundary,
 after the queue by default. Manual runs are generally unnecessary. You may
-optionally call `checks_run` for earlier feedback. List configured checks and
-inspect recorded results with `checks_status`. During automatic repair,
+optionally call `check_run` for earlier feedback. List configured checks and
+inspect recorded results with `check_status`. During automatic repair,
 fix the failures and finish the turn so Harness checks again. Do not run builds,
 tests, linters, formatters, or validation scripts directly through terminal tools
 or alternate subprocesses. During plan execution, finish the active phase and
@@ -56,7 +56,7 @@ rely on their parent's automatic completion gate after child work settles. Missi
 requires the authorized check-configuration workflow rather than an unrecorded
 command. Check-editing permission is shown in the Harness winbar. `/checks setup on`
 or `/checks setup off` toggles it without sending a prompt. Use the `harness-checks`
-skill to configure checks through `checks_configure`. Each submission requires
+skill to configure checks through `check_definition_edit`. Each submission requires
 approval outside YOLO. Read-only source and package-metadata discovery are unaffected.
 
 The build commands below define the required artifact and flags. Harness agents
@@ -67,23 +67,23 @@ selected source preparation and its prerequisites before unrelated verification.
 Explicit dependencies take precedence. Reserve dependencies for checks that
 require a successful prerequisite, not merely to reproduce category ordering.
 Do not make formatters or unit tests depend on the final executable build.
-Rust coverage uses `forge-rust-tests` for individual tests or affected packages
-and `forge-rust-workspace-tests` for workspace coverage. The global testing policy
+Rust coverage uses `rust-test` for individual tests or affected packages
+and `rust-test-workspace` for workspace coverage. The global testing policy
 governs coverage selection. After the generic-input host cutover, use declared
 `inputs` such as `{"package":"forge-harness","test":"checks::tests::case"}`.
 The host never discovers tests or rewrites Cargo commands. Repository callbacks
 own runner arguments, file ownership, and exact-case coverage validation.
-Package formatting uses `forge-rust-format-fix`, while shared configuration uses
-`forge-rust-workspace-format-fix`. Supply explicit formatter files when there are
+Package formatting uses `rust-format`, while shared configuration uses
+`rust-format-workspace`. Supply explicit formatter files when there are
 no task-relative Rust changes. Category ordering does not select additional checks.
-Run `forge-build` after the source changes stabilize and before runtime verification.
+Run `rust-build` after the source changes stabilize and before runtime verification.
 Do not rebuild the executable after every unit-test attempt.
-Host-based editor integration tests depend on `forge-build` because they consume
+Host-based editor integration tests depend on `rust-build` because they consume
 its executable. After later compiled-source edits, rebuild before using host-test
 results as verification of those edits.
 
 Finish every Forge code-change task, including Lua-only changes, by running the
-configured `forge-build` check after the final edits and targeted tests. Wait for
+configured `rust-build` check after the final edits and targeted tests. Wait for
 its recorded passing result before reporting completion. A pending, failed, or
 interrupted build does not establish that the executable is current. Run the check
 again if any Forge code changes afterward. Use the checks interface rather than a

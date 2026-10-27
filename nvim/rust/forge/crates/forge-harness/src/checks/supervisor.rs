@@ -360,6 +360,56 @@ impl CheckSupervisor {
         }
     }
 
+    pub(crate) fn running_summaries(&self) -> Result<serde_json::Value> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        let runs: Vec<_> = state
+            .records
+            .values()
+            .filter(|run| run.state == CheckState::Running)
+            .map(super::response::summary)
+            .collect();
+        Ok(serde_json::json!({"runs":runs}))
+    }
+
+    pub(crate) async fn status_summary(&self, id: &str, wait_ms: u64) -> Result<serde_json::Value> {
+        let deadline =
+            tokio::time::Instant::now() + std::time::Duration::from_millis(wait_ms.min(60_000));
+        loop {
+            let waiting = self.changed.notified();
+            tokio::pin!(waiting);
+            waiting.as_mut().enable();
+            let (summary, running) = {
+                let state = self
+                    .state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+                let run = state.records.get(id).context("unknown check run")?;
+                (
+                    super::response::summary(run),
+                    run.state == CheckState::Running,
+                )
+            };
+            if !running || wait_ms == 0 {
+                return Ok(summary);
+            }
+            if tokio::time::timeout_at(deadline, waiting).await.is_err() {
+                return self.status_summary_now(id);
+            }
+        }
+    }
+
+    fn status_summary_now(&self, id: &str) -> Result<serde_json::Value> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("check state lock poisoned"))?;
+        let run = state.records.get(id).context("unknown check run")?;
+        Ok(super::response::summary(run))
+    }
+
     /// Requests cancellation without releasing process ownership before collection finishes.
     pub fn cancel(&self, id: &str) -> Result<()> {
         let state = self

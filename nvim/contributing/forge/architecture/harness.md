@@ -18,7 +18,7 @@ queue timing. Enablement defaults on. The completion gate reads the effective
 setting before loading check configuration. Live changes use the settings route
 without acquiring provider execution ownership. Disabling the gate releases its
 deferred queue obligation and leaves explicit runs and plan Checking available.
-The provider `checks_list` tool and public checks catalog read effective settings
+The provider `check_definition_list` tool and public checks catalog read effective settings
 on each request and expose `automatic_checks` and `check_timing`. Existing tool
 scopes observe live changes without restarting the provider. Agents use this
 policy to choose between the completion gate and explicit verification.
@@ -1876,7 +1876,7 @@ and scoped-helper instructions. `ResourceCatalog` discovers its canonical source
 and provider resource profiles bind it like other selected skills. The per-turn
 contract references the skill without repeating its body. Automatic planning
 prerequisites also reference it and retain the original plan request.
-Questions are optional and never authorize publication. Every `checks_configure` invocation
+Questions are optional and never authorize publication. Every `check_definition_edit` invocation
 reviews the exact configuration and managed helper changes through the shared
 approval coordinator in Read and Write modes, regardless of saved allow rules.
 YOLO skips this review. Review choices apply only to that submission and do not

@@ -36,7 +36,14 @@ pub(crate) fn is_agent_tool(name: &str) -> bool {
 fn is_check_tool(name: &str) -> bool {
     matches!(
         name,
-        "checks_list" | "checks_configure" | "checks_run" | "checks_status" | "checks_cancel"
+        "check_definition_list"
+            | "check_definition_edit"
+            | "check_definition_details"
+            | "check_list"
+            | "check_run"
+            | "check_status"
+            | "check_detail"
+            | "check_cancel"
     )
 }
 
@@ -303,33 +310,49 @@ impl ControlToolRegistry {
         ];
         definitions.extend([
             ControlToolDefinition {
-                name: "checks_list",
-                description: "Read live automatic_checks enablement and check_timing, project check configuration, revision, overrides, history, and concrete command previews. Check this before deciding whether manual checks_run is needed. When automatic_checks is true, normally rely on the completion gate. When false, explicitly run applicable checks when verification is needed.",
+                name: "check_definition_list",
+                description: "Discover saved check definitions before choosing or editing a check. Call with no arguments. Get check_id, label, category, enablement, automatic selection, declared inputs with descriptions, configuration revision, and live automatic-check policy, without history, logs, or previews. Use check_definition_details with a listed check_id for the full definition, check_run to execute it, or check_definition_edit to publish changes. Use check_list instead to find running jobs.",
                 input_schema: strict_object_input_schema(vec![], &[]),
             },
             ControlToolDefinition {
-                name: "checks_configure",
-                description: "Submit project checks and managed helper files when check editing is enabled. Checks declare typed named action.inputs and either a fixed argv template or a command receiving JSON on stdin with input:true. Commands are opaque: Harness never infers a runner, category, package membership, or test discovery. Every call reviews the exact changes before saving in Read and Write modes, regardless of saved approval rules. YOLO approves automatically. Preserve unrelated settings and use the revision from checks_list. Does not execute commands or validate helper-language syntax.",
+                name: "check_definition_details",
+                description: "Inspect one saved check definition before execution or editing. Supply check_id from check_definition_list, for example {check_id:\"unit\"}. Get its complete trigger/action configuration, command, directory, inputs, defaults, dependencies, and configuration revision. Does not execute a check. Use check_run to start it or check_definition_edit to save changes. Use check_detail with run_id instead for completed execution logs.",
+                input_schema: strict_object_input_schema(vec![("check_id", string_schema())], &["check_id"]),
+            },
+            ControlToolDefinition {
+                name: "check_definition_edit",
+                description: "Publish saved check definitions and managed helper changes when check editing is enabled. Read check_definition_list for expected_revision and check_definition_details for definitions to preserve, then supply the complete config map and optional captured helpers. Declare typed action.inputs for fixed argv substitution or input:true JSON callbacks. Commands remain opaque, without runner discovery or rewriting. Get the new revision, changed check/helper names, and checks_executed:false. Every submission requires review outside YOLO. Does not run commands or validate helper syntax. Use check_run separately for execution.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::ConfigureChecks))
                     .expect("check configuration schema is serializable"),
             },
             ControlToolDefinition {
-                name: "checks_run",
-                description: "Run saved opaque commands by check name. Supply inputs as an object matching each check's declared action.inputs, for example inputs:{package:\"engine\",test:\"tests::example\"} when those names are declared. Input names have no built-in runner semantics. Exact {name} argv elements substitute declared scalar values or splice arrays of scalar values. input:true commands receive resolved inputs and changed-file context as JSON on stdin and own repository-specific selection and coverage validation. Omit inputs to use declared defaults/context sources. all:true explicitly selects full context and cannot be combined with inputs. Harness does not discover tests, inspect package managers, rewrite runner arguments, or parse runner stdout. Never accepts replacement commands. Unavailable during plan execution or while writing agents are active. Get results with checks_status.",
+                name: "check_run",
+                description: "Start saved checks selected from check_definition_list. Supply check as a name or list and optional declared inputs, for example {check:\"unit\",inputs:{package:\"engine\",test:\"tests::example\"}} when those names are declared. Omit inputs for defaults/context sources, or use all:true for full context, never both. Commands remain opaque and callers cannot replace them. Every admitted request immediately returns only run_id, even if execution finishes immediately. Never waits. Use check_status to wait or poll, check_detail after completion for logs, and check_cancel to stop work. Unavailable during plan execution or while writing agents are active.",
                 input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::CheckRunRequest))
                     .expect("check run schema is serializable"),
             },
             ControlToolDefinition {
-                name: "checks_status",
-                description: "Read recorded check results. Set wait_for_completion to wait through progress updates until completion or the deadline (default 60000 ms, maximum 60000). Without it, wait_ms waits for the next update (maximum 30000 ms).",
+                name: "check_status",
+                description: "Poll or wait for a run identified by check_run or check_list. Supply run_id and optional wait_ms from 0 to 60000, default 0, for example {run_id:\"run-123\",wait_ms:60000}. Waiting ends on completion or the original deadline without cancelling execution. Get compact state, exit code, progress, elapsed time, latest nonempty output line, failure reason, and executed/reused counts, without logs or configuration snapshots. Use check_detail after completion for exact invocation and full paginated logs, or check_cancel to request cancellation.",
                 input_schema: strict_object_input_schema(
-                    vec![("run_id", string_schema()), ("wait_ms", json!({"type":"integer", "minimum":0})), ("wait_for_completion", json!({"type":"boolean"}))],
+                    vec![("run_id", string_schema()), ("wait_ms", json!({"type":"integer", "minimum":0,"maximum":60000}))],
                     &["run_id"],
                 ),
             },
             ControlToolDefinition {
-                name: "checks_cancel",
-                description: "Request cancellation of a configured check run by run_id.",
+                name: "check_list",
+                description: "Find currently running check jobs in this session. Call with no arguments. Get runs containing the same compact summaries as check_status, including each run_id and latest nonempty output line. An empty runs array means no jobs are running, not that checks passed. Omits completed history and saved definitions, and never starts or waits for work. Use check_status with a returned run_id to wait, check_cancel to stop it, or check_definition_list to discover saved checks.",
+                input_schema: strict_object_input_schema(vec![], &[]),
+            },
+            ControlToolDefinition {
+                name: "check_detail",
+                description: "Inspect execution details after check_status reports completion. Supply run_id from check_run, optional stream (combined by default, stdout, or stderr), and optional cursor, for example {run_id:\"run-123\",stream:\"stderr\"}. Get exact executable/argv, working directory, resolved inputs, exit status, timing, reuse provenance, and a log page. Follow next_cursor with the same run_id and stream until null to read every selected command's complete log. Running jobs return only a message to wait with check_status. Unknown IDs, invalid cursors, and log I/O or decoding failures report errors. Use check_definition_details with check_id instead for saved configuration.",
+                input_schema: serde_json::to_value(schemars::schema_for!(crate::checks::DetailRequest))
+                    .expect("check detail schema is serializable"),
+            },
+            ControlToolDefinition {
+                name: "check_cancel",
+                description: "Stop an active check run identified by check_run or check_list. Supply run_id, for example {run_id:\"run-123\"}. Get cancellation_requested:true, which acknowledges the request rather than completed process cleanup. Preserves recorded output and does not disable the check definition. Use check_status to wait for the terminal state and check_detail afterward for logs. Unknown or inactive run IDs report errors.",
                 input_schema: strict_object_input_schema(vec![("run_id", string_schema())], &["run_id"]),
             },
         ]);
@@ -487,10 +510,25 @@ pub fn apply_invocation(
         }
         "agent_spawn" | "agent_send" | "agent_followup" | "agent_interrupt" | "agent_list"
         | "agent_activity" | "agent_tool_output" => {}
-        "lsp_overview" | "lsp_symbols" | "lsp_definition" | "lsp_context" | "lsp_references"
-        | "lsp_calls" | "lsp_paths" | "lsp_diagnostics" | "lsp_status" | "plan_checks_add"
-        | "plan_phase_done" | "checks_list" | "checks_configure" | "checks_run"
-        | "checks_status" | "checks_cancel" => {}
+        "lsp_overview"
+        | "lsp_symbols"
+        | "lsp_definition"
+        | "lsp_context"
+        | "lsp_references"
+        | "lsp_calls"
+        | "lsp_paths"
+        | "lsp_diagnostics"
+        | "lsp_status"
+        | "plan_checks_add"
+        | "plan_phase_done"
+        | "check_definition_list"
+        | "check_definition_edit"
+        | "check_definition_details"
+        | "check_list"
+        | "check_run"
+        | "check_status"
+        | "check_detail"
+        | "check_cancel" => {}
         "goal_complete" => output.evidence.structured_complete = true,
         "goal_blocked" => output.evidence.structured_blocked = true,
         "goal_status" => output.evidence.tool_called = true,
@@ -806,23 +844,65 @@ mod test {
     #[test]
     fn checks_catalog_matches_runtime_requests_and_root_ownership() {
         let requests = [
-            ("checks_list", json!({})),
+            ("check_definition_list", json!({})),
             (
-                "checks_configure",
+                "check_definition_edit",
                 json!({"expected_revision":"revision","config":{}}),
             ),
             (
-                "checks_run",
+                "check_run",
                 json!({"check":"unit","inputs":{"package":"engine","test":"tests::example"}}),
             ),
-            (
-                "checks_status",
-                json!({"run_id":"run","wait_ms":100,"wait_for_completion":true}),
-            ),
-            ("checks_cancel", json!({"run_id":"run"})),
+            ("check_status", json!({"run_id":"run","wait_ms":100})),
+            ("check_cancel", json!({"run_id":"run"})),
+            ("check_list", json!({})),
+            ("check_detail", json!({"run_id":"run"})),
+            ("check_definition_details", json!({"check_id":"unit"})),
         ];
         let catalog = ControlToolRegistry.mcp_tool_list();
+        for removed in [
+            "checks_list",
+            "checks_configure",
+            "checks_run",
+            "checks_status",
+            "checks_cancel",
+        ] {
+            assert!(!catalog.iter().any(|tool| tool["name"] == removed));
+        }
+        for (name, arguments) in [
+            ("check_run", json!({"check":"unit","wait_ms":10})),
+            (
+                "check_status",
+                json!({"run_id":"run","wait_for_completion":true}),
+            ),
+            ("check_status", json!({"run_id":"run","wait_ms":60001})),
+            ("check_detail", json!({"run_id":"run","stream":"unknown"})),
+        ] {
+            assert!(
+                validate_arguments(&ControlToolInvocation {
+                    name: name.into(),
+                    arguments,
+                })
+                .is_err()
+            );
+        }
         for (name, arguments) in requests {
+            let description =
+                catalog.iter().find(|tool| tool["name"] == name).unwrap()["description"]
+                    .as_str()
+                    .unwrap();
+            let usage = description.to_ascii_lowercase();
+            assert!(
+                usage.contains("supply") || usage.contains("no arguments"),
+                "{name} lacks request usage"
+            );
+            assert!(
+                catalog.iter().any(|tool| {
+                    let related = tool["name"].as_str().unwrap();
+                    related != name && is_check_tool(related) && description.contains(related)
+                }),
+                "{name} lacks a related check-tool reference"
+            );
             assert_eq!(
                 catalog.iter().filter(|tool| tool["name"] == name).count(),
                 1
@@ -856,7 +936,7 @@ mod test {
                 .iter()
                 .filter(|tool| is_check_tool(tool.name))
                 .count(),
-            5
+            8
         );
         assert!(
             !ControlToolRegistry

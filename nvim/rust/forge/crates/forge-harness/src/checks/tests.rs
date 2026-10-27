@@ -34,6 +34,160 @@ fn save(workspace: &std::path::Path, definitions: Vec<CheckDefinition>) {
 }
 
 #[test]
+fn definition_list_groups_categories_before_names() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let definitions = [
+        ("a-build", CheckCategory::Build),
+        ("b-test", CheckCategory::Test),
+        ("c-check", CheckCategory::Check),
+        ("d-format", CheckCategory::Format),
+    ].into_iter().map(|(id, category)| {
+        let mut selected = definition(id, "exit 0");
+        selected.category = category;
+        selected
+    }).collect();
+    save(workspace.path(), definitions);
+    let list = super::response::definitions(workspace.path())?;
+    let ids: Vec<_> = list["definitions"].as_array().unwrap().iter()
+        .map(|definition| definition["check_id"].as_str().unwrap()).collect();
+    assert_eq!(ids, ["d-format", "c-check", "b-test", "a-build"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn compact_tool_responses_separate_definitions_status_and_complete_logs() -> Result<()> {
+    let workspace = tempfile::tempdir()?;
+    let data = tempfile::tempdir()?;
+    let mut check = definition("named", "unused");
+    check.all = direct_operation(
+        "uninstalled-runner",
+        &["--value", "{value}"],
+        Some(serde_json::from_value(serde_json::json!({
+            "value":{"type":"string","description":"Exact value passed to the runner","default":"literal value"}
+        }))?),
+    );
+    save(workspace.path(), vec![check]);
+    let definitions = super::response::definitions(workspace.path())?;
+    assert_eq!(
+        definitions["definitions"][0]["inputs"]["value"]["description"],
+        "Exact value passed to the runner"
+    );
+    for field in ["history", "snapshot", "preview"] {
+        assert!(definitions.get(field).is_none());
+    }
+    let details = super::response::definition(workspace.path(), "named")?;
+    assert_eq!(details["definition"]["action"]["command"][2], "{value}");
+    assert!(super::response::definition(workspace.path(), "missing").is_err());
+    let runner = make_runner(workspace.path(), data.path());
+    assert_eq!(runner.running_summaries()?, serde_json::json!({"runs":[]}));
+    let prepared = runner.prepare_request(
+        crate::timeline::TimelineOwner::session("checks-test"),
+        RunRequest {
+            ids: vec!["named".into()],
+            ..Default::default()
+        },
+        None,
+        crate::session::CheckShell::Nushell,
+        "Explicit".into(),
+    )?;
+    let mut run = runner.resolve(prepared).await?;
+    run.commands[0].started_at_ms = Some(run.started_at_ms);
+    run.commands[0].state = CheckState::Running;
+    run.commands[0].preview = "first\n\u{1b}[32mCompiling example\u{1b}[0m\n\n".into();
+    let summary = super::response::summary(&run);
+    assert_eq!(summary["latest_output"], "Compiling example");
+    assert_eq!(summary["completed"], 0);
+    assert_eq!(summary["total"], 1);
+    assert!(summary.get("commands").is_none());
+    let mut request: super::DetailRequest =
+        serde_json::from_value(serde_json::json!({"run_id":run.id}))?;
+    let pending = super::response::detail(&run, &request)?;
+    assert!(
+        pending["message"]
+            .as_str()
+            .unwrap()
+            .contains("check_status")
+    );
+    assert!(pending.get("text").is_none());
+    runner.publish(&run, None).await?;
+    assert_eq!(runner.running_summaries()?["runs"][0]["run_id"], run.id);
+    assert_eq!(runner.status_summary(&run.id, 1).await?["state"], "running");
+    let waiting_id = run.id.clone();
+    let waiting = runner.status_summary(&waiting_id, 1000);
+    tokio::pin!(waiting);
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+    runner.publish(&run, None).await?;
+    assert!(futures_util::poll!(waiting.as_mut()).is_pending());
+    let output = format!(
+        "{}{}{}",
+        "a".repeat(16_383),
+        "\u{1f642}",
+        "complete diagnostic\n".repeat(10_000)
+    );
+    std::fs::create_dir_all(run.commands[0].output.parent().unwrap())?;
+    std::fs::write(&run.commands[0].output, &output)?;
+    run.state = CheckState::Failed;
+    run.completed_at_ms = Some(run.started_at_ms + 25);
+    run.commands[0].state = CheckState::Failed;
+    run.commands[0].completed_at_ms = run.completed_at_ms;
+    run.commands[0].exit_code = Some(7);
+    runner.publish(&run, None).await?;
+    assert_eq!(waiting.await?["state"], "failed");
+    assert_eq!(runner.running_summaries()?, serde_json::json!({"runs":[]}));
+    assert!(runner.status_summary("missing", 0).await.is_err());
+    let summary = super::response::summary(&run);
+    assert_eq!(summary["state"], "failed");
+    assert_eq!(summary["exit_code"], 7);
+    assert_eq!(summary["elapsed_ms"], 25);
+    let mut combined = String::new();
+    loop {
+        let page = super::response::detail(&run, &request)?;
+        assert_eq!(
+            page["command"]["invocation"]["program"],
+            "uninstalled-runner"
+        );
+        assert_eq!(
+            page["command"]["invocation"]["args"],
+            serde_json::json!(["--value", "literal value"])
+        );
+        combined.push_str(page["text"].as_str().unwrap());
+        if page["next_cursor"].is_null() {
+            break;
+        }
+        request.cursor = serde_json::from_value(page["next_cursor"].clone())?;
+    }
+    assert_eq!(combined, output);
+    let mut second = run.commands[0].clone();
+    second.id = "second".into();
+    second.output = workspace.path().join("second.log");
+    std::fs::write(&second.output, "second command")?;
+    run.commands.push(second);
+    request.cursor.offset = output.len() as u64;
+    let boundary = super::response::detail(&run, &request)?;
+    assert_eq!(boundary["next_cursor"]["command_index"], 1);
+    request.cursor = serde_json::from_value(boundary["next_cursor"].clone())?;
+    assert_eq!(
+        super::response::detail(&run, &request)?["text"],
+        "second command"
+    );
+    run.commands.pop();
+    request.cursor = Default::default();
+    request.cursor.offset = output.len() as u64 + 1;
+    assert!(super::response::detail(&run, &request).is_err());
+    request.cursor = Default::default();
+    std::fs::remove_file(&run.commands[0].output)?;
+    assert!(super::response::detail(&run, &request).is_err());
+    run.commands[0].started_at_ms = None;
+    run.commands[0].state = CheckState::Skipped;
+    assert_eq!(super::response::detail(&run, &request)?["text"], "");
+    run.commands[0].reused_from = Some(("prior-run".into(), "prior-command".into()));
+    assert!(super::response::detail(&run, &request).is_err());
+    assert_eq!(super::response::summary(&run)["reused"], 1);
+    assert_eq!(super::response::summary(&run)["executed"], 0);
+    Ok(())
+}
+
+#[test]
 fn check_order_prioritizes_categories_and_preserves_ties() -> Result<()> {
     let definitions = [
         ("build", CheckCategory::Build),
