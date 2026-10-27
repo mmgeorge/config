@@ -1,1 +1,4 @@
 * text=auto eol=lf
+
+# PowerToys snapshots have byte-for-byte SHA256 checksums in their manifest.
+windows/powertoys/backup/** -text

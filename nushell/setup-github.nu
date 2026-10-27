@@ -80,7 +80,7 @@ def main [--token-writer: path, --preview] {
       if ($status.stdout | str trim) == 'set' {
         print ($name + ': set (skip)')
       } else if $name == 'GH_ENTERPRISE_AGENT_TOKEN' {
-        print ($name + ': missing (prompt)')
+        print ($name + ': missing (optional; existing login is preserved)')
       } else {
         print ($name + ': missing (configure)')
       }
@@ -102,12 +102,23 @@ def main [--token-writer: path, --preview] {
   if $token_writer == null or not ($token_writer | path exists) {
     error make {msg: 'Provide --token-writer pointing to the Windows token persistence adapter.'}
   }
-  for command in ['gh' 'ssh' 'ssh-keygen' 'pwsh'] {
+  for command in ['gh' 'pwsh'] {
     if (which $command | is-empty) {
       error make {msg: $"Required command ($command) is missing. Install Git, GitHub CLI, and PowerShell, then reopen the terminal."}
     }
   }
   hide-env --ignore-errors GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN
+  let existing = (^gh auth status --active --hostname github.com | complete)
+  if $existing.exit_code == 0 {
+    print 'GitHub login: authenticated (skip)'
+    persist-token 'github.com' 'GITHUB_PERSONAL_ACCESS_TOKEN' $token_writer
+    return
+  }
+  for command in ['ssh' 'ssh-keygen'] {
+    if (which $command | is-empty) {
+      error make {msg: $"Required command ($command) is missing. Install Git, then reopen the terminal."}
+    }
+  }
   mut authenticated_host = []
   loop {
     let hostname = (prompt-host 'GitHub hostname' 'github.com')

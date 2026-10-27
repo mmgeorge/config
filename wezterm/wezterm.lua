@@ -1,5 +1,7 @@
 -- Pull in the wezterm API
 local wezterm                               = require 'wezterm'
+-- Include sibling modules when this config is selected via WEZTERM_CONFIG_FILE.
+package.path = wezterm.config_dir .. '/?.lua;' .. wezterm.config_dir .. '/?/init.lua;' .. package.path
 local action                                = wezterm.action
 local worktree                              = require 'worktree'
 

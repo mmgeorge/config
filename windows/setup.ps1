@@ -1,8 +1,14 @@
 [CmdletBinding()]
 param(
     [switch] $DryRun,
-    [switch] $ApplyPowerToysConfig
+    [switch] $ApplyPowerToysConfig,
+    [switch] $Desktop,
+    [Parameter(ValueFromRemainingArguments = $true)]
+    [ValidateSet('--desktop')]
+    [string[]] $Options
 )
+
+if ($Options -contains '--desktop') { $Desktop = $true }
 
 $ErrorActionPreference = 'Stop'
 $RepositoryPath = Split-Path -Parent $PSScriptRoot
@@ -84,40 +90,6 @@ if (Get-Command nu -ErrorAction SilentlyContinue) {
     Write-Output 'Shared CLI dependencies: unchecked (requires Nushell installation)'
 }
 
-$WindowsSshPath = Join-Path ([Environment]::GetFolderPath('System')) 'OpenSSH\ssh.exe'
-$MachineGitConfigPath = Join-Path $RepositoryPath 'git/config.local'
-if (-not (Test-Path -LiteralPath $WindowsSshPath -PathType Leaf)) {
-    throw 'Windows OpenSSH Client is missing. Install the Windows optional feature, then rerun setup.'
-}
-if (Get-Command git -ErrorAction SilentlyContinue) {
-    $WindowsSshCommand = '"' + $WindowsSshPath.Replace('\', '/') + '"'
-    $ConfiguredSshCommand = & git config --file $MachineGitConfigPath --get core.sshCommand
-    if ($LASTEXITCODE -notin @(0, 1)) {
-        throw "Cannot read the machine Git configuration (exit $LASTEXITCODE)."
-    }
-    if ($ConfiguredSshCommand -eq $WindowsSshCommand) {
-        Write-Output 'Git SSH: Windows OpenSSH configured (skip)'
-    } else {
-        Write-Output 'Git SSH: Windows OpenSSH (configure)'
-        if (-not $DryRun) {
-            & git config --file $MachineGitConfigPath --replace-all core.sshCommand $WindowsSshCommand
-            if ($LASTEXITCODE -ne 0) {
-                throw "Git SSH configuration failed (exit $LASTEXITCODE)."
-            }
-        }
-    }
-    if (-not $DryRun) {
-        $EffectiveSshCommand = & git config --global --includes --get core.sshCommand
-        if ($LASTEXITCODE -ne 0 -or $EffectiveSshCommand -ne $WindowsSshCommand) {
-            throw "Git does not load the Windows SSH setting. Include $RepositoryPath/git/config in the active global Git configuration, then rerun setup."
-        }
-    }
-} elseif ($DryRun) {
-    Write-Output 'Git SSH: unchecked (requires Git installation)'
-} else {
-    throw 'Git is not available after installation. Open a new terminal and rerun setup.'
-}
-
 if (Get-Command nu -ErrorAction SilentlyContinue) {
     & nu --no-config-file (Join-Path $RepositoryPath 'nushell/setup-github.nu') --token-writer (Join-Path $PSScriptRoot 'set-github-token.ps1') @DryRunArgument
     if ($LASTEXITCODE -ne 0) {
@@ -127,22 +99,51 @@ if (Get-Command nu -ErrorAction SilentlyContinue) {
     Write-Output 'GitHub authentication and SSH: unchecked (requires Nushell installation)'
 }
 
-$NushellSource = Join-Path $RepositoryPath 'nushell'
-$NushellTarget = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'nushell'
-$ExistingConfig = Get-Item -LiteralPath $NushellTarget -Force -ErrorAction SilentlyContinue
-if ($null -ne $ExistingConfig) {
-    if ($ExistingConfig.LinkType -eq 'Junction' -and $ExistingConfig.Target -contains $NushellSource) {
-        Write-Output 'Nushell config: linked (skip)'
-    } else {
-        Write-Output 'Nushell config: existing (preserve)'
+if ([Environment]::GetEnvironmentVariable('XDG_CONFIG_HOME', 'User') -eq $RepositoryPath) {
+    Write-Output 'Nushell config: XDG_CONFIG_HOME configured (skip)'
+} else {
+    Write-Output "Nushell config: XDG_CONFIG_HOME=$RepositoryPath (configure)"
+    if (-not $DryRun) {
+        [Environment]::SetEnvironmentVariable('XDG_CONFIG_HOME', $RepositoryPath, 'User')
+    }
+}
+if (-not $DryRun) { $env:XDG_CONFIG_HOME = $RepositoryPath }
+
+$DevHome = [Environment]::GetEnvironmentVariable('DEV_HOME', 'User')
+if ([string]::IsNullOrWhiteSpace($DevHome)) {
+    $DevHome = $env:DEV_HOME
+    if ([string]::IsNullOrWhiteSpace($DevHome)) {
+        $DevHome = Join-Path (Split-Path -Parent $RepositoryPath) 'code'
+    }
+    Write-Output "DEV_HOME: $DevHome (configure)"
+    if (-not $DryRun) {
+        [Environment]::SetEnvironmentVariable('DEV_HOME', $DevHome, 'User')
     }
 } else {
-    Write-Output 'Nushell config: missing (link)'
-    if (-not $DryRun) { New-Item -ItemType Junction -Path $NushellTarget -Target $NushellSource | Out-Null }
+    Write-Output "DEV_HOME: $DevHome (preserve)"
 }
+if (-not (Test-Path -LiteralPath $DevHome -PathType Container)) {
+    Write-Output "Development directory: $DevHome (create)"
+    if (-not $DryRun) { New-Item -ItemType Directory -Path $DevHome -Force | Out-Null }
+}
+if (-not $DryRun) { $env:DEV_HOME = $DevHome }
 
 $PowerShellDryRunArgument = @()
 if ($DryRun) { $PowerShellDryRunArgument += '-DryRun' }
+
+$WezTermConfig = Join-Path $RepositoryPath 'wezterm/wezterm.lua'
+if ([Environment]::GetEnvironmentVariable('WEZTERM_CONFIG_FILE', 'User') -eq $WezTermConfig) {
+    Write-Output 'WezTerm config: configured (skip)'
+} else {
+    Write-Output "WezTerm config: $WezTermConfig (configure)"
+    if (-not $DryRun) {
+        [Environment]::SetEnvironmentVariable('WEZTERM_CONFIG_FILE', $WezTermConfig, 'User')
+    }
+}
+if (-not $DryRun) { $env:WEZTERM_CONFIG_FILE = $WezTermConfig }
+& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-fonts.ps1') @PowerShellDryRunArgument
+if ($LASTEXITCODE -ne 0) { throw "Font setup failed (exit $LASTEXITCODE)." }
+
 & pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-rust.ps1') @PowerShellDryRunArgument
 if ($LASTEXITCODE -ne 0) {
     throw "Rust setup failed (exit $LASTEXITCODE)."
@@ -155,7 +156,9 @@ if ($LASTEXITCODE -ne 0) {
     throw "PowerToys setup failed (exit $LASTEXITCODE)."
 }
 
-if (Get-Command nu -ErrorAction SilentlyContinue) {
+if ($Desktop) {
+    Write-Output 'Kanata: skipped (desktop mode)'
+} elseif (Get-Command nu -ErrorAction SilentlyContinue) {
     & nu --no-config-file (Join-Path $RepositoryPath 'kanata/setup-kanata.nu') @DryRunArgument
     if ($LASTEXITCODE -ne 0) {
         throw "Kanata setup failed (exit $LASTEXITCODE)."

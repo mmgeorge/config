@@ -1,4 +1,5 @@
 export const required = [
+  { name: 'tree-sitter', winget: 'tree-sitter.tree-sitter-cli', brew: 'tree-sitter' }
   { name: 'carapace', winget: 'rsteube.Carapace', brew: 'carapace' }
   { name: 'bat', winget: 'sharkdp.bat', brew: 'bat' }
   { name: 'btop', winget: 'aristocratos.btop4win', brew: 'btop' }

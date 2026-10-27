@@ -1,7 +1,7 @@
 # Windows machine setup
 
-`setup.ps1` installs missing applications, configures Nushell when no configuration
-already exists, and calls the Kanata installer to configure launch at login.
+`setup.ps1` installs missing applications, points Nushell at this repository's
+configuration, and calls the Kanata installer to configure launch at login.
 It runs in Windows PowerShell 5.1 or PowerShell 7 and requires an existing
 PowerShell 7 installation (`pwsh`) and WinGet from Microsoft App Installer.
 Keep this repository at its intended permanent location
@@ -26,11 +26,20 @@ Install and configure what is missing after reviewing the preview:
 ./windows/setup.ps1
 ```
 
+Use `--desktop` (or PowerShell's `-Desktop`) to skip Kanata installation,
+profile validation, and startup configuration. Existing Kanata installations
+and startup shortcuts are left as they are. The option also works with `-DryRun`:
+
+```powershell
+./windows/setup.ps1 --desktop -DryRun
+./windows/setup.ps1 --desktop
+```
+
 Setup collects missing main applications and installs them in one WinGet call.
 Shared CLI dependencies use a separate batch. Rust, PowerToys, and Kanata retain
 their own setup steps. Installers run silently and accept package agreements. Windows can still request
 administrator approval for packages that require it. Setup does not request an
-automatic reboot. Kanata setup runs on every setup invocation and preserves an
+automatic reboot. Unless `--desktop` is specified, Kanata setup runs on every setup invocation and preserves an
 already matching startup shortcut.
 
 Application IDs live in `windows/packages.json`. Shared CLI dependencies live in
@@ -54,11 +63,35 @@ An existing working Node.js LTS installation is retained. A detected non-LTS or
 broken Node installation stops setup before package installation so it can be
 resolved explicitly.
 
-Setup creates a directory junction from the current user's AppData Nushell
-directory to this repository's `nushell` directory. An existing matching junction
-is retained. Any other existing configuration is reported as preserved and
-must be reconciled manually. The script does not change the default terminal or
-configure WezTerm's shell. Start `nu` in a new terminal to use Nushell.
+Setup saves the repository root as the current user's `XDG_CONFIG_HOME`,
+replacing any previous value. Nushell then reads `nushell/config.nu` and
+`nushell/env.nu` from this repository. Other XDG-aware applications also use
+this directory. Existing AppData configuration files and junctions are left
+in place. No `HOME` override is needed. Sign out and back in so applications
+inherit the variable. The script does not change the default terminal.
+
+Setup also saves `DEV_HOME` for the current user and creates its directory if
+missing. It preserves an existing value; otherwise it uses a `code` directory
+beside this repository (`D:\code` for `D:\config`). Nushell's development
+directory shortcuts use this variable. `-DryRun` previews these changes.
+
+Setup saves the repository's `wezterm/wezterm.lua` path in the current user's
+`WEZTERM_CONFIG_FILE` environment variable, replacing any previous value.
+Sign out and back in so newly launched applications inherit it.
+It also installs Cascadia Code NF regular and italic for the current user,
+using Microsoft's pinned Cascadia Code 2407.24 release and verifying the ZIP's
+SHA256 checksum. WinGet does not currently list this font, so `setup-fonts.ps1`
+downloads it directly from GitHub. Existing registered font files are skipped;
+`-DryRun` previews both steps without downloading or changing anything.
+Restart WezTerm after font installation.
+
+Setup leaves Git's SSH client selection and global configuration unchanged.
+Including the repository's shared `git/config` is optional and is not required
+for setup.
+
+An existing authenticated `gh` login for `github.com` is reused without login,
+hostname, or optional enterprise prompts. Setup still saves
+`GITHUB_PERSONAL_ACCESS_TOKEN` if missing, using the existing login.
 
 Kanata setup preserves an already matching login shortcut and verifies both
 keyboard profiles. Validate Kanata separately without changing startup:
@@ -89,7 +122,7 @@ Preview PowerToys installation and the saved files without changing anything:
 pwsh -NoProfile -File .\windows\setup-powertoys.ps1 -DryRun
 ```
 
-To replace existing settings, exit PowerToys and Command Palette, then run:
+To replace existing settings, run (this stops PowerToys and Command Palette):
 
 ```powershell
 .\windows\setup.ps1 -ApplyPowerToysConfig
@@ -99,5 +132,5 @@ The standalone equivalent is `pwsh -NoProfile -File
 .\windows\setup-powertoys.ps1 -ApplyConfig`. Changed destination files are backed
 up beneath the current user's LocalAppData `Microsoft\PowerToys-SetupBackups`
 directory before replacement. If an installer starts PowerToys automatically,
-exit PowerToys and rerun with `-ApplyConfig` to apply the snapshot. Start PowerToys
+setup stops it before restoring an unconfigured installation. Start PowerToys
 after restoration to load the settings. The script requires PowerShell 7.

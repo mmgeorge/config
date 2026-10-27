@@ -4,6 +4,7 @@
   { "Name": "Nushell", "Id": "Nushell.Nushell", "Command": "nu" },
   { "Name": "Node.js LTS", "Id": "OpenJS.NodeJS.LTS" },
   { "Name": "Steam", "Id": "Valve.Steam" },
+  { "Name": "Discord", "Id": "Discord.Discord" },
   { "Name": "Obsidian", "Id": "Obsidian.Obsidian" },
   { "Name": "WezTerm", "Id": "wez.wezterm" },
   { "Name": "Zotero", "Id": "DigitalScholar.Zotero" },

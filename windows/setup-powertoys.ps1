@@ -40,6 +40,7 @@ if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
     throw 'WinGet is missing. Install Microsoft App Installer, then rerun setup.'
 }
 $Detection = & winget.exe list --id Microsoft.PowerToys --exact --source winget --accept-source-agreements --disable-interactivity 2>&1
+$InstalledNow = $false
 if ($LASTEXITCODE -eq -1978335212) {
     Write-Output 'PowerToys: missing (install)'
     if (-not $DryRun) {
@@ -47,6 +48,7 @@ if ($LASTEXITCODE -eq -1978335212) {
         if ($LASTEXITCODE -ne 0) {
             throw "PowerToys installation failed (exit $LASTEXITCODE)."
         }
+        $InstalledNow = $true
     }
 } elseif ($LASTEXITCODE -ne 0) {
     throw "Cannot determine whether PowerToys is installed: $Detection"
@@ -65,12 +67,28 @@ if (-not $ApplyConfig) {
         return
     }
 }
-if (Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalette*' -ErrorAction SilentlyContinue) {
+$Running = @(Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalette*' -ErrorAction SilentlyContinue)
+if ($Running.Count -gt 0) {
     if ($DryRun) {
-        Write-Output 'PowerToys settings: restore blocked (exit PowerToys and Command Palette)'
+        Write-Output 'PowerToys settings: PowerToys and Command Palette must stop before restore'
         return
     }
-    throw 'Exit PowerToys and Command Palette before restoring settings, then rerun setup.'
+    if (-not ($InstalledNow -or $ApplyConfig)) {
+        throw 'Exit PowerToys and Command Palette, then rerun with -ApplyConfig to restore settings.'
+    }
+    Write-Output 'Stopping PowerToys and Command Palette to restore settings...'
+    # Stop the runner first so it cannot restart its utility processes.
+    Get-Process -Name 'PowerToys' -ErrorAction SilentlyContinue | Stop-Process -Force
+    $Deadline = [DateTime]::UtcNow.AddSeconds(15)
+    do {
+        $Running = @(Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalette*' -ErrorAction SilentlyContinue)
+        if ($Running.Count -eq 0) { break }
+        $Running | Stop-Process -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 250
+    } while ([DateTime]::UtcNow -lt $Deadline)
+    if (@(Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalette*' -ErrorAction SilentlyContinue).Count -gt 0) {
+        throw 'PowerToys processes are still running. Exit them, then rerun with -ApplyConfig.'
+    }
 }
 
 Write-Output "PowerToys settings: $($Change.Count) files (restore)"

@@ -698,6 +698,11 @@ def screenshotPull [url?: string] {
 }
 
 $env.config.shell_integration.osc7 = true
+# WezTerm on Windows scrolls on each keystroke when OSC 133 markers are enabled.
+# https://github.com/wezterm/wezterm/discussions/5859
+if $nu.os-info.name == 'windows' and ($env.TERM_PROGRAM? == 'WezTerm') {
+  $env.config.shell_integration.osc133 = false
+}
 
 $env.config.history = {
   file_format: "sqlite",
