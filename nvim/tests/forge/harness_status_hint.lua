@@ -3,6 +3,12 @@ local buffer = require("forge.buffer")
 local config = require("forge.infra.config")
 local commands = require("forge.shared.view_command_set")
 local hint = require("forge.views.harness.status_hint")
+require("forge.infra.highlights").setup()
+local status_white = tonumber(require("theme.palette").white:sub(2), 16)
+for _, group in ipairs({ "ForgeTimelineStatus", "ForgeTimelineStatusSpinner" }) do
+  assert(vim.api.nvim_get_hl(0, { name = group, link = false }).fg == status_white,
+    group .. " must always use white")
+end
 local transcript = buffer.open("status-hint", {})
 local command_set = commands.new()
 commands.register(command_set, "open_artifact", function() end)
