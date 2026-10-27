@@ -324,6 +324,11 @@ Each result contains `file` (repository-relative), terminal `state`, optional
 not stdout. Malformed reports fail, and a callback cannot report failures while
 claiming an overall successful result. Ordinary command output remains preserved.
 
+The Rust callback streams Cargo stdout and stderr while retaining both for the
+final report. A running check displays the latest nonempty output line beneath
+its title, including compiler progress before the test executable starts. Earlier
+output remains in the log rather than accumulating in the status area.
+
 ## Preview and execution
 
 Plan review and `/checks` show resolved commands and why they were selected.

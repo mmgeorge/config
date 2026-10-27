@@ -423,91 +423,96 @@ impl DeclarationResolver {
         Ok(true)
     }
 
-    fn load_rust(
-        &mut self,
-        path: &Path,
-        package: &str,
-        module: &[String],
-        depth: usize,
-    ) -> Result<()> {
-        if depth > 64 {
-            self.package.entry(package.into()).or_default().incomplete = true;
-            return Ok(());
+    fn load_rust(&mut self, path: &Path, package: &str, module: &[String]) -> Result<()> {
+        enum ModuleStep {
+            Load(PathBuf, Vec<String>),
+            Conditional(Vec<String>),
         }
-        let path = normalize(path);
-        if self.file.contains_key(&path) {
-            return Ok(());
-        }
-        if !self.load_file(&path, package, module)? {
-            self.package.entry(package.into()).or_default().incomplete = true;
-            return Ok(());
-        }
-        let index = self.file[&path].index.clone();
-        let state = self.package.entry(package.into()).or_default();
-        state.incomplete |= index.incomplete;
-        if module.is_empty() {
-            state.no_implicit_prelude = index.no_implicit_prelude;
-        }
-        let directory = path.parent().unwrap_or(Path::new("."));
-        let base = if module.is_empty() || path.file_name().is_some_and(|name| name == "mod.rs") {
-            directory.to_path_buf()
-        } else {
-            directory.join(path.file_stem().unwrap_or_default())
-        };
-        for declaration in &index.module {
-            let mut nested = module.to_vec();
-            nested.extend(declaration.scope.clone());
-            nested.push(declaration.name.clone());
-            if declaration.inline {
-                self.module.insert((package.into(), nested), path.clone());
+        let mut pending = vec![ModuleStep::Load(normalize(path), module.to_vec())];
+        while let Some(step) = pending.pop() {
+            let (path, module) =
+                match step {
+                    ModuleStep::Load(path, module) => (normalize(&path), module),
+                    ModuleStep::Conditional(module) => {
+                        for file in self.file.values_mut().filter(|file| {
+                            file.package == package && file.module.starts_with(&module)
+                        }) {
+                            let index = Arc::make_mut(&mut file.index);
+                            for symbol in &mut index.symbol {
+                                symbol.conditional = true;
+                            }
+                            for reference in &mut index.reference {
+                                reference.conditional = true;
+                            }
+                            for import in &mut index.import {
+                                import.conditional = true;
+                            }
+                        }
+                        continue;
+                    }
+                };
+            if self.file.contains_key(&path) {
                 continue;
             }
-            let container = declaration
-                .scope
-                .iter()
-                .fold(base.clone(), |directory, name| directory.join(name));
-            let explicit = declaration
-                .path
-                .as_ref()
-                .map(|relative| container.join(relative));
-            let direct = container.join(format!("{}.rs", declaration.name));
-            let target = explicit.unwrap_or_else(|| {
-                let probe_started = Instant::now();
-                let available = self.read(&direct).is_some();
-                if self.trace.is_some() {
-                    self.work.module_probe_ms += probe_started.elapsed().as_secs_f64() * 1000.0;
-                    self.work.module_probes += 1;
-                }
-                if available {
-                    direct
-                } else {
-                    container.join(&declaration.name).join("mod.rs")
-                }
-            });
-            if !path.starts_with(&self.workspace) {
-                self.pending_module
-                    .insert((package.into(), nested), (target, declaration.conditional));
+            if !self.load_file(&path, package, &module)? {
+                self.package.entry(package.into()).or_default().incomplete = true;
                 continue;
             }
-            self.load_rust(&target, package, &nested, depth + 1)?;
-            if declaration.conditional {
-                for file in self
-                    .file
-                    .values_mut()
-                    .filter(|file| file.package == package && file.module.starts_with(&nested))
-                {
-                    let index = Arc::make_mut(&mut file.index);
-                    for symbol in &mut index.symbol {
-                        symbol.conditional = true;
+            let index = self.file[&path].index.clone();
+            let state = self.package.entry(package.into()).or_default();
+            state.incomplete |= index.incomplete;
+            if module.is_empty() {
+                state.no_implicit_prelude = index.no_implicit_prelude;
+            }
+            let directory = path.parent().unwrap_or(Path::new("."));
+            let base = if module.is_empty() || path.file_name().is_some_and(|name| name == "mod.rs")
+            {
+                directory.to_path_buf()
+            } else {
+                directory.join(path.file_stem().unwrap_or_default())
+            };
+            let mut children = Vec::new();
+            for declaration in &index.module {
+                let mut nested = module.to_vec();
+                nested.extend(declaration.scope.clone());
+                nested.push(declaration.name.clone());
+                if declaration.inline {
+                    self.module.insert((package.into(), nested), path.clone());
+                    continue;
+                }
+                let container = declaration
+                    .scope
+                    .iter()
+                    .fold(base.clone(), |directory, name| directory.join(name));
+                let explicit = declaration
+                    .path
+                    .as_ref()
+                    .map(|relative| container.join(relative));
+                let direct = container.join(format!("{}.rs", declaration.name));
+                let target = explicit.unwrap_or_else(|| {
+                    let probe_started = Instant::now();
+                    let available = self.read(&direct).is_some();
+                    if self.trace.is_some() {
+                        self.work.module_probe_ms += probe_started.elapsed().as_secs_f64() * 1000.0;
+                        self.work.module_probes += 1;
                     }
-                    for reference in &mut index.reference {
-                        reference.conditional = true;
+                    if available {
+                        direct
+                    } else {
+                        container.join(&declaration.name).join("mod.rs")
                     }
-                    for import in &mut index.import {
-                        import.conditional = true;
-                    }
+                });
+                if !path.starts_with(&self.workspace) {
+                    self.pending_module
+                        .insert((package.into(), nested), (target, declaration.conditional));
+                    continue;
+                }
+                children.push(ModuleStep::Load(target, nested.clone()));
+                if declaration.conditional {
+                    children.push(ModuleStep::Conditional(nested));
                 }
             }
+            pending.extend(children.into_iter().rev());
         }
         Ok(())
     }
@@ -531,7 +536,7 @@ impl DeclarationResolver {
     fn register_root(&mut self, package: &str, root: PathBuf) -> Result<()> {
         let root = normalize(&root);
         if root.starts_with(&self.workspace) {
-            self.load_rust(&root, package, &[], 0)?;
+            self.load_rust(&root, package, &[])?;
         } else {
             self.pending_module
                 .insert((package.into(), Vec::new()), (root, false));
@@ -1432,7 +1437,7 @@ impl DeclarationResolver {
                 .pending_module
                 .remove(&(package.into(), module.to_vec()))
             {
-                if let Err(error) = self.load_rust(&target, package, module, depth) {
+                if let Err(error) = self.load_rust(&target, package, module) {
                     self.package.entry(package.into()).or_default().incomplete = true;
                     return unverified(&format!("module source cannot be indexed: {error:#}"));
                 }

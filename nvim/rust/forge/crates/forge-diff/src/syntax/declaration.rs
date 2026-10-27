@@ -54,11 +54,8 @@ impl DeclarationOverview {
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let tree = parser.parse(text, None).ok_or(SyntaxError::Cancelled)?;
         let mut comment = Vec::new();
-        let mut pending = vec![(tree.root_node(), 0)];
-        while let Some((node, depth)) = pending.pop() {
-            if depth > 128 {
-                return Err(SyntaxError::CaptureLimit);
-            }
+        let mut pending = vec![tree.root_node()];
+        while let Some(node) = pending.pop() {
             if node.kind().contains("comment") {
                 comment.push(DeclarationComment {
                     position: DeclarationPosition {
@@ -69,10 +66,7 @@ impl DeclarationOverview {
                 });
             } else {
                 let mut cursor = node.walk();
-                pending.extend(
-                    node.named_children(&mut cursor)
-                        .map(|child| (child, depth + 1)),
-                );
+                pending.extend(node.named_children(&mut cursor));
             }
         }
         comment.sort_unstable_by_key(|comment| (comment.position.line, comment.position.column));
@@ -373,17 +367,14 @@ impl DeclarationOverview {
         Ok(DeclarationPresentation { text, source })
     }
 
-    /// Canonicalize declarations with a bounded line width without modifying source files.
+    /// Canonicalize declarations using a preferred line width without modifying source files.
+    /// Zero uses one column. Indivisible syntax and literal text may exceed the preference.
     pub fn format_with_width(
         path: &str,
         overview: &str,
         line_width: usize,
     ) -> Result<String, SyntaxError> {
-        if !(40..=240).contains(&line_width) {
-            return Err(SyntaxError::Query(
-                "declaration line width must be between 40 and 240".into(),
-            ));
-        }
+        let line_width = line_width.max(1);
         Self::parse(path, overview)?;
         if ConfigurationFormat::for_path(path).is_some() {
             return Ok(overview.to_owned());

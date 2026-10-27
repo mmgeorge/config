@@ -173,7 +173,7 @@ pub(super) fn rows(flows: &[DesignFlow]) -> Vec<FlowRow> {
                 kind: FlowRowKind::Narrative,
             });
         }
-        for text in std::iter::once(format!("### {}", flow.title))
+        for text in std::iter::once(format!("### {}", label_text(&flow.title)))
             .chain(std::iter::once(String::new()))
             .chain(flow.description.split('\n').map(str::to_owned))
             .chain(std::iter::once(String::new()))
@@ -187,7 +187,7 @@ pub(super) fn rows(flows: &[DesignFlow]) -> Vec<FlowRow> {
             text: "```text".into(),
             kind: FlowRowKind::Fence,
         });
-        let mut diagram = vec![format!("On {}", flow.trigger)];
+        let mut diagram = vec![format!("On {}", label_text(&flow.trigger))];
         append_steps(&flow.steps, &mut diagram);
         output.extend(diagram.into_iter().map(|text| FlowRow {
             text,
@@ -207,7 +207,7 @@ pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
     for flow in flows {
         validate_label(&flow.title)?;
         ensure!(
-            titles.insert(&flow.title),
+            titles.insert(label_text(&flow.title)),
             "duplicate plan flow title: {}",
             flow.title
         );
@@ -242,14 +242,14 @@ pub(super) fn validate(flows: &[DesignFlow]) -> Result<()> {
 
 fn validate_label(label: &str) -> Result<()> {
     ensure!(
-        !label.trim().is_empty() && label.trim() == label && !label.chars().any(char::is_control),
-        "plan flow labels must be nonempty, unpadded single lines"
-    );
-    ensure!(
-        !label.contains('`'),
-        "plan flow labels must use plain text without backticks"
+        !label.trim().is_empty(),
+        "plan flow labels must be nonempty"
     );
     Ok(())
+}
+
+fn label_text(label: &str) -> String {
+    label.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Produces canonical Markdown shared by review, section reads, and revision diffs.
@@ -278,14 +278,22 @@ fn append_steps(steps: &[DesignFlowStep], rows: &mut Vec<String>) {
     while let Some(item) = pending.pop() {
         match item {
             RenderItem::Step(step, prefix, marker) => {
-                let mut line = format!("{prefix}{marker}{}", step.action);
+                let mut line = format!("{prefix}{marker}{}", label_text(&step.action));
                 if let [effect] = step.effects.as_slice() {
-                    line.push_str(&format!(" ┄▶ {} {}", effect.change, effect.target));
+                    line.push_str(&format!(
+                        " ┄▶ {} {}",
+                        label_text(&effect.change),
+                        label_text(&effect.target)
+                    ));
                 }
                 rows.push(line);
                 if step.effects.len() != 1 {
                     for effect in &step.effects {
-                        rows.push(format!("{prefix}  ┄▶ {} {}", effect.change, effect.target));
+                        rows.push(format!(
+                            "{prefix}  ┄▶ {} {}",
+                            label_text(&effect.change),
+                            label_text(&effect.target)
+                        ));
                     }
                 }
                 for (index, branch) in step.branches.iter().enumerate().rev() {
@@ -300,7 +308,7 @@ fn append_steps(steps: &[DesignFlowStep], rows: &mut Vec<String>) {
                 rows.push(format!(
                     "{prefix}{} if {}",
                     if last { "└─" } else { "├─" },
-                    branch.condition
+                    label_text(&branch.condition)
                 ));
                 let prefix = format!("{prefix}{}", if last { "   " } else { "│  " });
                 for (index, step) in branch.steps.iter().enumerate().rev() {
@@ -410,7 +418,7 @@ mod tests {
         invalid.steps.clear();
         assert!(validate(&[invalid]).is_err());
         let mut invalid = flow();
-        invalid.steps[0].action = "bad\nlabel".into();
+        invalid.steps[0].action = " \n\t ".into();
         assert!(validate(&[invalid]).is_err());
         let mut invalid = flow();
         invalid.steps[0].branches.push(DesignFlowBranch {
@@ -424,6 +432,71 @@ mod tests {
             steps: vec![],
         });
         assert!(validate(&[invalid]).is_err());
+    }
+
+    #[test]
+    fn label_presentation_is_normalized_without_rejecting_or_rewriting_content() {
+        let mut flow = flow();
+        let action = format!("inspect_{}", "x".repeat(8193));
+        flow.title = "  Collect\n shields \t".into();
+        flow.trigger = " `pickup`\r\n collected ".into();
+        flow.steps[0].action = format!("\t{action}\n");
+        flow.steps[0].effects[0].target = " `PlayerAbilities` ".into();
+        flow.steps[0].effects[0].change = " grant\nshield\tcharges to ".into();
+        flow.steps[0].branches.push(DesignFlowBranch {
+            condition: " shield\nis available ".into(),
+            steps: vec![DesignFlowStep {
+                action: " update_hud\n ".into(),
+                effects: vec![
+                    DesignFlowEffect {
+                        target: " first\nvalue ".into(),
+                        change: " update ".into(),
+                    },
+                    DesignFlowEffect {
+                        target: " second\tvalue ".into(),
+                        change: " preserve ".into(),
+                    },
+                ],
+                branches: vec![],
+            }],
+        });
+        validate(std::slice::from_ref(&flow)).unwrap();
+        let rendered = rows(std::slice::from_ref(&flow));
+        assert!(
+            rendered
+                .iter()
+                .all(|row| !row.text.contains(['\n', '\r', '\t']))
+        );
+        assert_eq!(rendered[0].text, "### Collect shields");
+        let rendered = text(std::slice::from_ref(&flow));
+        for expected in [
+            "On `pickup` collected",
+            "grant shield charges to `PlayerAbilities`",
+            "if shield is available",
+            "update first value",
+            "preserve second value",
+            &action,
+        ] {
+            assert!(rendered.contains(expected), "missing {expected}");
+        }
+        let mut duplicate = flow.clone();
+        duplicate.title = "Collect shields".into();
+        assert!(validate(&[flow.clone(), duplicate]).is_err());
+
+        let workspace = tempfile::tempdir().unwrap();
+        let store =
+            super::super::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        let mut document = super::super::document::test_fixture("labels", "Flow presentation");
+        let design = document.design.get_or_insert_with(Default::default);
+        design.document.flows = vec![flow];
+        store
+            .write_working_document("session", "labels", &document)
+            .unwrap();
+        let reopened = store.read_working_document("session", "labels").unwrap();
+        assert_eq!(reopened, document);
+        let projected = super::super::design_review::render(&reopened).unwrap();
+        assert!(projected.markdown.contains(&action));
+        assert!(projected.markdown.contains("On `pickup` collected"));
     }
 
     #[test]

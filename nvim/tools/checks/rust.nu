@@ -72,10 +72,13 @@ def main [action: string] {
       )
     }
     let started = date now
-    let result = ^cargo ...$arguments | complete
+    let result = (
+      ^cargo ...$arguments
+      | tee --stderr { lines | each {|line| print --stderr $line } | ignore }
+      | tee { lines | each {|line| print $line } | ignore }
+      | complete
+    )
     let elapsed = ((date now) - $started) / 1ms | into int
-    print --no-newline $result.stdout
-    print --stderr --no-newline $result.stderr
     let ran = $test == "" or ($result.stdout | lines | any {|line|
       ($line | str trim) == $"test ($test) ... ok"
     })

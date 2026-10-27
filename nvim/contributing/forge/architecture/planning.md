@@ -16,6 +16,22 @@ individual deliveries rather than total plan size, and an oversized first record
 progress. Patch confirmations retain the complete applied diff. Cache eviction controls retained
 reuse without rejecting explicit reads, declaration analysis, edits, or reviews.
 
+Harness owns declaration spacing, indentation style, table layout, and wrapping.
+Agents supply complete content and syntactic nesting rather than preformatted
+display rows. `declaration_line_width` is a preferred formatting width, not a
+validation constraint. Zero requests one column, and indivisible syntax, literals,
+and code examples remain complete even when wider than the preference. Source
+syntax and document integrity checks remain independent of presentation choices.
+Flow labels accept padding, line breaks, tabs, and backticks. The renderer joins
+label whitespace for diagram rows without rewriting the saved fields. Validation
+requires meaningful labels and distinct display titles, not agent-authored layout.
+
+Baseline validation reparses combined declarations and reference metadata, whose
+native parser recovery tree can be deeper than the original source tree.
+Protected-region scanning must retain all literal and comment regions rather
+than rejecting that recovery depth. Plan flow and ownership diagrams use work
+lists without a nesting cutoff and preserve navigation anchors for every row.
+
 PlanReview opens with one compact block snapshot. Modified files contribute changed
 chunks and enclosing declaration boundaries with shared compact diff presentation.
 Subsequent revisions send disjoint block patches and sparse source-anchor edits.
@@ -82,6 +98,10 @@ and proposal navigation. The shared Tree-sitter `DeclarationIndex` extracts scop
 imports, exports, generics, and signature references without examining implementation bodies.
 Proposed declarations replace their baseline files. Deleted lines use a separate baseline graph.
 Uncaptured and removed files cannot enter this resolver through filesystem discovery.
+
+Rust module loading uses a work list and the indexed-file map to terminate cycles,
+not a module-depth limit. Conditional modules mark their loaded descendants only
+after traversal, and missing or unreadable sources retain incomplete evidence.
 
 Callable behavior is stored as a tagged `FunctionBehavior`, either `Algorithm` or `Change`.
 New functions and methods require a nonempty `Algorithm` at submission. Existing callables use

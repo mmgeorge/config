@@ -65,7 +65,7 @@ impl WidthProfile {
                 });
             }
             column += cells;
-            if column + suffix_cells <= self.columns {
+            if suffix_cells <= self.columns.saturating_sub(column) {
                 suffix_offset = offset + cluster.len();
             }
         }
@@ -169,16 +169,8 @@ impl WidthProfile {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
-        if !(1..=4096).contains(&self.columns)
-            || !(1..=256).contains(&self.tabstop)
-            || self.cell_width.len() > 256
-            || self.variable_tabstop.len() > 256
-            || self
-                .variable_tabstop
-                .iter()
-                .any(|width| !(1..=256).contains(width))
-        {
-            return Err(ContractError("width profile exceeds layout limits"));
+        if self.columns == 0 || self.tabstop == 0 || self.variable_tabstop.contains(&0) {
+            return Err(ContractError("columns and tab stops must be positive"));
         }
         let mut previous = None;
         for range in &self.cell_width {
@@ -215,10 +207,14 @@ impl WidthProfile {
             }
         };
         for (offset, character) in text.char_indices() {
+            let codepoint = u32::from(character);
+            let index = self
+                .cell_width
+                .partition_point(|range| range.last < codepoint);
             let custom = self
                 .cell_width
-                .iter()
-                .find(|range| (range.first..=range.last).contains(&(character as u32)));
+                .get(index)
+                .filter(|range| range.first <= codepoint);
             if character == '\t' || character.is_control() || custom.is_some() {
                 column = column
                     .checked_add(plain(&text[segment_start..offset], segment_start == 0))
@@ -245,24 +241,127 @@ impl WidthProfile {
     }
 
     fn tab_cells(&self, column: usize) -> usize {
-        let mut stop = 0;
+        let mut remaining = column;
         for width in &self.variable_tabstop {
-            stop += width;
-            if stop > column {
-                return stop - column;
+            if *width > remaining {
+                return *width - remaining;
             }
+            remaining -= width;
         }
         let width = self
             .variable_tabstop
             .last()
             .copied()
             .unwrap_or(self.tabstop);
-        width - (column - stop) % width
+        width - remaining % width
     }
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn width_profiles_preserve_large_layouts() {
+        let source = "x".repeat(8193);
+        for columns in [1, 80, 4097, 16384, usize::MAX] {
+            let profile = super::WidthProfile {
+                columns,
+                ..Default::default()
+            };
+            assert_eq!(profile.cells(&source, 0).unwrap(), source.len());
+            let rows = profile.wrap_plain(&source, 0).unwrap();
+            assert_eq!(rows.concat(), source);
+            assert!(rows.iter().all(|row| row.len() <= columns));
+            assert_eq!(
+                profile.wrapped_prefix(&source, rows.len(), 0).unwrap(),
+                (source.len(), rows.len())
+            );
+        }
+
+        let profile = super::WidthProfile {
+            columns: 8192,
+            tabstop: 1024,
+            variable_tabstop: vec![512; 1024],
+            cell_width: (0..1024)
+                .map(|index| super::CellWidthRange {
+                    first: 0x400 + index,
+                    last: 0x400 + index,
+                    cells: 2,
+                })
+                .collect(),
+            ..Default::default()
+        };
+        let encoded = serde_json::to_vec(&profile).unwrap();
+        let restored: super::WidthProfile = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(restored, profile);
+        assert_eq!(restored.cells("\t", 0).unwrap(), 512);
+        assert_eq!(restored.cells("\t", 512 * 1023 + 1).unwrap(), 511);
+        assert_eq!(restored.cells("\t", 512 * 1024 + 1).unwrap(), 511);
+        let last = char::from_u32(0x7ff).unwrap().to_string();
+        assert_eq!(restored.cells(&last, 0).unwrap(), 2);
+        assert_eq!(restored.cells("abc", 0).unwrap(), 3);
+
+        let mut profile = super::WidthProfile {
+            columns: usize::MAX,
+            tabstop: usize::MAX,
+            ..Default::default()
+        };
+        assert_eq!(profile.cells("\t", 0).unwrap(), usize::MAX);
+        assert_eq!(profile.cells("\t", usize::MAX - 1).unwrap(), 1);
+        assert_eq!(profile.clip_plain("\t").unwrap(), "\t");
+        assert_eq!(profile.wrap_plain("\t", 0).unwrap(), vec!["\t"]);
+        assert_eq!(profile.wrapped_prefix("\t", 1, 0).unwrap(), (1, 1));
+        assert_eq!(
+            profile.cells("\t\t", 0).unwrap_err().0,
+            "display width overflow"
+        );
+        profile.variable_tabstop = vec![usize::MAX - 1, 2];
+        assert_eq!(profile.cells("\t", 0).unwrap(), usize::MAX - 1);
+        assert_eq!(
+            profile.cells("\t", usize::MAX - 1).unwrap_err().0,
+            "display width overflow"
+        );
+    }
+
+    #[test]
+    fn width_profiles_reject_invalid_geometry() {
+        for profile in [
+            super::WidthProfile {
+                columns: 0,
+                ..Default::default()
+            },
+            super::WidthProfile {
+                tabstop: 0,
+                ..Default::default()
+            },
+            super::WidthProfile {
+                variable_tabstop: vec![1, 0],
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                profile.validate().unwrap_err().0,
+                "columns and tab stops must be positive"
+            );
+        }
+        for ranges in [
+            vec![(2, 1, 1)],
+            vec![(0x110000, 0x110000, 1)],
+            vec![(1, 1, 0)],
+            vec![(1, 1, 3)],
+            vec![(1, 2, 1), (2, 3, 2)],
+            vec![(3, 4, 1), (1, 2, 2)],
+        ] {
+            let profile = super::WidthProfile {
+                cell_width: ranges
+                    .into_iter()
+                    .map(|(first, last, cells)| super::CellWidthRange { first, last, cells })
+                    .collect(),
+                ..Default::default()
+            };
+            assert!(profile.validate().is_err());
+        }
+    }
+
     #[test]
     fn clipped_previews_preserve_graphemes_tabs_and_unbroken_prefixes() {
         let mut profile = super::WidthProfile {

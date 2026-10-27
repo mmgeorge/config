@@ -77,19 +77,13 @@ impl DeclarationCalls {
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
         let mut protected = Vec::new();
-        let mut work = vec![(tree.root_node(), 0)];
-        while let Some((node, depth)) = work.pop() {
-            if depth > 128 {
-                return Err(SyntaxError::CaptureLimit);
-            }
+        let mut work = vec![tree.root_node()];
+        while let Some(node) = work.pop() {
             if node.kind().contains("string") || node.kind().contains("comment") {
                 protected.push(node.start_position().row..node.end_position().row + 1);
             } else {
                 let mut cursor = node.walk();
-                work.extend(
-                    node.named_children(&mut cursor)
-                        .map(|child| (child, depth + 1)),
-                );
+                work.extend(node.named_children(&mut cursor));
             }
         }
         protected.sort_unstable_by_key(|region| region.start);
@@ -131,9 +125,9 @@ impl DeclarationCalls {
         declarations: bool,
     ) -> Result<Vec<DeclarationCallable>, SyntaxError> {
         let mut callable = Vec::new();
-        collect(tree.root_node(), source, language, &[], &mut callable, 0)?;
+        collect(tree.root_node(), source, language, &mut callable);
         let mut return_type = HashMap::new();
-        collect_returns(tree.root_node(), source, language, &[], &mut return_type, 0)?;
+        collect_returns(tree.root_node(), source, language, &mut return_type);
         let callable_name = callable
             .iter()
             .map(|function| function.owner.clone())
@@ -148,13 +142,11 @@ impl DeclarationCalls {
                 tree.root_node(),
                 source,
                 language,
-                &[],
                 &return_type,
                 &callable_name,
                 &position,
                 &mut callable,
-                0,
-            )?;
+            );
         }
         let mut occurrence = HashMap::<String, usize>::new();
         for function in &mut callable {
@@ -273,203 +265,12 @@ fn collect(
     node: Node<'_>,
     source: &str,
     language: SyntaxLanguage,
-    scope: &[String],
     output: &mut Vec<DeclarationCallable>,
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
-    }
-    let mut nested = scope.to_vec();
-    if let Some(name) = callable_name(node, source) {
-        let mut binding = HashMap::new();
-        if let Some(container) = receiver_owner(node, source) {
-            binding.insert("self".into(), Some(container.clone()));
-            if matches!(node.kind(), "method_definition" | "arrow_function") {
-                binding.insert("this".into(), Some(container));
-            }
-        }
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            parameter_types(parameters, source, &mut binding);
-        }
-        lua_annotations(node, source, &mut binding);
-        let mut binding_position = std::collections::BTreeMap::new();
-        let mut parameter = node
-            .child_by_field_name("parameters")
-            .into_iter()
-            .collect::<Vec<_>>();
-        while let Some(parameter_node) = parameter.pop() {
-            let name = contents(parameter_node, source);
-            if matches!(parameter_node.kind(), "identifier" | "self") && binding.contains_key(name)
-            {
-                let position = parameter_node.start_position();
-                binding_position
-                    .entry(name.to_owned())
-                    .or_insert(super::DeclarationPosition {
-                        line: position.row as u32 + 1,
-                        column: position.column as u32,
-                    });
-            } else if parameter_node.kind() != "type_identifier" {
-                let mut children = parameter_node.walk();
-                parameter.extend(parameter_node.named_children(&mut children));
-            }
-        }
-        let name_node = node.child_by_field_name("name").unwrap_or(node);
-        let end = node
-            .child_by_field_name("body")
-            .map(|body| body.start_position().row)
-            .unwrap_or(node.end_position().row);
-        let mut heading = node.start_position().row;
-        let mut preceding = node.prev_named_sibling();
-        while let Some(previous) = preceding {
-            if !matches!(
-                previous.kind(),
-                "attribute_item" | "line_comment" | "block_comment" | "comment"
-            ) || previous.end_position().row + 1 < heading
-            {
-                break;
-            }
-            heading = previous.start_position().row;
-            preceding = previous.prev_named_sibling();
-        }
-        output.push(DeclarationCallable {
-            owner: owner(scope, &name, language),
-            line: name_node.start_position().row as u32 + 1,
-            heading_line: heading as u32 + 1,
-            column: name_node.start_position().column as u32,
-            end_line: end as u32 + 1,
-            return_type: None,
-            call: Vec::new(),
-            binding: binding.into_iter().collect(),
-            binding_position,
-        });
-        nested.push(name);
-    } else if let Some(name) = container(node, source) {
-        nested.push(name);
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect(child, source, language, &nested, output, depth + 1)?;
-    }
-    Ok(())
-}
-
-fn collect_returns(
-    node: Node<'_>,
-    source: &str,
-    language: SyntaxLanguage,
-    scope: &[String],
-    output: &mut HashMap<String, Option<String>>,
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
-    }
-    let mut nested = scope.to_vec();
-    if let Some(name) = callable_name(node, source) {
-        if let Some(value) = node.child_by_field_name("return_type") {
-            let value = contents(value, source)
-                .trim_start_matches(':')
-                .trim()
-                .split_inclusive(|character: char| !character.is_alphanumeric() && character != '_')
-                .map(|token| {
-                    let end = token
-                        .find(|character: char| !character.is_alphanumeric() && character != '_')
-                        .unwrap_or(token.len());
-                    if &token[..end] == "Self" {
-                        format!(
-                            "{}{}",
-                            scope.last().map(String::as_str).unwrap_or("Self"),
-                            &token[end..]
-                        )
-                    } else {
-                        token.into()
-                    }
-                })
-                .collect::<String>();
-            output
-                .entry(owner(scope, &name, language))
-                .and_modify(|previous| {
-                    if previous.as_ref() != Some(&value) {
-                        *previous = None;
-                    }
-                })
-                .or_insert(Some(value.clone()));
-            if !scope.is_empty() {
-                output
-                    .entry(name.clone())
-                    .and_modify(|previous| {
-                        if previous.as_ref() != Some(&value) {
-                            *previous = None;
-                        }
-                    })
-                    .or_insert(Some(value));
-            }
-        }
-        nested.push(name);
-    } else if let Some(name) = container(node, source).or_else(|| {
-        matches!(node.kind(), "struct_item")
-            .then(|| {
-                node.child_by_field_name("name")
-                    .map(|name| contents(name, source).to_owned())
-            })
-            .flatten()
-    }) {
-        nested.push(name);
-    }
-    if matches!(
-        node.kind(),
-        "field_declaration" | "public_field_definition" | "property_signature"
-    ) {
-        if let (Some(name), Some(value), Some(owner)) = (
-            node.child_by_field_name("name"),
-            node.child_by_field_name("type"),
-            scope.last(),
-        ) {
-            output.insert(
-                format!("field:{owner}.{}", contents(name, source)),
-                base_type(contents(value, source)),
-            );
-        }
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        collect_returns(child, source, language, &nested, output, depth + 1)?;
-    }
-    Ok(())
-}
-
-fn populate(
-    node: Node<'_>,
-    source: &str,
-    language: SyntaxLanguage,
-    scope: &[String],
-    returns: &HashMap<String, Option<String>>,
-    callable: &std::collections::HashSet<String>,
-    position: &HashMap<(u32, u32), usize>,
-    output: &mut [DeclarationCallable],
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
-    }
-    let mut nested = scope.to_vec();
-    if let Some(name) = callable_name(node, source) {
-        let line = node
-            .child_by_field_name("name")
-            .unwrap_or(node)
-            .start_position()
-            .row as u32
-            + 1;
-        let column = node
-            .child_by_field_name("name")
-            .unwrap_or(node)
-            .start_position()
-            .column as u32;
-        if let Some(item) = position
-            .get(&(line, column))
-            .and_then(|index| output.get_mut(*index))
-        {
+) {
+    let mut pending = vec![(node, Vec::<String>::new())];
+    while let Some((node, scope)) = pending.pop() {
+        let mut nested = scope.to_vec();
+        if let Some(name) = callable_name(node, source) {
             let mut binding = HashMap::new();
             if let Some(container) = receiver_owner(node, source) {
                 binding.insert("self".into(), Some(container.clone()));
@@ -481,38 +282,221 @@ fn populate(
                 parameter_types(parameters, source, &mut binding);
             }
             lua_annotations(node, source, &mut binding);
-            if let Some(body) = node.child_by_field_name("body") {
-                calls(
-                    body,
-                    source,
-                    language,
-                    returns,
-                    callable,
-                    &mut binding,
-                    &mut item.call,
-                    0,
-                )?;
+            let mut binding_position = std::collections::BTreeMap::new();
+            let mut parameter = node
+                .child_by_field_name("parameters")
+                .into_iter()
+                .collect::<Vec<_>>();
+            while let Some(parameter_node) = parameter.pop() {
+                let name = contents(parameter_node, source);
+                if matches!(parameter_node.kind(), "identifier" | "self")
+                    && binding.contains_key(name)
+                {
+                    let position = parameter_node.start_position();
+                    binding_position
+                        .entry(name.to_owned())
+                        .or_insert(super::DeclarationPosition {
+                            line: position.row as u32 + 1,
+                            column: position.column as u32,
+                        });
+                } else if parameter_node.kind() != "type_identifier" {
+                    let mut children = parameter_node.walk();
+                    parameter.extend(parameter_node.named_children(&mut children));
+                }
+            }
+            let name_node = node.child_by_field_name("name").unwrap_or(node);
+            let end = node
+                .child_by_field_name("body")
+                .map(|body| body.start_position().row)
+                .unwrap_or(node.end_position().row);
+            let mut heading = node.start_position().row;
+            let mut preceding = node.prev_named_sibling();
+            while let Some(previous) = preceding {
+                if !matches!(
+                    previous.kind(),
+                    "attribute_item" | "line_comment" | "block_comment" | "comment"
+                ) || previous.end_position().row + 1 < heading
+                {
+                    break;
+                }
+                heading = previous.start_position().row;
+                preceding = previous.prev_named_sibling();
+            }
+            output.push(DeclarationCallable {
+                owner: owner(&scope, &name, language),
+                line: name_node.start_position().row as u32 + 1,
+                heading_line: heading as u32 + 1,
+                column: name_node.start_position().column as u32,
+                end_line: end as u32 + 1,
+                return_type: None,
+                call: Vec::new(),
+                binding: binding.into_iter().collect(),
+                binding_position,
+            });
+            nested.push(name);
+        } else if let Some(name) = container(node, source) {
+            nested.push(name);
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|child| (child, nested.clone())),
+        );
+    }
+}
+
+fn collect_returns(
+    node: Node<'_>,
+    source: &str,
+    language: SyntaxLanguage,
+    output: &mut HashMap<String, Option<String>>,
+) {
+    let mut pending = vec![(node, Vec::<String>::new())];
+    while let Some((node, scope)) = pending.pop() {
+        let mut nested = scope.to_vec();
+        if let Some(name) = callable_name(node, source) {
+            if let Some(value) = node.child_by_field_name("return_type") {
+                let value = contents(value, source)
+                    .trim_start_matches(':')
+                    .trim()
+                    .split_inclusive(|character: char| {
+                        !character.is_alphanumeric() && character != '_'
+                    })
+                    .map(|token| {
+                        let end = token
+                            .find(|character: char| {
+                                !character.is_alphanumeric() && character != '_'
+                            })
+                            .unwrap_or(token.len());
+                        if &token[..end] == "Self" {
+                            format!(
+                                "{}{}",
+                                scope.last().map(String::as_str).unwrap_or("Self"),
+                                &token[end..]
+                            )
+                        } else {
+                            token.into()
+                        }
+                    })
+                    .collect::<String>();
+                output
+                    .entry(owner(&scope, &name, language))
+                    .and_modify(|previous| {
+                        if previous.as_ref() != Some(&value) {
+                            *previous = None;
+                        }
+                    })
+                    .or_insert(Some(value.clone()));
+                if !scope.is_empty() {
+                    output
+                        .entry(name.clone())
+                        .and_modify(|previous| {
+                            if previous.as_ref() != Some(&value) {
+                                *previous = None;
+                            }
+                        })
+                        .or_insert(Some(value));
+                }
+            }
+            nested.push(name);
+        } else if let Some(name) = container(node, source).or_else(|| {
+            matches!(node.kind(), "struct_item")
+                .then(|| {
+                    node.child_by_field_name("name")
+                        .map(|name| contents(name, source).to_owned())
+                })
+                .flatten()
+        }) {
+            nested.push(name);
+        }
+        if matches!(
+            node.kind(),
+            "field_declaration" | "public_field_definition" | "property_signature"
+        ) {
+            if let (Some(name), Some(value), Some(owner)) = (
+                node.child_by_field_name("name"),
+                node.child_by_field_name("type"),
+                scope.last(),
+            ) {
+                output.insert(
+                    format!("field:{owner}.{}", contents(name, source)),
+                    base_type(contents(value, source)),
+                );
             }
         }
-        nested.push(name);
-    } else if let Some(name) = container(node, source) {
-        nested.push(name);
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|child| (child, nested.clone())),
+        );
     }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        populate(
-            child,
-            source,
-            language,
-            &nested,
-            returns,
-            callable,
-            position,
-            output,
-            depth + 1,
-        )?;
+}
+
+fn populate(
+    node: Node<'_>,
+    source: &str,
+    language: SyntaxLanguage,
+    returns: &HashMap<String, Option<String>>,
+    callable: &std::collections::HashSet<String>,
+    position: &HashMap<(u32, u32), usize>,
+    output: &mut [DeclarationCallable],
+) {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if callable_name(node, source).is_some() {
+            let line = node
+                .child_by_field_name("name")
+                .unwrap_or(node)
+                .start_position()
+                .row as u32
+                + 1;
+            let column = node
+                .child_by_field_name("name")
+                .unwrap_or(node)
+                .start_position()
+                .column as u32;
+            if let Some(item) = position
+                .get(&(line, column))
+                .and_then(|index| output.get_mut(*index))
+            {
+                let mut binding = HashMap::new();
+                if let Some(container) = receiver_owner(node, source) {
+                    binding.insert("self".into(), Some(container.clone()));
+                    if matches!(node.kind(), "method_definition" | "arrow_function") {
+                        binding.insert("this".into(), Some(container));
+                    }
+                }
+                if let Some(parameters) = node.child_by_field_name("parameters") {
+                    parameter_types(parameters, source, &mut binding);
+                }
+                lua_annotations(node, source, &mut binding);
+                if let Some(body) = node.child_by_field_name("body") {
+                    calls(
+                        body,
+                        source,
+                        language,
+                        returns,
+                        callable,
+                        &mut binding,
+                        &mut item.call,
+                    );
+                }
+            }
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev(),
+        );
     }
-    Ok(())
 }
 
 fn receiver_owner(node: Node<'_>, source: &str) -> Option<String> {
@@ -649,62 +633,128 @@ fn expression_type(
     returns: &HashMap<String, Option<String>>,
     binding: &HashMap<String, Option<String>>,
 ) -> Option<String> {
-    match node.kind() {
-        "identifier" | "self" | "this" => binding
-            .get(contents(node, source))
-            .and_then(|value| value.as_deref())
-            .and_then(base_type),
-        "struct_expression" | "new_expression" | "table_constructor" => node
-            .child_by_field_name("name")
-            .or_else(|| node.child_by_field_name("constructor"))
-            .and_then(|value| base_type(contents(value, source))),
-        "call_expression" | "function_call" => {
-            let function = node
-                .child_by_field_name("function")
-                .or_else(|| node.child_by_field_name("name"))?;
-            let name = call_name(function, source, returns, binding);
-            returns
-                .get(&name)
-                .cloned()
-                .flatten()
-                .and_then(|value| base_type(&value))
-        }
-        "reference_expression" | "parenthesized_expression" | "await_expression" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor)
-                .next()
-                .and_then(|value| expression_type(value, source, returns, binding))
-        }
-        "try_expression" => {
-            let mut cursor = node.walk();
-            let value = node.named_children(&mut cursor).next()?;
-            let function = value.child_by_field_name("function")?;
-            let result = returns
-                .get(&call_name(function, source, returns, binding))
-                .cloned()
-                .flatten()?;
-            let inner = result
-                .split_once('<')?
-                .1
-                .split(',')
-                .next()?
-                .trim_end_matches('>');
-            base_type(inner)
-        }
-        "field_expression"
-        | "member_expression"
-        | "dot_index_expression"
-        | "subscript_expression"
-        | "bracket_index_expression" => {
-            let (receiver, field) = member_access(node, source)?;
-            let receiver = expression_type(receiver, source, returns, binding)?;
-            returns
-                .get(&format!("field:{receiver}.{field}"))
-                .cloned()
-                .flatten()
-        }
-        _ => None,
+    enum TypeStep<'tree> {
+        Expression(Node<'tree>),
+        Function(Node<'tree>),
+        Member(Node<'tree>, String, bool),
+        Field(String),
+        Return,
+        TryReturn,
     }
+    let mut pending = vec![TypeStep::Expression(node)];
+    let mut resolved = None;
+    while let Some(step) = pending.pop() {
+        match step {
+            TypeStep::Field(field) => {
+                resolved = resolved.and_then(|receiver| {
+                    returns
+                        .get(&format!("field:{receiver}.{field}"))
+                        .cloned()
+                        .flatten()
+                });
+            }
+            TypeStep::Return => {
+                resolved = resolved
+                    .and_then(|name| returns.get(&name).cloned().flatten())
+                    .and_then(|value| base_type(&value));
+            }
+            TypeStep::TryReturn => {
+                resolved = resolved
+                    .and_then(|name| returns.get(&name).cloned().flatten())
+                    .and_then(|result| {
+                        let inner = result
+                            .split_once('<')?
+                            .1
+                            .split(',')
+                            .next()?
+                            .trim_end_matches('>');
+                        base_type(inner)
+                    });
+            }
+            TypeStep::Member(receiver, member, rust) => {
+                resolved = Some(match resolved {
+                    Some(value) => format!("{value}{}{member}", if rust { "::" } else { "." }),
+                    None => format!("{}.{member}", receiver_name(receiver, source)),
+                });
+            }
+            TypeStep::Function(function) => {
+                if function.kind() == "generic_function"
+                    && let Some(function) = function.child_by_field_name("function")
+                {
+                    pending.push(TypeStep::Function(function));
+                } else if let Some((receiver, member)) = member_access(function, source) {
+                    pending.push(TypeStep::Member(
+                        receiver,
+                        member,
+                        function.kind() == "field_expression",
+                    ));
+                    pending.push(TypeStep::Expression(receiver));
+                } else {
+                    resolved = Some(unqualified_call_name(function, source));
+                }
+            }
+            TypeStep::Expression(node) => match node.kind() {
+                "identifier" | "self" | "this" => {
+                    resolved = binding
+                        .get(contents(node, source))
+                        .and_then(|value| value.as_deref())
+                        .and_then(base_type)
+                }
+                "struct_expression" | "new_expression" | "table_constructor" => {
+                    resolved = node
+                        .child_by_field_name("name")
+                        .or_else(|| node.child_by_field_name("constructor"))
+                        .and_then(|value| base_type(contents(value, source)))
+                }
+                "call_expression" | "function_call" => {
+                    if let Some(function) = node
+                        .child_by_field_name("function")
+                        .or_else(|| node.child_by_field_name("name"))
+                    {
+                        pending.push(TypeStep::Return);
+                        pending.push(TypeStep::Function(function));
+                    } else {
+                        resolved = None;
+                    }
+                }
+                "reference_expression" | "parenthesized_expression" | "await_expression" => {
+                    let mut cursor = node.walk();
+                    if let Some(value) = node.named_children(&mut cursor).next() {
+                        pending.push(TypeStep::Expression(value));
+                    } else {
+                        resolved = None;
+                    }
+                }
+                "try_expression" => {
+                    let mut cursor = node.walk();
+                    if let Some(function) = node
+                        .named_children(&mut cursor)
+                        .next()
+                        .and_then(|value| value.child_by_field_name("function"))
+                    {
+                        pending.push(TypeStep::TryReturn);
+                        pending.push(TypeStep::Function(function));
+                    } else {
+                        resolved = None;
+                    }
+                }
+                "field_expression"
+                | "member_expression"
+                | "dot_index_expression"
+                | "subscript_expression"
+                | "bracket_index_expression" => {
+                    if let Some((receiver, field)) = member_access(node, source) {
+                        pending.push(TypeStep::Field(field));
+                        pending.push(TypeStep::Expression(receiver));
+                    } else {
+                        resolved = None;
+                    }
+                }
+                _ => resolved = None,
+            },
+        }
+    }
+    resolved
 }
 
 fn member_access<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree>, String)> {
@@ -756,15 +806,15 @@ fn member_access<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree>,
 }
 
 fn call_name(
-    function: Node<'_>,
+    mut function: Node<'_>,
     source: &str,
     returns: &HashMap<String, Option<String>>,
     binding: &HashMap<String, Option<String>>,
 ) -> String {
-    if function.kind() == "generic_function" {
-        if let Some(function) = function.child_by_field_name("function") {
-            return call_name(function, source, returns, binding);
-        }
+    while function.kind() == "generic_function"
+        && let Some(inner) = function.child_by_field_name("function")
+    {
+        function = inner;
     }
     if let Some((receiver, member)) = member_access(function, source) {
         if let Some(value) = expression_type(receiver, source, returns, binding) {
@@ -780,6 +830,10 @@ fn call_name(
         let receiver = receiver_name(receiver, source);
         return format!("{receiver}.{member}");
     }
+    unqualified_call_name(function, source)
+}
+
+fn unqualified_call_name(function: Node<'_>, source: &str) -> String {
     let name = contents(function, source)
         .chars()
         .filter(|character| !character.is_whitespace())
@@ -794,16 +848,22 @@ fn call_name(
     }
 }
 
-fn receiver_name(node: Node<'_>, source: &str) -> String {
-    if matches!(node.kind(), "identifier" | "self" | "this" | "super") {
-        contents(node, source).into()
-    } else if let Some((receiver, member)) = member_access(node, source) {
-        format!("{}.{member}", receiver_name(receiver, source))
-    } else if !contents(node, source).contains(['\r', '\n']) {
-        contents(node, source).into()
+fn receiver_name(mut node: Node<'_>, source: &str) -> String {
+    let mut member_list = Vec::new();
+    while let Some((receiver, member)) = member_access(node, source) {
+        member_list.push(member);
+        node = receiver;
+    }
+    let mut name = if !contents(node, source).contains(['\r', '\n']) {
+        contents(node, source).to_owned()
     } else {
         "<unresolved>".into()
+    };
+    for member in member_list.into_iter().rev() {
+        name.push('.');
+        name.push_str(&member);
     }
+    name
 }
 
 fn calls(
@@ -814,241 +874,251 @@ fn calls(
     callable: &std::collections::HashSet<String>,
     binding: &mut HashMap<String, Option<String>>,
     output: &mut Vec<DeclarationCall>,
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
+) {
+    enum CallStep<'tree> {
+        Visit(Node<'tree>),
+        Bind(String, Option<String>),
+        Restore(HashMap<String, Option<String>>),
     }
-    if callable_name(node, source).is_some() {
-        return Ok(());
-    }
-    if matches!(node.kind(), "type_arguments" | "type_annotation")
-        || node.parent().is_some_and(|parent| {
-            parent
-                .child_by_field_name("type")
-                .is_some_and(|type_node| type_node.id() == node.id())
-        })
-    {
-        return Ok(());
-    }
-    let boundary = matches!(
-        node.kind(),
-        "block"
-            | "statement_block"
-            | "closure_expression"
-            | "arrow_function"
-            | "function_expression"
-    );
-    let previous = boundary.then(|| binding.clone());
-    if matches!(
-        node.kind(),
-        "closure_expression" | "arrow_function" | "function_expression"
-    ) {
-        if let Some(parameters) = node.child_by_field_name("parameters") {
-            parameter_types(parameters, source, binding);
+    let mut pending = vec![CallStep::Visit(node)];
+    while let Some(step) = pending.pop() {
+        let node = match step {
+            CallStep::Visit(node) => node,
+            CallStep::Bind(name, value) => {
+                binding.insert(name, value);
+                continue;
+            }
+            CallStep::Restore(previous) => {
+                *binding = previous;
+                continue;
+            }
+        };
+        if callable_name(node, source).is_some() {
+            continue;
         }
-    }
-    let pending_binding = if matches!(node.kind(), "let_declaration" | "variable_declarator") {
-        if let Some(name) = node
-            .child_by_field_name("pattern")
-            .or_else(|| node.child_by_field_name("name"))
+        if matches!(node.kind(), "type_arguments" | "type_annotation")
+            || node.parent().is_some_and(|parent| {
+                parent
+                    .child_by_field_name("type")
+                    .is_some_and(|type_node| type_node.id() == node.id())
+            })
         {
-            let value = node
-                .child_by_field_name("type")
-                .and_then(|value| base_type(contents(value, source)))
-                .or_else(|| {
-                    node.child_by_field_name("value")
-                        .and_then(|value| expression_type(value, source, returns, binding))
-                });
-            Some((
-                contents(name, source).trim_start_matches("mut ").to_owned(),
-                value,
-            ))
+            continue;
+        }
+        let boundary = matches!(
+            node.kind(),
+            "block"
+                | "statement_block"
+                | "closure_expression"
+                | "arrow_function"
+                | "function_expression"
+        );
+        let previous = boundary.then(|| binding.clone());
+        if matches!(
+            node.kind(),
+            "closure_expression" | "arrow_function" | "function_expression"
+        ) {
+            if let Some(parameters) = node.child_by_field_name("parameters") {
+                parameter_types(parameters, source, binding);
+            }
+        }
+        let pending_binding = if matches!(node.kind(), "let_declaration" | "variable_declarator") {
+            if let Some(name) = node
+                .child_by_field_name("pattern")
+                .or_else(|| node.child_by_field_name("name"))
+            {
+                let value = node
+                    .child_by_field_name("type")
+                    .and_then(|value| base_type(contents(value, source)))
+                    .or_else(|| {
+                        node.child_by_field_name("value")
+                            .and_then(|value| expression_type(value, source, returns, binding))
+                    });
+                Some((
+                    contents(name, source).trim_start_matches("mut ").to_owned(),
+                    value,
+                ))
+            } else {
+                None
+            }
         } else {
             None
+        };
+        if matches!(
+            node.kind(),
+            "call_expression" | "function_call" | "new_expression"
+        ) {
+            if let Some(function) = node
+                .child_by_field_name("function")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| node.child_by_field_name("constructor"))
+            {
+                let name = call_name(function, source, returns, binding);
+                if !(language == SyntaxLanguage::Rust
+                    && matches!(name.as_str(), "Ok" | "Err" | "Some"))
+                {
+                    output.push(DeclarationCall {
+                        kind: if node.kind() == "new_expression" {
+                            DeclarationCallKind::Construct
+                        } else {
+                            DeclarationCallKind::Call
+                        },
+                        name,
+                        expression: contents(function, source).into(),
+                        unresolved: shadowed_target(function, source, returns, binding),
+                        line: reference_token(function).start_position().row as u32 + 1,
+                        column: reference_token(function).start_position().column as u32,
+                    });
+                }
+            }
         }
-    } else {
-        None
-    };
-    if matches!(
-        node.kind(),
-        "call_expression" | "function_call" | "new_expression"
-    ) {
-        if let Some(function) = node
-            .child_by_field_name("function")
-            .or_else(|| node.child_by_field_name("name"))
-            .or_else(|| node.child_by_field_name("constructor"))
-        {
-            let name = call_name(function, source, returns, binding);
-            if !(language == SyntaxLanguage::Rust && matches!(name.as_str(), "Ok" | "Err" | "Some"))
+        if language == SyntaxLanguage::Rust && node.kind() == "struct_expression" {
+            if let Some(target) = node
+                .child_by_field_name("name")
+                .or_else(|| node.child_by_field_name("type"))
             {
                 output.push(DeclarationCall {
-                    kind: if node.kind() == "new_expression" {
-                        DeclarationCallKind::Construct
-                    } else {
-                        DeclarationCallKind::Call
-                    },
-                    name,
-                    expression: contents(function, source).into(),
-                    unresolved: shadowed_target(function, source, returns, binding),
-                    line: reference_token(function).start_position().row as u32 + 1,
-                    column: reference_token(function).start_position().column as u32,
+                    kind: DeclarationCallKind::Construct,
+                    name: base_type(contents(target, source))
+                        .unwrap_or_else(|| contents(target, source).into()),
+                    expression: contents(target, source).into(),
+                    unresolved: false,
+                    line: reference_token(target).start_position().row as u32 + 1,
+                    column: reference_token(target).start_position().column as u32,
                 });
             }
         }
-    }
-    if language == SyntaxLanguage::Rust && node.kind() == "struct_expression" {
-        if let Some(target) = node
-            .child_by_field_name("name")
-            .or_else(|| node.child_by_field_name("type"))
+        if language == SyntaxLanguage::Rust
+            && matches!(
+                node.kind(),
+                "field_initializer" | "shorthand_field_initializer" | "field_pattern"
+            )
         {
-            output.push(DeclarationCall {
-                kind: DeclarationCallKind::Construct,
-                name: base_type(contents(target, source))
-                    .unwrap_or_else(|| contents(target, source).into()),
-                expression: contents(target, source).into(),
-                unresolved: false,
-                line: reference_token(target).start_position().row as u32 + 1,
-                column: reference_token(target).start_position().column as u32,
-            });
-        }
-    }
-    if language == SyntaxLanguage::Rust
-        && matches!(
-            node.kind(),
-            "field_initializer" | "shorthand_field_initializer" | "field_pattern"
-        )
-    {
-        let field = node
-            .child_by_field_name("field")
-            .or_else(|| node.child_by_field_name("name"))
-            .or_else(|| {
-                let mut cursor = node.walk();
-                node.named_children(&mut cursor)
-                    .find(|child| matches!(child.kind(), "field_identifier" | "identifier"))
-            });
-        let mut parent = node.parent();
-        while let Some(container) = parent {
-            if matches!(container.kind(), "struct_expression" | "struct_pattern") {
-                if let (Some(field), Some(owner)) = (
-                    field,
-                    container
-                        .child_by_field_name("name")
-                        .or_else(|| container.child_by_field_name("type"))
-                        .and_then(|owner| base_type(contents(owner, source))),
-                ) {
-                    output.push(DeclarationCall {
-                        kind: DeclarationCallKind::Property,
-                        name: format!("{}::{}", owner, contents(field, source)),
-                        expression: contents(field, source).into(),
-                        unresolved: false,
-                        line: field.start_position().row as u32 + 1,
-                        column: field.start_position().column as u32,
-                    });
+            let field = node
+                .child_by_field_name("field")
+                .or_else(|| node.child_by_field_name("name"))
+                .or_else(|| {
+                    let mut cursor = node.walk();
+                    node.named_children(&mut cursor)
+                        .find(|child| matches!(child.kind(), "field_identifier" | "identifier"))
+                });
+            let mut parent = node.parent();
+            while let Some(container) = parent {
+                if matches!(container.kind(), "struct_expression" | "struct_pattern") {
+                    if let (Some(field), Some(owner)) = (
+                        field,
+                        container
+                            .child_by_field_name("name")
+                            .or_else(|| container.child_by_field_name("type"))
+                            .and_then(|owner| base_type(contents(owner, source))),
+                    ) {
+                        output.push(DeclarationCall {
+                            kind: DeclarationCallKind::Property,
+                            name: format!("{}::{}", owner, contents(field, source)),
+                            expression: contents(field, source).into(),
+                            unresolved: false,
+                            line: field.start_position().row as u32 + 1,
+                            column: field.start_position().column as u32,
+                        });
+                    }
+                    break;
                 }
-                break;
+                parent = container.parent();
             }
-            parent = container.parent();
         }
+        if matches!(
+            node.kind(),
+            "field_expression"
+                | "member_expression"
+                | "dot_index_expression"
+                | "subscript_expression"
+                | "bracket_index_expression"
+        ) && !invocation_target(node)
+        {
+            let name = call_name(node, source, returns, binding);
+            output.push(DeclarationCall {
+                kind: if callable.contains(&name) {
+                    DeclarationCallKind::Callback
+                } else {
+                    DeclarationCallKind::Property
+                },
+                name,
+                expression: contents(node, source).into(),
+                unresolved: member_access(node, source).is_none()
+                    || shadowed_target(node, source, returns, binding),
+                line: reference_token(node).start_position().row as u32 + 1,
+                column: reference_token(node).start_position().column as u32,
+            });
+        }
+        if matches!(
+            node.kind(),
+            "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier"
+        ) && !invocation_target(node)
+            && !binding.contains_key(contents(node, source))
+            && !node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "scoped_identifier"
+                        | "scoped_type_identifier"
+                        | "field_expression"
+                        | "member_expression"
+                        | "dot_index_expression"
+                        | "method_index_expression"
+                        | "subscript_expression"
+                        | "bracket_index_expression"
+                        | "parameters"
+                        | "parameter"
+                        | "closure_parameters"
+                        | "variable_list"
+                        | "type_annotation"
+                        | "type_arguments"
+                        | "struct_expression"
+                        | "struct_pattern"
+                ) || matches!(parent.kind(), "let_declaration" | "variable_declarator")
+                    && parent
+                        .child_by_field_name("pattern")
+                        .or_else(|| parent.child_by_field_name("name"))
+                        .is_some_and(|name| name.id() == node.id())
+            })
+        {
+            let name = contents(node, source).to_owned();
+            let callback = callable.contains(&name);
+            output.push(DeclarationCall {
+                kind: if callback {
+                    DeclarationCallKind::Callback
+                } else {
+                    DeclarationCallKind::Value
+                },
+                unresolved: false,
+                name,
+                expression: contents(node, source).into(),
+                line: node.start_position().row as u32 + 1,
+                column: node.start_position().column as u32,
+            });
+        }
+        if let Some(previous) = previous {
+            pending.push(CallStep::Restore(previous));
+        }
+        if let Some((name, value)) = pending_binding {
+            pending.push(CallStep::Bind(name, value));
+        }
+        let mut cursor = node.walk();
+        pending.extend(
+            node.named_children(&mut cursor)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(CallStep::Visit),
+        );
     }
-    if matches!(
-        node.kind(),
-        "field_expression"
-            | "member_expression"
-            | "dot_index_expression"
-            | "subscript_expression"
-            | "bracket_index_expression"
-    ) && !invocation_target(node)
-    {
-        let name = call_name(node, source, returns, binding);
-        output.push(DeclarationCall {
-            kind: if callable.contains(&name) {
-                DeclarationCallKind::Callback
-            } else {
-                DeclarationCallKind::Property
-            },
-            name,
-            expression: contents(node, source).into(),
-            unresolved: member_access(node, source).is_none()
-                || shadowed_target(node, source, returns, binding),
-            line: reference_token(node).start_position().row as u32 + 1,
-            column: reference_token(node).start_position().column as u32,
-        });
-    }
-    if matches!(
-        node.kind(),
-        "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier"
-    ) && !invocation_target(node)
-        && !binding.contains_key(contents(node, source))
-        && !node.parent().is_some_and(|parent| {
-            matches!(
-                parent.kind(),
-                "scoped_identifier"
-                    | "scoped_type_identifier"
-                    | "field_expression"
-                    | "member_expression"
-                    | "dot_index_expression"
-                    | "method_index_expression"
-                    | "subscript_expression"
-                    | "bracket_index_expression"
-                    | "parameters"
-                    | "parameter"
-                    | "closure_parameters"
-                    | "variable_list"
-                    | "type_annotation"
-                    | "type_arguments"
-                    | "struct_expression"
-                    | "struct_pattern"
-            ) || matches!(parent.kind(), "let_declaration" | "variable_declarator")
-                && parent
-                    .child_by_field_name("pattern")
-                    .or_else(|| parent.child_by_field_name("name"))
-                    .is_some_and(|name| name.id() == node.id())
-        })
-    {
-        let name = contents(node, source).to_owned();
-        let callback = callable.contains(&name);
-        output.push(DeclarationCall {
-            kind: if callback {
-                DeclarationCallKind::Callback
-            } else {
-                DeclarationCallKind::Value
-            },
-            unresolved: false,
-            name,
-            expression: contents(node, source).into(),
-            line: node.start_position().row as u32 + 1,
-            column: node.start_position().column as u32,
-        });
-    }
-    let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        calls(
-            child,
-            source,
-            language,
-            returns,
-            callable,
-            binding,
-            output,
-            depth + 1,
-        )?;
-    }
-    if let Some((name, value)) = pending_binding {
-        binding.insert(name, value);
-    }
-    if let Some(previous) = previous {
-        *binding = previous;
-    }
-    Ok(())
 }
 
-fn reference_token(node: Node<'_>) -> Node<'_> {
-    if node.kind() == "generic_function" {
-        return node
-            .child_by_field_name("function")
-            .map(reference_token)
-            .unwrap_or(node);
+fn reference_token(mut node: Node<'_>) -> Node<'_> {
+    while node.kind() == "generic_function" {
+        let Some(inner) = node.child_by_field_name("function") else {
+            return node;
+        };
+        node = inner;
     }
     node.child_by_field_name("field")
         .or_else(|| node.child_by_field_name("property"))
@@ -1080,15 +1150,16 @@ fn invocation_target(mut node: Node<'_>) -> bool {
 }
 
 fn shadowed_target(
-    function: Node<'_>,
+    mut function: Node<'_>,
     source: &str,
     returns: &HashMap<String, Option<String>>,
     binding: &HashMap<String, Option<String>>,
 ) -> bool {
-    if function.kind() == "generic_function" {
-        return function
-            .child_by_field_name("function")
-            .is_none_or(|function| shadowed_target(function, source, returns, binding));
+    while function.kind() == "generic_function" {
+        let Some(inner) = function.child_by_field_name("function") else {
+            return true;
+        };
+        function = inner;
     }
     if function.kind() == "identifier" {
         return binding.contains_key(contents(function, source));

@@ -49,7 +49,7 @@
       "default_tools_approval_mode": "approve"
     },
     "github": {
-      "targets": ["claudecode", "codexcli", "antigravity-cli"],
+      "targets": ["claudecode", "codexcli", "antigravity-cli", "copilotcli"],
       "type": "http",
       "url": "https://api.githubcopilot.com/mcp/",
       "headers": {

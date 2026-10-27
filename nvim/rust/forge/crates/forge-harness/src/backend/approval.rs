@@ -32,6 +32,10 @@ pub enum ApprovalResolution {
     DenyOnce,
     DenyExact,
     DenyBroad,
+    /// Automatic denial by saved permissions or filesystem access policy.
+    DenyPolicy,
+    /// Automatic denial because approval prompts are disabled.
+    DenyMode,
     /// Rejects an expired request without recording a persistent rule.
     TimedOut,
     Cancel,
@@ -485,7 +489,7 @@ impl PermissionCoordinator {
                         compiled.evaluate(&canonical)?
                     };
                     if canonical.decision == PermissionDecision::Deny {
-                        return Ok(ApprovalResolution::DenyOnce);
+                        return Ok(ApprovalResolution::DenyPolicy);
                     }
                     granted.push(target.clone());
                 }
@@ -502,9 +506,9 @@ impl PermissionCoordinator {
         }
         match evaluation.decision {
             PermissionDecision::Allow => return Ok(ApprovalResolution::AllowOnce),
-            PermissionDecision::Deny => return Ok(ApprovalResolution::DenyOnce),
+            PermissionDecision::Deny => return Ok(ApprovalResolution::DenyPolicy),
             PermissionDecision::Ask => match approval_mode {
-                ApprovalMode::Deny => return Ok(ApprovalResolution::DenyOnce),
+                ApprovalMode::Deny => return Ok(ApprovalResolution::DenyMode),
                 ApprovalMode::Allow => return Ok(ApprovalResolution::AllowOnce),
                 ApprovalMode::Ask => {}
             },
@@ -1576,7 +1580,7 @@ pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value 
     }
     json!({ "decision": match resolution {
         ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => "accept",
-        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad | ApprovalResolution::TimedOut => "decline",
+        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad | ApprovalResolution::DenyPolicy | ApprovalResolution::DenyMode | ApprovalResolution::TimedOut => "decline",
         ApprovalResolution::Cancel => "cancel",
     }})
 }
@@ -1629,8 +1633,8 @@ mod test {
                         .await
                 });
                 let expected = match (decision, mode) {
-                    (PermissionDecision::Deny, _)
-                    | (PermissionDecision::Ask, ApprovalMode::Deny) => ApprovalResolution::DenyOnce,
+                    (PermissionDecision::Deny, _) => ApprovalResolution::DenyPolicy,
+                    (PermissionDecision::Ask, ApprovalMode::Deny) => ApprovalResolution::DenyMode,
                     (PermissionDecision::Allow, _)
                     | (PermissionDecision::Ask, ApprovalMode::Allow) => {
                         ApprovalResolution::AllowOnce
@@ -1897,7 +1901,7 @@ mod test {
                     None,
                 )
                 .await?,
-            ApprovalResolution::DenyOnce
+            ApprovalResolution::DenyPolicy
         );
         drop(directories);
         assert!(coordinator.directory_by_owner.lock().unwrap().is_empty());
@@ -1947,7 +1951,7 @@ mod test {
             coordinator
                 .authorize(ApprovalMode::Allow, denied, address, None)
                 .await?,
-            ApprovalResolution::DenyOnce
+            ApprovalResolution::DenyPolicy
         );
         let invalid = PermissionRequest {
             id: "invalid".into(),
@@ -2100,7 +2104,7 @@ mod test {
                     None
                 )
                 .await?,
-            ApprovalResolution::DenyOnce
+            ApprovalResolution::DenyPolicy
         );
         store.write().unwrap().set_rule_list(&[(
             CATEGORY_READ.into(),
@@ -2116,7 +2120,7 @@ mod test {
                     None
                 )
                 .await?,
-            ApprovalResolution::DenyOnce
+            ApprovalResolution::DenyPolicy
         );
         let alias = directory.path().join("profile-alias");
         #[cfg(windows)]
@@ -2139,7 +2143,7 @@ mod test {
                     None
                 )
                 .await?,
-            ApprovalResolution::DenyOnce
+            ApprovalResolution::DenyPolicy
         );
         #[cfg(windows)]
         junction::delete(&alias)?;

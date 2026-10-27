@@ -21,6 +21,60 @@ fn typescript(root: &Path, files: &[(&str, &str)]) -> (DeclarationDesign, Declar
 }
 
 #[test]
+fn deep_rust_modules_preserve_ownership_conditions_and_cycle_termination() {
+    for conditional in [false, true] {
+        let root = tempfile::tempdir().unwrap();
+        let mut design = DeclarationDesign::default();
+        design.proposed.insert(
+            "lib.rs".into(),
+            format!(
+                "{}#[path = \"layer/0/mod.rs\"]\npub mod nested;\n",
+                if conditional {
+                    "#[cfg(feature = \"optional\")]\n"
+                } else {
+                    ""
+                },
+            ),
+        );
+        for index in 0..96 {
+            let text = if index == 95 {
+                "pub struct Final { pub value: u32 }\n#[path = \"../0/mod.rs\"]\npub mod cycle;\n"
+                    .to_owned()
+            } else {
+                format!("#[path = \"../{}/mod.rs\"]\npub mod nested;\n", index + 1)
+            };
+            design
+                .proposed
+                .insert(format!("layer/{index}/mod.rs"), text);
+        }
+        let resolver = DeclarationResolver::planned(root.path(), &design, false).unwrap();
+        assert_eq!(resolver.file.len(), 97);
+        assert!(!resolver.package["workspace"].incomplete);
+        let leaf = &resolver.file[&normalize(&root.path().join("layer/95/mod.rs"))];
+        assert_eq!(leaf.module, vec!["nested"; 96]);
+        assert_eq!(leaf.package, "workspace");
+        assert!(
+            leaf.index
+                .symbol
+                .iter()
+                .any(|symbol| symbol.name == "Final")
+        );
+        assert!(
+            leaf.index
+                .symbol
+                .iter()
+                .all(|symbol| symbol.conditional == conditional)
+        );
+        assert!(
+            leaf.index
+                .reference
+                .iter()
+                .all(|reference| reference.conditional == conditional)
+        );
+    }
+}
+
+#[test]
 fn constructs_validate_types_and_reject_known_non_types() {
     let root = tempfile::tempdir().unwrap();
     let text = "pub struct Weapon { pub cooldown: f32 }\npub const LIMIT: u32;\npub fn factory();\npub fn setup();\nConstructs\n  Weapon\n  factory\n  LIMIT\n  ExternalWeapon\n";

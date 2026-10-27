@@ -1172,6 +1172,7 @@ impl Backend for MockBackend {
                 )
                 .await?;
         }
+        let mut approval_denial = None;
         if let Some(permission) = &self.permission {
             let resolution = permission
                 .authorize(
@@ -1193,17 +1194,37 @@ impl Backend for MockBackend {
                     event_sink.as_ref(),
                 )
                 .await?;
-            anyhow::ensure!(
-                resolution == approval::ApprovalResolution::AllowOnce,
-                "mock approval was not allowed"
-            );
+            approval_denial = match resolution {
+                approval::ApprovalResolution::AllowOnce
+                | approval::ApprovalResolution::AllowExact
+                | approval::ApprovalResolution::AllowBroad => None,
+                approval::ApprovalResolution::Cancel => {
+                    return Err(crate::broker::TurnCancelled.into());
+                }
+                approval::ApprovalResolution::TimedOut => {
+                    Some("Automatically rejected because the approval timeout expired.")
+                }
+                approval::ApprovalResolution::DenyPolicy => {
+                    Some("Automatically rejected by saved permission policy.")
+                }
+                approval::ApprovalResolution::DenyMode => {
+                    Some("Automatically rejected in reject-all approval mode.")
+                }
+                approval::ApprovalResolution::DenyOnce
+                | approval::ApprovalResolution::DenyExact
+                | approval::ApprovalResolution::DenyBroad => Some("Rejected by the user."),
+            };
         }
         let event = BackendEvent {
             received_at_ms: None,
             address: None,
             turn_boundary: None,
             kind: "assistant_message".into(),
-            text: Some(if request.mode == PromptMode::PlanQuestion {
+            text: Some(if let Some(reason) = approval_denial {
+                format!(
+                    "Mock response: {reason} The requested operation was not executed. Continuing with permitted work."
+                )
+            } else if request.mode == PromptMode::PlanQuestion {
                 "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
             } else {
                 format!("Mock response: {}", request.input.text())
@@ -1227,6 +1248,40 @@ impl Backend for MockBackend {
         if response_hold.is_none() {
             self.wait_for_response(None, &mut active_steering, &mut steering_text_list)
                 .await?;
+        }
+        if approval_denial.is_some() {
+            let denial = BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "tool".into(),
+                text: None,
+                data: Value::Null,
+                activity: Some(ToolActivity {
+                    id: "mock-denied".into(),
+                    kind: ToolActivityKind::ToolCall,
+                    title: "mock-probe".into(),
+                    output: approval_denial.map(str::to_owned),
+                    status: Some("denied".into()),
+                    change: Default::default(),
+                    output_delta: false,
+                }),
+                summary: None,
+                task_update: None,
+            };
+            if let Some(sink) = &event_sink {
+                sink.send_wait(denial.clone()).await?;
+                sink.send_wait(event.clone()).await?;
+            }
+            self.permission
+                .as_ref()
+                .expect("mock approval owner")
+                .take_timeout_feedback(&request.owner()?)?;
+            return Ok(BackendOutput {
+                event: vec![denial, event],
+                capability: mock_capability(),
+                ..Default::default()
+            });
         }
         if request.mode == PromptMode::Plan {
             if let Some(document) = request

@@ -2741,7 +2741,7 @@ function M.command_set()
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
   command_set.register(set, "abort_plan", M.abort_plan)
-  command_set.register(set, "agents", M.open_agent_picker)
+  command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)
   command_set.register(set, "background", M.open_background_picker)
   command_set.register(set, "open_timeline", M.open_timeline_entry)
@@ -2765,18 +2765,12 @@ function M.attach_transcript(buf)
   keymaps.setup_view_keymaps(buf, "harness", state.command_set)
 end
 
----Keep the editable prompt's bindings limited to input and tuning controls.
+---Share session commands without overriding native editing with transcript-only actions.
 ---@return ForgeViewCommandSet
 function M.composer_command_set()
   local set = M.command_set()
-  local composer_controls = {
-    submit = true, queue = true, steer = true, cancel = true,
-    toggle_write = true, edit_queued = true, next_queued = true,
-    effort_down = true, effort_up = true,
-  }
-  for _, id in ipairs(vim.deepcopy(set.order)) do
-    if not composer_controls[id] then command_set.unregister(set, id) end
-  end
+  command_set.unregister(set, "visual_line_with_gutter")
+  command_set.unregister(set, "open_timeline")
   command_set.register(set, "history_previous", prompt_history.previous)
   command_set.register(set, "history_next", prompt_history.next)
   return set

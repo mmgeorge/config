@@ -17,9 +17,12 @@ client._set_launcher_for_test(vim.system)
 local state = require("forge.session").harness
 local errors = {}
 local approval_requests = 0
+local resolution_list = {}
 client.subscribe(function(event, payload)
   if event == "backend_event" and payload.kind == "approval_requested" then
     approval_requests = approval_requests + 1
+  elseif event == "backend_event" and payload.kind == "approval_resolved" then
+    resolution_list[#resolution_list + 1] = payload.data
   end
 end)
 vim.notify = function(message, level)
@@ -51,7 +54,58 @@ local succeeded, failure = xpcall(function()
   require("forge.views.harness").open()
   assert(vim.wait(10000, function() return state.session ~= nil end, 10),
     "startup timeout: " .. vim.inspect(errors))
+  local picker = require("forge.views.picker")
+  local controller = require("forge.views.harness.controller")
+  local permission_path = vim.fs.joinpath(data, "forge", "permissions.json")
+  local permission_before = vim.fn.readfile(permission_path)
+  request("session.input_timeouts", {
+    approval_timeout = { amount = 1, unit = "s" }, answer_timeout = { amount = 0, unit = "s" },
+  })
   for iteration = 1, 2 do
+    local before = approval_requests
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "Continue after approval expires " .. iteration })
+    controller.submit()
+    assert(state.busy, "composer submission did not enter busy state")
+    assert(vim.wait(10000, function()
+      local current = status()
+      return #state.approval == 1 and current and current.hint == "permission" and picker.is_open()
+    end, 10), "timed approval popup never appeared: " .. vim.inspect(errors))
+    local approval_id = state.approval[1].id
+    assert(vim.wait(5000, function()
+      local current = status()
+      return #state.approval == 0 and not picker.is_open()
+        and current and current.hint == "working" and current.animated
+    end, 10), "timeout did not clear the popup and resume work: " .. vim.inspect(status()))
+    assert(state.busy, "mock finished before timeout recovery was observable")
+    local resolution = resolution_list[#resolution_list]
+    assert(resolution.id == approval_id and resolution.resolution_source == "timeout",
+      "expiry was not recorded as an automatic timeout: " .. vim.inspect(resolution))
+    assert(vim.wait(10000, function()
+      local current = status()
+      return state.status and state.status.kind == "idle" and not state.busy
+        and (not current or not current.animated)
+    end, 10), "completed timeout recovery retained Working: " .. vim.inspect(status()))
+    assert(not hints():find("review permission", 1, true), "expired permission hint remained visible")
+    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    assert(text:find("Automatically rejected because the approval timeout expired", 1, true), text)
+    assert(text:find("The requested operation was not executed", 1, true), text)
+    assert(text:find("Continuing with permitted work", 1, true), text)
+    local snapshot = request("state.get", {})
+    assert(snapshot.status.kind == "idle" and #snapshot.approval == 0)
+    local history = request("exchange.list", {})
+    local exchange_count = #history
+    assert(history[exchange_count].state == "complete", "expired approval did not settle")
+    vim.wait(1500, function() return false end, 10)
+    local stable = request("state.get", {})
+    assert(stable.status.kind == "idle" and #request("exchange.list", {}) == exchange_count,
+      "answered timeout scheduled a duplicate continuation")
+    assert(approval_requests == before + 1, "timeout retried the rejected operation")
+    assert(vim.deep_equal(vim.fn.readfile(permission_path), permission_before), "timeout saved a permission rule")
+  end
+  request("session.input_timeouts", {
+    approval_timeout = { amount = 0, unit = "s" }, answer_timeout = { amount = 0, unit = "s" },
+  })
+  for iteration, choice in ipairs({ "allow_once", "deny_once", "allow_once" }) do
     local settled, result, problem
     client.request("prompt.submit", { text = "Resume after approval " .. iteration }, function(value, error)
       settled, result, problem = true, value, error
@@ -64,7 +118,7 @@ local succeeded, failure = xpcall(function()
       "permission action was not rendered: " .. hints())
     local approval = state.approval[1]
     local answers = {}
-    for _, item in ipairs(approval.item_list) do answers[#answers + 1] = { item_id = item.id, choice_id = "allow_once" } end
+    for _, item in ipairs(approval.item_list) do answers[#answers + 1] = { item_id = item.id, choice_id = choice } end
     request("approval.resolve", { approval_id = approval.id, answer_list = answers })
     assert(vim.wait(1500, function()
       local current = status()
@@ -75,8 +129,15 @@ local succeeded, failure = xpcall(function()
     assert(vim.wait(10000, function() return settled end, 10), "provider did not complete")
     assert(not problem, tostring(problem))
     assert(result.exchange.state == "complete", "approved exchange did not complete")
+    if choice == "deny_once" then
+      assert(resolution_list[#resolution_list].resolution_source == "user")
+      assert(vim.wait(5000, function()
+        return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+          :find("Rejected by the user", 1, true) ~= nil
+      end, 10), "user denial lost its origin")
+      assert(vim.deep_equal(vim.fn.readfile(permission_path), permission_before), "deny-once saved a rule")
+    end
   end
-  local controller = require("forge.views.harness.controller")
   local mock = dofile(root .. "/nvim/tests/forge/support/mock_provider.lua")
   for _, mode in ipairs({ "deny", "allow" }) do
     controller.task_transition({ action = "permission", change = { kind = "set_approval", mode = mode } })
@@ -93,11 +154,18 @@ local succeeded, failure = xpcall(function()
     held:release()
     assert(vim.wait(10000, function() return settled end, 10), "automatic approval did not resolve")
     assert(approval_requests == before and #state.approval == 0, "automatic approval opened a popup")
+    assert(not problem and result.exchange.state == "complete", tostring(problem))
     if mode == "deny" then
-      assert(problem and problem:find("mock approval was not allowed", 1, true), tostring(problem))
-    else
-      assert(not problem and result.exchange.state == "complete", tostring(problem))
+      assert(vim.wait(5000, function()
+        return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+          :find("Automatically rejected in reject-all approval mode", 1, true) ~= nil
+      end, 10), "automatic denial lost its origin")
     end
+    assert(vim.wait(5000, function()
+      local current = status()
+      return state.status and state.status.kind == "idle" and not state.busy
+        and (not current or not current.animated)
+    end, 10), "automatic approval decision left stale Working status")
   end
   assert(#errors == 0, table.concat(errors, "\n"))
 end, debug.traceback)

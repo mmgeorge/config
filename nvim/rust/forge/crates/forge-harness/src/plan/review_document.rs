@@ -2321,6 +2321,100 @@ impl PlanReviewDocument {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn wide_check_commands_survive_submission_capture_and_resize() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Wide check commands");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Preserve complete check commands.".into();
+        design.document.background = "Check commands can exceed the review viewport.".into();
+        design.document.design = "Wrap display rows without limiting stored command text.".into();
+        let command = format!("command{}", "x".repeat(8193));
+        std::fs::write(
+            store.workspace.join(".forge.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "checks": {
+                    "wide-command": {
+                        "trigger": {"auto": true},
+                        "action": {"command": command, "category": "test"}
+                    }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        canonical.design = Some(design);
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (submitted, rendered, digest) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        assert!(rendered.markdown.contains(&command));
+        let source = store
+            .capture_review_source("session", "plan", Some(1), &digest)
+            .unwrap();
+        assert!(source.rendered.markdown.contains(&command));
+        let historical = store.capture_revision_source("session", "plan", 1).unwrap();
+        assert_eq!(historical.rendered.markdown, source.rendered.markdown);
+
+        let mut document = PlanReviewDocument::new(
+            DocumentId("review".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        for columns in [1, 60, 8194, 100, 16384] {
+            document
+                .update_view(
+                    ViewId("view".into()),
+                    Some(WidthProfile {
+                        columns,
+                        tabstop: 512,
+                        variable_tabstop: vec![512; 257],
+                        cell_width: (0..257)
+                            .map(|index| forge_buffer::width::CellWidthRange {
+                                first: 0x400 + index,
+                                last: 0x400 + index,
+                                cells: 2,
+                            })
+                            .collect(),
+                        ..Default::default()
+                    }),
+                )
+                .unwrap();
+            let snapshot = document.snapshot();
+            let encoded = serde_json::to_vec(&snapshot).unwrap();
+            let delivered: BufferSnapshot = serde_json::from_slice(&encoded).unwrap();
+            let displayed = delivered
+                .block
+                .iter()
+                .filter(|block| block.id.0.starts_with("plan:configured-checks:"))
+                .flat_map(|block| block.text.wire_rows())
+                .filter_map(|row| row.split(" │ ").nth(1))
+                .map(str::trim_end)
+                .collect::<String>();
+            assert_eq!(displayed, format!("Command{command}"), "viewport {columns}");
+        }
+        let previous = serde_json::to_value(document.snapshot()).unwrap();
+        assert!(
+            document
+                .update_view(
+                    ViewId("view".into()),
+                    Some(WidthProfile {
+                        columns: 0,
+                        ..Default::default()
+                    })
+                )
+                .is_err()
+        );
+        assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), previous);
+        assert_eq!(document.source.document, submitted);
+    }
+
+    #[test]
     fn property_definition_reveals_private_field_in_the_plan() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());

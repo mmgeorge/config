@@ -197,7 +197,6 @@ pub struct RenderedPlan {
 struct PlanRenderer {
     line: Vec<String>,
     navigation: PlanNavigationIndex,
-    exhausted: bool,
 }
 
 const PLAN_LINE_WIDTH: usize = 100;
@@ -218,42 +217,10 @@ struct DiagramCell {
     anchor: DiagramAnchor,
 }
 
-struct RenderRows<Row> {
-    row: Vec<Row>,
-    exhausted: bool,
-}
-
-impl<Row> Default for RenderRows<Row> {
-    fn default() -> Self {
-        Self {
-            row: Vec::new(),
-            exhausted: false,
-        }
-    }
-}
-
-impl<Row> RenderRows<Row> {
-    fn push(&mut self, row: Row) {
-        if self.exhausted {
-            return;
-        }
-        self.row.push(row);
-    }
-    fn extend(&mut self, rows: impl IntoIterator<Item = Row>) {
-        for row in rows {
-            self.push(row);
-            if self.exhausted {
-                break;
-            }
-        }
-    }
-}
-
 impl PlanRenderer {
     fn new(document: &PlanDocument) -> Self {
         Self {
             line: Vec::new(),
-            exhausted: false,
             navigation: PlanNavigationIndex {
                 plan_id: document.plan_id.clone(),
                 plan_version: document.version,
@@ -270,9 +237,6 @@ impl PlanRenderer {
         path: Option<&str>,
         label: impl Into<String>,
     ) {
-        if self.exhausted {
-            return;
-        }
         let value = value.into();
         let mut anchor = PlanNavigationAnchor {
             line: 0,
@@ -291,9 +255,6 @@ impl PlanRenderer {
     }
 
     fn blank(&mut self) {
-        if self.exhausted {
-            return;
-        }
         self.line.push(String::new());
     }
 
@@ -306,17 +267,11 @@ impl PlanRenderer {
         path: Option<&str>,
         label: impl Into<String>,
     ) {
-        if self.exhausted {
-            return;
-        }
         let [first_prefix, continuation_prefix] = prefix;
         let json_path = json_path.into();
         let label = label.into();
         for line in wrap_prefixed(content, first_prefix, continuation_prefix, PLAN_LINE_WIDTH) {
             self.push(line, target.clone(), json_path.clone(), path, label.clone());
-            if self.exhausted {
-                break;
-            }
         }
     }
 
@@ -331,7 +286,6 @@ impl PlanRenderer {
     }
 
     fn finish(self) -> Result<RenderedPlan> {
-        anyhow::ensure!(!self.exhausted, "plan rendering exceeds 128 diagram levels");
         debug_assert_eq!(
             self.line.iter().filter(|line| !line.is_empty()).count(),
             self.navigation.anchor.len()
@@ -812,7 +766,7 @@ fn render_flow_rows(
     flow: &PlanFlow,
     flow_path: &str,
 ) {
-    let mut row_list = RenderRows::default();
+    let mut row_list = Vec::new();
     for (edge_index, edge) in flow.edges.iter().enumerate() {
         collect_flow_edge_rows(
             &mut row_list,
@@ -823,11 +777,6 @@ fn render_flow_rows(
             edge_index + 1 == flow.edges.len(),
         );
     }
-    if row_list.exhausted {
-        renderer.exhausted = true;
-        return;
-    }
-    let row_list = row_list.row;
     let preferred_owner_column = row_list
         .iter()
         .map(|row| row.content.chars().count())
@@ -865,105 +814,91 @@ struct FlowRenderRow {
 }
 
 fn collect_flow_edge_rows(
-    row_list: &mut RenderRows<FlowRenderRow>,
+    row_list: &mut Vec<FlowRenderRow>,
     graph: &PlanGraph<'_>,
     edge: &PlanFlowEdge,
     edge_path: &str,
     ancestor_last_list: &[bool],
     is_last: bool,
 ) {
-    if row_list.exhausted {
-        return;
+    enum FlowEntry<'source> {
+        Edge(&'source PlanFlowEdge),
+        Branch(&'source PlanFlowBranch),
     }
-    if ancestor_last_list.len() > 128 {
-        row_list.exhausted = true;
-        return;
-    }
-    row_list.push(FlowRenderRow {
-        content: flow_tree_content(
-            ancestor_last_list,
-            Some(is_last),
-            &flow_edge_content(graph, edge),
-        ),
-        path: flow_target_path(graph, &edge.target),
-        target: PlanReviewTarget::FlowEdge {
-            callable_kind: edge.callable.as_ref().map(|callable| callable.kind),
-            callable_name: edge.callable.as_ref().map(|callable| callable.name.clone()),
-            reference_kind: entity_reference_kind(&edge.target),
-            target_name: entity_reference_label(graph, &edge.target),
-            target_is_type: entity_reference_is_type(graph, &edge.target),
-            workspace_path: entity_reference_workspace_path(&edge.target),
-            workspace_line: entity_reference_workspace_line(&edge.target),
-        },
-        json_path: edge_path.to_owned(),
-        label: format!("Flow edge: {}", flow_relation_label(&edge.relation)),
-    });
+    let mut pending = vec![(
+        FlowEntry::Edge(edge),
+        edge_path.to_owned(),
+        ancestor_last_list.to_vec(),
+        is_last,
+    )];
+    while let Some((entry, entry_path, ancestor_last_list, is_last)) = pending.pop() {
+        let mut child_ancestor_list = ancestor_last_list.clone();
+        child_ancestor_list.push(is_last);
+        match entry {
+            FlowEntry::Edge(edge) => {
+                row_list.push(FlowRenderRow {
+                    content: flow_tree_content(
+                        &ancestor_last_list,
+                        Some(is_last),
+                        &flow_edge_content(graph, edge),
+                    ),
+                    path: flow_target_path(graph, &edge.target),
+                    target: PlanReviewTarget::FlowEdge {
+                        callable_kind: edge.callable.as_ref().map(|callable| callable.kind),
+                        callable_name: edge.callable.as_ref().map(|callable| callable.name.clone()),
+                        reference_kind: entity_reference_kind(&edge.target),
+                        target_name: entity_reference_label(graph, &edge.target),
+                        target_is_type: entity_reference_is_type(graph, &edge.target),
+                        workspace_path: entity_reference_workspace_path(&edge.target),
+                        workspace_line: entity_reference_workspace_line(&edge.target),
+                    },
+                    json_path: entry_path.clone(),
+                    label: format!("Flow edge: {}", flow_relation_label(&edge.relation)),
+                });
 
-    let mut child_ancestor_list = ancestor_last_list.to_vec();
-    child_ancestor_list.push(is_last);
-    let child_count = edge.expansion.len() + edge.branches.len();
-    for (step_index, step) in edge.expansion.iter().enumerate() {
-        collect_flow_edge_rows(
-            row_list,
-            graph,
-            step,
-            &format!("{edge_path}/expansion/{step_index}"),
-            &child_ancestor_list,
-            step_index + 1 == child_count,
-        );
-    }
-    for (branch_index, branch) in edge.branches.iter().enumerate() {
-        collect_flow_branch_rows(
-            row_list,
-            graph,
-            branch,
-            &format!("{edge_path}/branches/{branch_index}"),
-            &child_ancestor_list,
-            edge.expansion.len() + branch_index + 1 == child_count,
-        );
-    }
-}
+                let child_count = edge.expansion.len() + edge.branches.len();
+                for (branch_index, branch) in edge.branches.iter().enumerate().rev() {
+                    pending.push((
+                        FlowEntry::Branch(branch),
+                        format!("{entry_path}/branches/{branch_index}"),
+                        child_ancestor_list.clone(),
+                        edge.expansion.len() + branch_index + 1 == child_count,
+                    ));
+                }
+                for (step_index, step) in edge.expansion.iter().enumerate().rev() {
+                    pending.push((
+                        FlowEntry::Edge(step),
+                        format!("{entry_path}/expansion/{step_index}"),
+                        child_ancestor_list.clone(),
+                        step_index + 1 == child_count,
+                    ));
+                }
+            }
+            FlowEntry::Branch(branch) => {
+                row_list.push(FlowRenderRow {
+                    content: flow_tree_content(
+                        &ancestor_last_list,
+                        Some(is_last),
+                        &format!("when {}", branch.condition),
+                    ),
+                    path: None,
+                    target: PlanReviewTarget::FlowBranch {
+                        condition: branch.condition.clone(),
+                    },
+                    json_path: entry_path.clone(),
+                    label: format!("Flow branch: {}", branch.condition),
+                });
 
-fn collect_flow_branch_rows(
-    row_list: &mut RenderRows<FlowRenderRow>,
-    graph: &PlanGraph<'_>,
-    branch: &PlanFlowBranch,
-    branch_path: &str,
-    ancestor_last_list: &[bool],
-    is_last: bool,
-) {
-    if row_list.exhausted {
-        return;
-    }
-    if ancestor_last_list.len() > 128 {
-        row_list.exhausted = true;
-        return;
-    }
-    row_list.push(FlowRenderRow {
-        content: flow_tree_content(
-            ancestor_last_list,
-            Some(is_last),
-            &format!("when {}", branch.condition),
-        ),
-        path: None,
-        target: PlanReviewTarget::FlowBranch {
-            condition: branch.condition.clone(),
-        },
-        json_path: branch_path.to_owned(),
-        label: format!("Flow branch: {}", branch.condition),
-    });
-
-    let mut child_ancestor_list = ancestor_last_list.to_vec();
-    child_ancestor_list.push(is_last);
-    for (edge_index, edge) in branch.edges.iter().enumerate() {
-        collect_flow_edge_rows(
-            row_list,
-            graph,
-            edge,
-            &format!("{branch_path}/edges/{edge_index}"),
-            &child_ancestor_list,
-            edge_index + 1 == branch.edges.len(),
-        );
+                for (edge_index, edge) in branch.edges.iter().enumerate().rev() {
+                    pending.push((
+                        FlowEntry::Edge(edge),
+                        format!("{entry_path}/edges/{edge_index}"),
+                        child_ancestor_list.clone(),
+                        edge_index + 1 == branch.edges.len(),
+                    ));
+                }
+            }
+        }
     }
 }
 
@@ -1081,11 +1016,7 @@ fn render_object_model(
             |kind| !is_contract_kind(kind),
             PLAN_LINE_WIDTH,
         );
-        if cells.exhausted {
-            renderer.exhausted = true;
-            return;
-        }
-        for cell in cells.row {
+        for cell in cells {
             renderer.push(
                 cell.text,
                 cell.anchor.target,
@@ -1108,12 +1039,6 @@ fn render_object_model(
         |kind| !is_contract_kind(kind),
         PLAN_LINE_WIDTH.saturating_sub(DIAGRAM_CONCRETE_COLUMN),
     );
-    if contract_cell_list.exhausted || concrete_cell_list.exhausted {
-        renderer.exhausted = true;
-        return;
-    }
-    let contract_cell_list = contract_cell_list.row;
-    let concrete_cell_list = concrete_cell_list.row;
     renderer.section(
         format!(
             "{}Concrete",
@@ -1159,7 +1084,7 @@ fn diagram_entity_group(
     graph: &PlanGraph<'_>,
     include: impl Fn(EntityKind) -> bool,
     width: usize,
-) -> RenderRows<DiagramCell> {
+) -> Vec<DiagramCell> {
     let mut entity_list = document
         .entity_changes
         .iter()
@@ -1175,7 +1100,7 @@ fn diagram_entity_group(
             .unwrap_or(usize::MAX)
     });
     if entity_list.is_empty() {
-        let mut cells = RenderRows::default();
+        let mut cells = Vec::new();
         cells.push(DiagramCell {
             text: "<none>".into(),
             anchor: object_model_anchor(),
@@ -1190,7 +1115,7 @@ fn diagram_entity_group(
         .max()
         .unwrap_or_default();
     let path_column = DIAGRAM_PATH_COLUMN_MAX.min(width.saturating_sub(longest_path_width));
-    let mut cell_list = RenderRows::default();
+    let mut cell_list = Vec::new();
     for (entity_index, _) in entity_list {
         append_entity_cells(
             &mut cell_list,
@@ -1210,7 +1135,7 @@ fn diagram_entity_group(
 }
 
 fn append_entity_cells(
-    cell_list: &mut RenderRows<DiagramCell>,
+    cell_list: &mut Vec<DiagramCell>,
     document: &PlanDocument,
     graph: &PlanGraph<'_>,
     entity_index: usize,
@@ -1218,139 +1143,132 @@ fn append_entity_cells(
     width: usize,
     path_column: usize,
 ) {
-    if cell_list.exhausted {
-        return;
-    }
-    if depth > 128 {
-        cell_list.exhausted = true;
-        return;
-    }
-    let entity = &document.entity_changes[entity_index];
-    let entity_path = format!("/entity_changes/{entity_index}");
-    let indent = "  ".repeat(depth);
-    let mut declaration = format!(
-        "{}{} {}",
-        declaration_marker(entity.action.base_action()),
-        entity_kind_label(entity.kind),
-        entity.name
-    );
-    if let Some(reference) = &entity.extends {
-        declaration.push_str(&format!(
-            " extends {}",
-            entity_reference_label(graph, reference)
-        ));
-    }
-    if !entity.conforms_to.is_empty() {
-        let contract_list = entity
-            .conforms_to
-            .iter()
-            .map(|reference| entity_reference_label(graph, reference))
-            .collect::<Vec<_>>()
-            .join(", ");
-        declaration.push_str(&format!(": {contract_list}"));
-    }
-    let declaration_width = indent.chars().count() + declaration.chars().count();
-    let path_gap = path_column.saturating_sub(declaration_width).max(1);
-    declaration.push_str(&format!("{}[{}]", " ".repeat(path_gap), entity.path));
-    let entity_anchor = DiagramAnchor {
-        target: PlanReviewTarget::Entity {
-            name: entity.name.clone(),
-        },
-        json_path: entity_path.clone(),
-        path: Some(entity.path.clone()),
-        label: entity.name.clone(),
-    };
-    append_aligned_diagram_declaration(
-        cell_list,
-        &indent,
-        &declaration,
-        width,
-        entity_anchor.clone(),
-    );
-    for (member_index, member) in entity.members.iter().enumerate() {
-        append_diagram_member(
-            cell_list,
-            &format!("{indent}  "),
-            member,
-            width,
-            DiagramAnchor {
-                target: PlanReviewTarget::EntityMember {
-                    entity: entity.name.clone(),
-                    member: member.name.clone(),
-                },
-                json_path: format!("{entity_path}/members/{member_index}"),
-                path: Some(entity.path.clone()),
-                label: format!("{}::{}", entity.name, member.name),
-            },
+    let mut pending = vec![(entity_index, depth)];
+    while let Some((entity_index, current_depth)) = pending.pop() {
+        if current_depth > depth {
+            cell_list.push(DiagramCell {
+                text: String::new(),
+                anchor: object_model_anchor(),
+            });
+        }
+        let depth = current_depth;
+        let entity = &document.entity_changes[entity_index];
+        let entity_path = format!("/entity_changes/{entity_index}");
+        let indent = "  ".repeat(depth);
+        let mut declaration = format!(
+            "{}{} {}",
+            declaration_marker(entity.action.base_action()),
+            entity_kind_label(entity.kind),
+            entity.name
         );
-    }
-    for (variant_index, variant) in entity.variants.iter().enumerate() {
-        let variant_path = format!("{entity_path}/variants/{variant_index}");
-        let variant_declaration = variant.name.clone();
-        append_diagram_text(
-            cell_list,
-            &format!("{indent}  "),
-            &format!("{indent}  "),
-            &variant_declaration,
-            width,
-            DiagramAnchor {
-                target: PlanReviewTarget::EnumVariant {
-                    entity: entity.name.clone(),
-                    variant: variant.name.clone(),
-                },
-                json_path: variant_path.clone(),
-                path: Some(entity.path.clone()),
-                label: format!("{}::{}", entity.name, variant.name),
+        if let Some(reference) = &entity.extends {
+            declaration.push_str(&format!(
+                " extends {}",
+                entity_reference_label(graph, reference)
+            ));
+        }
+        if !entity.conforms_to.is_empty() {
+            let contract_list = entity
+                .conforms_to
+                .iter()
+                .map(|reference| entity_reference_label(graph, reference))
+                .collect::<Vec<_>>()
+                .join(", ");
+            declaration.push_str(&format!(": {contract_list}"));
+        }
+        let declaration_width = indent.chars().count() + declaration.chars().count();
+        let path_gap = path_column.saturating_sub(declaration_width).max(1);
+        declaration.push_str(&format!("{}[{}]", " ".repeat(path_gap), entity.path));
+        let entity_anchor = DiagramAnchor {
+            target: PlanReviewTarget::Entity {
+                name: entity.name.clone(),
             },
+            json_path: entity_path.clone(),
+            path: Some(entity.path.clone()),
+            label: entity.name.clone(),
+        };
+        append_aligned_diagram_declaration(
+            cell_list,
+            &indent,
+            &declaration,
+            width,
+            entity_anchor.clone(),
         );
-        for (field_index, field) in variant.fields.iter().enumerate() {
-            let field_declaration = format!("{}: {}", field.name, field.type_name);
-            append_diagram_text(
+        for (member_index, member) in entity.members.iter().enumerate() {
+            append_diagram_member(
                 cell_list,
-                &format!("{indent}    "),
-                &format!("{indent}    "),
-                &field_declaration,
+                &format!("{indent}  "),
+                member,
                 width,
                 DiagramAnchor {
-                    target: PlanReviewTarget::EnumVariantField {
+                    target: PlanReviewTarget::EntityMember {
                         entity: entity.name.clone(),
-                        variant: variant.name.clone(),
-                        field: field.name.clone(),
+                        member: member.name.clone(),
                     },
-                    json_path: format!("{variant_path}/fields/{field_index}"),
+                    json_path: format!("{entity_path}/members/{member_index}"),
                     path: Some(entity.path.clone()),
-                    label: format!("{}::{}::{}", entity.name, variant.name, field.name),
+                    label: format!("{}::{}", entity.name, member.name),
                 },
             );
         }
-    }
-    for child_index in graph.presentation_child_indices(&entity.name) {
-        cell_list.push(DiagramCell {
-            text: String::new(),
-            anchor: object_model_anchor(),
-        });
-        append_entity_cells(
-            cell_list,
-            document,
-            graph,
-            child_index,
-            depth.saturating_add(1),
-            width,
-            path_column,
+        for (variant_index, variant) in entity.variants.iter().enumerate() {
+            let variant_path = format!("{entity_path}/variants/{variant_index}");
+            let variant_declaration = variant.name.clone();
+            append_diagram_text(
+                cell_list,
+                &format!("{indent}  "),
+                &format!("{indent}  "),
+                &variant_declaration,
+                width,
+                DiagramAnchor {
+                    target: PlanReviewTarget::EnumVariant {
+                        entity: entity.name.clone(),
+                        variant: variant.name.clone(),
+                    },
+                    json_path: variant_path.clone(),
+                    path: Some(entity.path.clone()),
+                    label: format!("{}::{}", entity.name, variant.name),
+                },
+            );
+            for (field_index, field) in variant.fields.iter().enumerate() {
+                let field_declaration = format!("{}: {}", field.name, field.type_name);
+                append_diagram_text(
+                    cell_list,
+                    &format!("{indent}    "),
+                    &format!("{indent}    "),
+                    &field_declaration,
+                    width,
+                    DiagramAnchor {
+                        target: PlanReviewTarget::EnumVariantField {
+                            entity: entity.name.clone(),
+                            variant: variant.name.clone(),
+                            field: field.name.clone(),
+                        },
+                        json_path: format!("{variant_path}/fields/{field_index}"),
+                        path: Some(entity.path.clone()),
+                        label: format!("{}::{}::{}", entity.name, variant.name, field.name),
+                    },
+                );
+            }
+        }
+        pending.extend(
+            graph
+                .presentation_child_indices(&entity.name)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .map(|child_index| (child_index, depth + 1)),
         );
     }
 }
 
 fn append_diagram_member(
-    cell_list: &mut RenderRows<DiagramCell>,
+    cell_list: &mut Vec<DiagramCell>,
     indent: &str,
     member: &ProgramEntityMemberChange,
     width: usize,
     anchor: DiagramAnchor,
 ) {
-    if cell_list.exhausted {
-        return;
-    }
     let declaration = format!(
         "{} {}",
         visibility_marker(member.visibility),
@@ -1387,7 +1305,7 @@ fn append_diagram_member(
 }
 
 fn append_aligned_diagram_declaration(
-    cell_list: &mut RenderRows<DiagramCell>,
+    cell_list: &mut Vec<DiagramCell>,
     indent: &str,
     declaration: &str,
     width: usize,
@@ -1402,16 +1320,13 @@ fn append_aligned_diagram_declaration(
 }
 
 fn append_diagram_text(
-    cell_list: &mut RenderRows<DiagramCell>,
+    cell_list: &mut Vec<DiagramCell>,
     first_prefix: &str,
     continuation_prefix: &str,
     content: &str,
     width: usize,
     anchor: DiagramAnchor,
 ) {
-    if cell_list.exhausted {
-        return;
-    }
     cell_list.extend(
         wrap_prefixed(content, first_prefix, continuation_prefix, width)
             .into_iter()
@@ -1962,13 +1877,12 @@ mod test {
             wrap_prefixed("", "prefix", "", 9).collect::<Vec<_>>(),
             ["prefix"]
         );
-        let mut cells = RenderRows::default();
+        let mut cells = Vec::new();
         cells.push(DiagramCell {
             text: "x".repeat(32 * 1024 * 1024 + 1),
             anchor: object_model_anchor(),
         });
-        assert!(!cells.exhausted);
-        assert_eq!(cells.row[0].text.len(), 32 * 1024 * 1024 + 1);
+        assert_eq!(cells[0].text.len(), 32 * 1024 * 1024 + 1);
     }
     use super::*;
     use crate::plan::{attach_integration_test_fixture, attach_test_fixture, test_fixture};
@@ -2200,7 +2114,7 @@ mod test {
         let exact_width = format!("{indent}+ {}", member_signature(member))
             .chars()
             .count();
-        let mut cells = RenderRows::default();
+        let mut cells = Vec::new();
         append_diagram_member(
             &mut cells,
             indent,
@@ -2208,8 +2122,8 @@ mod test {
             exact_width,
             object_model_anchor(),
         );
-        assert_eq!(cells.row.len(), 1);
-        let mut cells = RenderRows::default();
+        assert_eq!(cells.len(), 1);
+        let mut cells = Vec::new();
         append_diagram_member(
             &mut cells,
             indent,
@@ -2217,9 +2131,9 @@ mod test {
             exact_width - 1,
             object_model_anchor(),
         );
-        assert_eq!(cells.row[0].text, "    + move_player(");
-        assert_eq!(cells.row[1].text, "        time: Res<Time>,");
-        assert_eq!(cells.row.last().unwrap().text, "      ): Result<(), Error>");
+        assert_eq!(cells[0].text, "    + move_player(");
+        assert_eq!(cells[1].text, "        time: Res<Time>,");
+        assert_eq!(cells.last().unwrap().text, "      ): Result<(), Error>");
     }
 
     #[test]
@@ -2585,6 +2499,94 @@ mod test {
                 < result_subtask.find("InspectionError").unwrap()
         );
         assert!(!result_subtask.contains("GeoParquetInspector"));
+    }
+
+    #[test]
+    fn deep_diagrams_preserve_all_entities_flow_branches_and_navigation() {
+        let mut document = test_fixture("deep", "Deep ownership");
+        let template = document.entity_changes[0].clone();
+        document.entity_changes = (0..160)
+            .map(|index| {
+                let mut entity = template.clone();
+                entity.name = format!("Owner{index}");
+                entity.kind = EntityKind::Struct;
+                entity.members.clear();
+                if index < 159 {
+                    entity.members.push(ProgramEntityMemberChange {
+                        action: ChangeAction::Add,
+                        renamed_from: None,
+                        kind: MemberKind::Field,
+                        name: "child".into(),
+                        description: None,
+                        visibility: None,
+                        type_name: Some(format!("Owner{}", index + 1)),
+                        parameters: Vec::new(),
+                        return_type: None,
+                    });
+                }
+                entity
+            })
+            .collect();
+        let graph = PlanGraph::new(&document);
+        assert_eq!(graph.presentation_parent("Owner159"), Some("Owner158"));
+        let mut renderer = PlanRenderer::new(&document);
+        render_object_model(&mut renderer, &document, &graph);
+        let mut nested = None;
+        for index in (0..160).rev() {
+            let mut edge = PlanFlowEdge {
+                relation: PlanFlowRelation::Emit,
+                target: EntityReference::ExternalEntity {
+                    entity_kind: ReferencedEntityKind::Endpoint,
+                    name: format!("destination{index}"),
+                    dependency: None,
+                },
+                callable: None,
+                payload_type: None,
+                return_type: None,
+                expansion: Vec::new(),
+                branches: Vec::new(),
+            };
+            if let Some(child) = nested {
+                if index % 2 == 0 {
+                    edge.branches.push(PlanFlowBranch {
+                        condition: format!("ready{index}"),
+                        edges: vec![child],
+                    });
+                } else {
+                    edge.expansion.push(child);
+                }
+            }
+            nested = Some(edge);
+        }
+        let flow = PlanFlow {
+            title: "Nested events".into(),
+            description: "Retain every event.".into(),
+            source: EntityReference::PlannedEntity {
+                entity: "Owner0".into(),
+            },
+            edges: vec![nested.unwrap()],
+        };
+        render_flow_rows(&mut renderer, &graph, &flow, "/flows/0");
+        let rendered = renderer.finish().unwrap();
+        for index in 0..160 {
+            assert!(rendered.navigation.anchor.iter().any(|anchor| matches!(
+                &anchor.target, PlanReviewTarget::Entity { name } if name == &format!("Owner{index}")
+            )));
+            assert!(
+                rendered
+                    .markdown
+                    .contains(&format!("Emit to destination{index}"))
+            );
+        }
+        for index in (0..159).step_by(2) {
+            assert!(rendered.navigation.anchor.iter().any(|anchor| matches!(
+                &anchor.target, PlanReviewTarget::FlowBranch { condition } if condition == &format!("ready{index}")
+            )));
+        }
+        assert!(
+            rendered.markdown.find("Emit to destination0").unwrap()
+                < rendered.markdown.find("Emit to destination159").unwrap()
+        );
     }
 
     #[test]

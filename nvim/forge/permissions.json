@@ -362,6 +362,7 @@
       "sh *": "deny",
       "sh.exe": "deny",
       "sh.exe *": "deny",
+      "shasum *": "allow",
       "sort": "allow",
       "sort *": "allow",
       "ss": "allow",

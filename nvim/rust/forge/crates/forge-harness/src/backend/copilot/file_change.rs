@@ -1,5 +1,5 @@
 use crate::backend::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, ensure};
 use forge_diff::{display::RowKind, patch::UnifiedPatch};
 
 /// Load reported file changes from native tool output without reading workspace files.
@@ -13,14 +13,30 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
         .file
         .into_iter()
         .map(|file| {
+            // Copilot prefixes its null-device marker as a/dev/null or b/dev/null.
+            // Decode it before a real workspace path can become relative dev/null.
             let old_path = file
                 .old_path
                 .as_deref()
+                .filter(|path| *path != "dev/null")
                 .map(|path| relative_path(path, workspace));
             let new_path = file
                 .new_path
                 .as_deref()
+                .filter(|path| *path != "dev/null")
                 .map(|path| relative_path(path, workspace));
+            let path = old_path
+                .as_ref()
+                .or(new_path.as_ref())
+                .context("Copilot file diff has no source path")?
+                .clone();
+            ensure!(
+                file.hunk.iter().all(|hunk| {
+                    (old_path.is_some() || hunk.old_lines.is_empty())
+                        && (new_path.is_some() || hunk.new_lines.is_empty())
+                }),
+                "Copilot file diff has source rows for an absent file"
+            );
             let kind = match (&old_path, &new_path) {
                 (None, _) => ProviderChangeKind::Add,
                 (_, None) => ProviderChangeKind::Delete,
@@ -44,12 +60,8 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
                     }
                 }
             }
-            ProviderFileChange {
-                path: old_path
-                    .as_ref()
-                    .or(new_path.as_ref())
-                    .expect("validated patch path")
-                    .clone(),
+            Ok(ProviderFileChange {
+                path,
                 move_path: if kind == ProviderChangeKind::Move {
                     new_path
                 } else {
@@ -57,9 +69,9 @@ pub(super) fn from_output(output: &str, workspace: &str) -> Result<ProviderChang
                 },
                 kind,
                 diff,
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(ProviderChangeSet { file })
 }
 
@@ -84,6 +96,157 @@ fn relative_path(path: &str, workspace: &str) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn prefixed_null_markers_render_as_additions_and_deletions() {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        use crate::buffer::projection::{ProjectionSource, project};
+        use crate::exchange::Exchange;
+        use forge_buffer::width::WidthProfile;
+
+        for workspace in ["/Users/me/project", "C:/project"] {
+            let reported_root = workspace.trim_start_matches('/');
+            let source = format!(
+                "diff --git a/{reported_root}/added.rs b/{reported_root}/added.rs\n\
+                 --- a/dev/null\n+++ b/{reported_root}/added.rs\n@@ -1,0 +1 @@\n+added\n\
+                 diff --git a/{reported_root}/capture_probe.rs b/dev/null\n\
+                 --- a/{reported_root}/capture_probe.rs\n+++ b/dev/null\n@@ -1,88 +0,0 @@\n{}",
+                "-removed\n".repeat(88),
+            );
+            let changes = from_output(&source, workspace).unwrap();
+            assert_eq!(changes.file.len(), 2);
+            assert_eq!(changes.file[0].kind, ProviderChangeKind::Add);
+            assert_eq!(changes.file[0].path, "added.rs");
+            assert_eq!(changes.file[1].kind, ProviderChangeKind::Delete);
+            assert_eq!(changes.file[1].path, "capture_probe.rs");
+            assert!(changes.file.iter().all(|file| file.move_path.is_none()));
+
+            let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+                "id":"changes", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Edit files", "kind":"chat", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))
+            .unwrap();
+            exchange.resume(0).unwrap();
+            let mut event = BackendEvent {
+                received_at_ms: None,
+                address: Some(ProviderAddress {
+                    owner: None,
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                }),
+                turn_boundary: Some(TurnBoundary::Started),
+                kind: "turn_started".into(),
+                text: None,
+                data: serde_json::Value::Null,
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            exchange.observe_turn(&event, 0).unwrap();
+            event.turn_boundary = None;
+            event.kind = "tool".into();
+            event.activity = Some(ToolActivity {
+                id: "edit".into(),
+                kind: ToolActivityKind::FileChange,
+                title: "apply_patch".into(),
+                output: Some(source),
+                output_delta: false,
+                status: Some("completed".into()),
+                change: changes,
+            });
+            exchange.observe_turn(&event, 1).unwrap();
+            let saved = serde_json::to_string(&exchange).unwrap();
+            let reopened: Exchange = serde_json::from_str(&saved).unwrap();
+            let projected = project(
+                ProjectionSource::Exchange(&reopened),
+                &WidthProfile::default(),
+                false,
+                &Default::default(),
+                &Default::default(),
+            )
+            .unwrap();
+            let rows = projected
+                .entry
+                .block
+                .iter()
+                .flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>();
+            assert!(rows.contains(&"New      added.rs +1 -0"), "{rows:?}");
+            assert!(
+                rows.contains(&"Deleted  capture_probe.rs +0 -88"),
+                "{rows:?}"
+            );
+            assert!(
+                rows.iter()
+                    .all(|row| !row.contains("Renamed") && !row.contains("dev/null"))
+            );
+        }
+    }
+
+    #[test]
+    fn null_markers_preserve_real_workspace_paths_and_empty_files() {
+        let workspace = "/Users/me/project";
+        for (old, new, kind, path) in [
+            (
+                "a/dev/null",
+                "b/Users/me/project/empty",
+                ProviderChangeKind::Add,
+                "empty",
+            ),
+            (
+                "a/Users/me/project/empty",
+                "b/dev/null",
+                ProviderChangeKind::Delete,
+                "empty",
+            ),
+            (
+                "a/dev/null",
+                "b/Users/me/project/dev/null",
+                ProviderChangeKind::Add,
+                "dev/null",
+            ),
+            (
+                "a/Users/me/project/dev/null",
+                "b/dev/null",
+                ProviderChangeKind::Delete,
+                "dev/null",
+            ),
+            (
+                "a/Users/me/project/dev/null",
+                "b/Users/me/project/dev/null",
+                ProviderChangeKind::Update,
+                "dev/null",
+            ),
+            (
+                "a/Users/me/project/old",
+                "b/Users/me/project/dev/null",
+                ProviderChangeKind::Move,
+                "old",
+            ),
+        ] {
+            let source = format!("--- {old}\n+++ {new}\n");
+            let changes = from_output(&source, workspace).unwrap();
+            assert_eq!(changes.file[0].kind, kind, "{source}");
+            assert_eq!(changes.file[0].path, path, "{source}");
+            assert_eq!(
+                changes.file[0].move_path.as_deref(),
+                (kind == ProviderChangeKind::Move).then_some("dev/null")
+            );
+        }
+        let ordinary =
+            UnifiedPatch::parse("--- a/old\n+++ b/dev/null\n@@ -1 +1 @@\n-old\n+new\n").unwrap();
+        assert_eq!(ordinary.file[0].new_path.as_deref(), Some("dev/null"));
+        for source in [
+            "--- a/dev/null\n+++ b/dev/null\n",
+            "--- a/dev/null\n+++ b/Users/me/project/file\n@@ -1 +1 @@\n-old\n+new\n",
+            "--- a/Users/me/project/file\n+++ b/dev/null\n@@ -1 +1 @@\n-old\n+new\n",
+        ] {
+            assert!(from_output(source, workspace).is_err(), "{source}");
+        }
+    }
 
     #[test]
     fn decodes_multiple_operations_and_exact_hunk_coordinates() {

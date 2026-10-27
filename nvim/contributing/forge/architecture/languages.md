@@ -173,6 +173,12 @@ can move rows, so source-token maps remain distinct from displayed coordinates.
 Callable references retain their exact source expression even when inferred
 receiver resolution is unavailable.
 
+Declaration comment scans, protected literal scans, callable extraction, and
+structural indexing traverse complete syntax trees without a nesting ceiling.
+Work lists replace recursive descent, including receiver-type inference, while
+preserving lexical occurrence order and restoring bindings after each scope.
+Rust public-macro recovery also visits every subtree without a depth cutoff.
+
 The Rust navigation boundary uses one-based lines and zero-based UTF-8 byte
 columns. The Lua adapter converts byte columns to the selected client's position
 encoding before a request, then converts returned locations back to byte columns.

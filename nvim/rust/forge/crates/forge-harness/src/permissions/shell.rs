@@ -118,12 +118,7 @@ pub fn highlights(command: &str, shell: CommandShell) -> Vec<CommandHighlight> {
     };
     let mut result = Vec::new();
     let mut pending = vec![(tree.root_node(), 0)];
-    let mut visited = 0;
     while let Some((node, depth)) = pending.pop() {
-        visited += 1;
-        if depth > 64 || visited > 8192 {
-            break;
-        }
         let group = match node.kind() {
             "comment" | "line_comment" | "block_comment" => Some("Comment"),
             "command_parameter" | "long_flag" | "short_flag" => Some("ForgeHarnessOption"),

@@ -63,6 +63,12 @@ transports and expose capability values that drive broker and editor behavior. `
 remains private to the Codex implementation. `CopilotEventDecoder` remains private to the native
 Copilot SDK implementation. Consumer-owned traits stay beside the feature that consumes them.
 
+Copilot's native file tools report absent sides as `a/dev/null` and `b/dev/null`.
+The Copilot diff adapter recognizes those markers before converting workspace
+paths to relative paths, so additions and deletions cannot become renames to a
+device path. A real workspace file named `dev/null` retains its identity after
+normalization. The shared ordinary-Git patch parser keeps its standard path rules.
+
 `MockBackend` implements the same provider boundary with deterministic responses.
 Its `backend/mock_response.rs` control stores session-scoped, one-response holds.
 The `backend.mock_response` host route handles hold, wait, release, and cancel
@@ -91,6 +97,27 @@ a domain followed by an action or query, without a `harness_` prefix. The curren
 LSP query tool is `lsp`. Provider MCP namespaces identify the server separately.
 Catalogs, dispatch, prompts, and activity handling use the same names. Old prefixed
 names are not registered as aliases.
+
+Copilot permission responses include denial feedback for saved policy, approval
+mode, user rejection, timeout, and evaluation errors. `PermissionCoordinator`
+distinguishes automatic denials from user choices before the adapter formats the
+feedback. Cancellation remains a separate outcome without continuation guidance.
+The current interaction contract and rejection feedback share reject-all guidance:
+the model continues autonomously with whitelisted commands and permitted tools,
+without waiting for approval or bypassing the restriction.
+The adapter marks native rejected tools as denied and retains terminal status
+when late progress arrives. Its per-prompt rejection state ignores native child
+events and requires a subsequent complete final answer or authoritative Harness
+control handoff before accepting completion. Provider idle without either becomes
+an explicit exchange failure, not an automatic retry or a fabricated assistant answer.
+Both native `denied` and `rejected` tool-error codes use the same classification.
+When Copilot supplies a final answer after denial, the adapter consumes that
+execution owner's pending timeout guidance so the input scheduler does not start
+a redundant continuation. Unanswered denials retain the guidance for recovery.
+The mock approval backend models denial as a tool result followed by permitted
+continuation, while cancellation still interrupts the response. Host coverage
+lets approval deadlines expire without user input and observes popup removal,
+automatic-timeout attribution, resumed activity, and final idle publication.
 
 ACP tool updates merge by native tool-call identity, so sparse completion notifications retain
 their original title, category, and content. Structured diff content becomes a `ProviderChangeSet`

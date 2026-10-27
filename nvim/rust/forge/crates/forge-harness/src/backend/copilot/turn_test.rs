@@ -682,6 +682,343 @@ fn fixture() -> Result<(tempfile::TempDir, CopilotBackend, BackendRequest)> {
 }
 
 #[tokio::test]
+async fn copilot_rejection_feedback_preserves_denial_origin_and_cancellation() -> Result<()> {
+    use crate::backend::approval::{ApprovalAnswer, ApprovalRequestView};
+    use crate::permissions::document::{CATEGORY_TOOL, PermissionDecision};
+
+    for scenario in [
+        "policy",
+        "policy-autonomous",
+        "mode",
+        "user",
+        "timeout",
+        "cancel",
+        "allow",
+        "invalid",
+    ] {
+        let (_root, backend, request) = fixture()?;
+        let coordinator = backend.permission_coordinator.clone();
+        let mode = match scenario {
+            "policy" | "allow" => ApprovalMode::Allow,
+            "mode" | "policy-autonomous" => ApprovalMode::Deny,
+            _ => ApprovalMode::Ask,
+        };
+        coordinator.store().write().unwrap().set_rule_list(&[(
+            CATEGORY_TOOL.into(),
+            "sample".into(),
+            if scenario.starts_with("policy") {
+                PermissionDecision::Deny
+            } else {
+                PermissionDecision::Ask
+            },
+        )])?;
+        coordinator.configure_timeout(
+            &request.harness_session_id,
+            crate::session::InputTimeout {
+                amount: if scenario == "timeout" { 1 } else { 0 },
+                unit: crate::session::TimeoutUnit::S,
+            },
+        )?;
+        let before = coordinator.store().read().unwrap().open().1;
+        let (sink, mut events) = crate::backend::events::channel();
+        let context = backend.permission_context(&request.runtime_key()?).await;
+        context.configure(
+            request.owner()?,
+            mode,
+            request.workspace.clone(),
+            Some(sink),
+        )?;
+        let handler = CopilotPermissionHandler {
+            context: context.clone(),
+        };
+        let task = tokio::spawn(async move {
+            handler
+                .handle(
+                    SessionId::new("native"),
+                    RequestId::new("request"),
+                    serde_json::from_value(if scenario == "invalid" {
+                        json!({"kind":"shell","fullCommandText":"echo '","shell":"bash"})
+                    } else {
+                        json!({"kind":"custom-tool","toolName":"sample"})
+                    })
+                    .unwrap(),
+                )
+                .await
+        });
+        if matches!(scenario, "user" | "cancel" | "timeout") {
+            let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                .await??
+                .context("approval event missing")?;
+            let view: ApprovalRequestView = serde_json::from_value(event.data)?;
+            if scenario != "timeout" {
+                coordinator
+                    .resolve(
+                        &view.id,
+                        &[ApprovalAnswer {
+                            item_id: view.item_list[0].id.clone(),
+                            choice_id: if scenario == "cancel" {
+                                "cancel"
+                            } else {
+                                "deny_once"
+                            }
+                            .into(),
+                        }],
+                        None,
+                    )
+                    .await?;
+            }
+        }
+        let PermissionResult::Decision(decision) =
+            tokio::time::timeout(std::time::Duration::from_secs(3), task).await??
+        else {
+            panic!("permission returned no decision")
+        };
+        let decision = serde_json::to_value(decision)?;
+        if scenario == "allow" {
+            assert_eq!(decision["kind"], "approve-once");
+        } else {
+            assert_eq!(decision["kind"], "reject");
+            if scenario == "cancel" {
+                assert!(decision.get("feedback").is_none());
+            } else {
+                let feedback = decision["feedback"]
+                    .as_str()
+                    .context("missing rejection feedback")?;
+                assert!(
+                    feedback.starts_with(
+                        "Tool call rejected. The requested operation was not executed."
+                    )
+                );
+                assert!(feedback.contains("Do not retry or bypass this denial."));
+                assert!(feedback.contains("explain the blocker to the user"));
+                let reason = match scenario {
+                    "policy" | "policy-autonomous" => {
+                        "Harness permission or filesystem access policy"
+                    }
+                    "mode" => "Reject-all approval mode is active",
+                    "user" => "Rejected by the user",
+                    "timeout" => "timeout expired",
+                    "invalid" => "permission evaluation failed",
+                    _ => unreachable!(),
+                };
+                assert!(feedback.contains(reason), "{scenario}: {feedback}");
+                assert_eq!(
+                    feedback.contains("Rejected by the user"),
+                    scenario == "user"
+                );
+                assert_eq!(
+                    feedback.contains("Automatically rejected"),
+                    scenario != "user"
+                );
+                if mode == ApprovalMode::Deny {
+                    assert!(feedback.contains("operating autonomously"));
+                    assert!(feedback.contains("whitelisted commands"));
+                    assert!(feedback.contains("Do not wait for user approval"));
+                }
+            }
+        }
+        assert_eq!(
+            context.state.lock().unwrap().cancelled,
+            scenario == "cancel"
+        );
+        assert_eq!(coordinator.store().read().unwrap().open().1, before);
+        context.configure(request.owner()?, mode, request.workspace.clone(), None)?;
+        assert!(!context.state.lock().unwrap().cancelled);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn copilot_rejection_without_answer_fails_instead_of_completing() -> Result<()> {
+    for code in ["rejected", "denied"] {
+        for response in ["missing", "commentary", "final", "child", "cancel"] {
+            let (_root, backend, request) = fixture()?;
+            let expires = code == "denied" && matches!(response, "missing" | "final");
+            let owner = request.owner()?;
+            backend.permission_coordinator.configure_timeout(
+                &request.harness_session_id,
+                crate::session::InputTimeout {
+                    amount: 1,
+                    unit: crate::session::TimeoutUnit::S,
+                },
+            )?;
+            backend
+                .permission_coordinator
+                .store()
+                .write()
+                .unwrap()
+                .set_rule_list(&[(
+                    crate::permissions::document::CATEGORY_BASH.into(),
+                    "mock-probe".into(),
+                    crate::permissions::document::PermissionDecision::Ask,
+                )])?;
+            let permission_before = backend
+                .permission_coordinator
+                .store()
+                .read()
+                .unwrap()
+                .open()
+                .1;
+            let context = backend.permission_context(&request.runtime_key()?).await;
+            let (client_read, mut server_write) = tokio::io::duplex(65536);
+            let (client_write, mut server_read) = tokio::io::duplex(65536);
+            *backend.client.lock().await = Some(Client::from_streams(
+                client_read,
+                client_write,
+                PathBuf::from(&request.workspace),
+            )?);
+            let (sink, mut events) = crate::backend::events::channel();
+            let server = async {
+                let create = read_request(&mut server_read).await?;
+                assert_eq!(create["method"], "session.create");
+                let session_id = create["params"]["sessionId"]
+                    .as_str()
+                    .context("missing session")?
+                    .to_owned();
+                respond(
+                    &mut server_write,
+                    &create,
+                    json!({"result":{"sessionId":session_id,"workspacePath":"."}}),
+                )
+                .await?;
+                for (method, result) in [
+                    (
+                        "session.plan.readSqlTodosWithDependencies",
+                        json!({"rows":[],"dependencies":[]}),
+                    ),
+                    ("session.eventLog.tail", json!({"cursor":"before"})),
+                    ("session.send", json!({"messageId":"prompt"})),
+                ] {
+                    let message = read_request(&mut server_read).await?;
+                    assert_eq!(message["method"], method);
+                    respond(&mut server_write, &message, json!({"result":result})).await?;
+                }
+                let mut notification = vec![
+                    ("assistant.turn_start", json!({"turnId":"turn"})),
+                    (
+                        "tool.execution_start",
+                        json!({"toolCallId":"denied","toolName":"bash","arguments":{"command":"echo sample"}}),
+                    ),
+                    (
+                        "tool.execution_complete",
+                        json!({"toolCallId":"denied","success":false,"error":{"code":code,"message":"Tool call rejected. Denied by policy."}}),
+                    ),
+                    (
+                        "tool.execution_progress",
+                        json!({"toolCallId":"denied","progressMessage":"late progress"}),
+                    ),
+                ];
+                if response != "missing" && response != "cancel" {
+                    notification.push((
+                    "assistant.message",
+                    json!({
+                        "messageId":"answer","content":"Cannot run that command.",
+                        "phase":if response == "commentary" { "commentary" } else { "final_answer" }
+                    }),
+                ));
+                }
+                notification.push(("session.idle", json!({})));
+                if response == "cancel" {
+                    context.state.lock().unwrap().cancelled = true;
+                }
+                for (index, (kind, mut data)) in notification.into_iter().enumerate() {
+                    if expires && kind == "tool.execution_complete" {
+                        write_frame(
+                            &mut server_write,
+                            json!({"jsonrpc":"2.0","method":"session.event",
+                            "params":{"sessionId":session_id,"event":{
+                                "id":"permission", "type":"permission.requested",
+                                "timestamp":"2026-10-27T12:00:00Z",
+                                "data":{"requestId":"permission", "toolCallId":"denied",
+                                    "kind":"shell", "fullCommandText":"mock-probe"}
+                            }}}),
+                        )
+                        .await?;
+                        let decision = read_request(&mut server_read).await?;
+                        assert_eq!(
+                            decision["method"],
+                            "session.permissions.handlePendingPermissionRequest"
+                        );
+                        assert_eq!(decision["params"]["requestId"], "permission");
+                        assert_eq!(decision["params"]["result"]["kind"], "reject");
+                        let feedback = decision["params"]["result"]["feedback"]
+                            .as_str()
+                            .context("missing native timeout feedback")?;
+                        assert!(feedback.contains("Automatically rejected"));
+                        assert!(feedback.contains("timeout expired"));
+                        assert!(feedback.contains("not executed"));
+                        assert!(!feedback.contains("Rejected by the user"));
+                        assert!(
+                            backend
+                                .permission_coordinator
+                                .has_timeout_feedback(&owner)?
+                        );
+                        data["error"]["message"] = json!(feedback);
+                        respond(&mut server_write, &decision, json!({"result":{}})).await?;
+                    }
+                    let mut event = json!({"id":format!("event-{index}"),"type":kind,
+                    "timestamp":"2026-10-27T12:00:00Z","data":data});
+                    if response == "child" && kind == "assistant.message" {
+                        event["agentId"] = json!("child");
+                    }
+                    write_frame(
+                        &mut server_write,
+                        json!({"jsonrpc":"2.0","method":"session.event",
+                    "params":{"sessionId":session_id,"event":event}}),
+                    )
+                    .await?;
+                }
+                Ok::<_, anyhow::Error>(())
+            };
+            let (server, result) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::join!(server, backend.prompt_stream(request.clone(), Some(sink)))
+            })
+            .await?;
+            server?;
+            match response {
+                "final" => {
+                    result?;
+                }
+                "cancel" => assert!(result.unwrap_err().is::<crate::broker::TurnCancelled>()),
+                _ => assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("stopped after a tool rejection without a final response")
+                ),
+            }
+            let mut latest = None;
+            while let Ok(event) = events.try_recv() {
+                if let Some(activity) = event.activity {
+                    latest = Some(activity);
+                }
+            }
+            assert_eq!(
+                latest.context("tool status missing")?.status.as_deref(),
+                Some("denied")
+            );
+            assert_eq!(
+                backend
+                    .permission_coordinator
+                    .has_timeout_feedback(&owner)?,
+                expires && response != "final"
+            );
+            assert_eq!(
+                backend
+                    .permission_coordinator
+                    .store()
+                    .read()
+                    .unwrap()
+                    .open()
+                    .1,
+                permission_before
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn copilot_submission_reconciliation_excludes_known_messages_and_ambiguous_history()
 -> Result<()> {
     for ambiguous in [false, true] {

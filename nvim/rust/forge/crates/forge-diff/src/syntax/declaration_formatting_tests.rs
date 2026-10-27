@@ -3,6 +3,44 @@ use tree_sitter::{Node, Parser};
 
 const WIDTHS: [usize; 6] = [40, 60, 80, 100, 120, 240];
 
+#[test]
+fn presentation_width_preferences_preserve_declaration_meaning() {
+    let identifier = format!("Contract{}", "X".repeat(8193));
+    for (path, source) in [
+        (
+            "contract.rs",
+            format!(
+                "/// Preserve the complete contract at every display width.\npub fn inspect(value: &{identifier}) -> &{identifier};\n"
+            ),
+        ),
+        (
+            "contract.ts",
+            format!(
+                "/** Preserve the complete contract at every display width. */\nexport function inspect(value: {identifier}): {identifier};\n"
+            ),
+        ),
+        (
+            "contract.lua",
+            format!(
+                "--- Preserve the complete contract at every display width.\nfunction inspect({identifier})\n"
+            ),
+        ),
+    ] {
+        let language = DeclarationOverview::language(path).unwrap();
+        let expected = meaning(language, &source);
+        for width in [0, 1, 12, 4097, usize::MAX] {
+            let formatted = DeclarationOverview::format_with_width(path, &source, width).unwrap();
+            assert!(formatted.contains(&identifier));
+            assert_eq!(meaning(language, &formatted), expected, "{path}: {width}");
+            assert_eq!(
+                DeclarationOverview::format_with_width(path, &formatted, width).unwrap(),
+                formatted,
+                "{path}: {width}"
+            );
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Meaning {
     syntax: Vec<String>,

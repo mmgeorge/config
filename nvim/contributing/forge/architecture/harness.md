@@ -89,6 +89,8 @@ Timeline ownership has no event-count or history-length limit. Recursive agent
 rendering grows stack segments instead of rejecting a fixed nesting depth, and
 persisted JSON uses the shared stack-growing codec. Output paging controls the
 materialized view without discarding the underlying content.
+Agent selection and refresh locate nested runs through an explicit work list,
+including runs attached to exchange entries, without a separate lookup-depth limit.
 
 Automatic repair reopens the completed owning exchange through a dedicated check
 transition and preserves its prompt, usage, and original checkpoint. Ordinary
@@ -293,8 +295,9 @@ transcript, while the composer retains its normal `W` behavior.
 
 The composer shares session commands with the transcript in Normal mode, including
 question and approval reopening, model selection, artifacts, help, and closing.
-Only row-targeted timeline navigation and selection are excluded from its command
-set. Insert-mode typing and prompt-history navigation retain their own bindings.
+Only timeline row activation and gutter selection are excluded from its command
+set. Prompt navigation and activity toggling focus the transcript before acting.
+Insert-mode typing and prompt-history navigation retain their own bindings.
 
 Timeline prompts and final-response bodies use `●`, thoughts use `○`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
 `▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
@@ -1439,10 +1442,11 @@ context followed by the sole command hint, `? help`, using the configured help b
 Every field separator uses the shared small gray `·` segment from `shared/keymaps`.
 Separators retain their own highlight independently of permission, lifecycle, and error text.
 The composer displays no key hints. Its bindings cover submission, queue editing,
-cancellation, write toggling, reasoning adjustment, and prompt history. Transcript
-navigation, help, and close bindings remain in the transcript so they do not replace
-native prompt editing keys. `/config` displays
-the underlying CLI provider.
+cancellation, write toggling, reasoning adjustment, prompt history, and shared
+Normal-mode session commands. Help and closing work in either pane independently
+of filesystem permissions. Timeline row activation and gutter selection remain
+transcript-only so the composer retains its native Enter, `.`, and `W` behavior.
+`/config` displays the underlying CLI provider.
 The winbar prefixes the model and thinking level with a gray outlined lightning glyph
 (`󱐌`, U+F140C) for Fast or a filled glyph (`󱐋`, U+F140B) in YOLO's neon red for Ultrafast,
 including before the model catalog loads. Standard has no glyph. The icon and gray

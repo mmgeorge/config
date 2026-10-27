@@ -27,7 +27,7 @@
 --- Per-repository config read from `<repo root>/.forge.json`.
 ---@class ForgeRepoConfig
 ---@field branch_prefix? string
----@field declaration_line_width? integer declaration formatting width from 40 through 240, default 80
+---@field declaration_line_width? integer preferred declaration formatting width, default 80; zero uses one column
 
 ---@alias ForgeKeymap string|string[]|false
 

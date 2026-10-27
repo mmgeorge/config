@@ -18,6 +18,14 @@ fold boundaries without copying unrelated document blocks.
 `ForgeRuntime` composes the shared repository, analysis, GitHub, and document services.
 Opening a non-Harness view does not create a Harness session.
 
+Display-width profiles accept positive viewport widths and tab stops without upper
+admission limits. Custom character-width ranges remain ordered and disjoint, with
+binary lookup during measurement and no range-count ceiling. Variable tab stops
+use remaining-column arithmetic rather than accumulating potentially overflowing
+positions. Only invalid geometry and actual display-width overflow fail validation
+or measurement. Plan check tables retain complete commands in saved artifacts and
+wrap them for the review viewport without imposing a content-width limit.
+
 `forge.buffer` applies native patches to physical buffers. Neovim owns unsent PR and issue
 field text. Explicit saves capture region bodies and revisions together. A queued save retains
 that capture rather than reading newer unsaved text when dispatch starts. Completion advances

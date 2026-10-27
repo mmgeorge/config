@@ -7,6 +7,30 @@ use crate::permissions::matcher::{
 };
 use crate::session::ApprovalMode;
 
+#[test]
+fn deep_command_highlights_do_not_weaken_permission_analysis() {
+    let command = format!(
+        "{}probe deep-marker\n{}probe tail-marker\n",
+        "if true; then\n".repeat(80),
+        "fi\n".repeat(80)
+    );
+    let highlights = highlights(&command, CommandShell::Bash);
+    for marker in ["probe deep-marker", "probe tail-marker"] {
+        let start = command.find(marker).unwrap();
+        assert!(
+            highlights
+                .iter()
+                .any(|highlight| highlight.range.start == start
+                    && highlight.group == "ForgeHarnessCommand"),
+            "{marker}"
+        );
+    }
+    assert!(matches!(
+        parse(&command, CommandShell::Bash).failure,
+        Some(CommandAnalysisFailure::Incomplete(_))
+    ));
+}
+
 fn policy(default: &str, probe: &str) -> CompiledPermissionDocument {
     let document = serde_json::json!({"permission": {"bash": {"*": default, "probe *": probe}}});
     CompiledPermissionDocument::compile(

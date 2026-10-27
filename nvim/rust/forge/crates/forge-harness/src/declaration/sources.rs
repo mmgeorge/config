@@ -39,7 +39,7 @@ pub(super) fn project(resolver: &mut DeclarationResolver) -> Result<()> {
             } else {
                 vec![stem.into()]
             };
-            resolver.load_rust(&resolver.workspace.join(path), "workspace", &module, 0)?;
+            resolver.load_rust(&resolver.workspace.join(path), "workspace", &module)?;
         }
     } else {
         install_project_fallback(resolver, &manifests)?;
@@ -112,7 +112,7 @@ fn loose_project_files(resolver: &mut DeclarationResolver) -> Result<()> {
         }
         state.incomplete = true;
         resolver.package.insert(identity.clone(), state);
-        resolver.load_rust(&resolver.workspace.join(path), &identity, &[], 0)?;
+        resolver.load_rust(&resolver.workspace.join(path), &identity, &[])?;
     }
     Ok(())
 }

@@ -48,7 +48,6 @@ pub enum SyntaxError {
     Query(String),
     Closed,
     Busy,
-    CaptureLimit,
     Cancelled,
     Deadline,
     WorkerFailed,

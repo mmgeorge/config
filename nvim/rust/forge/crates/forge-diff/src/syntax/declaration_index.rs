@@ -151,7 +151,7 @@ impl DeclarationIndex {
             && source.contains("pub macro")
         {
             let mut projection = source.as_bytes().to_vec();
-            if project_public_macros(tree.root_node(), source, &mut projection, 0) {
+            if project_public_macros(tree.root_node(), source, &mut projection) {
                 tree = parser
                     .parse(&projection, None)
                     .ok_or(SyntaxError::Cancelled)?;
@@ -175,7 +175,7 @@ impl DeclarationIndex {
                 source
             };
             lua_imports(tree.root_node(), source, &mut index);
-            lua_symbols(tree.root_node(), source, &mut index, &[], 0)?;
+            lua_symbols(tree.root_node(), source, &mut index, &[]);
             return Ok((
                 index,
                 DeclarationIndexTiming {
@@ -207,19 +207,7 @@ impl DeclarationIndex {
                 }
             }
         }
-        walk(
-            tree.root_node(),
-            source,
-            language,
-            &[],
-            "",
-            0,
-            false,
-            false,
-            false,
-            &mut index,
-            0,
-        )?;
+        walk(tree.root_node(), source, language, &mut index);
         Ok((
             index,
             DeclarationIndexTiming {
@@ -296,13 +284,7 @@ fn lua_imports(root: Node<'_>, source: &str, index: &mut DeclarationIndex) {
     }
 }
 
-fn lua_symbols(
-    root: Node<'_>,
-    source: &str,
-    index: &mut DeclarationIndex,
-    scope: &[String],
-    depth: usize,
-) -> Result<(), SyntaxError> {
+fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String]) {
     let mut local = std::collections::HashSet::new();
     let mut exported = std::collections::HashSet::new();
     for statement in children(root) {
@@ -335,7 +317,7 @@ fn lua_symbols(
             }
         }
     }
-    lua_symbol_walk(root, source, index, scope, &local, &exported, depth)
+    lua_symbol_walk(root, source, index, scope, &local, &exported)
 }
 
 fn lua_symbol_walk(
@@ -345,138 +327,135 @@ fn lua_symbol_walk(
     scope: &[String],
     local: &std::collections::HashSet<String>,
     exported: &std::collections::HashSet<String>,
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
-    }
-    if node.kind() == "function_declaration" {
-        if let Some(name) = node.child_by_field_name("name") {
-            let parts = contents(name, source)
-                .replace(':', ".")
-                .split('.')
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
-            let Some(member) = parts.last() else {
-                return Ok(());
-            };
-            let mut owner = scope.to_vec();
-            owner.extend(parts[..parts.len() - 1].iter().cloned());
-            if parts.len() > 1 {
-                let path = parts[..parts.len() - 1].to_vec();
+) {
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "function_declaration" {
+            if let Some(name) = node.child_by_field_name("name") {
+                let parts = contents(name, source)
+                    .replace(':', ".")
+                    .split('.')
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let Some(member) = parts.last() else {
+                    continue;
+                };
+                let mut owner = scope.to_vec();
+                owner.extend(parts[..parts.len() - 1].iter().cloned());
+                if parts.len() > 1 {
+                    let path = parts[..parts.len() - 1].to_vec();
+                    index.reference.push(DeclarationReference {
+                        length: path.join(".").len(),
+                        path,
+                        position: position(name),
+                        scope: scope.to_vec(),
+                        value_namespace: true,
+                        macro_namespace: false,
+                        conditional: false,
+                    });
+                }
+                let private = contents(node, source).trim_start().starts_with("local ")
+                    || parts
+                        .first()
+                        .is_some_and(|root| local.contains(root) && !exported.contains(root));
+                index.symbol.push(DeclarationSymbol {
+                    role: DeclarationRole::Callable,
+                    external_entry: false,
+                    property: false,
+                    name: member.clone(),
+                    scope: owner,
+                    position: DeclarationPosition {
+                        line: position(name).line,
+                        column: position(name).column + contents(name, source).len() as u32
+                            - member.len() as u32,
+                    },
+                    visibility: if private {
+                        SymbolVisibility::Private
+                    } else {
+                        SymbolVisibility::Public
+                    },
+                    type_namespace: false,
+                    value_namespace: true,
+                    macro_namespace: false,
+                    conditional: false,
+                    global: !private,
+                    parameter: false,
+                });
+            }
+            continue;
+        }
+        if node.kind() == "return_statement" {
+            for expression in children(node)
+                .into_iter()
+                .filter(|child| child.kind() == "expression_list")
+                .flat_map(children)
+                .filter(|child| child.kind() == "identifier")
+            {
                 index.reference.push(DeclarationReference {
-                    length: path.join(".").len(),
-                    path,
-                    position: position(name),
+                    path: vec![contents(expression, source).into()],
+                    position: position(expression),
+                    length: contents(expression, source).len(),
                     scope: scope.to_vec(),
                     value_namespace: true,
                     macro_namespace: false,
                     conditional: false,
                 });
             }
-            let private = contents(node, source).trim_start().starts_with("local ")
-                || parts
-                    .first()
-                    .is_some_and(|root| local.contains(root) && !exported.contains(root));
-            index.symbol.push(DeclarationSymbol {
-                role: DeclarationRole::Callable,
-                external_entry: false,
-                property: false,
-                name: member.clone(),
-                scope: owner,
-                position: DeclarationPosition {
-                    line: position(name).line,
-                    column: position(name).column + contents(name, source).len() as u32
-                        - member.len() as u32,
-                },
-                visibility: if private {
-                    SymbolVisibility::Private
-                } else {
-                    SymbolVisibility::Public
-                },
-                type_namespace: false,
-                value_namespace: true,
-                macro_namespace: false,
-                conditional: false,
-                global: !private,
-                parameter: false,
-            });
+            continue;
         }
-        return Ok(());
-    }
-    if node.kind() == "return_statement" {
-        for expression in children(node)
-            .into_iter()
-            .filter(|child| child.kind() == "expression_list")
-            .flat_map(children)
-            .filter(|child| child.kind() == "identifier")
+        if node.kind() == "variable_list"
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "assignment_statement")
         {
-            index.reference.push(DeclarationReference {
-                path: vec![contents(expression, source).into()],
-                position: position(expression),
-                length: contents(expression, source).len(),
-                scope: scope.to_vec(),
-                value_namespace: true,
-                macro_namespace: false,
-                conditional: false,
-            });
-        }
-        return Ok(());
-    }
-    if node.kind() == "variable_list"
-        && node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "assignment_statement")
-    {
-        for name in children(node)
-            .into_iter()
-            .filter(|child| matches!(child.kind(), "identifier" | "dot_index_expression"))
-        {
-            let name_text = contents(name, source);
-            if index
-                .import
-                .iter()
-                .any(|import| import.alias.as_deref() == Some(name_text))
+            for name in children(node)
+                .into_iter()
+                .filter(|child| matches!(child.kind(), "identifier" | "dot_index_expression"))
             {
-                continue;
+                let name_text = contents(name, source);
+                if index
+                    .import
+                    .iter()
+                    .any(|import| import.alias.as_deref() == Some(name_text))
+                {
+                    continue;
+                }
+                let mut parts = name_text.split('.').map(str::to_owned).collect::<Vec<_>>();
+                let member = parts.pop().unwrap();
+                let root = parts.first().map(String::as_str).unwrap_or(&member);
+                let public = !local.contains(root) || exported.contains(root);
+                index.symbol.push(DeclarationSymbol {
+                    role: if parts.is_empty() {
+                        DeclarationRole::Value
+                    } else {
+                        DeclarationRole::Property
+                    },
+                    external_entry: false,
+                    property: !parts.is_empty(),
+                    name: member.clone(),
+                    scope: scope.iter().cloned().chain(parts).collect(),
+                    position: DeclarationPosition {
+                        line: position(name).line,
+                        column: position(name).column + name_text.len() as u32
+                            - member.len() as u32,
+                    },
+                    visibility: if public {
+                        SymbolVisibility::Public
+                    } else {
+                        SymbolVisibility::Private
+                    },
+                    type_namespace: false,
+                    value_namespace: true,
+                    macro_namespace: false,
+                    conditional: false,
+                    global: public,
+                    parameter: false,
+                });
             }
-            let mut parts = name_text.split('.').map(str::to_owned).collect::<Vec<_>>();
-            let member = parts.pop().unwrap();
-            let root = parts.first().map(String::as_str).unwrap_or(&member);
-            let public = !local.contains(root) || exported.contains(root);
-            index.symbol.push(DeclarationSymbol {
-                role: if parts.is_empty() {
-                    DeclarationRole::Value
-                } else {
-                    DeclarationRole::Property
-                },
-                external_entry: false,
-                property: !parts.is_empty(),
-                name: member.clone(),
-                scope: scope.iter().cloned().chain(parts).collect(),
-                position: DeclarationPosition {
-                    line: position(name).line,
-                    column: position(name).column + name_text.len() as u32 - member.len() as u32,
-                },
-                visibility: if public {
-                    SymbolVisibility::Public
-                } else {
-                    SymbolVisibility::Private
-                },
-                type_namespace: false,
-                value_namespace: true,
-                macro_namespace: false,
-                conditional: false,
-                global: public,
-                parameter: false,
-            });
+            continue;
         }
-        return Ok(());
+        pending.extend(children(node).into_iter().rev());
     }
-    for child in children(node) {
-        lua_symbol_walk(child, source, index, scope, local, exported, depth + 1)?;
-    }
-    Ok(())
 }
 
 fn declaration_role(kind: &str) -> DeclarationRole {
@@ -723,393 +702,429 @@ fn member_owner(
     })
 }
 
-fn walk(
-    node: Node<'_>,
-    source: &str,
-    language: SyntaxLanguage,
-    scope: &[String],
-    attributes: &str,
+struct DeclarationFrame<'tree> {
+    node: Node<'tree>,
+    scope: Vec<String>,
+    attributes: String,
     ordinal: usize,
     exported: bool,
     conditional: bool,
     global: bool,
-    index: &mut DeclarationIndex,
-    depth: usize,
-) -> Result<(), SyntaxError> {
-    if depth > 128 {
-        return Err(SyntaxError::CaptureLimit);
-    }
-    let rust = language == SyntaxLanguage::Rust;
-    let kind = node.kind();
-    let public_macro = rust
-        && kind == "function_item"
-        && contents(node, source)
-            .trim_start()
-            .starts_with("pub macro ");
-    if matches!(
-        kind,
-        "block"
-            | "comment"
-            | "line_comment"
-            | "block_comment"
-            | "attribute_item"
-            | "inner_attribute_item"
-            | "decorator"
-    ) {
-        return Ok(());
-    }
-    if kind == "statement_block"
-        && !node.parent().is_some_and(|parent| {
-            matches!(
-                parent.kind(),
-                "internal_module" | "module" | "ambient_declaration"
-            )
-        })
-    {
-        return Ok(());
-    }
-    if kind == "ambient_declaration"
-        && contents(node, source)
-            .trim_start()
-            .starts_with("declare global")
-    {
-        for child in children(node) {
-            walk(
-                child,
-                source,
-                language,
-                &[],
-                "",
-                0,
-                false,
-                conditional,
-                true,
-                index,
-                depth + 1,
-            )?;
-        }
-        return Ok(());
-    }
-    if kind == "macro_invocation" {
-        index.incomplete = true;
-        return Ok(());
-    }
-    if kind == "use_declaration" {
-        if let Some(argument) = node.child_by_field_name("argument") {
-            rust_import(
-                argument,
-                source,
-                scope,
-                &[],
-                visibility(node, source, exported, true),
-                conditional,
-                index,
-            );
-        }
-        return Ok(());
-    }
-    if !rust && matches!(kind, "import_statement" | "export_statement") {
-        if contents(node, source).trim_start().starts_with("export =")
-            || children(node)
-                .iter()
-                .any(|child| child.kind() == "import_require_clause")
-        {
-            index.incomplete = true;
-        }
-        typescript_import(node, source, scope, conditional, index);
-        if let Some(declaration) = node.child_by_field_name("declaration") {
-            return walk(
-                declaration,
-                source,
-                language,
-                scope,
-                "",
-                0,
-                kind == "export_statement",
-                conditional,
-                global,
-                index,
-                depth + 1,
-            );
-        }
-        for child in children(node).into_iter().filter(|child| {
-            !matches!(
-                child.kind(),
-                "import_clause" | "export_clause" | "namespace_export" | "string" | "identifier"
-            )
-        }) {
-            walk(
-                child,
-                source,
-                language,
-                scope,
-                "",
-                0,
-                kind == "export_statement",
-                conditional,
-                global,
-                index,
-                depth + 1,
-            )?;
-        }
-        return Ok(());
-    }
-    if kind == "extern_crate_declaration" {
-        if let Some(name) = node.child_by_field_name("name") {
-            index.import.push(DeclarationImport {
-                scope: scope.to_vec(),
-                path: vec![contents(name, source).into()],
-                alias: node
-                    .child_by_field_name("alias")
-                    .map(|alias| contents(alias, source).into())
-                    .or_else(|| Some(contents(name, source).into())),
-                source: None,
-                glob: false,
-                namespace: true,
-                export: false,
-                visibility: visibility(node, source, false, true),
-                position: position(name),
-                conditional,
-            });
-        }
-        return Ok(());
-    }
-    let declaration = matches!(
-        kind,
-        "struct_item"
-            | "enum_item"
-            | "trait_item"
-            | "type_item"
-            | "function_item"
-            | "function_signature_item"
-            | "mod_item"
-            | "const_item"
-            | "static_item"
-            | "class_declaration"
-            | "abstract_class_declaration"
-            | "interface_declaration"
-            | "type_alias_declaration"
-            | "enum_declaration"
-            | "function_declaration"
-            | "function_signature"
-            | "internal_module"
-            | "module"
-            | "method_signature"
-            | "method_definition"
-            | "field_declaration"
-            | "public_field_definition"
-            | "property_signature"
-            | "associated_type"
-            | "type_parameter"
-            | "constrained_type_parameter"
-            | "optional_type_parameter"
-            | "variable_declarator"
-            | "mapped_type_clause"
-            | "enum_variant"
-    );
-    if !rust
-        && node
-            .parent()
-            .is_some_and(|parent| parent.kind() == "enum_body")
-        && matches!(kind, "property_identifier" | "string" | "enum_assignment")
-    {
-        let name = node.child_by_field_name("name").unwrap_or(node);
-        index.symbol.push(DeclarationSymbol {
-            role: DeclarationRole::Variant,
-            external_entry: false,
-            property: true,
-            name: contents(name, source).trim_matches(['\'', '"']).into(),
-            scope: scope.to_vec(),
-            position: position(name),
-            visibility: SymbolVisibility::Public,
-            type_namespace: false,
-            value_namespace: true,
-            macro_namespace: false,
+}
+
+fn walk(node: Node<'_>, source: &str, language: SyntaxLanguage, index: &mut DeclarationIndex) {
+    let mut pending = vec![DeclarationFrame {
+        node,
+        scope: Vec::new(),
+        attributes: String::new(),
+        ordinal: 0,
+        exported: false,
+        conditional: false,
+        global: false,
+    }];
+    while let Some(frame) = pending.pop() {
+        let DeclarationFrame {
+            node,
+            ref scope,
+            ref attributes,
+            ordinal,
+            exported,
             conditional,
-            global: false,
-            parameter: false,
-        });
-        return Ok(());
-    }
-    let mut nested = scope.to_vec();
-    let mut name_node = None;
-    if declaration {
-        name_node = node.child_by_field_name("name");
-        if let Some(name) = name_node {
-            let name_text = contents(name, source).trim_matches(['\'', '"']).to_owned();
-            if name_text == "global" && !rust {
-                nested.clear();
-            } else {
-                if let Some(owner) =
-                    member_owner(node, source, language, scope, &name_text, conditional)
-                {
-                    index.member_owner.push(owner);
-                }
-                let parameter = matches!(
-                    kind,
-                    "type_parameter"
-                        | "constrained_type_parameter"
-                        | "optional_type_parameter"
-                        | "mapped_type_clause"
+            global,
+        } = frame;
+        let rust = language == SyntaxLanguage::Rust;
+        let kind = node.kind();
+        if rust && kind == "attribute_item" {
+            rust_attribute(node, source, scope, conditional, index);
+            continue;
+        }
+        let public_macro = rust
+            && kind == "function_item"
+            && contents(node, source)
+                .trim_start()
+                .starts_with("pub macro ");
+        if matches!(
+            kind,
+            "block"
+                | "comment"
+                | "line_comment"
+                | "block_comment"
+                | "attribute_item"
+                | "inner_attribute_item"
+                | "decorator"
+        ) {
+            continue;
+        }
+        if kind == "statement_block"
+            && !node.parent().is_some_and(|parent| {
+                matches!(
+                    parent.kind(),
+                    "internal_module" | "module" | "ambient_declaration"
+                )
+            })
+        {
+            continue;
+        }
+        if kind == "ambient_declaration"
+            && contents(node, source)
+                .trim_start()
+                .starts_with("declare global")
+        {
+            pending.extend(
+                children(node)
+                    .into_iter()
+                    .rev()
+                    .map(|node| DeclarationFrame {
+                        node,
+                        scope: Vec::new(),
+                        attributes: String::new(),
+                        ordinal: 0,
+                        exported: false,
+                        conditional,
+                        global: true,
+                    }),
+            );
+            continue;
+        }
+        if kind == "macro_invocation" {
+            index.incomplete = true;
+            continue;
+        }
+        if kind == "use_declaration" {
+            if let Some(argument) = node.child_by_field_name("argument") {
+                rust_import(
+                    argument,
+                    source,
+                    scope,
+                    &[],
+                    visibility(node, source, exported, true),
+                    conditional,
+                    index,
                 );
-                let type_namespace = matches!(
-                    kind,
-                    "struct_item"
-                        | "enum_item"
-                        | "trait_item"
-                        | "type_item"
-                        | "mod_item"
-                        | "class_declaration"
-                        | "abstract_class_declaration"
-                        | "interface_declaration"
-                        | "type_alias_declaration"
-                        | "enum_declaration"
-                        | "internal_module"
-                        | "associated_type"
-                ) || parameter;
-                index.symbol.push(DeclarationSymbol {
-                    role: if kind == "variable_declarator"
-                        && node.child_by_field_name("value").is_some_and(|value| {
-                            matches!(value.kind(), "arrow_function" | "function_expression")
-                        }) {
-                        DeclarationRole::Callable
-                    } else {
-                        declaration_role(kind)
-                    },
-                    external_entry: declaration_entry(node, attributes),
-                    property: matches!(
-                        kind,
-                        "field_declaration" | "public_field_definition" | "property_signature"
-                    ),
-                    name: name_text.clone(),
+            }
+            continue;
+        }
+        if !rust && matches!(kind, "import_statement" | "export_statement") {
+            if contents(node, source).trim_start().starts_with("export =")
+                || children(node)
+                    .iter()
+                    .any(|child| child.kind() == "import_require_clause")
+            {
+                index.incomplete = true;
+            }
+            typescript_import(node, source, scope, conditional, index);
+            if let Some(declaration) = node.child_by_field_name("declaration") {
+                pending.push(DeclarationFrame {
+                    node: declaration,
+                    scope: scope.clone(),
+                    attributes: String::new(),
+                    ordinal: 0,
+                    exported: kind == "export_statement",
+                    conditional,
+                    global,
+                });
+                continue;
+            }
+            pending.extend(
+                children(node)
+                    .into_iter()
+                    .rev()
+                    .filter(|child| {
+                        !matches!(
+                            child.kind(),
+                            "import_clause"
+                                | "export_clause"
+                                | "namespace_export"
+                                | "string"
+                                | "identifier"
+                        )
+                    })
+                    .map(|node| DeclarationFrame {
+                        node,
+                        scope: scope.clone(),
+                        attributes: String::new(),
+                        ordinal: 0,
+                        exported: kind == "export_statement",
+                        conditional,
+                        global,
+                    }),
+            );
+            continue;
+        }
+        if kind == "extern_crate_declaration" {
+            if let Some(name) = node.child_by_field_name("name") {
+                index.import.push(DeclarationImport {
                     scope: scope.to_vec(),
+                    path: vec![contents(name, source).into()],
+                    alias: node
+                        .child_by_field_name("alias")
+                        .map(|alias| contents(alias, source).into())
+                        .or_else(|| Some(contents(name, source).into())),
+                    source: None,
+                    glob: false,
+                    namespace: true,
+                    export: false,
+                    visibility: visibility(node, source, false, true),
                     position: position(name),
-                    visibility: if kind == "enum_variant" {
-                        SymbolVisibility::Public
-                    } else {
-                        visibility(node, source, exported, rust)
-                    },
-                    type_namespace: type_namespace && !public_macro,
-                    macro_namespace: public_macro || kind == "mod_item",
-                    value_namespace: !matches!(
+                    conditional,
+                });
+            }
+            continue;
+        }
+        let declaration = matches!(
+            kind,
+            "struct_item"
+                | "enum_item"
+                | "trait_item"
+                | "type_item"
+                | "function_item"
+                | "function_signature_item"
+                | "mod_item"
+                | "const_item"
+                | "static_item"
+                | "class_declaration"
+                | "abstract_class_declaration"
+                | "interface_declaration"
+                | "type_alias_declaration"
+                | "enum_declaration"
+                | "function_declaration"
+                | "function_signature"
+                | "internal_module"
+                | "module"
+                | "method_signature"
+                | "method_definition"
+                | "field_declaration"
+                | "public_field_definition"
+                | "property_signature"
+                | "associated_type"
+                | "type_parameter"
+                | "constrained_type_parameter"
+                | "optional_type_parameter"
+                | "variable_declarator"
+                | "mapped_type_clause"
+                | "enum_variant"
+        );
+        if !rust
+            && node
+                .parent()
+                .is_some_and(|parent| parent.kind() == "enum_body")
+            && matches!(kind, "property_identifier" | "string" | "enum_assignment")
+        {
+            let name = node.child_by_field_name("name").unwrap_or(node);
+            index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Variant,
+                external_entry: false,
+                property: true,
+                name: contents(name, source).trim_matches(['\'', '"']).into(),
+                scope: scope.to_vec(),
+                position: position(name),
+                visibility: SymbolVisibility::Public,
+                type_namespace: false,
+                value_namespace: true,
+                macro_namespace: false,
+                conditional,
+                global: false,
+                parameter: false,
+            });
+            continue;
+        }
+        let mut nested = scope.to_vec();
+        let mut name_node = None;
+        if declaration {
+            name_node = node.child_by_field_name("name");
+            if let Some(name) = name_node {
+                let name_text = contents(name, source).trim_matches(['\'', '"']).to_owned();
+                if name_text == "global" && !rust {
+                    nested.clear();
+                } else {
+                    if let Some(owner) =
+                        member_owner(node, source, language, scope, &name_text, conditional)
+                    {
+                        index.member_owner.push(owner);
+                    }
+                    let parameter = matches!(
                         kind,
-                        "interface_declaration"
+                        "type_parameter"
+                            | "constrained_type_parameter"
+                            | "optional_type_parameter"
+                            | "mapped_type_clause"
+                    );
+                    let type_namespace = matches!(
+                        kind,
+                        "struct_item"
+                            | "enum_item"
+                            | "trait_item"
+                            | "type_item"
+                            | "mod_item"
+                            | "class_declaration"
+                            | "abstract_class_declaration"
+                            | "interface_declaration"
+                            | "type_alias_declaration"
+                            | "enum_declaration"
+                            | "internal_module"
+                            | "associated_type"
+                    ) || parameter;
+                    index.symbol.push(DeclarationSymbol {
+                        role: if kind == "variable_declarator"
+                            && node.child_by_field_name("value").is_some_and(|value| {
+                                matches!(value.kind(), "arrow_function" | "function_expression")
+                            }) {
+                            DeclarationRole::Callable
+                        } else {
+                            declaration_role(kind)
+                        },
+                        external_entry: declaration_entry(node, attributes),
+                        property: matches!(
+                            kind,
+                            "field_declaration" | "public_field_definition" | "property_signature"
+                        ),
+                        name: name_text.clone(),
+                        scope: scope.to_vec(),
+                        position: position(name),
+                        visibility: if kind == "enum_variant" {
+                            SymbolVisibility::Public
+                        } else {
+                            visibility(node, source, exported, rust)
+                        },
+                        type_namespace: type_namespace && !public_macro,
+                        macro_namespace: public_macro || kind == "mod_item",
+                        value_namespace: !matches!(
+                            kind,
+                            "interface_declaration"
+                                | "type_alias_declaration"
+                                | "type_item"
+                                | "trait_item"
+                        ) && !parameter
+                            && !public_macro,
+                        conditional,
+                        global: global || !rust && !index.external_module && scope.is_empty(),
+                        parameter,
+                    });
+                    if matches!(
+                        kind,
+                        "struct_item"
+                            | "enum_item"
+                            | "trait_item"
+                            | "function_item"
+                            | "function_signature_item"
+                            | "mod_item"
+                            | "class_declaration"
+                            | "abstract_class_declaration"
+                            | "interface_declaration"
+                            | "enum_declaration"
+                            | "function_declaration"
+                            | "function_signature"
+                            | "internal_module"
                             | "type_alias_declaration"
                             | "type_item"
-                            | "trait_item"
-                    ) && !parameter
-                        && !public_macro,
-                    conditional,
-                    global: global || !rust && !index.external_module && scope.is_empty(),
-                    parameter,
-                });
-                if matches!(
-                    kind,
-                    "struct_item"
-                        | "enum_item"
-                        | "trait_item"
-                        | "function_item"
-                        | "function_signature_item"
-                        | "mod_item"
-                        | "class_declaration"
-                        | "abstract_class_declaration"
-                        | "interface_declaration"
-                        | "enum_declaration"
-                        | "function_declaration"
-                        | "function_signature"
-                        | "internal_module"
-                        | "type_alias_declaration"
-                        | "type_item"
-                        | "method_signature"
-                        | "method_definition"
-                        | "property_signature"
-                        | "field_declaration"
-                        | "public_field_definition"
-                        | "variable_declarator"
-                        | "enum_variant"
-                ) {
-                    nested.push(name_text);
+                            | "method_signature"
+                            | "method_definition"
+                            | "property_signature"
+                            | "field_declaration"
+                            | "public_field_definition"
+                            | "variable_declarator"
+                            | "enum_variant"
+                    ) {
+                        nested.push(name_text);
+                    }
                 }
             }
         }
-    }
-    if matches!(
-        kind,
-        "function_type" | "constructor_type" | "conditional_type" | "index_signature"
-    ) {
-        nested.push(synthetic_scope(ordinal, node.kind()));
-    }
-    if kind == "infer_type" {
-        if let Some(name) = children(node)
-            .into_iter()
-            .find(|child| child.kind() == "type_identifier")
-        {
-            index.symbol.push(DeclarationSymbol {
-                role: DeclarationRole::Binding,
-                external_entry: false,
-                property: false,
-                name: contents(name, source).into(),
-                scope: scope.to_vec(),
-                position: position(name),
-                visibility: SymbolVisibility::Private,
-                type_namespace: true,
-                macro_namespace: false,
-                value_namespace: false,
-                conditional,
-                global: false,
-                parameter: true,
-            });
-            return Ok(());
+        if matches!(
+            kind,
+            "function_type" | "constructor_type" | "conditional_type" | "index_signature"
+        ) {
+            nested.push(synthetic_scope(ordinal, node.kind()));
         }
-    }
-    if kind == "type_query" {
-        if let Some(target) = children(node)
-            .first()
-            .filter(|target| matches!(target.kind(), "identifier" | "member_expression"))
-        {
-            let text = contents(*target, source);
-            index.reference.push(DeclarationReference {
-                path: text.split('.').map(str::to_owned).collect(),
-                position: position(*target),
-                length: text.len(),
-                scope: scope.to_vec(),
-                macro_namespace: false,
-                value_namespace: true,
-                conditional,
-            });
-        } else {
-            index.incomplete = true;
+        if kind == "infer_type" {
+            if let Some(name) = children(node)
+                .into_iter()
+                .find(|child| child.kind() == "type_identifier")
+            {
+                index.symbol.push(DeclarationSymbol {
+                    role: DeclarationRole::Binding,
+                    external_entry: false,
+                    property: false,
+                    name: contents(name, source).into(),
+                    scope: scope.to_vec(),
+                    position: position(name),
+                    visibility: SymbolVisibility::Private,
+                    type_namespace: true,
+                    macro_namespace: false,
+                    value_namespace: false,
+                    conditional,
+                    global: false,
+                    parameter: true,
+                });
+                continue;
+            }
         }
-        return Ok(());
-    }
-    if kind == "mod_item" {
-        if let Some(name) = name_node {
-            index.module.push(DeclarationModule {
-                scope: scope.to_vec(),
-                name: contents(name, source).into(),
-                path: quoted_attribute(attributes, "path"),
-                inline: node.child_by_field_name("body").is_some(),
-                conditional,
-            });
+        if kind == "type_query" {
+            if let Some(target) = children(node)
+                .first()
+                .filter(|target| matches!(target.kind(), "identifier" | "member_expression"))
+            {
+                let text = contents(*target, source);
+                index.reference.push(DeclarationReference {
+                    path: text.split('.').map(str::to_owned).collect(),
+                    position: position(*target),
+                    length: text.len(),
+                    scope: scope.to_vec(),
+                    macro_namespace: false,
+                    value_namespace: true,
+                    conditional,
+                });
+            } else {
+                index.incomplete = true;
+            }
+            continue;
         }
-    }
-    if kind == "impl_item" {
-        if let Some(owner) = node.child_by_field_name("type") {
-            let owner_text = contents(owner, source)
-                .split('<')
-                .next()
-                .unwrap_or("")
-                .trim()
-                .to_owned();
-            nested.push(owner_text);
-            nested.push(synthetic_scope(ordinal, "impl"));
+        if kind == "mod_item" {
+            if let Some(name) = name_node {
+                index.module.push(DeclarationModule {
+                    scope: scope.to_vec(),
+                    name: contents(name, source).into(),
+                    path: quoted_attribute(attributes, "path"),
+                    inline: node.child_by_field_name("body").is_some(),
+                    conditional,
+                });
+            }
+        }
+        if kind == "impl_item" {
+            if let Some(owner) = node.child_by_field_name("type") {
+                let owner_text = contents(owner, source)
+                    .split('<')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_owned();
+                nested.push(owner_text);
+                nested.push(synthetic_scope(ordinal, "impl"));
+                index.symbol.push(DeclarationSymbol {
+                    role: DeclarationRole::Binding,
+                    external_entry: false,
+                    property: false,
+                    name: "Self".into(),
+                    scope: nested.clone(),
+                    position: position(owner),
+                    visibility: SymbolVisibility::Private,
+                    type_namespace: true,
+                    macro_namespace: false,
+                    value_namespace: false,
+                    conditional,
+                    global: false,
+                    parameter: true,
+                });
+            }
+        }
+        if kind == "trait_item" {
             index.symbol.push(DeclarationSymbol {
                 role: DeclarationRole::Binding,
                 external_entry: false,
                 property: false,
                 name: "Self".into(),
                 scope: nested.clone(),
-                position: position(owner),
+                position: position(node),
                 visibility: SymbolVisibility::Private,
                 type_namespace: true,
                 macro_namespace: false,
@@ -1119,178 +1134,159 @@ fn walk(
                 parameter: true,
             });
         }
-    }
-    if kind == "trait_item" {
-        index.symbol.push(DeclarationSymbol {
-            role: DeclarationRole::Binding,
-            external_entry: false,
-            property: false,
-            name: "Self".into(),
-            scope: nested.clone(),
-            position: position(node),
-            visibility: SymbolVisibility::Private,
-            type_namespace: true,
-            macro_namespace: false,
-            value_namespace: false,
-            conditional,
-            global: false,
-            parameter: true,
-        });
-    }
-    if matches!(
-        kind,
-        "scoped_type_identifier"
-            | "nested_type_identifier"
-            | "scoped_identifier"
-            | "primitive_type"
-            | "predefined_type"
-    ) || kind == "type_identifier"
-        || kind == "identifier"
-            && node
-                .parent()
-                .is_some_and(|parent| parent.kind() == "extends_clause")
-    {
-        let text = contents(node, source);
-        let path = text
-            .split(if rust { "::" } else { "." })
-            .map(|part| part.trim().to_owned())
-            .collect::<Vec<_>>();
-        index.reference.push(DeclarationReference {
-            path,
-            position: position(node),
-            length: text.len(),
-            scope: scope.to_vec(),
-            macro_namespace: false,
-            value_namespace: kind == "scoped_identifier" || kind == "identifier",
-            conditional,
-        });
-        return Ok(());
-    }
-    let mut preceding = String::new();
-    let mut preceding_conditional = false;
-    let mut sibling_count = HashMap::new();
-    let mut child_cursor = node.walk();
-    for child in node.named_children(&mut child_cursor) {
-        let count = sibling_count.entry(child.kind()).or_insert(0);
-        let child_ordinal = *count;
-        *count += 1;
-        match child.kind() {
-            "attribute_item" if rust => {
-                rust_attribute(child, source, &nested, conditional, index);
-                preceding.push_str(contents(child, source));
-                preceding_conditional |= gates_declaration(child, source);
-                continue;
-            }
-            "line_comment" | "block_comment" | "comment" => continue,
-            _ => {}
-        }
-        let attributes = std::mem::take(&mut preceding);
-        let attribute_conditional = std::mem::take(&mut preceding_conditional);
-        if name_node.is_some_and(|name| name.id() == child.id()) {
-            continue;
-        }
         if matches!(
             kind,
-            "variable_declarator"
-                | "const_item"
-                | "static_item"
-                | "public_field_definition"
-                | "enum_variant"
-        ) && node
-            .child_by_field_name("value")
-            .is_some_and(|value| value.id() == child.id())
+            "scoped_type_identifier"
+                | "nested_type_identifier"
+                | "scoped_identifier"
+                | "primitive_type"
+                | "predefined_type"
+        ) || kind == "type_identifier"
+            || kind == "identifier"
+                && node
+                    .parent()
+                    .is_some_and(|parent| parent.kind() == "extends_clause")
         {
+            let text = contents(node, source);
+            let path = text
+                .split(if rust { "::" } else { "." })
+                .map(|part| part.trim().to_owned())
+                .collect::<Vec<_>>();
+            index.reference.push(DeclarationReference {
+                path,
+                position: position(node),
+                length: text.len(),
+                scope: scope.to_vec(),
+                macro_namespace: false,
+                value_namespace: kind == "scoped_identifier" || kind == "identifier",
+                conditional,
+            });
             continue;
         }
-        if kind == "variable_declarator"
-            && node
-                .child_by_field_name("name")
-                .is_some_and(|name| name.id() == child.id())
-        {
-            continue;
+        let mut preceding = String::new();
+        let mut preceding_conditional = false;
+        let mut sibling_count = HashMap::new();
+        let mut child_cursor = node.walk();
+        let mut child_work = Vec::new();
+        for child in node.named_children(&mut child_cursor) {
+            let count = sibling_count.entry(child.kind()).or_insert(0);
+            let child_ordinal = *count;
+            *count += 1;
+            match child.kind() {
+                "attribute_item" if rust => {
+                    child_work.push(DeclarationFrame {
+                        node: child,
+                        scope: nested.clone(),
+                        attributes: String::new(),
+                        ordinal: child_ordinal,
+                        exported,
+                        conditional,
+                        global,
+                    });
+                    preceding.push_str(contents(child, source));
+                    preceding_conditional |= gates_declaration(child, source);
+                    continue;
+                }
+                "line_comment" | "block_comment" | "comment" => continue,
+                _ => {}
+            }
+            let attributes = std::mem::take(&mut preceding);
+            let attribute_conditional = std::mem::take(&mut preceding_conditional);
+            if name_node.is_some_and(|name| name.id() == child.id()) {
+                continue;
+            }
+            if matches!(
+                kind,
+                "variable_declarator"
+                    | "const_item"
+                    | "static_item"
+                    | "public_field_definition"
+                    | "enum_variant"
+            ) && node
+                .child_by_field_name("value")
+                .is_some_and(|value| value.id() == child.id())
+            {
+                continue;
+            }
+            if kind == "variable_declarator"
+                && node
+                    .child_by_field_name("name")
+                    .is_some_and(|name| name.id() == child.id())
+            {
+                continue;
+            }
+            let child_global =
+                global || !rust && name_node.is_some_and(|name| contents(name, source) == "global");
+            let child_exported = if !rust && matches!(kind, "internal_module" | "module") {
+                node.parent()
+                    .is_some_and(|parent| parent.kind() == "ambient_declaration")
+            } else {
+                exported
+            };
+            let child_scope = if kind == "conditional_type"
+                && node
+                    .child_by_field_name("alternative")
+                    .is_some_and(|alternative| alternative.id() == child.id())
+            {
+                scope
+            } else {
+                &nested
+            };
+            child_work.push(DeclarationFrame {
+                node: child,
+                scope: child_scope.to_vec(),
+                attributes,
+                ordinal: child_ordinal,
+                exported: child_exported,
+                conditional: conditional || attribute_conditional,
+                global: child_global,
+            });
         }
-        let child_global =
-            global || !rust && name_node.is_some_and(|name| contents(name, source) == "global");
-        let child_exported = if !rust && matches!(kind, "internal_module" | "module") {
-            node.parent()
-                .is_some_and(|parent| parent.kind() == "ambient_declaration")
-        } else {
-            exported
-        };
-        let child_scope = if kind == "conditional_type"
-            && node
-                .child_by_field_name("alternative")
-                .is_some_and(|alternative| alternative.id() == child.id())
-        {
-            scope
-        } else {
-            &nested
-        };
-        walk(
-            child,
-            source,
-            language,
-            child_scope,
-            &attributes,
-            child_ordinal,
-            child_exported,
-            conditional || attribute_conditional,
-            child_global,
-            index,
-            depth + 1,
-        )?;
+        pending.extend(child_work.into_iter().rev());
     }
-    Ok(())
 }
 
 // Recover unsupported public macro signatures without shifting source coordinates.
-fn project_public_macros(
-    node: Node<'_>,
-    source: &str,
-    projection: &mut [u8],
-    depth: usize,
-) -> bool {
-    if depth > 128 {
-        return false;
-    }
+fn project_public_macros(node: Node<'_>, source: &str, projection: &mut [u8]) -> bool {
     let mut changed = false;
-    if node.kind() == "identifier"
-        && contents(node, source) == "macro"
-        && source[..node.start_byte()].trim_end().ends_with("pub")
-    {
-        let tail = &source[node.end_byte()..];
-        let name_start = node.end_byte() + tail.len() - tail.trim_start().len();
-        let name_length = source[name_start..]
-            .bytes()
-            .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
-            .count();
-        let name_end = name_start + name_length;
-        let tail = &source[name_end..];
-        let start = name_end + tail.len() - tail.trim_start().len();
-        if name_length > 0 && source.as_bytes().get(start) == Some(&b'(') {
-            let mut nesting = 0;
-            for (offset, byte) in source.as_bytes()[start..].iter().enumerate() {
-                if *byte == b'(' {
-                    nesting += 1;
-                }
-                if *byte == b')' {
-                    nesting -= 1;
-                    if nesting == 0 {
-                        projection[node.byte_range()].copy_from_slice(b"fn   ");
-                        for byte in &mut projection[start + 1..start + offset] {
-                            if !matches!(*byte, b'\n' | b'\r') {
-                                *byte = b' ';
+    let mut pending = vec![node];
+    while let Some(node) = pending.pop() {
+        if node.kind() == "identifier"
+            && contents(node, source) == "macro"
+            && source[..node.start_byte()].trim_end().ends_with("pub")
+        {
+            let tail = &source[node.end_byte()..];
+            let name_start = node.end_byte() + tail.len() - tail.trim_start().len();
+            let name_length = source[name_start..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
+                .count();
+            let name_end = name_start + name_length;
+            let tail = &source[name_end..];
+            let start = name_end + tail.len() - tail.trim_start().len();
+            if name_length > 0 && source.as_bytes().get(start) == Some(&b'(') {
+                let mut nesting = 0;
+                for (offset, byte) in source.as_bytes()[start..].iter().enumerate() {
+                    if *byte == b'(' {
+                        nesting += 1;
+                    }
+                    if *byte == b')' {
+                        nesting -= 1;
+                        if nesting == 0 {
+                            projection[node.byte_range()].copy_from_slice(b"fn   ");
+                            for byte in &mut projection[start + 1..start + offset] {
+                                if !matches!(*byte, b'\n' | b'\r') {
+                                    *byte = b' ';
+                                }
                             }
+                            changed = true;
+                            break;
                         }
-                        changed = true;
-                        break;
                     }
                 }
             }
         }
-    }
-    for child in children(node) {
-        changed |= project_public_macros(child, source, projection, depth + 1);
+        pending.extend(children(node).into_iter().rev());
     }
     changed
 }

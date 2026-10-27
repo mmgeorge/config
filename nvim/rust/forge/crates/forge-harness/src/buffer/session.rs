@@ -311,7 +311,7 @@ impl SessionPresentation {
                         "invalid agent identity"
                     );
                     ensure!(
-                        find_agent(self.timeline.entry_list(), run_id, 0).is_some(),
+                        find_agent(self.timeline.entry_list(), run_id).is_some(),
                         "agent history is unavailable"
                     );
                 }
@@ -1043,7 +1043,7 @@ impl SessionPresentation {
         }
         let unsettled = if let Some(run_id) = open.agent_scope.as_deref() {
             unsettled_exchanges(
-                find_agent(self.timeline.entry_list(), run_id, 0)
+                find_agent(self.timeline.entry_list(), run_id)
                     .into_iter()
                     .flat_map(|entry| match entry {
                         TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
@@ -1187,29 +1187,18 @@ fn settle_responses(projected: &mut ProjectedEntry) {
 fn find_agent<'source>(
     source: &'source [TimelineEntry],
     run_id: &str,
-    depth: usize,
 ) -> Option<&'source TimelineEntry> {
-    if depth > 16 {
-        return None;
-    }
-    for entry in source {
+    let mut pending = source.iter().rev().collect::<Vec<_>>();
+    while let Some(entry) = pending.pop() {
         match entry {
             TimelineEntry::AgentLifecycle { run, agent, .. } => {
                 if run.id == run_id {
                     return Some(entry);
                 }
-                if let Some(found) = find_agent(agent, run_id, depth + 1) {
-                    return Some(found);
-                }
+                pending.extend(agent.iter().rev());
             }
             TimelineEntry::Exchange { agent_by_id, .. } => {
-                for attached in agent_by_id.values() {
-                    if let Some(found) =
-                        find_agent(std::slice::from_ref(attached), run_id, depth + 1)
-                    {
-                        return Some(found);
-                    }
-                }
+                pending.extend(agent_by_id.values().collect::<Vec<_>>().into_iter().rev());
             }
             _ => {}
         }
@@ -1456,7 +1445,7 @@ fn reflow(
             .iter()
             .map(ProjectionSource::Entry)
             .collect::<Vec<_>>(),
-        Some(run_id) => find_agent(source, run_id, 0)
+        Some(run_id) => find_agent(source, run_id)
             .into_iter()
             .flat_map(|entry| match entry {
                 TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
@@ -1998,6 +1987,45 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn deep_agent_lookup_preserves_attached_exchange_and_sibling_order() {
+        let mut child = None;
+        for index in (0..64).rev() {
+            let identity = format!("deep-agent-{index}");
+            let mut run = crate::agent::Agent::pending("session", &identity, "Inspect", 0);
+            run.id = identity.clone();
+            let mut nested = Vec::new();
+            if let Some(child) = child {
+                if index % 2 == 0 {
+                    let mut exchange = interaction_entry(&format!("exchange-{index}"));
+                    let TimelineEntry::Exchange { agent_by_id, .. } = &mut exchange else {
+                        unreachable!()
+                    };
+                    agent_by_id.insert(format!("child-{index}"), child);
+                    nested.push(exchange);
+                } else {
+                    nested.push(child);
+                }
+            }
+            child = Some(TimelineEntry::AgentLifecycle {
+                id: identity,
+                created_at_ms: 0,
+                run,
+                exchange: Vec::new(),
+                agent: nested,
+            });
+        }
+        let source = vec![child.unwrap(), interaction_entry("tail")];
+        for index in 0..64 {
+            let identity = format!("deep-agent-{index}");
+            let found = find_agent(&source, &identity).unwrap();
+            assert!(
+                matches!(found, TimelineEntry::AgentLifecycle { run, .. } if run.id == identity)
+            );
+        }
+        assert!(find_agent(&source, "missing").is_none());
+    }
+
     #[test]
     fn long_messages_keep_two_previous_responses_and_reopen_after_resize() -> anyhow::Result<()> {
         use super::super::nodes::{NodeAction, NodeRequest};

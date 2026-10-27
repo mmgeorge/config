@@ -158,6 +158,20 @@ authoritative in every approval mode. An out-of-scope file request can receive a
 explicit grant under `ask`, an automatic rejection under `deny`, or a once-only
 approval under `allow`. Automatic approval never saves a rule or directory grant.
 
+Rejecting a Copilot tool request sends the model an explicit reason and states
+that the operation was not executed. The model can continue with permitted work
+or explain the blocker, but must not retry or bypass the denial. Saved-policy
+denials, approval-mode denials, timeouts, and user rejections retain distinct reasons.
+In reject-all approval mode (`/deny`), rejection feedback tells the model to continue
+autonomously using permitted tools and whitelisted commands without waiting for approval.
+Filesystem access labels such as `rx` do not select the approval mode.
+Cancel stops the response rather than requesting a continuation. If Copilot ends
+after a rejection without a final answer or a Harness control handoff, Harness
+reports the exchange as failed with the rejection reason instead of silently completing.
+Approval expiry dismisses its popup automatically and sends timeout feedback,
+without saving a deny rule. A final response after that denial settles the turn
+without scheduling another timeout-driven continuation.
+
 Copilot can read and write its current session's notes directory without approval,
 when writes are enabled. Write-off also rejects session-note writes. Harness gets
 that directory from the native CLI, so the
@@ -296,12 +310,14 @@ waiting for execution capacity do not interrupt the active response or checks.
 The prompt inherits ordinary text-buffer editing and navigation mappings. Harness
 adds submission, queueing, steering, cancellation, mode, and effort controls there.
 Normal mode also supports session commands, including `oe` to reopen a pending
-question or approval, model and artifact selection, help, and closing Harness.
+question or approval, `op` for artifacts, `og` for agents, model selection, help,
+and closing Harness. These hotkeys also work with Read permissions.
 In Insert mode, `Ctrl-J` inserts a newline at the cursor and preserves the draft.
 Press `Up` on the first draft line to recall submitted prompts. Repeated `Up` and
 `Down` browse history, and `Down` past the newest entry restores your unfinished
 draft and attachments. Inside a multiline draft, the arrows move between lines.
-`Alt-Up` and `Alt-Down` also browse history. Timeline row activation, folding,
+`Alt-Up` and `Alt-Down` also browse history. Prompt navigation and `oa` or `Tab`
+focus the timeline before navigating or toggling activity. Timeline row activation
 and gutter selection remain in the upper pane.
 
 In the timeline, press `W` to select whole lines from the left gutter, including

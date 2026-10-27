@@ -644,8 +644,10 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
         return;
     };
     // Background output can arrive after the tool has returned its final result.
-    if matches!(existing.status.as_deref(), Some("completed" | "failed"))
-        && update.status.as_deref() == Some("in_progress")
+    if matches!(
+        existing.status.as_deref(),
+        Some("completed" | "failed" | "denied")
+    ) && update.status.as_deref() == Some("in_progress")
     {
         return;
     }
@@ -733,7 +735,16 @@ fn tool_activity(provider_event: &SessionEvent, output: &BackendOutput) -> Optio
                 .and_then(Value::as_str)
                 .map(strip_ansi_escapes::strip_str);
             (
-                Some(if success { "completed" } else { "failed" }.into()),
+                Some(
+                    if success {
+                        "completed"
+                    } else if super::rejection::is_denied(data) {
+                        "denied"
+                    } else {
+                        "failed"
+                    }
+                    .into(),
+                ),
                 output,
                 false,
             )

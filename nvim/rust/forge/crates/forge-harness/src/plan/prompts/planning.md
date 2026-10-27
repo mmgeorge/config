@@ -343,7 +343,8 @@ Do not connect these actions into one execution merely because one uses the othe
   Each applicable branch runs its steps before the next enclosing step. When alternatives are
   exclusive, write mutually exclusive conditions explicitly. Branches do not mean parallel work.
 
-Use plain, single-line labels and the exact declaration names where available. Keep resulting
+Use descriptive labels and the exact declaration names where available. Harness normalizes label
+whitespace for display while retaining the original content. Keep resulting
 state in `effects`, rather than treating data as executable steps. Express conditions that govern
 execution in branch conditions or action labels instead of adding separate input inventories.
 Flow titles must be unique. There are no total flow, step-count, or nesting-depth limits.
@@ -522,12 +523,12 @@ executable function bodies, empty or placeholder bodies, or executable initializ
 pseudocode belongs only in an indented `Algorithm` block, never in a native-language body. Preserve
 reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
 
-Use two spaces per indentation level and one blank line between declarations and methods.
-Keep consecutive imports, fields, and enum variants together. Attach documentation immediately
-above attributes and their declaration. Harness formats each requested workspace overview and
-captured baseline, then canonicalizes both declaration snapshots on submission.
-Prose comments wrap to the repository line width, defaulting to 80 columns, and long parameter lists
-use one parameter per line. Literals, code examples, and indivisible types remain intact. Read virtual
+Preserve syntactic nesting and attach documentation to its declaration. Harness owns presentation
+formatting, indentation style, blank-line spacing, column widths, and line wrapping. Do not manually
+wrap content or shorten names, comments, commands, or diagrams to satisfy a display width.
+Harness formats each requested workspace overview and captured baseline, then canonicalizes both
+declaration snapshots on submission. The repository line width is a formatting preference, not a
+submission constraint. Literals, code examples, and indivisible types remain intact. Read virtual
 file ranges when their exact current text is unavailable and match that text, including indentation.
 Draft patches retain their layout until submission. Submission can reformat declarations, so read
 affected ranges before another revision unless current formatted text is already supplied in feedback.

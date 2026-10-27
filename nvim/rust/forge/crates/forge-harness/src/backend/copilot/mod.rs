@@ -3,6 +3,7 @@ mod event_decoder;
 mod event_stream;
 mod file_change;
 mod mcp;
+mod rejection;
 mod retry;
 mod session_directory;
 mod text_generation;
@@ -1169,6 +1170,7 @@ impl Backend for CopilotBackend {
         let mut execution_turn_stopped = false;
         let mut retry_failure = None;
         let mut retry_idle_deadline = None;
+        let mut rejection = rejection::RejectionState::default();
         loop {
             tokio::select! {
                 _ = async {
@@ -1183,6 +1185,7 @@ impl Backend for CopilotBackend {
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
                     turn_event.observe(&provider_event)?;
+                    rejection.observe(&provider_event);
                     self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
                         if let Some(failure) = &retry_failure {
@@ -1285,6 +1288,23 @@ impl Backend for CopilotBackend {
             anyhow::bail!("{}", failure.message);
         }
         skills.output(&mut output)?;
+        if self
+            .permission_context(&request.runtime_key()?)
+            .await
+            .state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?
+            .cancelled
+        {
+            return Err(crate::broker::TurnCancelled.into());
+        }
+        if !execution_turn_stopped {
+            rejection.finish(&output)?;
+        }
+        if rejection.answered {
+            self.permission_coordinator
+                .take_timeout_feedback(&request.owner()?)?;
+        }
         Ok(output)
     }
 
@@ -2212,6 +2232,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
+    cancelled: bool,
     checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::backend::ExecutionOwner>,
     approval_mode: ApprovalMode,
@@ -2230,6 +2251,7 @@ impl CopilotPermissionContext {
         Self {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
+                cancelled: false,
                 checkpoint: None,
                 owner: None,
                 approval_mode: ApprovalMode::Ask,
@@ -2253,6 +2275,7 @@ impl CopilotPermissionContext {
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))?;
         let session_directory = state.session_directory.take();
         *state = CopilotPermissionState {
+            cancelled: false,
             checkpoint: None,
             owner: Some(owner),
             approval_mode,
@@ -2318,9 +2341,13 @@ impl PermissionHandler for CopilotPermissionHandler {
                     state.session_directory.clone(),
                 ),
                 Err(_) => {
-                    return PermissionResult::reject(Some("permission context unavailable".into()));
+                    return rejection::deny(
+                        "Automatically rejected because Harness permission context is unavailable.",
+                        None,
+                    );
                 }
             };
+        let deny = |reason: &str| rejection::deny(reason, Some(approval_mode));
         let kind = permission_kind(data.kind);
         let params = serde_json::to_value(data).unwrap_or(Value::Null);
         let request = permission_from_copilot(request_id.to_string(), kind, params, &workspace);
@@ -2335,20 +2362,28 @@ impl PermissionHandler for CopilotPermissionHandler {
         }) {
             match self.context.coordinator.writes_disabled(owner.as_ref()) {
                 Ok(true) => {
-                    return PermissionResult::reject(Some(
-                        "Filesystem writing is off. The user can enable it with /write.".into(),
-                    ));
+                    return deny(
+                        "Automatically rejected because filesystem writing is off. The user can enable it with /write.",
+                    );
                 }
                 Ok(false) => {}
-                Err(error) => return PermissionResult::reject(Some(format!("{error:#}"))),
+                Err(error) => {
+                    return deny(&format!(
+                        "Automatically rejected because Harness permission evaluation failed: {error:#}"
+                    ));
+                }
             }
         }
         let protected = match self.context.coordinator.store().read() {
             Ok(store) => protected_target(&request, &store),
-            Err(_) => return PermissionResult::reject(Some("permission store unavailable".into())),
+            Err(_) => {
+                return deny(
+                    "Automatically rejected because Harness permission store is unavailable.",
+                );
+            }
         };
         if protected {
-            return PermissionResult::reject(Some("target is protected by Harness".into()));
+            return deny("Automatically rejected because the target is protected by Harness.");
         }
         if let Some(directory) = session_directory {
             match directory.approves(&session_id, &request, std::path::Path::new(&workspace)) {
@@ -2372,18 +2407,35 @@ impl PermissionHandler for CopilotPermissionHandler {
                         {
                             PermissionResult::approve_once()
                         }
-                        Ok(_) => PermissionResult::reject(None),
-                        Err(error) => PermissionResult::reject(Some(format!("{error:#}"))),
+                        Ok(_) => deny(
+                            "Automatically rejected by Harness permission policy for this session file.",
+                        ),
+                        Err(error) => deny(&format!(
+                            "Automatically rejected because Harness permission evaluation failed: {error:#}"
+                        )),
                     };
                 }
                 Ok(false) => {}
-                Err(error) => return PermissionResult::reject(Some(format!("{error:#}"))),
+                Err(error) => {
+                    return deny(&format!(
+                        "Automatically rejected because Harness session directory validation failed: {error:#}"
+                    ));
+                }
             }
         }
         match self
             .context
             .coordinator
-            .authorize(approval_mode, request, Some(crate::backend::ProviderAddress {owner,thread_id:session_id.to_string(),turn_id:String::new()}), event_sink.as_ref())
+            .authorize(
+                approval_mode,
+                request,
+                Some(crate::backend::ProviderAddress {
+                    owner,
+                    thread_id: session_id.to_string(),
+                    turn_id: String::new(),
+                }),
+                event_sink.as_ref(),
+            )
             .await
         {
             Ok(
@@ -2391,9 +2443,34 @@ impl PermissionHandler for CopilotPermissionHandler {
                 | ApprovalResolution::AllowExact
                 | ApprovalResolution::AllowBroad,
             ) => PermissionResult::approve_once(),
-            Ok(ApprovalResolution::TimedOut) => PermissionResult::reject(Some("Approval automatically rejected because its timeout expired. The user may be unavailable. Continue conservatively within existing permissions and avoid repeating the denied request.".into())),
-            Ok(_) => PermissionResult::reject(None),
-            Err(error) => PermissionResult::reject(Some(format!("{error:#}"))),
+            Ok(ApprovalResolution::TimedOut) => deny(
+                "Automatically rejected because the approval timeout expired. The user may be unavailable.",
+            ),
+            Ok(ApprovalResolution::DenyPolicy) => {
+                deny("Automatically rejected by Harness permission or filesystem access policy.")
+            }
+            Ok(ApprovalResolution::DenyMode) => deny(
+                "Automatically rejected because the current approval mode denies requests that need confirmation.",
+            ),
+            Ok(
+                ApprovalResolution::DenyOnce
+                | ApprovalResolution::DenyExact
+                | ApprovalResolution::DenyBroad,
+            ) => deny("Rejected by the user."),
+            Ok(ApprovalResolution::Cancel) => {
+                match self.context.state.lock() {
+                    Ok(mut state) => state.cancelled = true,
+                    Err(_) => {
+                        return deny(
+                            "Automatically rejected because Harness permission context is unavailable.",
+                        );
+                    }
+                }
+                PermissionResult::reject(None)
+            }
+            Err(error) => deny(&format!(
+                "Automatically rejected because Harness permission evaluation failed: {error:#}"
+            )),
         }
     }
 }

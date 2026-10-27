@@ -197,10 +197,6 @@ impl DeclarationDesign {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error).context("read .forge.json"),
         }
-        ensure!(
-            (40..=240).contains(&design.line_width),
-            "declaration line width must be between 40 and 240"
-        );
         design.validate()?;
         Ok(design)
     }
@@ -317,10 +313,6 @@ impl DeclarationDesign {
 
     /// Validate every proposed overview before exposing a persisted revision.
     pub fn validate(&self) -> Result<()> {
-        ensure!(
-            (40..=240).contains(&self.line_width),
-            "declaration line width must be between 40 and 240"
-        );
         self.document.validate()?;
         for (path, text) in &self.cargo_lock {
             validate_relative_path(path)?;
@@ -952,12 +944,18 @@ mod tests {
                 .all(|line| line.chars().count() <= 50)
         );
         assert!(design.changed_paths().is_empty());
-        std::fs::write(
-            workspace.path().join(".forge.json"),
-            r#"{"declaration_line_width":12}"#,
-        )
-        .unwrap();
-        assert!(DeclarationDesign::open(workspace.path()).is_err());
+        for width in [0, 1, 12, 4097, usize::MAX] {
+            std::fs::write(
+                workspace.path().join(".forge.json"),
+                serde_json::to_vec(&serde_json::json!({"declaration_line_width": width})).unwrap(),
+            )
+            .unwrap();
+            let design = DeclarationDesign::open(workspace.path()).unwrap();
+            assert_eq!(design.line_width, width);
+            let (source, _) = design.source(workspace.path(), "lib.rs").unwrap();
+            assert!(source.text.contains("pub struct Registry;"));
+            design.formatted().unwrap();
+        }
         std::fs::write(
             workspace.path().join(".forge.json"),
             r#"{"declaration_line_width":"80"}"#,
@@ -1399,6 +1397,83 @@ mod tests {
                 .read_submitted_document("session", "specification", 1)
                 .unwrap(),
             original
+        );
+    }
+
+    #[test]
+    fn deep_baseline_metadata_survives_patch_format_and_storage() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = tempfile::tempdir().unwrap();
+        let path = "state.ts";
+        let source = format!(
+            "type Options = {}unknown{};\nexport class RenderState {{\ngetStage(): unknown {{ return undefined; }}\nrun(options: Options, key: string): void {{\n{}\n}}\nprivate current: unknown;\n}}\n",
+            "Array<".repeat(256),
+            ">".repeat(256),
+            "options[key]();\n".repeat(16),
+        );
+        std::fs::write(workspace.path().join(path), &source).unwrap();
+        let initial = DeclarationDesign::default();
+        let (declaration, captured) = initial.source(workspace.path(), path).unwrap();
+        let combined = super::super::calls::combined(path, &declaration.text, &captured).unwrap();
+        let mut parser = tree_sitter::Parser::new();
+        parser
+            .set_language(&forge_diff::syntax::SyntaxLanguage::Typescript.grammar())
+            .unwrap();
+        let tree = parser.parse(&combined, None).unwrap();
+        let mut pending = vec![(tree.root_node(), 0)];
+        let mut maximum_depth = 0;
+        while let Some((node, depth)) = pending.pop() {
+            maximum_depth = maximum_depth.max(depth);
+            let mut cursor = node.walk();
+            pending.extend(
+                node.named_children(&mut cursor)
+                    .map(|child| (child, depth + 1)),
+            );
+        }
+        assert!(
+            maximum_depth > 128,
+            "fixture must exercise baseline scanning beyond the old depth limit: {maximum_depth}"
+        );
+        assert_eq!(
+            super::super::calls::parse(path, &combined, &captured)
+                .unwrap()
+                .1,
+            captured
+        );
+        let field = combined
+            .lines()
+            .find(|line| line.contains("private current"))
+            .unwrap();
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {path}\n@@\n+  prepareStatic(): unknown;\n+    Algorithm\n+      return null\n {field}\n*** End Patch"
+        );
+        let patched = initial
+            .patch(workspace.path(), &Default::default(), &patch)
+            .unwrap();
+        assert_eq!(patched.baseline_calls[path], captured);
+        for function in &captured {
+            assert_eq!(
+                patched.proposed_calls[path]
+                    .iter()
+                    .find(|candidate| candidate.owner == function.owner),
+                Some(function)
+            );
+        }
+        assert_eq!(patched.proposed_calls[path].len(), captured.len() + 1);
+        let formatted = patched.formatted().unwrap();
+        let mut document = crate::plan::document::test_fixture("deep", "Deep declarations");
+        document.design = Some(formatted);
+        let store = crate::plan::PlanFileStore::new(storage.path(), workspace.path());
+        store
+            .write_working_document("session", "deep", &document)
+            .unwrap();
+        assert_eq!(
+            store.read_working_document("session", "deep").unwrap(),
+            document
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace.path().join(path)).unwrap(),
+            source
         );
     }
 
