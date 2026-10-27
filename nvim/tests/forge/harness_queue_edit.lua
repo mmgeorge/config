@@ -2,148 +2,75 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
-local submission = require("forge.views.harness.prompt_submission")
-submission.start = function(_, prompt, callback)
-  client.request("prompt.submit", { text = prompt.text, attachments = prompt.attachments or {} }, callback)
-  assert(state.queue[1] == prompt.queue_entry, "queue entry disappeared before simulated acceptance")
-  table.remove(state.queue, 1)
-end
-local history = require("forge.views.harness.prompt_history")
-local notifications = require("forge.infra.notifications")
-local requests, warnings = {}, {}
-local original_stopinsert = vim.cmd.stopinsert
-local normal_mode_requests = 0
-vim.cmd.stopinsert = function()
-  normal_mode_requests = normal_mode_requests + 1
-  original_stopinsert()
-end
-client.request = function(method, params, callback)
-  if method == "backend.model_pins" then callback({}) return end
-  requests[#requests + 1] = { method = method, params = params, callback = callback }
-end
-history.record = function() end
-notifications.info = function() end
-notifications.error = function(message) error(message) end
-notifications.warn = function(message) warnings[#warnings + 1] = message end
+local input = require("forge.views.harness.input_state")
+local host = dofile("nvim/tests/forge/support/input.lua").new(state)
+local errors, warnings = {}, {}
+require("forge.infra.notifications").error = function(message) errors[#errors + 1] = message end
+require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+require("forge.views.harness.prompt_history").record = function() end
 controller.render = function() end
 controller.refresh_winbar = function() end
-state.session = { id = "queue-edit", backend = "mock", current_task_id = "task-1" }
-state.capability = { model_selection = true, effort_selection = true, native_steer = true }
-state.model_list = {}
-state.busy = true
-state.queue, state.queue_edit, state.pending_steer = {}, nil, {}
+client.request_for = function(_, method, parameters, callback)
+  assert(host.request(method, parameters, callback), method)
+end
+state.session = { id = "queue-edit", backend = "mock", current_task_id = "task" }
+state.queue, state.pending_steer = {}, {}
 state.composer_buf = vim.api.nvim_create_buf(false, true)
-
+state.presentation = { follow_tail = function() end, capture_prompt = function()
+  return { document = "draft", buffer = state.composer_buf, is_current = function() return true end }
+end }
+input.attach(state, function() end)
 local function compose(text)
-  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
 end
+local function text() return vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] end
+host.seed({
+  { text = "prior", task_id = "task" },
+  { text = "second", task_id = "task", config = { model = "retained" } },
+  { text = "third", task_id = "task" },
+})
+local prior, second, third = unpack(state.queue)
+compose("original composer draft")
+controller.edit_queued(-1)
+assert(text() == "third" and state.queue_edit.entry == third, "editing waited for reservation acknowledgement")
+compose("third edited")
+controller.edit_queued(-1)
+compose("second edited")
+controller.edit_queued(1)
+assert(text() == "third edited" and state.queue_edit.barrier == second)
+host.flush()
+host.deliver(prior.id)
+assert(state.queue[1] == second and state.queue_edit.drafts[second] == "second edited")
+controller.submit()
+assert(text() == "original composer draft" and not state.queue_edit)
+assert(state.queue[1] == second and second.text == "second edited" and third.text == "third edited")
+assert(second.config.model == "retained")
+host.flush()
+assert(state.queue[1] == second and second.text == "second edited")
 
-local function composer_text()
-  return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
-end
+compose("next draft")
+controller.edit_queued(-1)
+compose("retained third")
+controller.edit_queued(-1)
+compose("")
+host.flush()
+controller.submit()
+assert(#state.queue == 1 and state.queue[1] == third and text() == "next draft")
+host.flush()
+assert(third.text == "retained third")
 
-local success, failure = xpcall(function()
-  local config_metadata = { model = "retained" }
-  local prior_entry = { text = "prior prompt", task_id = "task-1" }
-  local second_entry = { text = "second original", task_id = "task-1", config = config_metadata }
-  local third_entry = { text = "third original", task_id = "task-1" }
-  state.queue = { prior_entry, second_entry, third_entry }
-  compose("original composer draft")
-
-  controller.edit_queued(-1)
-  assert(normal_mode_requests == 1, "entering queue editing must leave Insert mode")
-  assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == third_entry
-    and #state.queue == 3 and state.queue[1] == prior_entry and state.queue[2] == second_entry
-    and state.queue[3] == third_entry, "editing the tail changed queue order or chose the wrong barrier")
-  assert(composer_text() == "third original", "entering queue edit did not load the selected prompt")
-  compose("/model rejected impossible prompt")
-  controller.edit_queued(-1)
-  assert(state.queue_edit.entry == second_entry and state.queue_edit.drafts[third_entry] == "/model rejected impossible prompt"
-    and state.queue_edit.barrier == second_entry, "moving backward did not retain the third-entry draft")
-  compose("second edited")
-  controller.edit_queued(1)
-  assert(normal_mode_requests == 3, "navigating queued messages must return to Normal mode")
-  assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == second_entry
-    and composer_text() == "/model rejected impossible prompt", "forward navigation changed the barrier or lost a draft")
-  controller.edit_queued(-1)
-  assert(state.queue_edit.entry == second_entry and composer_text() == "second edited")
-  controller.submit()
-  assert(#warnings == 1 and warnings[1]:find("Queued message 3", 1, true), "invalid later draft was not identified by queue position")
-  assert(state.queue_edit.entry == third_entry and state.queue_edit.barrier == second_entry
-    and state.queue[1] == prior_entry and state.queue[2] == second_entry and state.queue[3] == third_entry
-    and prior_entry.text == "prior prompt" and second_entry.text == "second original"
-    and third_entry.text == "third original", "failed validation mutated or reordered the reserved queue")
-
-  state.busy = false
-  controller.drain()
-  assert(requests[1].method == "prompt.submit" and requests[1].params.text == "prior prompt"
-    and #state.queue == 2 and state.queue[1] == second_entry and state.queue[2] == third_entry,
-    "the earlier prompt did not drain ahead of the edit barrier")
-  state.busy = false
-  controller.drain()
-  assert(#requests == 1 and #state.queue == 2 and state.queue_edit.barrier == second_entry,
-    "drain crossed the earliest unfinished edit after the earlier prompt")
-
-  compose("third corrected")
-  state.busy = true
-  controller.submit()
-  assert(not state.queue_edit and #state.queue == 2 and state.queue[1] == second_entry and state.queue[2] == third_entry
-    and second_entry.text == "second edited" and third_entry.text == "third corrected"
-    and second_entry.config == config_metadata and composer_text() == "original composer draft"
-    and #requests == 1 and #state.pending_steer == 0,
-    "commit changed entry identity, metadata, position, steered while busy, or lost the original composer draft")
-  state.busy = false
-  controller.drain()
-  assert(requests[2].method == "prompt.submit" and requests[2].params.text == "second edited"
-    and #state.queue == 1 and state.queue[1] == third_entry, "the committed second entry did not drain first")
-  state.busy = false
-  controller.drain()
-  assert(requests[3].method == "prompt.submit" and requests[3].params.text == "third corrected"
-    and #state.queue == 0, "the corrected third entry did not drain second")
-
-  local deleted_entry = { text = "delete me", task_id = "task-1" }
-  local retained_entry = { text = "retain me", task_id = "task-1" }
-  state.queue, state.busy = { deleted_entry, retained_entry }, true
-  compose("another composer draft")
-  controller.edit_queued(-1)
-  compose("retained draft")
-  controller.edit_queued(-1)
-  assert(state.queue_edit.entry == deleted_entry and state.queue_edit.drafts[retained_entry] == "retained draft"
-    and state.queue[1] == deleted_entry and state.queue[2] == retained_entry,
-    "moving from the third entry to the second lost its draft or changed queue order")
-  compose("")
-  controller.submit()
-  assert(not state.queue_edit and #state.queue == 1 and state.queue[1] == retained_entry
-    and retained_entry.text == "retained draft" and composer_text() == "another composer draft"
-    and #requests == 3, "blank submit did not delete only the selected entry or restore the composer draft")
-  state.busy = false
-  controller.drain()
-  assert(requests[4].method == "prompt.submit" and requests[4].params.text == "retained draft"
-    and #state.queue == 0, "deleting the second entry did not release the third entry")
-
-  local before = { text = "before", task_id = "task-1" }
-  local selected = { text = "selected", task_id = "task-1" }
-  local after = { text = "after", task_id = "task-1" }
-  state.queue, state.busy = { before, selected, after }, false
-  compose("original draft")
-  controller.edit_queued(-1)
-  compose("after edited")
-  controller.edit_queued(-1)
-  compose("steer this instead")
-  controller.queue_submit()
-  assert(not state.queue_edit and #state.queue == 2 and state.queue[1] == before and state.queue[2] == after
-    and after.text == "after edited" and composer_text() == "steer this instead" and #requests == 4,
-    "unqueue lost the active draft, reordered other messages, or submitted automatically")
-  state.busy = true
-  controller.steer_submit()
-  assert(requests[5].method == "turn.steer" and requests[5].params.text == "steer this instead"
-    and #state.queue == 2 and state.queue[1] == before and state.queue[2] == after,
-    "unqueued prompt could not be steered independently of the remaining queue")
-end, debug.traceback)
-
-if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
-vim.cmd.stopinsert = original_stopinsert
-if vim.api.nvim_buf_is_valid(state.composer_buf) then vim.api.nvim_buf_delete(state.composer_buf, { force = true }) end
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
+controller.edit_queued(-1)
+compose("unqueue this")
+host.flush()
+controller.queue_submit()
+assert(text() == "unqueue this" and #state.queue == 0)
+local before = #host.requests
+host.flush()
+assert(#host.requests == before, "unqueue submitted the text")
+controller.steer_submit()
+assert(text() == "" and state.queue[1].text == "unqueue this")
+assert(host.requests[#host.requests].parameters.action.message.intent == "auto")
+host.flush()
+assert(#errors == 0 and #warnings == 0, table.concat(errors, "\n"))
 print("harness_queue_edit: passed")
 vim.cmd("qa!")

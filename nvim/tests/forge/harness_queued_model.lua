@@ -2,112 +2,53 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
-local model_picker = require("forge.views.harness.model_picker")
-local submission = require("forge.views.harness.prompt_submission")
-submission.start = function(_, prompt, callback)
-  client.request("prompt.submit", { text = prompt.text, attachments = prompt.attachments or {} }, callback)
-  assert(state.queue[1] == prompt.queue_entry, "queue entry disappeared before simulated acceptance")
-  table.remove(state.queue, 1)
-end
-local history = require("forge.views.harness.prompt_history")
-local notifications = require("forge.infra.notifications")
-local requests, rejected, warnings, selection = {}, {}, {}, nil
-client.request = function(method, params, callback)
-  if method == "backend.model_pins" then callback({}) return end
-  requests[#requests + 1] = { method = method, params = params, callback = callback }
-end
-history.record = function() end
-notifications.info = function() end
-notifications.error = function(message) rejected[#rejected + 1] = message end
-notifications.warn = function(message) warnings[#warnings + 1] = message end
+local input = require("forge.views.harness.input_state")
+local host = dofile("nvim/tests/forge/support/input.lua").new(state)
+local warnings = {}
 controller.render = function() end
 controller.refresh_winbar = function() end
-model_picker.open = function(options) selection = options.on_confirm end
-state.session = { id = "queue-model", backend = "mock", model = "old", resolved_model = "old" }
+require("forge.views.harness.prompt_history").record = function() end
+require("forge.infra.notifications").warn = function(message) warnings[#warnings + 1] = message end
+require("forge.infra.notifications").error = function(message) error(message) end
+client.request_for = function(_, method, parameters, callback)
+  assert(host.request(method, parameters, callback), method)
+end
+state.session = { id = "queued-model", backend = "mock", model = "old" }
 state.capability = { model_selection = true, effort_selection = true }
-state.model_backend, state.model_list = "mock", { { id = "gpt-5.6-sol" } }
 state.composer_buf = vim.api.nvim_create_buf(false, true)
+state.presentation = { follow_tail = function() end }
+state.queue = {}
+input.attach(state, function() end)
 local function compose(text)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
 end
-controller.task_transition = function(action, _, callback)
+compose("/model chosen xhigh explain this\nand this")
+controller.queue_submit()
+assert(state.session.model == "old" and #state.queue == 1, "queueing changed active model settings")
+local queued = state.queue[1]
+assert(queued.config.model == "chosen" and queued.config.effort == "xhigh")
+assert(queued.text == "explain this\nand this")
+host.flush()
+controller.edit_queued(-1)
+compose("/model another impossible never send")
+controller.submit()
+assert(#warnings == 1 and state.queue_edit, "invalid effort committed the edit")
+assert(queued.config.model == "chosen")
+compose("/model another high revised prompt")
+controller.submit()
+assert(queued.config.model == "another" and queued.text == "revised prompt")
+assert(state.session.model == "old", "optimistic edit changed provider configuration")
+host.flush()
+assert(queued.config.model == "another" and queued.config.effort == "high")
+assert(queued.text == "revised prompt")
+local configured
+controller.task_transition = function(action)
   assert(action.action == "configure")
-  requests[#requests + 1] = { method = "task.transition", params = action.config,
-    callback = function(applied, failure)
-      if applied then
-        state.session.model, state.session.resolved_model = action.config.model, action.config.model
-        state.session.effort = action.config.effort
-      elseif failure then
-        notifications.error(failure)
-      end
-      callback(applied)
-    end }
+  configured = action.config
 end
-local success, failure = xpcall(function()
-  local opened_mcp = false
-  local open_mcp_picker = controller.open_mcp_picker
-  controller.open_mcp_picker = function() opened_mcp = true end
-  compose("/mcp")
-  controller.queue_submit()
-  assert(opened_mcp and #requests == 0 and #state.queue == 0, "queued /mcp reached the provider")
-  controller.open_mcp_picker = open_mcp_picker
-  state.busy = true
-  state.queue = { "earlier prompt" }
-  compose("/model gpt-5.6-sol xhigh explain this\nand this")
-  controller.queue_submit()
-  assert(#requests == 0 and #state.queue == 2 and state.session.model == "old")
-  state.busy = false
-  controller.drain()
-  assert(requests[1].method == "prompt.submit" and requests[1].params.text == "earlier prompt")
-  state.busy = false
-  controller.drain()
-  assert(requests[2].method == "task.transition" and requests[2].params.model == "gpt-5.6-sol"
-    and requests[2].params.effort == "xhigh" and requests[2].params.validate)
-  controller.drain()
-  assert(#requests == 2, "queue advanced before configuration acknowledgement")
-  requests[2].callback(true)
-  assert(requests[3].method == "prompt.submit" and requests[3].params.text == "explain this\nand this")
-  assert(state.session.model == "gpt-5.6-sol" and #state.queue == 0)
-
-  compose("/model")
-  controller.queue_submit()
-  assert(selection and #requests == 3, "/model did not open the picker immediately")
-  selection({ model = "picked", effort = "high", context_window = 64000 })
-  assert(#requests == 4 and #state.queue == 0, "model-only configuration waited behind active work")
-  assert(requests[4].method == "task.transition" and requests[4].params.model == "picked"
-    and requests[4].params.context_window == 64000)
-  requests[4].callback(true)
-  assert(#requests == 4 and #state.queue == 0, "model-only entry submitted an empty prompt")
-  state.busy = false
-
-  compose("/model invalid xhigh never run")
-  controller.queue_submit()
-  local invalid_model_entry = state.queue[1]
-  controller.edit_queued(-1)
-  assert(state.configuring and #state.queue == 1 and state.queue[1] == invalid_model_entry and not state.queue_edit
-    and #warnings == 1, "the configuring queue front became editable")
-  requests[5].callback(nil, "unavailable model")
-  assert(#rejected == 1 and #state.queue == 1 and #requests == 5 and not state.configuring)
-  assert(state.session.model == "picked", "rejected configuration changed the active model")
-  controller.edit_queued(-1)
-  assert(#state.queue == 1 and state.queue[1] == invalid_model_entry and state.queue_edit.entry == invalid_model_entry
-    and table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
-      == "/model invalid xhigh never run", "failed configuration was removed or lost its queued identity")
-  compose("/model next impossible prompt")
-  controller.submit()
-  assert(#requests == 5 and #state.queue == 1 and state.queue[1] == invalid_model_entry
-    and state.queue_edit.entry == invalid_model_entry and #rejected == 1 and #warnings == 2,
-    "invalid edited model effort changed or submitted the reserved entry")
-  compose("/model next high submitted prompt")
-  controller.submit()
-  assert(requests[6].method == "task.transition")
-  requests[6].callback(true)
-  assert(requests[7].method == "prompt.submit" and requests[7].params.text == "submitted prompt")
-  controller.command_set().action_by_id.model.run({})
-  assert(type(selection) == "function", "shared model binding passed command context as the picker callback")
-end, debug.traceback)
-if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
-vim.api.nvim_buf_delete(state.composer_buf, { force = true })
-if not success then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
+compose("/model settings-only high")
+controller.queue_submit()
+assert(#state.queue == 1 and configured.model == "settings-only", "model-only selection was queued as empty input")
+assert(#warnings == 1)
 print("harness_queued_model: passed")
 vim.cmd("qa!")

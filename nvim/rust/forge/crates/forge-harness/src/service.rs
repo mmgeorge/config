@@ -24,6 +24,9 @@ use crate::protocol::HarnessMethod;
 use crate::session::{ProviderForkState, SessionLeaseConflict, SessionStore};
 use crate::storage::SqliteStore;
 
+#[path = "service/input.rs"]
+mod input_delivery;
+
 /// Defines provider settings for one-shot generation without a conversation lease.
 #[derive(Clone, Debug, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -537,10 +540,6 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.unwrap_or(&registry.initial_session_id);
         let controller = registry.resolve(session_id).await?;
-        if request.method == "queue.update" {
-            controller.observer.update_queue(&request.params)?;
-            return Ok(());
-        }
         let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
         admit_task_intent(&controller, session_id, request, &mut store)?;
         Ok(())
@@ -796,6 +795,8 @@ impl HarnessService {
                     .cloned()
                     .collect();
                 for controller in controller_list {
+                    controller.input_stopping.store(true, Ordering::Release);
+                    controller.input.changed.notify_one();
                     if let Some(task) = controller.timeout_task.lock().await.take() {
                         task.abort();
                     }
@@ -842,6 +843,9 @@ impl HarnessService {
                     .cloned()
                     .collect();
                 for controller in controller_list {
+                    if let Some(task) = controller.input_task.lock().await.take() {
+                        task.await.context("input worker shutdown failed")?;
+                    }
                     controller
                         .presentation
                         .lock()
@@ -908,7 +912,7 @@ impl HarnessService {
         let result = serde_json::to_value(&snapshot)?;
         *harness = Some(SessionControllerRegistry::new(
             snapshot.session.id.clone(),
-            SessionController::new(broker),
+            SessionController::new(broker)?,
             runtime,
             initialize,
         ));
@@ -918,6 +922,9 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    input: Arc<crate::input::SessionInputQueue>,
+    input_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    input_stopping: AtomicBool,
     trace: Arc<crate::trace::TraceStore>,
     data_root: PathBuf,
     observer: Arc<crate::broker::BrokerObserver>,
@@ -1036,9 +1043,14 @@ impl SessionController {
     }
 
     /// Build one independently serialized controller from a durable broker session.
-    fn new(broker: HarnessBroker) -> Arc<Self> {
+    fn new(mut broker: HarnessBroker) -> Result<Arc<Self>> {
         let catalog_request = broker.backend_catalog_request();
-        Arc::new(Self {
+        let input = Arc::new(crate::input::SessionInputQueue::default());
+        broker.input_wakeup = Some(input.changed.clone());
+        Ok(Arc::new(Self {
+            input,
+            input_task: Mutex::new(None),
+            input_stopping: AtomicBool::new(false),
             trace: broker.trace.clone(),
             data_root: broker.data_root.clone(),
             observer: broker.observer(),
@@ -1061,7 +1073,7 @@ impl SessionController {
             mcp_discovery: Mutex::new((0, crate::backend::mcp::McpDiscovery::default())),
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
-        })
+        }))
     }
 
     async fn attach_compaction(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
@@ -1246,6 +1258,7 @@ impl SessionController {
                 let publication = broker.refresh_input_schedule();
                 let result = result.and(publication);
                 drop(broker);
+                controller.input.changed.notify_one();
                 match result {
                     Ok(()) => {}
                     Err(error) if error.is::<crate::broker::TurnCancelled>() => {}
@@ -1309,6 +1322,8 @@ impl SessionController {
 
 impl Drop for SessionController {
     fn drop(&mut self) {
+        self.input_stopping.store(true, Ordering::Release);
+        self.input.changed.notify_one();
         if let Some(task) = self.timeout_task.get_mut().take() {
             task.abort();
         }
@@ -1403,7 +1418,7 @@ impl SessionControllerRegistry {
             broker.snapshot()?.session.id == session_id,
             "resolved Harness controller does not own requested session {session_id}"
         );
-        let controller = SessionController::new(broker);
+        let controller = SessionController::new(broker)?;
         controller_by_id.insert(session_id.to_owned(), Arc::clone(&controller));
         Ok(controller)
     }
@@ -1757,6 +1772,15 @@ async fn route_request(
     }
     let controller = registry.resolve(&session_id).await?;
     controller.attach_compaction(message_sink).await?;
+    controller.attach_input(message_sink).await?;
+    if matches!(
+        method,
+        HarnessMethod::InputApply | HarnessMethod::InputGet | HarnessMethod::InputOperation
+    ) {
+        return controller
+            .input_request(request, method, message_sink)
+            .await;
+    }
     if method == HarnessMethod::BackendMockResponse {
         let control = controller
             .backend
@@ -1766,16 +1790,6 @@ async fn route_request(
         let result = control.dispatch(&session_id, command).await?;
         message_sink
             .send_response(Response::success(request.id, result)?)
-            .await?;
-        return Ok(());
-    }
-    if method == HarnessMethod::QueueUpdate {
-        controller.observer.update_queue(&request.params)?;
-        message_sink
-            .send_response(Response::success(
-                request.id,
-                json!({"revision":request.params["revision"]}),
-            )?)
             .await?;
         return Ok(());
     }
@@ -2616,6 +2630,7 @@ async fn route_request(
     for event in result.event {
         message_sink.send_event(event).await?;
     }
+    controller.input.changed.notify_one();
     publish_execution_completion(
         message_sink,
         result.response,
@@ -2848,6 +2863,9 @@ fn admit_task_intent(
         resume_after_transition,
     };
     store.admit_task_operation(&operation)?;
+    if matches!(action, "pause" | "clear" | "undo") {
+        controller.input.suspend(true)?;
+    }
     Ok(operation)
 }
 
@@ -2946,6 +2964,16 @@ async fn route_task_transition(
         ));
     }
     retain_configuration_event(&mut store, &operation)?;
+    if operation.state == "completed"
+        && matches!(
+            operation.action["action"].as_str(),
+            Some("resume" | "plan" | "execute" | "goal" | "fork" | "attach_plan")
+        )
+    {
+        let update = controller.input.suspend(false)?;
+        controller.publish_input(update, sink).await?;
+    }
+    controller.input.changed.notify_one();
     if operation
         .action
         .pointer("/config/settings_revision")
@@ -6968,7 +6996,7 @@ mod tests {
     async fn settled_mutations_wait_for_maintenance_without_provider_cleanup() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker);
+        let mut controller = SessionController::new(broker).unwrap();
         let backend = Arc::new(SteeringBackend {
             request: Mutex::new(Vec::new()),
         });
@@ -7213,7 +7241,7 @@ mod tests {
     async fn goal_control_reaches_provider_while_prompt_owns_broker() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker);
+        let mut controller = SessionController::new(broker).unwrap();
         let backend = Arc::new(SteeringBackend {
             request: Mutex::new(Vec::new()),
         });
@@ -7253,7 +7281,7 @@ mod tests {
     async fn goal_control_timeout_includes_a_blocked_provider_stop() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker);
+        let mut controller = SessionController::new(broker).unwrap();
         let backend = Arc::new(SteeringBackend {
             request: Mutex::new(Vec::new()),
         });
@@ -7277,7 +7305,7 @@ mod tests {
     async fn goal_control_acquires_broker_when_no_provider_reader_starts() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let broker = HarnessBroker::initialize(initialize(&fixture, "mock"))?;
-        let mut controller = SessionController::new(broker);
+        let mut controller = SessionController::new(broker).unwrap();
         let backend = crate::backend::codex::CodexBackend::new_with_permission_coordinator(
             vec!["codex".into(), "app-server".into()],
             crate::backend::approval::PermissionCoordinator::transient(fixture.path())?,
@@ -7295,6 +7323,161 @@ mod tests {
             assert!(controller.broker.try_lock().is_err());
             drop(admitted);
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn host_owned_input_steers_and_preserves_edit_and_pause_barriers() -> Result<()> {
+        use crate::backend::mock_response::MockResponseCommand;
+        use crate::input::{InputAction, InputEdit, InputIntent, InputMessage, InputOperation};
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await?;
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&registry.initial_session_id).await?;
+        let session_id = registry.initial_session_id.clone();
+        let control = controller.backend.mock_response_control().unwrap();
+        let held = control
+            .dispatch(&session_id, MockResponseCommand::Hold { mode: None })
+            .await?;
+        let hold_id = held["id"].as_str().unwrap().to_owned();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let reader = tokio::spawn(async move {
+            while output.recv().await?.is_some() {}
+            Ok::<(), anyhow::Error>(())
+        });
+        controller.attach_input(&sink).await?;
+        let message = |id: &str, intent: InputIntent| InputOperation {
+            id: format!("operation-{id}"),
+            control_revision: 0,
+            action: InputAction::Submit {
+                message: InputMessage {
+                    id: id.into(),
+                    revision: 0,
+                    text: format!("input {id}"),
+                    task_id: None,
+                    intent,
+                    delivery: Default::default(),
+                    attachments: vec![],
+                    config: None,
+                    reservation: None,
+                    submission_id: None,
+                    error: None,
+                },
+            },
+        };
+        controller
+            .input
+            .apply(message("first", InputIntent::Auto))?;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            control.dispatch(
+                &session_id,
+                MockResponseCommand::Wait {
+                    id: hold_id.clone(),
+                },
+            ),
+        )
+        .await??;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if controller.input.snapshot()?.messages.iter().any(|message| {
+                    message.id == "first"
+                        && message.delivery == crate::input::InputDelivery::Accepted
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(
+            controller.execution_admission.available_permits(),
+            0,
+            "delivery acknowledgement must not release active execution"
+        );
+        controller
+            .input
+            .apply(message("steered", InputIntent::Auto))?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !controller
+                    .input
+                    .snapshot()?
+                    .messages
+                    .iter()
+                    .any(|message| message.id == "steered")
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        controller
+            .input
+            .apply(message("queued", InputIntent::Queue))?;
+        controller.input.apply(InputOperation {
+            id: "edit".into(),
+            control_revision: 0,
+            action: InputAction::Reserve {
+                id: "queued".into(),
+                revision: 1,
+                reservation: "editor".into(),
+            },
+        })?;
+        controller.input.suspend(true)?;
+        control
+            .dispatch(&session_id, MockResponseCommand::Release { id: hold_id })
+            .await?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while controller.execution_admission.available_permits() == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await?;
+        let queued = controller
+            .input
+            .snapshot()?
+            .messages
+            .into_iter()
+            .find(|message| message.id == "queued")
+            .unwrap();
+        assert_eq!(queued.reservation.as_deref(), Some("editor"));
+        controller.input.apply(InputOperation {
+            id: "commit".into(),
+            control_revision: 0,
+            action: InputAction::Commit {
+                reservation: "editor".into(),
+                edits: vec![InputEdit {
+                    id: "queued".into(),
+                    revision: queued.revision,
+                    text: "edited follow-up".into(),
+                    attachments: vec![],
+                    config: None,
+                }],
+            },
+        })?;
+        assert!(controller.input.snapshot()?.suspended);
+        controller.input.suspend(false)?;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if controller.input.snapshot()?.messages.is_empty() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            Ok::<(), anyhow::Error>(())
+        })
+        .await??;
+        assert_eq!(controller.execution_admission.available_permits(), 1);
+        service.shutdown(Duration::from_secs(5)).await?;
+        drop(sink);
+        reader.await??;
         Ok(())
     }
 

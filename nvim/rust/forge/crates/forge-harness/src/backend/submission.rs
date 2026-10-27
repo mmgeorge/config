@@ -68,6 +68,15 @@ pub(crate) struct SubmissionStore {
 }
 
 impl SubmissionStore {
+    pub(crate) fn submission(self: &Arc<Self>, id: &str) -> Result<Arc<Submission>> {
+        let submission = Arc::new(Submission {
+            store: self.clone(),
+            id: id.into(),
+            acceptance: tokio::sync::watch::channel(false).0,
+        });
+        submission.record()?;
+        Ok(submission)
+    }
     /// Opens a crash-recoverable journal without depending on trace enablement.
     pub fn open(root: &Path, trace: Arc<TraceStore>) -> Result<Arc<Self>> {
         std::fs::create_dir_all(root)?;
@@ -113,6 +122,7 @@ impl SubmissionStore {
         Ok(Arc::new(Submission {
             store: self.clone(),
             id: record.id,
+            acceptance: tokio::sync::watch::channel(false).0,
         }))
     }
 
@@ -222,9 +232,26 @@ impl std::fmt::Debug for SubmissionStore {
 pub struct Submission {
     store: Arc<SubmissionStore>,
     id: String,
+    acceptance: tokio::sync::watch::Sender<bool>,
 }
 
 impl Submission {
+    pub(crate) fn acceptance(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.acceptance.subscribe()
+    }
+    pub(crate) async fn reconcile(&self, backend: &dyn Backend) -> Result<SubmissionRecord> {
+        let record = self.record()?;
+        if matches!(record.delivery, SubmissionState::Sending { .. }) {
+            let known = self
+                .store
+                .receipts(&record.request, backend.descriptor().kind)?;
+            if let Some(receipt) = backend.reconcile_submission(&record, &known).await? {
+                self.accepted(receipt)?;
+                return self.record();
+            }
+        }
+        Ok(record)
+    }
     /// Returns the stable host identity used for correlation, never a deduplication promise.
     pub fn id(&self) -> &str {
         &self.id
@@ -273,6 +300,7 @@ impl Submission {
         )?;
         let mut record: SubmissionRecord = serde_json::from_str(&payload)?;
         if matches!(record.delivery, SubmissionState::Accepted { .. }) {
+            self.acceptance.send_replace(true);
             return Ok(());
         }
         ensure!(
@@ -314,6 +342,7 @@ impl Submission {
         }
         transaction.commit()?;
         drop(connection);
+        self.acceptance.send_replace(true);
         for changed in &changed {
             self.store.log(changed);
         }
@@ -395,6 +424,7 @@ impl Submission {
                 let handle = Self {
                     store: self.store.clone(),
                     id: pending.id.clone(),
+                    acceptance: tokio::sync::watch::channel(false).0,
                 };
                 let known_receipts = self.store.receipts(request, provider)?;
                 if let Some(receipt) = backend

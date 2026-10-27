@@ -21,6 +21,7 @@ function HarnessSnapshot.apply(state, result)
     and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
   if state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
     state.task_operation, state.busy, state.restore_applying = nil, false, nil
+    state.request_busy, state.execution_busy = false, false
     state.check_interrupt_pending = nil
     if state.presentation and state.presentation.transcript then
       require("forge.views.harness.status_hint").clear(state.presentation.transcript.buffer)

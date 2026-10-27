@@ -82,7 +82,9 @@ M.empty_diff_rows = {}
 ---@field render_fold_signature? string
 ---@field queue (string|ForgeQueuedPrompt)[]
 ---@field queue_paused boolean
----@field check_queue? ForgeCheckQueuePublication
+---@field input? ForgeInputViewState
+---@field execution_busy? boolean
+---@field request_busy? boolean
 ---@field status_thoughts? boolean
 ---@field subagent_tools? boolean
 ---@field lsp_tools? boolean
@@ -100,8 +102,6 @@ M.empty_diff_rows = {}
 ---@field configuration_debounce? boolean
 ---@field configuration_error? string
 ---@field pending_steer table[]
----@field prompt_submission? ForgePromptSubmission
----@field prompt_sequence? integer
 ---@field execution_request_owner? table Opaque owner of the current execution callback.
 ---@field question_draft? {owner_id?:string, question_set_id:string, question_id:string, text:string} Rejected clarification retained for retry.
 ---@field transcript_buf integer?

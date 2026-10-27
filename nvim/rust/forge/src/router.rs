@@ -523,10 +523,7 @@ impl HostRouter {
             {
                 return Ok(method);
             }
-            if matches!(
-                harness_method,
-                HarnessMethod::TaskTransition | HarnessMethod::QueueUpdate
-            ) {
+            if harness_method == HarnessMethod::TaskTransition {
                 self.host
                     .harness
                     .prepare_task(envelope.session_id.as_deref(), &envelope.request)

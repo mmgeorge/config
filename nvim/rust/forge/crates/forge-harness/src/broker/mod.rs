@@ -612,6 +612,8 @@ pub struct HarnessBroker {
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(Option<forge_buffer::identity::DocumentId>, u64)>,
+    pub(crate) input_submission: Option<Arc<crate::backend::submission::Submission>>,
+    pub(crate) input_wakeup: Option<Arc<tokio::sync::Notify>>,
     submitted_attachments: Vec<crate::attachment::InputAttachment>,
     active_wait_projection: Option<ActiveWait>,
     pub(crate) parent_input: crate::backend::SteeringLane,
@@ -960,6 +962,8 @@ impl HarnessBroker {
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
             prompt_admission: None,
+            input_submission: None,
+            input_wakeup: None,
             active_wait_projection: None,
             parent_input: Default::default(),
             submitted_attachments: Vec::new(),
@@ -1633,7 +1637,7 @@ impl HarnessBroker {
                 .observer
                 .record_prompt_history(params, self.clock.now_ms()),
             HarnessMethod::QueueEditLast => {
-                anyhow::bail!("prompt queue ownership lives in the Neovim client")
+                anyhow::bail!("queued edits require input.apply")
             }
             HarnessMethod::PlanAcceptanceCancel => self.cancel_plan_acceptance(),
             HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
@@ -1686,6 +1690,9 @@ impl HarnessBroker {
                 Ok((json!({ "shutdown": true }), Vec::new()))
             }
             HarnessMethod::TurnRestart
+            | HarnessMethod::InputApply
+            | HarnessMethod::InputGet
+            | HarnessMethod::InputOperation
             | HarnessMethod::TurnSteer
             | HarnessMethod::ApprovalResolve
             | HarnessMethod::BackendSkills
@@ -4587,6 +4594,7 @@ impl HarnessBroker {
         plan.generation.reset_no_progress();
         self.store.save_plan(&plan)?;
         self.record_plan_trace("feedback_consumed", plan_trace_fields(&plan));
+        self.settle_task(None)?;
         let lifecycle = PlanLifecycleRecord {
             title: plan.title.clone(),
             anchor: Some(self.plan_exchange_anchor(&plan.id)?),
@@ -7451,6 +7459,13 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if matches!(
+            backend_event.kind.as_str(),
+            "execution_state" | "turn_started"
+        ) && let Some(wakeup) = &self.input_wakeup
+        {
+            wakeup.notify_one();
+        }
         // Configuration completion belongs to the Rust service. Other forwarded events follow the UI contract.
         if !matches!(
             backend_event.kind.as_str(),

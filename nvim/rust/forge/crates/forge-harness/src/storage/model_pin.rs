@@ -51,7 +51,9 @@ impl ModelPinStore {
             !model.trim().is_empty(),
             "model pin identifier cannot be empty"
         );
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
         if pinned {
             transaction.execute(
                 "INSERT OR IGNORE INTO model_pin (backend, model) VALUES (?1, ?2)",
@@ -133,6 +135,37 @@ mod test {
             ModelPinStore::open(directory.path())?.load("copilot")?,
             ["first", "second"]
         );
+        Ok(())
+    }
+
+    #[test]
+    fn model_pin_write_waits_for_another_connection() -> anyhow::Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut holder = ModelPinStore::open(directory.path())?;
+        let mut contender = ModelPinStore::open(directory.path())?;
+        let transaction = holder
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let (started, waiting) = std::sync::mpsc::channel();
+        let (completed, outcome) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            started.send(()).unwrap();
+            completed
+                .send(contender.set("copilot", "waiting-model", true))
+                .unwrap();
+        });
+        waiting.recv()?;
+        assert!(matches!(
+            outcome.recv_timeout(std::time::Duration::from_millis(50)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        transaction.commit()?;
+        assert_eq!(
+            outcome.recv_timeout(std::time::Duration::from_secs(2))??,
+            ["waiting-model"]
+        );
+        writer.join().unwrap();
+        assert_eq!(holder.load("copilot")?, ["waiting-model"]);
         Ok(())
     }
 }

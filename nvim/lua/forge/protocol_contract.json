@@ -1,5 +1,5 @@
 {
-  "version": 24,
+  "version": 25,
   "node": {
     "kind": [
       "exchange",
@@ -23,6 +23,12 @@
     ]
   },
   "session": {
+    "input_changed": {
+      "route": "handle",
+      "required": {
+        "revision": "integer"
+      }
+    },
     "background_error": {
       "route": "handle",
       "required": {

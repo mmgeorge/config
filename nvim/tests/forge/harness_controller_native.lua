@@ -26,7 +26,11 @@ client.host_generation = function() return generation end
 client.subscribe = function(callback) receive = callback return function() end end
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "native-controller")
-  if method == "prompt.submit" then submitted = params submitted_callback = callback return end
+  if method == "input.get" then
+    callback({ revision = state.input and state.input.revision or 0, messages = {}, suspended = false, execution_busy = false })
+    return
+  end
+  if method == "input.apply" then submitted = params submitted_callback = callback return end
   if method == "session.configure" then
     assert(type(params.status_thoughts) == "boolean")
     status_thought_request[#status_thought_request + 1] = { params = params, callback = callback }
@@ -104,6 +108,10 @@ local success, failure = xpcall(function()
   local original_state_request = client.request_for
   local synchronized = false
   client.request_for = function(_, method, _, callback)
+    if method == "input.get" then
+      callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
+      return
+    end
     assert(method == "state.get")
     callback(null_snapshot)
     synchronized = true
@@ -118,6 +126,10 @@ local success, failure = xpcall(function()
     completed = completed + 1
   end }
   client.request_for = function(_, method, _, callback)
+    if method == "input.get" then
+      callback({ revision = 0, messages = {}, suspended = false, execution_busy = false })
+      return
+    end
     assert(method == "state.get")
     reads[#reads + 1] = callback
   end
@@ -431,23 +443,15 @@ local success, failure = xpcall(function()
   completion_visible = true
   controller.submit()
   assert(not completion_visible, "native submission retained completion for the consumed draft")
-  assert(submitted and submitted.submission and submitted.text == "native draft")
+  assert(submitted and submitted.action.kind == "submit" and submitted.action.message.text == "native draft")
   assert(vim.wait(2500, function() return sync_count > sync_before_submission end, 20),
-    "busy Harness did not refresh the native transcript status")
-  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft", "controller cleared before native admission")
-  receive("backend_event", { kind = "prompt_submission", data = { document = state.presentation.document,
-    token = submitted.submission.token, state = "accepted" } }, "native-controller")
+    "optimistic submission did not refresh the native transcript")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
-  local original_state_request = client.request_for
-  local recovered_state = false
-  client.request_for = function(_, method)
-    assert(method == "state.get")
-    recovered_state = true
-  end
-  submitted_callback(nil, "simulated provider failure")
-  assert(not state.busy and recovered_state, "provider failure did not reconcile execution state")
-  state.state_sync_pending = false
-  client.request_for = original_state_request
+  submitted_callback({ operation_id = submitted.id, revision = state.input.revision + 1,
+    suspended = false, upsert = {}, removed = {}, error = "simulated admission failure" })
+  assert(#state.input.rejected == 1, "failed optimistic input was not retained")
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft")
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
   generation = 2
   controller.render()
@@ -461,13 +465,9 @@ local success, failure = xpcall(function()
   controller.drain()
   assert(#state.queue == 1 and submitted == nil, "finalizing status drained queued input")
   state.status = { kind = "idle" }
-  assert(state.execution_notice, "provider failure lost its persistent notice")
-  state.execution_notice = nil
   controller.drain()
-  assert(#state.queue == 1 and submitted ~= nil, "idle status did not submit retained queued input")
-  receive("backend_event", { kind = "prompt_submission", data = { document = state.presentation.document,
-    token = submitted.submission.token, state = "accepted" } }, "native-controller")
-  assert(#state.queue == 0, "accepted queued input remained in the queue")
+  assert(#state.queue == 1 and submitted == nil, "Lua independently dispatched host-owned input")
+  state.queue = {}
   local original_plain_request = client.request
   local child_request_for = client.request_for
   client.request_for = function(session_id, method, params, callback)

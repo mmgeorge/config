@@ -1,5 +1,6 @@
 local M = {}
 local attachment = require("forge.views.harness.attachment")
+local input_state = require("forge.views.harness.input_state")
 
 ---@class ForgeQueuedPrompt
 ---@field text string
@@ -34,6 +35,14 @@ end
 ---@return ForgeAttachmentSelection[]? attachments
 function M.move(state, draft, direction)
   local edit = state.queue_edit
+  if not edit and state.failed_queue_edit then
+    edit = state.failed_queue_edit
+    state.failed_queue_edit = nil
+    state.queue_edit = edit
+    edit.original_draft = draft
+    edit.original_attachments = attachment.capture(state.composer_buf).attachments
+    return edit.drafts[edit.entry] or edit.entry.text, nil, edit.attachments[edit.entry] or edit.entry.attachments
+  end
   if direction > 0 and not edit then return nil, "No queued prompt is being edited" end
   ---@type integer?
   local index = #state.queue + 1
@@ -42,22 +51,25 @@ function M.move(state, draft, direction)
   index = index + direction
   if index < 1 then return nil, edit and "Already editing the first queued prompt" or "No queued prompt to edit" end
   if index > #state.queue then return nil, "Already editing the last queued prompt" end
-  if index == 1 and (state.configuring or state.prompt_submission and state.prompt_submission.queue_entry == state.queue[index]) then
-    return nil, "The first queued prompt is being admitted"
-  end
   local entry = state.queue[index]
-  if type(entry) == "string" then
-    entry = { text = entry, task_id = state.session and state.session.current_task_id }
-    state.queue[index] = entry
+  if entry.delivery == "delivering" or entry.delivery == "unknown" then
+    return nil, "Delivery has started. The original message cannot be edited."
   end
   if edit then
     edit.drafts[edit.entry] = draft
     edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
   else edit = { entry = entry, barrier = entry, drafts = {}, attachments = {}, original_draft = draft,
+    reservation = input_state.reservation(),
     original_attachments = attachment.capture(state.composer_buf).attachments, buffer = state.composer_buf } end
   if index < (position(state.queue, edit.barrier) or index) then edit.barrier = entry end
   edit.entry = entry
   state.queue_edit = edit
+  if entry.reservation ~= edit.reservation and not entry.local_only then
+    input_state.perform(state, { kind = "reserve", id = entry.id, revision = entry.revision or 0,
+      reservation = edit.reservation }, function(failure)
+      if failure and state.queue_edit == edit then edit.failure = failure end
+    end)
+  end
   return edit.drafts[entry] or entry.text, nil, edit.attachments[entry] or entry.attachments
 end
 
@@ -79,20 +91,45 @@ end
 ---@return ForgeAttachmentSelection[]? attachments
 function M.finish(state, draft)
   local edit = state.queue_edit
-  if not edit or not position(state.queue, edit.entry) then
+  if not edit then
     return nil, "The queued message being edited is no longer available"
   end
+  if not position(state.queue, edit.entry) then
+    if draft ~= "" then return nil, "This message was delivered. Unqueue to keep the edited draft separately." end
+    state.queue_edit = nil
+    input_state.perform(state, { kind = "release", reservation = edit.reservation })
+    return edit.original_draft, nil, edit.original_attachments
+  end
+  if edit.failure and draft ~= "" then return nil, edit.failure .. ". Unqueue to retain this draft separately." end
   edit.drafts[edit.entry] = draft
   edit.attachments[edit.entry] = attachment.capture(state.composer_buf).attachments
-  local retained = {}
+  local edits = {}
+  local local_edits = {}
   for _, entry in ipairs(state.queue) do
     local updated = edit.drafts[entry]
-    if updated == nil or updated:find("%S") then
-      if updated ~= nil then entry.text, entry.attachments = updated, edit.attachments[entry] end
-      retained[#retained + 1] = entry
+    if updated ~= nil then
+      if entry.local_only then
+        local_edits[#local_edits + 1] = { entry = entry, text = updated,
+          attachments = edit.attachments[entry] or entry.attachments or {} }
+      else
+        edits[#edits + 1] = { id = entry.id, revision = entry.revision or 0,
+          text = edit.commit_text and edit.commit_text[entry] or updated,
+          config = edit.commit_config and edit.commit_config[entry],
+          attachments = edit.attachments[entry] or entry.attachments or {} }
+      end
     end
   end
-  state.queue, state.queue_edit = retained, nil
+  state.queue_edit = nil
+  for _, change in ipairs(local_edits) do
+    input_state.discard_rejected(state, change.entry.id)
+    if change.text:find("%S") then input_state.submit(state, change.text, change.attachments, "queue", change.entry.config) end
+  end
+  input_state.perform(state, { kind = "commit", reservation = edit.reservation, edits = edits }, function(failure)
+    if failure then
+      state.failed_queue_edit = edit
+      edit.failure = failure
+    end
+  end)
   return edit.original_draft, nil, edit.original_attachments
 end
 
@@ -102,11 +139,12 @@ end
 ---@return (string|{text: string})[]
 function M.staging(state, draft)
   local edit = state.queue_edit
-  if not edit then return state.queue end
   local staged = {}
   for _, entry in ipairs(state.queue) do
-    local text = edit.drafts[entry] or (type(entry) == "table" and entry.text or entry)
-    if entry == edit.entry then text = "[editing] " .. draft end
+    local text = edit and edit.drafts[entry] or entry.text
+    if edit and entry == edit.entry then text = "[editing] " .. draft
+    elseif entry.error then text = "[" .. entry.delivery .. ": " .. entry.error .. "] " .. text
+    end
     staged[#staged + 1] = { text = text }
   end
   return staged

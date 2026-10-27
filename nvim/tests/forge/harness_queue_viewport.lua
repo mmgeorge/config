@@ -1,47 +1,70 @@
 vim.loader.enable(false)
 vim.o.lines, vim.o.columns = 30, 80
-local scene = dofile("nvim/tests/forge/support/check_groups_scene.lua").open()
-local state = scene.state
+local root = vim.fn.getcwd()
+local workspace, data = vim.fn.tempname(), vim.fn.tempname()
+vim.fn.mkdir(workspace, "p")
+vim.fn.mkdir(data, "p")
+local binary = vim.fn.fnamemodify(require("forge.builder").binary_path(), ":p")
+local original_stdpath = vim.fn.stdpath
+vim.fn.stdpath = function(kind)
+  return (kind == "data" or kind == "config") and data or original_stdpath(kind)
+end
+package.loaded["forge.builder"] = { ensure = function(callback)
+  vim.schedule(function() callback({ ok = true, path = binary }) end)
+  return function() end
+end }
+local client = require("forge.client")
+client._set_launcher_for_test(vim.system)
+local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
+local failures = {}
+require("forge.infra.notifications").error = function(message) failures[#failures + 1] = message end
+local function await(predicate, message)
+  assert(vim.wait(5000, function() return #failures > 0 or predicate() end, 10), message)
+  assert(#failures == 0, table.concat(failures, "\n"))
+end
 local function settled()
-  assert(vim.wait(5000, function()
-    return not state.presentation.syncing and not state.presentation.pending
+  await(function()
+    return state.input and #state.input.pending == 0 and not state.input.refreshing
+      and state.presentation and not state.presentation.syncing and not state.presentation.pending
       and not state.presentation.staging_inflight and not state.presentation.applying
       and vim.deep_equal(state.presentation.staging, state.presentation.applied_staging)
-  end, 10), "queue presentation did not settle")
+  end, "queue presentation did not settle")
 end
-local function assert_tail()
-  local count = vim.api.nvim_buf_line_count(state.transcript_buf)
-  local first, last = unpack(vim.api.nvim_win_call(state.transcript_win, function()
-    return { vim.fn.line("w0"), vim.fn.line("w$") }
-  end))
-  local status = require("forge.views.harness.status_region").location(state.presentation.transcript) + 1
-  assert(last == count and first <= status, "queue editing hid status or the queue tail")
-  assert(vim.api.nvim_get_current_win() == state.composer_win, "queue editing stole composer focus")
+local function compose(text)
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, vim.split(text, "\n", { plain = true }))
+end
+local function text()
+  return table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n")
 end
 local success, failure = xpcall(function()
-  state.busy = true
+  vim.fn.chdir(workspace)
+  require("forge").setup({ harness_logging = false, harness = { backend = "mock",
+    backends = { mock = { command = { "mock" }, selectable = true } } } })
+  require("forge.views.harness").open()
+  await(function() return state.ready and state.presentation and state.presentation.ready and state.input end, "startup")
+  controller.cancel_turn()
+  await(function() return not state.task_operation and not state.request_busy end, "pause")
   local original = "first queued line\nfirst hidden line"
   local selected = "second queued line\n" .. string.rep("complete draft line 界\n", 12) .. "last draft line"
-  state.queue = { { text = original }, { text = selected } }
-  controller.refresh_winbar()
+  compose(original)
+  controller.queue_submit()
+  compose(selected)
+  controller.queue_submit()
   settled()
-  local text = table.concat(scene.lines(), "\n")
-  assert(text:find("first queued line", 1, true) and text:find("second queued line", 1, true))
-  assert(not text:find("hidden line", 1, true) and not text:find("last draft line", 1, true), "queue leaked complete messages")
-  scene.toggle("scene:checks")
+  local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  assert(transcript:find("first queued line", 1, true) and transcript:find("second queued line", 1, true))
+  assert(not transcript:find("first hidden line", 1, true) and not transcript:find("last draft line", 1, true))
   controller.edit_queued(-1)
+  assert(text() == selected, "editing waited for acknowledgement or lost the complete draft")
   settled()
-  assert_tail()
-  assert(table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n") == selected,
-    "editing lost the complete queued message")
+  assert(vim.api.nvim_get_current_win() == state.composer_win)
   controller.edit_queued(-1)
+  assert(text() == original)
   settled()
-  assert_tail()
-  assert(table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n") == original)
   controller.edit_queued(1)
   settled()
-  assert_tail()
+  assert(text() == selected)
   vim.api.nvim_set_current_win(state.transcript_win)
   vim.api.nvim_win_set_cursor(state.transcript_win, { 1, 2 })
   vim.api.nvim_win_call(state.transcript_win, function() vim.cmd("normal! zt") end)
@@ -50,19 +73,20 @@ local success, failure = xpcall(function()
   settled()
   assert(vim.deep_equal(view, vim.api.nvim_win_call(state.transcript_win, vim.fn.winsaveview)),
     "passive queue refresh moved a history reader")
-  controller.edit_queued(-1)
   controller.submit()
   settled()
-  assert_tail()
-  assert(not state.queue_edit and #state.queue == 2, "saving changed the queue")
+  assert(not state.queue_edit and #state.queue == 2)
   controller.edit_queued(-1)
   controller.queue_submit()
   settled()
-  assert_tail()
-  assert(not state.queue_edit and #state.queue == 1, "unqueue did not remove only the edited message")
-  assert(table.concat(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false), "\n") == selected,
-    "unqueue lost the complete message")
+  assert(not state.queue_edit and #state.queue == 1 and text() == selected,
+    "unqueue lost the complete message or removed another entry")
 end, debug.traceback)
-scene.close()
-assert(success, failure)
+require("forge.views.harness.workspace").release(state)
+if state.presentation then state.presentation.close() end
+client.stop()
+local collected = vim.wait(5000, function() return client._client.process == nil end, 10)
+vim.fn.chdir(root)
+vim.fn.stdpath = original_stdpath
+assert(success and collected, failure or "fixture host did not stop")
 print("harness_queue_viewport: passed")

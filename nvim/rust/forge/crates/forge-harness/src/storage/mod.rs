@@ -921,7 +921,9 @@ impl SqliteStore {
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
             rows.push(("plan_lifecycle_record", lifecycle.id.as_str(), payload));
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(exchange) = exchange {
             let written = transaction.execute(
                 "UPDATE exchange_record SET payload=?1 WHERE id=?2 AND session_id=?3 AND agent_id=?4",
@@ -948,7 +950,9 @@ impl SqliteStore {
         for payload in [&mut deviation_payload, &mut execution_payload] {
             payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
         }
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         for (table, id, payload) in [
             ("plan_deviation_record", &deviation.id, deviation_payload),
             ("plan_execution_record", &execution.id, execution_payload),
@@ -1086,7 +1090,9 @@ impl SqliteStore {
                 && event.owner == crate::timeline::TimelineOwner::session(&session.id),
             "fork history event must belong to its destination session"
         );
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let primary = Agent::primary(&session.id, session.created_at_ms);
         anyhow::ensure!(
             session.primary_agent_id == primary.id,
@@ -1414,7 +1420,9 @@ impl SessionStore for SqliteStore {
             session.primary_agent_id == primary.id,
             "session primary agent identity does not belong to this session"
         );
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)\
              ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=excluded.payload",

@@ -14,7 +14,6 @@ local task_control = require("forge.views.harness.task")
 function M.notice(state)
   local notice = state.presentation and diagnostic.get(state.presentation, "failure", "error")
     or diagnostic.get(state, "host_error", "error")
-    or diagnostic.get(state, "execution_notice", "warning")
     or diagnostic.get(state, "queue_notice", "info")
     or diagnostic.get(state, "connection_error", "info")
     or diagnostic.get(state, "sync_error", "info")
@@ -25,6 +24,7 @@ function M.notice(state)
   local submission = state.busy and state.prompt_submission
   local entry = submission and submission.queue_entry or (state.queue or {})[1]
   if not entry or state.queue_edit and state.queue_edit.barrier == entry then return end
+  if entry.error or entry.reservation or state.input and state.input.suspended then return end
   if type(entry) == "table" and entry.task_id ~= (state.session and state.session.current_task_id) then return end
   local task = task_control.current(state)
   if task and vim.tbl_contains({ "paused", "blocked", "failed", "stopping" }, task.status) then return end

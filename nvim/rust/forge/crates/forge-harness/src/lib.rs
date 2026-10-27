@@ -13,6 +13,7 @@ pub mod control_tools;
 pub(crate) mod declaration;
 pub mod exchange;
 pub mod goal;
+pub(crate) mod input;
 mod limits;
 pub mod permissions;
 pub mod plan;

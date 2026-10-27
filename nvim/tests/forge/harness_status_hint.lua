@@ -36,6 +36,12 @@ assert(buffer.apply_snapshot(transcript, {
   } },
 }).kind == "Applied")
 assert(displayed():find("op open plan", 1, true))
+transcript.message_notice = { text = "Not submitted · an earlier request was busy", failed = false }
+assert(displayed():find("op open plan", 1, true), "message rejection hid the plan review action")
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Waiting for plan review · revision 1")
+local message_footer = vim.api.nvim_buf_get_extmark_by_id(transcript.buffer, namespace, 3, { details = true })
+assert(message_footer[3].virt_lines[1][1][1]:find("earlier request", 1, true))
+transcript.message_notice = nil
 config.options.keymaps.harness.open_artifact = "<F6>"
 assert(displayed():find("<F6> open plan", 1, true))
 config.options.keymaps.harness.open_artifact = false

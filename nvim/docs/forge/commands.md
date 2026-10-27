@@ -401,9 +401,20 @@ and output allowances do not increase the displayed context size.
 
 Input timeouts run independently of the picker. An idle session has no periodic
 timeout check. Changing a timeout affects future questions and approvals without
-extending an existing deadline. If another execution prevents a clarification
-from being submitted, Harness shows **Not submitted**, keeps the question open,
-and restores the clarification text for retry.
+extending an existing deadline. Ordinary submitted messages update the display
+immediately, then Harness starts, steers, or queues them according to the actual
+execution state. Queue editing remains local while an asynchronous reservation
+protects the message from delivery. Failed operations retain drafts and show their
+diagnostic separately from task status and review actions.
+
+Question-picker clarifications use the same delivery path. A timeout that resumes
+planning before the clarification arrives therefore does not reject the message
+merely because execution is occupied.
+
+Queued messages and unfinished queue operations stay in session memory, not in
+the shared history database. Restarting the host discards pending queued messages.
+Provider-delivery evidence remains saved independently so an uncertain send is
+not automatically duplicated.
 
 `/checks` opens project checks. `/checks edit on` and
 `/checks edit off` toggle check-editing permission without sending a prompt.

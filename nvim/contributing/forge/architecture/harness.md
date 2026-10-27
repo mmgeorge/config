@@ -43,6 +43,51 @@ has its own handler so ordinary streamed messages do not reserve its temporary s
 The resumed-repair regression runs with a 1 MiB worker stack to leave room for the
 enclosing host request lifecycle on the normal worker stack.
 
+## Input delivery and optimistic editing
+
+`SessionController` owns accepted messages through an in-memory `SessionInputQueue`.
+Queue operations atomically update message revisions and retain idempotent
+operation outcomes for that controller's lifetime. `input.apply`, `input.get`, and `input.operation` remain available
+without acquiring the provider execution lock. The input worker reuses execution
+admission, provider steering, task controls, and the submission journal.
+
+Neovim retains confirmed input state, pending optimistic operations, and editor
+drafts separately. Submitting or editing changes the display before an
+acknowledgement arrives. Typing stays local. Replies retire their matching
+operation and reapply later pending operations over confirmed state. A rejected
+submission cannot replace newer composer text.
+
+Edit reservations prevent delivery of the reserved message and following queue
+entries. Saving commits the reserved revisions together. Removing or unqueueing
+does not send the captured text. A delivery that wins before reservation leaves
+the edited draft available rather than changing a message already sent.
+
+Pause establishes a revisioned delivery barrier. Operations captured before that
+barrier cannot undo it when they arrive later. Explicit resume and new input use
+the current control revision. Queued messages retain their original task and
+configuration. Completion checks read the accepted host queue, not a second
+editor-maintained pending flag.
+
+Provider acceptance and Harness queue acknowledgement are distinct. Confirmed
+non-delivery may become queued input. Uncertain provider writes require journal
+reconciliation before replay. Message diagnostics render separately from the
+canonical task status and cannot replace plan-review actions.
+
+Claimed messages leave the visible queue without a sending label. Provider
+acceptance publishes independently of response completion, while execution keeps
+its admission permit through finalization. Failed delivery restores the retained
+message. Queue operations do not open SQLite, write files, or wait for another
+session's storage. Pending messages, edit reservations, and queue operation
+outcomes do not survive a host restart. The provider submission journal remains
+durable to prevent uncertain provider delivery from being replayed.
+
+Shared history, settings, pins, and provider-delivery journals remain in SQLite.
+Mutating transactions acquire write admission before reading their baselines.
+The existing five-second SQLite busy timeout waits for another writer rather than
+failing a read-to-write transaction upgrade. Read-only snapshots retain deferred
+transactions so they do not exclude writers. Real storage failures and exhausted
+write waits remain explicit.
+
 ## Timeline storage and incremental projection
 
 Portable settings retain automatic completion-check enablement independently of

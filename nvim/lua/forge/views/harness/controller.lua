@@ -21,10 +21,10 @@ local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
 local task_control = require("forge.views.harness.task")
 local queue_editor = require("forge.views.harness.queue_editor")
-local check_queue = require("forge.views.harness.check_queue")
 local attachment = require("forge.views.harness.attachment")
 local prompt_submission = require("forge.views.harness.prompt_submission")
 local tabline = require("forge.views.harness.tabline")
+local input_state = require("forge.views.harness.input_state")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
 local render_observer_for_test = nil
@@ -190,7 +190,7 @@ end
 local function restore_retracted_prompt(text, attachments)
   local state = harness_state()
   if state.queue_edit or composer_text(state.composer_buf) ~= "" then
-    table.insert(state.queue, 1, { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id })
+    input_state.submit(state, text, attachments or {}, "queue")
     notifications.warn("The retracted prompt was queued because the composer already contains a newer draft", "ForgeHarness")
     render_status_hint(state)
     return
@@ -222,7 +222,6 @@ local function status_text()
   local selected_model = selected_setting(state, "model")
   if selected_model ~= configured_model then model = selected_model end
   local busy = state.host_error and "host stopped"
-    or state.execution_notice and "stopped"
     or state.cancel_requested and "cancelling"
     or state.busy and ""
     or (#state.queue > 0 and ("queued " .. #state.queue) or "")
@@ -325,6 +324,7 @@ render_status_hint = function(state)
     state.presentation.transcript.restore_recovery = state.restore_recovery
     state.presentation.transcript.recap = state.recap
     state.presentation.transcript.rename_status = state.rename_status
+    state.presentation.transcript.message_notice = diagnostic.get(state, "execution_notice", "warning")
     state.presentation.transcript.status_notice = require("forge.views.harness.health").notice(state)
     if state.presentation.set_staging then
       state.presentation.set_staging(queue_editor.staging(state, composer_text(state.composer_buf)), state.pending_steer)
@@ -340,7 +340,6 @@ end
 function M.render()
   local state = harness_state()
   if state.initial_snapshot_pending then M.refresh_winbar() return end
-  if not state.host_error then check_queue.publish(state, function() vim.schedule(M.drain) end) end
   render_status_hint(state)
   if state.host_error then M.refresh_winbar() return end
   if state.switching_backend then M.refresh_winbar() return end
@@ -409,7 +408,8 @@ end
 ---@return table? owner
 local function set_busy(busy)
   local state = harness_state()
-  state.busy = busy
+  state.request_busy = busy
+  state.busy = busy or state.execution_busy == true
   state.execution_request_owner = busy and {} or nil
   if busy then
     state.execution_notice = nil
@@ -532,6 +532,7 @@ local function synchronize_state(callback, target_state)
     end
     local state = synchronized_state
     snapshot.apply(state, result)
+    input_state.refresh(state)
     if harness_state() ~= state then state.state_sync_callback = nil return end
     M.attach_transcript(state.transcript_buf)
     require("forge.views.harness.agent_picker").refresh()
@@ -577,6 +578,7 @@ end
 local function on_event(event, payload)
   local state = harness_state()
   if event == "task_operation" then task_control.receive(state, payload) return end
+  if event == "input_changed" then input_state.receive(state, payload) return end
   if event == "host_stopped" then
     state.check_interrupt_pending = nil
     diagnostic.set(state, "host_error", payload.message,
@@ -593,6 +595,7 @@ local function on_event(event, payload)
     state.configuration_completion, state.task_config = nil, nil
     state.approval, state.active_wait, state.dismissed_approval_id = {}, nil, nil
     state.ready = false
+    state.execution_busy = false
     if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
     set_busy(false)
     M.refresh_winbar()
@@ -637,12 +640,14 @@ local function on_event(event, payload)
       local execution = payload.data or {}
       if type(execution.session) ~= "table" or not state.session or execution.session.id ~= state.session.id then return end
       state.session = execution.session
+      state.execution_busy = true
+      state.busy = true
       state.task = execution.task or state.task
       state.goal = type(execution.goal) == "table" and execution.goal.state ~= "cleared" and execution.goal or nil
       state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
       M.refresh_winbar()
     elseif payload.kind == "prompt_submission" then
-      if prompt_submission.receive(state, payload) then schedule_render() end
+      schedule_render()
     elseif payload.kind == "approval_requested" then
       if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
@@ -674,14 +679,6 @@ local function on_event(event, payload)
       if state.session then state.session.context_usage = payload.data or payload end
       M.refresh_winbar()
     elseif payload.kind == "timeline_node_updated" then
-      local update = payload.data or payload
-      local acknowledged = update.node and update.node.prompt
-      for index, pending in ipairs(state.pending_steer or {}) do
-        if acknowledged and pending.text == acknowledged.text then
-          table.remove(state.pending_steer, index)
-          break
-        end
-      end
       M.refresh_winbar()
     elseif payload.kind == "error" then
       if type(payload.text) == "string" then notifications.warn(payload.text, "ForgeHarness") end
@@ -894,19 +891,12 @@ function M.present_plan_question(force)
     ask = function(params)
       state.plan_question_open = false
       prompt_history.record(params.text)
-      local request_owner = set_busy(true)
-      client.request("question.ask", params, function(_, request_error, error_detail)
-        if finish_execution(request_error, error_detail, request_owner) then return end
-        state.question_draft = request_error and error_detail and error_detail.code == "not_admitted"
-          and { owner_id = owner_id, question_set_id = elicitation.question_set.id, question_id = params.question_id, text = params.text } or nil
+      local pending_draft = { owner_id = owner_id, question_set_id = elicitation.question_set.id,
+        question_id = params.question_id, text = params.text }
+      state.question_draft = pending_draft
+      input_state.submit(state, params.text, {}, "auto", nil, function(failure)
+        if not failure and state.question_draft == pending_draft then state.question_draft = nil end
         question_presentation.reset(state)
-        if request_error then
-          if not error_detail or error_detail.code ~= "not_admitted" then
-            notifications.error(request_error, "Planning clarification")
-          end
-          synchronize_state()
-          return
-        end
         synchronize_state()
       end)
     end,
@@ -914,6 +904,11 @@ function M.present_plan_question(force)
       state.plan_question_open = false
       local request_owner = set_busy(true)
       client.request("question.continue", {}, function(_, request_error, error_detail)
+        if request_error and error_detail and error_detail.code == "not_admitted" then
+          set_busy(false)
+          synchronize_state()
+          return
+        end
         if finish_execution(request_error, error_detail, request_owner) then return end
         if request_error then
           if not error_detail or error_detail.code ~= "not_admitted" then
@@ -990,8 +985,6 @@ end
 ---@param text string
 begin_request = function(text, from_composer, attachments, captured_prompt, queue_entry)
   local state = harness_state()
-  local request_session_id = state.session and state.session.id
-  local request_epoch = state.runtime_epoch
   local context
   if from_composer then
     local failure
@@ -1004,55 +997,12 @@ begin_request = function(text, from_composer, attachments, captured_prompt, queu
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
   if from_composer then state.queue_paused = false end
-  local request_owner = set_busy(true)
-  local goal_objective = text:match("^/goal%s+(.+)$")
-  if goal_objective and goal_objective ~= "pause" and goal_objective ~= "resume" and goal_objective ~= "clear" then
-    state.goal = { objective = goal_objective, state = "active" }
-  end
-  M.render()
-  local function receive(result, request_error, error_detail)
-    if not state.session or state.session.id ~= request_session_id or state.runtime_epoch ~= request_epoch then return end
-    local interrupted = state.check_interrupt_pending
-    if interrupted and interrupted.old_prompt_sequence == state.prompt_sequence then
-      if result then
-        state.session = result.session or (result.id and result) or state.session
-        state.capability = result.capability or state.capability
-      end
-      finish_execution(nil)
-      interrupted.old_prompt_pending = false
-      resume_check_interrupted_prompt(state, interrupted)
-      return
-    end
-    if finish_execution(request_error, error_detail, request_owner) then return end
-    state.cancel_requested = false
-    if request_error then
-      if error_detail and error_detail.code == "turn_retracted" then
-        local prompt = error_detail.data and error_detail.data.prompt or text
-        if not from_composer and not queue_entry then restore_retracted_prompt(prompt, attachments) end
-        synchronize_state()
-        return
-      end
-      if error_detail and error_detail.code == "turn_cancelled" then
-        synchronize_state(M.drain)
-        return
-      end
-      if not error_detail or (error_detail.code ~= "not_admitted" and error_detail.code ~= "outcome_unknown") then
-        notifications.error(request_error, "ForgeHarness")
-      end
-      synchronize_state()
-      return
-    elseif result then
-      state.session = result.session or (result.id and result) or state.session
-      state.capability = result.capability or state.capability
-    end
-    synchronize_state(M.drain)
-  end
   prompt_submission.start(state, {
     text = text, attachments = attachments, context = context,
     source = captured_prompt and captured_prompt.source,
     changedtick = captured_prompt and captured_prompt.changedtick,
     queue_entry = queue_entry,
-  }, receive)
+  }, function() M.refresh_winbar() end)
 end
 
 resume_check_interrupted_prompt = function(state, interrupted)
@@ -1087,17 +1037,15 @@ end
 
 function M.drain()
   local state = harness_state()
-  if not state.host_error and check_queue.publish(state, function() vim.schedule(M.drain) end) then return end
   if state.queue_paused then state.queue_suspended = true return end
   if state.check_interrupt_pending then
     resume_check_interrupted_prompt(state, state.check_interrupt_pending)
     return
   end
   if state.checks_running then return end
-  if state.host_error or state.execution_notice or state.task_operation or state.sync_error or state.connection_error then return end
+  if state.host_error or state.task_operation or state.sync_error or state.connection_error then return end
   if state.aborting_plan then return end
-  if state.busy or state.prompt_submission or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
-  if #(state.pending_steer or {}) > 0 then return end
+  if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if state.status and state.status.kind == "finalizing" then return end
   if state.pending_config then
     local pending_config = state.pending_config
@@ -1111,56 +1059,6 @@ function M.drain()
       if applied then vim.schedule(M.drain) end
     end)
     return
-  end
-  local current_task_id = state.session and state.session.current_task_id
-  local current_task = task_control.current(state)
-  local first_queued = state.queue[1]
-  state.queue_suspended = type(first_queued) == "table" and first_queued.task_id ~= current_task_id
-    or current_task ~= nil and vim.tbl_contains({ "paused", "blocked", "failed", "stopping" }, current_task.status)
-  local next_entry = state.queue[1]
-  local next_text = type(next_entry) == "table" and next_entry.text or next_entry
-  if state.active_elicitation and state.active_elicitation.elicitation
-    and not (next_text and next_text:match("^/replan%s")) then
-    return
-  end
-  local entry = state.queue[1]
-  if state.queue_edit and state.queue_edit.barrier == entry then return end
-  if type(entry) == "string" then
-    entry = { text = entry, task_id = current_task_id }
-    state.queue[1] = entry
-  end
-  local text = type(entry) == "table" and entry.text or entry
-  if text and not state.queue_suspended then
-    local next_config, prompt, failure = model_command(text)
-    if failure then report_configuration_error(failure) return end
-    if next_config then
-      if type(entry) == "table" then next_config = vim.tbl_extend("force", next_config, entry.config or {}) end
-      M.configure(next_config, true, function(applied)
-        if not applied then return end
-        if state.queue_paused then return end
-        if state.queue[1] ~= entry then return end
-        if state.queue_edit and state.queue_edit.barrier == entry then return end
-        if prompt ~= "" then begin_request(prompt, false, entry.attachments or {}, nil, entry)
-        else table.remove(state.queue, 1) M.drain() end
-      end)
-      return
-    end
-    if text == "/compact" then
-      M.compact(function(applied)
-        if applied and state.queue[1] == entry then table.remove(state.queue, 1) end
-      end)
-    else begin_request(text, false, entry.attachments or {}, nil, entry) end
-    return
-  end
-  if not text and state.checks_deferred then
-    local session_id, epoch = state.session.id, state.runtime_epoch
-    local request_owner = set_busy(true)
-    client.request_for(session_id, "checks.complete", {}, function(_, failure, detail)
-      if not state.session or state.session.id ~= session_id or state.runtime_epoch ~= epoch then return end
-      if finish_execution(failure, detail, request_owner) then return end
-      if failure then notifications.error(failure, "Harness checks") end
-      synchronize_state(M.drain)
-    end)
   end
 end
 
@@ -1639,11 +1537,12 @@ end
 local function finish_queue_edit(state, text, unqueue)
   local edit = state.queue_edit
   queue_editor.remember(state, text)
+  edit.commit_text, edit.commit_config = {}, {}
   local source = require("forge.views.harness.completion.command_source")
   for index, entry in ipairs(state.queue) do
     local draft = edit.drafts[entry]
     if draft and draft ~= "" and not (unqueue and entry == edit.entry) then
-      local _, _, failure = model_command(draft)
+      local next_config, prompt, failure = model_command(draft)
       if not source.accepts_prompt(draft) or not source.queues_execution(draft) then
         failure = "Use a prompt, or clear the text to delete this queued message"
       end
@@ -1654,6 +1553,7 @@ local function finish_queue_edit(state, text, unqueue)
         M.refresh_winbar()
         return
       end
+      if next_config then edit.commit_text[entry], edit.commit_config[entry] = prompt, next_config end
     end
   end
   local selected_attachments = edit.attachments[edit.entry]
@@ -1977,14 +1877,10 @@ function M.submit()
     M.agent_action("followup", state.selected_agent_run_id, text)
     return
   end
-  if state.task_operation and state.task_operation.state ~= "running" and not state.checks_running then
-    M.refresh_winbar()
-    return
-  end
   if state.check_interrupt_pending then
     local attachments = attachment.capture(state.composer_buf).attachments
     set_composer_text(state.composer_buf, "")
-    state.queue[#state.queue + 1] = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
+    input_state.submit(state, text, attachments, "queue")
     M.refresh_winbar()
     return
   end
@@ -2001,8 +1897,7 @@ function M.submit()
       prompt = { context = context, source = source },
       session_id = state.session.id,
       runtime_epoch = state.runtime_epoch,
-      old_prompt_pending = state.prompt_submission ~= nil,
-      old_prompt_sequence = state.prompt_sequence,
+      old_prompt_pending = false,
       was_busy = state.busy,
       cancel_complete = false,
     }
@@ -2013,6 +1908,7 @@ function M.submit()
     local run_id = state.active_check_run
     if type(run_id) ~= "string" then
       interrupted.cancel_complete = true
+      set_busy(false)
       resume_check_interrupted_prompt(state, interrupted)
       return
     end
@@ -2035,29 +1931,7 @@ function M.submit()
     if not sent then cancelled(nil, tostring(failure)) end
     return
   end
-  if state.busy or state.configuring then
-    local attachments = attachment.capture(state.composer_buf).attachments
-    set_composer_text(state.composer_buf, "")
-    if state.busy and not selected_agent_run(state)
-      and ((state.capability and state.capability.native_steer) or (state.status and state.status.kind == "waiting_for_agent"))
-    then
-      submit_immediate(state, text, attachments)
-      return
-    end
-    state.queue[#state.queue + 1] = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
-    M.refresh_winbar()
-    return
-  end
   begin_request(text, true)
-end
-
-local function remove_pending_steer(state, target)
-  for index, entry in ipairs(state.pending_steer or {}) do
-    if entry == target then
-      table.remove(state.pending_steer, index)
-      return
-    end
-  end
 end
 
 submit_immediate = function(state, text, attachments)
@@ -2066,21 +1940,8 @@ submit_immediate = function(state, text, attachments)
     M.agent_action("message", state.selected_agent_run_id, text)
     return
   end
-  set_composer_text(state.composer_buf, "")
-  local pending = { text = text, attachments = attachments, task_id = state.session and state.session.current_task_id }
   recap.clear(state)
-  state.pending_steer = state.pending_steer or {}
-  state.pending_steer[#state.pending_steer + 1] = pending
-  M.refresh_winbar()
-  client.request("turn.steer", pending, function(_, request_error)
-    if request_error then
-      remove_pending_steer(state, pending)
-      state.queue[#state.queue + 1] = pending
-      notifications.warn("Steering missed the active turn. Queued as a follow-up", "ForgeHarness")
-    end
-    M.refresh_winbar()
-    vim.schedule(M.drain)
-  end)
+  begin_request(text, true, attachments)
 end
 
 ---Send the composer into the active provider turn without creating a new interaction.
@@ -2093,14 +1954,6 @@ function M.steer_submit()
   if state.selected_agent_run_id then
     prompt_history.record(text)
     M.agent_action("message", state.selected_agent_run_id, text)
-    return
-  end
-  if not state.busy then
-    notifications.warn("Harness has no active turn to steer", "ForgeHarness")
-    return
-  end
-  if not ((state.capability and state.capability.native_steer) or (state.status and state.status.kind == "waiting_for_agent")) then
-    notifications.warn("The current backend does not support active-turn steering", "ForgeHarness")
     return
   end
   prompt_history.record(text)
@@ -2123,11 +1976,12 @@ function M.queue_submit()
     M.submit()
     return
   end
-  local _, _, failure = model_command(text)
+  local captured_config, prompt, failure = model_command(text)
   if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
-  state.queue[#state.queue + 1] = { text = text, attachments = attachment.capture(state.composer_buf).attachments, task_id = state.session and state.session.current_task_id }
+  local attachments = attachment.capture(state.composer_buf).attachments
   set_composer_text(state.composer_buf, "")
+  input_state.submit(state, prompt or text, attachments, "queue", captured_config)
   M.refresh_winbar()
   M.drain()
 end
@@ -2455,8 +2309,7 @@ function M.task_transition(action, submitted_text, completed, method)
     local interrupted = state.check_interrupt_pending
     if interrupted then
       state.check_interrupt_pending = nil
-      table.insert(state.queue, 1, { text = interrupted.text, attachments = interrupted.attachments,
-        task_id = state.session.current_task_id })
+      input_state.submit(state, interrupted.text, interrupted.attachments or {}, "queue")
     end
   elseif vim.tbl_contains({ "resume", "clear", "chat", "plan", "goal", "execute" }, action.action) then
     state.queue_paused = false
@@ -2471,8 +2324,7 @@ function M.task_transition(action, submitted_text, completed, method)
   local current = task_control.current(state)
   if action.action == "resume" and current and current.status == "running"
     and (not action.task_id or action.task_id == current.id) then
-    M.render()
-    M.drain()
+    input_state.perform(state, { kind = "resume" })
     return
   end
   set_busy(true)
@@ -2778,6 +2630,12 @@ end
 
 function M.attach()
   local state = harness_state()
+  input_state.attach(state, function()
+    local active = session.harness
+    session.activate_harness(state)
+    M.render()
+    if active ~= state then session.activate_harness(active) end
+  end)
   local composer_buffer = state.composer_buf
   attachment.attach(composer_buffer, state.session and state.session.id)
   attachment.decorate(state.transcript_buf)

@@ -708,13 +708,13 @@ Resolve write source without executing validation. Their completion persists Che
 process admission. Manual Verify begins only after the declaration scan and enabled checks pass.
 
 The completion gate defaults to `after_queue`. `/config` can select `between_work`
-instead, and the settings store persists that choice globally. Lua publishes ordered,
-host-identified queue snapshots through `queue.update` before admitting more work.
-The service accepts these updates independently of the active broker lock.
+instead, and the settings store persists that choice globally. Rust derives pending
+work from its revisioned input queue. Input operations remain available independently
+of the active broker lock.
 `CompletionQueue` retains deferred validation and the original change owner across
 queued interactions. The final interaction therefore checks changes from the entire
-batch. If queue editing removes the remaining work, Lua invokes `checks.complete`
-under normal execution admission. Failed, paused, or waiting work retains its existing
+batch. If queue editing removes the remaining work, the host input worker invokes
+`checks.complete` under normal execution admission. Failed, paused, or waiting work retains its existing
 admission boundaries. Plan Checking and explicitly requested runs remain independent.
 
 One Rust-owned runner serves the automatic gate and `check_run`. Its provider-neutral

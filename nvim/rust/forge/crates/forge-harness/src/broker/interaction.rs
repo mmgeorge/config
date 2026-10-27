@@ -10,10 +10,13 @@ impl HarnessBroker {
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let submission_store =
             crate::backend::submission::SubmissionStore::open(&self.data_root, self.trace.clone())?;
-        let submission = submission_store.prepare(
-            &self.backend_request(input.clone(), mode),
-            self.backend.descriptor().kind,
-        )?;
+        let submission = match self.input_submission.take() {
+            Some(submission) => submission,
+            None => submission_store.prepare(
+                &self.backend_request(input.clone(), mode),
+                self.backend.descriptor().kind,
+            )?,
+        };
         let (mut interaction, mut event) =
             Box::pin(self.admit_interaction(&text, mode, admission.as_ref())).await?;
 

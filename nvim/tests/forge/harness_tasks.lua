@@ -55,7 +55,8 @@ requests[#requests].reply(nil, "Forge request admission is full", { code = "not_
 assert(state.task_operation.state == "running" and settled == 3,
   "a failed status read changed the admitted operation outcome")
 assert(state.execution_notice:find("Retrying task status", 1, true))
-assert(not require("forge.views.harness.health").notice(state).failed)
+assert(not require("forge.views.harness.health").notice(state),
+  "task-control polling diagnostic replaced canonical execution status")
 timers[#timers]()
 requests[#requests].reply({ state = "running" })
 assert(state.execution_notice == nil, "a successful status read retained the transient failure")
@@ -91,7 +92,7 @@ assert(settled == 6 and state.task_operation == nil)
 begin({ action = "pause" })
 local queued_control = requests[#requests]
 queued_control.reply(nil, "admission full", { code = "not_admitted" })
-assert(state.task_operation and not require("forge.views.harness.health").notice(state).failed)
+assert(state.task_operation and not require("forge.views.harness.health").notice(state))
 timers[#timers]()
 local retry = requests[#requests]
 assert(retry.method == queued_control.method and retry.params.operation_id == queued_control.params.operation_id,

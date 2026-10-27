@@ -26,7 +26,10 @@ client.subscribe(function(event, payload)
   if event == "backend_event" and payload.kind == "execution_state" then starts = starts + 1 end
 end)
 local function await(predicate, message)
-  assert(vim.wait(15000, function() return #failures > 0 or predicate() end, 10), message)
+  assert(vim.wait(15000, function() return #failures > 0 or predicate() end, 10),
+    message .. "\n" .. vim.inspect({ queue = state.queue, task = state.task,
+      operation = state.task_operation, input = state.input and { revision = state.input.revision,
+        pending = state.input.pending, suspended = state.input.suspended }, status = state.status }))
   assert(#failures == 0, table.concat(failures, "\n"))
 end
 local function request(method, params)
@@ -85,6 +88,7 @@ local success, failure = xpcall(function()
   assert(executed() == 1, "final gate lost the earlier queued edit")
   assert(vim.json.decode(table.concat(vim.fn.readfile(baseline), "\n")).owner == owner,
     "the last item replaced the first change baseline")
+  if vim.g.forge_check_queue_first_batch then return end
 
   local applied
   controller.configure({ check_timing = "between_work" }, false, function(value) applied = value end)

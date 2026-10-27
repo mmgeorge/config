@@ -53,22 +53,6 @@ impl BrokerObserver {
         Ok(json!({"check_editing": enabled}))
     }
 
-    /// Adopts a current host's ordered queue publication independently of execution.
-    pub(crate) fn update_queue(&self, params: &Value) -> Result<()> {
-        anyhow::ensure!(
-            params["runtime_epoch"].as_str() == Some(&self.runtime_epoch),
-            "queue update belongs to a retired Harness host"
-        );
-        self.completion_queue.update(
-            params["revision"]
-                .as_u64()
-                .context("queue update requires revision")?,
-            params["pending"]
-                .as_bool()
-                .context("queue update requires pending")?,
-        )
-    }
-
     /// Reads current durable state together with the last published runtime metadata.
     pub(crate) fn snapshot(&self) -> Result<BrokerSnapshot> {
         let revision = self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1;

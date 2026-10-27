@@ -3,6 +3,12 @@ use serde::Deserialize;
 /// Identifies an accepted Harness operation before session state is accessed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum HarnessMethod {
+    #[serde(rename = "input.apply")]
+    InputApply,
+    #[serde(rename = "input.get")]
+    InputGet,
+    #[serde(rename = "input.operation")]
+    InputOperation,
     #[serde(rename = "attachment.import")]
     AttachmentImport,
     #[serde(rename = "lsp.authorize")]
@@ -21,8 +27,6 @@ pub enum HarnessMethod {
     ChecksRun,
     #[serde(rename = "checks.complete")]
     ChecksComplete,
-    #[serde(rename = "queue.update")]
-    QueueUpdate,
     #[serde(rename = "checks.status")]
     ChecksStatus,
     #[serde(rename = "checks.cancel")]
